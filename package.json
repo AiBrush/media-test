@@ -1,0 +1,31 @@
+{
+  "name": "media-browser-test",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Library-agnostic, browser-only media-engine conformance & benchmark suite. The comparison vs the reference engine (Mediabunny) is the product.",
+  "engines": {
+    "note": "Use bun/bunx. npm/npx are unavailable in this environment."
+  },
+  "scripts": {
+    "bake": "bash scripts/bake-fixtures.sh",
+    "serve": "bash scripts/serve.sh",
+    "run": "bash scripts/run.sh",
+    "compare": "bash scripts/compare.sh",
+    "add-engine": "bash scripts/add-engine.sh",
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "playwright": "^1.48.0"
+  },
+  "dependencies": {
+    "mediabunny": "^1.0.0",
+    "mp4box": "^0.5.2",
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1"
+  }
+}

@@ -1,0 +1,19 @@
+# raw media is rebuilt by the offline bake — never committed
+fixtures/media/
+
+# deps & build output
+node_modules/
+dist/
+.vite/
+bun.lockb
+
+# vendored engine bundles (dynamically imported browser libs)
+src/engines/**/vendor/
+
+# raw per-run results & snapshots (only results/report.md is committed)
+results/raw/
+results/runs/
+
+# OS / editor noise
+.DS_Store
+*.log
