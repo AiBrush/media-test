@@ -329,29 +329,61 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
     );
   }
 
-  // pts/dts (small tolerance) + keyframe flags, compared positionally up to the shorter length
-  const tsTolUs = t.seekToleranceUs; // reuse 1ms as a "small" packet ts tolerance
-  let ptsMismatch = 0;
-  let dtsMismatch = 0;
+  // ORDER-INDEPENDENT, PER-TRACK comparison. Golden (ffprobe) lists packets interleaved by dts across
+  // tracks; an engine may yield them grouped per-track. So group BOTH sides by trackIndex, sort each
+  // group by dts then pts, and compare position-by-position within the track. Sizes + keyframe flags
+  // must match exactly. Timestamps are compared offset-tolerantly: a CONSTANT per-track origin shift
+  // (ffprobe exposes raw container priming / edit-list pts, e.g. -21333µs, while an engine may apply
+  // the edit list and start at 0) is allowed; a VARYING residual is a real inter-packet timing error.
+  const tsTolUs = t.seekToleranceUs; // reuse 1ms as the "small" packet ts tolerance
+  const byTrack = (ps: PacketInfo[]): Map<number, PacketInfo[]> => {
+    const m = new Map<number, PacketInfo[]>();
+    for (const p of ps) {
+      let g = m.get(p.trackIndex);
+      if (!g) {
+        g = [];
+        m.set(p.trackIndex, g);
+      }
+      g.push(p);
+    }
+    for (const g of m.values()) g.sort((x, y) => x.dtsUs - y.dtsUs || x.ptsUs - y.ptsUs);
+    return m;
+  };
+  const gotByTrack = byTrack(got);
+  const wantByTrack = byTrack(want);
+
+  let sizeMismatch = 0;
   let kfMismatch = 0;
-  let trackMismatch = 0;
-  const n = Math.min(got.length, want.length);
-  let maxPtsDelta = 0;
-  for (let i = 0; i < n; i++) {
-    const a = got[i]!;
-    const b = want[i]!;
-    if (a.trackIndex !== b.trackIndex) trackMismatch++;
-    const dp = Math.abs(a.ptsUs - b.ptsUs);
-    if (dp > maxPtsDelta) maxPtsDelta = dp;
-    if (dp > tsTolUs) ptsMismatch++;
-    if (Math.abs(a.dtsUs - b.dtsUs) > tsTolUs) dtsMismatch++;
-    if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
+  let ptsDrift = 0;
+  let dtsDrift = 0;
+  let comparedTracks = 0;
+  let maxPtsDriftUs = 0;
+  for (const [trackIndex, wantTrack] of wantByTrack) {
+    const gotTrack = gotByTrack.get(trackIndex) ?? [];
+    const m = Math.min(gotTrack.length, wantTrack.length);
+    if (m === 0) continue;
+    comparedTracks++;
+    // Per-track constant offset, taken from the first aligned packet (origin alignment).
+    const ptsOffset = gotTrack[0]!.ptsUs - wantTrack[0]!.ptsUs;
+    const dtsOffset = gotTrack[0]!.dtsUs - wantTrack[0]!.dtsUs;
+    for (let i = 0; i < m; i++) {
+      const a = gotTrack[i]!;
+      const b = wantTrack[i]!;
+      if (a.size !== b.size) sizeMismatch++;
+      if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
+      const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
+      const dtsResid = Math.abs(a.dtsUs - b.dtsUs - dtsOffset);
+      if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
+      if (ptsResid > tsTolUs) ptsDrift++;
+      if (dtsResid > tsTolUs) dtsDrift++;
+    }
   }
-  measurements.maxPtsDeltaUs = maxPtsDelta;
-  if (trackMismatch) diffs.push(`${trackMismatch}/${n} packets had a trackIndex mismatch`);
-  if (ptsMismatch) diffs.push(`${ptsMismatch}/${n} packets pts beyond ±${tsTolUs}µs`);
-  if (dtsMismatch) diffs.push(`${dtsMismatch}/${n} packets dts beyond ±${tsTolUs}µs`);
-  if (kfMismatch) diffs.push(`${kfMismatch}/${n} packets keyframe-flag mismatch`);
+  measurements.comparedTracks = comparedTracks;
+  measurements.maxPtsDriftUs = maxPtsDriftUs;
+  if (sizeMismatch) diffs.push(`${sizeMismatch} packets had a size mismatch`);
+  if (kfMismatch) diffs.push(`${kfMismatch} packets had a keyframe-flag mismatch`);
+  if (ptsDrift) diffs.push(`${ptsDrift} packets pts drift beyond ±${tsTolUs}µs after per-track origin alignment`);
+  if (dtsDrift) diffs.push(`${dtsDrift} packets dts drift beyond ±${tsTolUs}µs after per-track origin alignment`);
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
   return pass(oracle, `packet table matches golden (${got.length} packets)`, measurements);
