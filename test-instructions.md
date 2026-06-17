@@ -1,460 +1,470 @@
-# Browser Media-Engine Conformance & Benchmark Suite — Build Instructions
+# Browser Media-Framework Benchmark Suite — Specification
 
-**Audience:** Claude Code agents building (and then continuously running) the suite.
+**What this is.** A **library-agnostic, real-browser benchmark suite** that puts every browser media framework through the **same battery of cases** — functional correctness, deep edge cases, and performance — measures a **value for each framework on each case**, and declares a **clear winner per case** plus an **overall leaderboard**. The deliverable is the comparison: *for this case, which framework is correct, and which is fastest, and by how much.*
 
-**What this is:** a **library-agnostic, browser-only** test project. It defines a battery of media tests **once**, then runs that **same** battery — functional correctness, performance, and robustness — **inside real browsers** against **any media library you register behind a common adapter**. It produces a **comparison report** (every engine vs a chosen reference, default Mediabunny) so we can objectively measure the improvements we make or the libraries we evaluate. This is the measurement backbone for the `aibrush/media` decision (*optimize / adopt / skip*).
+**This is not a loop.** There is no cron, no "continuous iteration", no background driver. You **bake once**, then **run on demand** (now, after a framework updates, after you add a case, or in CI) and read the report. "Run the suite" is like "run the tests": a one-shot, re-runnable command — not a recurring job.
 
-**Hard mandate — BROWSER ONLY.** The libraries under test run **in the browser** (WebCodecs / WASM / pure-JS). There is **no Node-library testing and no native binary in the test loop.** `@mediabunny/server`, `node-av`, native FFmpeg, and any other server/CLI codec path are **explicitly out of scope as engines** (they belong to a separate backend effort, not this suite). The only place a binary may run is a **one-time, offline fixture bake** that produces static media + golden data; once baked, the running suite touches nothing but the browser and the browser libraries.
-
----
-
-## 0. The two rules that override everything
-
-1. **No measurement → no claim. No green correctness oracle → no admissible benchmark.** Every number is produced in-browser by the suite, validated by a library-independent oracle, and reported with the engine, the browser, and the workload it is gated to. A speedup that fails conformance is a regression. (*INV §1, §13, §14*.)
-2. **The comparison is the product.** The suite's deliverable is not "Mediabunny is fast" — it is a **matrix**: `engine × browser × scenario → {pass/fail/NA, metrics}`, with **deltas vs the reference engine**. That matrix is how we decide and how we prove an improvement.
-
-The suite must be **fair across libraries**: it judges only **observable behavior** (bytes in → bytes/metadata/frames out, validated against ground truth), never a library's internals. Internals are engine-specific and live in an optional per-engine plugin (§10.4); they never enter the cross-engine comparison.
+**The question it answers:** *Across the media libraries that run in a browser, which one wins each task — and is it actually correct while winning?*
 
 ---
 
-## 1. Agent operating rules (read every iteration)
+## 0. The rules that override everything
 
-- **Browser-only at test time.** All test execution and all measurement happen in a real browser page/Worker. If you find yourself measuring a library in Node, stop — it is out of scope.
-- **No binary in the loop.** `ffmpeg`/`ffprobe`/Bento4 may run **only** in the offline `fixtures/bake` step, which is not part of `run`. The committed golden data is what the browser compares against.
-- **No measurement is ever fabricated.** Not run = `—`. Unsupported = `NA` (and record *why*: engine-undeclared vs browser-unsupported). Never guess a number.
-- **Correctness gates every benchmark**, per engine, per browser, per scenario.
-- **Local only.** No deploy, no prod, no cloud beyond fetching/installing the libraries under test. Never touch AiBrush prod/dev.
-- **Long runs go to background.** Browser bench matrices and the offline bake exceed the 60 s Bash limit — launch with `run_in_background` and poll.
-- **Commit small, ignore large.** Commit suite code, scenario/corpus *manifests*, the *bake scripts*, golden *digests*, and the report. Git-ignore raw media, `node_modules`, library bundles, and raw per-run JSON.
-- **Reference engine is pinned.** Default reference = Mediabunny at a recorded version. Deltas are always "vs reference on the same browser + same corpus."
+1. **Correctness gates the number.** A framework is eligible to *win* a case only if its output passed that case's correctness oracle. A fast-but-wrong result never wins; it is recorded `FAIL`. No green oracle → no admissible benchmark value. (This is what separates a real benchmark from a vanity chart.)
+2. **The winner is the product.** Every case ends in a verdict: **a winner** (the fastest *correct* framework), its value, and the margin over the runner-up — per browser. The suite's output is the leaderboard, not prose.
+3. **Judge only observable behavior.** Bytes/metadata/frames in → bytes/metadata/frames out, validated against independent ground truth. Never a framework's internals (those are framework-specific and unfair to compare).
+4. **Real browser, never headless.** Every measurement runs in a **real, non-headless browser** (Brave by default). No headless shell, no fake/software-only codec contexts — they don't reflect what users get.
+5. **bun only, never node.** Every JS/TS execution uses `bun`/`bunx` — scripts, shebangs, the launcher, CI. The single exception is the **offline bake**, where native `ffmpeg`/`ffprobe`/Bento4 produce fixtures; even there the JS runtime is `bun`.
+6. **Never fabricate.** Not run = `—`. Unsupported = `NA` with the reason (framework-can't vs browser-can't, kept distinct). Every number is produced in-browser by the suite.
+7. **Measure the operation, not the library.** A framework's one-time cost — downloading its code, compiling/instantiating WASM, configuring/warming a WebCodecs encoder — is **excluded from every operation benchmark**. It happens in `init()`, awaited *before* the timed window opens, and is reported **separately** as a `load/init time` metric (informational, never folded into ops/s, packets/s, frames/s, or wall). A 30 MB WASM core is a *bundle-size* and *load-time* fact, not a slowdown of the convert it then performs.
+8. **All libraries are hosted locally.** Every framework runtime (incl. heavy WASM cores like `@ffmpeg/core`) is vendored and served from the local origin. **Nothing is fetched from the internet at run time** — no CDN/unpkg `toBlobURL`. Runs are hermetic, offline, and repeatable; a flaky network can never perturb a measurement.
+9. **Every framework competes on its OWN best path.** Fairness is *not* forcing an identical lowest-common-denominator API on everyone — it is giving each framework its **fastest documented configuration** on the current browser, then recording exactly what that was. Use hardware-accelerated WebCodecs over software; **WebGPU > WebGL > 2D-canvas/CPU** for scaling/color/pixel work; pipelined/streaming over batch; Worker offload; multi-threaded WASM where the framework ships and recommends it; zero-copy/transferable buffers; the queue depths the docs suggest. The chosen config is **recorded per framework** in the report so every number reads "this framework, at its best, configured thus." Two guard-rails: (a) it must be a path the framework's **own docs endorse** — best *supported* config, never a hand-rolled advantage the library doesn't sanction, and never crippling a rival's fast path; (b) the fast path still must pass the **same correctness oracle** — speed is earned via the better backend, never via a lower correctness bar (a WebGPU resize is SSIM/PSNR-gated like any other).
 
 ---
 
-## 2. Architecture
+## 1. The frameworks under test
+
+All sit behind one common adapter (`MediaEngine`, §4). Adding a framework = adding one adapter file; it then runs the **entire battery** automatically. Mediabunny is the **reference** (deltas are quoted against it), but any framework can win any case.
+
+> **Kind is orientation only.** The "kind" column positions each framework so we know roughly what to test; the **exact capabilities are determined by research (§15) + `capabilities()` + runtime detection — never asserted here.** Do not infer support from this table.
+
+| Framework | Kind (per its own docs) | First thing the research agent (§15) must establish |
+| --- | --- | --- |
+| **mediabunny** (reference) | WebCodecs orchestrator, pure-TS, zero-dep | the Δ baseline — its full read/write/transcode/trim API + recommended fast path + version |
+| **ffmpeg.wasm** | WASM, software codecs | single- vs **multi-thread** core, which codecs/containers the wasm build ships, how to **vendor it locally** |
+| **mp4box.js** | pure-JS ISOBMFF parser/fragmenter | exactly which read/probe/segment ops it exposes (and what it does not) |
+| **platform** | raw WebCodecs + `<video>`/MSE/MediaRecorder | per-browser WebCodecs/MSE/MediaRecorder/ImageDecoder limits |
+| **@remotion/media-parser** | pure-JS parser | its container + metadata/packet coverage and streaming model |
+| **web-demuxer** | WASM (ffmpeg-based) demuxer | its container list + WebCodecs-chunk output shape |
+| **@remotion/webcodecs** | WebCodecs converter | its transcode/convert/resize options + supported in/out |
+| **aibrush-media** | future candidate | placeholder adapter today; no capabilities until built |
+
+> A framework being read-only (a parser) is **not** a reason to drop a case. Parsers simply score `-` on encode cases and compete only on the cases they declare. The suite is **case-centric and framework-blind**: cases are defined once and never edited to flatter a framework, and **who supports what is discovered, not assumed.**
+
+---
+
+## 2. Execution model — three commands, no loop
 
 ```
-                         ┌─────────────────────────────────────────────┐
-   offline, one-time     │  fixtures/bake  (ffmpeg + in-browser capture) │
-   (binaries allowed)    │  → static media corpus + golden ground truth  │   ──► committed
-                         └─────────────────────────────────────────────┘
-                                          │ (static files, fetched in-page)
-   ─────────────────────────────────────────────────────────────────────────────────────
-   test time (browser only, no binaries)  ▼
-                         ┌───────────────────────────────────────────────────────────┐
-   launcher (Playwright, │   SUITE = a static browser app (runs in-page + in Workers) │
-   automation only — NOT │                                                            │
-   part of measurement)  │   registry of ENGINE ADAPTERS  (browser libs)              │
-        │                │     • mediabunny (reference)   • ffmpeg.wasm               │
-        ├─ Chromium ───► │     • mp4box.js                • platform (WebCodecs/<video>)│
-        ├─ WebKit   ───► │     • aibrush/media (future)   • <your candidate>          │
-        └─ Firefox  ───► │                                                            │
-                         │   for each engine × scenario (capability-gated):           │
-                         │     run op in-page/Worker → validate via browser-pure      │
-                         │     ORACLE (golden digest / reference re-import / SSIM /    │
-                         │     playback) → record conformance + in-browser metrics    │
-                         └───────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-                         COMPARISON REPORT: engine × browser × scenario matrix + Δ vs reference
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. BAKE   (offline, once; native binaries allowed)           │
+  │    fixtures/bake.mjs (run via bun) → static corpus + golden  │  → committed (golden+manifest)
+  └─────────────────────────────────────────────────────────────┘
+                          │ static files, fetched in-page
+  ─────────────────────────────────────────────────────────────────
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 2. RUN    (on demand, REAL BROWSER — Brave, non-headless)    │
+  │    serve the suite → open in Brave → for each framework×case:│
+  │      run op in-page → CORRECTNESS oracle → if pass, MEASURE  │
+  │    → write results/raw/<browser>.json                        │
+  └─────────────────────────────────────────────────────────────┘
+                          │
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 3. REPORT (on demand)                                        │
+  │    compare → results/report.md: winner per case + leaderboard│
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-**Pieces:**
+- **Bake** is offline and one-time (re-run only when the corpus changes). It is the *only* place a binary runs.
+- **Run** happens entirely in a real browser. The launcher (Playwright driving real Brave, or the `/chrome` extension, or simply opening `index.html`) only **automates** open→run→save; it performs **no measurement**.
+- **Report** turns raw results into the winners + leaderboard. Pure transformation, re-runnable anytime.
 
-- **Engine adapter** — a thin shim implementing the suite's `MediaEngine` interface for one browser library, plus a **declared capability set** (§5). Adding a library = adding one adapter file. This is what makes the suite agnostic.
-- **Scenario** — one engine-independent test/benchmark case: `(operation, input asset, options, required-capabilities, oracles, metrics)`. Scenarios never name a library.
-- **Capability negotiation** — the runner runs a scenario on an engine only if the engine declares the needed capabilities **and** the current browser supports the needed WebCodecs codecs (runtime feature-detect). Otherwise `NA`, with the reason.
-- **Browser-pure oracle** — validates an engine's observable output using only the browser + committed golden data + the reference engine (§8).
-- **Comparison engine** — assembles the matrix and the deltas-vs-reference (§12).
+You re-run `run`+`report` whenever you want a fresh comparison. That is the whole lifecycle.
 
 ---
 
-## 3. Scope boundaries (in / out)
-
-| In scope (browser) | Out of scope |
-| --- | --- |
-| Libraries that run in the browser: WebCodecs orchestrators (Mediabunny), WASM (ffmpeg.wasm), pure-JS (mp4box.js), and the raw platform (WebCodecs + `<video>`/MSE/MediaRecorder) | Node-only libraries; `@mediabunny/server`/node-av; native FFmpeg/CLI **as engines under test** |
-| Test execution + measurement entirely in-page / in Workers | Any measurement in Node or via a binary |
-| Cross-browser: Chromium, WebKit, Firefox | Headless "fake" codecs that don't reflect real browser behavior |
-| Offline, one-time fixture bake (may use ffmpeg + an in-browser MediaRecorder capture) to produce **static** corpus + golden data | Running ffmpeg/ffprobe/Bento4 during `run` (the test loop) |
-| All containers/codecs/API aspects the browser libraries expose | Server transcode pipelines, hardware-context/AVFrame paths |
-
-> The backend/native story (the investigation's OPP-10, the real AiBrush perf lever) is deliberately **not** tested here. This suite answers a different question: *among libraries that run in the browser, which is most correct and fastest, and how much did our change improve things?*
-
----
-
-## 4. Directory layout
-
-you are in `media-browser-test/` . Self-contained.
+## 3. Directory layout (`media-browser-test/`, self-contained)
 
 ```
-media-browser-test/
-├── README.md
-├── package.json                # suite app + launcher deps (bundler, playwright). NOT the engines' runtime.
-├── index.html                  # the suite app entry (open in ANY browser to run manually)
-├── .gitignore                  # fixtures/media, node_modules, dist, results/raw, engine bundles
-│
-├── fixtures/                   # OFFLINE, one-time (binaries allowed here only)
-│   ├── bake.mjs                # ffmpeg + headless-browser-capture → media/ + golden/
-│   ├── manifest.json           # every asset: id, family, codecs, gen method, sha256, notes
-│   ├── media/                  # GIT-IGNORED static media (rebuilt by bake.mjs)
-│   └── golden/                 # COMMITTED ground-truth digests (small JSON) per asset/scenario
-│
+├── test-instructions.md        # THIS spec (the canonical description)
+├── README.md  package.json  tsconfig.json  vite.config.mjs  index.html  .gitignore
+├── fixtures/
+│   ├── bake.mjs                # offline: ffmpeg/ffprobe/Bento4 (+ in-browser capture) → media/ + golden/
+│   ├── manifest.json           # every asset: id, family, container, codecs[], genMethod, sha256, sizeBytes
+│   ├── media/   (git-ignored)  # rebuilt by bake
+│   └── golden/  (committed)    # small JSON ground truth (meta, packets, frame digests, luma sigs)
 ├── src/
-│   ├── core/
-│   │   ├── engine.ts           # the MediaEngine interface + normalized result types + CapabilitySet
-│   │   ├── scenario.ts         # defineScenario(); the engine-independent case model
-│   │   ├── registry.ts         # engine + scenario registration
-│   │   ├── runner.ts           # capability negotiation + per-(engine,scenario) execution (in Worker)
-│   │   ├── measure.ts          # in-browser metrics (wall, mem, longtasks, queue sizes, reads/writes)
-│   │   ├── bench.ts            # warmup, N iters, median/p95/MAD, A/B alternation, significance
-│   │   ├── oracles.ts          # browser-pure validators (golden digest, reimport, SSIM/PSNR, playback)
-│   │   ├── feature-detect.ts   # per-browser WebCodecs/codec/WebGPU support probing
-│   │   └── report.ts           # build the comparison matrix + Δ vs reference (JSON + markdown)
-│   │
-│   ├── engines/                # ONE adapter per library (this is the agnostic boundary)
-│   │   ├── mediabunny/adapter.ts          # reference engine
-│   │   ├── ffmpeg-wasm/adapter.ts
-│   │   ├── mp4box/adapter.ts
-│   │   ├── platform/adapter.ts            # raw WebCodecs + <video>/MSE/MediaRecorder
-│   │   ├── aibrush-media/adapter.ts       # placeholder for the future drop-in
-│   │   └── _template/adapter.ts           # copy this to add a new library
-│   │
-│   ├── scenarios/              # engine-independent cases, grouped by family (§9)
-│   │   ├── probe/  demux/  remux/  transcode/  decode-seek/
-│   │   ├── trim/  mux/  encryption/  metadata/  streaming-output/  audio-dsp/
-│   │   └── robustness/         # edge / malformed / fuzz / property-metamorphic
-│   │
-│   └── app/                    # the in-page UI: pick engines+browsers+scenarios, run, view matrix
-│
-├── results/
-│   ├── raw/                    # GIT-IGNORED per-run JSON (per engine × browser)
-│   ├── runs/<iso-timestamp>/   # GIT-IGNORED snapshots
-│   └── report.md               # COMMITTED comparison matrix + scorecards (§12)
-│
-└── scripts/
-    ├── bake-fixtures.sh        # runs fixtures/bake.mjs (offline; binaries OK)
-    ├── serve.sh               # static-serve the suite app for manual/in-browser runs
-    ├── run.sh                 # launch Chromium/WebKit/Firefox, run the battery, collect results
-    ├── compare.sh             # (re)build report.md from results/raw against the reference engine
-    └── add-engine.sh          # scaffold a new adapter from _template
+│   ├── core/  engine.ts scenario.ts registry.ts runner.ts measure.ts bench.ts oracles.ts feature-detect.ts report.ts
+│   ├── engines/  mediabunny/ ffmpeg-wasm/ mp4box/ platform/ remotion-media-parser/ web-demuxer/ remotion-webcodecs/ aibrush-media/ _template/
+│   ├── cases/    functional/ edge/ performance/      # the battery, grouped by dimension (§6–§8)
+│   └── app/      # in-page UI: pick frameworks + cases, Run, watch the live matrix + winners
+├── results/  raw/ (git-ignored)   report.md (committed)   report.json (committed)
+└── scripts/  bake-fixtures.sh  serve.sh  run.sh  compare.sh  add-engine.sh   (all bun/bunx)
 ```
 
-`.gitignore` (at least): `fixtures/media/`, `node_modules/`, `dist/`, `results/raw/`, `results/runs/`, `src/engines/**/vendor/`.
+`.gitignore`: `fixtures/media/`, `node_modules/`, `dist/`, `.vite/`, `results/raw/`, `src/engines/**/vendor/`.
 
 ---
 
-## 5. The engine adapter contract (`src/core/engine.ts`)
+## 4. The adapter contract (`src/core/engine.ts` — authoritative)
 
-Everything is **bytes/blobs/metadata/frames in → bytes/metadata/frames out**, async, browser-native. No method exposes library internals.
+Everything is **bytes/blobs/metadata/frames in → out**, async, browser-native; no method exposes internals. A framework declares a **CapabilitySet**; the runner only runs a case on it when the framework declares the capability **and** the real browser can configure the needed codec (else `NA`, with which kind).
 
-```ts
-export type BrowserName = 'chromium' | 'webkit' | 'firefox'
+Key types (see `engine.ts` for the full, current definitions):
 
-export interface MediaInput {
-  id: string                              // corpus asset id
-  url: string                             // served static; supports HTTP Range
-  mime: string
-  blob(): Promise<Blob>
-  arrayBuffer(): Promise<ArrayBuffer>
-}
+- `MediaInput` (served static asset, HTTP-Range capable), `MediaBytes`, `NormalizedMetadata`, `PacketInfo`, `DemuxResult`, `FrameDigest`/`FrameSink` (sha256 of normalized RGBA).
+- `Operation = probe | demux | remux | transcode | decodeFrames | seek | trim | mux | decrypt`.
+- `CapabilitySet { operations, containersIn[], containersOut[], videoCodecs[], audioCodecs[], encryption[], features[] }` — honest declaration; `features` includes e.g. `resize`, `rotate`, `fanout`, `metadata:write`, `fragmented`, `fastStart:reserve`, `webcodecs:independent` (WASM/JS engines that don't route through WebCodecs opt out of the browser-codec gate).
+- `MediaEngine { id; capabilities(); init?; dispose?; probe; demux; remux; transcode; decodeFrames; seek; trim; mux?; decrypt? }`.
 
-export type MediaBytes = { bytes: Uint8Array; mime: string; container: string }
+**`init()` is the load phase, and it is untimed (rule §0.7).** Every adapter does *all* one-time, heavy work in `init()` — dynamic-import its (locally-hosted, §0.8) bundle, fetch+compile+instantiate WASM, spin up its Worker, configure/warm a WebCodecs encoder/decoder. The runner `await`s `init()` **before** opening any timing window, so library load/compile never counts against an operation. `dispose()` tears it down (free WASM heap, close Workers/codecs) so peak-memory is clean. The one-time cost is captured *separately* as the `load/init time` metric.
 
-export interface NormalizedMetadata {
-  container: string
-  durationSec: number | null
-  tracks: Array<{
-    type: 'video' | 'audio' | 'subtitle' | 'other'
-    codec: string
-    width?: number; height?: number; fps?: number; rotation?: number
-    sampleRate?: number; channels?: number
-    bitrate?: number | null; language?: string | null
-  }>
-  tags?: Record<string, string>
-}
-
-export interface PacketInfo { trackIndex: number; size: number; ptsUs: number; dtsUs: number; keyframe: boolean }
-export interface DemuxResult { metadata: NormalizedMetadata; packets: PacketInfo[] }
-
-// frames are returned as digests (committed-golden comparison) and optionally raw for SSIM/PSNR
-export interface FrameDigest { index: number; ptsUs: number; sha256: string /* of normalized RGBA */ }
-export interface FrameSink { frames: FrameDigest[]; getPixels?(i: number): Promise<ImageData> }
-
-export type Operation =
-  | 'probe' | 'demux' | 'remux' | 'transcode'
-  | 'decodeFrames' | 'seek' | 'trim' | 'mux' | 'decrypt'
-
-export interface CapabilitySet {
-  operations: Partial<Record<Operation, boolean>>
-  containersIn: string[]                  // e.g. ['mp4','mov','mkv','webm','ts','wav','ogg','flac','mp3','adts','hls']
-  containersOut: string[]
-  videoCodecs: string[]                   // ['h264','hevc','vp8','vp9','av1', ...]
-  audioCodecs: string[]                   // ['aac','opus','mp3','flac','vorbis','pcm-*', ...]
-  encryption: Array<'cenc-ctr' | 'cenc-cbcs' | 'hls-aes128'>
-  features: string[]                      // 'fragmented','fastStart:reserve','trim:frame-accurate',
-                                          // 'metadata:write','alpha','resize','rotate','fanout', ...
-}
-
-export interface MediaEngine {
-  readonly id: string                     // 'mediabunny@1.48.0', 'ffmpeg.wasm@0.12', 'aibrush-media@dev'
-  capabilities(): CapabilitySet           // DECLARED; the runner also runtime-feature-detects per browser
-  init?(): Promise<void>; dispose?(): Promise<void>
-
-  probe(input: MediaInput): Promise<NormalizedMetadata>
-  demux(input: MediaInput): Promise<DemuxResult>
-  remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes>
-  transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes>
-  decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink>
-  seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }>
-  trim(input: MediaInput, range: { startUs: number; endUs: number }, opts: { container: string; frameAccurate: boolean }): Promise<MediaBytes>
-  mux?(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes>
-  decrypt?(input: MediaInput, key: { kid?: string; keyHex: string; ivHex?: string }, opts: { scheme: 'cenc-ctr' | 'cenc-cbcs' | 'hls-aes128' }): Promise<MediaBytes>
-}
-
-export interface TranscodeOptions {
-  container: string
-  video?: { codec?: string; width?: number; height?: number; fps?: number; bitrate?: number; rotate?: number }
-  audio?: { codec?: string; sampleRate?: number; channels?: number; bitrate?: number }
-  variants?: TranscodeOptions['video'][]  // fan-out / ABR ladder (one input → N renditions)
-}
-```
-
-**Capability + browser negotiation (`runner.ts` + `feature-detect.ts`):** a scenario declares `requires` (operation + containers + codecs + features). The runner runs it on engine E in browser B iff `E.capabilities()` covers `requires` **and** `feature-detect(B)` confirms the codecs are configurable (`VideoEncoder/Decoder.isConfigSupported`, `AudioEncoder/Decoder`, alpha, WebGPU). Otherwise it records:
-
-- `NA(engine)` — engine does not declare the capability (e.g. mp4box can't transcode).
-- `NA(browser)` — the browser lacks the WebCodecs codec (e.g. HEVC encode on Firefox).
-
-Both are first-class results — *"works in Chromium, unsupported in WebKit"* is exactly the kind of finding a browser-only suite must surface.
+**Adding a framework:** `scripts/add-engine.sh <id>` copies `_template/adapter.ts`; implement the interface + honest `capabilities()`, register it, and it's automatically in every case and the leaderboard.
 
 ---
 
-## 6. Engines to ship (and how to add one)
+## 5. Corpus & oracles (the correctness gate)
 
-Ship these adapters first; **Mediabunny is the reference**. Each declares capabilities honestly and is loaded as a **browser bundle**, dynamically imported so it never bloats the suite shell.
+### 5.1 Corpus (`fixtures/bake.mjs`, offline, checksummed)
 
-| Engine id | Role | Strengths to exercise | Known limits → many `NA` |
-| --- | --- | --- | --- |
-| `mediabunny` | **reference** | full container mux/demux + WebCodecs transcode/remux/trim/probe/decrypt | no image codecs; WebCodecs-gated transcode |
-| `ffmpeg.wasm` | broad-coverage comparison | widest codec/container coverage; software decode/encode (no WebCodecs needed) | slow; large WASM; memory limits on big files |
-| `mp4box.js` | demux/probe specialist | MP4/fragmentation/probe correctness | demux/probe/fragment only → `NA` for transcode/most remux |
-| `platform` | "what the browser gives for free" baseline | WebCodecs decode/encode, `<video>` playback, MSE, MediaRecorder mux | not a container library; limited mux/remux |
-| `aibrush-media` | **future candidate** | whatever we build | placeholder adapter + capability stub now |
-| `_template` | scaffold | — | copy to add any new library |
+A fixed, `sha256`-pinned corpus the browser `fetch()`es. Families, chosen to exercise everything and to break weak parsers:
 
-**Adding a library (the workflow the user asked for):** `scripts/add-engine.sh <id>` copies `_template/adapter.ts`, you implement the interface against the new browser library and fill in `capabilities()`, register it, then `scripts/run.sh` runs the **entire existing battery** against it and `scripts/compare.sh` shows it **side-by-side vs the reference**. No scenario changes. That is the agnostic property: *drop in a library → get its full scorecard and its deltas.*
+- **Big read file** — a large 1080p H.264 `.mov` (BigBuckBunny-style) to stress metadata-extract / packet-iteration / convert throughput (mirrors Mediabunny's benchmark input).
+- **Video MP4/MOV** — H.264 1080p & 4K, HEVC, **with/without B-frames**, **VFR**, **rotated**, **multi-track**.
+- **Matroska/WebM** — H.264-in-MKV, VP8/VP9/AV1 WebM, **VP9 with alpha**.
+- **MPEG-TS / HLS** — H.264 TS, HLS VOD, **AES-128 HLS**.
+- **Encrypted MP4** — **CENC `ctr`**, **CENC `cbcs`** (baked via Bento4/Shaka if available, else honest `NA`).
+- **Audio** — WAV s16/s24/f32, **big-endian PCM (AIFF)**, MP3 (**Xing TOC** + **CBR no-TOC**), FLAC (**±SEEKTABLE**), AAC/ADTS, Opus/OGG.
+- **Recorder-origin** — **headerless MediaRecorder WebM/Opus** (no Duration element), captured in-browser once and committed.
+- **Stress / malformed** — multi-hour / many-samples, **zero-length**, **truncated**, bit-flipped mutants.
+- **Image negatives** — JPEG/PNG/WebP, kept **only for the negative-input guard** (feeding an image into an audio/video op must fail cleanly, never crash — §7/§A.16).
 
----
+`manifest.json` carries the checksum set; the suite asserts on load and fails loudly on mismatch. Media is git-ignored + rebuilt; **manifest + golden + bake script are committed**.
 
-## 7. The corpus (static, browser-fetchable; baked offline once)
+### 5.2 Oracles (`src/core/oracles.ts`, browser-pure)
 
-`fixtures/bake.mjs` produces a **fixed, checksummed** corpus + golden data. Binaries are allowed **here only**; output is static files the browser fetches. `manifest.json` records per asset: `id, family, container, codecs[], genMethod, sha256, sizeBytes, notes`. Media is git-ignored and rebuilt; **manifest + golden + bake script are committed**. Families (cover all aspects):
+Correctness is judged the same way for every framework, using only the browser + committed golden + the reference engine:
 
-| Asset family | Examples | Feeds scenarios |
+| Op | Oracle | Pass criterion |
 | --- | --- | --- |
-| Video MP4/MOV | H.264 1080p/4K, HEVC, with/without B-frames, VFR, rotated, multi-track | probe/demux/remux/transcode/decode/seek/trim |
-| Matroska/WebM | H.264 in MKV, VP8/VP9/AV1 WebM, **VP9 with alpha** | remux, transcode, alpha, demux |
-| MPEG-TS / HLS | H.264 TS, HLS VOD playlist, **AES-128 encrypted HLS** | remux, TS demux, decrypt |
-| Encrypted MP4 | **CENC `ctr`**, **CENC `cbcs`** | decrypt (capability-gated; bake via Bento4/Shaka offline) |
-| Audio | WAV pcm_s16/s24/f32/**s16be**, MP3 (**Xing TOC** + CBR no-TOC), FLAC (**±SEEKTABLE**), AAC/ADTS, Opus/OGG | probe/decode/seek/transcode/audio-dsp |
-| Recorder-origin | **headerless MediaRecorder WebM/Opus** (no Duration element) | probe/duration robustness — *bake in-browser via MediaRecorder*, then commit |
-| Stress | multi-hour / many-samples file, zero-length, truncated, bit-flipped mutants | streaming-output, memory, robustness/fuzz |
-| Image (negative) | JPEG/PNG/WebP | confirms `NA` for engines without image codecs |
+| probe | vs `golden/<a>.meta.json` | duration within tolerance (strict for precise containers; wider, documented band for estimate-only TS/ADTS/HLS/CBR-MP3); codec/dims/fps/channels match |
+| demux | vs `golden/<a>.packets.json` | per-track, order-independent: counts, sizes, keyframe flags; timestamps within a constant per-track origin offset |
+| remux (lossless) | decode output in-browser → frame digests vs golden; reference re-import; `<video>` playback | frames bit-exact; re-imports; plays |
+| transcode/resize/rotate/alpha/fan-out | decode output → **SSIM + PSNR** vs reference frames; alpha plane separately | SSIM ≥ 0.99 (tuned per codec); PSNR ≥ 40 dB; plays |
+| decode/seek | frame digest vs golden; seek lands on expected keyframe | correct frame; accuracy within tolerance |
+| trim | out duration ≈ requested; boundary frames vs golden | duration + boundaries correct |
+| decrypt | decoded frames bit-exact vs golden | byte/frame-exact |
+| mux | reference re-import + playback; frames vs source | round-trips; plays |
+| property/metamorphic | computed in-browser (§7) | invariant holds |
 
-**Browser-pure rule:** the *running* suite only `fetch()`es these static files. `ffmpeg` ran once, offline, to make them. The headerless-WebM asset is captured by a one-time in-browser MediaRecorder script (the faithful way to reproduce the missing-Duration case) and committed.
+Golden = small committed JSON, baked from **independent** tools (ffprobe/ffmpeg/Bento4) so the oracle is real ground truth, not "whatever the reference did."
 
-After bake: `sha256` every asset into `manifest.json`; the suite asserts checksums on load. A corpus mismatch invalidates all golden data — fail loudly.
+### 5.3 The asset directory & the size ladder
+
+**There is ONE asset directory: `fixtures/media/`.** Every test media file lives here (indexed by `fixtures/manifest.json`, fetched at run time as `/fixtures/media/<id>`). It is git-ignored (binary/large) and populated three ways — **generated** by the bake, **fetched** by the bake from pinned URLs, or **provided** by you (§5.4). The directory is the single source of test media; nothing is read from anywhere else at run time.
+
+**Size is a first-class test axis** — throughput, peak memory, lazy/partial reading, and streaming all behave differently at each scale, so we prepare media at **all sizes** and benchmark the applicable operations across the full ladder (the winner at 10 MB can differ from the winner at 1 GB):
+
+| Bucket | Target size | Example asset(s) | Source | What it stresses |
+| --- | --- | --- | --- | --- |
+| **empty** | 0 B | `zero_length.mp4` | generated (touch) | robustness (graceful fail) |
+| **micro** | ~1 KB | `truncated_h264.mp4`, 1-frame clip | generated | header/edge robustness |
+| **tiny** | ~100 KB | 1–2 s 360p, short audio | generated | probe/demux latency, init overhead |
+| **small** | ~1 MB | ~5 s 720p, one song | generated | functional baseline + perf |
+| **medium** | ~10 MB | 30 s 1080p (`h264_1080p_30s`) | generated | default workhorse |
+| **large** | ~100 MB | 60–120 s 1080p, 20 s 4K | generated (slow) | sustained throughput, memory |
+| **huge** | ~500–700 MB | `BigBuckBunny1080pH264.mov` (Mediabunny's own input) | **fetched or provided** | metadata-extract / packet-iterate / convert **at scale** (parity with the published chart) |
+| **massive** | 1–4 GB / multi-hour | multi-hour 1080p, many-thousand-sample file | bake makes a long low-bitrate one; real ones **provided** | lazy-read, streaming, peak-memory, OOM resistance |
+
+For each bucket we keep at least one asset per **major container/codec** it is meant to stress (e.g. a *huge* H.264 MP4 **and** a *huge* VP9 WebM), so the size axis crosses the format axis. Perf cases may report a metric **vs size** (a short curve), not just a single point.
+
+### 5.4 Provenance & the user-provided protocol (when an asset can't be generated)
+
+Every `manifest.json` entry declares a `source` and a `sizeBucket`:
+
+- **`generated`** — `bake.mjs` makes it deterministically with ffmpeg (testsrc2/sine + bit-exact flags). Covers most buckets.
+- **`fetched`** — `bake.mjs` downloads a **pinned public URL** (recorded + `sha256`-verified), offline-once, never re-fetched at run time (e.g. BigBuckBunny).
+- **`captured`** — produced once in a real browser (e.g. headerless MediaRecorder WebM via `fixtures/tools/record-fixture.html`), then kept as a committed-provided file.
+- **`provided`** — **the agent cannot produce it**: no available tool (real CENC `cbcs` without Bento4/Shaka), too large/licensed to fetch, or a real-world capture (device HEVC, HDR, camera).
+
+**Protocol the agent MUST follow when it cannot produce an asset:**
+
+1. **Never fake it; never silently skip.** Keep the manifest entry with `source: "provided"`, clear acquisition `notes`, an optional `sourceUrl`, expected `sizeBytes`/`sha256` when known.
+2. `bake.mjs` prints a **`MISSING ASSETS`** block: for each, the exact path to drop it at (`fixtures/media/<id>`), where to obtain it, and the expected size/checksum.
+3. The agent **surfaces that list to the user verbatim** — "please place these files in `fixtures/media/`: …" — and proceeds with everything else (it does not block the rest of the suite).
+4. Until the file is present, every case needing it is **`NA(asset-missing)`** — a distinct reason, never `FAIL` and never a fabricated value.
+5. After you drop the file in and re-run `bake --golden-only`, the suite fills checksums + golden and the cases activate. On load the suite verifies each present asset's `sha256`; a mismatch **fails loudly** so a wrong "provided" file can't corrupt results.
+
+This is how the corpus stays both **complete** (every size, every format we care about) and **honest** (agents request what they can't make, rather than guessing or skipping silently).
 
 ---
 
-## 8. Browser-pure oracles & golden ground truth (`oracles.ts` + `fixtures/golden/`)
+## 6. Dimension A — Functional cases (correctness coverage)
 
-Correctness is judged the **same way regardless of engine**, using only the browser + committed golden data + the reference engine. Pick the right mode per operation:
+Each case is one `(op, asset, options, requires, oracles, metrics)`, framework-blind. Coverage families: **probe/metadata, demux, remux (cross-container matrix MP4↔MOV↔MKV↔WebM↔TS + audio), transcode (codec matrix H.264/HEVC/VP8/VP9/AV1 + AAC/Opus/MP3/FLAC/PCM), decode/seek, trim, mux, encryption (ctr/cbcs/HLS-AES), metadata read+write, streaming/output (buffer/streaming/fragmented/CMAF/fastStart/tiny-TS), audio-DSP (resample/ch-mix/PCM incl. big-endian & 24-bit), fan-out/ABR, image negatives.**
 
-| Operation | Oracle (all browser-side at test time) | Pass criterion |
+**Winner semantics (functional):** a case is PASS/FAIL/NA per framework. The dimension winner is the framework with the **highest correctness coverage** (most cases PASS, NA excluded from the denominator) — reported as a **conformance %** and a per-family breakdown. Ties broken by fewer FAILs, then by breadth of declared capabilities actually exercised.
+
+---
+
+## 7. Dimension B — Deep edge cases (the stress dimension)
+
+Every framework runs these in a **Worker** so a crash/hang is contained and timeout-detectable. This is where weak frameworks are separated from robust ones.
+
+- **Container/codec edges:** open-GOP & B-frame reorder; VFR; display-matrix rotation; multi-track selection; fragmented/CMAF; `fastStart:reserve` large forward seek; tiny 188-byte TS writes; many-samples / multi-hour.
+- **Audio edges:** big-endian PCM (AIFF), 24-bit PCM, MP3 Xing-TOC vs CBR-no-TOC duration, FLAC ±SEEKTABLE seek accuracy, headerless MediaRecorder WebM (no Duration → must still report a sane duration).
+- **Encryption edges:** CENC `ctr`, `cbcs` per-subsample IV pattern, AES-128 HLS; unencrypted input must be left untouched.
+- **Malformed / fuzz:** in-browser byte mutation (bit-flips, header truncation, zeroed spans) of valid assets → the framework must **fail gracefully** (throw/reject) within a timeout — **no crash, no hang, no unbounded memory.** Record `graceful` / `crash` / `timeout` / `OOM`.
+- **Property / metamorphic invariants (in-browser):** `decode(remux(x)) == decode(x)`; `demux(mux(x)) ≈ x`; `probe(remux(x)).dur ≈ probe(x).dur`; `trim(a..b) ++ trim(b..c) ≈ trim(a..c)`; `probe(x).dur` consistent across containers of the same content.
+- **Image negatives:** JPEG/PNG/WebP → clean `NA`/error, never a crash.
+
+**Winner semantics (edge):** the framework with the highest **robustness rate** = (graceful-or-correct outcomes) ÷ (applicable edge cases), with invariants-held counted. A crash/hang/OOM is a hard loss for that case.
+
+---
+
+## 8. Dimension C — Performance benchmarks (the headline)
+
+Same observable operations, now **timed and resource-profiled**. Includes the **four published Mediabunny benchmarks** as first-class cases, run for **every** framework, plus a per-op timing sweep.
+
+### 8.1 Headline cases (Mediabunny-parity, run for all frameworks)
+
+| Case | Operation | Primary metric (direction) |
 | --- | --- | --- |
-| **probe / metadata** | compare `NormalizedMetadata` to committed `golden/<asset>.meta.json` (baked from ffprobe, offline) | duration within ±1 frame; codec/dims/fps/channels match |
-| **demux** | compare packet table to committed `golden/<asset>.packets.json`; cross-check count/keyframes | track layout + timestamps + keyframe flags match |
-| **remux** (lossless) | decode the engine's output **in-browser** (platform WebCodecs) → frame digests; compare to `golden/<asset>.frames.json`; also **re-import with the reference engine** and compare packet tables; also **`<video>` playback smoke** | decoded frames **bit-exact**; output re-imports; plays |
-| **transcode / transform / alpha / fan-out** | decode output in-browser → **SSIM + PSNR in-browser** (JS/WebGL) vs committed reference frames; alpha plane compared separately | SSIM ≥ 0.99 (tune per codec); PSNR ≥ 40 dB; no color shift; plays |
-| **decode / seek** | frame digest at timestamp vs golden; assert seek lands on expected keyframe | correct frame; seek accuracy within tolerance |
-| **trim** | probe(out).duration ≈ requested; decoded boundary frames vs golden | duration + boundary frames correct |
-| **decrypt** | decoded frames bit-exact vs `golden` (baked from an offline reference decrypt) | byte/frame-exact |
-| **mux** | re-import with reference engine + playback; decoded frames vs source | round-trips; plays |
-| **property / metamorphic** | computed entirely in-browser (see §11) | invariant holds |
+| `perf/extract-metadata` | repeated `probe` of the big file | **ops/s** (higher) |
+| `perf/iterate-video-packets` | `demux`, count all video packets | **packets/s** (higher) |
+| `perf/convert-webm-resize-320x180` | `transcode` → WebM, resize 320×180 | **frames/s** (higher) |
+| `perf/bundle-size` | build-time: bundle the framework's used entrypoints, minify+gzip | **kB** (lower) |
 
-**Golden artifacts are small JSON committed under `fixtures/golden/`** (metadata JSON, packet tables, frame-digest lists, reference SSIM frames as downsampled luma signatures) — **never raw media**. They are baked offline from independent tools (ffprobe/ffmpeg/Bento4) so the oracle is not "whatever the reference engine did," it is independent ground truth. The reference-engine re-import and `<video>` playback are *additional* browser-native cross-checks, not the sole truth.
+### 8.2 Full per-op sweep (across the corpus)
 
----
+Every functional op also gets a timed case: probe, demux, remux (per container pair), transcode (per codec/resize/fps/bitrate/rotate), decode, seek, trim, mux, decrypt, audio-DSP.
 
-## 9. Pillar 1 — Functional / conformance scenarios (full coverage, all aspects)
-
-Every scenario is engine-independent and capability-gated. A scenario is declared like:
-
-```ts
-defineScenario({
-  id: 'remux/h264_mp4_to_mkv',
-  op: 'remux',
-  input: 'h264_1080p_30s.mp4',
-  options: { container: 'mkv' },
-  requires: { operations: ['remux'], containersIn: ['mp4'], containersOut: ['mkv'], videoCodecs: ['h264'] },
-  oracles: ['decoded-frames-bitexact', 'reference-reimport', 'playback-smoke'],
-  metrics: ['wall', 'throughputRealtime', 'peakMemory', 'sourceReads', 'targetWrites', 'longtasks'],
-})
-```
-
-Coverage families (each expands into many parameterized scenarios across the corpus):
-
-| Family | What it asserts (across all applicable containers/codecs) |
-| --- | --- |
-| **Probe / metadata** | duration, container, per-track codec/dims/fps/sample-rate/channels/rotation/tags, for every container |
-| **Demux** | packet tables (size/pts/dts/keyframe) match golden; lazy vs full read consistency |
-| **Remux** | **cross-container matrix** (MP4↔MOV↔MKV↔WebM↔TS; audio WAV/MP3/FLAC/OGG/ADTS), **lossless** (decoded frames identical), output re-imports + plays |
-| **Transcode** | **codec matrix** (H.264/HEVC/VP8/VP9/AV1; AAC/Opus/MP3/FLAC/PCM), resize, fps change, bitrate, rotate; SSIM/PSNR gated |
-| **Decode / seek** | frame-accurate decode; keyframe & non-keyframe seek; VFR; B-frame reorder |
-| **Trim** | keyframe-aligned and frame-accurate; duration + boundary correctness |
-| **Mux** | from encoded tracks → container; round-trip + playback |
-| **Encryption** | CENC `ctr`, CENC `cbcs`, AES-128 HLS decrypt; unencrypted input must be untouched |
-| **Metadata / tags** | read everywhere; write where supported (then re-probe) |
-| **Streaming / output targets** | buffer vs streaming output; fragmented/CMAF; `fastStart:reserve` large forward seek; tiny TS writes |
-| **Audio DSP** | resample (up/down, ch-mix), PCM format conversions incl. big-endian and 24-bit |
-| **Fan-out / ABR** | one input → N renditions; per-rendition fps/size; each rendition SSIM-validated |
-| **Image (negative)** | feeding JPEG/PNG/WebP yields a clean `NA`/graceful error, never a crash |
-
-`scripts/run.sh --pillar functional` runs all; conformance results land per `engine × browser × scenario`.
-
----
-
-## 10. Pillar 2 — Performance benchmarks (cross-engine, in-browser)
-
-### 10.1 What is measured
-
-The **same operations** as the functional scenarios, but timed and resource-profiled, so the comparison is fair (observable op in → op out). Metrics (`measure.ts`, all in-browser):
+### 8.3 Metrics (`src/core/measure.ts`, all in-browser)
 
 | Metric | Source |
 | --- | --- |
-| Wall time / **throughput × real-time** (`mediaSec / wallSec`) | `performance.now()` |
-| Peak JS heap / memory | `performance.measureUserAgentSpecificMemory()` (Chromium) — **capability-gated**; fallback `performance.memory`; else omit + flag |
-| Main-thread blocking | `PerformanceObserver({type:'longtask'})`, sum of > 50 ms tasks |
-| # source reads / range fetches | counting Source wrapper + `performance.getEntriesByType('resource')` |
-| # target writes / bytes out | counting Target wrapper |
-| Decode/encode throughput (frames/s) | per-op counters |
+| wall time / **throughput × real-time** (`mediaSec/wallSec`) | `performance.now()` |
+| **ops/s**, **packets/s**, **frames/s** (decode & encode) | per-op counters / wall |
+| peak memory | `measureUserAgentSpecificMemory()` (gated) → `performance.memory` → omit+flag |
+| main-thread blocking | `PerformanceObserver({type:'longtask'})`, Σ tasks > 50 ms |
+| source reads / range fetches, target writes / bytes out | counting Source/Target wrappers |
+| **bundle size** (kB, min+gzip) | offline per-engine build (the one build-time metric) |
 
-### 10.2 Protocol (`bench.ts`)
+### 8.4 Protocol (`src/core/bench.ts`)
 
-- Warm up ≥ 3 unmeasured iterations; measure ≥ 6 (browser is slow) — record actual N.
-- **A/B alternation** when comparing two engines on the same machine/browser (interleave to cancel thermal drift); never "all A then all B."
-- Each iteration in a **fresh Worker / page context** for clean memory; the machine on AC power, quiesced.
-- Report **median, p95, MAD**; declare a difference only when it exceeds `max(noise-band, 3%)`; otherwise **within-noise**. Optional Mann–Whitney U.
-- Tag every bench `e2e` (it is an observable operation). Engine-internal stage micro-benches are §10.4, not here.
+- **Load/init is OUTSIDE the timed window (rule §0.7).** The framework is fully initialized first — `await engine.init()` performs module load, WASM compile/instantiate, and any encoder/decoder configure+warmup — and *then* the clock starts and wraps **only the operation call**. `measure.ts` opens the timing window after init resolves and closes it when the op returns; init bytes/seconds are never inside it.
+- **Fresh context for clean memory, init still untimed.** When an iteration runs in a fresh Worker/page (for clean peak-memory), `init()` runs untimed inside that context *before* the measured op — so re-initialization per iteration never leaks into the operation time. (For load-heavy engines you may also init once and reuse across iterations; either way the timed window excludes load.)
+- Warm up ≥ 3 unmeasured iterations of the **operation** (separate from init warmup); measure ≥ 6 (record actual N).
+- Report **median, p95, MAD**. A difference counts only when it exceeds `max(noise-band, 3%)`; otherwise **within-noise** (→ tie).
+- A/B-alternate when head-to-head; never "all A then all B."; AC power; quiesced machine.
+- A bench runs **only after** the same case's correctness oracle passed for that framework (rule §0.1).
+- **`load/init time` is its own case/metric** (§A.14) — measured once per framework×browser (cold: clear caches; and warm: caches primed), reported on its own line. It explains *why* a heavy engine is heavier to adopt, without ever penalizing the speed of the work it does.
 
-### 10.3 Cross-browser is a first-class axis
+### 8.5 Fairness — every framework on its own best path (rule §0.9)
 
-Run every bench on Chromium, WebKit, and Firefox via the launcher. WebCodecs availability and hardware codec sessions vary by browser/OS/GPU (*INV §11*) — so a number is only comparable **within the same browser on the same machine**. The report never compares a Firefox number to a Chromium number; it compares **engines within a browser**.
+Each adapter must drive its framework the way the framework's **docs recommend for maximum performance**, and expose what it used so the comparison is reproducible.
 
-### 10.4 Engine-internal benches & the encoder-starvation diagnostic (optional, per-engine)
-
-Mediabunny-internal hot-path isolations (the *INV* OPP stage benches) and the **encoder-starvation** diagnostic (*INV §13*: is the WebCodecs encoder ever idle waiting on JS? poll `encodeQueueSize`/`decodeQueueSize`) are **engine-specific** and live under `src/engines/mediabunny/internal/`. They are **not** part of the cross-engine comparison (no other library has the same internals). Use them only when optimizing Mediabunny itself; record them in a separate per-engine annex of the report.
-
----
-
-## 11. Pillar 3 — Robustness (edge / malformed / fuzz / property), in-browser
-
-Run each engine in a **Worker** so a crash/hang is contained and detectable by timeout.
-
-- **Edge cases:** open-GOP & B-frames; VFR; rotated; multi-track; headerless MediaRecorder WebM; big-endian/24-bit PCM; CBC chunk-boundary chaining; `cbcs` pattern (per-subsample IV); MP4 `fastStart:reserve`; fragmented/CMAF; multi-hour/many-samples; zero-length.
-- **Malformed / fuzz:** in-browser byte mutation (bit-flips, header truncation, random spans) of valid assets → the engine must **fail gracefully** (throw / reject) within a timeout — **no crash, no hang, no unbounded memory.** Record `graceful` / `crash` / `timeout` / `OOM` per engine × browser.
-- **Property / metamorphic invariants (all in-browser):**
-  - `decode(remux(x)) == decode(x)` (remux lossless),
-  - `demux(mux(x)) ≈ x`,
-  - `probe(remux(x)).duration ≈ probe(x).duration`,
-  - `trim(x, a..b) ++ trim(x, b..c) ≈ trim(x, a..c)` (decoded-frame level),
-  - `probe(x).duration` consistent across containers of the same content.
-- **Image negatives:** JPEG/PNG/WebP → clean `NA`/error, never a crash.
-
-These produce a **robustness scorecard** per engine × browser (graceful-handling rate, invariants held).
+- **Backend selection (fastest available, in order):** hardware WebCodecs → software; **WebGPU → WebGL → OffscreenCanvas 2D → CPU** for resize/rotate/color/SSIM; native container fast paths over generic ones. If a framework auto-selects, let it; if it has a flag, set it to the fast option.
+- **Pipelining & concurrency:** streaming/pipelined reads+decode+encode over batch; Worker offload; tuned `encodeQueueSize`/`decodeQueueSize` (avoid encoder starvation); transferable/zero-copy buffers; progressive HTTP-Range reads.
+- **Multi-threaded WASM, now unlocked by local hosting:** because every lib is same-origin (§0.8), the dev server sets **COOP: same-origin + COEP: require-corp** → cross-origin isolation → `SharedArrayBuffer` available. That lets ffmpeg.wasm (and any mt-WASM framework) run its **multi-threaded** core — its best path — and also enables `measureUserAgentSpecificMemory()` for precise peak-memory. Headers are uniform for all frameworks; each uses what it can.
+- **Recorded per framework (`configUsed`):** e.g. `{ backend:'webgpu', hwAccel:true, wasmThreads:8, pipeline:'streaming', queueDepth:8, coreBuild:'mt' }`. The report prints this beside each framework so a number is never an apples-to-oranges artifact of a slow API path.
+- **Still gated:** the fast path's output runs the **same** oracle as everyone else. Faster backend, identical correctness bar.
+- **Honest caveat in the report:** if a framework's best path needs cross-origin isolation, hardware that another lacks, or a browser flag, that is *recorded* (it is part of "what it takes to get this framework's best") — never hidden, never used to silently disadvantage another.
 
 ---
 
-## 12. The comparison report (`report.ts` → `results/report.md`) — the deliverable
+## 9. Winner determination (`src/core/report.ts`) — the core deliverable
 
-This is what answers *"how do the libraries compare and how much did we improve?"* Build four artifacts from `results/raw/`:
+For **each case**, **within each browser**:
 
-1. **Capability matrix** — `engine × capability` (declared) and `engine × browser → supported codecs` (runtime-detected).
-2. **Conformance matrix** — `engine × browser × scenario → PASS / FAIL / NA(engine) / NA(browser)`, with failure reasons. Summarized to a **conformance %** per engine × browser.
-3. **Benchmark matrix** — `engine × browser × scenario → {median, p95, throughput×RT, peak mem, longtasks}`.
-4. **Δ-vs-reference view** — pick the reference engine (default `mediabunny@<pinned>`); for every other engine (or candidate build) show **Δ% per scenario** (perf) and **conformance delta** (gained/lost cases), **within the same browser**. Verdict vocabulary per cell: `faster` / `slower` / `within-noise` / `gained` / `regressed` / `NA`.
+1. **Eligibility:** a framework is eligible only if its correctness oracle for the case **passed** (`PASS`). Frameworks that are `FAIL`/`NA`/`—` are listed but cannot win.
+2. **Rank** eligible frameworks by the case's **primary metric**, respecting direction (ops/s, packets/s, frames/s, throughput×RT → higher-better; wall, peak-mem, bundle-size → lower-better).
+3. **Winner = rank 1.** Report its **value** and the **margin** over rank 2 (Δ%).
+4. **Tie** when rank 1 and rank 2 are within `max(noise-band, 3%)` → co-winners, flagged `tie`.
+5. **Uncontested** when only one framework is eligible (others `NA`/`FAIL`) → it wins, flagged `uncontested` so a default win is never mistaken for a contest.
+6. **Never cross browsers.** Winners are per-browser; a Brave number is never ranked against a different browser's number.
 
-Plus a **scorecard** per engine: conformance %, perf index (geomean of throughput ratios vs reference, per browser), capability breadth, robustness rate. Emit machine-readable `results/raw/*.json` alongside the markdown.
+**Overall leaderboard** (per browser, and a combined view):
 
-> Using it to measure an improvement: register the optimized library (or our fork, or `aibrush/media`) as a **new engine id**, run, and read its **Δ-vs-reference** column. A green improvement = faster-or-equal on the target scenarios **with no conformance regression** in **every** target browser.
-
----
-
-## 13. Execution environments & reproducibility
-
-- **Browsers:** Chromium, WebKit, Firefox, driven by Playwright **only as a launcher** (it starts the browser and serves the static suite; it performs no measurement). The same suite app also runs by simply opening `index.html` in any browser for manual runs.
-- **Launch flags:** enable WebCodecs/WebGPU where the browser needs flags; record the exact browser build + GPU string in each run's `env`.
-- **Pinning:** pin and record suite version, each engine's version/bundle hash, the corpus checksum set, browser versions. A change in any invalidates comparisons until re-baselined.
-- **Caveats (write them into the report):** browser perf numbers are **indicative** — GPU/OS/thermals and the hardware **codec session limit** move them; always AC power + quiesced; never cross-machine or cross-browser compare a raw number; for OPP-11-style parallelism the ceiling is the codec session limit, not `navigator.hardwareConcurrency` (*INV §11*).
+- **Wins** — count of cases each framework won (and ties).
+- **Perf index** — geomean of each framework's ratio to the per-case winner (1.00 = always the fastest), and separately vs the reference (mediabunny).
+- **Conformance %** (Dimension A), **robustness rate** (Dimension B), **bundle size**, **capability breadth**.
+- A one-line **verdict per framework** ("wins metadata-extract & packet-iteration; loses convert to platform; smallest bundle").
 
 ---
 
-## 14. How you use it + the continuous loop
+## 10. The report (`results/report.md` + `report.json`)
 
-**Setup (once):** scaffold §4; `scripts/bake-fixtures.sh` (offline); build the core + the reference `mediabunny` adapter + the `platform` baseline; write the scenario families; `scripts/run.sh` across the three browsers; `scripts/compare.sh` → first `report.md` with Mediabunny as reference. Commit suite + manifest + golden + report.
+Sections, all grouped by browser, with a `—`/`-`(NA-engine)/`-ᵇ`(NA-browser) legend:
 
-**Loop (continuous, library-agnostic):** one iteration =
+1. **Winners table** — one row per case: `case → 🏆 winner (value) · runner-up (value, Δ%) · tie/uncontested flag`.
+2. **Leaderboard** — wins, perf index, conformance %, robustness rate, bundle size, per-framework verdict.
+3. **Capability matrix** — declared caps + runtime-detected codecs per framework × browser.
+4. **Conformance matrix** — framework × case → PASS/FAIL/NA + reasons (Dimensions A & B).
+5. **Benchmark matrix** — framework × case → {median, p95, primary-metric value, peak mem, longtasks} (Dimension C; blank behind a non-PASS gate).
+6. **Δ-vs-reference** — per case, each framework vs mediabunny: `faster/slower/within-noise/gained/regressed/NA`.
+7. **Caveats** — numbers are indicative (GPU/OS/thermals, hardware codec-session limits); AC power + quiesced; never cross-browser/cross-machine compare; bundle size is min+gzip at a pinned version.
 
-1. **Add or change an engine** — implement/adjust one adapter (a new library, our optimized fork as a new id, or `aibrush/media`). Never edit scenarios to favor an engine.
-2. `scripts/run.sh --engine <id>` across all three browsers (background; poll).
-3. **Conformance gate first** — the engine's scenarios must pass (or be honest `NA`); a `FAIL` blocks any perf claim for that scenario.
-4. `scripts/compare.sh` — regenerate the matrix + Δ-vs-reference.
-5. **Record honestly** — `faster` / `within-noise` / `regressed` / `gained` / `lost`, per browser. A within-noise delta is not a win; a conformance regression is a stop.
-6. Commit (suite/adapters/golden/report; media + raw ignored). Next iteration.
-
-Each `run.sh` call is idempotent and self-gating, so the loop never emits an unmeasured or uncorrected claim. Coverage grows by **adding scenarios** (any new aspect to test) and **adding engines** (any new library to compare) — both are append-only.
-
----
-
-## 15. Honesty & anti-patterns
-
-- ❌ Measuring or "testing" a library in Node, or via a binary, at test time. **Browser only.**
-- ❌ Treating `@mediabunny/server`/native FFmpeg as an engine here. Out of scope.
-- ❌ Running ffmpeg/ffprobe/Bento4 inside `run` — they belong to the offline bake; the suite compares against **committed golden** data.
-- ❌ Judging an engine by its internals — only observable output, validated by oracles, enters the comparison.
-- ❌ A perf number without a green conformance gate for that exact engine × browser × scenario.
-- ❌ Quoting a number across browsers/machines; collapsing `NA(engine)` and `NA(browser)`.
-- ❌ Editing scenarios to make a favored engine look better; scenarios are engine-blind.
-- ❌ Calling a within-noise delta an improvement, or hiding a conformance regression.
-- ❌ Blocking a foreground Bash call on a browser matrix run or the bake (use `run_in_background`).
+`report.json` is the machine-readable twin (every value + every winner verdict).
 
 ---
 
-## 16. Definition of Done — initial build
+## 11. Execution environment & reproducibility
 
-- [ ] **Offline bake** reproduces the full corpus + golden data deterministically; checksums asserted on load; binaries appear **only** in the bake.
-- [ ] **Suite runs in a real browser** (open `index.html` works) and across Chromium/WebKit/Firefox via the launcher; the launcher does no measurement.
-- [ ] **Engine adapters:** `mediabunny` (reference) + `platform` + at least one more (`ffmpeg.wasm` or `mp4box.js`), each with an honest `capabilities()`. `_template` + `add-engine.sh` work end-to-end (proven by scaffolding a throwaway adapter).
-- [ ] **Capability/browser negotiation** records `NA(engine)` vs `NA(browser)` distinctly.
-- [ ] **Pillar 1 (functional):** every family in §9 has scenarios; oracles are browser-pure (golden + reimport + SSIM/PSNR + playback); all green or honest-NA for the reference engine in every browser.
-- [ ] **Pillar 2 (performance):** every functional scenario has a bench; cross-browser; protocol (warmup/N/median/p95/MAD/A-B) implemented.
-- [ ] **Pillar 3 (robustness):** edge + malformed/fuzz (Worker-isolated, timeout-guarded) + property/metamorphic invariants run; robustness scorecard produced.
-- [ ] **Comparison report** (`results/report.md`): capability + conformance + benchmark matrices + Δ-vs-reference + per-engine scorecards, with the browser caveats written in.
-- [ ] **Self-test:** registering Mediabunny twice under two ids yields Δ ≈ 0 within noise on every scenario (proves the rig measures nothing where nothing changed).
-- [ ] `README.md` documents: open-in-browser, `bake-fixtures`, `run`, `compare`, and `add-engine` (how to drop in a library and read its scorecard).
+- **Browser:** a **real, non-headless** browser — **Brave by default** (`/Applications/Brave Browser.app`, overridable via `BRAVE_PATH`). Other real browsers (Chromium/WebKit/Firefox) are selectable, also non-headless. **No headless shell anywhere.** If launching the system Brave conflicts with a running instance, use a dedicated user-data-dir or drive it via the `/chrome` extension.
+- **Serving:** `bun --bun` runs Vite (so vite never spawns node); a small middleware serves `fixtures/**` as raw bytes with HTTP Range **before** module transform (so `.ts` *media* like `h264_ts.ts` is not parsed as TypeScript).
+- **All libraries hosted locally (rule §0.8).** Every framework — and every heavy core it needs (`@ffmpeg/core` .js/.wasm, web-demuxer's wasm, etc.) — is installed via `bun` and served from the **local origin** (out of `node_modules/` or a committed-by-reference `vendor/` dir). **No CDN/unpkg/`toBlobURL`-from-the-internet at run time.** This makes runs hermetic + offline + repeatable, and means a 30 MB core is downloaded **once at `bun install`**, not per run, and never inside a measured window. Vendored core paths are pinned + recorded in each run's `env`.
+- **Load/init excluded from operation timing (rule §0.7).** `init()` (load, WASM instantiate, encoder warmup) is awaited before the clock starts; only the operation is timed. A separate `load/init time` metric reports the one-time cost on its own.
+- **Pinning & env:** record per run the browser build + GPU string, each framework's version/bundle hash, the corpus checksum set. A change in any invalidates comparisons until re-run.
 
 ---
 
-## 17. First actions for the agent
+## 12. How you use it
 
-2. Define `src/core/engine.ts` (the §5 contract) and `src/core/scenario.ts` (`defineScenario`).
-3. Write `fixtures/bake.mjs` (offline ffmpeg + in-browser MediaRecorder capture) + `manifest.json` for the core corpus; bake; commit manifest + golden.
-4. Build `src/core/{feature-detect,measure,bench,oracles,runner,report}.ts`.
-5. Implement the **reference `mediabunny` adapter** and the **`platform` adapter** (raw WebCodecs + `<video>`).
-6. Write the first scenarios per family (§9) + their oracles (§8); get the reference engine green/NA across Chromium/WebKit/Firefox.
-7. Add a second engine (`ffmpeg.wasm` or `mp4box.js`) → produce the first **comparison `report.md`**.
-8. Implement the **self-test** (Mediabunny vs Mediabunny → Δ≈0).
-9. Add robustness (§11) and the cross-browser launcher (§13).
-10. Hand off to the loop (§14): coverage grows by adding scenarios; comparison grows by adding engines.
+```
+bun run bake      # scripts/bake-fixtures.sh — offline, once (binaries OK; bun runtime)
+bun run serve     # serve the suite for manual viewing (open index.html in Brave)
+bun run bench     # scripts/run.sh — real Brave, run the battery, write results/raw/
+bun run compare   # scripts/compare.sh — build results/report.md (winners + leaderboard)
+bun run add-engine <id>   # scaffold a new framework adapter; it joins the battery automatically
+```
 
-> The contract, restated: **browser only; measure or don't claim; correctness gates every number; judge observable output, not internals; the comparison vs the reference is the product.** This suite is the agnostic scoreboard — point it at any browser media library and it tells you, per browser, how correct and how fast that library is, and exactly how much an improvement moved the needle.
+Re-run `bench` + `compare` whenever you want a fresh comparison (after a framework update, a new case, or an optimization). Adding coverage = adding cases; adding a contender = adding an adapter. Both are append-only and never edited to favor a framework.
+
+---
+
+## 13. Definition of done
+
+- [ ] **Bake** reproduces corpus + golden deterministically (binaries only here, bun runtime); checksums asserted on load.
+- [ ] **Run** executes the full battery in **real Brave, non-headless**, for **every** registered framework, and writes per-browser raw results. No headless path remains.
+- [ ] **All frameworks present** — mediabunny, ffmpeg.wasm (local core), mp4box.js, platform, @remotion/media-parser, web-demuxer, @remotion/webcodecs, aibrush-media (stub) — each with honest `capabilities()`.
+- [ ] **Dimension A/B/C cases** implemented with browser-pure oracles; the reference engine is green-or-honest-NA on every case.
+- [ ] **Correctness gates every measured value**; `NA(framework)` vs `NA(browser)` kept distinct.
+- [ ] **Winner per case** computed (with tie / uncontested flags) + **overall leaderboard**, per browser.
+- [ ] The four **headline Mediabunny benchmarks** run for all frameworks.
+- [ ] `report.md` + `report.json` produced, with caveats; bun-only throughout; no `node`/`npx` anywhere.
+- [ ] **Self-check:** the same framework registered twice ties itself within noise on every perf case (proves the rig measures nothing where nothing changed).
+
+---
+
+## 14. Honesty & anti-patterns
+
+- ❌ A perf value without a green correctness oracle for that exact framework × browser × case.
+- ❌ Headless browsers, fake/software codec contexts, or measuring in Node.
+- ❌ `node`/`npx` anywhere; fetching WASM cores from a CDN at run time.
+- ❌ Declaring a winner across browsers/machines, or from a within-noise margin (that's a **tie**), or hiding that a win was **uncontested**.
+- ❌ Editing a case to make a favored framework look better; cases are framework-blind and append-only.
+- ❌ Judging by internals; collapsing `NA(framework)` and `NA(browser)`; fabricating any number.
+
+> **The contract, restated:** one battery, every framework, in a real browser; correctness gates every number; each case ends in a clear, honest winner; the leaderboard is the product.
+
+---
+
+## 15. How Claude builds & maintains this suite (research-first, Opus-orchestrated)
+
+This suite is built by Claude Code agents, and the **build process itself has rules** — because a framework benchmarked through the wrong (slow, deprecated) API is an unfair, wrong result.
+
+**Research-first — before writing ANY framework's adapter or its cases:**
+
+1. **Search + read the framework's official, current docs** (README, API reference, guide, changelog, release notes). **Do not code a framework's API from memory** — these libraries move fast; the recommended API and the fastest path change between versions.
+2. Determine and write down: the **latest version**; the **recommended API** for each operation (probe / demux / decode / encode / remux / trim / mux); the **documented best-performance path** (§0.9 — hardware WebCodecs, WebGPU vs WebGL, multi-threaded WASM, streaming/pipelining, queue depth); required **headers / flags / Worker** setup; how to **vendor it locally** (§0.8 — no CDN at run time); and the **honest limits** (what it genuinely cannot do → declare `NA`, render `-`).
+3. **Cite sources** in the adapter header (doc URLs + the version researched) and surface the chosen fast-path config as `configUsed` (§8.5). Every number must be traceable to "this is the framework's own recommended way, at version X."
+
+**Orchestration — Opus agents + Workflows:**
+
+- **Contracts first, then parallelize.** Author/confirm the shared contracts (`src/core/engine.ts`, `scenario.ts`, the §A catalog) so concurrent agents cannot drift; only then fan out.
+- **Fan out** independent units to subagents: **one agent per framework adapter** (each does its own research above + implements the fast path + an honest `capabilities()`), plus agents for **case families**, **oracles**, **bake recipes**, and **report sections**. Prefer a **Workflow** for any substantial multi-file batch.
+- **Always launch spawned agents on the Opus model**, and brief each on the standing rules: bun-only (§0.5), real-browser/no-headless (§0.4), local hosting (§0.8), load-excluded (§0.7), best-path + record `configUsed` (§0.9), and research-first (this section).
+- **Integrate centrally:** after a fan-out, run `bunx tsc --noEmit`, reconcile interface drift, run the affected cases in **real Brave**, then **commit small**. Individual agents never commit.
+
+**Verification before a number is admissible:** ran in real Brave · correctness oracle green · `configUsed` recorded · Δ-vs-reference computed. Only then does the value enter the report.
+
+---
+
+## Appendix A — Exhaustive feature/benchmark catalog
+
+**This catalog enumerates the FEATURES — the rows below. It deliberately does NOT state which framework supports what.** Per §15, per-framework support is the **output of research** (a Claude search agent reads each framework's *current* docs/source) **+ each adapter's honest `capabilities()` + per-browser runtime feature-detect** — never assumed in this spec. The **report** is where support appears, per framework × browser: a measured `value`/`PASS` (supported & correct), `-` = `NA(engine)` (the framework doesn't do it), `-ᵇ` = `NA(browser)` (the browser can't configure it), `—` = not run.
+
+**Rule:** every feature *any* framework exposes becomes a case. A feature only one framework has still gets a case; the others simply show `-` in the report (informative — it shows what they can't do). Cases are never dropped because some framework lacks a feature, and never edited to flatter one. **New features discovered during research are appended here as rows**, then implemented as cases.
+
+Each row = one or more registered cases, parameterized across the corpus + the size ladder (§5.3). *Oracle* = how correctness is gated (§5.2); *Metric* = the primary number a perf case reports (§8). **Per-framework support columns are intentionally absent — that determination is the research agent's job; read the report for who supports what.**
+
+**Scope rule.** A feature is in scope **iff at least one of the core frameworks** — **mediabunny, mp4box.js, @remotion/media-parser, web-demuxer, @remotion/webcodecs** — supports it. A feature that **only** `ffmpeg.wasm` and/or the raw `platform` can do (no core framework) is **out of scope and removed**. `ffmpeg.wasm` and `platform` still run as **contenders / baseline** on in-scope features, but they never *define* scope. The §15 research pass applies this rule per row and deletes any row no core framework supports. (This is why playback/adaptive-streaming, audio-effects/Web-Audio, image-processing, scene-analysis, real-time/WebRTC, and multi-input compositing are not here — they are platform/specialist/ffmpeg-only.)
+
+## A.1 Input sources & reading modes
+
+`File`/`Blob` · `ArrayBuffer`/`Uint8Array` · URL + **HTTP Range** (partial/lazy — read only needed bytes) · **streaming input** (process while downloading) · `ReadableStream`/async-iterable source · custom pluggable `Source` · read **without loading the whole file into memory**.
+*Oracle:* produced metadata/packets match golden. *Metric:* wall, source-reads / range-fetches (lower = lazier), time-to-first-byte.
+
+## A.2 Containers — READ (demux / probe)
+
+mp4 / ISOBMFF · mov / QuickTime · fragmented-mp4 / CMAF · Matroska (MKV) · WebM · MPEG-TS · HLS (m3u8) · FLV · AVI · Ogg / OGV · MP3 (elementary) · WAV / RIFF · AIFF · FLAC · AAC / ADTS · CAF · 3GP / 3G2 · GIF-as-video · *(+ any other a framework documents — research appends it)*.
+*Oracle:* `golden-metadata` (probe) / `golden-packets` (demux). *Metric:* probe **ops/s**, demux **packets/s**.
+
+## A.3 Containers — WRITE (mux)
+
+mp4 — progressive · **fastStart** (moov-first) · **in-place reserve** (no second pass) — · fragmented-mp4 / CMAF · mov · Matroska (MKV) · WebM · WAV · MP3 · Ogg · ADTS / AAC · MPEG-TS · **streaming write target** (write while muxing).
+*Oracle:* reference re-import + `<video>` playback + decoded-frames vs source. *Metric:* wall, **frames/s**, bytes-out, target-writes.
+
+## A.4 Video codecs — DECODE
+
+H.264 / AVC · H.265 / HEVC · VP8 · VP9 · AV1 · MPEG-2 · MPEG-4 part2 · Theora · ProRes · **8-bit & 10-bit depth** · *(+ others a framework lists)*. Browser-gated codecs (HEVC/AV1) → `NA(browser)` where the browser can't configure them, distinct from `NA(engine)`.
+*Oracle:* decoded-frames vs golden / SSIM. *Metric:* **decode fps**. (A parse-only framework that identifies a codec but renders no pixels is `-` here; it contests packet-iteration instead, §A.7.)
+
+## A.5 Video codecs — ENCODE
+
+H.264 / AVC · H.265 / HEVC · VP8 · VP9 · AV1 · **10-bit / HDR10** · *(+ others)*.
+*Oracle:* SSIM/PSNR on decoded output. *Metric:* **encode fps**.
+
+## A.6 Audio codecs — DECODE & ENCODE
+
+AAC (LC/HE) · Opus · MP3 · FLAC · Vorbis · PCM s16/s24/f32 · **PCM big-endian & 24-bit** (the AIFF/s16be edge) · ALAC · AC-3 / E-AC-3 · DTS · *(+ others)*. Two cases each — decode and encode.
+*Oracle:* decoded-PCM digest vs golden / format match. *Metric:* decode & encode throughput (samples or frames / s).
+
+## A.7 Core operations (one correctness-gated + timed case each, across the corpus)
+
+probe / extract-metadata · demux / iterate-packets · decode-frames (→ pixels) · seek (keyframe + exact) · remux (lossless container change) · transcode (re-encode) · trim / cut (keyframe + frame-accurate) · concat / splice · mux (from encoded tracks) · **extract audio track** (→ wav/mp3) · **replace / swap audio track** · decrypt (CENC/HLS) · thumbnail / frame-at-time · fragmentation / MSE-segments.
+*Oracle:* per §5.2 (golden / reference-reimport / SSIM / playback / invariants). *Metric:* per op — probe **ops/s**, demux **packets/s**, decode/encode **fps**, remux/transcode/trim/mux **wall** + throughput×realtime, seek **ms/seek**.
+
+## A.8 Video transforms (transcode-case variants, SSIM/PSNR-gated)
+
+resize / scale (down & up) · rotate 90/180/270 + display-matrix · flip (h/v) · crop / pad / letterbox · fps change (down & up / interpolate) · bitrate target / CRF / quality / two-pass · color-space convert (601/709/2020) · **HDR → SDR tone-map** · **alpha preservation** (VP8/VP9 alpha — separate alpha-plane oracle) · **fan-out / ABR ladder** (1 input → N renditions).
+*Oracle:* SSIM + PSNR vs reference frames (alpha plane compared separately). *Metric:* **frames/s**.
+
+## A.9 Audio transforms / DSP
+
+resample (rate convert) · channel-mix (mono↔stereo↔5.1) · PCM format convert (incl. big-endian / 24-bit) · volume / gain · fade in/out.
+*Oracle:* decoded-PCM digest vs golden / format match. *Metric:* wall, samples/s.
+
+## A.10 Output / streaming modes
+
+buffer (whole file in memory) · streaming target (incremental write) · fragmented / CMAF output · fastStart (moov-first) · tiny-chunk writes (188-byte TS / low-latency) · MSE-ready segment generation.
+*Oracle:* reference re-import + `<video>` playback. *Metric:* wall, target-writes, time-to-first-byte, bytes-out.
+
+## A.11 Metadata / tags / structure
+
+read duration / dims / fps / sample-rate / channels · read tags · **write tags** (then re-probe) · rotation / display-matrix · chapters · edit lists · multi-track + track selection · language / cover-art / timecode.
+*Oracle:* `golden-metadata` / re-probe after write. *Metric:* wall.
+
+## A.12 Encryption / DRM
+
+CENC `cenc` (AES-CTR) decrypt · CENC `cbcs` (AES-CBC pattern, per-subsample IV) decrypt · HLS AES-128 decrypt · ClearKey · leave-unencrypted-input-untouched (negative).
+*Oracle:* `decrypt-bitexact` — decoded frames bit-exact vs golden (golden from an offline reference decrypt). *Metric:* wall, decode fps.
+
+## A.13 Subtitles / text / data tracks
+
+read text track (mov_text / WebVTT / SRT) · write / mux text track · data / metadata tracks (e.g. GPMF, KLV).
+*Oracle:* extracted text vs golden / re-probe. *Metric:* wall.
+
+## A.14 Performance dimensions (each a measured, correctness-gated case)
+
+extract-metadata **ops/s** (↑) · iterate-video-packets **packets/s** (↑) · convert-to-WebM + resize 320×180 **frames/s** (↑) · decode **fps** (↑) · encode **fps** (↑) · seek **ms/seek** (↓) · time-to-first-frame / first-byte **ms** (↓) · **load/init time ms** (↓ — reported separately per §0.7) · peak memory **bytes** (↓ — via `measureUserAgentSpecificMemory`) · main-thread **longtask ms** (↓) · **bundle size** per-feature + total **kB min+gzip** (↓) · source-reads / range-fetches **count** (↓ = lazier). (↑ higher-is-better, ↓ lower-is-better; winner per §9. Which frameworks contest each case is research/runtime-determined, not assumed.)
+
+## A.15 Developer / platform aspects (researched from docs/source — scored, not a perf race)
+
+TypeScript types · zero runtime deps · tree-shakeable (pay-for-what-you-use) · runs in a Worker · needs `SharedArrayBuffer`/COOP+COEP · hardware-accelerated (WebCodecs) · WebGPU / WebGL backend (§0.9) · license. **Established by the §15 research agent** from each framework's docs/source/package and recorded — never assumed.
+
+## A.16 Deep edge cases (each a case; expectation = "handle gracefully or correctly")
+
+Open-GOP & B-frame reorder · VFR (nominal vs real fps) · rotated (matrix not w/h swap) · multi-track + non-default track select · **headerless MediaRecorder WebM** (no Duration → must still report a sane duration) · big-endian & 24-bit PCM · MP3 **Xing-TOC vs CBR-no-TOC** duration · FLAC **±SEEKTABLE** seek accuracy · CENC `cbcs` per-subsample IV pattern · MP4 `fastStart:reserve` large forward seek · fragmented/CMAF init+media split · multi-hour / many-thousand-sample file · **zero-length** file · **header-truncated** file · **bit-flipped / fuzzed** spans (must fail gracefully, no crash/hang/OOM) · negative/seek-past-EOF · 0×0 or 1×1 video · extreme fps (1 fps, 240 fps) · audio-only / video-only / no-tracks · mismatched container/codec (e.g. h264 mislabeled) · timestamp wraparound / discontinuity (TS) · gapless audio (encoder delay/padding) · variable channel count.
+
+**Metamorphic invariants (each a case):** `decode(remux(x)) == decode(x)` · `demux(mux(x)) ≈ x` · `probe(remux(x)).dur ≈ probe(x).dur` · `trim(a..b) ++ trim(b..c) ≈ trim(a..c)` · `probe(x).dur` consistent across containers of identical content · `transcode` is idempotent in dimensions (resize to same size = no-op-ish).
+
+---
+
+### Appendix B — How the catalog drives the run & report
+
+- Each catalog row with a non-`-` cell for ≥1 framework becomes one or more registered cases (parameterized across the corpus assets that exercise it).
+- A framework's adapter `capabilities()` declares which rows it claims; the runner turns an unclaimed row into `NA(engine)` → **`-`** in the report. A claimed-but-browser-unsupported codec → `NA(browser)` → **`-ᵇ`**.
+- The report shows the full catalog as rows; cells are `🏆`/value/`PASS`/`FAIL`/`-`/`-ᵇ`/`—`. The **per-row winner** = fastest *correct* framework; rows where only one framework is non-`-` are flagged **uncontested** (still reported — they show unique capabilities, which is itself a finding).
+- New features discovered in any framework are **appended** here first (as rows with `?` for the unknowns), then implemented as cases. This appendix is the living source of "what we benchmark."
