@@ -21,7 +21,7 @@
  * Download button writes), plus a console summary line.
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,7 +32,7 @@ const ROOT = resolve(__dirname, '..');
 
 const opts = {
   baseUrl: 'http://localhost:5173',
-  browser: 'chromium',
+  browser: 'brave', // default to a REAL, non-headless browser (user mandate: no headless testing)
   engines: /** @type {string[]} */ ([]),
   scenarios: /** @type {string[]} */ ([]),
   pillar: 'all',
@@ -60,7 +60,7 @@ for (let i = 0; i < argv.length; i++) {
     case '--timeout-ms': opts.timeoutMs = Number(next()); break;
     case '--headed': opts.headed = true; break;
     case '-h': case '--help':
-      console.log('bun scripts/launch.mjs --base-url URL --browser chromium|webkit|firefox [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS] [--headed]');
+      console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS]');
       process.exit(0);
     default:
       console.error(`launch.mjs: unknown arg '${a}'`);
@@ -68,9 +68,20 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 
-const ENGINE_MAP = { chromium: 'chromium', webkit: 'webkit', firefox: 'firefox' };
-if (!ENGINE_MAP[opts.browser]) {
-  console.error(`launch.mjs: unknown --browser '${opts.browser}' (use chromium|webkit|firefox)`);
+// ALL runs use a REAL, NON-HEADLESS browser (user mandate: remove all headless testing). 'brave'
+// launches the system Brave binary through Playwright's chromium driver (Brave is Chromium-based);
+// chromium/webkit/firefox use Playwright's bundled engines, also non-headless. Playwright stays a
+// pure LAUNCHER (§13) — it opens the served web app and triggers the in-page run; it measures nothing.
+const BRAVE_PATH =
+  process.env.BRAVE_PATH || '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
+const BROWSERS = {
+  brave: { type: 'chromium', executablePath: BRAVE_PATH },
+  chromium: { type: 'chromium' },
+  webkit: { type: 'webkit' },
+  firefox: { type: 'firefox' },
+};
+if (!BROWSERS[opts.browser]) {
+  console.error(`launch.mjs: unknown --browser '${opts.browser}' (use brave|chromium|webkit|firefox)`);
   process.exit(2);
 }
 
@@ -89,11 +100,26 @@ try {
 
 // ── drive one browser ────────────────────────────────────────────────────────────────────────
 
-const browserType = playwright[ENGINE_MAP[opts.browser]];
+const browserCfg = BROWSERS[opts.browser];
+const browserType = playwright[browserCfg.type];
 const pageUrl = `${opts.baseUrl.replace(/\/$/, '')}/index.html`;
 
-console.log(`[launch] ${opts.browser} → ${pageUrl}`);
-const browser = await browserType.launch({ headless: !opts.headed });
+// NEVER headless. If a custom executablePath is required (Brave), verify it exists up front so we
+// fail with a clear message instead of a cryptic Playwright spawn error.
+const launchOpts = { headless: false };
+if (browserCfg.executablePath) {
+  if (!existsSync(browserCfg.executablePath)) {
+    console.error(
+      `launch.mjs: ${opts.browser} binary not found at '${browserCfg.executablePath}'. ` +
+        `Set BRAVE_PATH to the Brave executable, or use --browser chromium.`,
+    );
+    process.exit(4);
+  }
+  launchOpts.executablePath = browserCfg.executablePath;
+}
+
+console.log(`[launch] ${opts.browser} (real browser, non-headless) → ${pageUrl}`);
+const browser = await browserType.launch(launchOpts);
 let exitCode = 0;
 try {
   const context = await browser.newContext();

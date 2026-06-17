@@ -43,9 +43,11 @@ if ! command -v bunx >/dev/null 2>&1 && ! command -v bun >/dev/null 2>&1; then
   exit 2
 fi
 
-# Prefer `bunx vite`; fall back to `bun x vite`.
+# Run vite under the BUN runtime — never node. `bunx vite` honors vite's '#!/usr/bin/env node'
+# shebang and spawns a node process; invoking vite's CLI script with `bun --bun` forces the bun
+# runtime instead (verified: process is `bun --bun …vite.js`, no node, serves correctly).
 run_vite() {
-  if command -v bunx >/dev/null 2>&1; then bunx vite "$@"; else bun x vite "$@"; fi
+  bun --bun node_modules/vite/bin/vite.js "$@"
 }
 
 # Enable cross-origin isolation so measureUserAgentSpecificMemory is available where supported.

@@ -66,7 +66,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ${#BROWSERS[@]} -eq 0 ]]; then BROWSERS=(chromium webkit firefox); fi
+# Default to Brave (a REAL, non-headless browser) — user mandate: no headless testing. Other
+# browsers (chromium/webkit/firefox) remain selectable via --browser and also run non-headless.
+if [[ ${#BROWSERS[@]} -eq 0 ]]; then BROWSERS=(brave); fi
 
 if ! command -v bun >/dev/null 2>&1; then echo "error: bun required for the launcher (node/npm/npx are unavailable here)." >&2; exit 2; fi
 
