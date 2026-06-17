@@ -1,0 +1,14 @@
+{
+  "container": "aiff",
+  "durationSec": 5,
+  "tracks": [
+    {
+      "type": "audio",
+      "codec": "pcm-s16be",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 1536000,
+      "language": null
+    }
+  ]
+}

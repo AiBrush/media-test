@@ -10,7 +10,10 @@
 #   --browser <name>     chromium|webkit|firefox (repeatable / comma-separated). Default: all three.
 #   --pillar <name>      functional|performance|robustness|all. Default: all.
 #   --scenario <id>      run only this scenario (repeatable / comma-separated).
-#   --port <n>           static server port (default 5173).
+#   --port <n>           static server port. Default: an EPHEMERAL FREE port is auto-selected (so a
+#                        stale dev server from a prior run can never be silently reused). Pass --port
+#                        to pin one; if a pinned port is already taken the run aborts (it will NOT
+#                        reuse a foreign server).
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 1800000 = 30 min).
 #   --headed             show the browser window (debugging).
@@ -31,7 +34,8 @@ BROWSERS=()
 ENGINES=()
 SCENARIOS=()
 PILLAR="all"
-PORT="5173"
+PORT=""            # empty ⇒ auto-select a free ephemeral port (see port selection below)
+PORT_EXPLICIT=0   # set when the user pins --port (we then refuse to reuse a foreign server on it)
 WARMUP=""
 ITERS=""
 TIMEOUT_MS="1800000"
@@ -49,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     --browser) append_csv BROWSERS "$2"; shift 2 ;;
     --scenario) append_csv SCENARIOS "$2"; shift 2 ;;
     --pillar) PILLAR="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
+    --port) PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
     --warmup) WARMUP="$2"; shift 2 ;;
     --iters) ITERS="$2"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
@@ -63,9 +67,61 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#BROWSERS[@]} -eq 0 ]]; then BROWSERS=(chromium webkit firefox); fi
-if [[ -z "${BASE_URL}" ]]; then BASE_URL="http://localhost:${PORT}"; fi
 
 if ! command -v bun >/dev/null 2>&1; then echo "error: bun required for the launcher (node/npm/npx are unavailable here)." >&2; exit 2; fi
+
+# ── port helpers ───────────────────────────────────────────────────────────────────────────────
+# port_in_use <port> → 0 (true) if something is LISTENING on the TCP port, else 1. Uses lsof when
+# available (present on macOS + most Linux); falls back to a bash /dev/tcp connect probe.
+port_in_use() {
+  local p="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    [[ -n "$(lsof -ti "tcp:${p}" -sTCP:LISTEN 2>/dev/null)" ]]
+    return $?
+  fi
+  # /dev/tcp probe: a successful connect means a listener is present.
+  (exec 3<>"/dev/tcp/127.0.0.1/${p}") >/dev/null 2>&1 && { exec 3>&- 3<&- 2>/dev/null; return 0; }
+  return 1
+}
+
+# pids_on_port <port> → space-separated PIDs LISTENING on the port (empty if none / no lsof).
+pids_on_port() {
+  command -v lsof >/dev/null 2>&1 && lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null | tr '\n' ' '
+}
+
+# pick_free_port → echo a TCP port nothing is listening on. Tries 5173 first (familiar dev port),
+# then a spread of candidates so concurrent runs/agents don't collide. Bash 3.2-safe (no $RANDOM
+# arithmetic surprises — we still seed from $$ + $RANDOM for spread). Exits non-zero if none free.
+pick_free_port() {
+  local cand seed
+  seed=$(( ( $$ + ${RANDOM:-0} ) % 4000 ))
+  # Candidate list: the classic 5173, then a deterministic-ish spread in the 49152–65535 ephemeral
+  # range so we avoid well-known ports and reduce collision odds across parallel launchers.
+  for cand in 5173 5174 5175 $((49152 + seed)) $((50000 + seed)) $((51000 + seed)) $((52000 + seed)) $((53000 + seed)) $((54000 + seed)) $((55000 + seed)); do
+    if ! port_in_use "${cand}"; then echo "${cand}"; return 0; fi
+  done
+  return 1
+}
+
+# ── select the static-server port (only relevant when we actually serve) ─────────────────────────
+if [[ "${NO_SERVE}" -ne 1 ]]; then
+  if [[ "${PORT_EXPLICIT}" -eq 1 ]]; then
+    # User pinned a port. NEVER reuse a foreign server already on it — abort with guidance instead.
+    if port_in_use "${PORT}"; then
+      echo "[run] port ${PORT} is already in use$( [[ -n "$(pids_on_port "${PORT}")" ]] && echo " (pid(s): $(pids_on_port "${PORT}"))" )." >&2
+      echo "[run] refusing to reuse a server we did not start. Free it (e.g. kill the pid above), or omit --port to auto-pick a free one." >&2
+      exit 1
+    fi
+  else
+    # Auto-select a free ephemeral port so a stale dev server from a prior run is never reused.
+    PORT="$(pick_free_port)" || { echo "[run] could not find a free port to serve on." >&2; exit 1; }
+    echo "[run] auto-selected free port :${PORT}"
+  fi
+fi
+
+# Default port for the --no-serve display case (server is foreign / already up).
+if [[ -z "${PORT}" ]]; then PORT="5173"; fi
+if [[ -z "${BASE_URL}" ]]; then BASE_URL="http://localhost:${PORT}"; fi
 
 # ── start the static server (unless told not to) ─────────────────────────────────────────────
 SERVER_PID=""
@@ -78,26 +134,70 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# is_descendant <pid> <ancestor> → 0 if <pid> is <ancestor> or any process up its parent chain is
+# <ancestor>. Used to confirm the process listening on our port really is the serve.sh we launched
+# (vite runs as a CHILD of the serve.sh wrapper, so the listener is a descendant of SERVER_PID).
+is_descendant() {
+  local pid="$1" ancestor="$2" ppid guard=0
+  while [[ -n "${pid}" && "${pid}" != "0" && "${pid}" != "1" ]]; do
+    [[ "${pid}" == "${ancestor}" ]] && return 0
+    ppid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+    [[ -z "${ppid}" || "${ppid}" == "${pid}" ]] && break
+    pid="${ppid}"
+    guard=$((guard + 1)); [[ "${guard}" -gt 50 ]] && break
+  done
+  return 1
+}
+
+# server_is_ours → 0 if the listener on $PORT is SERVER_PID or a descendant of it. If lsof is not
+# available we can't inspect ownership, so we return 0 (don't block) and rely on the readiness probe.
+server_is_ours() {
+  local owners owner
+  owners="$(pids_on_port "${PORT}")"
+  [[ -z "${owners}" ]] && return 1                 # nothing listening yet → not ready
+  if ! command -v lsof >/dev/null 2>&1; then return 0; fi
+  for owner in ${owners}; do
+    is_descendant "${owner}" "${SERVER_PID}" && return 0
+  done
+  return 1
+}
+
 if [[ "${NO_SERVE}" -ne 1 ]]; then
   echo "[run] starting static server on :${PORT}"
   bash "${SCRIPT_DIR}/serve.sh" --port "${PORT}" >/tmp/media-suite-serve.log 2>&1 &
   SERVER_PID=$!
 
-  # Wait for the server to answer index.html (up to ~30s).
-  echo "[run] waiting for ${BASE_URL}/index.html …"
+  # Wait until OUR server answers (up to ~30s). Readiness = two conditions both true:
+  #   (1) the process listening on :PORT is SERVER_PID or a descendant (we picked a free port, so
+  #       this should hold — but it guards against a race where something else grabbed it), AND
+  #   (2) it serves a real suite response. We probe /fixtures/manifest.json: it is served by the
+  #       suite's own vite fixtures middleware with Cache-Control: no-store, so a successful 200
+  #       confirms THIS run's server (not a stale build cache or a foreign static server lacking
+  #       the fixtures tree). We also confirm index.html resolves.
+  echo "[run] waiting for ${BASE_URL} (own server on :${PORT}) …"
   ready=0
   for _ in $(seq 1 60); do
-    if curl -fsS "${BASE_URL}/index.html" >/dev/null 2>&1; then ready=1; break; fi
-    # If the server died, surface its log.
+    # If our server died, surface its log immediately.
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
       echo "[run] server exited early; log:" >&2; cat /tmp/media-suite-serve.log >&2; exit 1
+    fi
+    if server_is_ours \
+        && curl -fsS "${BASE_URL}/fixtures/manifest.json" >/dev/null 2>&1 \
+        && curl -fsS "${BASE_URL}/index.html" >/dev/null 2>&1; then
+      ready=1; break
     fi
     sleep 0.5
   done
   if [[ "${ready}" -ne 1 ]]; then
-    echo "[run] server did not become ready; log:" >&2; cat /tmp/media-suite-serve.log >&2; exit 1
+    # Distinguish "a foreign server stole the port" from "our server never came up".
+    if ! server_is_ours && curl -fsS "${BASE_URL}/index.html" >/dev/null 2>&1; then
+      echo "[run] a server we did NOT start is answering on :${PORT} (pid(s): $(pids_on_port "${PORT}")); refusing to use it." >&2
+    else
+      echo "[run] server did not become ready; log:" >&2; cat /tmp/media-suite-serve.log >&2
+    fi
+    exit 1
   fi
-  echo "[run] server ready."
+  echo "[run] server ready (verified own instance on :${PORT})."
 fi
 
 # ── launch each browser through the Playwright driver ────────────────────────────────────────

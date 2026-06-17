@@ -156,6 +156,107 @@ function withDefaults(tol?: OracleTolerances): Required<OracleTolerances> {
   };
 }
 
+// ── Per-container probe duration tolerance (golden-metadata only) ──────────────────────────────
+
+/**
+ * WHY a per-container duration band exists:
+ *
+ * `durationToleranceSec` (≈ ±1 frame) is the right gate for containers that carry a PRECISE, global
+ * duration in their header — an explicit movie/segment duration (mp4/mov `mvhd`, mkv/webm
+ * `Duration`), a per-sample total (wav byte count, flac STREAMINFO total samples), or a granule/page
+ * tail (ogg). Two correct demuxers must agree on those to within rounding, so a >1-frame gap is a
+ * real engine bug and MUST fail.
+ *
+ * Some containers, by contrast, have NO precise global duration in the header. A demuxer can only
+ * ESTIMATE total duration, and two correct demuxers legitimately disagree by far more than a frame
+ * depending on the estimation method:
+ *   - `ts`   : MPEG-TS has no global duration. Duration is derived from first/last PTS (or PCR), and
+ *              ffprobe vs a PTS-walk can differ by a GOP or more (e.g. ffprobe 10.02s, an engine that
+ *              extrapolates the trailing frame duration 11.43s). This is an estimation difference,
+ *              not a decode error.
+ *   - `adts` : Raw ADTS AAC is a bare frame stream with no duration header; duration = frameCount ×
+ *              1024 / sampleRate, and a partial-last-frame or scan-prefix heuristic shifts it.
+ *   - `hls`  : Playlist duration is the SUM of `#EXTINF` segment durations (themselves rounded) and
+ *              may or may not include discontinuities/trailing partial segments.
+ *   - `mp3`  : A CBR MP3 with NO Xing/Info TOC has no duration field — it is estimated from
+ *              byterate × size, which drifts with ID3 padding and the final partial frame. (A Xing
+ *              MP3 DOES carry an accurate frame count and therefore stays STRICT — see isLooseMp3.)
+ *   - `webm` : A normal WebM carries a Segment `Duration`; a headerless/streaming MediaRecorder WebM
+ *              does NOT (live capture, unknown length, sparse/absent Cues), so its duration is
+ *              estimated from the last block timestamp. Only the recorder-origin variant is loose —
+ *              see isLooseRecorderWebm; ordinary WebM stays STRICT.
+ *
+ * For the estimate-only set we widen to max(±0.5s, ±15%). Rationale: ±0.5s covers a one-GOP / one-
+ * AAC-frame / one-segment rounding tail on short clips, and ±15% covers the proportional drift a PTS
+ * extrapolation or byterate estimate produces on longer clips (the observed worst case is MPEG-TS at
+ * ~14%). This is deliberately NOT a blanket loosening (§15): precise containers keep the ±1-frame
+ * gate, and within the loose set only the genuinely header-less MP3/WebM variants qualify. The band
+ * is codified here so it is auditable in one place.
+ */
+const LOOSE_DURATION_CONTAINERS = new Set<string>(['ts', 'adts', 'hls']);
+const LOOSE_DURATION_ABS_SEC = 0.5;
+const LOOSE_DURATION_REL = 0.15;
+
+/** A CBR MP3 with no Xing/Info TOC estimates duration from byterate; a Xing MP3 does not. */
+function isLooseMp3(container: string, assetId: string): boolean {
+  if (container !== 'mp3') return false;
+  const id = assetId.toLowerCase();
+  // The Xing/Info variant carries an accurate frame count → STRICT. Everything else mp3 (CBR no TOC,
+  // and the unknown default) is treated as estimate-only. Markers cover the committed corpus ids.
+  if (id.includes('xing') || id.includes('info_header') || id.includes('_toc')) return false;
+  return id.includes('cbr') || id.includes('notoc') || id.includes('noxing') || id.includes('no_toc');
+}
+
+/** A headerless / MediaRecorder-origin WebM has no Segment Duration; a normal WebM does. */
+function isLooseRecorderWebm(container: string, assetId: string): boolean {
+  if (container !== 'webm') return false;
+  const id = assetId.toLowerCase();
+  return id.includes('recorder') || id.includes('headerless') || id.includes('mediarecorder');
+}
+
+/**
+ * Resolve the duration tolerance for a golden-metadata comparison. Returns the strict per-frame
+ * tolerance for precise containers, or the wider estimate-only band for header-less containers. The
+ * second tuple element flags whether the loose band was applied (surfaced in the failure detail).
+ * `assetId` (the scenario input / corpus id) disambiguates the mp3 and webm sub-cases the container
+ * token alone cannot. If a scenario set an EXPLICIT durationToleranceSec override we honor it as-is
+ * and never widen (a per-scenario override is intentional and takes precedence).
+ */
+function durationToleranceFor(
+  container: string,
+  assetId: string,
+  t: Required<OracleTolerances>,
+  explicitOverride: boolean,
+): { tolSec: number; loose: boolean } {
+  if (explicitOverride) return { tolSec: t.durationToleranceSec, loose: false };
+  const c = container.trim().toLowerCase();
+  const isLoose =
+    LOOSE_DURATION_CONTAINERS.has(c) || isLooseMp3(c, assetId) || isLooseRecorderWebm(c, assetId);
+  if (!isLoose) return { tolSec: t.durationToleranceSec, loose: false };
+  // Loose band: max(absolute floor, relative fraction of the golden duration). The caller supplies
+  // the relative term keyed off the reference duration so the band scales with clip length.
+  return { tolSec: LOOSE_DURATION_ABS_SEC, loose: true };
+}
+
+/** The primary corpus asset id for a comparison (the input the op actually ran against). */
+function primaryAssetId(ctx: OracleContext): string {
+  if (ctx.input?.id) return ctx.input.id;
+  const inp = ctx.scenario.input;
+  return Array.isArray(inp) ? (inp[0] ?? '') : (inp ?? '');
+}
+
+/** The container token for a comparison: prefer measured metadata, fall back to the asset extension. */
+function resolveContainer(measured: string | undefined, assetId: string): string {
+  const m = (measured ?? '').trim().toLowerCase();
+  if (m) return m;
+  const ext = assetId.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1] ?? '';
+  // Map a few extensions to their canonical container token (the meta `container` field uses these).
+  if (ext === 'm3u8') return 'hls';
+  if (ext === 'aac') return 'adts';
+  if (ext === 'm4a' || ext === 'm4v') return 'mp4';
+  return ext;
+}
+
 // ── Oracle context ───────────────────────────────────────────────────────────────────────────
 
 export interface OracleContext {
@@ -243,15 +344,32 @@ function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): Orac
     diffs.push(`container: measured '${got.container}' vs golden '${want.container}'`);
   }
 
-  // duration within ±tolerance (only when both present)
+  // duration within ±tolerance (only when both present). Precise containers use the strict ±1-frame
+  // band; estimate-only containers (ts/adts/hls/headerless-webm/CBR-no-TOC-mp3) use a wider, clearly
+  // documented band because no precise global duration exists for two demuxers to agree on. The
+  // container is taken from measured metadata, falling back to the asset extension.
   if (got.durationSec != null && want.durationSec != null) {
     const d = Math.abs(got.durationSec - want.durationSec);
     measurements.durationDeltaSec = d;
-    if (d > t.durationToleranceSec) {
+    const assetId = primaryAssetId(ctx);
+    const container = resolveContainer(want.container ?? got.container, assetId);
+    const explicitOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
+    const band = durationToleranceFor(container, assetId, t, explicitOverride);
+    // For the loose set the effective tolerance is max(absolute floor, relative × golden duration).
+    const tolSec = band.loose
+      ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(want.durationSec))
+      : band.tolSec;
+    measurements.durationToleranceSec = tolSec;
+    if (d > tolSec) {
+      const looseNote = band.loose
+        ? ` [estimate-only container '${container}': loose band max(±${LOOSE_DURATION_ABS_SEC}s, ±${(
+            LOOSE_DURATION_REL * 100
+          ).toFixed(0)}%) applied]`
+        : '';
       diffs.push(
         `duration: measured ${got.durationSec.toFixed(4)}s vs golden ${want.durationSec.toFixed(
           4,
-        )}s (Δ ${d.toFixed(4)}s > tol ${t.durationToleranceSec.toFixed(4)}s)`,
+        )}s (Δ ${d.toFixed(4)}s > tol ${tolSec.toFixed(4)}s)${looseNote}`,
       );
     }
   } else if (want.durationSec != null && got.durationSec == null) {

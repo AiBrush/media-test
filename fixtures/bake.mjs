@@ -605,9 +605,11 @@ const RECIPES = {
     ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_f32le', '-ar', '48000', '-ac', '2', '-f', 'wav', out], 'wav_f32.wav');
     return 'ok';
   },
-  'wav_s16be.wav': (out) => {
-    // Big-endian PCM in a RIFX/WAV container.
-    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16be', '-ar', '48000', '-ac', '2', '-f', 'wav', out], 'wav_s16be.wav');
+  'pcm_s16be.aiff': (out) => {
+    // Big-endian 16-bit PCM. RIFF/WAVE cannot carry pcm_s16be ("Codec pcm_s16be not supported in
+    // WAVE format" — WAVE is little-endian by construction). AIFF is the natural big-endian PCM
+    // container, so the BIG-ENDIAN handling intent (§7) is honored honestly here.
+    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16be', '-ar', '48000', '-ac', '2', '-f', 'aiff', out], 'pcm_s16be.aiff');
     return 'ok';
   },
   'mp3_xing.mp3': (out) => {
@@ -723,6 +725,14 @@ const RECIPES = {
     return 'ok';
   },
 };
+
+// ── Intentionally-broken robustness assets ───────────────────────────────────────────────────
+//
+// These assets are deliberately malformed (zero-length / header-truncated) to exercise the
+// graceful-failure oracle. ffprobe failing to read them is the EXPECTED outcome, not a bake error,
+// so we skip golden (meta/packets/frames) derivation for them and record a clear "no golden
+// (intentionally broken)" note. They keep their checksum + size in the manifest.
+const EXPECT_GOLDEN_FAILURE = new Set(['zero_length.mp4', 'truncated_h264.mp4']);
 
 // ── Encryption secret + caveat side-channels (filled by recipes, consumed by golden bake) ────────
 
@@ -867,6 +877,7 @@ function canonicalContainer(formatName, assetId) {
   if (lower.endsWith('.ts')) return 'ts';
   if (lower.endsWith('.m3u8')) return 'hls';
   if (lower.endsWith('.wav')) return 'wav';
+  if (lower.endsWith('.aiff') || lower.endsWith('.aif')) return 'aiff';
   if (lower.endsWith('.mp3')) return 'mp3';
   if (lower.endsWith('.flac')) return 'flac';
   if (lower.endsWith('.ogg') || lower.endsWith('.opus')) return 'ogg';
@@ -895,9 +906,23 @@ function rotationOf(stream) {
   return undefined;
 }
 
+/**
+ * Per-asset ffprobe/ffmpeg *input* options for the golden derivation. HLS playlists that reference
+ * a sibling AES-128 key file need `-allowed_extensions ALL` (the .key extension is blocked for
+ * "security" by default) and `-protocol_whitelist file,crypto,data` so ffprobe will open the key and
+ * the encrypted segments. Returned args must precede the input path (they are *input* demux options).
+ */
+function goldenInputOpts(assetId) {
+  if (assetId.toLowerCase().endsWith('.m3u8')) {
+    return ['-allowed_extensions', 'ALL', '-protocol_whitelist', 'file,crypto,data,http,https,tcp,tls'];
+  }
+  return [];
+}
+
 /** Build NormalizedMetadata (engine.ts) from ffprobe -show_format -show_streams JSON. */
 function normalizedMetadataFor(assetId, mediaPath) {
-  const probe = ffprobeJson(['-show_format', '-show_streams', mediaPath], `${assetId} meta`);
+  const inOpts = goldenInputOpts(assetId);
+  const probe = ffprobeJson([...inOpts, '-show_format', '-show_streams', mediaPath], `${assetId} meta`);
   const fmt = probe.format || {};
   const streams = probe.streams || [];
 
@@ -939,7 +964,8 @@ function normalizedMetadataFor(assetId, mediaPath) {
 
 /** Build PacketInfo[] (engine.ts) from ffprobe -show_packets JSON. Times normalized to integer µs. */
 function packetsFor(assetId, mediaPath) {
-  const probe = ffprobeJson(['-show_packets', '-show_entries', 'packet=stream_index,size,pts_time,dts_time,flags', mediaPath], `${assetId} packets`);
+  const inOpts = goldenInputOpts(assetId);
+  const probe = ffprobeJson([...inOpts, '-show_packets', '-show_entries', 'packet=stream_index,size,pts_time,dts_time,flags', mediaPath], `${assetId} packets`);
   const pkts = probe.packets || [];
   return pkts.map((p) => {
     const ptsUs = p.pts_time != null && p.pts_time !== 'N/A' ? Math.round(Number(p.pts_time) * 1e6) : 0;
@@ -967,8 +993,9 @@ function frameHookFor(assetId, mediaPath, meta) {
   // Pull the first ~12 video frame PTS so the browser pass digests a deterministic, bounded set.
   let ptsList = [];
   try {
+    const inOpts = goldenInputOpts(assetId);
     const probe = ffprobeJson(
-      ['-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time,key_frame', '-read_intervals', '%+#12', mediaPath],
+      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time,key_frame', '-read_intervals', '%+#12', mediaPath],
       `${assetId} frames-hook`,
     );
     ptsList = (probe.frames || [])
@@ -1020,7 +1047,7 @@ function main() {
   mkdirSync(GOLDEN_DIR, { recursive: true });
 
   const manifest = loadManifest();
-  const summary = { generated: [], reused: [], skipped: [], golden: [], goldenPending: [], errors: [] };
+  const summary = { generated: [], reused: [], skipped: [], golden: [], goldenPending: [], goldenSkipped: [], errors: [] };
 
   log('media-browser-test fixture bake');
   log(
@@ -1084,8 +1111,16 @@ function main() {
         log(`  · ${id}: golden skipped (no media present)`);
         continue;
       }
-      // zero_length / image negatives: ffprobe may legitimately produce minimal/odd output. We
-      // still emit whatever golden we can; the oracle for negatives is graceful-failure, not meta.
+      // Intentionally-broken robustness assets: ffprobe SHOULD fail on these. Skip golden derivation
+      // and record a clear note instead of emitting a GOLDEN ERROR (which would fail the bake). The
+      // graceful-failure oracle compares the engine's behavior, not against ffprobe-derived golden.
+      if (EXPECT_GOLDEN_FAILURE.has(id)) {
+        summary.goldenSkipped.push(id);
+        log(`  · ${id}: no golden (intentionally broken — graceful-failure oracle, ffprobe failure expected)`);
+        continue;
+      }
+      // image negatives: ffprobe may legitimately produce minimal/odd output. We still emit whatever
+      // golden we can; the oracle for negatives is graceful-failure, not meta.
       try {
         const meta = normalizedMetadataFor(id, out);
         writeJson(join(GOLDEN_DIR, `${id}.meta.json`), meta);
@@ -1178,6 +1213,9 @@ function printSummary(s) {
   if (s.skipped.length) {
     log(`  skipped   : ${s.skipped.length}`);
     for (const k of s.skipped) log(`      ⨯ ${k.id} — ${k.reason}`);
+  }
+  if (s.goldenSkipped?.length) {
+    log(`  no golden : ${s.goldenSkipped.length} (intentionally broken — ffprobe failure expected) — ${s.goldenSkipped.join(', ')}`);
   }
   if (NOSEEKTABLE_CAVEAT) {
     log('  caveat    : flac_noseektable.flac — metaflac not installed; SEEKTABLE could not be stripped (asset kept, golden notes the discrepancy).');

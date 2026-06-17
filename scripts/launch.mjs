@@ -99,9 +99,13 @@ try {
   const context = await browser.newContext();
   const page = await context.newPage();
 
-  // Surface page console + errors to the driver log (debugging only — not measurement).
+  // Surface page console errors + warnings to the driver log (debugging only — not measurement).
+  // Warnings matter here because the runner WARN+SKIPs unknown --engine/--scenario ids instead of
+  // aborting; forwarding them tells the operator why a requested id produced no cells.
   page.on('console', (msg) => {
-    if (msg.type() === 'error') console.error(`[page:${opts.browser}] ${msg.text()}`);
+    const type = msg.type();
+    if (type === 'error') console.error(`[page:${opts.browser}] ${msg.text()}`);
+    else if (type === 'warning') console.warn(`[page:${opts.browser}] ${msg.text()}`);
   });
   page.on('pageerror', (err) => console.error(`[pageerror:${opts.browser}] ${err.message}`));
 

@@ -273,16 +273,16 @@
       "notes": "32-bit float PCM WAV."
     },
     {
-      "id": "wav_s16be.wav",
+      "id": "pcm_s16be.aiff",
       "family": "audio",
-      "container": "wav",
+      "container": "aiff",
       "codecs": [
         "pcm-s16be"
       ],
-      "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_s16be, -f wav (RIFX big-endian)",
-      "sha256": null,
-      "sizeBytes": null,
-      "notes": "Big-endian 16-bit PCM. Byte-order edge case for audio-dsp/robustness."
+      "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_s16be, -f aiff (big-endian PCM; WAVE/RIFF cannot carry pcm_s16be, AIFF is the natural big-endian PCM container)",
+      "sha256": "316f3916d7ce8b719ab93c1b9682cc409914546f2ae51b0b95229722fb879010",
+      "sizeBytes": 960054,
+      "notes": "Big-endian 16-bit PCM in AIFF. Byte-order edge case for audio-dsp/robustness. (Was wav_s16be.wav: pcm_s16be is invalid in WAVE; moved to AIFF.)"
     },
     {
       "id": "mp3_xing.mp3",

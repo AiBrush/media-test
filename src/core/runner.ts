@@ -55,6 +55,7 @@ import type { MeasureContext } from './measure.ts';
 import type { GoldenStore, OracleContext } from './oracles.ts';
 
 import { getEngine, getReferenceEngineId, listEngines, listScenarios, getScenario } from './registry.ts';
+import type { RegisteredEngine } from './registry.ts';
 import { detectCodecSupport, detectEnv } from './feature-detect.ts';
 import { Meter } from './measure.ts';
 import { bench } from './bench.ts';
@@ -748,15 +749,27 @@ async function runBench(
 export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const pillar = opts.pillar ?? 'all';
 
-  // Resolve engines: requested ids (validated) or all registered.
-  const engineIds = opts.engineIds ?? listEngines().map((e) => e.id);
-  // Resolve scenarios: requested ids or all registered, then filter by pillar.
+  // Resolve engines: requested ids (filtered against the registry) or all registered. Unknown ids
+  // must NOT abort the whole run — a single bad --engine arg should warn+skip, never zero out the
+  // matrix. Matching is forgiving so short names work: an arg matches a registration when it equals
+  // the registration id, equals the engine's `.id`, or is a case-insensitive prefix of either (so
+  // `mp4box` → `mp4box.js@0.5.4`, `mediabunny` → `mediabunny@1.48.0`). Exact ids still match.
+  const allEngines = listEngines();
+  const engineIds = opts.engineIds
+    ? resolveEngineIds(opts.engineIds, allEngines)
+    : allEngines.map((e) => e.id);
+  // Resolve scenarios: requested ids or all registered, then filter by pillar. Unknown scenario ids
+  // are WARNED and SKIPPED (not thrown) so the rest of the run proceeds.
   const allScenarios = opts.scenarioIds
-    ? opts.scenarioIds.map((id) => {
+    ? opts.scenarioIds.reduce<Scenario[]>((acc, id) => {
         const s = getScenario(id);
-        if (!s) throw new Error(`unknown scenario id: ${id}`);
-        return s;
-      })
+        if (!s) {
+          console.warn(`runMatrix: unknown scenario id '${id}' — skipping (not in registry)`);
+          return acc;
+        }
+        acc.push(s);
+        return acc;
+      }, [])
     : listScenarios();
   const scenarios = allScenarios.filter((s) => scenarioMatchesPillar(s, pillar));
 
@@ -887,6 +900,58 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve user-supplied engine args against the registry, forgiving short names. An arg matches a
+ * registered engine when it equals the registration id (exact, case-sensitive first, then
+ * case-insensitive) or is a case-insensitive prefix of it — so `mp4box` matches `mp4box.js@0.5.4`
+ * and `mediabunny` matches `mediabunny@1.48.0`, while exact ids keep working unchanged. The
+ * registration id is the engine's `.id` by convention (registerEngine stores `{ id }`), so matching
+ * the registration id is equivalent to matching the engine's `.id` without constructing the engine.
+ *
+ * Unknown args are WARNED and SKIPPED (never thrown) so one bad `--engine` does not zero the matrix.
+ * Order follows the user's args; duplicates (incl. two args resolving to the same engine) are
+ * de-duplicated, preserving first-seen order.
+ */
+function resolveEngineIds(requested: string[], registered: RegisteredEngine[]): string[] {
+  const ids = registered.map((e) => e.id);
+  const resolved: string[] = [];
+  const seen = new Set<string>();
+  for (const arg of requested) {
+    const match = matchEngineId(arg, ids);
+    if (!match) {
+      console.warn(
+        `runMatrix: unknown engine id '${arg}' — skipping (no registered engine matches by id or prefix)`,
+      );
+      continue;
+    }
+    if (!seen.has(match)) {
+      seen.add(match);
+      resolved.push(match);
+    }
+  }
+  return resolved;
+}
+
+/** Match one engine arg against the known registration ids (exact → ci-exact → ci-prefix). */
+function matchEngineId(arg: string, ids: string[]): string | undefined {
+  const lower = arg.toLowerCase();
+  // Exact (case-sensitive) wins so a precise id is never shadowed by a looser candidate.
+  const exact = ids.find((id) => id === arg);
+  if (exact) return exact;
+  const ciExact = ids.find((id) => id.toLowerCase() === lower);
+  if (ciExact) return ciExact;
+  const prefix = ids.filter((id) => id.toLowerCase().startsWith(lower));
+  if (prefix.length >= 1) {
+    if (prefix.length > 1) {
+      console.warn(
+        `runMatrix: engine arg '${arg}' is an ambiguous prefix (${prefix.join(', ')}) — using '${prefix[0]}'`,
+      );
+    }
+    return prefix[0];
+  }
+  return undefined;
+}
 
 function errMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
