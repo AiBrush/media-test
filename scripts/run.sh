@@ -207,8 +207,10 @@ LAUNCH_COMMON=(--base-url "${BASE_URL}" --pillar "${PILLAR}" --out "results/raw"
 [[ "${HEADED}" -eq 1 ]] && LAUNCH_COMMON+=(--headed)
 [[ -n "${WARMUP}" ]] && LAUNCH_COMMON+=(--warmup "${WARMUP}")
 [[ -n "${ITERS}" ]] && LAUNCH_COMMON+=(--iters "${ITERS}")
-for e in "${ENGINES[@]}"; do LAUNCH_COMMON+=(--engine "${e}"); done
-for s in "${SCENARIOS[@]}"; do LAUNCH_COMMON+=(--scenario "${s}"); done
+# bash 3.2 + set -u: expanding an EMPTY array as "${arr[@]}" raises 'unbound variable', so guard on
+# length first (${#arr[@]} is always safe). Empty ENGINES/SCENARIOS ⇒ run all (no filter forwarded).
+if [[ ${#ENGINES[@]} -gt 0 ]]; then for e in "${ENGINES[@]}"; do LAUNCH_COMMON+=(--engine "${e}"); done; fi
+if [[ ${#SCENARIOS[@]} -gt 0 ]]; then for s in "${SCENARIOS[@]}"; do LAUNCH_COMMON+=(--scenario "${s}"); done; fi
 
 OVERALL=0
 for b in "${BROWSERS[@]}"; do
