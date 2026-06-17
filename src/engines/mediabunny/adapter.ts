@@ -375,9 +375,9 @@ export class MediabunnyEngine implements MediaEngine {
         const track = tracks[trackIndex];
         if (!track) continue;
         const sink = new EncodedPacketSink(track);
-        // metadataOnly avoids loading sample bytes; verifyKeyPackets gives accurate key flags.
+        // verifyKeyPackets gives accurate keyframe flags. NOTE: mediabunny rejects metadataOnly +
+        // verifyKeyPackets together, and the packet table needs byteLength, so we load full packets.
         for await (const pkt of sink.packets(undefined, undefined, {
-          metadataOnly: true,
           verifyKeyPackets: true,
         })) {
           const ptsUs = pkt.microsecondTimestamp;

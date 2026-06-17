@@ -57,9 +57,9 @@ if [[ "${PREVIEW}" -eq 1 ]]; then
   run_vite build
   # vite preview serves dist/; fixtures live outside dist, so symlink them in for the preview server.
   if [[ ! -e dist/fixtures ]]; then ln -s ../fixtures dist/fixtures; fi
-  exec run_vite preview --port "${PORT}" ${HOST_FLAG}
+  run_vite preview --port "${PORT}" ${HOST_FLAG}
 fi
 
 echo "→ serving suite (bunx vite dev) on http://localhost:${PORT}/  (fixtures/ served from repo root)"
 echo "  open http://localhost:${PORT}/index.html in any browser, or drive headlessly with scripts/run.sh"
-exec run_vite --port "${PORT}" ${HOST_FLAG}
+run_vite --port "${PORT}" ${HOST_FLAG}

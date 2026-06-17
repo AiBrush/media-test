@@ -40,7 +40,8 @@ NO_SERVE=0
 KEEP_SERVING=0
 BASE_URL=""
 
-append_csv() { local -n arr=$1; IFS=',' read -ra parts <<< "$2"; for p in "${parts[@]}"; do [[ -n "$p" ]] && arr+=("$p"); done; }
+# bash 3.2-compatible CSV-append into a named array (macOS ships bash 3.2 — no `local -n` namerefs).
+append_csv() { local _name="$1" _val="$2" _p; IFS=',' read -ra _parts <<< "$_val"; for _p in "${_parts[@]}"; do [[ -n "$_p" ]] && eval "${_name}+=(\"\$_p\")"; done; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
