@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Media-Engine Conformance & Benchmark Suite</title>
+    <!--
+      Suite app entry (§4, §2). Vite serves src/app/main.ts as a module; opening this file via the
+      static server (scripts/serve.sh) runs the whole battery in any browser. No bundler-specific
+      magic beyond a single <script type="module"> so it also works under `vite preview` / a plain
+      ES-module-capable static host. All measurement happens in-page / in Workers — never in Node.
+    -->
+    <style>
+      :root {
+        color-scheme: light dark;
+        --pass: #1a7f37;
+        --fail: #cf222e;
+        --na: #6e7781;
+        --err: #bc4c00;
+        --bg-alt: rgba(127, 127, 127, 0.08);
+        --border: rgba(127, 127, 127, 0.35);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 0;
+        padding: 1.25rem 1.5rem 4rem;
+        max-width: 1400px;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin: 0 0 0.25rem;
+      }
+      .subtitle {
+        color: var(--na);
+        margin: 0 0 1rem;
+      }
+      section {
+        margin: 1.25rem 0;
+      }
+      h2 {
+        font-size: 1rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--na);
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 0.25rem;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.25rem;
+        align-items: flex-start;
+      }
+      fieldset {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        min-width: 220px;
+        max-height: 280px;
+        overflow: auto;
+      }
+      legend {
+        font-weight: 600;
+        padding: 0 0.4rem;
+      }
+      label.opt {
+        display: block;
+        white-space: nowrap;
+        padding: 1px 0;
+      }
+      .actions {
+        display: flex;
+        gap: 0.6rem;
+        align-items: center;
+        flex-wrap: wrap;
+        margin: 0.75rem 0;
+      }
+      button {
+        font: inherit;
+        padding: 0.45rem 0.9rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--bg-alt);
+        cursor: pointer;
+      }
+      button.primary {
+        background: #0969da;
+        color: #fff;
+        border-color: #0969da;
+        font-weight: 600;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      select,
+      input[type='number'] {
+        font: inherit;
+        padding: 0.3rem 0.4rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+      }
+      #progress-wrap {
+        height: 8px;
+        background: var(--bg-alt);
+        border-radius: 4px;
+        overflow: hidden;
+        margin: 0.5rem 0;
+        display: none;
+      }
+      #progress-bar {
+        height: 100%;
+        width: 0;
+        background: #0969da;
+        transition: width 0.15s ease;
+      }
+      #progress-label {
+        color: var(--na);
+        font-size: 0.85rem;
+      }
+      table {
+        border-collapse: collapse;
+        font-size: 0.85rem;
+        width: 100%;
+      }
+      th,
+      td {
+        border: 1px solid var(--border);
+        padding: 0.3rem 0.5rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: var(--bg-alt);
+        position: sticky;
+        top: 0;
+      }
+      td.scn {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.78rem;
+        white-space: nowrap;
+      }
+      .status {
+        font-weight: 600;
+        font-size: 0.78rem;
+        white-space: nowrap;
+      }
+      .status.PASS {
+        color: var(--pass);
+      }
+      .status.FAIL {
+        color: var(--fail);
+      }
+      .status.ERROR {
+        color: var(--err);
+      }
+      .status.NA_ENGINE,
+      .status.NA_BROWSER,
+      .status.SKIPPED {
+        color: var(--na);
+      }
+      .metric {
+        color: var(--na);
+        font-size: 0.72rem;
+        display: block;
+      }
+      .env-grid {
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 0.1rem 0.75rem;
+        font-size: 0.85rem;
+      }
+      .env-grid dt {
+        color: var(--na);
+      }
+      .codec-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        margin-top: 0.4rem;
+      }
+      .pill {
+        font-size: 0.72rem;
+        padding: 0.1rem 0.4rem;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+      }
+      .pill.yes {
+        border-color: var(--pass);
+        color: var(--pass);
+      }
+      .pill.no {
+        border-color: var(--na);
+        color: var(--na);
+        opacity: 0.6;
+      }
+      .muted {
+        color: var(--na);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.85em;
+      }
+      details {
+        margin-top: 0.5rem;
+      }
+      summary {
+        cursor: pointer;
+      }
+      .banner {
+        padding: 0.5rem 0.75rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--bg-alt);
+        margin: 0.5rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Media-Engine Conformance &amp; Benchmark Suite</h1>
+    <p class="subtitle">
+      Library-agnostic, browser-only. Every number is produced in-page, gated by a library-independent
+      oracle, reported vs the reference engine. The comparison is the product.
+    </p>
+
+    <noscript>
+      <p class="banner">This suite requires JavaScript modules. Serve it with <code>scripts/serve.sh</code>.</p>
+    </noscript>
+
+    <section id="env-section">
+      <h2>Environment &amp; codec support</h2>
+      <div id="env" class="muted">Detecting browser + WebCodecs support…</div>
+    </section>
+
+    <section id="controls-section">
+      <h2>Controls</h2>
+      <div class="controls" id="controls">
+        <fieldset id="engines-fs">
+          <legend>Engines</legend>
+          <div id="engines-list" class="muted">Registering engines…</div>
+        </fieldset>
+        <fieldset id="scenarios-fs">
+          <legend>Scenarios</legend>
+          <div id="scenarios-list" class="muted">Registering scenarios…</div>
+        </fieldset>
+        <fieldset id="options-fs">
+          <legend>Options</legend>
+          <label class="opt"
+            >Pillar
+            <select id="pillar">
+              <option value="all">all</option>
+              <option value="functional">functional</option>
+              <option value="performance">performance</option>
+              <option value="robustness">robustness</option>
+            </select>
+          </label>
+          <label class="opt"
+            >Warmup <input type="number" id="warmup" min="0" max="20" value="3" style="width: 4rem"
+          /></label>
+          <label class="opt"
+            >Iters <input type="number" id="iters" min="1" max="50" value="6" style="width: 4rem"
+          /></label>
+          <label class="opt"
+            >Browser tag
+            <select id="browser-tag">
+              <option value="auto">auto-detect</option>
+              <option value="chromium">chromium</option>
+              <option value="webkit">webkit</option>
+              <option value="firefox">firefox</option>
+            </select>
+          </label>
+        </fieldset>
+      </div>
+      <div class="actions">
+        <button id="run" class="primary">Run matrix</button>
+        <button id="select-all-eng" type="button">All engines</button>
+        <button id="select-all-scn" type="button">All scenarios</button>
+        <button id="download" type="button" disabled>Download results JSON</button>
+        <span id="run-status" class="muted"></span>
+      </div>
+      <div id="progress-wrap"><div id="progress-bar"></div></div>
+      <div id="progress-label"></div>
+    </section>
+
+    <section id="results-section">
+      <h2>Conformance matrix &amp; metrics</h2>
+      <div id="results">
+        <p class="muted">No run yet. Pick engines + scenarios and press <strong>Run matrix</strong>.</p>
+      </div>
+    </section>
+
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>

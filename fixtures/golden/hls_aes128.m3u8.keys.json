@@ -1,0 +1,7 @@
+{
+  "$note": "Decrypt-oracle ground truth (key/KID/IV) baked offline. Browser decrypt output is compared bit-exact against the golden frames decoded from the cleartext.",
+  "assetId": "hls_aes128.m3u8",
+  "keyHex": "366a63833fcc99941516c6239b0d3f11",
+  "ivHex": "953e5e232e1585e615d9164ece153cf2",
+  "scheme": "hls-aes128"
+}

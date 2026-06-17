@@ -1,0 +1,14 @@
+{
+  "container": "adts",
+  "durationSec": 10.031,
+  "tracks": [
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 130650,
+      "language": null
+    }
+  ]
+}

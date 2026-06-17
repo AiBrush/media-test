@@ -1,0 +1,200 @@
+/**
+ * src/engines/platform/probe.ts — best-effort NormalizedMetadata from raw platform APIs.
+ *
+ * Raw platform probing is limited: an HTMLVideoElement exposes duration + intrinsic dimensions but
+ * NOT the codec fourcc, fps, channel layout, or bitrate. To fill codec/dims we use the inline
+ * demuxers (MP4/WebM) which read the sample-description boxes directly. For containers neither
+ * demuxer parses, we degrade to a <video>-only probe (duration + a single video track with unknown
+ * codec). This is declared honestly in capabilities() and reflected in the returned metadata.
+ */
+
+import type { MediaInput, NormalizedMetadata, NormalizedTrack } from '../../core/engine.ts';
+import { demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import { demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+
+/** Map a MIME / asset id hint to a canonical container token. */
+function containerFromMime(mime: string, bytes: Uint8Array): string {
+  const m = mime.toLowerCase();
+  if (m.includes('mp4')) return 'mp4';
+  if (m.includes('quicktime') || m.includes('mov')) return 'mov';
+  if (m.includes('webm')) return 'webm';
+  if (m.includes('matroska') || m.includes('mkv')) return 'mkv';
+  if (m.includes('mpegts') || m.includes('mp2t') || m.includes('/ts')) return 'ts';
+  if (m.includes('ogg')) return 'ogg';
+  if (m.includes('wav')) return 'wav';
+  if (m.includes('mpeg') && m.includes('audio')) return 'mp3';
+  // Fall back to a sniff.
+  if (looksLikeMp4(bytes)) return 'mp4';
+  if (looksLikeWebm(bytes)) return 'webm';
+  return 'unknown';
+}
+
+/**
+ * Read duration + intrinsic dimensions from a <video> element (page main thread only). Resolves
+ * null fields if the element cannot load (e.g. browser can't play the container).
+ */
+async function probeViaVideoElement(
+  blob: Blob,
+  timeoutMs: number,
+): Promise<{ durationSec: number | null; width?: number; height?: number }> {
+  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+    return { durationSec: null };
+  }
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement('video');
+  video.muted = true;
+  video.preload = 'metadata';
+  video.src = url;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const ok = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve();
+      };
+      const err = () => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error('<video> error before metadata'));
+      };
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(new Error('metadata timeout'));
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        video.removeEventListener('loadedmetadata', ok);
+        video.removeEventListener('error', err);
+      };
+      video.addEventListener('loadedmetadata', ok, { once: true });
+      video.addEventListener('error', err, { once: true });
+    });
+    const durationSec = Number.isFinite(video.duration) ? video.duration : null;
+    const out: { durationSec: number | null; width?: number; height?: number } = { durationSec };
+    if (video.videoWidth > 0) out.width = video.videoWidth;
+    if (video.videoHeight > 0) out.height = video.videoHeight;
+    return out;
+  } catch {
+    return { durationSec: null };
+  } finally {
+    video.removeAttribute('src');
+    try {
+      video.load();
+    } catch {
+      /* ignore */
+    }
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** Estimate fps from demuxed sample timestamps (median inter-frame interval). */
+function fpsFromSamples(samples: Array<{ ptsUs: number }>): number | undefined {
+  if (samples.length < 2) return undefined;
+  const sorted = samples.map((s) => s.ptsUs).sort((a, b) => a - b);
+  const deltas: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const d = sorted[i]! - sorted[i - 1]!;
+    if (d > 0) deltas.push(d);
+  }
+  if (deltas.length === 0) return undefined;
+  deltas.sort((a, b) => a - b);
+  const median = deltas[Math.floor(deltas.length / 2)]!;
+  return median > 0 ? Math.round((1_000_000 / median) * 1000) / 1000 : undefined;
+}
+
+/** Duration in seconds from demuxed samples (last pts + its duration, or pts span). */
+function durationFromSamples(samples: Array<{ ptsUs: number; durationUs: number }>): number | null {
+  if (samples.length === 0) return null;
+  let maxEnd = 0;
+  for (const s of samples) maxEnd = Math.max(maxEnd, s.ptsUs + (s.durationUs || 0));
+  return maxEnd > 0 ? maxEnd / 1_000_000 : null;
+}
+
+/**
+ * Probe an input to NormalizedMetadata. Uses inline demux (MP4/WebM) for codec/dims/fps when it can,
+ * supplemented by a <video> element for an authoritative duration; otherwise a <video>-only probe.
+ */
+export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number }): Promise<NormalizedMetadata> {
+  const timeoutMs = opts?.timeoutMs ?? 5000;
+  const ab = await input.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  const container = containerFromMime(input.mime, bytes);
+
+  const tracks: NormalizedTrack[] = [];
+  let durationSec: number | null = null;
+
+  // Inline demux for video codec/dims/fps when the container is parseable.
+  let demuxFps: number | undefined;
+  let demuxDuration: number | null = null;
+  try {
+    if (container === 'mp4' || container === 'mov' || looksLikeMp4(bytes)) {
+      const t = demuxMp4Video(bytes);
+      const track: NormalizedTrack = {
+        type: 'video',
+        codec: t.config.codec,
+        width: t.config.codedWidth,
+        height: t.config.codedHeight,
+        bitrate: null,
+        language: null,
+      };
+      const fps = fpsFromSamples(t.samples);
+      if (fps !== undefined) {
+        track.fps = fps;
+        demuxFps = fps;
+      }
+      tracks.push(track);
+      demuxDuration = durationFromSamples(t.samples);
+    } else if (container === 'webm' || container === 'mkv' || looksLikeWebm(bytes)) {
+      const t = demuxWebmVideo(bytes);
+      const track: NormalizedTrack = {
+        type: 'video',
+        codec: t.config.codec,
+        width: t.config.codedWidth,
+        height: t.config.codedHeight,
+        bitrate: null,
+        language: null,
+      };
+      const fps = fpsFromSamples(t.samples);
+      if (fps !== undefined) {
+        track.fps = fps;
+        demuxFps = fps;
+      }
+      tracks.push(track);
+      demuxDuration = durationFromSamples(t.samples);
+    }
+  } catch (e) {
+    // Unsupported variant (fragmented MP4, exotic MKV): leave tracks for the <video> probe to fill.
+    if (!(e instanceof UnsupportedMp4Error) && !(e instanceof UnsupportedWebmError)) throw e;
+  }
+
+  // <video> probe for an authoritative duration + dims (page only). Audio-only containers and
+  // containers the demuxer skipped still get a duration here.
+  const blob = new Blob([bytes.slice().buffer], { type: input.mime || 'application/octet-stream' });
+  const ve = await probeViaVideoElement(blob, timeoutMs);
+  durationSec = ve.durationSec ?? demuxDuration;
+  if (durationSec === null) durationSec = demuxDuration;
+
+  if (tracks.length === 0) {
+    // Demuxer didn't recognize the container. If <video> loaded with intrinsic dims, declare a
+    // single video track with UNKNOWN codec (honest: we couldn't identify it without demux).
+    if (ve.width && ve.height) {
+      tracks.push({ type: 'video', codec: 'unknown', width: ve.width, height: ve.height, bitrate: null, language: null });
+    } else if (durationSec !== null) {
+      // Likely audio-only or a container <video> played without video — declare an unknown track.
+      tracks.push({ type: 'other', codec: 'unknown', bitrate: null, language: null });
+    }
+  } else if (tracks[0] && (!tracks[0].width || !tracks[0].height) && ve.width && ve.height) {
+    // Fill dims from <video> if the demuxer didn't have them.
+    tracks[0].width = ve.width;
+    tracks[0].height = ve.height;
+  }
+
+  void demuxFps;
+  const meta: NormalizedMetadata = { container, durationSec, tracks };
+  return meta;
+}

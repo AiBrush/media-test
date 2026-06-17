@@ -1,0 +1,34 @@
+{
+  "container": "mp4",
+  "durationSec": 10,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "h264",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "bitrate": 3358956,
+      "language": "und"
+    },
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 128143,
+      "language": "und"
+    },
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 128112,
+      "language": "und"
+    }
+  ],
+  "tags": {
+    "major_brand": "isom"
+  }
+}

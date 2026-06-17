@@ -163,7 +163,7 @@ export interface ScenarioResult {
   scenarioId: string;
   family: ScenarioFamily;
   status: ResultStatus;
-  /** for NA_*/FAIL/ERROR: the reason (which capability/codec, which oracle, the error) */
+  /** for NA / FAIL / ERROR: the reason (which capability/codec, which oracle, the error) */
   reason?: string;
   oracleOutcomes: OracleOutcome[];
   /** per-metric aggregated stats; present only when status === 'PASS' (correctness gates benches) */

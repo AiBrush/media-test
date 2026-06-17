@@ -1,0 +1,11 @@
+{
+  "$note": "HLS segment listing for the streaming oracle. Segments are served as siblings of the playlist under fixtures/media/.",
+  "playlist": "hls_vod.m3u8",
+  "segments": [
+    "hls_vod_000.ts",
+    "hls_vod_001.ts",
+    "hls_vod_002.ts",
+    "hls_vod_003.ts",
+    "hls_vod_004.ts"
+  ]
+}

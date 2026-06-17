@@ -1,0 +1,79 @@
+{
+  "$todo": "BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer (src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.",
+  "pending": true,
+  "assetId": "hevc_1080p_10s.mp4",
+  "frames": [
+    {
+      "index": 0,
+      "ptsUs": 0,
+      "keyframe": true,
+      "sha256": null
+    },
+    {
+      "index": 1,
+      "ptsUs": 33333,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 2,
+      "ptsUs": 66667,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 3,
+      "ptsUs": 100000,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 4,
+      "ptsUs": 133333,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 5,
+      "ptsUs": 166667,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 6,
+      "ptsUs": 200000,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 7,
+      "ptsUs": 233333,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 8,
+      "ptsUs": 266667,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 9,
+      "ptsUs": 300000,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 10,
+      "ptsUs": 333333,
+      "keyframe": false,
+      "sha256": null
+    },
+    {
+      "index": 11,
+      "ptsUs": 366667,
+      "keyframe": false,
+      "sha256": null
+    }
+  ]
+}

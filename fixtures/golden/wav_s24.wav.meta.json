@@ -1,0 +1,14 @@
+{
+  "container": "wav",
+  "durationSec": 5,
+  "tracks": [
+    {
+      "type": "audio",
+      "codec": "pcm-s24",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 2304000,
+      "language": null
+    }
+  ]
+}

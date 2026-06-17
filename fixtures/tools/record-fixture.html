@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Record fixtures/media/recorder_headerless.webm</title>
+<style>body{font:14px system-ui;margin:2rem;max-width:48rem}button{font-size:1rem;padding:.5rem 1rem}</style>
+<h1>Bake the recorder-origin WebM (browser-only)</h1>
+<p>This asset is a <b>MediaRecorder</b> capture — a cluster-only WebM with no Cues/Duration in its
+header. ffmpeg cannot honestly produce one, so we record it here. Click <b>Record</b>, wait ~3s, then
+save the download as <code>fixtures/media/recorder_headerless.webm</code> and re-run
+<code>bun fixtures/bake.mjs recorder_headerless.webm</code> to checksum it.</p>
+<canvas id="c" width="320" height="240" style="border:1px solid #ccc"></canvas>
+<p><button id="rec">Record 3s</button> <span id="status"></span></p>
+<script type="module">
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let t = 0;
+function draw() {
+  t += 1;
+  ctx.fillStyle = 'hsl(' + (t % 360) + ' 70% 50%)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#fff';
+  ctx.font = '24px monospace';
+  ctx.fillText('frame ' + t, 20, 120);
+  requestAnimationFrame(draw);
+}
+draw();
+document.getElementById('rec').onclick = async () => {
+  const status = document.getElementById('status');
+  const stream = canvas.captureStream(30);
+  // Add a silent-ish audio track via WebAudio so the WebM has audio+video like a real recording.
+  try {
+    const ac = new AudioContext();
+    const osc = ac.createOscillator(); osc.frequency.value = 440;
+    const dst = ac.createMediaStreamDestination(); osc.connect(dst); osc.start();
+    dst.stream.getAudioTracks().forEach((a) => stream.addTrack(a));
+  } catch {}
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus') ? 'video/webm;codecs=vp8,opus' : 'video/webm';
+  const rec = new MediaRecorder(stream, { mimeType: mime });
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'recorder_headerless.webm';
+    a.click();
+    status.textContent = 'Saved download. Move it to fixtures/media/ and re-run the bake.';
+  };
+  rec.start(); // single blob, no timeslice → header-light, non-seekable
+  status.textContent = 'recording…';
+  setTimeout(() => rec.stop(), 3000);
+};
+</script>

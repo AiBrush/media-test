@@ -1,0 +1,26 @@
+{
+  "container": "webm",
+  "durationSec": 5.008,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "av1",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "bitrate": 3100238,
+      "language": null
+    },
+    {
+      "type": "audio",
+      "codec": "opus",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 3100238,
+      "language": null
+    }
+  ],
+  "tags": {
+    "encoder": "Lavf"
+  }
+}
