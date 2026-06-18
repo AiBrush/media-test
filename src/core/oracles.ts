@@ -157,6 +157,7 @@ export const DEFAULT_TOLERANCES: Required<OracleTolerances> = {
   ssimMin: 0.99,
   psnrMinDb: 40,
   durationToleranceSec: 1 / 24, // ≈ 0.0417s (≈ 1 frame @ 24 fps)
+  fpsTolerance: 0.05,
   seekToleranceUs: 1000,
 };
 
@@ -165,6 +166,7 @@ function withDefaults(tol?: OracleTolerances): Required<OracleTolerances> {
     ssimMin: tol?.ssimMin ?? DEFAULT_TOLERANCES.ssimMin,
     psnrMinDb: tol?.psnrMinDb ?? DEFAULT_TOLERANCES.psnrMinDb,
     durationToleranceSec: tol?.durationToleranceSec ?? DEFAULT_TOLERANCES.durationToleranceSec,
+    fpsTolerance: tol?.fpsTolerance ?? DEFAULT_TOLERANCES.fpsTolerance,
     seekToleranceUs: tol?.seekToleranceUs ?? DEFAULT_TOLERANCES.seekToleranceUs,
   };
 }
@@ -399,14 +401,19 @@ function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): Orac
   for (let i = 0; i < n; i++) {
     const a = gotTracks[i]!;
     const b = goldTracks[i]!;
-    diffs.push(...compareTrack(i, a, b));
+    diffs.push(...compareTrack(i, a, b, t));
   }
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
   return pass(oracle, `metadata matches golden (${gotTracks.length} track(s))`, measurements);
 }
 
-function compareTrack(i: number, a: NormalizedTrack, b: NormalizedTrack): string[] {
+function compareTrack(
+  i: number,
+  a: NormalizedTrack,
+  b: NormalizedTrack,
+  t: Required<OracleTolerances>,
+): string[] {
   const d: string[] = [];
   const p = `track[${i}]`;
   if (a.type !== b.type) d.push(`${p}.type: '${a.type}' vs '${b.type}'`);
@@ -415,8 +422,8 @@ function compareTrack(i: number, a: NormalizedTrack, b: NormalizedTrack): string
   if (b.width != null && a.width !== b.width) d.push(`${p}.width: ${a.width} vs ${b.width}`);
   if (b.height != null && a.height !== b.height) d.push(`${p}.height: ${a.height} vs ${b.height}`);
   // fps with small fractional tolerance (29.97 vs 30000/1001 rounding)
-  if (b.fps != null && a.fps != null && Math.abs(a.fps - b.fps) > 0.05) {
-    d.push(`${p}.fps: ${a.fps} vs ${b.fps}`);
+  if (b.fps != null && a.fps != null && Math.abs(a.fps - b.fps) > t.fpsTolerance) {
+    d.push(`${p}.fps: ${a.fps} vs ${b.fps} (tol ±${t.fpsTolerance})`);
   } else if (b.fps != null && a.fps == null) {
     d.push(`${p}.fps: null vs ${b.fps}`);
   }

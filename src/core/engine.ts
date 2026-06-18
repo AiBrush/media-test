@@ -8,7 +8,7 @@
  * and bake contexts alike.
  */
 
-export type BrowserName = 'chromium' | 'webkit' | 'firefox';
+export type BrowserName = 'brave' | 'chromium' | 'webkit' | 'firefox';
 
 /** A corpus asset, served as a static file (supports HTTP Range). */
 export interface MediaInput {
@@ -104,7 +104,7 @@ export interface CapabilitySet {
   videoCodecs: string[]; // ['h264','hevc','vp8','vp9','av1', ...]
   audioCodecs: string[]; // ['aac','opus','mp3','flac','vorbis','pcm-s16','pcm-s24','pcm-f32', ...]
   encryption: EncryptionScheme[];
-  features: string[]; // 'fragmented','fastStart:reserve','trim:frame-accurate','metadata:write','alpha','resize','rotate','fanout', ...
+  features: string[]; // 'fragmented','fastStart:reserve','trim:frame-accurate','metadata:write','packets:dts','alpha','resize','rotate', ...
 }
 
 export interface TranscodeVideoOptions {

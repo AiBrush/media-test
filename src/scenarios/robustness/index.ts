@@ -109,6 +109,7 @@ interface EdgeCase {
   features?: string[];
   encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
   options?: Record<string, unknown>;
+  tolerances?: Scenario['tolerances'];
   oracles: Scenario['oracles'];
   notes?: string;
 }
@@ -131,6 +132,7 @@ const EDGE_CASES: EdgeCase[] = [
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     oracles: ['golden-metadata'],
+    tolerances: { fpsTolerance: 0.1 },
     notes: 'VFR duration/fps reporting under non-uniform timestamps.',
   },
   {
@@ -279,6 +281,7 @@ const edgeScenarios: Scenario[] = EDGE_CASES.map((c) =>
     },
     oracles: c.oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     // The edge battery is also timeout-guarded so a hang on a hard-but-valid input is caught.
     timeoutMs: FUZZ_TIMEOUT_MS,
     ...(c.notes ? { notes: c.notes } : {}),

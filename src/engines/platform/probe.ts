@@ -98,9 +98,21 @@ async function probeViaVideoElement(
   }
 }
 
-/** Estimate fps from demuxed sample timestamps (median inter-frame interval). */
-function fpsFromSamples(samples: Array<{ ptsUs: number }>): number | undefined {
+/** Estimate fps from demuxed samples as average sample rate; fall back to median interval. */
+function fpsFromSamples(samples: Array<{ ptsUs: number; durationUs?: number }>): number | undefined {
   if (samples.length < 2) return undefined;
+
+  let minStart = Number.POSITIVE_INFINITY;
+  let maxEnd = Number.NEGATIVE_INFINITY;
+  for (const s of samples) {
+    minStart = Math.min(minStart, s.ptsUs);
+    maxEnd = Math.max(maxEnd, s.ptsUs + (s.durationUs || 0));
+  }
+  const spanUs = maxEnd - minStart;
+  if (Number.isFinite(spanUs) && spanUs > 0) {
+    return Math.round(((samples.length * 1_000_000) / spanUs) * 1000) / 1000;
+  }
+
   const sorted = samples.map((s) => s.ptsUs).sort((a, b) => a - b);
   const deltas: number[] = [];
   for (let i = 1; i < sorted.length; i++) {

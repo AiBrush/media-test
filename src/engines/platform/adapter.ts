@@ -218,8 +218,9 @@ export class PlatformEngine implements MediaEngine {
       audioCodecs: ['aac', 'opus', 'vorbis'],
       encryption: [],
       // 'alpha' decode is possible via WebCodecs alpha:'keep' on VP8/VP9; 'resize' via canvas in the
-      // transcode path. We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
-      features: ['resize', 'alpha'],
+      // transcode path; 'packets:dts' comes from MP4 sample-table decode timestamps.
+      // We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
+      features: ['resize', 'alpha', 'packets:dts'],
     };
   }
 

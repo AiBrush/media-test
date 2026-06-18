@@ -144,7 +144,7 @@ function wireControls(): void {
 function resolveBrowser(explicit?: BrowserName | 'auto'): BrowserName {
   if (explicit && explicit !== 'auto') return explicit;
   const tag = getEl<HTMLSelectElement>('browser-tag').value;
-  if (tag === 'chromium' || tag === 'webkit' || tag === 'firefox') return tag;
+  if (tag === 'brave' || tag === 'chromium' || tag === 'webkit' || tag === 'firefox') return tag;
   return env.browser;
 }
 

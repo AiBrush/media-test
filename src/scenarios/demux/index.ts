@@ -56,6 +56,7 @@ interface DemuxCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
+  features?: string[];
   notes?: string;
 }
 
@@ -67,6 +68,7 @@ const DEMUX_CASES: DemuxCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['packets:dts'],
     notes: 'B-frames: dts < pts on reordered frames — golden encodes the exact dts/pts spread.',
   },
   {
@@ -74,6 +76,7 @@ const DEMUX_CASES: DemuxCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['packets:dts'],
     notes: 'VFR: uneven inter-packet pts deltas; demux must preserve per-sample timestamps verbatim.',
   },
   {
@@ -223,6 +226,7 @@ const coreScenarios: Scenario[] = DEMUX_CASES.map((c) =>
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.encryption ? { encryption: c.encryption } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: ['golden-packets'],
     metrics: ['wall'],

@@ -211,6 +211,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
         'http-range', // webReader issues HTTP Range requests for URL sources (HLS path; dossier §A.1/§A.14)
         'streaming-read', // progressive parse, async-callback back-pressure
         'worker', // parseMediaOnWebWorker main-thread offload (when bundler allows)
+        'packets:dts', // sample.decodingTimestamp is surfaced separately from timestamp
         'webcodecs:samples', // emits EncodedVideoChunk/EncodedAudioChunk-compatible samples
       ],
     };

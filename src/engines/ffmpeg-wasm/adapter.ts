@@ -660,6 +660,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'trim:frame-accurate', // output-seek re-encode
       'fragmented', // -movflags frag_keyframe+empty_moov
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
+      'packets:dts', // framecrc exposes packet dts separately from pts
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
     ];
   }

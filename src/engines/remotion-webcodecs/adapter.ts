@@ -210,7 +210,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       // No decrypt API.
       encryption: [],
       // Pixel transforms are limited to resize + rotate (90° multiples) on OffscreenCanvas 2D.
-      features: ['resize', 'rotate'],
+      features: ['resize', 'rotate', 'packets:dts'],
     };
   }
 

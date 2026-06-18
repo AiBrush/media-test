@@ -356,7 +356,7 @@ export class Mp4boxEngine implements MediaEngine {
       // 'webcodecs:demux-feed': demux output feeds WebCodecs EncodedVideoChunk/description.
       // 'webcodecs:independent': probe/demux/remux are pure-JS and never touch the browser codec
       //                          gate, so the runner must not browser-gate them on codec availability.
-      features: ['fragmented', 'metadata:read', 'webcodecs:demux-feed', 'webcodecs:independent'],
+      features: ['fragmented', 'metadata:read', 'packets:dts', 'webcodecs:demux-feed', 'webcodecs:independent'],
     };
   }
 

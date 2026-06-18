@@ -81,6 +81,7 @@ export interface OracleTolerances {
   ssimMin?: number;
   psnrMinDb?: number;
   durationToleranceSec?: number;
+  fpsTolerance?: number;
   seekToleranceUs?: number;
 }
 

@@ -7,7 +7,7 @@
 #
 # Flags (all optional; sensible defaults):
 #   --engine <id>        run only this engine (repeatable / comma-separated). Default: all registered.
-#   --browser <name>     chromium|webkit|firefox (repeatable / comma-separated). Default: all three.
+#   --browser <name>     brave|chromium|webkit|firefox (repeatable / comma-separated). Default: brave.
 #   --pillar <name>      functional|performance|robustness|all. Default: all.
 #   --scenario <id>      run only this scenario (repeatable / comma-separated).
 #   --port <n>           static server port. Default: an EPHEMERAL FREE port is auto-selected (so a

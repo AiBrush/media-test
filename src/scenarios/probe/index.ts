@@ -30,7 +30,7 @@
  * silent (§15).
  */
 
-import type { MetricId, OracleId, Scenario } from '../../core/scenario.ts';
+import type { MetricId, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
 // ── (A) per-container golden-metadata probes ─────────────────────────────────────────────────────
@@ -41,6 +41,7 @@ interface ProbeCase {
   container: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
+  tolerances?: OracleTolerances;
   notes?: string;
 }
 
@@ -61,7 +62,8 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'Variable frame rate — fps is nominal/average; oracle tolerates ±1 frame on duration.',
+    tolerances: { fpsTolerance: 0.1 },
+    notes: 'Variable frame rate — fps is nominal/average; oracle uses a VFR-specific average-fps tolerance.',
   },
   {
     asset: 'h264_rotated90.mp4',
@@ -276,6 +278,7 @@ const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
     },
     oracles: ['golden-metadata'],
     metrics: ['wall'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   }),
 );

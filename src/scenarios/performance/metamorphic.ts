@@ -123,7 +123,7 @@ const vfrIteratePackets: Scenario = perfCase({
   id: 'performance/metamorphic-vfr-iterate-packets',
   op: 'demux',
   input: VFR_ASSET,
-  requires: mp4H264In('demux'),
+  requires: { ...mp4H264In('demux'), features: ['packets:dts'] },
   oracles: ['golden-packets'],
   metrics: ['packetsPerSec', 'throughputRealtime', 'wall'],
   primary: 'packetsPerSec',
@@ -143,6 +143,7 @@ const vfrProbeDuration: Scenario = perfCase({
   oracles: ['golden-metadata'],
   metrics: ['opsPerSec', 'wall'],
   primary: 'opsPerSec',
+  tolerances: { fpsTolerance: 0.1 },
   timeoutMs: T_FAST,
   notes:
     `§A.16 VFR duration: probe ${VFR_ASSET}, golden-metadata asserts duration derives from real ` +

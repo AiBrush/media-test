@@ -1,8 +1,8 @@
 # Browser Media-Engine Benchmark Report
 
-Reference engine: `mediabunny` · Suite 0.1.0 · Generated 2026-06-18T14:01:02.096Z
+Reference engine: `mediabunny` · Suite 0.1.0 · Generated 2026-06-18T17:40:53.441Z
 
-Engines: `aibrush-media@dev`, `ffmpeg.wasm@0.12.15`, `mediabunny@1.48.0`, `mp4box@2.3.0`, `platform@chrome-149`, `remotion-media-parser@4.0.479`, `remotion-webcodecs@4.0.479`, `web-demuxer@4.0.0` · Browsers: chromium, brave · Scenarios: 338
+Engines: `aibrush-media@dev`, `ffmpeg.wasm@0.12.15`, `mediabunny@1.48.0`, `mp4box@2.3.0`, `platform@chrome-149`, `remotion-media-parser@4.0.479`, `remotion-webcodecs@4.0.479`, `web-demuxer@4.0.0` · Browsers: brave, chromium · Scenarios: 339
 
 All deltas are **within a single browser, vs the reference engine, on the same corpus.** Numbers are never compared across browsers (see Caveats).
 
@@ -12,29 +12,2482 @@ All deltas are **within a single browser, vs the reference engine, on the same c
 
 | # | Engine | Wins | Conf % | Robust % | Bundle | Breadth | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `mediabunny@1.48.0` | 28 (27 unc.) | 31.1% | — | 165.2 kB | 7 | 28 wins (1 contested, 27 uncontested) · perf 1× vs winners · 31.1% conformant · 165.2 kB bundle |
+| 1 | `mediabunny@1.48.0` | 30 (29 unc.) | 31.8% | 100% | 165.2 kB | 8 | 30 wins (1 contested, 29 uncontested) · perf 0.99× vs winners · 31.8% conformant · 100% robust · 165.2 kB bundle |
 | 2 | `remotion-webcodecs@4.0.479` | 7 (7 unc.) | 46.5% | — | 94 kB | 6 | 7 wins (0 contested, 7 uncontested) · perf 0.15× vs winners · 46.5% conformant · 94 kB bundle |
-| 3 | `mp4box@2.3.0` | 3 (2 unc.) | 63% | — | 41.3 kB | 5 | 3 wins (1 contested, 2 uncontested) · perf 0.25× vs winners · 63% conformant · 41.3 kB bundle |
+| 3 | `mp4box@2.3.0` | 4 (3 unc.) | 63.4% | — | 41.3 kB | 5 | 4 wins (1 contested, 3 uncontested) · perf 1× vs winners · 63.4% conformant · 41.3 kB bundle |
 | 4 | `ffmpeg.wasm@0.12.15` | 2 | 75% | — | 1.4 kB | 1 | 2 wins · perf 0.74× vs winners · 75% conformant · 1.4 kB bundle |
 | 5 | `web-demuxer@4.0.0` | 2 (2 unc.) | 37.1% | — | 43.2 kB | 4 | 2 wins (0 contested, 2 uncontested) · perf 0.22× vs winners · 37.1% conformant · 43.2 kB bundle |
 | 6 | `remotion-media-parser@4.0.479` | 1 | 53.8% | — | 72.6 kB | 4 | 1 win · perf 0.06× vs winners · 53.8% conformant · 72.6 kB bundle |
-| 7 | `platform@chrome-149` | 0 | 47.2% | — | — | 4 | 0 wins · perf 0.9× vs winners · 47.2% conformant |
+| 7 | `platform@chrome-149` | 1 | 47.8% | — | — | 4 | 1 win · perf 0.95× vs winners · 47.8% conformant |
 | 8 | `aibrush-media@dev` | 0 | 0% | — | — | 0 | 0 wins · 0% conformant |
 
 _Wins = cases where the engine was the fastest CORRECT engine; co-winners of a tie both count, "unc." = uncontested (the only eligible engine). Win COUNTS are aggregated across browsers (counts are safe to sum; raw timing numbers are not — see Caveats). Ranked by wins, then conformance._
 
 ## Conformance summary (context)
 
-| Engine | chromium conf % | brave conf % |
+| Engine | brave conf % | chromium conf % |
 | --- | --- | --- |
 | `aibrush-media@dev` | 0% | 0% |
-| `ffmpeg.wasm@0.12.15` | 75% | 0% |
-| `mediabunny@1.48.0` | 28.5% | 100% |
-| `mp4box@2.3.0` | 63% | 0% |
-| `platform@chrome-149` | 46.6% | 100% |
-| `remotion-media-parser@4.0.479` | 53.8% | 0% |
-| `remotion-webcodecs@4.0.479` | 46.5% | 0% |
-| `web-demuxer@4.0.0` | 37.1% | 0% |
+| `ffmpeg.wasm@0.12.15` | 0% | 75% |
+| `mediabunny@1.48.0` | 100% | 28.5% |
+| `mp4box@2.3.0` | 100% | 63% |
+| `platform@chrome-149` | 100% | 46.6% |
+| `remotion-media-parser@4.0.479` | 0% | 53.8% |
+| `remotion-webcodecs@4.0.479` | 0% | 46.5% |
+| `web-demuxer@4.0.0` | 0% | 37.1% |
+
+## Browser: brave
+
+### 1. Result matrix — display value per engine × case
+
+_Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicative for this browser only — never compared across browsers (see Caveats)._
+
+| Case | Primary metric | aibrush-media@dev | ffmpeg.wasm@0.12.15 | mediabunny@1.48.0 | mp4box@2.3.0 | platform@chrome-149 | remotion-media-parser@4.0.479 | remotion-webcodecs@4.0.479 | web-demuxer@4.0.0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/caf_container_probe` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/gain_half_f32` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — | — | — | — | — |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — | — | — | — | — |
+| `demux/aac_adts` | — | — | — | — | — | — | — | — | — |
+| `demux/av1_720p_5s` | — | — | — | — | — | — | — | — | — |
+| `demux/empty_audio_zero_packets` | — | — | — | — | — | — | — | — | — |
+| `demux/flac_noseektable` | — | — | — | — | — | — | — | — | — |
+| `demux/flac_seektable` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_4k_10s` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_bframes_1080p` | wall (ms) | — | — | N/A | Pass (22.91 ms) | — | — | — | N/A |
+| `demux/h264_in_mkv` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_multitrack` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_rotated90` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_ts` | — | — | — | — | — | — | — | — | — |
+| `demux/h264_vfr` | — | — | — | — | — | — | — | — | — |
+| `demux/hevc_1080p_10s` | — | — | — | — | — | — | — | — | — |
+| `demux/hls_aes128` | — | — | — | — | — | — | — | — | — |
+| `demux/hls_vod` | — | — | — | — | — | — | — | — | — |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — | — | — | — | — |
+| `demux/mp3_cbr_notoc` | — | — | — | — | — | — | — | — | — |
+| `demux/mp3_xing` | — | — | — | — | — | — | — | — | — |
+| `demux/opus` | — | — | — | — | — | — | — | — | — |
+| `demux/pcm_s16be` | — | — | — | — | — | — | — | — | — |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — | — | — | — | — |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — | — | — | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — | — | — | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — | — | — | — | — |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | — | — | — | — | — |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — | — | — | — | — |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — | — | — | — | — |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — | — |
+| `demux/vp8_720p_10s` | — | — | — | — | — | — | — | — | — |
+| `demux/vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
+| `demux/vp9_alpha` | — | — | — | — | — | — | — | — | — |
+| `demux/wav_f32` | — | — | — | — | — | — | — | — | — |
+| `demux/wav_s16` | — | — | — | — | — | — | — | — | — |
+| `demux/wav_s24` | — | — | — | — | — | — | — | — | — |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — | — | — | — | — |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — | — |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — | — |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — | — | — | — | — |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — | — | — | — | — |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — | — | — | — | — |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_flac_seektable` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_in_mkv` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_multitrack` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_mp3_xing` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_no_tags_wav` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_opus` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_pcm_s16be` | — | — | — | — | — | — | — | — | — |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — | — | — | — | — |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — | — | — | — | — |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | — | — | — | — | — |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — | — | — | — | — |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | — | — | — | — | — |
+| `metadata/write_mkv_tags` | — | — | — | — | — | — | — | — | — |
+| `metadata/write_mp3_id3` | — | — | — | — | — | — | — | — | — |
+| `metadata/write_mp4_tags` | — | — | — | — | — | — | — | — | — |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — | — | — | — | — |
+| `mux/aac_to_adts` | — | — | — | — | — | — | — | — | — |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/av1_opus_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/drop_audio_track_subset_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (28.25 ms) | N/A | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — | — | — | — | — |
+| `mux/flac_to_mkv_audio` | — | — | — | — | — | — | — | — | — |
+| `mux/h264_aac_to_mkv` | throughputRealtime (x-realtime) | — | — | Pass (84.06 ms) | N/A | — | — | — | — |
+| `mux/h264_aac_to_mov` | — | — | — | — | — | — | — | — | — |
+| `mux/h264_aac_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (88.49 ms) | — | — | — | — | — |
+| `mux/h264_aac_to_ts` | — | — | — | — | — | — | — | — | — |
+| `mux/mp3_to_mp3` | — | — | — | — | — | — | — | — | — |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | — | — | — | — | — |
+| `mux/mp4_faststart_reserve` | — | — | — | — | — | — | — | — | — |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — | — |
+| `mux/mp4_progressive_buffer` | — | — | — | — | — | — | — | — | — |
+| `mux/mp4_streaming_target` | — | — | — | — | — | — | — | — | — |
+| `mux/neg_h264_into_wav_illegal` | — | — | — | Pass (89 ms) | N/A | — | — | — | — |
+| `mux/opus_to_ogg` | — | — | — | — | — | — | — | — | — |
+| `mux/opus_to_webm_audio` | — | — | — | — | — | — | — | — | — |
+| `mux/pcm_f32_to_wav` | — | — | — | — | — | — | — | — | — |
+| `mux/pcm_s16_to_wav` | — | — | — | — | — | — | — | — | — |
+| `mux/pcm_s24_to_wav` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — | — | — | — | — |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — | — | — | — | — |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `mux/video_plus_audio_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (89.66 ms) | N/A | — | — | — | — |
+| `mux/vorbis_to_ogg` | — | — | — | — | — | — | — | — | — |
+| `mux/vp9_opus_to_webm` | — | — | — | — | — | — | — | — | — |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — | — | — | — | — |
+| `performance/bundle-size` | — | — | — | — | — | — | — | — | — |
+| `performance/convert-longtasks` | — | — | — | — | — | — | — | — | — |
+| `performance/convert-peak-memory` | — | — | — | — | — | — | — | — | — |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | — | — | — | — | — |
+| `performance/decode-fps` | decodeFps (fps) | — | — | Pass (5.43 s) | — | Pass (5.71 s) | — | — | — |
+| `performance/encode-fps` | — | — | — | — | — | — | — | — | — |
+| `performance/extract-metadata` | — | — | — | — | — | — | — | — | — |
+| `performance/iterate-video-packets` | — | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-decode-remux` | — | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | — | N/A | — | — | — | — | — |
+| `performance/metamorphic-vfr-probe-duration` | opsPerSec (ops/s) | — | — | Pass (11.7 ms) | — | — | — | — | — |
+| `performance/op-sweep-demux` | — | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-probe` | — | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | — | — | — | — | — |
+| `performance/seek-ms` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — | — | — | — | — |
+| `probe/aac_adts` | — | — | — | — | — | — | — | — | — |
+| `probe/av1_720p_5s` | — | — | — | — | — | — | — | — | — |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — | — | — | — | — |
+| `probe/cenc_cbcs` | — | — | — | — | — | — | — | — | — |
+| `probe/cenc_ctr` | — | — | — | — | — | — | — | — | — |
+| `probe/empty-audio-wav` | — | — | — | — | — | — | — | — | — |
+| `probe/flac_noseektable` | — | — | — | — | — | — | — | — | — |
+| `probe/flac_seektable` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_4k_10s` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_bframes_1080p` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_in_mkv` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_multitrack` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_rotated90` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_ts` | — | — | — | — | — | — | — | — | — |
+| `probe/h264_vfr` | wall (ms) | — | — | Pass (9.2 ms) | — | Pass (8.42 ms) | — | — | — |
+| `probe/hevc_1080p_10s` | — | — | — | — | — | — | — | — | — |
+| `probe/hls_aes128` | — | — | — | — | — | — | — | — | — |
+| `probe/hls_vod` | — | — | — | — | — | — | — | — | — |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | — | — | — | — | — |
+| `probe/large_h264_1080p_120s` | — | — | — | — | — | — | — | — | — |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | — | — | — | — | — |
+| `probe/longform_1h_audio` | — | — | — | — | — | — | — | — | — |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | — | — | — | — | — |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | — | — | — | — | — |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — | — | — | — | — |
+| `probe/micro_audio_short` | — | — | — | — | — | — | — | — | — |
+| `probe/micro_h264_1frame` | wall (ms) | N/A | — | Pass (1.94 ms) | — | — | — | — | — |
+| `probe/mp3_cbr_notoc` | — | — | — | — | — | — | — | — | — |
+| `probe/mp3_xing` | — | — | — | — | — | — | — | — | — |
+| `probe/opus` | — | — | — | — | — | — | — | — | — |
+| `probe/pcm_s16be` | — | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-large` | — | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | — | — | — | — | — |
+| `probe/recorder_headerless` | — | — | — | — | — | — | — | — | — |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | — | — | — | — | — |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — | — |
+| `probe/truncated-header-graceful` | — | — | — | — | — | — | — | — | — |
+| `probe/vp8_720p_10s` | — | — | — | — | — | — | — | — | — |
+| `probe/vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
+| `probe/vp9_alpha` | — | — | — | — | — | — | — | — | — |
+| `probe/wav_f32` | — | — | — | — | — | — | — | — | — |
+| `probe/wav_s16` | — | — | — | — | — | — | — | — | — |
+| `probe/wav_s24` | — | — | — | — | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/opus_ogg_to_webm` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — | — | — | — | — |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | wall (ms) | — | — | Pass (12.74 ms) | — | — | — | — | — |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — | — | — | — | — |
+| `streaming-output/webm_streaming_target` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_aac_adts_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_mp3_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/av1_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_keyframe_aligned` | throughputRealtime (x-realtime) | — | — | Pass (723 ms) | N/A | — | — | — | — |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_noop_full_range_idempotent` | throughputRealtime (x-realtime) | — | — | Pass (64.11 ms) | N/A | — | — | — | — |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_start_zero_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_to_eof_copy` | — | — | — | — | — | — | — | — | — |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/hevc_frame_accurate` | — | — | — | — | — | — | — | — | — |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — | — | — | — | — |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | — | — | — | — | — |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — | — | — | — | — |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | — | — | — | — | — |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/mov_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/robust_zero_length_range` | — | — | — | Pass (67 ms) | N/A | — | — | — | — |
+| `trim/ts_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — | — | — | — | — |
+
+### 2. Winners — one per case (🏆 = fastest correct engine)
+
+| Case | Winner | Value | Runner-up | Margin | Eligible | Flag |
+| --- | --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | 0 | no winner |
+| `audio-dsp/caf_container_probe` | — | — | — | — | 0 | no winner |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | 0 | no winner |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | 0 | no winner |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | 0 | no winner |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | 0 | no winner |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | 0 | no winner |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | 0 | no winner |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | 0 | no winner |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | 0 | no winner |
+| `audio-dsp/gain_half_f32` | — | — | — | — | 0 | no winner |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | 0 | no winner |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | 0 | no winner |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | 0 | no winner |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | 0 | no winner |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | 0 | no winner |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | 0 | no winner |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | 0 | no winner |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | 0 | no winner |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | 0 | no winner |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | 0 | no winner |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | 0 | no winner |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | 0 | no winner |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | 0 | no winner |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | 0 | no winner |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | 0 | no winner |
+| `demux/aac_adts` | — | — | — | — | 0 | no winner |
+| `demux/av1_720p_5s` | — | — | — | — | 0 | no winner |
+| `demux/empty_audio_zero_packets` | — | — | — | — | 0 | no winner |
+| `demux/flac_noseektable` | — | — | — | — | 0 | no winner |
+| `demux/flac_seektable` | — | — | — | — | 0 | no winner |
+| `demux/h264_1080p_30s` | — | — | — | — | 0 | no winner |
+| `demux/h264_1080p_5s` | — | — | — | — | 0 | no winner |
+| `demux/h264_4k_10s` | — | — | — | — | 0 | no winner |
+| `demux/h264_bframes_1080p` | `mp4box@2.3.0` (uncontested) | 22.91 ms | — | — | 1 | uncontested |
+| `demux/h264_in_mkv` | — | — | — | — | 0 | no winner |
+| `demux/h264_multitrack` | — | — | — | — | 0 | no winner |
+| `demux/h264_rotated90` | — | — | — | — | 0 | no winner |
+| `demux/h264_ts` | — | — | — | — | 0 | no winner |
+| `demux/h264_vfr` | — | — | — | — | 0 | no winner |
+| `demux/hevc_1080p_10s` | — | — | — | — | 0 | no winner |
+| `demux/hls_aes128` | — | — | — | — | 0 | no winner |
+| `demux/hls_vod` | — | — | — | — | 0 | no winner |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | 0 | no winner |
+| `demux/mp3_cbr_notoc` | — | — | — | — | 0 | no winner |
+| `demux/mp3_xing` | — | — | — | — | 0 | no winner |
+| `demux/opus` | — | — | — | — | 0 | no winner |
+| `demux/pcm_s16be` | — | — | — | — | 0 | no winner |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | 0 | no winner |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | 0 | no winner |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | 0 | no winner |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | 0 | no winner |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | 0 | no winner |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | 0 | no winner |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | 0 | no winner |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | 0 | no winner |
+| `demux/vp8_720p_10s` | — | — | — | — | 0 | no winner |
+| `demux/vp9_1080p_10s` | — | — | — | — | 0 | no winner |
+| `demux/vp9_alpha` | — | — | — | — | 0 | no winner |
+| `demux/wav_f32` | — | — | — | — | 0 | no winner |
+| `demux/wav_s16` | — | — | — | — | 0 | no winner |
+| `demux/wav_s24` | — | — | — | — | 0 | no winner |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | 0 | no winner |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | 0 | no winner |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | 0 | no winner |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | 0 | no winner |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | 0 | no winner |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | 0 | no winner |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | 0 | no winner |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | 0 | no winner |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | 0 | no winner |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | 0 | no winner |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `metadata/read_flac_seektable` | — | — | — | — | 0 | no winner |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | 0 | no winner |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | 0 | no winner |
+| `metadata/read_h264_in_mkv` | — | — | — | — | 0 | no winner |
+| `metadata/read_h264_multitrack` | — | — | — | — | 0 | no winner |
+| `metadata/read_mp3_xing` | — | — | — | — | 0 | no winner |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | 0 | no winner |
+| `metadata/read_no_tags_wav` | — | — | — | — | 0 | no winner |
+| `metadata/read_opus` | — | — | — | — | 0 | no winner |
+| `metadata/read_pcm_s16be` | — | — | — | — | 0 | no winner |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | 0 | no winner |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | 0 | no winner |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | 0 | no winner |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | 0 | no winner |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | 0 | no winner |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | 0 | no winner |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | 0 | no winner |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | 0 | no winner |
+| `metadata/write_mkv_tags` | — | — | — | — | 0 | no winner |
+| `metadata/write_mp3_id3` | — | — | — | — | 0 | no winner |
+| `metadata/write_mp4_tags` | — | — | — | — | 0 | no winner |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | 0 | no winner |
+| `mux/aac_to_adts` | — | — | — | — | 0 | no winner |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/av1_opus_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/drop_audio_track_subset_to_mp4` | `mediabunny@1.48.0` (uncontested) | 508.26 x-realtime | — | — | 1 | uncontested |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | 0 | no winner |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | 0 | no winner |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | 0 | no winner |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | 0 | no winner |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | 0 | no winner |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | 0 | no winner |
+| `mux/flac_to_mkv_audio` | — | — | — | — | 0 | no winner |
+| `mux/h264_aac_to_mkv` | `mediabunny@1.48.0` (uncontested) | 325.64 x-realtime | — | — | 1 | uncontested |
+| `mux/h264_aac_to_mov` | — | — | — | — | 0 | no winner |
+| `mux/h264_aac_to_mp4` | `mediabunny@1.48.0` (uncontested) | 380.08 x-realtime | — | — | 1 | uncontested |
+| `mux/h264_aac_to_ts` | — | — | — | — | 0 | no winner |
+| `mux/mp3_to_mp3` | — | — | — | — | 0 | no winner |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | 0 | no winner |
+| `mux/mp4_faststart_reserve` | — | — | — | — | 0 | no winner |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | 0 | no winner |
+| `mux/mp4_progressive_buffer` | — | — | — | — | 0 | no winner |
+| `mux/mp4_streaming_target` | — | — | — | — | 0 | no winner |
+| `mux/neg_h264_into_wav_illegal` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
+| `mux/opus_to_ogg` | — | — | — | — | 0 | no winner |
+| `mux/opus_to_webm_audio` | — | — | — | — | 0 | no winner |
+| `mux/pcm_f32_to_wav` | — | — | — | — | 0 | no winner |
+| `mux/pcm_s16_to_wav` | — | — | — | — | 0 | no winner |
+| `mux/pcm_s24_to_wav` | — | — | — | — | 0 | no winner |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | 0 | no winner |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | 0 | no winner |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | 0 | no winner |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | 0 | no winner |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | 0 | no winner |
+| `mux/video_plus_audio_to_mp4` | `mediabunny@1.48.0` (uncontested) | 373.65 x-realtime | — | — | 1 | uncontested |
+| `mux/vorbis_to_ogg` | — | — | — | — | 0 | no winner |
+| `mux/vp9_opus_to_webm` | — | — | — | — | 0 | no winner |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | 0 | no winner |
+| `performance/bundle-size` | — | — | — | — | 0 | no winner |
+| `performance/convert-longtasks` | — | — | — | — | 0 | no winner |
+| `performance/convert-peak-memory` | — | — | — | — | 0 | no winner |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | 0 | no winner |
+| `performance/decode-fps` | 🏆 `mediabunny@1.48.0` | 55.15 fps | `platform@chrome-149` | +11.46% | 2 | contested |
+| `performance/encode-fps` | — | — | — | — | 0 | no winner |
+| `performance/extract-metadata` | — | — | — | — | 0 | no winner |
+| `performance/iterate-video-packets` | — | — | — | — | 0 | no winner |
+| `performance/metamorphic-decode-remux` | — | — | — | — | 0 | no winner |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | 0 | no winner |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | 0 | no winner |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | 0 | no winner |
+| `performance/metamorphic-vfr-probe-duration` | `mediabunny@1.48.0` (uncontested) | 149.7 ops/s | — | — | 1 | uncontested |
+| `performance/op-sweep-demux` | — | — | — | — | 0 | no winner |
+| `performance/op-sweep-probe` | — | — | — | — | 0 | no winner |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | 0 | no winner |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | 0 | no winner |
+| `performance/seek-ms` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | 0 | no winner |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | 0 | no winner |
+| `probe/aac_adts` | — | — | — | — | 0 | no winner |
+| `probe/av1_720p_5s` | — | — | — | — | 0 | no winner |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | 0 | no winner |
+| `probe/cenc_cbcs` | — | — | — | — | 0 | no winner |
+| `probe/cenc_ctr` | — | — | — | — | 0 | no winner |
+| `probe/empty-audio-wav` | — | — | — | — | 0 | no winner |
+| `probe/flac_noseektable` | — | — | — | — | 0 | no winner |
+| `probe/flac_seektable` | — | — | — | — | 0 | no winner |
+| `probe/h264_1080p_30s` | — | — | — | — | 0 | no winner |
+| `probe/h264_1080p_5s` | — | — | — | — | 0 | no winner |
+| `probe/h264_4k_10s` | — | — | — | — | 0 | no winner |
+| `probe/h264_bframes_1080p` | — | — | — | — | 0 | no winner |
+| `probe/h264_in_mkv` | — | — | — | — | 0 | no winner |
+| `probe/h264_multitrack` | — | — | — | — | 0 | no winner |
+| `probe/h264_rotated90` | — | — | — | — | 0 | no winner |
+| `probe/h264_ts` | — | — | — | — | 0 | no winner |
+| `probe/h264_vfr` | 🏆 `platform@chrome-149` | 8.42 ms | `mediabunny@1.48.0` | +8.48% | 2 | contested |
+| `probe/hevc_1080p_10s` | — | — | — | — | 0 | no winner |
+| `probe/hls_aes128` | — | — | — | — | 0 | no winner |
+| `probe/hls_vod` | — | — | — | — | 0 | no winner |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | 0 | no winner |
+| `probe/large_h264_1080p_120s` | — | — | — | — | 0 | no winner |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | 0 | no winner |
+| `probe/longform_1h_audio` | — | — | — | — | 0 | no winner |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | 0 | no winner |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | 0 | no winner |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | 0 | no winner |
+| `probe/micro_audio_short` | — | — | — | — | 0 | no winner |
+| `probe/micro_h264_1frame` | `mediabunny@1.48.0` (uncontested) | 1.94 ms | — | — | 1 | uncontested |
+| `probe/mp3_cbr_notoc` | — | — | — | — | 0 | no winner |
+| `probe/mp3_xing` | — | — | — | — | 0 | no winner |
+| `probe/opus` | — | — | — | — | 0 | no winner |
+| `probe/pcm_s16be` | — | — | — | — | 0 | no winner |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | 0 | no winner |
+| `probe/perf-extract-metadata-large` | — | — | — | — | 0 | no winner |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | 0 | no winner |
+| `probe/recorder_headerless` | — | — | — | — | 0 | no winner |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | 0 | no winner |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | 0 | no winner |
+| `probe/truncated-header-graceful` | — | — | — | — | 0 | no winner |
+| `probe/vp8_720p_10s` | — | — | — | — | 0 | no winner |
+| `probe/vp9_1080p_10s` | — | — | — | — | 0 | no winner |
+| `probe/vp9_alpha` | — | — | — | — | 0 | no winner |
+| `probe/wav_f32` | — | — | — | — | 0 | no winner |
+| `probe/wav_s16` | — | — | — | — | 0 | no winner |
+| `probe/wav_s24` | — | — | — | — | 0 | no winner |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | 0 | no winner |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | 0 | no winner |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | 0 | no winner |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | 0 | no winner |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | 0 | no winner |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | 0 | no winner |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | 0 | no winner |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | 0 | no winner |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | 0 | no winner |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/opus_ogg_to_webm` | — | — | — | — | 0 | no winner |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | 0 | no winner |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | 0 | no winner |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | 0 | no winner |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | 0 | no winner |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | 0 | no winner |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | 0 | no winner |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | 0 | no winner |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | 0 | no winner |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | 0 | no winner |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | 0 | no winner |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | 0 | no winner |
+| `robustness/edge_vfr_probe` | `mediabunny@1.48.0` (uncontested) | 12.74 ms | — | — | 1 | uncontested |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | 0 | no winner |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | 0 | no winner |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | 0 | no winner |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | 0 | no winner |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | 0 | no winner |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | 0 | no winner |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | 0 | no winner |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | 0 | no winner |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | 0 | no winner |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | 0 | no winner |
+| `streaming-output/webm_streaming_target` | — | — | — | — | 0 | no winner |
+| `trim/audio_aac_adts_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_mp3_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | 0 | no winner |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | 0 | no winner |
+| `trim/av1_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | 0 | no winner |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/h264_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/h264_keyframe_aligned` | `mediabunny@1.48.0` (uncontested) | 42.05 x-realtime | — | — | 1 | uncontested |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | 0 | no winner |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/h264_noop_full_range_idempotent` | `mediabunny@1.48.0` (uncontested) | 672.57 x-realtime | — | — | 1 | uncontested |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/h264_start_zero_copy` | — | — | — | — | 0 | no winner |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/h264_to_eof_copy` | — | — | — | — | 0 | no winner |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/hevc_frame_accurate` | — | — | — | — | 0 | no winner |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | 0 | no winner |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | 0 | no winner |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | 0 | no winner |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | 0 | no winner |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/mov_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/robust_zero_length_range` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
+| `trim/ts_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | 0 | no winner |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | 0 | no winner |
+
+### 3. Conformance matrix (same display rule, grouped by correctness)
+
+| Scenario | aibrush-media@dev | ffmpeg.wasm@0.12.15 | mediabunny@1.48.0 | mp4box@2.3.0 | platform@chrome-149 | remotion-media-parser@4.0.479 | remotion-webcodecs@4.0.479 | web-demuxer@4.0.0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | — | — | — | — |
+| `audio-dsp/caf_container_probe` | — | — | — | — | — | — | — | — |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — | — | — | — |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — | — | — | — |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — | — | — | — |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | — | — | — | — |
+| `audio-dsp/gain_half_f32` | — | — | — | — | — | — | — | — |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — | — | — | — |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — | — | — | — |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — | — | — | — |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | — | — | — | — |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — | — | — | — |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — | — | — | — |
+| `demux/aac_adts` | — | — | — | — | — | — | — | — |
+| `demux/av1_720p_5s` | — | — | — | — | — | — | — | — |
+| `demux/empty_audio_zero_packets` | — | — | — | — | — | — | — | — |
+| `demux/flac_noseektable` | — | — | — | — | — | — | — | — |
+| `demux/flac_seektable` | — | — | — | — | — | — | — | — |
+| `demux/h264_1080p_30s` | — | — | — | — | — | — | — | — |
+| `demux/h264_1080p_5s` | — | — | — | — | — | — | — | — |
+| `demux/h264_4k_10s` | — | — | — | — | — | — | — | — |
+| `demux/h264_bframes_1080p` | — | — | N/A | Pass (22.91 ms) | — | — | — | N/A |
+| `demux/h264_in_mkv` | — | — | — | — | — | — | — | — |
+| `demux/h264_multitrack` | — | — | — | — | — | — | — | — |
+| `demux/h264_rotated90` | — | — | — | — | — | — | — | — |
+| `demux/h264_ts` | — | — | — | — | — | — | — | — |
+| `demux/h264_vfr` | — | — | — | — | — | — | — | — |
+| `demux/hevc_1080p_10s` | — | — | — | — | — | — | — | — |
+| `demux/hls_aes128` | — | — | — | — | — | — | — | — |
+| `demux/hls_vod` | — | — | — | — | — | — | — | — |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — | — | — | — |
+| `demux/mp3_cbr_notoc` | — | — | — | — | — | — | — | — |
+| `demux/mp3_xing` | — | — | — | — | — | — | — | — |
+| `demux/opus` | — | — | — | — | — | — | — | — |
+| `demux/pcm_s16be` | — | — | — | — | — | — | — | — |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — | — | — | — |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — | — | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — | — | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — | — | — | — |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | — | — | — | — |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — | — | — | — |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — | — | — | — |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — |
+| `demux/vp8_720p_10s` | — | — | — | — | — | — | — | — |
+| `demux/vp9_1080p_10s` | — | — | — | — | — | — | — | — |
+| `demux/vp9_alpha` | — | — | — | — | — | — | — | — |
+| `demux/wav_f32` | — | — | — | — | — | — | — | — |
+| `demux/wav_s16` | — | — | — | — | — | — | — | — |
+| `demux/wav_s24` | — | — | — | — | — | — | — | — |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — | — | — | — |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — | — | — | — |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — | — | — | — |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — | — | — | — |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `metadata/read_flac_seektable` | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_in_mkv` | — | — | — | — | — | — | — | — |
+| `metadata/read_h264_multitrack` | — | — | — | — | — | — | — | — |
+| `metadata/read_mp3_xing` | — | — | — | — | — | — | — | — |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — | — | — | — |
+| `metadata/read_no_tags_wav` | — | — | — | — | — | — | — | — |
+| `metadata/read_opus` | — | — | — | — | — | — | — | — |
+| `metadata/read_pcm_s16be` | — | — | — | — | — | — | — | — |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — | — | — | — |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — | — | — | — |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | — | — | — | — |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — | — | — | — |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | — | — | — | — |
+| `metadata/write_mkv_tags` | — | — | — | — | — | — | — | — |
+| `metadata/write_mp3_id3` | — | — | — | — | — | — | — | — |
+| `metadata/write_mp4_tags` | — | — | — | — | — | — | — | — |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — | — | — | — |
+| `mux/aac_to_adts` | — | — | — | — | — | — | — | — |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/av1_opus_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/drop_audio_track_subset_to_mp4` | — | — | Pass (28.25 ms) | N/A | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — | — | — | — |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — | — | — | — |
+| `mux/flac_to_mkv_audio` | — | — | — | — | — | — | — | — |
+| `mux/h264_aac_to_mkv` | — | — | Pass (84.06 ms) | N/A | — | — | — | — |
+| `mux/h264_aac_to_mov` | — | — | — | — | — | — | — | — |
+| `mux/h264_aac_to_mp4` | — | — | Pass (88.49 ms) | — | — | — | — | — |
+| `mux/h264_aac_to_ts` | — | — | — | — | — | — | — | — |
+| `mux/mp3_to_mp3` | — | — | — | — | — | — | — | — |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | — | — | — | — |
+| `mux/mp4_faststart_reserve` | — | — | — | — | — | — | — | — |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — |
+| `mux/mp4_progressive_buffer` | — | — | — | — | — | — | — | — |
+| `mux/mp4_streaming_target` | — | — | — | — | — | — | — | — |
+| `mux/neg_h264_into_wav_illegal` | — | — | Pass (89 ms) | N/A | — | — | — | — |
+| `mux/opus_to_ogg` | — | — | — | — | — | — | — | — |
+| `mux/opus_to_webm_audio` | — | — | — | — | — | — | — | — |
+| `mux/pcm_f32_to_wav` | — | — | — | — | — | — | — | — |
+| `mux/pcm_s16_to_wav` | — | — | — | — | — | — | — | — |
+| `mux/pcm_s24_to_wav` | — | — | — | — | — | — | — | — |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — | — | — | — |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — | — | — | — |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — | — | — | — |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — | — | — | — |
+| `mux/video_plus_audio_to_mp4` | — | — | Pass (89.66 ms) | N/A | — | — | — | — |
+| `mux/vorbis_to_ogg` | — | — | — | — | — | — | — | — |
+| `mux/vp9_opus_to_webm` | — | — | — | — | — | — | — | — |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — | — | — | — |
+| `performance/bundle-size` | — | — | — | — | — | — | — | — |
+| `performance/convert-longtasks` | — | — | — | — | — | — | — | — |
+| `performance/convert-peak-memory` | — | — | — | — | — | — | — | — |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | — | — | — | — |
+| `performance/decode-fps` | — | — | Pass (5.43 s) | — | Pass (5.71 s) | — | — | — |
+| `performance/encode-fps` | — | — | — | — | — | — | — | — |
+| `performance/extract-metadata` | — | — | — | — | — | — | — | — |
+| `performance/iterate-video-packets` | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-decode-remux` | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — | — | — | — |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | N/A | — | — | — | — | — |
+| `performance/metamorphic-vfr-probe-duration` | — | — | Pass (11.7 ms) | — | — | — | — | — |
+| `performance/op-sweep-demux` | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-probe` | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — | — | — | — |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | — | — | — | — |
+| `performance/seek-ms` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — | — | — | — |
+| `probe/aac_adts` | — | — | — | — | — | — | — | — |
+| `probe/av1_720p_5s` | — | — | — | — | — | — | — | — |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — | — | — | — |
+| `probe/cenc_cbcs` | — | — | — | — | — | — | — | — |
+| `probe/cenc_ctr` | — | — | — | — | — | — | — | — |
+| `probe/empty-audio-wav` | — | — | — | — | — | — | — | — |
+| `probe/flac_noseektable` | — | — | — | — | — | — | — | — |
+| `probe/flac_seektable` | — | — | — | — | — | — | — | — |
+| `probe/h264_1080p_30s` | — | — | — | — | — | — | — | — |
+| `probe/h264_1080p_5s` | — | — | — | — | — | — | — | — |
+| `probe/h264_4k_10s` | — | — | — | — | — | — | — | — |
+| `probe/h264_bframes_1080p` | — | — | — | — | — | — | — | — |
+| `probe/h264_in_mkv` | — | — | — | — | — | — | — | — |
+| `probe/h264_multitrack` | — | — | — | — | — | — | — | — |
+| `probe/h264_rotated90` | — | — | — | — | — | — | — | — |
+| `probe/h264_ts` | — | — | — | — | — | — | — | — |
+| `probe/h264_vfr` | — | — | Pass (9.2 ms) | — | Pass (8.42 ms) | — | — | — |
+| `probe/hevc_1080p_10s` | — | — | — | — | — | — | — | — |
+| `probe/hls_aes128` | — | — | — | — | — | — | — | — |
+| `probe/hls_vod` | — | — | — | — | — | — | — | — |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | — | — | — | — |
+| `probe/large_h264_1080p_120s` | — | — | — | — | — | — | — | — |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | — | — | — | — |
+| `probe/longform_1h_audio` | — | — | — | — | — | — | — | — |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | — | — | — | — |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | — | — | — | — |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — | — | — | — |
+| `probe/micro_audio_short` | — | — | — | — | — | — | — | — |
+| `probe/micro_h264_1frame` | N/A | — | Pass (1.94 ms) | — | — | — | — | — |
+| `probe/mp3_cbr_notoc` | — | — | — | — | — | — | — | — |
+| `probe/mp3_xing` | — | — | — | — | — | — | — | — |
+| `probe/opus` | — | — | — | — | — | — | — | — |
+| `probe/pcm_s16be` | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-large` | — | — | — | — | — | — | — | — |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | — | — | — | — |
+| `probe/recorder_headerless` | — | — | — | — | — | — | — | — |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | — | — | — | — |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — |
+| `probe/truncated-header-graceful` | — | — | — | — | — | — | — | — |
+| `probe/vp8_720p_10s` | — | — | — | — | — | — | — | — |
+| `probe/vp9_1080p_10s` | — | — | — | — | — | — | — | — |
+| `probe/vp9_alpha` | — | — | — | — | — | — | — | — |
+| `probe/wav_f32` | — | — | — | — | — | — | — | — |
+| `probe/wav_s16` | — | — | — | — | — | — | — | — |
+| `probe/wav_s24` | — | — | — | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — | — | — | — |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — | — | — | — |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — | — | — | — |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/opus_ogg_to_webm` | — | — | — | — | — | — | — | — |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — | — | — | — |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — | — | — | — |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — | — | — | — |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — | — | — | — |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — | — | — | — |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — | — | — | — |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | Pass (12.74 ms) | — | — | — | — | — |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — | — | — | — |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — | — | — | — |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — | — | — | — |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — | — | — | — |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | — | — | — | — |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — | — | — | — |
+| `streaming-output/webm_streaming_target` | — | — | — | — | — | — | — | — |
+| `trim/audio_aac_adts_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_mp3_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | — | — | — | — |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | — | — | — | — |
+| `trim/av1_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — | — | — | — |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/h264_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/h264_keyframe_aligned` | — | — | Pass (723 ms) | N/A | — | — | — | — |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | — | — | — | — |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/h264_noop_full_range_idempotent` | — | — | Pass (64.11 ms) | N/A | — | — | — | — |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/h264_start_zero_copy` | — | — | — | — | — | — | — | — |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/h264_to_eof_copy` | — | — | — | — | — | — | — | — |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/hevc_frame_accurate` | — | — | — | — | — | — | — | — |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — | — | — | — |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | — | — | — | — |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — | — | — | — |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | — | — | — | — |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/mov_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/robust_zero_length_range` | — | — | Pass (67 ms) | N/A | — | — | — | — |
+| `trim/ts_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | — | — | — | — |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — | — | — | — |
+
+<details><summary>Cell details</summary>
+
+- `aibrush-media@dev` · `probe/micro_h264_1frame` — **N/A**: engine does not declare operation 'probe'
+- `mediabunny@1.48.0` · `demux/h264_bframes_1080p` — **N/A**: engine does not declare feature 'packets:dts'
+- `mediabunny@1.48.0` · `performance/metamorphic-vfr-iterate-packets` — **N/A**: engine does not declare feature 'packets:dts'
+- `mp4box@2.3.0` · `mux/drop_audio_track_subset_to_mp4` — **N/A**: engine does not declare operation 'mux'
+- `mp4box@2.3.0` · `mux/h264_aac_to_mkv` — **N/A**: engine does not declare operation 'mux'
+- `mp4box@2.3.0` · `mux/neg_h264_into_wav_illegal` — **N/A**: engine does not declare operation 'mux'
+- `mp4box@2.3.0` · `mux/video_plus_audio_to_mp4` — **N/A**: engine does not declare operation 'mux'
+- `mp4box@2.3.0` · `trim/h264_keyframe_aligned` — **N/A**: engine does not declare operation 'trim'
+- `mp4box@2.3.0` · `trim/h264_noop_full_range_idempotent` — **N/A**: engine does not declare operation 'trim'
+- `mp4box@2.3.0` · `trim/robust_zero_length_range` — **N/A**: engine does not declare operation 'trim'
+- `web-demuxer@4.0.0` · `demux/h264_bframes_1080p` — **N/A**: engine does not declare feature 'packets:dts'
+
+</details>
+
+### 4. Benchmark matrix (full per-engine timing detail)
+
+_Indicative for this browser only. Cells without a green conformance gate are blank (—)._
+
+**`aibrush-media@dev`**
+
+_No admissible benchmarks (no green conformance gate)._
+
+**`ffmpeg.wasm@0.12.15`**
+
+_No admissible benchmarks (no green conformance gate)._
+
+**`mediabunny@1.48.0`**
+
+| Scenario | wall median (ms) | wall p95 (ms) | ×realtime | peak mem | longtasks (ms) |
+| --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | — |
+| `audio-dsp/caf_container_probe` | — | — | — | — | — |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | — |
+| `audio-dsp/gain_half_f32` | — | — | — | — | — |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | — |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — |
+| `demux/aac_adts` | — | — | — | — | — |
+| `demux/av1_720p_5s` | — | — | — | — | — |
+| `demux/empty_audio_zero_packets` | — | — | — | — | — |
+| `demux/flac_noseektable` | — | — | — | — | — |
+| `demux/flac_seektable` | — | — | — | — | — |
+| `demux/h264_1080p_30s` | — | — | — | — | — |
+| `demux/h264_1080p_5s` | — | — | — | — | — |
+| `demux/h264_4k_10s` | — | — | — | — | — |
+| `demux/h264_bframes_1080p` | — | — | — | — | — |
+| `demux/h264_in_mkv` | — | — | — | — | — |
+| `demux/h264_multitrack` | — | — | — | — | — |
+| `demux/h264_rotated90` | — | — | — | — | — |
+| `demux/h264_ts` | — | — | — | — | — |
+| `demux/h264_vfr` | — | — | — | — | — |
+| `demux/hevc_1080p_10s` | — | — | — | — | — |
+| `demux/hls_aes128` | — | — | — | — | — |
+| `demux/hls_vod` | — | — | — | — | — |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — |
+| `demux/mp3_cbr_notoc` | — | — | — | — | — |
+| `demux/mp3_xing` | — | — | — | — | — |
+| `demux/opus` | — | — | — | — | — |
+| `demux/pcm_s16be` | — | — | — | — | — |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | — |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — |
+| `demux/vp8_720p_10s` | — | — | — | — | — |
+| `demux/vp9_1080p_10s` | — | — | — | — | — |
+| `demux/vp9_alpha` | — | — | — | — | — |
+| `demux/wav_f32` | — | — | — | — | — |
+| `demux/wav_s16` | — | — | — | — | — |
+| `demux/wav_s24` | — | — | — | — | — |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — |
+| `metadata/read_flac_seektable` | — | — | — | — | — |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | — |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | — |
+| `metadata/read_h264_in_mkv` | — | — | — | — | — |
+| `metadata/read_h264_multitrack` | — | — | — | — | — |
+| `metadata/read_mp3_xing` | — | — | — | — | — |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — |
+| `metadata/read_no_tags_wav` | — | — | — | — | — |
+| `metadata/read_opus` | — | — | — | — | — |
+| `metadata/read_pcm_s16be` | — | — | — | — | — |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | — |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | — |
+| `metadata/write_mkv_tags` | — | — | — | — | — |
+| `metadata/write_mp3_id3` | — | — | — | — | — |
+| `metadata/write_mp4_tags` | — | — | — | — | — |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
+| `mux/aac_to_adts` | — | — | — | — | — |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
+| `mux/av1_opus_to_mp4` | — | — | — | — | — |
+| `mux/drop_audio_track_subset_to_mp4` | 28.3 | 28.3 | 508.26× | 25.25 MiB | 55 |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — |
+| `mux/flac_to_mkv_audio` | — | — | — | — | — |
+| `mux/h264_aac_to_mkv` | 84.1 | 84.1 | 325.64× | 209.83 MiB | 55 |
+| `mux/h264_aac_to_mov` | — | — | — | — | — |
+| `mux/h264_aac_to_mp4` | 88.5 | 88.5 | 380.08× | 209.57 MiB | 0 |
+| `mux/h264_aac_to_ts` | — | — | — | — | — |
+| `mux/mp3_to_mp3` | — | — | — | — | — |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | — |
+| `mux/mp4_faststart_reserve` | — | — | — | — | — |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `mux/mp4_progressive_buffer` | — | — | — | — | — |
+| `mux/mp4_streaming_target` | — | — | — | — | — |
+| `mux/neg_h264_into_wav_illegal` | — | — | — | — | — |
+| `mux/opus_to_ogg` | — | — | — | — | — |
+| `mux/opus_to_webm_audio` | — | — | — | — | — |
+| `mux/pcm_f32_to_wav` | — | — | — | — | — |
+| `mux/pcm_s16_to_wav` | — | — | — | — | — |
+| `mux/pcm_s24_to_wav` | — | — | — | — | — |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | — |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | — |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — |
+| `mux/video_plus_audio_to_mp4` | 89.7 | 89.7 | 373.65× | 198.46 MiB | 55 |
+| `mux/vorbis_to_ogg` | — | — | — | — | — |
+| `mux/vp9_opus_to_webm` | — | — | — | — | — |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — |
+| `performance/bundle-size` | — | — | — | — | — |
+| `performance/convert-longtasks` | — | — | — | — | — |
+| `performance/convert-peak-memory` | — | — | — | — | — |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | — |
+| `performance/decode-fps` | 5427.4 | 5427.4 | — | — | — |
+| `performance/encode-fps` | — | — | — | — | — |
+| `performance/extract-metadata` | — | — | — | — | — |
+| `performance/iterate-video-packets` | — | — | — | — | — |
+| `performance/metamorphic-decode-remux` | — | — | — | — | — |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — |
+| `performance/metamorphic-vfr-probe-duration` | 11.7 | 11.7 | — | — | — |
+| `performance/op-sweep-demux` | — | — | — | — | — |
+| `performance/op-sweep-probe` | — | — | — | — | — |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | — |
+| `performance/seek-ms` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — |
+| `probe/aac_adts` | — | — | — | — | — |
+| `probe/av1_720p_5s` | — | — | — | — | — |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — |
+| `probe/cenc_cbcs` | — | — | — | — | — |
+| `probe/cenc_ctr` | — | — | — | — | — |
+| `probe/empty-audio-wav` | — | — | — | — | — |
+| `probe/flac_noseektable` | — | — | — | — | — |
+| `probe/flac_seektable` | — | — | — | — | — |
+| `probe/h264_1080p_30s` | — | — | — | — | — |
+| `probe/h264_1080p_5s` | — | — | — | — | — |
+| `probe/h264_4k_10s` | — | — | — | — | — |
+| `probe/h264_bframes_1080p` | — | — | — | — | — |
+| `probe/h264_in_mkv` | — | — | — | — | — |
+| `probe/h264_multitrack` | — | — | — | — | — |
+| `probe/h264_rotated90` | — | — | — | — | — |
+| `probe/h264_ts` | — | — | — | — | — |
+| `probe/h264_vfr` | 9.2 | 9.2 | — | — | — |
+| `probe/hevc_1080p_10s` | — | — | — | — | — |
+| `probe/hls_aes128` | — | — | — | — | — |
+| `probe/hls_vod` | — | — | — | — | — |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | — |
+| `probe/large_h264_1080p_120s` | — | — | — | — | — |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | — |
+| `probe/longform_1h_audio` | — | — | — | — | — |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | — |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | — |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — |
+| `probe/micro_audio_short` | — | — | — | — | — |
+| `probe/micro_h264_1frame` | 1.9 | 1.9 | — | — | — |
+| `probe/mp3_cbr_notoc` | — | — | — | — | — |
+| `probe/mp3_xing` | — | — | — | — | — |
+| `probe/opus` | — | — | — | — | — |
+| `probe/pcm_s16be` | — | — | — | — | — |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | — |
+| `probe/perf-extract-metadata-large` | — | — | — | — | — |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | — |
+| `probe/recorder_headerless` | — | — | — | — | — |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | — |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | — |
+| `probe/truncated-header-graceful` | — | — | — | — | — |
+| `probe/vp8_720p_10s` | — | — | — | — | — |
+| `probe/vp9_1080p_10s` | — | — | — | — | — |
+| `probe/vp9_alpha` | — | — | — | — | — |
+| `probe/wav_f32` | — | — | — | — | — |
+| `probe/wav_s16` | — | — | — | — | — |
+| `probe/wav_s24` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | — |
+| `remux/opus_ogg_to_webm` | — | — | — | — | — |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | 12.7 | 12.7 | — | 0 B | 0 |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | — |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — |
+| `streaming-output/webm_streaming_target` | — | — | — | — | — |
+| `trim/audio_aac_adts_copy` | — | — | — | — | — |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | — |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | — |
+| `trim/audio_mp3_copy` | — | — | — | — | — |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | — |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | — |
+| `trim/av1_keyframe_aligned` | — | — | — | — | — |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | — |
+| `trim/h264_frame_accurate` | — | — | — | — | — |
+| `trim/h264_keyframe_aligned` | 723.3 | 723.3 | 42.05× | 0 B | 0 |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | — |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_noop_full_range_idempotent` | 64.1 | 64.1 | 672.57× | 0 B | 0 |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_start_zero_copy` | — | — | — | — | — |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — |
+| `trim/h264_to_eof_copy` | — | — | — | — | — |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | — |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | — |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | — |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | — |
+| `trim/mov_keyframe_aligned` | — | — | — | — | — |
+| `trim/robust_zero_length_range` | — | — | — | — | — |
+| `trim/ts_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — |
+
+**`mp4box@2.3.0`**
+
+| Scenario | wall median (ms) | wall p95 (ms) | ×realtime | peak mem | longtasks (ms) |
+| --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | — |
+| `audio-dsp/caf_container_probe` | — | — | — | — | — |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | — |
+| `audio-dsp/gain_half_f32` | — | — | — | — | — |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | — |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — |
+| `demux/aac_adts` | — | — | — | — | — |
+| `demux/av1_720p_5s` | — | — | — | — | — |
+| `demux/empty_audio_zero_packets` | — | — | — | — | — |
+| `demux/flac_noseektable` | — | — | — | — | — |
+| `demux/flac_seektable` | — | — | — | — | — |
+| `demux/h264_1080p_30s` | — | — | — | — | — |
+| `demux/h264_1080p_5s` | — | — | — | — | — |
+| `demux/h264_4k_10s` | — | — | — | — | — |
+| `demux/h264_bframes_1080p` | 22.9 | 22.9 | — | — | — |
+| `demux/h264_in_mkv` | — | — | — | — | — |
+| `demux/h264_multitrack` | — | — | — | — | — |
+| `demux/h264_rotated90` | — | — | — | — | — |
+| `demux/h264_ts` | — | — | — | — | — |
+| `demux/h264_vfr` | — | — | — | — | — |
+| `demux/hevc_1080p_10s` | — | — | — | — | — |
+| `demux/hls_aes128` | — | — | — | — | — |
+| `demux/hls_vod` | — | — | — | — | — |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — |
+| `demux/mp3_cbr_notoc` | — | — | — | — | — |
+| `demux/mp3_xing` | — | — | — | — | — |
+| `demux/opus` | — | — | — | — | — |
+| `demux/pcm_s16be` | — | — | — | — | — |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | — |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — |
+| `demux/vp8_720p_10s` | — | — | — | — | — |
+| `demux/vp9_1080p_10s` | — | — | — | — | — |
+| `demux/vp9_alpha` | — | — | — | — | — |
+| `demux/wav_f32` | — | — | — | — | — |
+| `demux/wav_s16` | — | — | — | — | — |
+| `demux/wav_s24` | — | — | — | — | — |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — |
+| `metadata/read_flac_seektable` | — | — | — | — | — |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | — |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | — |
+| `metadata/read_h264_in_mkv` | — | — | — | — | — |
+| `metadata/read_h264_multitrack` | — | — | — | — | — |
+| `metadata/read_mp3_xing` | — | — | — | — | — |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — |
+| `metadata/read_no_tags_wav` | — | — | — | — | — |
+| `metadata/read_opus` | — | — | — | — | — |
+| `metadata/read_pcm_s16be` | — | — | — | — | — |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | — |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | — |
+| `metadata/write_mkv_tags` | — | — | — | — | — |
+| `metadata/write_mp3_id3` | — | — | — | — | — |
+| `metadata/write_mp4_tags` | — | — | — | — | — |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
+| `mux/aac_to_adts` | — | — | — | — | — |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
+| `mux/av1_opus_to_mp4` | — | — | — | — | — |
+| `mux/drop_audio_track_subset_to_mp4` | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — |
+| `mux/flac_to_mkv_audio` | — | — | — | — | — |
+| `mux/h264_aac_to_mkv` | — | — | — | — | — |
+| `mux/h264_aac_to_mov` | — | — | — | — | — |
+| `mux/h264_aac_to_mp4` | — | — | — | — | — |
+| `mux/h264_aac_to_ts` | — | — | — | — | — |
+| `mux/mp3_to_mp3` | — | — | — | — | — |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | — |
+| `mux/mp4_faststart_reserve` | — | — | — | — | — |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `mux/mp4_progressive_buffer` | — | — | — | — | — |
+| `mux/mp4_streaming_target` | — | — | — | — | — |
+| `mux/neg_h264_into_wav_illegal` | — | — | — | — | — |
+| `mux/opus_to_ogg` | — | — | — | — | — |
+| `mux/opus_to_webm_audio` | — | — | — | — | — |
+| `mux/pcm_f32_to_wav` | — | — | — | — | — |
+| `mux/pcm_s16_to_wav` | — | — | — | — | — |
+| `mux/pcm_s24_to_wav` | — | — | — | — | — |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | — |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | — |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — |
+| `mux/video_plus_audio_to_mp4` | — | — | — | — | — |
+| `mux/vorbis_to_ogg` | — | — | — | — | — |
+| `mux/vp9_opus_to_webm` | — | — | — | — | — |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — |
+| `performance/bundle-size` | — | — | — | — | — |
+| `performance/convert-longtasks` | — | — | — | — | — |
+| `performance/convert-peak-memory` | — | — | — | — | — |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | — |
+| `performance/decode-fps` | — | — | — | — | — |
+| `performance/encode-fps` | — | — | — | — | — |
+| `performance/extract-metadata` | — | — | — | — | — |
+| `performance/iterate-video-packets` | — | — | — | — | — |
+| `performance/metamorphic-decode-remux` | — | — | — | — | — |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — |
+| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — |
+| `performance/op-sweep-demux` | — | — | — | — | — |
+| `performance/op-sweep-probe` | — | — | — | — | — |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | — |
+| `performance/seek-ms` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — |
+| `probe/aac_adts` | — | — | — | — | — |
+| `probe/av1_720p_5s` | — | — | — | — | — |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — |
+| `probe/cenc_cbcs` | — | — | — | — | — |
+| `probe/cenc_ctr` | — | — | — | — | — |
+| `probe/empty-audio-wav` | — | — | — | — | — |
+| `probe/flac_noseektable` | — | — | — | — | — |
+| `probe/flac_seektable` | — | — | — | — | — |
+| `probe/h264_1080p_30s` | — | — | — | — | — |
+| `probe/h264_1080p_5s` | — | — | — | — | — |
+| `probe/h264_4k_10s` | — | — | — | — | — |
+| `probe/h264_bframes_1080p` | — | — | — | — | — |
+| `probe/h264_in_mkv` | — | — | — | — | — |
+| `probe/h264_multitrack` | — | — | — | — | — |
+| `probe/h264_rotated90` | — | — | — | — | — |
+| `probe/h264_ts` | — | — | — | — | — |
+| `probe/h264_vfr` | — | — | — | — | — |
+| `probe/hevc_1080p_10s` | — | — | — | — | — |
+| `probe/hls_aes128` | — | — | — | — | — |
+| `probe/hls_vod` | — | — | — | — | — |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | — |
+| `probe/large_h264_1080p_120s` | — | — | — | — | — |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | — |
+| `probe/longform_1h_audio` | — | — | — | — | — |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | — |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | — |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — |
+| `probe/micro_audio_short` | — | — | — | — | — |
+| `probe/micro_h264_1frame` | — | — | — | — | — |
+| `probe/mp3_cbr_notoc` | — | — | — | — | — |
+| `probe/mp3_xing` | — | — | — | — | — |
+| `probe/opus` | — | — | — | — | — |
+| `probe/pcm_s16be` | — | — | — | — | — |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | — |
+| `probe/perf-extract-metadata-large` | — | — | — | — | — |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | — |
+| `probe/recorder_headerless` | — | — | — | — | — |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | — |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | — |
+| `probe/truncated-header-graceful` | — | — | — | — | — |
+| `probe/vp8_720p_10s` | — | — | — | — | — |
+| `probe/vp9_1080p_10s` | — | — | — | — | — |
+| `probe/vp9_alpha` | — | — | — | — | — |
+| `probe/wav_f32` | — | — | — | — | — |
+| `probe/wav_s16` | — | — | — | — | — |
+| `probe/wav_s24` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | — |
+| `remux/opus_ogg_to_webm` | — | — | — | — | — |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | — |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — |
+| `streaming-output/webm_streaming_target` | — | — | — | — | — |
+| `trim/audio_aac_adts_copy` | — | — | — | — | — |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | — |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | — |
+| `trim/audio_mp3_copy` | — | — | — | — | — |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | — |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | — |
+| `trim/av1_keyframe_aligned` | — | — | — | — | — |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | — |
+| `trim/h264_frame_accurate` | — | — | — | — | — |
+| `trim/h264_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | — |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_noop_full_range_idempotent` | — | — | — | — | — |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_start_zero_copy` | — | — | — | — | — |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — |
+| `trim/h264_to_eof_copy` | — | — | — | — | — |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | — |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | — |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | — |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | — |
+| `trim/mov_keyframe_aligned` | — | — | — | — | — |
+| `trim/robust_zero_length_range` | — | — | — | — | — |
+| `trim/ts_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — |
+
+**`platform@chrome-149`**
+
+| Scenario | wall median (ms) | wall p95 (ms) | ×realtime | peak mem | longtasks (ms) |
+| --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | — | — | — | — | — |
+| `audio-dsp/caf_container_probe` | — | — | — | — | — |
+| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — |
+| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — |
+| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — |
+| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — |
+| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — |
+| `audio-dsp/fade_in_out_f32` | — | — | — | — | — |
+| `audio-dsp/gain_half_f32` | — | — | — | — | — |
+| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — |
+| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — |
+| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — |
+| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — |
+| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — |
+| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — |
+| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — |
+| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — |
+| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_decode_s24` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — |
+| `audio-dsp/throughput_encode_s24` | — | — | — | — | — |
+| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — |
+| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — |
+| `demux/aac_adts` | — | — | — | — | — |
+| `demux/av1_720p_5s` | — | — | — | — | — |
+| `demux/empty_audio_zero_packets` | — | — | — | — | — |
+| `demux/flac_noseektable` | — | — | — | — | — |
+| `demux/flac_seektable` | — | — | — | — | — |
+| `demux/h264_1080p_30s` | — | — | — | — | — |
+| `demux/h264_1080p_5s` | — | — | — | — | — |
+| `demux/h264_4k_10s` | — | — | — | — | — |
+| `demux/h264_bframes_1080p` | — | — | — | — | — |
+| `demux/h264_in_mkv` | — | — | — | — | — |
+| `demux/h264_multitrack` | — | — | — | — | — |
+| `demux/h264_rotated90` | — | — | — | — | — |
+| `demux/h264_ts` | — | — | — | — | — |
+| `demux/h264_vfr` | — | — | — | — | — |
+| `demux/hevc_1080p_10s` | — | — | — | — | — |
+| `demux/hls_aes128` | — | — | — | — | — |
+| `demux/hls_vod` | — | — | — | — | — |
+| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — |
+| `demux/mp3_cbr_notoc` | — | — | — | — | — |
+| `demux/mp3_xing` | — | — | — | — | — |
+| `demux/opus` | — | — | — | — | — |
+| `demux/pcm_s16be` | — | — | — | — | — |
+| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — |
+| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — |
+| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — |
+| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — |
+| `demux/size_micro_micro_audio_short` | — | — | — | — | — |
+| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — |
+| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — |
+| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — |
+| `demux/vp8_720p_10s` | — | — | — | — | — |
+| `demux/vp9_1080p_10s` | — | — | — | — | — |
+| `demux/vp9_alpha` | — | — | — | — | — |
+| `demux/wav_f32` | — | — | — | — | — |
+| `demux/wav_s16` | — | — | — | — | — |
+| `demux/wav_s24` | — | — | — | — | — |
+| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — |
+| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt` | — | — | — | — | — |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/clearkey_decrypt_na` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt` | — | — | — | — | — |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — |
+| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — |
+| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — |
+| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — |
+| `metadata/read_flac_seektable` | — | — | — | — | — |
+| `metadata/read_h264_1080p_30s` | — | — | — | — | — |
+| `metadata/read_h264_1080p_5s` | — | — | — | — | — |
+| `metadata/read_h264_in_mkv` | — | — | — | — | — |
+| `metadata/read_h264_multitrack` | — | — | — | — | — |
+| `metadata/read_mp3_xing` | — | — | — | — | — |
+| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — |
+| `metadata/read_no_tags_wav` | — | — | — | — | — |
+| `metadata/read_opus` | — | — | — | — | — |
+| `metadata/read_pcm_s16be` | — | — | — | — | — |
+| `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
+| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
+| `metadata/tracks_attribution_multitrack` | — | — | — | — | — |
+| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — |
+| `metadata/write_flac_vorbiscomment` | — | — | — | — | — |
+| `metadata/write_mkv_tags` | — | — | — | — | — |
+| `metadata/write_mp3_id3` | — | — | — | — | — |
+| `metadata/write_mp4_tags` | — | — | — | — | — |
+| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
+| `mux/aac_to_adts` | — | — | — | — | — |
+| `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
+| `mux/av1_opus_to_mp4` | — | — | — | — | — |
+| `mux/drop_audio_track_subset_to_mp4` | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — |
+| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — |
+| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — |
+| `mux/flac_to_mkv_audio` | — | — | — | — | — |
+| `mux/h264_aac_to_mkv` | — | — | — | — | — |
+| `mux/h264_aac_to_mov` | — | — | — | — | — |
+| `mux/h264_aac_to_mp4` | — | — | — | — | — |
+| `mux/h264_aac_to_ts` | — | — | — | — | — |
+| `mux/mp3_to_mp3` | — | — | — | — | — |
+| `mux/mp3_to_mp4_audio` | — | — | — | — | — |
+| `mux/mp4_faststart_reserve` | — | — | — | — | — |
+| `mux/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `mux/mp4_progressive_buffer` | — | — | — | — | — |
+| `mux/mp4_streaming_target` | — | — | — | — | — |
+| `mux/neg_h264_into_wav_illegal` | — | — | — | — | — |
+| `mux/opus_to_ogg` | — | — | — | — | — |
+| `mux/opus_to_webm_audio` | — | — | — | — | — |
+| `mux/pcm_f32_to_wav` | — | — | — | — | — |
+| `mux/pcm_s16_to_wav` | — | — | — | — | — |
+| `mux/pcm_s24_to_wav` | — | — | — | — | — |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mkv` | — | — | — | — | — |
+| `mux/size_large_1080p_to_mp4` | — | — | — | — | — |
+| `mux/size_longform_audio_to_mp4` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — |
+| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — |
+| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — |
+| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — |
+| `mux/three_track_assembly_to_mkv` | — | — | — | — | — |
+| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — |
+| `mux/video_plus_audio_to_mp4` | — | — | — | — | — |
+| `mux/vorbis_to_ogg` | — | — | — | — | — |
+| `mux/vp9_opus_to_webm` | — | — | — | — | — |
+| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — |
+| `performance/bundle-size` | — | — | — | — | — |
+| `performance/convert-longtasks` | — | — | — | — | — |
+| `performance/convert-peak-memory` | — | — | — | — | — |
+| `performance/convert-webm-resize-320x180` | — | — | — | — | — |
+| `performance/decode-fps` | 5711.3 | 5711.3 | — | — | — |
+| `performance/encode-fps` | — | — | — | — | — |
+| `performance/extract-metadata` | — | — | — | — | — |
+| `performance/iterate-video-packets` | — | — | — | — | — |
+| `performance/metamorphic-decode-remux` | — | — | — | — | — |
+| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — |
+| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — |
+| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — |
+| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — |
+| `performance/op-sweep-demux` | — | — | — | — | — |
+| `performance/op-sweep-probe` | — | — | — | — | — |
+| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — |
+| `performance/op-sweep-transcode-webm` | — | — | — | — | — |
+| `performance/seek-ms` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — |
+| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — |
+| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — |
+| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — |
+| `probe/aac_adts` | — | — | — | — | — |
+| `probe/av1_720p_5s` | — | — | — | — | — |
+| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — |
+| `probe/cenc_cbcs` | — | — | — | — | — |
+| `probe/cenc_ctr` | — | — | — | — | — |
+| `probe/empty-audio-wav` | — | — | — | — | — |
+| `probe/flac_noseektable` | — | — | — | — | — |
+| `probe/flac_seektable` | — | — | — | — | — |
+| `probe/h264_1080p_30s` | — | — | — | — | — |
+| `probe/h264_1080p_5s` | — | — | — | — | — |
+| `probe/h264_4k_10s` | — | — | — | — | — |
+| `probe/h264_bframes_1080p` | — | — | — | — | — |
+| `probe/h264_in_mkv` | — | — | — | — | — |
+| `probe/h264_multitrack` | — | — | — | — | — |
+| `probe/h264_rotated90` | — | — | — | — | — |
+| `probe/h264_ts` | — | — | — | — | — |
+| `probe/h264_vfr` | 8.4 | 8.4 | — | — | — |
+| `probe/hevc_1080p_10s` | — | — | — | — | — |
+| `probe/hls_aes128` | — | — | — | — | — |
+| `probe/hls_vod` | — | — | — | — | — |
+| `probe/huge_h264_1080p_600s` | — | — | — | — | — |
+| `probe/large_h264_1080p_120s` | — | — | — | — | — |
+| `probe/large_vp9_1080p_120s` | — | — | — | — | — |
+| `probe/longform_1h_audio` | — | — | — | — | — |
+| `probe/massive_h264_1080p_2h` | — | — | — | — | — |
+| `probe/metamorphic-duration-across-containers` | — | — | — | — | — |
+| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — |
+| `probe/micro_audio_short` | — | — | — | — | — |
+| `probe/micro_h264_1frame` | — | — | — | — | — |
+| `probe/mp3_cbr_notoc` | — | — | — | — | — |
+| `probe/mp3_xing` | — | — | — | — | — |
+| `probe/opus` | — | — | — | — | — |
+| `probe/pcm_s16be` | — | — | — | — | — |
+| `probe/perf-extract-metadata-huge` | — | — | — | — | — |
+| `probe/perf-extract-metadata-large` | — | — | — | — | — |
+| `probe/perf-extract-metadata-massive` | — | — | — | — | — |
+| `probe/recorder_headerless` | — | — | — | — | — |
+| `probe/tiny_h264_360p_2s` | — | — | — | — | — |
+| `probe/tiny_vp9_360p_2s` | — | — | — | — | — |
+| `probe/truncated-header-graceful` | — | — | — | — | — |
+| `probe/vp8_720p_10s` | — | — | — | — | — |
+| `probe/vp9_1080p_10s` | — | — | — | — | — |
+| `probe/vp9_alpha` | — | — | — | — | — |
+| `probe/wav_f32` | — | — | — | — | — |
+| `probe/wav_s16` | — | — | — | — | — |
+| `probe/wav_s24` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — |
+| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — |
+| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — |
+| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — |
+| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — |
+| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — |
+| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mov` | — | — | — | — | — |
+| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — |
+| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — |
+| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — |
+| `remux/opus_ogg_to_mkv` | — | — | — | — | — |
+| `remux/opus_ogg_to_webm` | — | — | — | — | — |
+| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — |
+| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — |
+| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — |
+| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — |
+| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — |
+| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — |
+| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
+| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
+| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/mp4_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — |
+| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — |
+| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — |
+| `streaming-output/mp4_streaming_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — |
+| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — |
+| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — |
+| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — |
+| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — |
+| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — |
+| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — |
+| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — |
+| `streaming-output/ts_tiny_writes` | — | — | — | — | — |
+| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — |
+| `streaming-output/webm_streaming_target` | — | — | — | — | — |
+| `trim/audio_aac_adts_copy` | — | — | — | — | — |
+| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — |
+| `trim/audio_flac_noseektable_copy` | — | — | — | — | — |
+| `trim/audio_flac_seektable_copy` | — | — | — | — | — |
+| `trim/audio_mp3_copy` | — | — | — | — | — |
+| `trim/audio_opus_ogg_copy` | — | — | — | — | — |
+| `trim/audio_wav_pcm_copy` | — | — | — | — | — |
+| `trim/av1_keyframe_aligned` | — | — | — | — | — |
+| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — |
+| `trim/h264_bframes_frame_accurate` | — | — | — | — | — |
+| `trim/h264_frame_accurate` | — | — | — | — | — |
+| `trim/h264_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_keyframe_aligned_short` | — | — | — | — | — |
+| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_noop_full_range_idempotent` | — | — | — | — | — |
+| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — |
+| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — |
+| `trim/h264_start_zero_copy` | — | — | — | — | — |
+| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — |
+| `trim/h264_to_eof_copy` | — | — | — | — | — |
+| `trim/h264_vfr_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_frame_accurate` | — | — | — | — | — |
+| `trim/hevc_keyframe_aligned` | — | — | — | — | — |
+| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — |
+| `trim/large_h264_copy_lazyread` | — | — | — | — | — |
+| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — |
+| `trim/massive_h264_copy_sustained` | — | — | — | — | — |
+| `trim/mkv_keyframe_aligned` | — | — | — | — | — |
+| `trim/mov_keyframe_aligned` | — | — | — | — | — |
+| `trim/robust_zero_length_range` | — | — | — | — | — |
+| `trim/ts_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp8_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_keyframe_aligned` | — | — | — | — | — |
+| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — |
+
+**`remotion-media-parser@4.0.479`**
+
+_No admissible benchmarks (no green conformance gate)._
+
+**`remotion-webcodecs@4.0.479`**
+
+_No admissible benchmarks (no green conformance gate)._
+
+**`web-demuxer@4.0.0`**
+
+_No admissible benchmarks (no green conformance gate)._
+
+
+### 5. Δ vs reference (`mediabunny`)
+
+| Scenario | aibrush-media@dev perf | aibrush-media@dev conf | ffmpeg.wasm@0.12.15 perf | ffmpeg.wasm@0.12.15 conf | mediabunny@1.48.0 perf | mediabunny@1.48.0 conf | mp4box@2.3.0 perf | mp4box@2.3.0 conf | platform@chrome-149 perf | platform@chrome-149 conf | remotion-media-parser@4.0.479 perf | remotion-media-parser@4.0.479 conf | remotion-webcodecs@4.0.479 perf | remotion-webcodecs@4.0.479 conf | web-demuxer@4.0.0 perf | web-demuxer@4.0.0 conf |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `audio-dsp/aiff_container_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/caf_container_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/downmix_5_1_to_stereo` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/downmix_stereo_to_mono` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/edge_empty_audio_transcode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/edge_gapless_aac_decode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/edge_longform_audio_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/edge_longform_audio_resample_16k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/edge_variable_channel_count_downmix` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/fade_in_out_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/gain_half_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/gain_minus6db_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/meta_idempotent_resample_same_rate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/meta_probe_duration_across_wav_aiff` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/meta_roundtrip_endianness_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/negative_image_into_audio_transcode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_f32_to_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s16_to_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s16be_to_s16le` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s16le_to_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s24_to_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s24_to_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/pcm_s24be_to_s16le` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/resample_44k1_to_48k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/resample_48k_to_16k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/resample_48k_to_44k1` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/throughput_decode_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/throughput_decode_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/throughput_encode_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/throughput_encode_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/upmix_mono_to_stereo` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `audio-dsp/upmix_stereo_to_5_1` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/aac_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/av1_720p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/empty_audio_zero_packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/flac_noseektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_4k_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_bframes_1080p` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/h264_vfr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/hevc_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/hls_aes128` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/hls_vod` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/metamorphic_flac_seektable_invariance` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/mp3_cbr_notoc` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_huge_huge_h264_1080p_600s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_large_large_h264_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_large_large_vp9_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_massive_massive_h264_1080p_2h` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_micro_micro_audio_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_micro_micro_h264_1frame` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_tiny_tiny_h264_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/size_tiny_tiny_vp9_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/vp8_720p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/vp9_alpha` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/wav_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/wav_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `demux/wav_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/cenc_cbcs_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/cenc_cens_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/cenc_ctr_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/cenc_ctr_decrypt_eq_cleartext` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/clearkey_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/hls_aes128_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/hls_aes128_decrypt_eq_cleartext` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/hls_sample_aes_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/perf_cenc_ctr_decrypt_throughput` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `encryption/unencrypted_left_untouched_noop` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/meta_consistent_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_no_tags_recorder_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_no_tags_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/read_vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/rotation_decode_read_h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/rotation_survives_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/tagedit_no_corrupt_audio_flac` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/tagedit_no_corrupt_video_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/tracks_attribution_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/tracks_packet_attribution_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/write_flac_vorbiscomment` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/write_mkv_tags` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/write_mp3_id3` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/write_mp4_tags` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `metadata/write_ogg_vorbiscomment` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/aac_to_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/audio_only_aac_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/av1_opus_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/drop_audio_track_subset_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_bframes_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_bframes_decode_mux_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_hevc_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_hevc_decode_mux_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_multitrack_keep_all_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_rotation_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/edge_rotation_decode_mux_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/flac_to_mkv_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/h264_aac_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/h264_aac_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/h264_aac_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/h264_aac_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp3_to_mp3` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp3_to_mp4_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp4_faststart_reserve` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp4_fragmented_cmaf` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp4_progressive_buffer` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/mp4_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/neg_h264_into_wav_illegal` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/opus_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/opus_to_webm_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/pcm_f32_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/pcm_s16_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/pcm_s24_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_av1_mux_duration_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_h264_decode_mux_mp4_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_h264_mux_duration_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_h264_mux_duration_mp4_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_vfr_mux_duration_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_vfr_mux_duration_mp4_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_vp9_decode_mux_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/prop_vp9_mux_duration_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_large_1080p_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_large_1080p_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_longform_audio_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_micro_1frame_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_micro_1frame_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/size_tiny_360p_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/swap_audio_video_with_opus_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/three_track_assembly_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/video_a_plus_audio_b_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/video_plus_audio_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/vorbis_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/vp9_opus_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `mux/vp9_video_plus_opus_audio_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/bundle-size` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/convert-longtasks` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/convert-peak-memory` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/convert-webm-resize-320x180` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/decode-fps` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/encode-fps` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/extract-metadata` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/iterate-video-packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/metamorphic-decode-remux` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/metamorphic-probe-duration-cross-container` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/metamorphic-transcode-idempotent-source-res` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/metamorphic-vfr-iterate-packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/metamorphic-vfr-probe-duration` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/op-sweep-demux` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/op-sweep-probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/op-sweep-remux-mp4-to-mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/op-sweep-transcode-webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/seek-ms` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-demux-peak-memory-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-demux-peak-memory-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-demux-peak-memory-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-medium` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-extract-metadata-tiny` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-medium` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `performance/size-ladder-iterate-packets-tiny` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/aac_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/av1_720p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/big_buck_bunny_1080p_h264` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/cenc_cbcs` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/cenc_ctr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/empty-audio-wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/flac_noseektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_4k_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_bframes_1080p` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/h264_vfr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/hevc_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/hls_aes128` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/hls_vod` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/huge_h264_1080p_600s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/large_h264_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/large_vp9_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/longform_1h_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/massive_h264_1080p_2h` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/metamorphic-duration-across-containers` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/metamorphic-recorder-headerless-sane-duration` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/micro_audio_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/micro_h264_1frame` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/mp3_cbr_notoc` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/perf-extract-metadata-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/perf-extract-metadata-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/perf-extract-metadata-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/recorder_headerless` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/tiny_h264_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/tiny_vp9_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/truncated-header-graceful` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/vp8_720p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/vp9_alpha` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/wav_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/wav_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `probe/wav_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/aac_adts_adts_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/aac_adts_adts_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/av1_720p_5s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/av1_720p_5s_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/av1_720p_5s_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/flac_seektable_flac_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/flac_seektable_flac_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_30s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_30s_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_30s_mp4_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_5s_mov_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_5s_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_1080p_5s_mov_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_bframes_1080p_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_in_mkv_mkv_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_in_mkv_mkv_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_in_mkv_mkv_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_multitrack_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_rotated90_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_ts_ts_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_ts_ts_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/h264_ts_ts_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/hevc_1080p_10s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/hevc_1080p_10s_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/huge_h264_1080p_600s_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/large_h264_1080p_120s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/large_vp9_1080p_120s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/massive_h264_1080p_2h_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/micro_audio_short_mp4_to_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/mp3_xing_mp3_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/mp3_xing_mp3_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/opus_ogg_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/opus_ogg_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_adts_to_mp4_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_bframes_decode_remux_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_bframes_decode_remux_mp4_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_mp3_to_mp4_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_multitrack_survives_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_recorder_headerless_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_rotation_survives_mp4_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_roundtrip_mp4_mkv_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/prop_ts_to_mp4_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/vp8_720p_10s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/vp9_1080p_10s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/vp9_1080p_10s_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `remux/vp9_1080p_10s_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `robustness/edge_vfr_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/buffer_massive_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_buffer_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_faststart_in_memory` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_faststart_none_control` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_faststart_reserve` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_fragmented_cmaf` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_ttfb_buffer_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/mp4_ttfb_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_decode_equals_buffer_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_decode_equals_stream_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_faststart_in_memory_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_faststart_reserve_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_frag_premise_decode_equality_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_probe_dur_buffer_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_probe_dur_fragmented_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_probe_dur_stream_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_ts_stream_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/prop_webm_headerless_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/stream_huge_h264_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/stream_large_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/stream_large_vp9_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/stream_massive_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/ts_continuity_many_writes` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/ts_tiny_writes` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/webm_headerless_live_stream` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `streaming-output/webm_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_aac_adts_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_aiff_pcm_be_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_flac_noseektable_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_flac_seektable_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_mp3_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_opus_ogg_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/audio_wav_pcm_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/av1_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/fmp4_fragment_boundary_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_bframes_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_keyframe_aligned_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_multitrack_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_noop_full_range_idempotent` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_open_gop_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_rotated_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_single_gop_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_start_zero_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_subframe_range_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_to_eof_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/h264_vfr_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/hevc_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/hevc_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/huge_h264_mov_copy_peakmem` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/large_h264_copy_lazyread` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/large_h264_frame_accurate_throughput` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/massive_h264_copy_sustained` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/mkv_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/mov_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/robust_zero_length_range` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/ts_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/vp8_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/vp9_alpha_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/vp9_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `trim/vp9_noop_full_range_idempotent` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 
 ## Browser: chromium
 
@@ -319,6 +2772,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
+| `robustness/edge_vfr_probe` | — | — | — | — | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | N/A | — | ERROR | ERROR | N/A | N/A | ERROR | N/A |
 | `streaming-output/mp4_buffer_target` | — | N/A | — | FAIL | Pass (722 ms) | N/A | N/A | Pass (7.77 s) | N/A |
 | `streaming-output/mp4_faststart_in_memory` | — | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
@@ -662,6 +3116,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | 0 | no winner |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | 0 | no winner |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | 0 | no winner |
+| `robustness/edge_vfr_probe` | — | — | — | — | 0 | no winner |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | 0 | no winner |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | 2 | no winner |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | 0 | no winner |
@@ -1005,6 +3460,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `remux/vp9_1080p_10s_webm_to_mkv` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/vp9_1080p_10s_webm_to_mp4` | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
 | `remux/vp9_1080p_10s_webm_to_webm` | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
+| `robustness/edge_vfr_probe` | — | — | — | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | N/A | — | ERROR | ERROR | N/A | N/A | ERROR | N/A |
 | `streaming-output/mp4_buffer_target` | N/A | — | FAIL | Pass (722 ms) | N/A | N/A | Pass (7.77 s) | N/A |
 | `streaming-output/mp4_faststart_in_memory` | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
@@ -2421,7 +4877,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `remotion-media-parser@4.0.479` · `probe/perf-extract-metadata-massive` — **ERROR**: failed to fetch corpus asset 'massive_h264_1080p_2h.mp4' (404 Not Found)
 - `remotion-media-parser@4.0.479` · `probe/recorder_headerless` — **ERROR**: failed to fetch corpus asset 'recorder_headerless.webm' (404 Not Found)
 - `remotion-media-parser@4.0.479` · `probe/tiny_vp9_360p_2s` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
-- `remotion-media-parser@4.0.479` · `probe/truncated-header-graceful` — **ERROR**: Error in Media Parser: End of parsing of [object Blob] has been reached, but no tracks have been found
+- `remotion-media-parser@4.0.479` · `probe/truncated-header-graceful` — **ERROR**: Error in Media Parser: End of parsing of [object Blob] has been reached, but no tracks have been found 
 - `remotion-media-parser@4.0.479` · `probe/vp8_720p_10s` — **N/A**: browser cannot decode audio codec 'vorbis' (WebCodecs AudioDecoder.isConfigSupported=false)
 - `remotion-media-parser@4.0.479` · `probe/vp9_1080p_10s` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
 - `remotion-media-parser@4.0.479` · `probe/vp9_alpha` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
@@ -2699,7 +5155,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `remotion-webcodecs@4.0.479` · `probe/perf-extract-metadata-massive` — **ERROR**: Server returned status code 404 for http://localhost:5173/fixtures/media/massive_h264_1080p_2h.mp4 and range 0
 - `remotion-webcodecs@4.0.479` · `probe/recorder_headerless` — **ERROR**: Server returned status code 404 for http://localhost:5173/fixtures/media/recorder_headerless.webm and range 0
 - `remotion-webcodecs@4.0.479` · `probe/tiny_vp9_360p_2s` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
-- `remotion-webcodecs@4.0.479` · `probe/truncated-header-graceful` — **ERROR**: Error in Media Parser: End of parsing of /fixtures/media/truncated_h264.mp4 has been reached, but no tracks have been found
+- `remotion-webcodecs@4.0.479` · `probe/truncated-header-graceful` — **ERROR**: Error in Media Parser: End of parsing of /fixtures/media/truncated_h264.mp4 has been reached, but no tracks have been found 
 - `remotion-webcodecs@4.0.479` · `probe/vp8_720p_10s` — **N/A**: browser cannot decode audio codec 'vorbis' (WebCodecs AudioDecoder.isConfigSupported=false)
 - `remotion-webcodecs@4.0.479` · `probe/vp9_1080p_10s` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
 - `remotion-webcodecs@4.0.479` · `probe/vp9_alpha` — **FAIL**: oracle 'golden-metadata' failed: track[0].fps: null vs 30
@@ -3396,6 +5852,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -3739,6 +6196,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -4082,6 +6540,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -4429,6 +6888,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -4772,6 +7232,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -5115,6 +7576,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
 | `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
+| `robustness/edge_vfr_probe` | — | — | — | — | — |
 | `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
 | `streaming-output/mp4_buffer_target` | — | — | — | — | — |
 | `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
@@ -5459,2110 +7921,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `remux/vp9_1080p_10s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 | `remux/vp9_1080p_10s_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 | `remux/vp9_1080p_10s_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/buffer_massive_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_buffer_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_faststart_in_memory` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_faststart_none_control` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_faststart_reserve` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_fragmented_cmaf` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_ttfb_buffer_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/mp4_ttfb_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_decode_equals_buffer_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_decode_equals_stream_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_probe_dur_buffer_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_probe_dur_fragmented_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_probe_dur_stream_shape` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_ts_stream_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/prop_webm_headerless_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/stream_large_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/stream_large_vp9_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/stream_massive_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/ts_continuity_many_writes` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/ts_tiny_writes` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/webm_headerless_live_stream` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `streaming-output/webm_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_aac_adts_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_aiff_pcm_be_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_flac_noseektable_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_flac_seektable_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_mp3_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_opus_ogg_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/audio_wav_pcm_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/av1_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/fmp4_fragment_boundary_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_bframes_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_keyframe_aligned_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_multitrack_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_noop_full_range_idempotent` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_open_gop_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_rotated_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_single_gop_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_start_zero_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_subframe_range_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_to_eof_copy` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/h264_vfr_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/hevc_frame_accurate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/hevc_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/huge_h264_mov_copy_peakmem` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/large_h264_copy_lazyread` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/large_h264_frame_accurate_throughput` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/massive_h264_copy_sustained` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/mkv_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/mov_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/robust_zero_length_range` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/ts_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/vp8_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/vp9_alpha_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/vp9_keyframe_aligned` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `trim/vp9_noop_full_range_idempotent` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-
-## Browser: brave
-
-### 1. Result matrix — display value per engine × case
-
-_Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicative for this browser only — never compared across browsers (see Caveats)._
-
-| Case | Primary metric | aibrush-media@dev | ffmpeg.wasm@0.12.15 | mediabunny@1.48.0 | mp4box@2.3.0 | platform@chrome-149 | remotion-media-parser@4.0.479 | remotion-webcodecs@4.0.479 | web-demuxer@4.0.0 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/caf_container_probe` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/fade_in_out_f32` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/gain_half_f32` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s24` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s24` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — | — | — | — | — |
-| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — | — | — | — | — |
-| `demux/aac_adts` | — | — | — | — | — | — | — | — | — |
-| `demux/av1_720p_5s` | — | — | — | — | — | — | — | — | — |
-| `demux/empty_audio_zero_packets` | — | — | — | — | — | — | — | — | — |
-| `demux/flac_noseektable` | — | — | — | — | — | — | — | — | — |
-| `demux/flac_seektable` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_4k_10s` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_bframes_1080p` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_in_mkv` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_multitrack` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_rotated90` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_ts` | — | — | — | — | — | — | — | — | — |
-| `demux/h264_vfr` | — | — | — | — | — | — | — | — | — |
-| `demux/hevc_1080p_10s` | — | — | — | — | — | — | — | — | — |
-| `demux/hls_aes128` | — | — | — | — | — | — | — | — | — |
-| `demux/hls_vod` | — | — | — | — | — | — | — | — | — |
-| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — | — | — | — | — |
-| `demux/mp3_cbr_notoc` | — | — | — | — | — | — | — | — | — |
-| `demux/mp3_xing` | — | — | — | — | — | — | — | — | — |
-| `demux/opus` | — | — | — | — | — | — | — | — | — |
-| `demux/pcm_s16be` | — | — | — | — | — | — | — | — | — |
-| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — | — | — | — | — |
-| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — | — | — | — | — |
-| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — | — | — | — | — |
-| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — | — | — | — | — |
-| `demux/size_micro_micro_audio_short` | — | — | — | — | — | — | — | — | — |
-| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — | — | — | — | — |
-| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — | — | — | — | — |
-| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — | — |
-| `demux/vp8_720p_10s` | — | — | — | — | — | — | — | — | — |
-| `demux/vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
-| `demux/vp9_alpha` | — | — | — | — | — | — | — | — | — |
-| `demux/wav_f32` | — | — | — | — | — | — | — | — | — |
-| `demux/wav_s16` | — | — | — | — | — | — | — | — | — |
-| `demux/wav_s24` | — | — | — | — | — | — | — | — | — |
-| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — | — | — | — | — |
-| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt` | — | — | — | — | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — | — |
-| `encryption/clearkey_decrypt_na` | — | — | — | — | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt` | — | — | — | — | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — | — |
-| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — | — | — | — | — |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — | — | — | — | — |
-| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — | — | — | — | — |
-| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_flac_seektable` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_in_mkv` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_multitrack` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_mp3_xing` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_no_tags_wav` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_opus` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_pcm_s16be` | — | — | — | — | — | — | — | — | — |
-| `metadata/read_vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — | — | — | — | — |
-| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — | — | — | — | — |
-| `metadata/tracks_attribution_multitrack` | — | — | — | — | — | — | — | — | — |
-| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — | — | — | — | — |
-| `metadata/write_flac_vorbiscomment` | — | — | — | — | — | — | — | — | — |
-| `metadata/write_mkv_tags` | — | — | — | — | — | — | — | — | — |
-| `metadata/write_mp3_id3` | — | — | — | — | — | — | — | — | — |
-| `metadata/write_mp4_tags` | — | — | — | — | — | — | — | — | — |
-| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — | — | — | — | — |
-| `mux/aac_to_adts` | — | — | — | — | — | — | — | — | — |
-| `mux/audio_only_aac_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/av1_opus_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/drop_audio_track_subset_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (28.25 ms) | N/A | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — | — | — | — | — |
-| `mux/flac_to_mkv_audio` | — | — | — | — | — | — | — | — | — |
-| `mux/h264_aac_to_mkv` | throughputRealtime (x-realtime) | — | — | Pass (84.06 ms) | N/A | — | — | — | — |
-| `mux/h264_aac_to_mov` | — | — | — | — | — | — | — | — | — |
-| `mux/h264_aac_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (88.49 ms) | — | — | — | — | — |
-| `mux/h264_aac_to_ts` | — | — | — | — | — | — | — | — | — |
-| `mux/mp3_to_mp3` | — | — | — | — | — | — | — | — | — |
-| `mux/mp3_to_mp4_audio` | — | — | — | — | — | — | — | — | — |
-| `mux/mp4_faststart_reserve` | — | — | — | — | — | — | — | — | — |
-| `mux/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — | — |
-| `mux/mp4_progressive_buffer` | — | — | — | — | — | — | — | — | — |
-| `mux/mp4_streaming_target` | — | — | — | — | — | — | — | — | — |
-| `mux/neg_h264_into_wav_illegal` | — | — | — | Pass (89 ms) | N/A | — | — | — | — |
-| `mux/opus_to_ogg` | — | — | — | — | — | — | — | — | — |
-| `mux/opus_to_webm_audio` | — | — | — | — | — | — | — | — | — |
-| `mux/pcm_f32_to_wav` | — | — | — | — | — | — | — | — | — |
-| `mux/pcm_s16_to_wav` | — | — | — | — | — | — | — | — | — |
-| `mux/pcm_s24_to_wav` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — | — | — | — | — |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — | — | — | — | — |
-| `mux/size_large_1080p_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/size_large_1080p_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/size_longform_audio_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/three_track_assembly_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `mux/video_plus_audio_to_mp4` | throughputRealtime (x-realtime) | — | — | Pass (89.66 ms) | N/A | — | — | — | — |
-| `mux/vorbis_to_ogg` | — | — | — | — | — | — | — | — | — |
-| `mux/vp9_opus_to_webm` | — | — | — | — | — | — | — | — | — |
-| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — | — | — | — | — |
-| `performance/bundle-size` | — | — | — | — | — | — | — | — | — |
-| `performance/convert-longtasks` | — | — | — | — | — | — | — | — | — |
-| `performance/convert-peak-memory` | — | — | — | — | — | — | — | — | — |
-| `performance/convert-webm-resize-320x180` | — | — | — | — | — | — | — | — | — |
-| `performance/decode-fps` | decodeFps (fps) | — | — | Pass (5.43 s) | — | Pass (5.71 s) | — | — | — |
-| `performance/encode-fps` | — | — | — | — | — | — | — | — | — |
-| `performance/extract-metadata` | — | — | — | — | — | — | — | — | — |
-| `performance/iterate-video-packets` | — | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-decode-remux` | — | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-demux` | — | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-probe` | — | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-transcode-webm` | — | — | — | — | — | — | — | — | — |
-| `performance/seek-ms` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — | — | — | — | — |
-| `probe/aac_adts` | — | — | — | — | — | — | — | — | — |
-| `probe/av1_720p_5s` | — | — | — | — | — | — | — | — | — |
-| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — | — | — | — | — |
-| `probe/cenc_cbcs` | — | — | — | — | — | — | — | — | — |
-| `probe/cenc_ctr` | — | — | — | — | — | — | — | — | — |
-| `probe/empty-audio-wav` | — | — | — | — | — | — | — | — | — |
-| `probe/flac_noseektable` | — | — | — | — | — | — | — | — | — |
-| `probe/flac_seektable` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_1080p_30s` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_1080p_5s` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_4k_10s` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_bframes_1080p` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_in_mkv` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_multitrack` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_rotated90` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_ts` | — | — | — | — | — | — | — | — | — |
-| `probe/h264_vfr` | — | — | — | — | — | — | — | — | — |
-| `probe/hevc_1080p_10s` | — | — | — | — | — | — | — | — | — |
-| `probe/hls_aes128` | — | — | — | — | — | — | — | — | — |
-| `probe/hls_vod` | — | — | — | — | — | — | — | — | — |
-| `probe/huge_h264_1080p_600s` | — | — | — | — | — | — | — | — | — |
-| `probe/large_h264_1080p_120s` | — | — | — | — | — | — | — | — | — |
-| `probe/large_vp9_1080p_120s` | — | — | — | — | — | — | — | — | — |
-| `probe/longform_1h_audio` | — | — | — | — | — | — | — | — | — |
-| `probe/massive_h264_1080p_2h` | — | — | — | — | — | — | — | — | — |
-| `probe/metamorphic-duration-across-containers` | — | — | — | — | — | — | — | — | — |
-| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — | — | — | — | — |
-| `probe/micro_audio_short` | — | — | — | — | — | — | — | — | — |
-| `probe/micro_h264_1frame` | wall (ms) | N/A | — | Pass (3.56 ms) | — | — | — | — | — |
-| `probe/mp3_cbr_notoc` | — | — | — | — | — | — | — | — | — |
-| `probe/mp3_xing` | — | — | — | — | — | — | — | — | — |
-| `probe/opus` | — | — | — | — | — | — | — | — | — |
-| `probe/pcm_s16be` | — | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-huge` | — | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-large` | — | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-massive` | — | — | — | — | — | — | — | — | — |
-| `probe/recorder_headerless` | — | — | — | — | — | — | — | — | — |
-| `probe/tiny_h264_360p_2s` | — | — | — | — | — | — | — | — | — |
-| `probe/tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — | — |
-| `probe/truncated-header-graceful` | — | — | — | — | — | — | — | — | — |
-| `probe/vp8_720p_10s` | — | — | — | — | — | — | — | — | — |
-| `probe/vp9_1080p_10s` | — | — | — | — | — | — | — | — | — |
-| `probe/vp9_alpha` | — | — | — | — | — | — | — | — | — |
-| `probe/wav_f32` | — | — | — | — | — | — | — | — | — |
-| `probe/wav_s16` | — | — | — | — | — | — | — | — | — |
-| `probe/wav_s24` | — | — | — | — | — | — | — | — | — |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/aac_adts_adts_to_ts` | — | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/opus_ogg_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/opus_ogg_to_webm` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — | — | — | — | — |
-| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_buffer_target` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_streaming_target` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/ts_tiny_writes` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — | — | — | — | — |
-| `streaming-output/webm_streaming_target` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_aac_adts_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_flac_noseektable_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_flac_seektable_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_mp3_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_opus_ogg_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/audio_wav_pcm_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/av1_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_bframes_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_keyframe_aligned` | throughputRealtime (x-realtime) | — | — | Pass (723 ms) | N/A | — | — | — | — |
-| `trim/h264_keyframe_aligned_short` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_noop_full_range_idempotent` | throughputRealtime (x-realtime) | — | — | Pass (64.11 ms) | N/A | — | — | — | — |
-| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_start_zero_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_to_eof_copy` | — | — | — | — | — | — | — | — | — |
-| `trim/h264_vfr_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/hevc_frame_accurate` | — | — | — | — | — | — | — | — | — |
-| `trim/hevc_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — | — | — | — | — |
-| `trim/large_h264_copy_lazyread` | — | — | — | — | — | — | — | — | — |
-| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — | — | — | — | — |
-| `trim/massive_h264_copy_sustained` | — | — | — | — | — | — | — | — | — |
-| `trim/mkv_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/mov_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/robust_zero_length_range` | — | — | — | Pass (67 ms) | N/A | — | — | — | — |
-| `trim/ts_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/vp8_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/vp9_keyframe_aligned` | — | — | — | — | — | — | — | — | — |
-| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — | — | — | — | — |
-
-### 2. Winners — one per case (🏆 = fastest correct engine)
-
-| Case | Winner | Value | Runner-up | Margin | Eligible | Flag |
-| --- | --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | — | — | — | — | 0 | no winner |
-| `audio-dsp/caf_container_probe` | — | — | — | — | 0 | no winner |
-| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | 0 | no winner |
-| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | 0 | no winner |
-| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | 0 | no winner |
-| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | 0 | no winner |
-| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | 0 | no winner |
-| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | 0 | no winner |
-| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | 0 | no winner |
-| `audio-dsp/fade_in_out_f32` | — | — | — | — | 0 | no winner |
-| `audio-dsp/gain_half_f32` | — | — | — | — | 0 | no winner |
-| `audio-dsp/gain_minus6db_s16` | — | — | — | — | 0 | no winner |
-| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | 0 | no winner |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | 0 | no winner |
-| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | 0 | no winner |
-| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | 0 | no winner |
-| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | 0 | no winner |
-| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | 0 | no winner |
-| `audio-dsp/resample_48k_to_16k` | — | — | — | — | 0 | no winner |
-| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | 0 | no winner |
-| `audio-dsp/throughput_decode_s16be` | — | — | — | — | 0 | no winner |
-| `audio-dsp/throughput_decode_s24` | — | — | — | — | 0 | no winner |
-| `audio-dsp/throughput_encode_s16be` | — | — | — | — | 0 | no winner |
-| `audio-dsp/throughput_encode_s24` | — | — | — | — | 0 | no winner |
-| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | 0 | no winner |
-| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | 0 | no winner |
-| `demux/aac_adts` | — | — | — | — | 0 | no winner |
-| `demux/av1_720p_5s` | — | — | — | — | 0 | no winner |
-| `demux/empty_audio_zero_packets` | — | — | — | — | 0 | no winner |
-| `demux/flac_noseektable` | — | — | — | — | 0 | no winner |
-| `demux/flac_seektable` | — | — | — | — | 0 | no winner |
-| `demux/h264_1080p_30s` | — | — | — | — | 0 | no winner |
-| `demux/h264_1080p_5s` | — | — | — | — | 0 | no winner |
-| `demux/h264_4k_10s` | — | — | — | — | 0 | no winner |
-| `demux/h264_bframes_1080p` | — | — | — | — | 0 | no winner |
-| `demux/h264_in_mkv` | — | — | — | — | 0 | no winner |
-| `demux/h264_multitrack` | — | — | — | — | 0 | no winner |
-| `demux/h264_rotated90` | — | — | — | — | 0 | no winner |
-| `demux/h264_ts` | — | — | — | — | 0 | no winner |
-| `demux/h264_vfr` | — | — | — | — | 0 | no winner |
-| `demux/hevc_1080p_10s` | — | — | — | — | 0 | no winner |
-| `demux/hls_aes128` | — | — | — | — | 0 | no winner |
-| `demux/hls_vod` | — | — | — | — | 0 | no winner |
-| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | 0 | no winner |
-| `demux/mp3_cbr_notoc` | — | — | — | — | 0 | no winner |
-| `demux/mp3_xing` | — | — | — | — | 0 | no winner |
-| `demux/opus` | — | — | — | — | 0 | no winner |
-| `demux/pcm_s16be` | — | — | — | — | 0 | no winner |
-| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | 0 | no winner |
-| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | 0 | no winner |
-| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | 0 | no winner |
-| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | 0 | no winner |
-| `demux/size_micro_micro_audio_short` | — | — | — | — | 0 | no winner |
-| `demux/size_micro_micro_h264_1frame` | — | — | — | — | 0 | no winner |
-| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | 0 | no winner |
-| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | 0 | no winner |
-| `demux/vp8_720p_10s` | — | — | — | — | 0 | no winner |
-| `demux/vp9_1080p_10s` | — | — | — | — | 0 | no winner |
-| `demux/vp9_alpha` | — | — | — | — | 0 | no winner |
-| `demux/wav_f32` | — | — | — | — | 0 | no winner |
-| `demux/wav_s16` | — | — | — | — | 0 | no winner |
-| `demux/wav_s24` | — | — | — | — | 0 | no winner |
-| `encryption/cenc_cbcs_decrypt` | — | — | — | — | 0 | no winner |
-| `encryption/cenc_cens_decrypt_na` | — | — | — | — | 0 | no winner |
-| `encryption/cenc_ctr_decrypt` | — | — | — | — | 0 | no winner |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | 0 | no winner |
-| `encryption/clearkey_decrypt_na` | — | — | — | — | 0 | no winner |
-| `encryption/hls_aes128_decrypt` | — | — | — | — | 0 | no winner |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | 0 | no winner |
-| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | 0 | no winner |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | 0 | no winner |
-| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | 0 | no winner |
-| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `metadata/read_flac_seektable` | — | — | — | — | 0 | no winner |
-| `metadata/read_h264_1080p_30s` | — | — | — | — | 0 | no winner |
-| `metadata/read_h264_1080p_5s` | — | — | — | — | 0 | no winner |
-| `metadata/read_h264_in_mkv` | — | — | — | — | 0 | no winner |
-| `metadata/read_h264_multitrack` | — | — | — | — | 0 | no winner |
-| `metadata/read_mp3_xing` | — | — | — | — | 0 | no winner |
-| `metadata/read_no_tags_recorder_webm` | — | — | — | — | 0 | no winner |
-| `metadata/read_no_tags_wav` | — | — | — | — | 0 | no winner |
-| `metadata/read_opus` | — | — | — | — | 0 | no winner |
-| `metadata/read_pcm_s16be` | — | — | — | — | 0 | no winner |
-| `metadata/read_vp9_1080p_10s` | — | — | — | — | 0 | no winner |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | 0 | no winner |
-| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | 0 | no winner |
-| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | 0 | no winner |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | 0 | no winner |
-| `metadata/tracks_attribution_multitrack` | — | — | — | — | 0 | no winner |
-| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | 0 | no winner |
-| `metadata/write_flac_vorbiscomment` | — | — | — | — | 0 | no winner |
-| `metadata/write_mkv_tags` | — | — | — | — | 0 | no winner |
-| `metadata/write_mp3_id3` | — | — | — | — | 0 | no winner |
-| `metadata/write_mp4_tags` | — | — | — | — | 0 | no winner |
-| `metadata/write_ogg_vorbiscomment` | — | — | — | — | 0 | no winner |
-| `mux/aac_to_adts` | — | — | — | — | 0 | no winner |
-| `mux/audio_only_aac_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/av1_opus_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/drop_audio_track_subset_to_mp4` | `mediabunny@1.48.0` (uncontested) | 508.26 x-realtime | — | — | 1 | uncontested |
-| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | 0 | no winner |
-| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | 0 | no winner |
-| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | 0 | no winner |
-| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | 0 | no winner |
-| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | 0 | no winner |
-| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | 0 | no winner |
-| `mux/flac_to_mkv_audio` | — | — | — | — | 0 | no winner |
-| `mux/h264_aac_to_mkv` | `mediabunny@1.48.0` (uncontested) | 325.64 x-realtime | — | — | 1 | uncontested |
-| `mux/h264_aac_to_mov` | — | — | — | — | 0 | no winner |
-| `mux/h264_aac_to_mp4` | `mediabunny@1.48.0` (uncontested) | 380.08 x-realtime | — | — | 1 | uncontested |
-| `mux/h264_aac_to_ts` | — | — | — | — | 0 | no winner |
-| `mux/mp3_to_mp3` | — | — | — | — | 0 | no winner |
-| `mux/mp3_to_mp4_audio` | — | — | — | — | 0 | no winner |
-| `mux/mp4_faststart_reserve` | — | — | — | — | 0 | no winner |
-| `mux/mp4_fragmented_cmaf` | — | — | — | — | 0 | no winner |
-| `mux/mp4_progressive_buffer` | — | — | — | — | 0 | no winner |
-| `mux/mp4_streaming_target` | — | — | — | — | 0 | no winner |
-| `mux/neg_h264_into_wav_illegal` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
-| `mux/opus_to_ogg` | — | — | — | — | 0 | no winner |
-| `mux/opus_to_webm_audio` | — | — | — | — | 0 | no winner |
-| `mux/pcm_f32_to_wav` | — | — | — | — | 0 | no winner |
-| `mux/pcm_s16_to_wav` | — | — | — | — | 0 | no winner |
-| `mux/pcm_s24_to_wav` | — | — | — | — | 0 | no winner |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | 0 | no winner |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | 0 | no winner |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | 0 | no winner |
-| `mux/size_large_1080p_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/size_large_1080p_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/size_longform_audio_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/size_micro_1frame_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/size_micro_1frame_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/size_tiny_360p_to_mp4` | — | — | — | — | 0 | no winner |
-| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/three_track_assembly_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | 0 | no winner |
-| `mux/video_plus_audio_to_mp4` | `mediabunny@1.48.0` (uncontested) | 373.65 x-realtime | — | — | 1 | uncontested |
-| `mux/vorbis_to_ogg` | — | — | — | — | 0 | no winner |
-| `mux/vp9_opus_to_webm` | — | — | — | — | 0 | no winner |
-| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | 0 | no winner |
-| `performance/bundle-size` | — | — | — | — | 0 | no winner |
-| `performance/convert-longtasks` | — | — | — | — | 0 | no winner |
-| `performance/convert-peak-memory` | — | — | — | — | 0 | no winner |
-| `performance/convert-webm-resize-320x180` | — | — | — | — | 0 | no winner |
-| `performance/decode-fps` | 🏆 `mediabunny@1.48.0` | 55.15 fps | `platform@chrome-149` | +11.46% | 2 | contested |
-| `performance/encode-fps` | — | — | — | — | 0 | no winner |
-| `performance/extract-metadata` | — | — | — | — | 0 | no winner |
-| `performance/iterate-video-packets` | — | — | — | — | 0 | no winner |
-| `performance/metamorphic-decode-remux` | — | — | — | — | 0 | no winner |
-| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | 0 | no winner |
-| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | 0 | no winner |
-| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | 0 | no winner |
-| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | 0 | no winner |
-| `performance/op-sweep-demux` | — | — | — | — | 0 | no winner |
-| `performance/op-sweep-probe` | — | — | — | — | 0 | no winner |
-| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | 0 | no winner |
-| `performance/op-sweep-transcode-webm` | — | — | — | — | 0 | no winner |
-| `performance/seek-ms` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-large` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-large` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | 0 | no winner |
-| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | 0 | no winner |
-| `probe/aac_adts` | — | — | — | — | 0 | no winner |
-| `probe/av1_720p_5s` | — | — | — | — | 0 | no winner |
-| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | 0 | no winner |
-| `probe/cenc_cbcs` | — | — | — | — | 0 | no winner |
-| `probe/cenc_ctr` | — | — | — | — | 0 | no winner |
-| `probe/empty-audio-wav` | — | — | — | — | 0 | no winner |
-| `probe/flac_noseektable` | — | — | — | — | 0 | no winner |
-| `probe/flac_seektable` | — | — | — | — | 0 | no winner |
-| `probe/h264_1080p_30s` | — | — | — | — | 0 | no winner |
-| `probe/h264_1080p_5s` | — | — | — | — | 0 | no winner |
-| `probe/h264_4k_10s` | — | — | — | — | 0 | no winner |
-| `probe/h264_bframes_1080p` | — | — | — | — | 0 | no winner |
-| `probe/h264_in_mkv` | — | — | — | — | 0 | no winner |
-| `probe/h264_multitrack` | — | — | — | — | 0 | no winner |
-| `probe/h264_rotated90` | — | — | — | — | 0 | no winner |
-| `probe/h264_ts` | — | — | — | — | 0 | no winner |
-| `probe/h264_vfr` | — | — | — | — | 0 | no winner |
-| `probe/hevc_1080p_10s` | — | — | — | — | 0 | no winner |
-| `probe/hls_aes128` | — | — | — | — | 0 | no winner |
-| `probe/hls_vod` | — | — | — | — | 0 | no winner |
-| `probe/huge_h264_1080p_600s` | — | — | — | — | 0 | no winner |
-| `probe/large_h264_1080p_120s` | — | — | — | — | 0 | no winner |
-| `probe/large_vp9_1080p_120s` | — | — | — | — | 0 | no winner |
-| `probe/longform_1h_audio` | — | — | — | — | 0 | no winner |
-| `probe/massive_h264_1080p_2h` | — | — | — | — | 0 | no winner |
-| `probe/metamorphic-duration-across-containers` | — | — | — | — | 0 | no winner |
-| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | 0 | no winner |
-| `probe/micro_audio_short` | — | — | — | — | 0 | no winner |
-| `probe/micro_h264_1frame` | `mediabunny@1.48.0` (uncontested) | 3.56 ms | — | — | 1 | uncontested |
-| `probe/mp3_cbr_notoc` | — | — | — | — | 0 | no winner |
-| `probe/mp3_xing` | — | — | — | — | 0 | no winner |
-| `probe/opus` | — | — | — | — | 0 | no winner |
-| `probe/pcm_s16be` | — | — | — | — | 0 | no winner |
-| `probe/perf-extract-metadata-huge` | — | — | — | — | 0 | no winner |
-| `probe/perf-extract-metadata-large` | — | — | — | — | 0 | no winner |
-| `probe/perf-extract-metadata-massive` | — | — | — | — | 0 | no winner |
-| `probe/recorder_headerless` | — | — | — | — | 0 | no winner |
-| `probe/tiny_h264_360p_2s` | — | — | — | — | 0 | no winner |
-| `probe/tiny_vp9_360p_2s` | — | — | — | — | 0 | no winner |
-| `probe/truncated-header-graceful` | — | — | — | — | 0 | no winner |
-| `probe/vp8_720p_10s` | — | — | — | — | 0 | no winner |
-| `probe/vp9_1080p_10s` | — | — | — | — | 0 | no winner |
-| `probe/vp9_alpha` | — | — | — | — | 0 | no winner |
-| `probe/wav_f32` | — | — | — | — | 0 | no winner |
-| `probe/wav_s16` | — | — | — | — | 0 | no winner |
-| `probe/wav_s24` | — | — | — | — | 0 | no winner |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/aac_adts_adts_to_ts` | — | — | — | — | 0 | no winner |
-| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | 0 | no winner |
-| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | 0 | no winner |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | 0 | no winner |
-| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | 0 | no winner |
-| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | 0 | no winner |
-| `remux/h264_ts_ts_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/h264_ts_ts_to_mov` | — | — | — | — | 0 | no winner |
-| `remux/h264_ts_ts_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | 0 | no winner |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | 0 | no winner |
-| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/opus_ogg_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/opus_ogg_to_webm` | — | — | — | — | 0 | no winner |
-| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | 0 | no winner |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | 0 | no winner |
-| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | 0 | no winner |
-| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | 0 | no winner |
-| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | 0 | no winner |
-| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | 0 | no winner |
-| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | 0 | no winner |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | 0 | no winner |
-| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | 0 | no winner |
-| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | 0 | no winner |
-| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | 0 | no winner |
-| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | 0 | no winner |
-| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_buffer_target` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_faststart_none_control` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_faststart_reserve` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_streaming_target` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | 0 | no winner |
-| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | 0 | no winner |
-| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | 0 | no winner |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | 0 | no winner |
-| `streaming-output/stream_large_h264_mp4` | — | — | — | — | 0 | no winner |
-| `streaming-output/stream_large_vp9_webm` | — | — | — | — | 0 | no winner |
-| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | 0 | no winner |
-| `streaming-output/ts_continuity_many_writes` | — | — | — | — | 0 | no winner |
-| `streaming-output/ts_tiny_writes` | — | — | — | — | 0 | no winner |
-| `streaming-output/webm_headerless_live_stream` | — | — | — | — | 0 | no winner |
-| `streaming-output/webm_streaming_target` | — | — | — | — | 0 | no winner |
-| `trim/audio_aac_adts_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_flac_noseektable_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_flac_seektable_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_mp3_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_opus_ogg_copy` | — | — | — | — | 0 | no winner |
-| `trim/audio_wav_pcm_copy` | — | — | — | — | 0 | no winner |
-| `trim/av1_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | 0 | no winner |
-| `trim/h264_bframes_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/h264_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/h264_keyframe_aligned` | `mediabunny@1.48.0` (uncontested) | 42.05 x-realtime | — | — | 1 | uncontested |
-| `trim/h264_keyframe_aligned_short` | — | — | — | — | 0 | no winner |
-| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/h264_noop_full_range_idempotent` | `mediabunny@1.48.0` (uncontested) | 672.57 x-realtime | — | — | 1 | uncontested |
-| `trim/h264_open_gop_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/h264_single_gop_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/h264_start_zero_copy` | — | — | — | — | 0 | no winner |
-| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/h264_to_eof_copy` | — | — | — | — | 0 | no winner |
-| `trim/h264_vfr_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/hevc_frame_accurate` | — | — | — | — | 0 | no winner |
-| `trim/hevc_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | 0 | no winner |
-| `trim/large_h264_copy_lazyread` | — | — | — | — | 0 | no winner |
-| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | 0 | no winner |
-| `trim/massive_h264_copy_sustained` | — | — | — | — | 0 | no winner |
-| `trim/mkv_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/mov_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/robust_zero_length_range` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
-| `trim/ts_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/vp8_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/vp9_keyframe_aligned` | — | — | — | — | 0 | no winner |
-| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | 0 | no winner |
-
-### 3. Conformance matrix (same display rule, grouped by correctness)
-
-| Scenario | aibrush-media@dev | ffmpeg.wasm@0.12.15 | mediabunny@1.48.0 | mp4box@2.3.0 | platform@chrome-149 | remotion-media-parser@4.0.479 | remotion-webcodecs@4.0.479 | web-demuxer@4.0.0 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | — | — | — | — | — | — | — | — |
-| `audio-dsp/caf_container_probe` | — | — | — | — | — | — | — | — |
-| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — | — | — | — |
-| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — | — | — | — |
-| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — | — | — | — |
-| `audio-dsp/fade_in_out_f32` | — | — | — | — | — | — | — | — |
-| `audio-dsp/gain_half_f32` | — | — | — | — | — | — | — | — |
-| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — | — | — | — |
-| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — | — | — | — |
-| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — | — | — | — |
-| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s24` | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s24` | — | — | — | — | — | — | — | — |
-| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — | — | — | — |
-| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — | — | — | — |
-| `demux/aac_adts` | — | — | — | — | — | — | — | — |
-| `demux/av1_720p_5s` | — | — | — | — | — | — | — | — |
-| `demux/empty_audio_zero_packets` | — | — | — | — | — | — | — | — |
-| `demux/flac_noseektable` | — | — | — | — | — | — | — | — |
-| `demux/flac_seektable` | — | — | — | — | — | — | — | — |
-| `demux/h264_1080p_30s` | — | — | — | — | — | — | — | — |
-| `demux/h264_1080p_5s` | — | — | — | — | — | — | — | — |
-| `demux/h264_4k_10s` | — | — | — | — | — | — | — | — |
-| `demux/h264_bframes_1080p` | — | — | — | — | — | — | — | — |
-| `demux/h264_in_mkv` | — | — | — | — | — | — | — | — |
-| `demux/h264_multitrack` | — | — | — | — | — | — | — | — |
-| `demux/h264_rotated90` | — | — | — | — | — | — | — | — |
-| `demux/h264_ts` | — | — | — | — | — | — | — | — |
-| `demux/h264_vfr` | — | — | — | — | — | — | — | — |
-| `demux/hevc_1080p_10s` | — | — | — | — | — | — | — | — |
-| `demux/hls_aes128` | — | — | — | — | — | — | — | — |
-| `demux/hls_vod` | — | — | — | — | — | — | — | — |
-| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — | — | — | — |
-| `demux/mp3_cbr_notoc` | — | — | — | — | — | — | — | — |
-| `demux/mp3_xing` | — | — | — | — | — | — | — | — |
-| `demux/opus` | — | — | — | — | — | — | — | — |
-| `demux/pcm_s16be` | — | — | — | — | — | — | — | — |
-| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — | — | — | — |
-| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — | — | — | — |
-| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — | — | — | — |
-| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — | — | — | — |
-| `demux/size_micro_micro_audio_short` | — | — | — | — | — | — | — | — |
-| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — | — | — | — |
-| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — | — | — | — |
-| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — |
-| `demux/vp8_720p_10s` | — | — | — | — | — | — | — | — |
-| `demux/vp9_1080p_10s` | — | — | — | — | — | — | — | — |
-| `demux/vp9_alpha` | — | — | — | — | — | — | — | — |
-| `demux/wav_f32` | — | — | — | — | — | — | — | — |
-| `demux/wav_s16` | — | — | — | — | — | — | — | — |
-| `demux/wav_s24` | — | — | — | — | — | — | — | — |
-| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — | — | — | — |
-| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt` | — | — | — | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — |
-| `encryption/clearkey_decrypt_na` | — | — | — | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt` | — | — | — | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — | — | — | — |
-| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — | — | — | — |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — | — | — | — |
-| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — | — | — | — |
-| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `metadata/read_flac_seektable` | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_1080p_30s` | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_1080p_5s` | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_in_mkv` | — | — | — | — | — | — | — | — |
-| `metadata/read_h264_multitrack` | — | — | — | — | — | — | — | — |
-| `metadata/read_mp3_xing` | — | — | — | — | — | — | — | — |
-| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — | — | — | — |
-| `metadata/read_no_tags_wav` | — | — | — | — | — | — | — | — |
-| `metadata/read_opus` | — | — | — | — | — | — | — | — |
-| `metadata/read_pcm_s16be` | — | — | — | — | — | — | — | — |
-| `metadata/read_vp9_1080p_10s` | — | — | — | — | — | — | — | — |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — | — | — | — |
-| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — | — | — | — |
-| `metadata/tracks_attribution_multitrack` | — | — | — | — | — | — | — | — |
-| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — | — | — | — |
-| `metadata/write_flac_vorbiscomment` | — | — | — | — | — | — | — | — |
-| `metadata/write_mkv_tags` | — | — | — | — | — | — | — | — |
-| `metadata/write_mp3_id3` | — | — | — | — | — | — | — | — |
-| `metadata/write_mp4_tags` | — | — | — | — | — | — | — | — |
-| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — | — | — | — |
-| `mux/aac_to_adts` | — | — | — | — | — | — | — | — |
-| `mux/audio_only_aac_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/av1_opus_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/drop_audio_track_subset_to_mp4` | — | — | Pass (28.25 ms) | N/A | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — | — | — | — |
-| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — | — | — | — |
-| `mux/flac_to_mkv_audio` | — | — | — | — | — | — | — | — |
-| `mux/h264_aac_to_mkv` | — | — | Pass (84.06 ms) | N/A | — | — | — | — |
-| `mux/h264_aac_to_mov` | — | — | — | — | — | — | — | — |
-| `mux/h264_aac_to_mp4` | — | — | Pass (88.49 ms) | — | — | — | — | — |
-| `mux/h264_aac_to_ts` | — | — | — | — | — | — | — | — |
-| `mux/mp3_to_mp3` | — | — | — | — | — | — | — | — |
-| `mux/mp3_to_mp4_audio` | — | — | — | — | — | — | — | — |
-| `mux/mp4_faststart_reserve` | — | — | — | — | — | — | — | — |
-| `mux/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — |
-| `mux/mp4_progressive_buffer` | — | — | — | — | — | — | — | — |
-| `mux/mp4_streaming_target` | — | — | — | — | — | — | — | — |
-| `mux/neg_h264_into_wav_illegal` | — | — | Pass (89 ms) | N/A | — | — | — | — |
-| `mux/opus_to_ogg` | — | — | — | — | — | — | — | — |
-| `mux/opus_to_webm_audio` | — | — | — | — | — | — | — | — |
-| `mux/pcm_f32_to_wav` | — | — | — | — | — | — | — | — |
-| `mux/pcm_s16_to_wav` | — | — | — | — | — | — | — | — |
-| `mux/pcm_s24_to_wav` | — | — | — | — | — | — | — | — |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — | — | — | — |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — | — | — | — |
-| `mux/size_large_1080p_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/size_large_1080p_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/size_longform_audio_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — | — | — | — |
-| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/three_track_assembly_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — | — | — | — |
-| `mux/video_plus_audio_to_mp4` | — | — | Pass (89.66 ms) | N/A | — | — | — | — |
-| `mux/vorbis_to_ogg` | — | — | — | — | — | — | — | — |
-| `mux/vp9_opus_to_webm` | — | — | — | — | — | — | — | — |
-| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — | — | — | — |
-| `performance/bundle-size` | — | — | — | — | — | — | — | — |
-| `performance/convert-longtasks` | — | — | — | — | — | — | — | — |
-| `performance/convert-peak-memory` | — | — | — | — | — | — | — | — |
-| `performance/convert-webm-resize-320x180` | — | — | — | — | — | — | — | — |
-| `performance/decode-fps` | — | — | Pass (5.43 s) | — | Pass (5.71 s) | — | — | — |
-| `performance/encode-fps` | — | — | — | — | — | — | — | — |
-| `performance/extract-metadata` | — | — | — | — | — | — | — | — |
-| `performance/iterate-video-packets` | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-decode-remux` | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — | — | — | — |
-| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-demux` | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-probe` | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — | — | — | — |
-| `performance/op-sweep-transcode-webm` | — | — | — | — | — | — | — | — |
-| `performance/seek-ms` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — | — | — | — |
-| `probe/aac_adts` | — | — | — | — | — | — | — | — |
-| `probe/av1_720p_5s` | — | — | — | — | — | — | — | — |
-| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — | — | — | — |
-| `probe/cenc_cbcs` | — | — | — | — | — | — | — | — |
-| `probe/cenc_ctr` | — | — | — | — | — | — | — | — |
-| `probe/empty-audio-wav` | — | — | — | — | — | — | — | — |
-| `probe/flac_noseektable` | — | — | — | — | — | — | — | — |
-| `probe/flac_seektable` | — | — | — | — | — | — | — | — |
-| `probe/h264_1080p_30s` | — | — | — | — | — | — | — | — |
-| `probe/h264_1080p_5s` | — | — | — | — | — | — | — | — |
-| `probe/h264_4k_10s` | — | — | — | — | — | — | — | — |
-| `probe/h264_bframes_1080p` | — | — | — | — | — | — | — | — |
-| `probe/h264_in_mkv` | — | — | — | — | — | — | — | — |
-| `probe/h264_multitrack` | — | — | — | — | — | — | — | — |
-| `probe/h264_rotated90` | — | — | — | — | — | — | — | — |
-| `probe/h264_ts` | — | — | — | — | — | — | — | — |
-| `probe/h264_vfr` | — | — | — | — | — | — | — | — |
-| `probe/hevc_1080p_10s` | — | — | — | — | — | — | — | — |
-| `probe/hls_aes128` | — | — | — | — | — | — | — | — |
-| `probe/hls_vod` | — | — | — | — | — | — | — | — |
-| `probe/huge_h264_1080p_600s` | — | — | — | — | — | — | — | — |
-| `probe/large_h264_1080p_120s` | — | — | — | — | — | — | — | — |
-| `probe/large_vp9_1080p_120s` | — | — | — | — | — | — | — | — |
-| `probe/longform_1h_audio` | — | — | — | — | — | — | — | — |
-| `probe/massive_h264_1080p_2h` | — | — | — | — | — | — | — | — |
-| `probe/metamorphic-duration-across-containers` | — | — | — | — | — | — | — | — |
-| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — | — | — | — |
-| `probe/micro_audio_short` | — | — | — | — | — | — | — | — |
-| `probe/micro_h264_1frame` | N/A | — | Pass (3.56 ms) | — | — | — | — | — |
-| `probe/mp3_cbr_notoc` | — | — | — | — | — | — | — | — |
-| `probe/mp3_xing` | — | — | — | — | — | — | — | — |
-| `probe/opus` | — | — | — | — | — | — | — | — |
-| `probe/pcm_s16be` | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-huge` | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-large` | — | — | — | — | — | — | — | — |
-| `probe/perf-extract-metadata-massive` | — | — | — | — | — | — | — | — |
-| `probe/recorder_headerless` | — | — | — | — | — | — | — | — |
-| `probe/tiny_h264_360p_2s` | — | — | — | — | — | — | — | — |
-| `probe/tiny_vp9_360p_2s` | — | — | — | — | — | — | — | — |
-| `probe/truncated-header-graceful` | — | — | — | — | — | — | — | — |
-| `probe/vp8_720p_10s` | — | — | — | — | — | — | — | — |
-| `probe/vp9_1080p_10s` | — | — | — | — | — | — | — | — |
-| `probe/vp9_alpha` | — | — | — | — | — | — | — | — |
-| `probe/wav_f32` | — | — | — | — | — | — | — | — |
-| `probe/wav_s16` | — | — | — | — | — | — | — | — |
-| `probe/wav_s24` | — | — | — | — | — | — | — | — |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/aac_adts_adts_to_ts` | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — | — | — | — |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — | — | — | — |
-| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mov` | — | — | — | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — | — | — | — |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/opus_ogg_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/opus_ogg_to_webm` | — | — | — | — | — | — | — | — |
-| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — | — | — | — |
-| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — | — | — | — |
-| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — | — | — | — |
-| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — | — | — | — |
-| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — | — | — | — |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — | — | — | — |
-| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — | — | — | — |
-| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — | — | — | — |
-| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_buffer_target` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_streaming_target` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — | — | — | — |
-| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — | — | — | — |
-| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — | — | — | — |
-| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — | — | — | — |
-| `streaming-output/ts_tiny_writes` | — | — | — | — | — | — | — | — |
-| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — | — | — | — |
-| `streaming-output/webm_streaming_target` | — | — | — | — | — | — | — | — |
-| `trim/audio_aac_adts_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_flac_noseektable_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_flac_seektable_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_mp3_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_opus_ogg_copy` | — | — | — | — | — | — | — | — |
-| `trim/audio_wav_pcm_copy` | — | — | — | — | — | — | — | — |
-| `trim/av1_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — | — | — | — |
-| `trim/h264_bframes_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/h264_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/h264_keyframe_aligned` | — | — | Pass (723 ms) | N/A | — | — | — | — |
-| `trim/h264_keyframe_aligned_short` | — | — | — | — | — | — | — | — |
-| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/h264_noop_full_range_idempotent` | — | — | Pass (64.11 ms) | N/A | — | — | — | — |
-| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/h264_start_zero_copy` | — | — | — | — | — | — | — | — |
-| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/h264_to_eof_copy` | — | — | — | — | — | — | — | — |
-| `trim/h264_vfr_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/hevc_frame_accurate` | — | — | — | — | — | — | — | — |
-| `trim/hevc_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — | — | — | — |
-| `trim/large_h264_copy_lazyread` | — | — | — | — | — | — | — | — |
-| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — | — | — | — |
-| `trim/massive_h264_copy_sustained` | — | — | — | — | — | — | — | — |
-| `trim/mkv_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/mov_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/robust_zero_length_range` | — | — | Pass (67 ms) | N/A | — | — | — | — |
-| `trim/ts_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/vp8_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/vp9_keyframe_aligned` | — | — | — | — | — | — | — | — |
-| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — | — | — | — |
-
-<details><summary>Cell details</summary>
-
-- `aibrush-media@dev` · `probe/micro_h264_1frame` — **N/A**: engine does not declare operation 'probe'
-- `mp4box@2.3.0` · `mux/drop_audio_track_subset_to_mp4` — **N/A**: engine does not declare operation 'mux'
-- `mp4box@2.3.0` · `mux/h264_aac_to_mkv` — **N/A**: engine does not declare operation 'mux'
-- `mp4box@2.3.0` · `mux/neg_h264_into_wav_illegal` — **N/A**: engine does not declare operation 'mux'
-- `mp4box@2.3.0` · `mux/video_plus_audio_to_mp4` — **N/A**: engine does not declare operation 'mux'
-- `mp4box@2.3.0` · `trim/h264_keyframe_aligned` — **N/A**: engine does not declare operation 'trim'
-- `mp4box@2.3.0` · `trim/h264_noop_full_range_idempotent` — **N/A**: engine does not declare operation 'trim'
-- `mp4box@2.3.0` · `trim/robust_zero_length_range` — **N/A**: engine does not declare operation 'trim'
-
-</details>
-
-### 4. Benchmark matrix (full per-engine timing detail)
-
-_Indicative for this browser only. Cells without a green conformance gate are blank (—)._
-
-**`aibrush-media@dev`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-**`ffmpeg.wasm@0.12.15`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-**`mediabunny@1.48.0`**
-
-| Scenario | wall median (ms) | wall p95 (ms) | ×realtime | peak mem | longtasks (ms) |
-| --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | — | — | — | — | — |
-| `audio-dsp/caf_container_probe` | — | — | — | — | — |
-| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — |
-| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — |
-| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — |
-| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — |
-| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — |
-| `audio-dsp/fade_in_out_f32` | — | — | — | — | — |
-| `audio-dsp/gain_half_f32` | — | — | — | — | — |
-| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — |
-| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — |
-| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — |
-| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — |
-| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — |
-| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — |
-| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — |
-| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — |
-| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — |
-| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s24` | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s24` | — | — | — | — | — |
-| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — |
-| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — |
-| `demux/aac_adts` | — | — | — | — | — |
-| `demux/av1_720p_5s` | — | — | — | — | — |
-| `demux/empty_audio_zero_packets` | — | — | — | — | — |
-| `demux/flac_noseektable` | — | — | — | — | — |
-| `demux/flac_seektable` | — | — | — | — | — |
-| `demux/h264_1080p_30s` | — | — | — | — | — |
-| `demux/h264_1080p_5s` | — | — | — | — | — |
-| `demux/h264_4k_10s` | — | — | — | — | — |
-| `demux/h264_bframes_1080p` | — | — | — | — | — |
-| `demux/h264_in_mkv` | — | — | — | — | — |
-| `demux/h264_multitrack` | — | — | — | — | — |
-| `demux/h264_rotated90` | — | — | — | — | — |
-| `demux/h264_ts` | — | — | — | — | — |
-| `demux/h264_vfr` | — | — | — | — | — |
-| `demux/hevc_1080p_10s` | — | — | — | — | — |
-| `demux/hls_aes128` | — | — | — | — | — |
-| `demux/hls_vod` | — | — | — | — | — |
-| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — |
-| `demux/mp3_cbr_notoc` | — | — | — | — | — |
-| `demux/mp3_xing` | — | — | — | — | — |
-| `demux/opus` | — | — | — | — | — |
-| `demux/pcm_s16be` | — | — | — | — | — |
-| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — |
-| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — |
-| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — |
-| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — |
-| `demux/size_micro_micro_audio_short` | — | — | — | — | — |
-| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — |
-| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — |
-| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — |
-| `demux/vp8_720p_10s` | — | — | — | — | — |
-| `demux/vp9_1080p_10s` | — | — | — | — | — |
-| `demux/vp9_alpha` | — | — | — | — | — |
-| `demux/wav_f32` | — | — | — | — | — |
-| `demux/wav_s16` | — | — | — | — | — |
-| `demux/wav_s24` | — | — | — | — | — |
-| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — |
-| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt` | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — |
-| `encryption/clearkey_decrypt_na` | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt` | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — |
-| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — |
-| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — |
-| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — |
-| `metadata/read_flac_seektable` | — | — | — | — | — |
-| `metadata/read_h264_1080p_30s` | — | — | — | — | — |
-| `metadata/read_h264_1080p_5s` | — | — | — | — | — |
-| `metadata/read_h264_in_mkv` | — | — | — | — | — |
-| `metadata/read_h264_multitrack` | — | — | — | — | — |
-| `metadata/read_mp3_xing` | — | — | — | — | — |
-| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — |
-| `metadata/read_no_tags_wav` | — | — | — | — | — |
-| `metadata/read_opus` | — | — | — | — | — |
-| `metadata/read_pcm_s16be` | — | — | — | — | — |
-| `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
-| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
-| `metadata/tracks_attribution_multitrack` | — | — | — | — | — |
-| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — |
-| `metadata/write_flac_vorbiscomment` | — | — | — | — | — |
-| `metadata/write_mkv_tags` | — | — | — | — | — |
-| `metadata/write_mp3_id3` | — | — | — | — | — |
-| `metadata/write_mp4_tags` | — | — | — | — | — |
-| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
-| `mux/aac_to_adts` | — | — | — | — | — |
-| `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
-| `mux/av1_opus_to_mp4` | — | — | — | — | — |
-| `mux/drop_audio_track_subset_to_mp4` | 28.3 | 28.3 | 508.26× | 25.25 MiB | 55 |
-| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — |
-| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — |
-| `mux/flac_to_mkv_audio` | — | — | — | — | — |
-| `mux/h264_aac_to_mkv` | 84.1 | 84.1 | 325.64× | 209.83 MiB | 55 |
-| `mux/h264_aac_to_mov` | — | — | — | — | — |
-| `mux/h264_aac_to_mp4` | 88.5 | 88.5 | 380.08× | 209.57 MiB | 0 |
-| `mux/h264_aac_to_ts` | — | — | — | — | — |
-| `mux/mp3_to_mp3` | — | — | — | — | — |
-| `mux/mp3_to_mp4_audio` | — | — | — | — | — |
-| `mux/mp4_faststart_reserve` | — | — | — | — | — |
-| `mux/mp4_fragmented_cmaf` | — | — | — | — | — |
-| `mux/mp4_progressive_buffer` | — | — | — | — | — |
-| `mux/mp4_streaming_target` | — | — | — | — | — |
-| `mux/neg_h264_into_wav_illegal` | — | — | — | — | — |
-| `mux/opus_to_ogg` | — | — | — | — | — |
-| `mux/opus_to_webm_audio` | — | — | — | — | — |
-| `mux/pcm_f32_to_wav` | — | — | — | — | — |
-| `mux/pcm_s16_to_wav` | — | — | — | — | — |
-| `mux/pcm_s24_to_wav` | — | — | — | — | — |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — |
-| `mux/size_large_1080p_to_mkv` | — | — | — | — | — |
-| `mux/size_large_1080p_to_mp4` | — | — | — | — | — |
-| `mux/size_longform_audio_to_mp4` | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — |
-| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — |
-| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — |
-| `mux/three_track_assembly_to_mkv` | — | — | — | — | — |
-| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — |
-| `mux/video_plus_audio_to_mp4` | 89.7 | 89.7 | 373.65× | 198.46 MiB | 55 |
-| `mux/vorbis_to_ogg` | — | — | — | — | — |
-| `mux/vp9_opus_to_webm` | — | — | — | — | — |
-| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — |
-| `performance/bundle-size` | — | — | — | — | — |
-| `performance/convert-longtasks` | — | — | — | — | — |
-| `performance/convert-peak-memory` | — | — | — | — | — |
-| `performance/convert-webm-resize-320x180` | — | — | — | — | — |
-| `performance/decode-fps` | 5427.4 | 5427.4 | — | — | — |
-| `performance/encode-fps` | — | — | — | — | — |
-| `performance/extract-metadata` | — | — | — | — | — |
-| `performance/iterate-video-packets` | — | — | — | — | — |
-| `performance/metamorphic-decode-remux` | — | — | — | — | — |
-| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — |
-| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — |
-| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — |
-| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — |
-| `performance/op-sweep-demux` | — | — | — | — | — |
-| `performance/op-sweep-probe` | — | — | — | — | — |
-| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — |
-| `performance/op-sweep-transcode-webm` | — | — | — | — | — |
-| `performance/seek-ms` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — |
-| `probe/aac_adts` | — | — | — | — | — |
-| `probe/av1_720p_5s` | — | — | — | — | — |
-| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — |
-| `probe/cenc_cbcs` | — | — | — | — | — |
-| `probe/cenc_ctr` | — | — | — | — | — |
-| `probe/empty-audio-wav` | — | — | — | — | — |
-| `probe/flac_noseektable` | — | — | — | — | — |
-| `probe/flac_seektable` | — | — | — | — | — |
-| `probe/h264_1080p_30s` | — | — | — | — | — |
-| `probe/h264_1080p_5s` | — | — | — | — | — |
-| `probe/h264_4k_10s` | — | — | — | — | — |
-| `probe/h264_bframes_1080p` | — | — | — | — | — |
-| `probe/h264_in_mkv` | — | — | — | — | — |
-| `probe/h264_multitrack` | — | — | — | — | — |
-| `probe/h264_rotated90` | — | — | — | — | — |
-| `probe/h264_ts` | — | — | — | — | — |
-| `probe/h264_vfr` | — | — | — | — | — |
-| `probe/hevc_1080p_10s` | — | — | — | — | — |
-| `probe/hls_aes128` | — | — | — | — | — |
-| `probe/hls_vod` | — | — | — | — | — |
-| `probe/huge_h264_1080p_600s` | — | — | — | — | — |
-| `probe/large_h264_1080p_120s` | — | — | — | — | — |
-| `probe/large_vp9_1080p_120s` | — | — | — | — | — |
-| `probe/longform_1h_audio` | — | — | — | — | — |
-| `probe/massive_h264_1080p_2h` | — | — | — | — | — |
-| `probe/metamorphic-duration-across-containers` | — | — | — | — | — |
-| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — |
-| `probe/micro_audio_short` | — | — | — | — | — |
-| `probe/micro_h264_1frame` | 3.6 | 3.6 | — | — | — |
-| `probe/mp3_cbr_notoc` | — | — | — | — | — |
-| `probe/mp3_xing` | — | — | — | — | — |
-| `probe/opus` | — | — | — | — | — |
-| `probe/pcm_s16be` | — | — | — | — | — |
-| `probe/perf-extract-metadata-huge` | — | — | — | — | — |
-| `probe/perf-extract-metadata-large` | — | — | — | — | — |
-| `probe/perf-extract-metadata-massive` | — | — | — | — | — |
-| `probe/recorder_headerless` | — | — | — | — | — |
-| `probe/tiny_h264_360p_2s` | — | — | — | — | — |
-| `probe/tiny_vp9_360p_2s` | — | — | — | — | — |
-| `probe/truncated-header-graceful` | — | — | — | — | — |
-| `probe/vp8_720p_10s` | — | — | — | — | — |
-| `probe/vp9_1080p_10s` | — | — | — | — | — |
-| `probe/vp9_alpha` | — | — | — | — | — |
-| `probe/wav_f32` | — | — | — | — | — |
-| `probe/wav_s16` | — | — | — | — | — |
-| `probe/wav_s24` | — | — | — | — | — |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
-| `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — |
-| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mov` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — |
-| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — |
-| `remux/opus_ogg_to_mkv` | — | — | — | — | — |
-| `remux/opus_ogg_to_webm` | — | — | — | — | — |
-| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — |
-| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — |
-| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — |
-| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — |
-| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — |
-| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — |
-| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
-| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
-| `streaming-output/mp4_buffer_target` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — |
-| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — |
-| `streaming-output/mp4_streaming_target` | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — |
-| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — |
-| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — |
-| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — |
-| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — |
-| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — |
-| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — |
-| `streaming-output/ts_tiny_writes` | — | — | — | — | — |
-| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — |
-| `streaming-output/webm_streaming_target` | — | — | — | — | — |
-| `trim/audio_aac_adts_copy` | — | — | — | — | — |
-| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — |
-| `trim/audio_flac_noseektable_copy` | — | — | — | — | — |
-| `trim/audio_flac_seektable_copy` | — | — | — | — | — |
-| `trim/audio_mp3_copy` | — | — | — | — | — |
-| `trim/audio_opus_ogg_copy` | — | — | — | — | — |
-| `trim/audio_wav_pcm_copy` | — | — | — | — | — |
-| `trim/av1_keyframe_aligned` | — | — | — | — | — |
-| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — |
-| `trim/h264_bframes_frame_accurate` | — | — | — | — | — |
-| `trim/h264_frame_accurate` | — | — | — | — | — |
-| `trim/h264_keyframe_aligned` | 723.3 | 723.3 | 42.05× | 0 B | 0 |
-| `trim/h264_keyframe_aligned_short` | — | — | — | — | — |
-| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — |
-| `trim/h264_noop_full_range_idempotent` | 64.1 | 64.1 | 672.57× | 0 B | 0 |
-| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — |
-| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — |
-| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — |
-| `trim/h264_start_zero_copy` | — | — | — | — | — |
-| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — |
-| `trim/h264_to_eof_copy` | — | — | — | — | — |
-| `trim/h264_vfr_frame_accurate` | — | — | — | — | — |
-| `trim/hevc_frame_accurate` | — | — | — | — | — |
-| `trim/hevc_keyframe_aligned` | — | — | — | — | — |
-| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — |
-| `trim/large_h264_copy_lazyread` | — | — | — | — | — |
-| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — |
-| `trim/massive_h264_copy_sustained` | — | — | — | — | — |
-| `trim/mkv_keyframe_aligned` | — | — | — | — | — |
-| `trim/mov_keyframe_aligned` | — | — | — | — | — |
-| `trim/robust_zero_length_range` | — | — | — | — | — |
-| `trim/ts_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp8_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — |
-
-**`mp4box@2.3.0`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-**`platform@chrome-149`**
-
-| Scenario | wall median (ms) | wall p95 (ms) | ×realtime | peak mem | longtasks (ms) |
-| --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | — | — | — | — | — |
-| `audio-dsp/caf_container_probe` | — | — | — | — | — |
-| `audio-dsp/downmix_5_1_to_stereo` | — | — | — | — | — |
-| `audio-dsp/downmix_stereo_to_mono` | — | — | — | — | — |
-| `audio-dsp/edge_empty_audio_transcode` | — | — | — | — | — |
-| `audio-dsp/edge_gapless_aac_decode` | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_probe` | — | — | — | — | — |
-| `audio-dsp/edge_longform_audio_resample_16k` | — | — | — | — | — |
-| `audio-dsp/edge_variable_channel_count_downmix` | — | — | — | — | — |
-| `audio-dsp/fade_in_out_f32` | — | — | — | — | — |
-| `audio-dsp/gain_half_f32` | — | — | — | — | — |
-| `audio-dsp/gain_minus6db_s16` | — | — | — | — | — |
-| `audio-dsp/meta_idempotent_resample_same_rate` | — | — | — | — | — |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | — | — | — | — | — |
-| `audio-dsp/meta_roundtrip_endianness_s16` | — | — | — | — | — |
-| `audio-dsp/negative_image_into_audio_transcode` | — | — | — | — | — |
-| `audio-dsp/pcm_f32_to_s16` | — | — | — | — | — |
-| `audio-dsp/pcm_s16_to_f32` | — | — | — | — | — |
-| `audio-dsp/pcm_s16be_to_s16le` | — | — | — | — | — |
-| `audio-dsp/pcm_s16le_to_s16be` | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_f32` | — | — | — | — | — |
-| `audio-dsp/pcm_s24_to_s16` | — | — | — | — | — |
-| `audio-dsp/pcm_s24be_to_s16le` | — | — | — | — | — |
-| `audio-dsp/resample_44k1_to_48k` | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_16k` | — | — | — | — | — |
-| `audio-dsp/resample_48k_to_44k1` | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s16be` | — | — | — | — | — |
-| `audio-dsp/throughput_decode_s24` | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s16be` | — | — | — | — | — |
-| `audio-dsp/throughput_encode_s24` | — | — | — | — | — |
-| `audio-dsp/upmix_mono_to_stereo` | — | — | — | — | — |
-| `audio-dsp/upmix_stereo_to_5_1` | — | — | — | — | — |
-| `demux/aac_adts` | — | — | — | — | — |
-| `demux/av1_720p_5s` | — | — | — | — | — |
-| `demux/empty_audio_zero_packets` | — | — | — | — | — |
-| `demux/flac_noseektable` | — | — | — | — | — |
-| `demux/flac_seektable` | — | — | — | — | — |
-| `demux/h264_1080p_30s` | — | — | — | — | — |
-| `demux/h264_1080p_5s` | — | — | — | — | — |
-| `demux/h264_4k_10s` | — | — | — | — | — |
-| `demux/h264_bframes_1080p` | — | — | — | — | — |
-| `demux/h264_in_mkv` | — | — | — | — | — |
-| `demux/h264_multitrack` | — | — | — | — | — |
-| `demux/h264_rotated90` | — | — | — | — | — |
-| `demux/h264_ts` | — | — | — | — | — |
-| `demux/h264_vfr` | — | — | — | — | — |
-| `demux/hevc_1080p_10s` | — | — | — | — | — |
-| `demux/hls_aes128` | — | — | — | — | — |
-| `demux/hls_vod` | — | — | — | — | — |
-| `demux/metamorphic_flac_seektable_invariance` | — | — | — | — | — |
-| `demux/mp3_cbr_notoc` | — | — | — | — | — |
-| `demux/mp3_xing` | — | — | — | — | — |
-| `demux/opus` | — | — | — | — | — |
-| `demux/pcm_s16be` | — | — | — | — | — |
-| `demux/size_huge_huge_h264_1080p_600s` | — | — | — | — | — |
-| `demux/size_large_large_h264_1080p_120s` | — | — | — | — | — |
-| `demux/size_large_large_vp9_1080p_120s` | — | — | — | — | — |
-| `demux/size_massive_massive_h264_1080p_2h` | — | — | — | — | — |
-| `demux/size_micro_micro_audio_short` | — | — | — | — | — |
-| `demux/size_micro_micro_h264_1frame` | — | — | — | — | — |
-| `demux/size_tiny_tiny_h264_360p_2s` | — | — | — | — | — |
-| `demux/size_tiny_tiny_vp9_360p_2s` | — | — | — | — | — |
-| `demux/vp8_720p_10s` | — | — | — | — | — |
-| `demux/vp9_1080p_10s` | — | — | — | — | — |
-| `demux/vp9_alpha` | — | — | — | — | — |
-| `demux/wav_f32` | — | — | — | — | — |
-| `demux/wav_s16` | — | — | — | — | — |
-| `demux/wav_s24` | — | — | — | — | — |
-| `encryption/cenc_cbcs_decrypt` | — | — | — | — | — |
-| `encryption/cenc_cens_decrypt_na` | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt` | — | — | — | — | — |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | — | — | — | — | — |
-| `encryption/clearkey_decrypt_na` | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt` | — | — | — | — | — |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | — | — | — | — | — |
-| `encryption/hls_sample_aes_decrypt_na` | — | — | — | — | — |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | — | — | — | — | — |
-| `encryption/unencrypted_left_untouched_noop` | — | — | — | — | — |
-| `metadata/meta_consistent_mp4_to_mkv` | — | — | — | — | — |
-| `metadata/read_flac_seektable` | — | — | — | — | — |
-| `metadata/read_h264_1080p_30s` | — | — | — | — | — |
-| `metadata/read_h264_1080p_5s` | — | — | — | — | — |
-| `metadata/read_h264_in_mkv` | — | — | — | — | — |
-| `metadata/read_h264_multitrack` | — | — | — | — | — |
-| `metadata/read_mp3_xing` | — | — | — | — | — |
-| `metadata/read_no_tags_recorder_webm` | — | — | — | — | — |
-| `metadata/read_no_tags_wav` | — | — | — | — | — |
-| `metadata/read_opus` | — | — | — | — | — |
-| `metadata/read_pcm_s16be` | — | — | — | — | — |
-| `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
-| `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
-| `metadata/tracks_attribution_multitrack` | — | — | — | — | — |
-| `metadata/tracks_packet_attribution_multitrack` | — | — | — | — | — |
-| `metadata/write_flac_vorbiscomment` | — | — | — | — | — |
-| `metadata/write_mkv_tags` | — | — | — | — | — |
-| `metadata/write_mp3_id3` | — | — | — | — | — |
-| `metadata/write_mp4_tags` | — | — | — | — | — |
-| `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
-| `mux/aac_to_adts` | — | — | — | — | — |
-| `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
-| `mux/av1_opus_to_mp4` | — | — | — | — | — |
-| `mux/drop_audio_track_subset_to_mp4` | — | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_bframes_decode_mux_mp4` | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_hevc_decode_mux_mp4` | — | — | — | — | — |
-| `mux/edge_multitrack_keep_all_to_mp4` | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mkv` | — | — | — | — | — |
-| `mux/edge_rotation_decode_mux_mov` | — | — | — | — | — |
-| `mux/flac_to_mkv_audio` | — | — | — | — | — |
-| `mux/h264_aac_to_mkv` | — | — | — | — | — |
-| `mux/h264_aac_to_mov` | — | — | — | — | — |
-| `mux/h264_aac_to_mp4` | — | — | — | — | — |
-| `mux/h264_aac_to_ts` | — | — | — | — | — |
-| `mux/mp3_to_mp3` | — | — | — | — | — |
-| `mux/mp3_to_mp4_audio` | — | — | — | — | — |
-| `mux/mp4_faststart_reserve` | — | — | — | — | — |
-| `mux/mp4_fragmented_cmaf` | — | — | — | — | — |
-| `mux/mp4_progressive_buffer` | — | — | — | — | — |
-| `mux/mp4_streaming_target` | — | — | — | — | — |
-| `mux/neg_h264_into_wav_illegal` | — | — | — | — | — |
-| `mux/opus_to_ogg` | — | — | — | — | — |
-| `mux/opus_to_webm_audio` | — | — | — | — | — |
-| `mux/pcm_f32_to_wav` | — | — | — | — | — |
-| `mux/pcm_s16_to_wav` | — | — | — | — | — |
-| `mux/pcm_s24_to_wav` | — | — | — | — | — |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | — | — | — | — | — |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | — | — | — | — | — |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | — | — | — | — | — |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | — | — | — | — | — |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | — | — | — | — | — |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | — | — | — | — | — |
-| `mux/size_large_1080p_to_mkv` | — | — | — | — | — |
-| `mux/size_large_1080p_to_mp4` | — | — | — | — | — |
-| `mux/size_longform_audio_to_mp4` | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mkv` | — | — | — | — | — |
-| `mux/size_micro_1frame_to_mp4` | — | — | — | — | — |
-| `mux/size_tiny_360p_to_mp4` | — | — | — | — | — |
-| `mux/swap_audio_video_with_opus_to_mkv` | — | — | — | — | — |
-| `mux/three_track_assembly_to_mkv` | — | — | — | — | — |
-| `mux/video_a_plus_audio_b_to_mkv` | — | — | — | — | — |
-| `mux/video_plus_audio_to_mp4` | — | — | — | — | — |
-| `mux/vorbis_to_ogg` | — | — | — | — | — |
-| `mux/vp9_opus_to_webm` | — | — | — | — | — |
-| `mux/vp9_video_plus_opus_audio_to_webm` | — | — | — | — | — |
-| `performance/bundle-size` | — | — | — | — | — |
-| `performance/convert-longtasks` | — | — | — | — | — |
-| `performance/convert-peak-memory` | — | — | — | — | — |
-| `performance/convert-webm-resize-320x180` | — | — | — | — | — |
-| `performance/decode-fps` | 5711.3 | 5711.3 | — | — | — |
-| `performance/encode-fps` | — | — | — | — | — |
-| `performance/extract-metadata` | — | — | — | — | — |
-| `performance/iterate-video-packets` | — | — | — | — | — |
-| `performance/metamorphic-decode-remux` | — | — | — | — | — |
-| `performance/metamorphic-probe-duration-cross-container` | — | — | — | — | — |
-| `performance/metamorphic-transcode-idempotent-source-res` | — | — | — | — | — |
-| `performance/metamorphic-vfr-iterate-packets` | — | — | — | — | — |
-| `performance/metamorphic-vfr-probe-duration` | — | — | — | — | — |
-| `performance/op-sweep-demux` | — | — | — | — | — |
-| `performance/op-sweep-probe` | — | — | — | — | — |
-| `performance/op-sweep-remux-mp4-to-mkv` | — | — | — | — | — |
-| `performance/op-sweep-transcode-webm` | — | — | — | — | — |
-| `performance/seek-ms` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-huge` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large` | — | — | — | — | — |
-| `performance/size-ladder-demux-peak-memory-large4k` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-huge` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-large4k` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-massive` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-medium` | — | — | — | — | — |
-| `performance/size-ladder-extract-metadata-tiny` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-huge` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-large4k` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-massive` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-medium` | — | — | — | — | — |
-| `performance/size-ladder-iterate-packets-tiny` | — | — | — | — | — |
-| `probe/aac_adts` | — | — | — | — | — |
-| `probe/av1_720p_5s` | — | — | — | — | — |
-| `probe/big_buck_bunny_1080p_h264` | — | — | — | — | — |
-| `probe/cenc_cbcs` | — | — | — | — | — |
-| `probe/cenc_ctr` | — | — | — | — | — |
-| `probe/empty-audio-wav` | — | — | — | — | — |
-| `probe/flac_noseektable` | — | — | — | — | — |
-| `probe/flac_seektable` | — | — | — | — | — |
-| `probe/h264_1080p_30s` | — | — | — | — | — |
-| `probe/h264_1080p_5s` | — | — | — | — | — |
-| `probe/h264_4k_10s` | — | — | — | — | — |
-| `probe/h264_bframes_1080p` | — | — | — | — | — |
-| `probe/h264_in_mkv` | — | — | — | — | — |
-| `probe/h264_multitrack` | — | — | — | — | — |
-| `probe/h264_rotated90` | — | — | — | — | — |
-| `probe/h264_ts` | — | — | — | — | — |
-| `probe/h264_vfr` | — | — | — | — | — |
-| `probe/hevc_1080p_10s` | — | — | — | — | — |
-| `probe/hls_aes128` | — | — | — | — | — |
-| `probe/hls_vod` | — | — | — | — | — |
-| `probe/huge_h264_1080p_600s` | — | — | — | — | — |
-| `probe/large_h264_1080p_120s` | — | — | — | — | — |
-| `probe/large_vp9_1080p_120s` | — | — | — | — | — |
-| `probe/longform_1h_audio` | — | — | — | — | — |
-| `probe/massive_h264_1080p_2h` | — | — | — | — | — |
-| `probe/metamorphic-duration-across-containers` | — | — | — | — | — |
-| `probe/metamorphic-recorder-headerless-sane-duration` | — | — | — | — | — |
-| `probe/micro_audio_short` | — | — | — | — | — |
-| `probe/micro_h264_1frame` | — | — | — | — | — |
-| `probe/mp3_cbr_notoc` | — | — | — | — | — |
-| `probe/mp3_xing` | — | — | — | — | — |
-| `probe/opus` | — | — | — | — | — |
-| `probe/pcm_s16be` | — | — | — | — | — |
-| `probe/perf-extract-metadata-huge` | — | — | — | — | — |
-| `probe/perf-extract-metadata-large` | — | — | — | — | — |
-| `probe/perf-extract-metadata-massive` | — | — | — | — | — |
-| `probe/recorder_headerless` | — | — | — | — | — |
-| `probe/tiny_h264_360p_2s` | — | — | — | — | — |
-| `probe/tiny_vp9_360p_2s` | — | — | — | — | — |
-| `probe/truncated-header-graceful` | — | — | — | — | — |
-| `probe/vp8_720p_10s` | — | — | — | — | — |
-| `probe/vp9_1080p_10s` | — | — | — | — | — |
-| `probe/vp9_alpha` | — | — | — | — | — |
-| `probe/wav_f32` | — | — | — | — | — |
-| `probe/wav_s16` | — | — | — | — | — |
-| `probe/wav_s24` | — | — | — | — | — |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
-| `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_mp4` | — | — | — | — | — |
-| `remux/av1_720p_5s_webm_to_webm` | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_mkv` | — | — | — | — | — |
-| `remux/flac_seektable_flac_to_ogg` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_mov` | — | — | — | — | — |
-| `remux/h264_1080p_30s_mp4_to_ts` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mkv` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_mp4` | — | — | — | — | — |
-| `remux/h264_1080p_5s_mov_to_ts` | — | — | — | — | — |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mov` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_mp4` | — | — | — | — | — |
-| `remux/h264_in_mkv_mkv_to_ts` | — | — | — | — | — |
-| `remux/h264_multitrack_mp4_to_mkv` | — | — | — | — | — |
-| `remux/h264_rotated90_mp4_to_mov` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mkv` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mov` | — | — | — | — | — |
-| `remux/h264_ts_ts_to_mp4` | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/hevc_1080p_10s_mp4_to_mov` | — | — | — | — | — |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | — | — | — | — | — |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | — | — | — | — | — |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | — | — | — | — | — |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | — | — | — | — | — |
-| `remux/micro_audio_short_mp4_to_adts` | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mkv` | — | — | — | — | — |
-| `remux/mp3_xing_mp3_to_mp4` | — | — | — | — | — |
-| `remux/opus_ogg_to_mkv` | — | — | — | — | — |
-| `remux/opus_ogg_to_webm` | — | — | — | — | — |
-| `remux/prop_adts_to_mp4_duration_invariant` | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | — | — | — | — | — |
-| `remux/prop_bframes_decode_remux_mp4_mov` | — | — | — | — | — |
-| `remux/prop_mp3_to_mp4_duration_invariant` | — | — | — | — | — |
-| `remux/prop_multitrack_survives_mp4_mkv` | — | — | — | — | — |
-| `remux/prop_recorder_headerless_duration_materialized` | — | — | — | — | — |
-| `remux/prop_rotation_survives_mp4_mov` | — | — | — | — | — |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | — | — | — | — | — |
-| `remux/prop_ts_to_mp4_duration_materialized` | — | — | — | — | — |
-| `remux/vp8_720p_10s_webm_to_mkv` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mkv` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_mp4` | — | — | — | — | — |
-| `remux/vp9_1080p_10s_webm_to_webm` | — | — | — | — | — |
-| `streaming-output/buffer_massive_h264_mp4` | — | — | — | — | — |
-| `streaming-output/mp4_buffer_target` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_in_memory` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_none_control` | — | — | — | — | — |
-| `streaming-output/mp4_faststart_reserve` | — | — | — | — | — |
-| `streaming-output/mp4_fragmented_cmaf` | — | — | — | — | — |
-| `streaming-output/mp4_streaming_target` | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_buffer_target` | — | — | — | — | — |
-| `streaming-output/mp4_ttfb_streaming_target` | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_buffer_shape` | — | — | — | — | — |
-| `streaming-output/prop_decode_equals_stream_shape` | — | — | — | — | — |
-| `streaming-output/prop_faststart_in_memory_duration_invariant` | — | — | — | — | — |
-| `streaming-output/prop_faststart_reserve_duration_invariant` | — | — | — | — | — |
-| `streaming-output/prop_frag_premise_decode_equality_mp4` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_buffer_shape` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_fragmented_shape` | — | — | — | — | — |
-| `streaming-output/prop_probe_dur_stream_shape` | — | — | — | — | — |
-| `streaming-output/prop_ts_stream_duration_materialized` | — | — | — | — | — |
-| `streaming-output/prop_webm_headerless_duration_materialized` | — | — | — | — | — |
-| `streaming-output/stream_huge_h264_mov_to_mp4` | — | — | — | — | — |
-| `streaming-output/stream_large_h264_mp4` | — | — | — | — | — |
-| `streaming-output/stream_large_vp9_webm` | — | — | — | — | — |
-| `streaming-output/stream_massive_h264_mp4` | — | — | — | — | — |
-| `streaming-output/ts_continuity_many_writes` | — | — | — | — | — |
-| `streaming-output/ts_tiny_writes` | — | — | — | — | — |
-| `streaming-output/webm_headerless_live_stream` | — | — | — | — | — |
-| `streaming-output/webm_streaming_target` | — | — | — | — | — |
-| `trim/audio_aac_adts_copy` | — | — | — | — | — |
-| `trim/audio_aiff_pcm_be_copy` | — | — | — | — | — |
-| `trim/audio_flac_noseektable_copy` | — | — | — | — | — |
-| `trim/audio_flac_seektable_copy` | — | — | — | — | — |
-| `trim/audio_mp3_copy` | — | — | — | — | — |
-| `trim/audio_opus_ogg_copy` | — | — | — | — | — |
-| `trim/audio_wav_pcm_copy` | — | — | — | — | — |
-| `trim/av1_keyframe_aligned` | — | — | — | — | — |
-| `trim/fmp4_fragment_boundary_copy` | — | — | — | — | — |
-| `trim/h264_bframes_frame_accurate` | — | — | — | — | — |
-| `trim/h264_frame_accurate` | — | — | — | — | — |
-| `trim/h264_keyframe_aligned` | — | — | — | — | — |
-| `trim/h264_keyframe_aligned_short` | — | — | — | — | — |
-| `trim/h264_multitrack_keyframe_aligned` | — | — | — | — | — |
-| `trim/h264_noop_full_range_idempotent` | — | — | — | — | — |
-| `trim/h264_open_gop_frame_accurate` | — | — | — | — | — |
-| `trim/h264_rotated_keyframe_aligned` | — | — | — | — | — |
-| `trim/h264_single_gop_frame_accurate` | — | — | — | — | — |
-| `trim/h264_start_zero_copy` | — | — | — | — | — |
-| `trim/h264_subframe_range_frame_accurate` | — | — | — | — | — |
-| `trim/h264_to_eof_copy` | — | — | — | — | — |
-| `trim/h264_vfr_frame_accurate` | — | — | — | — | — |
-| `trim/hevc_frame_accurate` | — | — | — | — | — |
-| `trim/hevc_keyframe_aligned` | — | — | — | — | — |
-| `trim/huge_h264_mov_copy_peakmem` | — | — | — | — | — |
-| `trim/large_h264_copy_lazyread` | — | — | — | — | — |
-| `trim/large_h264_frame_accurate_throughput` | — | — | — | — | — |
-| `trim/massive_h264_copy_sustained` | — | — | — | — | — |
-| `trim/mkv_keyframe_aligned` | — | — | — | — | — |
-| `trim/mov_keyframe_aligned` | — | — | — | — | — |
-| `trim/robust_zero_length_range` | — | — | — | — | — |
-| `trim/ts_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp8_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_alpha_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_keyframe_aligned` | — | — | — | — | — |
-| `trim/vp9_noop_full_range_idempotent` | — | — | — | — | — |
-
-**`remotion-media-parser@4.0.479`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-**`remotion-webcodecs@4.0.479`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-**`web-demuxer@4.0.0`**
-
-_No admissible benchmarks (no green conformance gate)._
-
-
-### 5. Δ vs reference (`mediabunny`)
-
-| Scenario | aibrush-media@dev perf | aibrush-media@dev conf | ffmpeg.wasm@0.12.15 perf | ffmpeg.wasm@0.12.15 conf | mediabunny@1.48.0 perf | mediabunny@1.48.0 conf | mp4box@2.3.0 perf | mp4box@2.3.0 conf | platform@chrome-149 perf | platform@chrome-149 conf | remotion-media-parser@4.0.479 perf | remotion-media-parser@4.0.479 conf | remotion-webcodecs@4.0.479 perf | remotion-webcodecs@4.0.479 conf | web-demuxer@4.0.0 perf | web-demuxer@4.0.0 conf |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `audio-dsp/aiff_container_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/caf_container_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/downmix_5_1_to_stereo` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/downmix_stereo_to_mono` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/edge_empty_audio_transcode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/edge_gapless_aac_decode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/edge_longform_audio_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/edge_longform_audio_resample_16k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/edge_variable_channel_count_downmix` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/fade_in_out_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/gain_half_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/gain_minus6db_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/meta_idempotent_resample_same_rate` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/meta_probe_duration_across_wav_aiff` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/meta_roundtrip_endianness_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/negative_image_into_audio_transcode` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_f32_to_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s16_to_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s16be_to_s16le` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s16le_to_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s24_to_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s24_to_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/pcm_s24be_to_s16le` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/resample_44k1_to_48k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/resample_48k_to_16k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/resample_48k_to_44k1` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/throughput_decode_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/throughput_decode_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/throughput_encode_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/throughput_encode_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/upmix_mono_to_stereo` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `audio-dsp/upmix_stereo_to_5_1` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/aac_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/av1_720p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/empty_audio_zero_packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/flac_noseektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_4k_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_bframes_1080p` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/h264_vfr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/hevc_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/hls_aes128` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/hls_vod` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/metamorphic_flac_seektable_invariance` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/mp3_cbr_notoc` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_huge_huge_h264_1080p_600s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_large_large_h264_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_large_large_vp9_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_massive_massive_h264_1080p_2h` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_micro_micro_audio_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_micro_micro_h264_1frame` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_tiny_tiny_h264_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/size_tiny_tiny_vp9_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/vp8_720p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/vp9_alpha` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/wav_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/wav_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `demux/wav_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/cenc_cbcs_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/cenc_cens_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/cenc_ctr_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/cenc_ctr_decrypt_eq_cleartext` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/clearkey_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/hls_aes128_decrypt` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/hls_aes128_decrypt_eq_cleartext` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/hls_sample_aes_decrypt_na` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/perf_cenc_ctr_decrypt_throughput` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `encryption/unencrypted_left_untouched_noop` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/meta_consistent_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_no_tags_recorder_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_no_tags_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/read_vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/rotation_decode_read_h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/rotation_survives_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/tagedit_no_corrupt_audio_flac` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/tagedit_no_corrupt_video_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/tracks_attribution_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/tracks_packet_attribution_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/write_flac_vorbiscomment` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/write_mkv_tags` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/write_mp3_id3` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/write_mp4_tags` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `metadata/write_ogg_vorbiscomment` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/aac_to_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/audio_only_aac_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/av1_opus_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/drop_audio_track_subset_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_bframes_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_bframes_decode_mux_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_hevc_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_hevc_decode_mux_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_multitrack_keep_all_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_rotation_decode_mux_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/edge_rotation_decode_mux_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/flac_to_mkv_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/h264_aac_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/h264_aac_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/h264_aac_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/h264_aac_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp3_to_mp3` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp3_to_mp4_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp4_faststart_reserve` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp4_fragmented_cmaf` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp4_progressive_buffer` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/mp4_streaming_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/neg_h264_into_wav_illegal` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/opus_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/opus_to_webm_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/pcm_f32_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/pcm_s16_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/pcm_s24_to_wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_av1_mux_duration_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_h264_decode_mux_mp4_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_h264_mux_duration_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_h264_mux_duration_mp4_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_vfr_mux_duration_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_vfr_mux_duration_mp4_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_vp9_decode_mux_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/prop_vp9_mux_duration_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_large_1080p_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_large_1080p_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_longform_audio_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_micro_1frame_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_micro_1frame_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/size_tiny_360p_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/swap_audio_video_with_opus_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/three_track_assembly_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/video_a_plus_audio_b_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/video_plus_audio_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/vorbis_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/vp9_opus_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `mux/vp9_video_plus_opus_audio_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/bundle-size` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/convert-longtasks` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/convert-peak-memory` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/convert-webm-resize-320x180` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/decode-fps` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/encode-fps` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/extract-metadata` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/iterate-video-packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/metamorphic-decode-remux` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/metamorphic-probe-duration-cross-container` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/metamorphic-transcode-idempotent-source-res` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/metamorphic-vfr-iterate-packets` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/metamorphic-vfr-probe-duration` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/op-sweep-demux` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/op-sweep-probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/op-sweep-remux-mp4-to-mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/op-sweep-transcode-webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/seek-ms` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-demux-peak-memory-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-demux-peak-memory-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-demux-peak-memory-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-medium` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-extract-metadata-tiny` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-large4k` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-medium` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `performance/size-ladder-iterate-packets-tiny` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/aac_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/av1_720p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/big_buck_bunny_1080p_h264` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/cenc_cbcs` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/cenc_ctr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/empty-audio-wav` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/flac_noseektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/flac_seektable` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_1080p_30s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_1080p_5s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_4k_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_bframes_1080p` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_in_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_multitrack` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_rotated90` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/h264_vfr` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/hevc_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/hls_aes128` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/hls_vod` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/huge_h264_1080p_600s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/large_h264_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/large_vp9_1080p_120s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/longform_1h_audio` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/massive_h264_1080p_2h` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/metamorphic-duration-across-containers` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/metamorphic-recorder-headerless-sane-duration` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/micro_audio_short` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/micro_h264_1frame` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/mp3_cbr_notoc` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/mp3_xing` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/opus` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/pcm_s16be` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/perf-extract-metadata-huge` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/perf-extract-metadata-large` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/perf-extract-metadata-massive` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/recorder_headerless` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/tiny_h264_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/tiny_vp9_360p_2s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/truncated-header-graceful` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/vp8_720p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/vp9_1080p_10s` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/vp9_alpha` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/wav_f32` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/wav_s16` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `probe/wav_s24` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/aac_adts_adts_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/aac_adts_adts_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/av1_720p_5s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/av1_720p_5s_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/av1_720p_5s_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/flac_seektable_flac_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/flac_seektable_flac_to_ogg` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_30s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_30s_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_30s_mp4_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_5s_mov_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_5s_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_1080p_5s_mov_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_bframes_1080p_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_in_mkv_mkv_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_in_mkv_mkv_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_in_mkv_mkv_to_ts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_multitrack_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_rotated90_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_ts_ts_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_ts_ts_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/h264_ts_ts_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/hevc_1080p_10s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/hevc_1080p_10s_mp4_to_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/huge_h264_1080p_600s_mov_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/large_h264_1080p_120s_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/large_vp9_1080p_120s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/massive_h264_1080p_2h_mp4_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/micro_audio_short_mp4_to_adts` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/mp3_xing_mp3_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/mp3_xing_mp3_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/opus_ogg_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/opus_ogg_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_adts_to_mp4_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_bframes_decode_remux_mp4_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_mp3_to_mp4_duration_invariant` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_multitrack_survives_mp4_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_recorder_headerless_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_rotation_survives_mp4_mov` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_roundtrip_mp4_mkv_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/prop_ts_to_mp4_duration_materialized` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/vp8_720p_10s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/vp9_1080p_10s_webm_to_mkv` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/vp9_1080p_10s_webm_to_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
-| `remux/vp9_1080p_10s_webm_to_webm` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
+| `robustness/edge_vfr_probe` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 | `streaming-output/buffer_massive_h264_mp4` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 | `streaming-output/mp4_buffer_target` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 | `streaming-output/mp4_faststart_in_memory` | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
@@ -7629,13 +7988,13 @@ _No admissible benchmarks (no green conformance gate)._
 
 ## 5. Per-engine scorecard
 
-| Engine | Conformance % | Pass / applicable | Perf idx (chromium) | Perf idx (brave) | Capability breadth | Robustness % |
+| Engine | Conformance % | Pass / applicable | Perf idx (brave) | Perf idx (chromium) | Capability breadth | Robustness % |
 | --- | --- | --- | --- | --- | --- | --- |
 | `aibrush-media@dev` | 0% | 0 / 0 | — | — | 0 (—) | — |
 | `ffmpeg.wasm@0.12.15` | 75% | 3 / 4 | — | — | 1 (performance) | — |
-| `mediabunny@1.48.0` | 31.1% | 87 / 280 | — | — | 7 (demux, metadata, mux, performance, probe, remux, trim) | — |
-| `mp4box@2.3.0` | 63% | 51 / 81 | — | — | 5 (demux, metadata, performance, probe, streaming-output) | — |
-| `platform@chrome-149` | 47.2% | 42 / 89 | — | — | 4 (demux, metadata, performance, probe) | — |
+| `mediabunny@1.48.0` | 31.8% | 90 / 283 | — | — | 8 (demux, metadata, mux, performance, probe, remux, robustness, trim) | 100% (1/1) |
+| `mp4box@2.3.0` | 63.4% | 52 / 82 | — | — | 5 (demux, metadata, performance, probe, streaming-output) | — |
+| `platform@chrome-149` | 47.8% | 43 / 90 | — | — | 4 (demux, metadata, performance, probe) | — |
 | `remotion-media-parser@4.0.479` | 53.8% | 49 / 91 | — | — | 4 (demux, metadata, performance, probe) | — |
 | `remotion-webcodecs@4.0.479` | 46.5% | 67 / 144 | — | — | 6 (demux, metadata, performance, probe, remux, streaming-output) | — |
 | `web-demuxer@4.0.0` | 37.1% | 33 / 89 | — | — | 4 (demux, metadata, performance, probe) | — |

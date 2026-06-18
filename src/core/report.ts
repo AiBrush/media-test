@@ -14,13 +14,13 @@
  *   2. A benchmark is admissible only behind a green conformance gate; a perf number with no PASS is
  *      not reported (§0.1). A FAIL (wrong output) is shown as FAIL, never as a benchmark number.
  *   3. THE NUMBERS ARE THE PRODUCT (§8, §9): the markdown leads with the primary-metric value (with
- *      unit) for each engine × case that PASSed, "NA" where the framework genuinely cannot run the
+ *      unit) for each engine × case that PASSed, "N/A" where the framework genuinely cannot run the
  *      case, and FAIL where the output was wrong. The conformance LETTER is secondary.
  *
  * NA distinction — model vs presentation: the data model and `report.json` KEEP NA_ENGINE and
  * NA_BROWSER DISTINCT (spec §0.6/§10/§14 forbid collapsing them in the machine-readable twin, and
  * `ResultStatus` carries both). The USER DIRECTIVE (this rework) overrides only the *markdown
- * presentation*: `report.md` renders BOTH as a single user-facing "NA" (the `-ᵇ` browser-specific
+ * presentation*: `report.md` renders BOTH as a single user-facing "N/A" (the `-ᵇ` browser-specific
  * marker is gone) because the reader does not care about browser-specific gaps. JSON consumers are
  * unaffected; only the human-facing rendering collapses. See `naLabelMd` / `statusLabelMd`.
  */
@@ -167,7 +167,7 @@ export interface ReportJson {
 // ── constants ────────────────────────────────────────────────────────────────────────────────
 
 const EM_DASH = '—';
-const BROWSER_ORDER: BrowserName[] = ['chromium', 'webkit', 'firefox'];
+const BROWSER_ORDER: BrowserName[] = ['brave', 'chromium', 'webkit', 'firefox'];
 
 /** Primary throughput metric used for Δ + perf index, in priority order (first present wins). */
 const THROUGHPUT_METRICS: MetricId[] = [
@@ -925,7 +925,7 @@ function renderConformanceSummary(json: ReportJson): string {
 
 /**
  * THE benchmark-first per-case table (USER DIRECTIVE item 1/4; §8/§9): scenario × engine, every cell
- * the PRIMARY-METRIC NUMBER (with unit) when that engine ran the case correctly, "NA" when the
+ * the PRIMARY-METRIC NUMBER (with unit) when that engine ran the case correctly, "N/A" when the
  * framework can't, FAIL when the output was wrong. This is the product — the conformance matrix below
  * is now the secondary, letter-based view. Each row appends the case's primary-metric name so the
  * unit/direction is unambiguous; 🏆 prefixes the per-case winner's number.
@@ -1161,7 +1161,7 @@ function fmtMetricValue(value: number, metric: MetricId | null): string {
  *     functional-only oracle case). Honest: we never invent a number (§0.6/§14).
  *   - FAIL / ERROR → shown as FAIL / ERROR. Correctness GATES the number (§0.1): a wrong output is a
  *     clearly-marked non-number, NEVER a benchmark value.
- *   - NA_ENGINE / NA_BROWSER → a single collapsed "NA" (the framework genuinely cannot run the case;
+ *   - NA_ENGINE / NA_BROWSER → a single collapsed "N/A" (the framework genuinely cannot run the case;
  *     best-effort attempted). The `-ᵇ` distinction is intentionally dropped here (see `statusLabelMd`).
  *   - SKIPPED / not-run → SKIPPED / — .
  */
