@@ -156,8 +156,10 @@ export interface MuxCase {
  */
 function defaultOracles(c: MuxCase): OracleId[] {
   const sourceIsIsoBmff = c.containersIn.every((cc) => cc === 'mp4' || cc === 'mov');
+  const hasTrackSelection = Array.isArray(c.extraOptions?.trackSelect);
+  const isSingleSource = !Array.isArray(c.input);
   const oracles: OracleId[] = [];
-  if (sourceIsIsoBmff && FAITHFUL_REIMPORT_TARGETS.has(c.to)) {
+  if (isSingleSource && !hasTrackSelection && sourceIsIsoBmff && FAITHFUL_REIMPORT_TARGETS.has(c.to)) {
     oracles.push('reference-reimport');
   }
   if (PLAYABLE_TARGETS.has(c.to)) {

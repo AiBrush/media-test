@@ -224,7 +224,10 @@ try {
   writeFileSync(outPath, JSON.stringify(payload, null, 2) + '\n');
 
   const counts = {};
-  for (const r of payload.results) counts[r.status] = (counts[r.status] ?? 0) + 1;
+  for (const r of payload.results) {
+    const label = summaryStatusLabel(r.status);
+    counts[label] = (counts[label] ?? 0) + 1;
+  }
   console.log(
     `[launch] ${opts.browser} done: ${payload.results.length} results ` +
       `(${Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' ')}) → ${outPath}`,
@@ -242,3 +245,21 @@ try {
 }
 
 process.exit(exitCode);
+
+function summaryStatusLabel(status) {
+  switch (status) {
+    case 'PASS':
+      return 'Pass';
+    case 'NA_ENGINE':
+    case 'NA_BROWSER':
+      return 'N/A';
+    case 'FAIL':
+      return 'Fail';
+    case 'ERROR':
+      return 'Error';
+    case 'SKIPPED':
+      return 'Skipped';
+    default:
+      return String(status || 'Unknown');
+  }
+}

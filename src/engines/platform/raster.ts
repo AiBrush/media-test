@@ -2,9 +2,9 @@
  * src/engines/platform/raster.ts — turn a decoded VideoFrame / ImageBitmap / video element into a
  * normalized ImageData (tight RGBA, top-left origin, straight alpha) suitable for digesting.
  *
- * Realm-aware: prefers OffscreenCanvas (works in Worker + page) and falls back to a DOM <canvas>
- * (page only). A 2D canvas always yields straight-alpha, top-left RGBA via getImageData, so canvas
- * rasterization is the normalization step itself.
+ * Realm-aware: for WebCodecs VideoFrame we prefer copyTo(RGBA), which avoids browser canvas
+ * fingerprinting perturbations and is available in Worker + page. Canvas remains the fallback for
+ * rotation/crop cases, ImageBitmap, and <video> element grabs.
  */
 
 /** Source we can draw to a 2D canvas. VideoFrame/ImageBitmap are CanvasImageSource in WebCodecs realms. */
@@ -70,17 +70,49 @@ function videoFrameDisplaySize(frame: VideoFrame): { width: number; height: numb
 }
 
 /**
- * Draw a VideoFrame to a 2D canvas and read back normalized RGBA. drawImage applies any rotation /
- * crop the frame carries and produces straight-alpha top-left pixels at display size.
+ * Convert a VideoFrame to normalized RGBA. Prefer direct WebCodecs copyTo(RGBA) for uncropped,
+ * unrotated frames: it avoids canvas readback perturbations in privacy-hardened browsers. Fall back
+ * to canvas so rotation/crop metadata is still honored where drawImage is the correct presenter.
  */
-export function imageDataFromVideoFrame(frame: VideoFrame): ImageData {
+export async function imageDataFromVideoFrame(frame: VideoFrame): Promise<ImageData> {
   const { width, height } = videoFrameDisplaySize(frame);
   if (width <= 0 || height <= 0) throw new Error('VideoFrame has zero display size');
+
+  const copied = await imageDataViaCopyTo(frame, width, height);
+  if (copied) return copied;
+
   const canvas = makeCanvas2D(width, height);
   canvas.ctx.clearRect(0, 0, width, height);
   // VideoFrame is a CanvasImageSource; drawImage scales the visible rect into the canvas.
   canvas.ctx.drawImage(frame as unknown as Drawable, 0, 0, width, height);
   return canvas.getImageData();
+}
+
+async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: number): Promise<ImageData | null> {
+  const f = frame as unknown as {
+    codedWidth?: number;
+    codedHeight?: number;
+    visibleRect?: { x?: number; y?: number; width?: number; height?: number };
+    copyTo?: (destination: BufferSource, options?: { format?: string }) => Promise<unknown>;
+  };
+  const rect = f.visibleRect;
+  const untransformed =
+    (f.codedWidth ?? width) === width &&
+    (f.codedHeight ?? height) === height &&
+    (!rect ||
+      ((rect.x ?? 0) === 0 &&
+        (rect.y ?? 0) === 0 &&
+        (rect.width ?? width) === width &&
+        (rect.height ?? height) === height));
+  if (!untransformed || typeof f.copyTo !== 'function') return null;
+
+  try {
+    const rgba = new Uint8Array(width * height * 4);
+    await f.copyTo(rgba, { format: 'RGBA' });
+    return new ImageData(new Uint8ClampedArray(rgba), width, height);
+  } catch {
+    return null;
+  }
 }
 
 /** Draw an ImageBitmap (e.g. from createImageBitmap on a <video>) to a canvas and read RGBA. */

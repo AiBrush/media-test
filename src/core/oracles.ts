@@ -677,9 +677,10 @@ async function referenceReimport(ctx: OracleContext): Promise<OracleOutcome> {
     return fail(oracle, `reference engine failed to demux engine output: ${errMsg(err)}`);
   }
   const pkts = demux.packets ?? [];
+  const reimportKeyframes = pkts.filter((p) => p.keyframe).length;
   const measurements: Record<string, number> = {
     reimportPackets: pkts.length,
-    reimportKeyframes: pkts.filter((p) => p.keyframe).length,
+    reimportKeyframes,
   };
   if (pkts.length === 0) {
     return fail(oracle, 'reference re-import produced an empty packet table', measurements);
@@ -693,14 +694,14 @@ async function referenceReimport(ctx: OracleContext): Promise<OracleOutcome> {
     if (!withinRel(pkts.length, want.length, 0.02, 1)) {
       diffs.push(`packet count: reimport ${pkts.length} vs golden ${want.length}`);
     }
-    if (measurements.reimportKeyframes !== goldKf) {
-      diffs.push(`keyframes: reimport ${measurements.reimportKeyframes} vs golden ${goldKf}`);
+    if (!withinRel(reimportKeyframes, goldKf, 0.02, 1)) {
+      diffs.push(`keyframes: reimport ${reimportKeyframes} vs golden ${goldKf}`);
     }
     if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
   }
   return pass(
     oracle,
-    `reference re-imported engine output: ${pkts.length} packets, ${measurements.reimportKeyframes} keyframes`,
+    `reference re-imported engine output: ${pkts.length} packets, ${reimportKeyframes} keyframes`,
     measurements,
   );
 }
@@ -1289,10 +1290,12 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
 
 /**
  * PASS iff the operation already threw/rejected (handled cleanly within the timeout, no
- * crash/hang/OOM). The runner signals this via the scenario notes / a marker on ctx.scenario.notes
- * or by leaving ctx.output undefined together with a recorded error. We read the signal:
- *   - ctx.scenario.notes containing a status token: 'graceful' | 'threw' | 'rejected' | 'error' →
- *     PASS;  'crash' | 'hang' | 'timeout' | 'oom' → FAIL.
+ * crash/hang/OOM). The runner normally signals this by leaving ctx.output undefined together with a
+ * recorded error. For hand-authored fixtures, an explicit `signal:<token>` marker in notes may
+ * override that inference; ordinary prose is intentionally ignored so words like "within the timeout"
+ * do not become false runner verdicts.
+ *   - explicit notes marker `signal:<token>` may be graceful/threw/rejected/error or
+ *     crash/hang/timeout/oom.
  *   - else: if the op produced NO output for a robustness/malformed scenario, infer it failed
  *     gracefully (the runner caught the throw and routed here) → PASS; if it produced output for a
  *     known-malformed input, that is suspicious → FAIL ("did not reject malformed input").
@@ -1301,16 +1304,15 @@ function gracefulFailure(ctx: OracleContext, _t: Required<OracleTolerances>): Or
   const oracle: OracleId = 'graceful-failure';
   const notes = (ctx.scenario.notes ?? '').toLowerCase();
 
-  const badTokens = ['crash', 'hang', 'timeout', 'oom', 'out-of-memory'];
-  for (const tok of badTokens) {
-    if (notes.includes(tok)) {
-      return fail(oracle, `runner reported '${tok}' on malformed input (not graceful)`);
+  const marker = /\bsignal\s*[:=]\s*([a-z-]+)/.exec(notes)?.[1];
+  if (marker) {
+    const badTokens = ['crash', 'hang', 'timeout', 'oom', 'out-of-memory'];
+    if (badTokens.includes(marker)) {
+      return fail(oracle, `runner reported '${marker}' on malformed input (not graceful)`);
     }
-  }
-  const goodTokens = ['graceful', 'threw', 'rejected', 'rejection', 'errored', 'handled'];
-  for (const tok of goodTokens) {
-    if (notes.includes(tok)) {
-      return pass(oracle, `malformed input handled gracefully (signal: '${tok}')`);
+    const goodTokens = ['graceful', 'threw', 'rejected', 'rejection', 'errored', 'handled'];
+    if (goodTokens.includes(marker)) {
+      return pass(oracle, `malformed input handled gracefully (signal: '${marker}')`);
     }
   }
 

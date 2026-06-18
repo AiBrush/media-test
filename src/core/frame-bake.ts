@@ -97,6 +97,13 @@ export interface GoldenSsimDoc {
  */
 const LUMA_SIG_SIDE = 16;
 
+/**
+ * Decode enough leading frames that the WebCodecs path sees the same reorder/lookahead window as the
+ * decode-fps benchmark. A tiny `maxFrames` can flush an H.264 decoder before the same presentation
+ * prefix has stabilized, producing goldens that disagree with the supported benchmark cell.
+ */
+const FRAME_BAKE_DECODE_MIN_FRAMES = 300;
+
 /** Where the static golden lives (served by the dev server's fixturesStatic middleware). */
 const GOLDEN_BASE = 'fixtures/golden';
 /** Where the static media lives (served raw, Range-capable). */
@@ -355,6 +362,7 @@ function make2dContext(
 export async function bakeAssetFrames(
   assetId: string,
   engine: MediaEngine,
+  force = false,
 ): Promise<FrameBakeAssetResult> {
   const framesFile = `${assetId}.frames.json`;
   const ssimFile = `${assetId}.ssim.json`;
@@ -378,7 +386,7 @@ export async function bakeAssetFrames(
   // Already baked? (a real, non-null sha256 present on every listed frame and not flagged pending).
   const alreadyFilled =
     placeholder.pending === false && listed.every((f) => typeof f.sha256 === 'string' && f.sha256.length > 0);
-  if (alreadyFilled) {
+  if (alreadyFilled && !force) {
     return { ...base, status: 'skipped', note: 'frames golden already filled (non-pending, all sha256 present)' };
   }
 
@@ -400,7 +408,7 @@ export async function bakeAssetFrames(
   // Decode → an ordered list of decoded frames (with pixels for the luma signature).
   let decoded: DecodedFrame[];
   try {
-    decoded = await decodeAssetFrames(assetId, engine, input, listed.length);
+    decoded = await decodeAssetFrames(assetId, engine, input, Math.max(listed.length, FRAME_BAKE_DECODE_MIN_FRAMES));
   } catch (err) {
     return {
       ...base,
@@ -538,6 +546,8 @@ function emptyImage(digest: FrameDigest): ImageData {
 export interface FrameBakeOptions {
   /** restrict to these asset ids (default: every manifest asset with a frames.json placeholder). */
   assetIds?: string[];
+  /** regenerate even when the existing frames golden is already filled. */
+  force?: boolean;
   /** progress callback (done, total, current asset id). */
   onProgress?: (done: number, total: number, assetId: string) => void;
 }
@@ -561,7 +571,7 @@ export async function runFrameBake(opts: FrameBakeOptions = {}): Promise<FrameBa
       opts.onProgress?.(i, ids.length, id);
       let result: FrameBakeAssetResult;
       try {
-        result = await bakeAssetFrames(id, engine);
+        result = await bakeAssetFrames(id, engine, opts.force === true);
       } catch (err) {
         result = {
           assetId: id,

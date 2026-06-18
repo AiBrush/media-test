@@ -186,6 +186,12 @@ export interface MediaEngine {
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes>;
+  /**
+   * Optional runner hook for mux scenarios. Engines that can expose encoded packet bytes may turn one
+   * or more corpus inputs into mux-ready tracks; support is still declared exclusively through
+   * capabilities().operations.mux and negotiated before this hook is called.
+   */
+  prepareMuxTracks?(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks>;
   mux?(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes>;
   decrypt?(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes>;
 }

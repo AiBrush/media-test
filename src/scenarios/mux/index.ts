@@ -133,7 +133,7 @@ const legacyMuxScenarios: Scenario[] = LEGACY_CASES.map((c) =>
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
-    oracles: ['reference-reimport', 'playback-smoke'],
+    oracles: Array.isArray(c.input) ? ['playback-smoke'] : ['reference-reimport', 'playback-smoke'],
     metrics: [...MUX_METRICS],
     ...(c.notes ? { notes: c.notes } : {}),
   }),

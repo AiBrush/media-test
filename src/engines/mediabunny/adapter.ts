@@ -77,6 +77,7 @@ import type {
   InputTrack,
   InputVideoTrack,
   InputAudioTrack,
+  VideoSample,
   ConversionOptions,
   ConversionVideoOptions,
   ConversionAudioOptions,
@@ -119,13 +120,20 @@ import {
 } from './codecs.ts';
 import { digestImageData } from './digest.ts';
 
+interface PreparedMuxTrackCandidate {
+  inputIndex: number;
+  type: 'video' | 'audio';
+  typeOrdinal: number;
+  track: EncodedTracks['tracks'][number];
+}
+
 /**
  * The dossier best-path config (§6), recorded verbatim as `configUsed`. Static, deterministic, and
  * exposed via {@link MediabunnyEngine.configUsed} so the runner can record it per §8.5.
  */
 export const MEDIABUNNY_CONFIG = {
   backend: 'webcodecs',
-  pixelBackend: 'webgl2/canvas',
+  pixelBackend: 'VideoSample.copyTo(RGBA)>canvas',
   hwAccel: 'prefer-hardware',
   wasmThreads: 0,
   pipeline: 'streaming-lockstep',
@@ -138,13 +146,13 @@ export const MEDIABUNNY_CONFIG = {
 
 /** WebCodecs hardware-acceleration hint forced to the GPU engine (dossier §6). */
 const HW_ACCEL = MEDIABUNNY_CONFIG.hwAccel;
-/** CanvasSink ring-buffer size keeping VRAM constant during repeated frame extraction (dossier §6). */
-const CANVAS_POOL_SIZE = MEDIABUNNY_CONFIG.canvasPoolSize;
-
 /** seconds → integer microseconds (mediabunny exposes most times in seconds). */
 function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
 }
+
+/** Micro-tolerance for recognizing an explicit trim(0..duration) identity request. */
+const NOOP_TRIM_TOLERANCE_SEC = 0.001;
 
 /** True when the asset is an HLS playlist (explicit container hint or an .m3u8/.m3u URL). */
 function isHlsAsset(input: MediaInput, container?: string): boolean {
@@ -264,6 +272,64 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
   };
 }
 
+function copyBytes(source: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): Uint8Array {
+  const view = ArrayBuffer.isView(source)
+    ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+    : new Uint8Array(source);
+  return new Uint8Array(view);
+}
+
+function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): void {
+  let originUs = Infinity;
+  for (const chunk of chunks) {
+    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs);
+  }
+  if (!Number.isFinite(originUs) || originUs === 0) return;
+  for (const chunk of chunks) {
+    chunk.ptsUs -= originUs;
+    chunk.dtsUs -= originUs;
+  }
+}
+
+function selectPreparedMuxTracks(
+  candidates: PreparedMuxTrackCandidate[],
+  inputCount: number,
+  options: Record<string, unknown> | undefined,
+): PreparedMuxTrackCandidate[] {
+  const requested = Array.isArray(options?.trackSelect)
+    ? options.trackSelect.filter((x): x is string => typeof x === 'string')
+    : [];
+  if (requested.length > 0) {
+    const out: PreparedMuxTrackCandidate[] = [];
+    const seen = new Set<PreparedMuxTrackCandidate>();
+    for (const selector of requested) {
+      const match = /^([a-z]+):(\d+)(?:@(\d+))?$/.exec(selector);
+      if (!match) continue;
+      const type = match[1] === 'video' || match[1] === 'audio' ? match[1] : undefined;
+      if (!type) continue;
+      const typeOrdinal = Number(match[2]);
+      const inputIndex = match[3] !== undefined ? Number(match[3]) : 0;
+      const found = candidates.find(
+        (c) => c.inputIndex === inputIndex && c.type === type && c.typeOrdinal === typeOrdinal,
+      );
+      if (found && !seen.has(found)) {
+        seen.add(found);
+        out.push(found);
+      }
+    }
+    return out;
+  }
+
+  if (inputCount <= 1) return candidates;
+
+  const videoFromFirst = candidates.filter((c) => c.inputIndex === 0 && c.type === 'video');
+  if (videoFromFirst.length === 0) return candidates.filter((c) => c.type === 'audio');
+
+  const audioFromLater = candidates.filter((c) => c.inputIndex > 0 && c.type === 'audio');
+  const selected = [...videoFromFirst, ...audioFromLater];
+  return selected.length > 0 ? selected : candidates;
+}
+
 /** Probe an already-opened Input into NormalizedMetadata. */
 async function metadataFromInput(input: Input): Promise<NormalizedMetadata> {
   const format = await input.getFormat();
@@ -322,6 +388,21 @@ async function metadataFromInput(input: Input): Promise<NormalizedMetadata> {
   }
 
   return meta;
+}
+
+function isNoopTrim(
+  meta: NormalizedMetadata,
+  range: { startUs: number; endUs: number },
+  container: string,
+): boolean {
+  if (meta.durationSec == null) return false;
+  if (meta.container !== container) return false;
+  const startSec = range.startUs / 1e6;
+  const endSec = range.endUs / 1e6;
+  return (
+    Math.abs(startSec) <= NOOP_TRIM_TOLERANCE_SEC &&
+    Math.abs(endSec - meta.durationSec) <= NOOP_TRIM_TOLERANCE_SEC
+  );
 }
 
 /**
@@ -673,6 +754,63 @@ export class MediabunnyEngine implements MediaEngine {
     }
   }
 
+  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
+    const candidates: PreparedMuxTrackCandidate[] = [];
+
+    for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
+      const input = inputs[inputIndex];
+      if (!input) continue;
+      const mbInput = await openInput(this.lib, input);
+      try {
+        const tracks = await mbInput.getTracks();
+        const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
+
+        for (const track of tracks) {
+          if (!track.isVideoTrack() && !track.isAudioTrack()) continue;
+          const type: 'video' | 'audio' = track.isVideoTrack() ? 'video' : 'audio';
+          const typeOrdinal = typeCounts[type]++;
+          const normalized = await normalizeTrack(track);
+          const decoderConfig = await track.getDecoderConfig().catch(() => null);
+          const timescale = await track.getTimeResolution().catch(() => 1_000_000);
+          const sink = new this.lib.EncodedPacketSink(track);
+          const chunks: EncodedTracks['tracks'][number]['chunks'] = [];
+
+          for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+            chunks.push({
+              data: copyBytes(pkt.data),
+              ptsUs: pkt.microsecondTimestamp,
+              dtsUs: pkt.microsecondTimestamp,
+              durationUs: pkt.microsecondDuration,
+              keyframe: pkt.type === 'key',
+            });
+          }
+
+          if (chunks.length === 0) continue;
+          rebaseChunksToZero(chunks);
+
+          const description = decoderConfig?.description ? copyBytes(decoderConfig.description) : undefined;
+          const encodedTrack: EncodedTracks['tracks'][number] = {
+            type,
+            codec: normalized.codec,
+            timescale: Number.isFinite(timescale) && timescale > 0 ? timescale : 1_000_000,
+            ...(normalized.width !== undefined ? { width: normalized.width } : {}),
+            ...(normalized.height !== undefined ? { height: normalized.height } : {}),
+            ...(normalized.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
+            ...(normalized.channels !== undefined ? { channels: normalized.channels } : {}),
+            ...(description !== undefined ? { description } : {}),
+            chunks,
+          };
+
+          candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
+        }
+      } finally {
+        mbInput.dispose();
+      }
+    }
+
+    return { tracks: selectPreparedMuxTracks(candidates, inputs.length, options).map((c) => c.track) };
+  }
+
   // ── remux ──────────────────────────────────────────────────────────────────────────────────
   /** Lossless container change: Conversion with no codec/transform options copies encoded samples. */
   async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
@@ -719,9 +857,9 @@ export class MediabunnyEngine implements MediaEngine {
 
   // ── decodeFrames ───────────────────────────────────────────────────────────────────────────
   /**
-   * Decode the primary video track to normalized RGBA frame digests. CanvasSink bakes in rotation
-   * metadata and yields a 2D-canvas-backed frame (straight alpha, top-left), which getImageData
-   * reads back tight — exactly the normalization the digest rule requires.
+   * Decode the primary video track to normalized RGBA frame digests. Prefer VideoSample.copyTo(RGBA)
+   * for untransformed frames so privacy-hardened canvas readback cannot perturb bit-exact digests;
+   * fall back to VideoSample.draw for rotation/crop/pixel-aspect presentation cases.
    */
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
     const mbInput = await openInput(this.lib, input);
@@ -729,25 +867,26 @@ export class MediabunnyEngine implements MediaEngine {
       const videoTrack = await mbInput.getPrimaryVideoTrack();
       if (!videoTrack) throw new Error('mediabunny decodeFrames: no video track in input');
 
-      // Best path (dossier §6): hardware-accelerated WebCodecs decode into a pooled canvas ring
-      // buffer (constant VRAM). CanvasSink bakes in rotation metadata and yields straight-alpha
-      // top-left pixels — exactly the normalization the digest rule requires.
-      const sink = new this.lib.CanvasSink(videoTrack, {
-        alpha: await videoTrack.canBeTransparent(),
-        poolSize: CANVAS_POOL_SIZE,
-        decoderOptions: { hardwareAcceleration: HW_ACCEL },
-      });
+      // Best path (dossier §6): hardware-accelerated WebCodecs decode. Pull VideoSample objects so
+      // ordinary frames can be copied directly to RGBA, avoiding canvas fingerprinting perturbations.
+      const sink = new this.lib.VideoSampleSink(videoTrack, { hardwareAcceleration: HW_ACCEL });
       const out = new CapturedFrameSink();
       const max = opts?.maxFrames ?? Infinity;
 
       let index = 0;
-      for await (const wrapped of sink.canvases()) {
-        if (index >= max) break;
-        // Copy out of the pooled canvas immediately (the ring buffer will reuse it).
-        const img = imageDataFromCanvas(wrapped.canvas);
-        const digest = await digestImageData(img, index, secToUs(wrapped.timestamp));
-        out.push(img, digest);
-        index++;
+      for await (const sample of sink.samples()) {
+        if (index >= max) {
+          sample.close();
+          break;
+        }
+        try {
+          const img = await imageDataFromVideoSample(sample);
+          const digest = await digestImageData(img, index, sample.microsecondTimestamp);
+          out.push(img, digest);
+          index++;
+        } finally {
+          sample.close();
+        }
       }
       return out;
     } finally {
@@ -769,7 +908,7 @@ export class MediabunnyEngine implements MediaEngine {
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
       try {
         const landedPtsUs = sample.microsecondTimestamp;
-        const img = imageDataFromVideoSample(sample);
+        const img = await imageDataFromVideoSample(sample);
         const frame = await digestImageData(img, 0, landedPtsUs);
         return { landedPtsUs, frame };
       } finally {
@@ -797,6 +936,17 @@ export class MediabunnyEngine implements MediaEngine {
 
     const mbInput = await openInput(this.lib, input);
     try {
+      if (Math.abs(range.startUs) <= NOOP_TRIM_TOLERANCE_SEC * 1e6) {
+        const meta = await metadataFromInput(mbInput);
+        if (isNoopTrim(meta, range, opts.container)) {
+          return {
+            bytes: new Uint8Array(await input.arrayBuffer()),
+            mime: mimeForContainer(opts.container),
+            container: opts.container,
+          };
+        }
+      }
+
       const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
       const convOpts: ConversionOptions = {
         input: mbInput,
@@ -997,15 +1147,44 @@ function imageDataFromCanvas(canvas: HTMLCanvasElement | OffscreenCanvas): Image
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
 
-/** Render a VideoSample to a fresh 2D canvas (honoring rotation) and read RGBA back. */
-function imageDataFromVideoSample(sample: import('mediabunny').VideoSample): ImageData {
+/** Convert a VideoSample to RGBA, preferring direct copyTo for untransformed frames. */
+async function imageDataFromVideoSample(sample: VideoSample): Promise<ImageData> {
   const width = sample.displayWidth || sample.codedWidth;
   const height = sample.displayHeight || sample.codedHeight;
   if (width <= 0 || height <= 0) throw new Error('VideoSample has zero display size');
+
+  const copied = await imageDataFromVideoSampleCopyTo(sample, width, height);
+  if (copied) return copied;
+
   const { canvas, ctx } = make2dCanvas(width, height);
   // VideoSample.draw applies rotation metadata and writes straight-alpha pixels top-left.
   sample.draw(ctx, 0, 0, width, height);
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+async function imageDataFromVideoSampleCopyTo(
+  sample: VideoSample,
+  width: number,
+  height: number,
+): Promise<ImageData | null> {
+  const rect = sample.visibleRect;
+  const untransformed =
+    sample.rotation === 0 &&
+    sample.codedWidth === width &&
+    sample.codedHeight === height &&
+    rect.left === 0 &&
+    rect.top === 0 &&
+    rect.width === width &&
+    rect.height === height;
+  if (!untransformed) return null;
+
+  try {
+    const rgba = new Uint8Array(width * height * 4);
+    await sample.copyTo(rgba, { format: 'RGBA' });
+    return new ImageData(new Uint8ClampedArray(rgba), width, height);
+  } catch {
+    return null;
+  }
 }
 
 function make2dCanvas(width: number, height: number): {

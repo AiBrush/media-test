@@ -391,9 +391,13 @@ function asMaxFrames(options: Scenario['options']): number | undefined {
   return typeof v === 'number' ? v : undefined;
 }
 function asTrimRange(options: Scenario['options']): { startUs: number; endUs: number } {
+  const o = (options ?? {}) as Record<string, unknown>;
+  const range = o['range'] as Record<string, unknown> | undefined;
+  const startUs = typeof range?.['startUs'] === 'number' ? (range['startUs'] as number) : asNumberOpt(options, 'startUs', 0);
+  const endUs = typeof range?.['endUs'] === 'number' ? (range['endUs'] as number) : asNumberOpt(options, 'endUs', 0);
   return {
-    startUs: asNumberOpt(options, 'startUs', 0),
-    endUs: asNumberOpt(options, 'endUs', 0),
+    startUs,
+    endUs,
   };
 }
 function asTrimOpts(options: Scenario['options']): { container: string; frameAccurate: boolean } {
@@ -418,12 +422,12 @@ function asEncryptionScheme(options: Scenario['options']): EncryptionScheme {
 
 /**
  * Execute the engine method for `scenario.op` against `input(s)`, returning the normalized
- * `OpResult`. `mux` consumes pre-encoded tracks (the runner demuxes/probes the inputs via the same
- * engine to assemble `EncodedTracks` is out of scope here — the suite feeds `options.tracks`); we
- * accept either an `EncodedTracks` payload in options or, lacking one, throw a clear error.
+ * `OpResult`. `mux` consumes pre-encoded tracks; the runner accepts explicit `options.tracks`, or
+ * delegates corpus-input-to-track assembly to engines that expose `prepareMuxTracks`.
  */
-async function executeOp(engine: MediaEngine, scenario: Scenario, input: MediaInput): Promise<OpResult> {
+async function executeOp(engine: MediaEngine, scenario: Scenario, inputs: MediaInput[]): Promise<OpResult> {
   const op: Operation = scenario.op;
+  const input = inputs[0]!;
   switch (op) {
     case 'probe':
       return { metadata: await engine.probe(input) };
@@ -443,8 +447,13 @@ async function executeOp(engine: MediaEngine, scenario: Scenario, input: MediaIn
       return { output: await engine.trim(input, asTrimRange(scenario.options), asTrimOpts(scenario.options)) };
     case 'mux': {
       if (!engine.mux) throw new Error("engine.mux is not implemented (capability declared but method missing)");
-      const tracks = (scenario.options as { tracks?: EncodedTracks } | undefined)?.tracks;
-      if (!tracks) throw new Error('mux scenario requires options.tracks (EncodedTracks)');
+      const options = (scenario.options ?? {}) as Record<string, unknown>;
+      const tracks =
+        (scenario.options as { tracks?: EncodedTracks } | undefined)?.tracks ??
+        (engine.prepareMuxTracks ? await engine.prepareMuxTracks(inputs, options) : undefined);
+      if (!tracks) {
+        throw new Error('mux scenario requires options.tracks or engine.prepareMuxTracks()');
+      }
       return { output: await engine.mux(tracks, { container: asContainerOpt(scenario.options) }) };
     }
     case 'decrypt': {
@@ -552,7 +561,7 @@ export async function runOne(
     // 5) FUNCTIONAL PASS FIRST — execute the op (timeout-guarded), then run all oracles.
     let opResult: OpResult;
     try {
-      opResult = await withTimeout(executeOp(engine, scenario, primaryInput), scenario.timeoutMs);
+      opResult = await withTimeout(executeOp(engine, scenario, inputs), scenario.timeoutMs);
     } catch (err) {
       if (err instanceof TimeoutError) {
         return finalize('FAIL', [], `timeout: ${err.message}`);
@@ -677,7 +686,7 @@ async function runRobustness(
   let opError: unknown;
 
   try {
-    opResult = await withTimeout(executeOp(engine, scenario, input), scenario.timeoutMs);
+    opResult = await withTimeout(executeOp(engine, scenario, [input]), scenario.timeoutMs);
     verdict = 'graceful'; // it returned without crashing/hanging; the engine did not blow up
   } catch (err) {
     if (err instanceof TimeoutError) {
@@ -746,10 +755,9 @@ async function runBench(
       async (): Promise<MetricSample> => {
         // Fresh input per iteration: re-fetch bytes (cache is per-MediaInput, so rebuild).
         const freshInputs = inputs.map((i) => buildMediaInput(i.id, scenario.mutate));
-        const freshPrimary = freshInputs[0]!;
         const meter = new Meter({ observeLongtasks: metric === 'longtasks' });
         meter.begin();
-        const opResult = await withTimeout(executeOp(engine, scenario, freshPrimary), scenario.timeoutMs);
+        const opResult = await withTimeout(executeOp(engine, scenario, freshInputs), scenario.timeoutMs);
         const ctx: MeasureContext = {};
         const mediaSec = mediaSecFromContext(golden, opResult);
         if (mediaSec !== undefined) ctx.mediaSec = mediaSec;
@@ -898,15 +906,23 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // Build the reference engine for oracles that re-import (only when distinct from candidate).
+      // Build the reference engine for oracles that re-import. When the candidate is the registered
+      // reference, reuse that already-initialized instance for the oracle instead of omitting it.
       let referenceEngine: MediaEngine | undefined;
-      const refReg = referenceEngineId !== engineId ? getEngine(referenceEngineId) : undefined;
-      if (refReg) {
-        try {
-          referenceEngine = await refReg.factory();
-          if (referenceEngine.init) await referenceEngine.init();
-        } catch {
-          referenceEngine = undefined; // oracle that needs it will fail with a clear reason
+      let disposeReferenceEngine = false;
+      if (referenceEngineId === engineId) {
+        referenceEngine = engine;
+      } else {
+        const refReg = getEngine(referenceEngineId);
+        if (refReg) {
+          try {
+            referenceEngine = await refReg.factory();
+            if (referenceEngine.init) await referenceEngine.init();
+            disposeReferenceEngine = true;
+          } catch {
+            referenceEngine = undefined; // oracle that needs it will fail with a clear reason
+            disposeReferenceEngine = false;
+          }
         }
       }
 
@@ -939,7 +955,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         };
       } finally {
         // Dispose the reference engine we spun up for this cell.
-        if (referenceEngine?.dispose) {
+        if (disposeReferenceEngine && referenceEngine?.dispose) {
           try {
             await referenceEngine.dispose();
           } catch {

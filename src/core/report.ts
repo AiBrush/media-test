@@ -29,6 +29,7 @@ import type { BenchSummary, MetricId, ResultStatus, ScenarioResult } from './sce
 import type { BrowserName } from './engine.ts';
 import { compareBench, metricHigherIsBetter, metricUnit } from './bench.ts';
 import type { CompareVerdict } from './bench.ts';
+import { visibleResult } from './format.ts';
 
 export interface ReportInput {
   results: ScenarioResult[];
@@ -50,6 +51,7 @@ export type ConformanceDelta = 'gained' | 'regressed' | 'same' | 'NA';
 export interface ConformanceCell {
   status: ResultStatus | null; // null = not run (—)
   reason?: string;
+  durationMs?: number;
 }
 
 export interface BenchCell {
@@ -211,8 +213,8 @@ const CAVEATS: string[] = [
   'Browser numbers are INDICATIVE only. They depend on GPU, OS, drivers, and thermal state; a measurement made on one machine does not transfer to another.',
   'NEVER compare a raw number across browsers or across machines. Every delta in this report is "vs the reference engine, on the SAME browser, on the same corpus." Cross-browser comparison is invalid by construction — that is why the report is grouped by browser.',
   'Hardware codec sessions are the real parallelism ceiling, not navigator.hardwareConcurrency. Contention for a limited number of hardware decode/encode sessions can dominate timing for codec-bound workloads.',
-  'No measurement → no claim. No green correctness oracle → no admissible benchmark: a perf number is reported only behind a PASS for that engine × browser × scenario. A speedup that fails conformance is a regression, not a win — a FAIL is shown as FAIL, never as a benchmark number.',
-  'NA = not supported by the framework (a best-effort run was attempted). This report folds NA(engine) (the engine did not declare the capability) and NA(browser) (the browser lacks the WebCodecs codec / API) into a single user-facing "NA" — the browser-specific gap is not surfaced here. The machine-readable report.json KEEPS the two distinct (the distinction lives in the data, just not in this human-facing table).',
+  'No measurement -> no claim. No green correctness oracle -> no admissible benchmark: a perf number is reported only after the engine produced correct output for that engine x browser x scenario. A speedup with wrong output is a regression, not a win.',
+  'N/A = not supported by the framework or by the browser/runtime. The machine-readable report.json keeps the two internal not-applicable statuses distinct; the human-facing table intentionally folds them into one marker.',
   'Runs assume AC power and a quiesced machine. Differences within the noise band are reported as within-noise and are NOT claimed as improvements or regressions.',
 ];
 
@@ -315,7 +317,8 @@ function buildBrowserSection(
         continue;
       }
       const reasonProps = r.reason ? { reason: r.reason } : {};
-      confRow[scenarioId] = { status: r.status, ...reasonProps };
+      const durationProps = r.durationMs !== undefined ? { durationMs: r.durationMs } : {};
+      confRow[scenarioId] = { status: r.status, ...reasonProps, ...durationProps };
       benchRow[scenarioId] = benchCellFrom(r);
 
       if (isAdmissible(r.status)) {
@@ -828,11 +831,9 @@ function renderMarkdown(json: ReportJson): string {
   // Benchmark-first reading guide (USER DIRECTIVE; §8/§9). The NUMBER is the product; correctness
   // gates it (§0.1); NA collapses the two not-supported flavors into one user-facing marker.
   out.push(
-    '> **Reading the numbers:** every benchmark cell shows the case\'s **primary-metric value (with ' +
-      'unit)** for an engine that ran it **correctly** (🏆 = the fastest correct engine for that case). ' +
-      '**NA** = not supported by the framework (a best-effort run was attempted). **FAIL** = the output ' +
-      'was wrong — a FAIL is never reported as a benchmark number (§0.1). `—` = not run. (NA folds ' +
-      'engine-can\'t and browser-can\'t into one marker; `report.json` keeps them distinct.)',
+    '> **Reading the matrix:** every completed cell shows **Pass (<execution time>)** when the ' +
+      'operation ran correctly, or **N/A** when the engine or browser/runtime cannot support that ' +
+      'case. Machine-readable `report.json` keeps the internal status distinction.',
   );
   out.push('');
 
@@ -854,13 +855,11 @@ function renderMarkdown(json: ReportJson): string {
     out.push(`## Browser: ${section.browser}`);
     out.push('');
 
-    out.push('### 1. Benchmark numbers — primary metric per engine × case (🏆 = fastest correct)');
+    out.push('### 1. Result matrix — display value per engine × case');
     out.push('');
     out.push(
-      '_The product: each cell is the case\'s primary-metric value (with unit) for an engine that ' +
-        'PASSed. **NA** = framework can\'t run the case (best-effort attempted). **FAIL** = wrong ' +
-        'output (never a number). `PASS` = correct but no rankable metric. `—` = not run. Indicative ' +
-        'for this browser only — never compared across browsers (see Caveats)._',
+      '_Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicative for this ' +
+        'browser only — never compared across browsers (see Caveats)._',
     );
     out.push('');
     out.push(renderBenchmarkNumbers(section));
@@ -871,7 +870,7 @@ function renderMarkdown(json: ReportJson): string {
     out.push(renderWinners(section, json.referenceEngineId));
     out.push('');
 
-    out.push('### 3. Conformance matrix (correctness letters — secondary to the numbers above)');
+    out.push('### 3. Conformance matrix (same display rule, grouped by correctness)');
     out.push('');
     out.push(renderConformanceMatrix(section));
     out.push('');
@@ -935,22 +934,19 @@ function renderBenchmarkNumbers(section: BrowserSection): string {
   if (section.engines.length === 0 || section.scenarios.length === 0) {
     return '_No results._';
   }
-  const winnerCoByScenario = new Map<string, Set<string>>();
   const metricByScenario = new Map<string, MetricId | null>();
   for (const w of section.winners) {
-    winnerCoByScenario.set(w.scenarioId, new Set(w.coWinners));
     metricByScenario.set(w.scenarioId, w.primaryMetric);
   }
 
   const header = ['Case', 'Primary metric', ...section.engines];
   const rows: string[][] = [];
   for (const scenarioId of section.scenarios) {
-    const coWinners = winnerCoByScenario.get(scenarioId) ?? new Set<string>();
     const metric = metricByScenario.get(scenarioId) ?? null;
     const cells = section.engines.map((engineId) => {
       const benchCell = section.bench[engineId]?.[scenarioId];
       const confCell = section.conformance[engineId]?.[scenarioId];
-      return benchmarkCellMd(benchCell, confCell, coWinners.has(engineId));
+      return benchmarkCellMd(benchCell, confCell);
     });
     rows.push([
       `\`${scenarioId}\``,
@@ -970,7 +966,8 @@ function renderConformanceMatrix(section: BrowserSection): string {
   for (const scenarioId of section.scenarios) {
     const cells = section.engines.map((engineId) => {
       const cell = section.conformance[engineId]?.[scenarioId];
-      return cell ? statusLabelMd(cell.status) : EM_DASH;
+      const benchCell = section.bench[engineId]?.[scenarioId];
+      return cell ? visibleCellMd(benchCell, cell) : EM_DASH;
     });
     rows.push([`\`${scenarioId}\``, ...cells]);
   }
@@ -985,13 +982,12 @@ function renderReasonNotes(section: BrowserSection): string {
       const cell = section.conformance[engineId]?.[scenarioId];
       if (!cell || cell.status === null || cell.status === 'PASS') continue;
       if (!cell.reason) continue;
-      notes.push(`- \`${engineId}\` · \`${scenarioId}\` — **${statusLabelMd(cell.status)}**: ${cell.reason}`);
+      const benchCell = section.bench[engineId]?.[scenarioId];
+      notes.push(`- \`${engineId}\` · \`${scenarioId}\` — **${visibleCellMd(benchCell, cell)}**: ${cell.reason}`);
     }
   }
   if (notes.length === 0) return '';
-  return ['<details><summary>Reasons (FAIL / NA / ERROR)</summary>', '', ...notes, '', '</details>', ''].join(
-    '\n',
-  );
+  return ['<details><summary>Cell details</summary>', '', ...notes, '', '</details>', ''].join('\n');
 }
 
 function renderBenchMatrix(section: BrowserSection): string {
@@ -1053,7 +1049,7 @@ function renderScorecards(json: ReportJson): string {
   const header = [
     'Engine',
     'Conformance %',
-    'PASS / admissible',
+    'Pass / applicable',
     ...json.browsers.map((b) => `Perf idx (${b})`),
     'Capability breadth',
     'Robustness %',
@@ -1172,67 +1168,29 @@ function fmtMetricValue(value: number, metric: MetricId | null): string {
 function benchmarkCellMd(
   cell: BenchCell | undefined,
   conf: ConformanceCell | undefined,
-  isWinner: boolean,
 ): string {
-  const status = conf?.status ?? null;
-  if (status === null) return EM_DASH; // not run
-  if (isNaStatus(status)) return naLabelMd(); // collapsed NA — framework can't run the case
-  if (status === 'FAIL') return 'FAIL'; // wrong output — never a number (§0.1)
-  if (status === 'ERROR') return 'ERROR';
-  if (status === 'SKIPPED') return 'SKIPPED';
-  // PASS: lead with the primary-metric number when measured; else honest "PASS" (no number to show).
-  if (
-    cell?.primaryValueMedian !== undefined &&
-    cell.primaryMetric !== undefined &&
-    Number.isFinite(cell.primaryValueMedian)
-  ) {
-    const num = fmtMetricValue(cell.primaryValueMedian, cell.primaryMetric);
-    return isWinner ? `🏆 ${num}` : num;
-  }
-  return 'PASS';
+  return visibleCellMd(cell, conf);
 }
 
 // ── label / format helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Markdown-facing status label. NA COLLAPSE (USER DIRECTIVE, overriding the §15 presentation note):
- * BOTH NA_ENGINE and NA_BROWSER render as a single "NA" here — the `-ᵇ` browser-specific distinction
- * is gone from `report.md` because the reader does not care about browser-specific gaps. The two
- * statuses stay DISTINCT in the data model and in `report.json` (spec §0.6/§10/§14); only this
- * human-facing string folds them. See `naLabelMd`.
- */
-function statusLabelMd(status: ResultStatus | null): string {
-  switch (status) {
-    case 'PASS':
-      return 'PASS';
-    case 'FAIL':
-      return 'FAIL';
-    case 'NA_ENGINE':
-    case 'NA_BROWSER':
-      return naLabelMd();
-    case 'ERROR':
-      return 'ERROR';
-    case 'SKIPPED':
-      return 'SKIPPED';
-    case null:
-    default:
-      return EM_DASH;
-  }
-}
-
-/** True when the status is a "not supported by the framework" cell (either NA flavor). */
-function isNaStatus(status: ResultStatus | null): boolean {
-  return status === 'NA_ENGINE' || status === 'NA_BROWSER';
-}
-
-/** The single collapsed user-facing NA marker for the markdown report (see `statusLabelMd`). */
-function naLabelMd(): string {
-  return 'NA';
+function visibleCellMd(cell: BenchCell | undefined, conf: ConformanceCell | undefined): string {
+  const status = conf?.status ?? null;
+  if (status === null) return EM_DASH;
+  const bench =
+    cell?.wallMedianMs !== undefined && Number.isFinite(cell.wallMedianMs)
+      ? { wall: { median: cell.wallMedianMs } }
+      : undefined;
+  return visibleResult({
+    status,
+    ...(bench ? { bench } : {}),
+    ...(conf?.durationMs !== undefined ? { durationMs: conf.durationMs } : {}),
+  });
 }
 
 function perfDeltaLabel(d: DeltaCell | undefined): string {
   if (!d || d.perf === undefined || d.perf === null) {
-    return d?.reason ? `NA` : 'NA';
+    return 'N/A';
   }
   const { verdict, deltaPct } = d.perf;
   const sign = deltaPct > 0 ? '+' : '';
@@ -1253,7 +1211,7 @@ function conformanceDeltaLabel(d: ConformanceDelta | undefined): string {
     case 'NA':
     case undefined:
     default:
-      return 'NA';
+      return 'N/A';
   }
 }
 

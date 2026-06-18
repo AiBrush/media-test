@@ -177,7 +177,7 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
   try {
     for (let i = 0; i < emit.length; i++) {
       const { ptsUs, frame } = emit[i]!;
-      const img = imageDataFromVideoFrame(frame);
+      const img = await imageDataFromVideoFrame(frame);
       const digest = await digestImageData(img, i, ptsUs);
       sink.add(digest, img);
     }

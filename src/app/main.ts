@@ -20,6 +20,8 @@ import { runMatrix } from '../core/runner.ts';
 import type { RunOptions } from '../core/runner.ts';
 import type { BrowserName } from '../core/engine.ts';
 import type { ScenarioResult } from '../core/scenario.ts';
+import type { ResultStatus } from '../core/scenario.ts';
+import { installFrameBakeControl } from '../core/frame-bake.ts';
 import { registerAll } from './register.ts';
 import type { RegistrationReport } from './register.ts';
 import {
@@ -112,6 +114,7 @@ async function boot(): Promise<void> {
 
   // 4. Wire controls.
   wireControls();
+  installFrameBakeControl();
 
   // 5. Expose the launcher control surface.
   window.__SUITE__ = {
@@ -223,10 +226,29 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
 
 function summarize(results: ScenarioResult[]): string {
   const counts: Record<string, number> = {};
-  for (const r of results) counts[r.status] = (counts[r.status] ?? 0) + 1;
+  for (const r of results) {
+    const label = summaryStatusLabel(r.status);
+    counts[label] = (counts[label] ?? 0) + 1;
+  }
   return Object.entries(counts)
     .map(([k, v]) => `${k}:${v}`)
     .join(' ');
+}
+
+function summaryStatusLabel(status: ResultStatus): string {
+  switch (status) {
+    case 'PASS':
+      return 'Pass';
+    case 'NA_ENGINE':
+    case 'NA_BROWSER':
+      return 'N/A';
+    case 'FAIL':
+      return 'Fail';
+    case 'ERROR':
+      return 'Error';
+    case 'SKIPPED':
+      return 'Skipped';
+  }
 }
 
 /** Download the gathered results as a JSON file (the same shape the launcher collects). */
