@@ -947,6 +947,208 @@ const RECIPES = {
     ffmpeg(['-f', 'lavfi', '-i', TESTSRC(640, 480, 1, 1), ...BITEXACT, '-frames:v', '1', '-c:v', 'libwebp', '-f', 'image2', out], 'image.webp');
     return 'ok';
   },
+
+  // ── Size-ladder cross-family completeness (§5.3) ──────────────────────────────────────────────
+  // §5.3: "For each bucket we keep at least one asset per major container/codec it is meant to
+  // stress (e.g. a *huge* H.264 MP4 AND a *huge* VP9 WebM), so the size axis crosses the format
+  // axis." The huge + massive rungs had only the MP4/H.264 family; these add the WebM/VP9 twin so
+  // BOTH rungs cross container/codec exactly as the spec's worked example requires. VERY slow
+  // (VP9 sw encode of long 1080p) + large → gated by --skip-longform like their MP4 siblings.
+  'huge_vp9_1080p_240s.webm': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: huge ~240s 1080p VP9 WebM (huge-rung WebM/VP9 twin) intentionally not generated this run (VP9 sw encode is very slow).' };
+    }
+    // 240s @ ~1080p VP9 CRF34 lands in the ~500-700 MB "huge" band, matching huge_h264_1080p_600s.mov.
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 240),
+        '-f', 'lavfi', '-i', SINE(440, 240),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', '34',
+        '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-g', '60',
+        '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+        '-f', 'webm',
+        out,
+      ],
+      'huge_vp9_1080p_240s.webm',
+    );
+    return 'ok';
+  },
+  'massive_vp9_1080p_2h.webm': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: massive 2h 1080p VP9 WebM (massive-rung WebM/VP9 twin) intentionally not generated this run.' };
+    }
+    // Low-bitrate capped VP9 so 2h lands ~1-1.4 GB / many-thousand-sample with bounded encode time,
+    // mirroring massive_h264_1080p_2h.mp4 in the other family.
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 7200),
+        '-f', 'lavfi', '-i', SINE(440, 7200, 48000, 1),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libvpx-vp9', '-b:v', '700k', '-maxrate', '800k', '-bufsize', '1600k',
+        '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-g', '60', '-pix_fmt', 'yuv420p',
+        '-c:a', 'libopus', '-b:a', '64k', '-ar', '48000', '-ac', '1',
+        '-f', 'webm',
+        out,
+      ],
+      'massive_vp9_1080p_2h.webm',
+    );
+    return 'ok';
+  },
+
+  // ── Deep-edge assets (§7 / §A.16) ─────────────────────────────────────────────────────────────
+  // Degenerate tiny dimensions. §A.16: "0×0 or 1×1 video". libx264/yuv420p REQUIRES even
+  // dimensions, so a real 1×1 cannot be H.264 — VP9 carries 1×1 honestly. The MP4/H.264 family's
+  // smallest-even degenerate twin (2×2) lives in video_2x2_h264.mp4 below. (The 1-fps end of the
+  // "extreme fps" edge is already covered by micro_h264_1frame.mp4 @ rate=1.)
+  'video_1x1.webm': (out) => {
+    // Build at 4×4 then scale to 1×1 (testsrc2 won't synthesize a 1×1 source directly).
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(4, 4, 30, 2),
+        ...BITEXACT, ...NOMETA,
+        '-vf', 'scale=1:1',
+        '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', '40',
+        '-deadline', 'good', '-cpu-used', '5', '-g', '30',
+        '-f', 'webm',
+        out,
+      ],
+      'video_1x1.webm',
+    );
+    return 'ok';
+  },
+  'video_2x2_h264.mp4': (out) => {
+    // Smallest even-dimension H.264 (libx264 cannot do 1×1). The MP4/H.264 degenerate-size twin of
+    // video_1x1.webm so the tiny-dimension edge crosses both major families.
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(2, 2, 30, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '30', '-g', '30', '-keyint_min', '30',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'video_2x2_h264.mp4',
+    );
+    return 'ok';
+  },
+  'video_240fps.mp4': (out) => {
+    // Extreme high fps (240 fps) end of §A.16's "extreme fps (1 fps, 240 fps)".
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(320, 240, 240, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '28', '-g', '240', '-keyint_min', '240',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'video_240fps.mp4',
+    );
+    return 'ok';
+  },
+  'fragmented_cmaf.mp4': (out) => {
+    // CMAF-style fragmented MP4: empty moov + moof/mdat fragments (init+media split). §A.16
+    // "fragmented/CMAF init+media split". Clean (unencrypted) so it isolates the fragmentation edge
+    // from the encryption edge (cenc_ctr.mp4 is fragmented AND encrypted).
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1280, 720, 30, 4),
+        '-f', 'lavfi', '-i', SINE(440, 4),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '24', '-g', '60', '-keyint_min', '60',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        // CMAF-ish: fragment on each keyframe, empty moov, default_base_moof for self-contained moofs.
+        '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4',
+        out,
+      ],
+      'fragmented_cmaf.mp4',
+    );
+    return 'ok';
+  },
+  'mislabeled_h264.webm': (out) => {
+    // Mismatched container/codec (§A.16 "h264 mislabeled"): genuine H.264/MP4 (ISOBMFF) BYTES written
+    // into a file whose extension claims WebM. `-f mp4` forces the muxer regardless of the .webm name,
+    // so the bytes start with `ftyp...` (NOT the EBML 1A45DFA3 magic). The probe oracle must trust the
+    // sniffed content, not the lying extension/MIME. Golden meta is derived from the true bytes (mp4).
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(320, 240, 30, 2),
+        '-f', 'lavfi', '-i', SINE(440, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '28', '-g', '60', '-keyint_min', '60',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        '-f', 'mp4', // <-- override the .webm extension: real container is MP4
+        out,
+      ],
+      'mislabeled_h264.webm',
+    );
+    return 'ok';
+  },
+  'gapless_aac.m4a': (out) => {
+    // Gapless audio edge (§A.16 "gapless audio (encoder delay/padding)"). AAC always carries encoder
+    // delay (priming samples) + end padding; a non-frame-aligned duration (1.013 s @ 44.1 kHz) makes
+    // the padding non-trivial. iTunSMPB/edit-list gapless info must be honored so the decoded sample
+    // count matches the nominal duration (no audible gap on loop).
+    ffmpeg(
+      ['-f', 'lavfi', '-i', SINE(440, 1.013, 44100), ...BITEXACT, ...NOMETA, '-c:a', 'aac', '-b:a', '96k', '-ar', '44100', '-ac', '2', '-movflags', '+faststart', '-f', 'mp4', out],
+      'gapless_aac.m4a',
+    );
+    return 'ok';
+  },
+  'audio_6ch_51.m4a': (out) => {
+    // Variable / non-stereo channel count (§A.16 "variable channel count"): a 6-channel 5.1 AAC track
+    // (the rest of the audio corpus is mono/stereo). Exercises channel-layout-aware probe + downmix.
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', SINE(440, 3),
+        ...BITEXACT, ...NOMETA,
+        // Fan the mono sine out to a full 5.1 layout so channels=6 / layout=5.1.
+        '-af', 'pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0',
+        '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
+        '-movflags', '+faststart', '-f', 'mp4',
+        out,
+      ],
+      'audio_6ch_51.m4a',
+    );
+    return 'ok';
+  },
+  'ts_discontinuity.ts': (out) => {
+    // Timestamp discontinuity (§A.16 "timestamp wraparound / discontinuity (TS)"). A reliable,
+    // deterministic discontinuity is built by concatenating two independently-timestamped MPEG-TS
+    // segments: segment B is muxed with a large +output_ts_offset, so the joined stream's PTS jumps
+    // forward (~+597 s) at the splice. TS is byte-concatenable at the packet boundary, so we write
+    // segA then segB into one .ts. The demux oracle must tolerate the forward PTS jump without
+    // treating it as a corrupt stream (no negative-duration / no hang).
+    const tmp = mkdtempBake();
+    try {
+      const segA = join(tmp, 'a.ts');
+      const segB = join(tmp, 'b.ts');
+      const tsArgs = (freq, extra) => [
+        '-f', 'lavfi', '-i', TESTSRC(320, 240, 30, 2),
+        '-f', 'lavfi', '-i', SINE(freq, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '28', '-g', '30', '-keyint_min', '30',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+        '-bsf:v', 'h264_mp4toannexb',
+        ...extra,
+        '-f', 'mpegts',
+      ];
+      ffmpeg([...tsArgs(440, []), segA], 'ts_discontinuity.ts(segA)');
+      ffmpeg([...tsArgs(660, ['-output_ts_offset', '600', '-muxpreload', '0', '-muxdelay', '0']), segB], 'ts_discontinuity.ts(segB)');
+      // Raw byte-concat of the two TS files → one stream with a PTS discontinuity at the boundary.
+      writeFileSync(out, Buffer.concat([readFileSync(segA), readFileSync(segB)]));
+      return 'ok';
+    } finally {
+      rmSafe(tmp);
+    }
+  },
 };
 
 // ── Intentionally-broken robustness assets ───────────────────────────────────────────────────
@@ -1093,6 +1295,9 @@ function canonicalCodec(name) {
 function canonicalContainer(formatName, assetId) {
   // ffprobe format_name is a comma list ("mov,mp4,m4a,3gp,..."). Prefer the asset's known suffix.
   const lower = assetId.toLowerCase();
+  // Deliberately-mislabeled asset (§A.16): its .webm extension LIES — the bytes are really MP4/ISOBMFF.
+  // Report the TRUE container so golden meta stays honest (the suffix heuristic below must not win).
+  if (lower === 'mislabeled_h264.webm') return 'mp4';
   if (lower.endsWith('.mov')) return 'mov';
   if (lower.endsWith('.mp4') || lower.endsWith('.m4a') || lower.endsWith('.m4v')) return 'mp4';
   if (lower.endsWith('.mkv')) return 'mkv';

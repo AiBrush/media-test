@@ -537,13 +537,71 @@ function sameLayout(a: Record<number, number>, b: Record<number, number>): boole
 
 async function decodedFramesBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   const oracle: OracleId = 'decoded-frames-bitexact';
-  if (!ctx.output) return fail(oracle, 'no ctx.output bytes to decode');
+
+  // Golden is the gate. An absent/pending golden is a BAKE gap (the in-browser frame-bake must run),
+  // NOT an engine defect — surface that honestly rather than pretending the engine produced nothing.
   const want = ctx.golden.frames;
   if (!want || !want.length) {
-    return fail(oracle, 'no golden frame digests (fixtures/golden/<id>.frames.json absent/empty)');
+    return fail(
+      oracle,
+      'no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; ' +
+        'frame-bake must run — not an engine defect)',
+    );
   }
-  const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
-  return compareDigests(oracle, sink.frames, want);
+
+  // SEEK op: the candidate is the single landed frame (ctx.seek.frame). It is NOT part of an indexed
+  // sequence, so we must match it to golden BY PTS, not by the engine's arbitrary frame index — an
+  // index-keyed compare would falsely pair the landed frame (e.g. at 5s) with golden[0] (at 0s) on an
+  // index collision and report a spurious digest mismatch. We compare against the golden frame nearest
+  // the landed pts within half a frame; if none exists (seek-target golden not baked — the committed
+  // golden only covers the opening frames) there is nothing this oracle can validate, so we FAIL
+  // honestly. (seek-accuracy is the primary seek gate and performs the same pts-keyed digest check;
+  // this oracle adds coverage only once seek-target golden frames are baked.)
+  if (!ctx.frames && !ctx.output && ctx.seek) {
+    const landed = ctx.seek.frame;
+    const ref = matchByPts(want, landed.ptsUs);
+    const measurements: Record<string, number> = { landedPtsUs: landed.ptsUs, goldenFrames: want.length };
+    if (!ref) {
+      return fail(
+        oracle,
+        `no golden frame within ½-frame of the landed pts ${landed.ptsUs}µs ` +
+          `(seek-target golden not baked; opening-frame golden does not cover the seek time)`,
+        measurements,
+      );
+    }
+    if (normHex(landed.sha256) !== normHex(ref.sha256)) {
+      return fail(
+        oracle,
+        `landed frame sha256 ${shortHex(landed.sha256)} vs golden ${shortHex(ref.sha256)} at pts ${ref.ptsUs}µs`,
+        measurements,
+      );
+    }
+    return pass(oracle, `landed seek frame digest bit-exact vs golden at pts ${ref.ptsUs}µs`, measurements);
+  }
+
+  // Source the CANDIDATE frame sequence. Two remaining op shapes feed this oracle (the runner sets
+  // exactly one — see buildOracleContext):
+  //   • decodeFrames → ctx.frames (the engine's OWN decoded FrameSink). Compare those digests
+  //     directly; the engine already decoded the pixels and normalized them to RGBA. (Previously this
+  //     oracle read ONLY ctx.output and hard-failed every decodeFrames cell with "no ctx.output".)
+  //   • remux/transcode/trim/decrypt → ctx.output (encoded bytes): re-decode with the platform engine.
+  // A null/empty platform sink (output not decodable) is a clean FAIL, never an uncaught throw.
+  let got: FrameDigest[];
+  if (ctx.frames) {
+    got = Array.isArray(ctx.frames.frames) ? ctx.frames.frames : [];
+  } else if (ctx.output) {
+    let sink: FrameSink | null | undefined;
+    try {
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+    } catch (err) {
+      return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
+    }
+    got = sink && Array.isArray(sink.frames) ? sink.frames : [];
+  } else {
+    return fail(oracle, 'no decoded frames, seek frame, or output bytes on ctx to compare');
+  }
+
+  return compareDigests(oracle, got, want);
 }
 
 /** Compare a decoded sink's digests against golden digests, matched by index (then ptsUs fallback). */
@@ -556,7 +614,7 @@ function compareDigests(
     measuredFrames: got.length,
     goldenFrames: want.length,
   };
-  if (!got.length) return fail(oracle, 'platform decode produced 0 frames', measurements);
+  if (!got.length) return fail(oracle, 'no decoded frames to compare (0 produced)', measurements);
 
   const byIndex = new Map<number, FrameDigest>();
   for (const f of got) byIndex.set(f.index, f);
@@ -913,27 +971,54 @@ function resizeImageData(img: ImageData, w: number, h: number): ImageData | null
 
 async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   const oracle: OracleId = 'alpha-plane';
-  if (!ctx.output) return fail(oracle, 'no ctx.output bytes to decode for alpha comparison');
 
-  // Compare the alpha channel separately from color. We need candidate pixels (from platform decode)
-  // and a golden reference. Golden carries frame digests; a dedicated alpha digest is encoded by
-  // digestFrame over the alpha-only plane when the bake emits one (frames[i].sha256 of the alpha
-  // image). Absent golden pixels, we verify alpha presence + that decoded frames have a non-trivial
-  // alpha channel, and bit-exact alpha via the frame digest when the golden was baked alpha-only.
+  // Compare the alpha channel separately from color. We need pixel-bearing candidate frames and a
+  // golden reference. Golden carries frame digests; a dedicated alpha digest is encoded by digestFrame
+  // over the alpha-only plane when the bake emits one (frames[i].sha256 of the alpha image). Absent
+  // golden pixels, we verify alpha presence + that decoded frames have a non-trivial alpha channel,
+  // and bit-exact alpha via the frame digest when the golden was baked alpha-only.
+  //
+  // CANDIDATE SOURCE: for a decodeFrames op the engine's OWN sink is on ctx.frames (and exposes
+  // getPixels); for a bytes-producing op (transcode/remux) we re-decode ctx.output with the platform
+  // engine. Previously this oracle read ONLY ctx.output and hard-failed every alpha DECODE cell with
+  // "no ctx.output" — the same wiring gap as decoded-frames-bitexact. A null/empty/getPixels-less sink
+  // is a clean FAIL, never an uncaught throw.
   const want = ctx.golden.frames;
-  const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want?.length });
-  if (!sink.frames.length) return fail(oracle, 'platform decode produced 0 frames');
+  let sink: FrameSink | null | undefined;
+  if (ctx.frames) {
+    sink = ctx.frames;
+  } else if (ctx.output) {
+    try {
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want?.length });
+    } catch (err) {
+      return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
+    }
+  } else {
+    return fail(oracle, 'no decoded frames (ctx.frames) or output bytes (ctx.output) for alpha comparison');
+  }
+  if (!sink || !Array.isArray(sink.frames) || !sink.frames.length) {
+    return fail(oracle, 'no decoded frames to inspect for an alpha plane (0 produced)');
+  }
   if (typeof sink.getPixels !== 'function') {
     return fail(oracle, 'decode sink did not expose getPixels; cannot inspect alpha plane');
   }
+  const getPixels = sink.getPixels.bind(sink);
 
   let maxMeanAbsDiff = 0;
   let framesWithAlpha = 0;
+  let pixelFrames = 0;
   const pairs = Math.min(sink.frames.length, want?.length ?? sink.frames.length);
   const measurements: Record<string, number> = { pairs };
 
   for (let i = 0; i < pairs; i++) {
-    const px = await sink.getPixels(i);
+    let px: ImageData | null | undefined;
+    try {
+      px = await getPixels(i);
+    } catch {
+      px = undefined;
+    }
+    if (!px) continue; // an unreadable frame contributes no evidence (never a null-deref)
+    pixelFrames++;
     const alpha = extractAlpha(px);
     if (alpha.nonOpaque) framesWithAlpha++;
 
@@ -952,10 +1037,14 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   }
 
   measurements.framesWithAlpha = framesWithAlpha;
+  measurements.pixelFrames = pixelFrames;
   measurements.maxAlphaMeanAbsDiff = maxMeanAbsDiff;
 
+  if (pixelFrames === 0) {
+    return fail(oracle, `could not read pixels for any of ${pairs} frame(s); cannot inspect alpha plane`, measurements);
+  }
   if (framesWithAlpha === 0) {
-    return fail(oracle, `no frame exposed a non-opaque alpha channel over ${pairs} frame(s)`, measurements);
+    return fail(oracle, `no frame exposed a non-opaque alpha channel over ${pixelFrames} readable frame(s)`, measurements);
   }
   if (want && maxMeanAbsDiff > 0) {
     return fail(
@@ -989,7 +1078,17 @@ function seekAccuracy(ctx: OracleContext, t: Required<OracleTolerances>): Oracle
   let expectedPtsUs: number | undefined;
 
   if (requestedUs != null && want.packets && want.packets.length) {
-    const kf = keyframeAtOrBefore(want.packets, requestedUs);
+    // Restrict the expected-keyframe search to the VIDEO track. A seek lands on a VIDEO frame, but
+    // golden packets interleave video + audio, and an audio track (e.g. AAC) is all-keyframe at a
+    // fine ~21ms cadence — so an unfiltered keyframeAtOrBefore would pick an AUDIO keyframe pts and
+    // falsely fail a correct VIDEO seek (the audio keyframe sits between video keyframes). We derive
+    // the video track index set from golden meta (positionally aligned with packet trackIndex) with a
+    // structural fallback when meta is absent.
+    const videoTracks = videoTrackIndices(want);
+    const videoPkts = videoTracks
+      ? want.packets.filter((p) => videoTracks.has(p.trackIndex))
+      : want.packets;
+    const kf = keyframeAtOrBefore(videoPkts.length ? videoPkts : want.packets, requestedUs);
     if (kf) {
       expectedPtsUs = kf.ptsUs;
       expectedFrame = (want.frames ?? []).find((f) => Math.abs(f.ptsUs - kf.ptsUs) <= 1000);
@@ -1045,6 +1144,37 @@ function keyframeAtOrBefore(pkts: PacketInfo[], tUs: number): PacketInfo | undef
   return best;
 }
 
+/**
+ * Derive the set of VIDEO packet trackIndices from the golden store, or `undefined` when it cannot be
+ * determined (caller then treats all tracks as candidates — correct for an all-intra/audio-only clip).
+ *
+ * Preference order:
+ *   1. golden.meta.tracks — the meta track list is positionally aligned with the packet `trackIndex`
+ *      convention (both follow ffprobe stream order), so meta index i ⇒ packets with trackIndex i. We
+ *      take the indices whose meta type is 'video'.
+ *   2. Structural fallback when meta is absent: a video track carries a MIX of keyframe + non-keyframe
+ *      packets, whereas audio (AAC/Opus/…) is all-keyframe. So tracks that have ≥1 non-keyframe packet
+ *      are video. If EVERY track is all-keyframe (all-intra video, or audio-only), we return undefined
+ *      so the caller falls back to all tracks (the all-intra case where any keyframe pick is correct).
+ */
+function videoTrackIndices(golden: GoldenStore): Set<number> | undefined {
+  const metaTracks = golden.meta?.tracks;
+  if (metaTracks && metaTracks.length) {
+    const s = new Set<number>();
+    metaTracks.forEach((tr, i) => {
+      if (tr?.type === 'video') s.add(i);
+    });
+    if (s.size) return s;
+  }
+  const pkts = golden.packets;
+  if (pkts && pkts.length) {
+    const hasNonKeyframe = new Set<number>();
+    for (const p of pkts) if (!p.keyframe) hasNonKeyframe.add(p.trackIndex);
+    if (hasNonKeyframe.size) return hasNonKeyframe;
+  }
+  return undefined;
+}
+
 // ── trim-boundaries ──────────────────────────────────────────────────────────────────────────
 
 async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
@@ -1068,10 +1198,19 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     }
   }
 
-  const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 4096 });
-  if (outDurationSec == null && sink.frames.length >= 2) {
-    const first = sink.frames[0]!.ptsUs;
-    const last = sink.frames[sink.frames.length - 1]!.ptsUs;
+  // Decode the trimmed output for the frame-span duration proxy + boundary-frame digests. A decode
+  // failure or null/empty sink is non-fatal here: the reference-engine probe above may already have a
+  // duration, and the boundary-frame block below simply has nothing to compare. Never null-deref.
+  let frames: FrameDigest[] = [];
+  try {
+    const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 4096 });
+    if (sink && Array.isArray(sink.frames)) frames = sink.frames;
+  } catch {
+    /* decode failed; rely on the reference probe duration if any, else report below */
+  }
+  if (outDurationSec == null && frames.length >= 2) {
+    const first = frames[0]!.ptsUs;
+    const last = frames[frames.length - 1]!.ptsUs;
     outDurationSec = (last - first) / 1e6;
   }
 
@@ -1094,9 +1233,9 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
 
   // Boundary frame digests vs golden: first and last decoded frames must match golden boundaries.
   const want = ctx.golden.frames;
-  if (want && want.length && sink.frames.length) {
-    const firstGot = sink.frames[0]!;
-    const lastGot = sink.frames[sink.frames.length - 1]!;
+  if (want && want.length && frames.length) {
+    const firstGot = frames[0]!;
+    const lastGot = frames[frames.length - 1]!;
     const firstWant = want[0]!;
     const lastWant = want[want.length - 1]!;
     if (normHex(firstGot.sha256) !== normHex(firstWant.sha256)) {
@@ -1128,10 +1267,20 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   if (!ctx.output) return fail(oracle, 'no ctx.output (decrypted) bytes to decode');
   const want = ctx.golden.frames;
   if (!want || !want.length) {
-    return fail(oracle, 'no golden frame digests for decrypt comparison (frames.json absent)');
+    return fail(
+      oracle,
+      'no golden frame digests for decrypt comparison (fixtures/golden/<id>.frames.json absent or ' +
+        'pending; frame-bake must run — not an engine defect)',
+    );
   }
-  const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
-  const out = compareDigests(oracle, sink.frames, want);
+  let sink: FrameSink | null | undefined;
+  try {
+    sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+  } catch (err) {
+    return fail(oracle, `platform decode of decrypted output failed: ${errMsg(err)}`);
+  }
+  const got = sink && Array.isArray(sink.frames) ? sink.frames : [];
+  const out = compareDigests(oracle, got, want);
   // Re-label the detail to the decrypt context while preserving pass/fail + measurements.
   return { ...out, oracle };
 }
@@ -1204,10 +1353,16 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const want = ctx.golden.frames;
     if (!want || !want.length) {
-      return fail(oracle, `[${which}] no golden frames = decode(x) to compare against`);
+      return fail(oracle, `[${which}] no golden frames = decode(x) to compare against (frame-bake pending)`);
     }
-    const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
-    const out = compareDigests(oracle, sink.frames, want);
+    let sink: FrameSink | null | undefined;
+    try {
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+    } catch (err) {
+      return fail(oracle, `[${which}] platform decode of output failed: ${errMsg(err)}`);
+    }
+    const got = sink && Array.isArray(sink.frames) ? sink.frames : [];
+    const out = compareDigests(oracle, got, want);
     return {
       ...out,
       detail: `[invariant decode(remux(x))==decode(x)] ${out.detail ?? ''}`.trim(),
@@ -1253,9 +1408,15 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     // trim(a..b)++trim(b..c) ≈ trim(a..c): compare output decode to golden (the baked a..c decode).
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const want = ctx.golden.frames;
-    if (!want || !want.length) return fail(oracle, `[${which}] no golden frames for trim-concat`);
-    const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
-    const out = compareDigests(oracle, sink.frames, want);
+    if (!want || !want.length) return fail(oracle, `[${which}] no golden frames for trim-concat (frame-bake pending)`);
+    let sink: FrameSink | null | undefined;
+    try {
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+    } catch (err) {
+      return fail(oracle, `[${which}] platform decode of output failed: ${errMsg(err)}`);
+    }
+    const got = sink && Array.isArray(sink.frames) ? sink.frames : [];
+    const out = compareDigests(oracle, got, want);
     return { ...out, detail: `[invariant trim concat ≈ direct trim] ${out.detail ?? ''}`.trim() };
   }
 

@@ -5,10 +5,25 @@
  * FFmpeg's demuxers to WebAssembly and runs them in a bundled Worker; it parses containers and hands
  * back ready-to-use WebCodecs objects (VideoDecoderConfig + EncodedVideoChunk) plus raw packets and
  * media info. It does NOT decode pixels, encode, mux, remux, transcode, trim, or decrypt of its own
- * — so capabilities() declares ONLY probe, demux, seek (lossless, browser-codec-independent) and the
- * OPTIONAL decodeFrames (whose pixels come from the browser's WebCodecs and are therefore declared
- * WITHOUT 'webcodecs:independent', i.e. browser-codec-gated). Everything else is left undeclared,
- * which the runner records as NA(engine) (never a fabricated pass).
+ * — so capabilities() declares ONLY probe, demux, seek and the OPTIONAL decodeFrames. Everything else
+ * is left undeclared, which the runner records as NA(engine) (never a fabricated pass).
+ *
+ * ── 'webcodecs:independent' — WHY IT IS DECLARED (a deliberate departure from dossier §9) ──────────
+ * probe and demux are PURE WASM parses: they call load()->getMediaInfo()/getAVStreams()/readAVPacket()
+ * and NEVER touch the browser's WebCodecs codec table — exactly like the only other pure demuxer,
+ * mp4box (src/engines/mp4box/adapter.ts), which declares 'webcodecs:independent' for the same reason.
+ * The runner's negotiate() Pass-2 (src/core/runner.ts) is a FLAT, whole-engine gate: WITHOUT this
+ * feature it browser-gates EVERY declared codec — so probe/demux of hevc/av1 (which the WASM parses
+ * perfectly with NO decoder) were being falsely marked NA_BROWSER on Brave/Chrome where HEVC/AV1
+ * WebCodecs DECODE is unavailable. That false-NA hides a genuinely-supported feature (a FAIL-class
+ * honesty bug under the standing rules) and is an unfair asymmetry vs mp4box, whose identical pure
+ * probe/demux PASS. Declaring the feature opts the engine out of the codec gate so probe/demux are
+ * judged on the only thing that matters for a parser — whether the WASM parses the bytes.
+ * TRADE-OFF (accepted, and HONEST): the same flat gate means decodeFrames/seek — whose PIXELS DO come
+ * from the browser's WebCodecs — are no longer auto-marked NA_BROWSER for an unconfigurable codec.
+ * Instead they SELF-GATE via VideoDecoder.isConfigSupported() and THROW a clear error, which the
+ * runner records as a clean ERROR (never a crash, never a fabricated pass). An honest ERROR on a
+ * decode the browser cannot do is strictly better than a false NA on a parse the engine genuinely can.
  *
  * Dossier (authoritative): research/dossiers/web-demuxer.md (researched 2026-06-17).
  *   Doc URLs cited there and used here:
@@ -24,7 +39,7 @@
  *   await d.load(file);                            // File | URL string
  *   await d.getMediaInfo();                        // WebMediaInfo { format_name, duration, streams[] }
  *   await d.getAVStreams();                        // WebAVStream[]
- *   d.readAVPacket(0,0,avMediaType,perTypeIndex)   // ReadableStream<WebAVPacket> (low-level demux, multi-track)
+ *   d.readAVPacket(0,endSec,avMediaType,perTypeIdx) // ReadableStream<WebAVPacket> (low-level demux, multi-track)
  *   await d.getDecoderConfig('video'|'audio')      // VideoDecoderConfig | AudioDecoderConfig
  *   await d.seek('video', tSec)                    // EncodedVideoChunk (BACKWARD = nearest keyframe)
  *   d.read('video', start?, end?)                  // ReadableStream<EncodedVideoChunk>
@@ -182,6 +197,21 @@ function trackTypeOf(stream: WebAVStream): TrackType {
   }
 }
 
+/** Map a suite TrackType to web-demuxer's numeric AVMediaType for readAVPacket's `streamType` arg.
+ *  Returns undefined for 'other' (data/attachment) streams the adapter does not packetize. */
+function avMediaTypeOf(type: TrackType): AVMediaType | undefined {
+  switch (type) {
+    case 'video':
+      return AV_MEDIA_VIDEO;
+    case 'audio':
+      return AV_MEDIA_AUDIO;
+    case 'subtitle':
+      return AV_MEDIA_SUBTITLE;
+    default:
+      return undefined;
+  }
+}
+
 /** Best-effort bitrate (WebAVStream.bit_rate is a decimal string; '0'/'' → null). */
 function bitrateOf(s: string | undefined): number | null {
   if (!s) return null;
@@ -313,10 +343,10 @@ export class WebDemuxerEngine implements MediaEngine {
 
   capabilities(): CapabilitySet {
     return {
-      // HONEST: web-demuxer is a demuxer/parser only. probe/demux/seek are its own work (no browser
-      // codec needed → pass on every browser). decodeFrames is implemented but its PIXELS come from
-      // the browser's WebCodecs, so it is declared WITHOUT 'webcodecs:independent' (browser-gated):
-      // HEVC/AV1 fall to NA(browser) where the browser can't configure the decoder.
+      // HONEST: web-demuxer is a demuxer/parser only. probe/demux/seek are its own work. decodeFrames
+      // is implemented but its PIXELS come from the browser's WebCodecs; it self-gates on
+      // VideoDecoder.isConfigSupported() and throws (→ clean ERROR) when the browser can't configure
+      // the codec — see the 'webcodecs:independent' rationale in the file header.
       operations: {
         probe: true,
         demux: true,
@@ -329,13 +359,25 @@ export class WebDemuxerEngine implements MediaEngine {
       // Demuxer writes nothing.
       containersOut: [],
       // Codecs web-demuxer can identify + packetize from these containers. Pixel decode (decodeFrames
-      // / seek) routes through the browser's WebCodecs and is gated accordingly by the runner.
+      // / seek) routes through the browser's WebCodecs and self-gates via isConfigSupported().
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis'],
       encryption: [],
-      // NOTE: deliberately NOT 'webcodecs:independent' — any pixel decode is the browser's WebCodecs,
-      // so the runner MUST browser-gate decodeFrames/seek on *Decoder.isConfigSupported.
-      features: ['metadata:read', 'multitrack', 'rotation:read', 'seek:keyframe'],
+      // 'metadata:read' : probe reads container/duration/dims/fps/rotation/language/tags.
+      // 'multitrack'    : demux reads EVERY stream (incl. 2nd+ same-type tracks) via per-stream
+      //                   readAVPacket(streamIndex) and labels each packet with its absolute index.
+      // 'rotation:read' : surfaces WebAVStream.rotation in NormalizedTrack.rotation.
+      // 'seek:keyframe' : seek() lands on the preceding keyframe (AVSEEK_FLAG_BACKWARD).
+      // 'webcodecs:independent' : probe/demux are pure WASM and never touch the browser codec gate, so
+      //                   the runner must NOT browser-gate them on codec availability (matches mp4box;
+      //                   see the file header for the full rationale + accepted decode/seek trade-off).
+      features: [
+        'metadata:read',
+        'multitrack',
+        'rotation:read',
+        'seek:keyframe',
+        'webcodecs:independent',
+      ],
     };
   }
 
@@ -408,13 +450,22 @@ export class WebDemuxerEngine implements MediaEngine {
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
 
   /**
-   * Emit a packet table. We drain the low-level `readAVPacket()` ReadableStream per stream (the v4
-   * non-ASYNCIFY read path, dossier §6) with a getReader() loop — the documented streaming fast
-   * path. readAVPacket addresses a stream by (AVMediaType, PER-TYPE index): web-demuxer's
-   * `readMediaPacket(type)` always defaults to streamIndex -1 (the best stream of that type) and
-   * cannot target a specific multi-track stream, so we call readAVPacket directly with the stream's
-   * per-type ordinal to cover multi-track inputs correctly. trackIndex is the ABSOLUTE
-   * WebAVStream.index so it lines up with NormalizedMetadata.tracks ordering.
+   * Emit a packet table covering EVERY stream (including 2nd+ tracks of the same media type). We drain
+   * the low-level `readAVPacket(start, end, streamType, streamIndex)` ReadableStream PER STREAM (the v4
+   * non-ASYNCIFY read path, dossier §3/§6) with a getReader() loop — the documented streaming fast
+   * path that the v4 "refactor read_av_packet to non-ASYNCIFY" release made work cross-browser.
+   *
+   * Stream addressing (verified against node_modules/web-demuxer/dist/web-demuxer.{d.ts,js}):
+   *   - `readAVPacket(start, end, streamType, streamIndex, seekFlag)` selects the `streamIndex`-th
+   *     stream OF THAT `streamType` (the FFmpeg av_find_best_stream wanted_stream_nb convention; the
+   *     per-type ordinal, NOT the absolute container index). `streamIndex` defaults to -1 = best.
+   *   - The convenience `readMediaPacket(type, …)` hardwires that streamIndex to undefined → -1, so it
+   *     can read ONLY the best stream of each type and SILENTLY DROPS additional same-type tracks. We
+   *     therefore call readAVPacket directly with each stream's per-type ordinal so multi-track inputs
+   *     (e.g. video + 2 audio) are read in full. (`read('video')`, used by decodeFrames below, is this
+   *     very readAVPacket path — there is no "AVPacketReader.create failed" limitation in v4.)
+   *   - trackIndex is set to the ABSOLUTE WebAVStream.index so it lines up with the
+   *     NormalizedMetadata.tracks ordering (getMediaInfo().streams / getAVStreams() are index-aligned).
    *
    * Each WebAVPacket carries only a presentation timestamp (SECONDS) and a 0|1 keyframe flag; there
    * is no DTS field, so we report dtsUs === ptsUs (honest: the lib exposes no decode timeline).
@@ -425,26 +476,23 @@ export class WebDemuxerEngine implements MediaEngine {
     const metadata = toNormalizedMetadata(info);
     const streams = await d.getAVStreams();
 
-    // web-demuxer v4: the low-level readAVPacket() and read() ERROR in the prebuilt (non-ASYNCIFY)
-    // wasm ("AVPacketReader.create failed (null reader)" / "Unknown Error") — verified in-browser. The
-    // WORKING streaming API is readMediaPacket(type, start, end) [times in seconds, end > start], which
-    // reads the BEST stream of each media type (streamIndex -1). So we count packets per media TYPE
-    // present, mapping each to the absolute index of the first stream of that type. True per-stream
-    // multi-track addressing is unavailable in this build (documented limitation).
+    // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;
-    const firstIndexOfType: Partial<Record<'video' | 'audio' | 'subtitle', number>> = {};
-    for (const stream of streams) {
-      const t = trackTypeOf(stream);
-      if ((t === 'video' || t === 'audio' || t === 'subtitle') && firstIndexOfType[t] === undefined) {
-        firstIndexOfType[t] = stream.index;
-      }
-    }
+
+    // Per-type running ordinal: the Nth video/audio/subtitle stream, in container order. This is the
+    // `streamIndex` readAVPacket expects (best-stream -1 convention), distinct from the absolute index.
+    const perTypeCount: Partial<Record<'video' | 'audio' | 'subtitle', number>> = {};
 
     const packets: PacketInfo[] = [];
-    for (const type of ['video', 'audio', 'subtitle'] as const) {
-      const trackIndex = firstIndexOfType[type];
-      if (trackIndex === undefined) continue;
-      const reader = d.readMediaPacket(type, 0, endSec).getReader();
+    for (const stream of streams) {
+      const type = trackTypeOf(stream);
+      const avType = avMediaTypeOf(type);
+      if (avType === undefined) continue; // skip data/attachment streams we don't packetize
+      const perTypeIndex = perTypeCount[type as 'video' | 'audio' | 'subtitle'] ?? 0;
+      perTypeCount[type as 'video' | 'audio' | 'subtitle'] = perTypeIndex + 1;
+
+      const trackIndex = stream.index; // absolute index → aligns with metadata.tracks
+      const reader = d.readAVPacket(0, endSec, avType, perTypeIndex).getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -482,6 +530,13 @@ export class WebDemuxerEngine implements MediaEngine {
    * VideoDecoder in a pipelined loop (dossier §6 best path), rasterize each VideoFrame to ImageData,
    * and digest. Pixels are the BROWSER's — config support is checked first so an unsupported codec
    * (e.g. HEVC/AV1 on a browser that can't configure it) fails LOUDLY rather than faking a pass.
+   *
+   * maxFrames means "the first N frames IN PRESENTATION ORDER". The decoder EMITS frames in DECODE
+   * order, which for B-frame streams differs from presentation order, so we must NOT truncate at the
+   * decoder output to maxFrames (that could close an early-pts frame that arrives late and keep a
+   * higher-pts one). Instead we buffer up to a slightly larger reorder window (submitCap), then sort
+   * by pts and slice to maxFrames — guaranteeing the lowest-pts N are returned for any reorder depth
+   * up to the window margin.
    */
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
     if (!hasVideoDecoder()) {
@@ -496,12 +551,17 @@ export class WebDemuxerEngine implements MediaEngine {
     }
 
     const maxFrames = opts?.maxFrames ?? Number.POSITIVE_INFINITY;
+    // Buffer a reorder window past maxFrames so B-frame-reordered presentation frames are all present
+    // before we pick the lowest-pts maxFrames. Also bounds how many chunks we submit (pipelining).
+    const submitCap = Number.isFinite(maxFrames) ? maxFrames + 16 : Number.POSITIVE_INFINITY;
     const collected: Array<{ ptsUs: number; frame: VideoFrame }> = [];
     let decodeError: Error | undefined;
 
     const decoder = new VideoDecoder({
       output: (frame) => {
-        if (collected.length >= maxFrames) {
+        // Retain up to the reorder window (NOT maxFrames) so a late-arriving low-pts frame is kept;
+        // the final lowest-pts maxFrames selection happens after the pts sort below.
+        if (collected.length >= submitCap) {
           frame.close();
           return;
         }
@@ -515,9 +575,8 @@ export class WebDemuxerEngine implements MediaEngine {
     try {
       decoder.configure(config);
 
-      // Pipelined streaming read: enqueue chunks as they arrive; cap submission a little past
-      // maxFrames so B-frame reordering can flush enough presentation frames.
-      const submitCap = Number.isFinite(maxFrames) ? maxFrames + 16 : Number.POSITIVE_INFINITY;
+      // Pipelined streaming read: enqueue chunks as they arrive; cap submission at submitCap (a little
+      // past maxFrames) so B-frame reordering can flush enough presentation frames.
       const reader = d.read('video').getReader();
       let submitted = 0;
       try {
@@ -554,7 +613,9 @@ export class WebDemuxerEngine implements MediaEngine {
 
     if (decodeError && collected.length === 0) throw decodeError;
 
-    // Emit in presentation order, capped at maxFrames.
+    // Sort the buffered reorder window by presentation time, THEN take the lowest-pts maxFrames. This
+    // makes the cap retain the first-N-by-presentation even when the decoder emitted them out of order
+    // (B-frames), rather than the first-N-by-decode-arrival.
     collected.sort((a, b) => a.ptsUs - b.ptsUs);
     const emit = collected.slice(0, Number.isFinite(maxFrames) ? maxFrames : collected.length);
 

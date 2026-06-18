@@ -7,38 +7,33 @@
  * reference engine and diff the packet table) and a `playback-smoke` (<video> can play it).
  *
  * Coverage is a cross-container matrix restricted to *lossless* pairs — a codec must be legal in
- * both source and target container (e.g. H.264 in mp4/mov/mkv/ts, VP9/Opus in webm/mkv, PCM only in
- * wav, etc.). Pairs where the codec cannot live in the target (H.264→webm, VP9→mp4) are intentionally
- * omitted: those are transcode, not remux.
+ * both source and target container. This index holds the BASE matrix; the symmetric-mesh completion
+ * (§6), audio reverses/expansion (§A.3), the size axis (§5.3), the metamorphic invariants (§7/§A.16)
+ * and the remux-targeted negatives are split into sibling files and concatenated below. All sub-
+ * batteries emit identical scenario shapes via ./_shared.ts and stay one exported `remuxScenarios`.
+ *
+ * ORACLE NOTE (see ./_shared.ts header for the full rationale): for an op:'remux' scenario the runner
+ * only runs engine.remux and exposes the result as ctx.output — it never probes/demuxes the output
+ * into ctx.metadata/ctx.demux. So `golden-metadata`/`golden-packets` are NOT valid remux gates (they
+ * read ctx.metadata/ctx.demux and always fail "absent"). AUDIO remux additionally cannot use
+ * `decoded-frames-bitexact` (it digests RGBA video frames; there is no PCM oracle), so audio cases
+ * gate on `reference-reimport` + `playback-smoke` and get their sample-fidelity proxy from a
+ * property-invariant 'probe-duration' case in metamorphic.ts.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
-import { defineScenario } from '../../core/scenario.ts';
-
-const REMUX_OUT_METRICS = [
-  'wall',
-  'throughputRealtime',
-  'peakMemory',
-  'sourceReads',
-  'targetWrites',
-  'longtasks',
-] as const;
-
-interface RemuxCase {
-  /** source asset id */
-  asset: string;
-  /** source container token */
-  from: string;
-  /** target container token */
-  to: string;
-  videoCodecs?: string[];
-  audioCodecs?: string[];
-  notes?: string;
-}
+import { buildRemuxAll, type RemuxCase } from './_shared.ts';
+import { remuxAudioScenarios } from './audio.ts';
+import { remuxMatrixScenarios } from './matrix.ts';
+import { remuxMetamorphicScenarios } from './metamorphic.ts';
+import { remuxNegativeScenarios } from './negative.ts';
+import { remuxSizeLadderScenarios } from './size-ladder.ts';
 
 /**
- * Lossless cross-container matrix. Each entry is a (source asset, target container) pair where every
- * track's codec is representable in the target without re-encoding.
+ * Base lossless cross-container matrix (the legacy battery). Each entry is a (source asset, target
+ * container) pair where every track's codec is representable in the target without re-encoding. The
+ * symmetric-mesh REVERSE/ROUND-TRIP cells and the previously-zero <->WebM video arm are added in
+ * ./matrix.ts; the audio reverses/expansion in ./audio.ts.
  */
 const REMUX_CASES: RemuxCase[] = [
   // ── H.264(+AAC) is portable across mp4 / mov / mkv / ts ──
@@ -53,7 +48,7 @@ const REMUX_CASES: RemuxCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'TS→MP4: Annex-B → AVCC bitstream conversion is still lossless (same coded samples).',
+    notes: 'TS->MP4: Annex-B -> AVCC bitstream conversion is still lossless (same coded samples).',
   },
   {
     asset: 'h264_bframes_1080p.mp4',
@@ -101,13 +96,18 @@ const REMUX_CASES: RemuxCase[] = [
     notes: 'AV1 + Opus are both legal in mp4 — lossless remux out of webm.',
   },
 
-  // ── Audio-only lossless remux (codec must be legal in target) ──
+  // ── Audio-only lossless remux (codec must be legal in target). ──
+  // ORACLE FIX: these are AUDIO remuxes. `decoded-frames-bitexact` decodes to RGBA video frames and
+  // the audio golden ships no frames.json, so it FAILed unconditionally and gated nothing; and a
+  // remux op never populates ctx.metadata so `golden-metadata` is inapplicable too. The honest gate
+  // is reference-reimport + playback-smoke (set as the default audio oracle set in _shared.ts), with
+  // the sample-fidelity proxy provided by the metamorphic 'probe-duration' cases (metamorphic.ts).
   {
     asset: 'aac_adts.aac',
     from: 'adts',
     to: 'mp4',
     audioCodecs: ['aac'],
-    notes: 'ADTS AAC → MP4(.m4a): strip ADTS headers, wrap raw AAC — lossless.',
+    notes: 'ADTS AAC -> MP4(.m4a): strip ADTS headers, wrap raw AAC — lossless.',
   },
   {
     asset: 'mp3_xing.mp3',
@@ -121,34 +121,27 @@ const REMUX_CASES: RemuxCase[] = [
     from: 'flac',
     to: 'mkv',
     audioCodecs: ['flac'],
-    notes: 'FLAC → MKV: lossless audio re-wrap; SEEKTABLE dropped, samples identical.',
+    notes: 'FLAC -> MKV: lossless audio re-wrap; SEEKTABLE dropped, samples identical.',
   },
   {
     asset: 'opus.ogg',
     from: 'ogg',
     to: 'webm',
     audioCodecs: ['opus'],
-    notes: 'Opus OGG → WebM: lossless audio re-wrap into Matroska/WebM.',
+    notes: 'Opus OGG -> WebM: lossless audio re-wrap into Matroska/WebM.',
   },
 ];
 
-export const remuxScenarios: Scenario[] = REMUX_CASES.map((c) =>
-  defineScenario({
-    id: `remux/${c.asset.replace(/\.[^.]+$/, '')}_${c.from}_to_${c.to}`,
-    op: 'remux',
-    input: c.asset,
-    options: { container: c.to },
-    requires: {
-      operations: ['remux'],
-      containersIn: [c.from],
-      containersOut: [c.to],
-      ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
-      ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-    },
-    oracles: ['decoded-frames-bitexact', 'reference-reimport', 'playback-smoke'],
-    metrics: [...REMUX_OUT_METRICS],
-    ...(c.notes ? { notes: c.notes } : {}),
-  }),
-);
+const baseRemuxScenarios: Scenario[] = buildRemuxAll(REMUX_CASES);
+
+/** The whole remux family: base matrix + mesh completion + audio + size axis + metamorphic + negatives. */
+export const remuxScenarios: Scenario[] = [
+  ...baseRemuxScenarios,
+  ...remuxMatrixScenarios,
+  ...remuxAudioScenarios,
+  ...remuxSizeLadderScenarios,
+  ...remuxMetamorphicScenarios,
+  ...remuxNegativeScenarios,
+];
 
 export default remuxScenarios;

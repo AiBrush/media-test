@@ -252,7 +252,28 @@ export function parseFormats(log: string): { demux: Set<string>; mux: Set<string
 
 // ── Capability derivation from probe sets ────────────────────────────────────────────────────
 
-/** Video codecs we can both DECODE (decoders set) and ENCODE (encoders set, software encoder name). */
+/**
+ * Video codecs we can both DECODE (decoders set) and ENCODE (encoders set, software encoder name).
+ *
+ * WHY round-trip-gated (decode ∧ encode), not decode-only — and the AV1 read-side caveat:
+ * The suite's `CapabilitySet.videoCodecs` is a SINGLE flat list that the runner uses to negotiate
+ * EVERY op. Critically, ffmpeg.wasm declares the `webcodecs:independent` feature, so the runner's
+ * negotiate() SHORT-CIRCUITS its Pass-2 (browser/encode) codec gate (runner.ts:148-150) and treats
+ * anything in this list as fully round-trippable for encode-producing ops too. So if we added a
+ * decode-only codec (e.g. av1, which this build genuinely DEMUXES and could `-c copy`/decode) to this
+ * list purely to un-NA the read-side cases (demux/remux-copy), the encode-producing cases that share
+ * the token — transcode→av1 (`videoEncoderName('av1')===null`) and any av1 mux — would FALSELY
+ * negotiate OK and then THROW at runtime → an ERROR over-claim, which the suite ranks as strictly
+ * WORSE than the honest read-side NA it would cure. The read-side vs encode-side distinction simply
+ * cannot be expressed through this one flat list while `webcodecs:independent` is declared.
+ *
+ * Therefore we keep the conservative round-trip gate here (AV1 fails the encode test → absent). The
+ * honest cure for the read-side false-NA on av1 (demux/remux of av1-in-webm, which this engine truly
+ * performs via stream copy) is OUTSIDE this adapter's scope: either drop the videoCodecs requirement
+ * from the read-only scenarios (src/scenarios/{demux,remux}) so they gate on the container alone, or
+ * split a decode-only set into core (src/core/engine.ts CapabilitySet + runner.ts negotiate()). The
+ * golden-packets / reference-reimport oracles remain the full correctness gate either way.
+ */
 export function deriveVideoCodecs(
   encoders: Set<string>,
   decoders: Set<string>,
@@ -263,7 +284,7 @@ export function deriveVideoCodecs(
     const enc = VIDEO_ENCODER[canonical];
     const encodes = enc !== undefined && encoders.has(enc);
     // Declare a codec only when BOTH decode and encode are present (the suite treats a videoCodec
-    // token as round-trippable). AV1 fails the encode test → absent.
+    // token as round-trippable; see the round-trip-gate rationale above). AV1 fails encode → absent.
     if (decodes && encodes) out.push(canonical);
   }
   return out;

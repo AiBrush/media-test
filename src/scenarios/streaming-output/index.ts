@@ -1,127 +1,49 @@
 /**
  * src/scenarios/streaming-output/index.ts — Pillar 1, family "streaming-output".
  *
- * Exercises HOW bytes leave the engine, independent of the codec work:
- *  - buffer vs streaming target: produce the whole blob at once vs incrementally (target writes
- *    observed via the targetWrites/bytesOut metrics).
- *  - fragmented / CMAF (feature 'fragmented'): moof/mdat fragmented MP4 suitable for MSE.
- *  - fastStart:reserve (feature 'fastStart:reserve'): reserve a forward moov and patch it — the
- *    oracle/runner provokes a large forward seek in the target to test reserve handling.
- *  - tiny TS writes: MPEG-TS output written in many small 188-byte-aligned chunks.
+ * Exercises HOW bytes leave the engine (the output SHAPE), independent of the codec work: buffer vs
+ * streaming target, fragmented/CMAF (moof/mdat), fastStart (moov-first / reserve / none), MPEG-TS tiny
+ * writes, headerless/live WebM, and the bounded-peak-memory promise of a stream target at GB scale.
+ * Every case is a lossless `remux` (coded samples copied), so the SHAPE — not the codec — is what
+ * differs. See ./_shared.ts for the oracle rationale and the contract-level caveat that the shape
+ * knobs in `options` are not yet forwarded by the runner (a core change outside this writer's scope).
  *
- * All are remux ops (coded samples copied) so correctness reduces to "re-imports + plays": the
- * `reference-reimport` and `playback-smoke` oracles. The output-shape knob lives in options.
+ * This index holds the BASE six output-shape cases and concatenates the sibling sub-batteries:
+ *   - ./base.ts                 — the original six shapes (stable ids), with the honest oracle fix
+ *                                 (fragmented/TS/headerless drop playback-smoke → false-FAIL risk).
+ *   - ./ttfb.ts                 — time-to-first-byte (§A.10) buffer vs stream, ranked on timeToFirstByte.
+ *   - ./fragmented-faststart.ts — fastStart progressive (moov-first) + fastStart:false control + the
+ *                                 fragmented lossless-copy premise; documents the moof/mdat structure,
+ *                                 moov-position, forward-seek, and reserve overflow/underflow gaps that
+ *                                 need a new structural oracle (out of scope) rather than faking them.
+ *   - ./ts-webm-live.ts         — MPEG-TS continuity across tiny writes + headerless/"live" WebM.
+ *   - ./size-ladder.ts          — buffer-vs-stream PEAK-MEMORY contrast at large/huge/massive scale
+ *                                 (§A.10 reason-to-exist + §5.3), ranked on peakMemory.
+ *   - ./metamorphic.ts          — decode(remux_shape(x))==decode(x) and probe(remux_shape(x)).dur≈
+ *                                 probe(x).dur across buffer/stream/fragmented shapes (§A.16).
+ *
+ * All sub-batteries emit identical scenario shapes via ./_shared.ts and stay one exported
+ * `streamingOutputScenarios` (imported by ../index.ts). Do NOT edit ../index.ts.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
-import { defineScenario } from '../../core/scenario.ts';
 
-const STREAM_METRICS = [
-  'wall',
-  'throughputRealtime',
-  'peakMemory',
-  'targetWrites',
-  'bytesOut',
-  'longtasks',
-] as const;
+import { streamingBaseScenarios } from './base.ts';
+import { streamingTtfbScenarios } from './ttfb.ts';
+import { streamingFragmentedFastStartScenarios } from './fragmented-faststart.ts';
+import { streamingTsWebmLiveScenarios } from './ts-webm-live.ts';
+import { streamingSizeLadderScenarios } from './size-ladder.ts';
+import { streamingMetamorphicScenarios } from './metamorphic.ts';
 
-interface StreamCase {
-  id: string;
-  asset: string;
-  from: string;
-  to: string;
-  videoCodecs?: string[];
-  audioCodecs?: string[];
-  /** output-shape options forwarded to the engine */
-  options: Record<string, unknown>;
-  /** extra features the output mode needs */
-  features?: string[];
-  notes?: string;
-}
-
-const STREAM_CASES: StreamCase[] = [
-  {
-    id: 'mp4_buffer_target',
-    asset: 'h264_1080p_30s.mp4',
-    from: 'mp4',
-    to: 'mp4',
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
-    options: { container: 'mp4', target: 'buffer' },
-    notes: 'Whole-blob (in-memory) target; baseline for the streaming comparison.',
-  },
-  {
-    id: 'mp4_streaming_target',
-    asset: 'h264_1080p_30s.mp4',
-    from: 'mp4',
-    to: 'mp4',
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
-    options: { container: 'mp4', target: 'stream' },
-    notes: 'Incremental/streaming target; targetWrites should be many small writes, not one.',
-  },
-  {
-    id: 'mp4_fragmented_cmaf',
-    asset: 'h264_1080p_30s.mp4',
-    from: 'mp4',
-    to: 'mp4',
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
-    options: { container: 'mp4', fragmented: true, target: 'stream' },
-    features: ['fragmented'],
-    notes: 'Fragmented MP4 (CMAF): moof/mdat fragments, MSE-appendable; re-import must see segments.',
-  },
-  {
-    id: 'mp4_faststart_reserve',
-    asset: 'h264_1080p_30s.mp4',
-    from: 'mp4',
-    to: 'mp4',
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
-    options: { container: 'mp4', fastStart: 'reserve', target: 'stream' },
-    features: ['fastStart:reserve'],
-    notes: 'fastStart with reserved forward moov; runner provokes a large forward seek in the target.',
-  },
-  {
-    id: 'ts_tiny_writes',
-    asset: 'h264_1080p_30s.mp4',
-    from: 'mp4',
-    to: 'ts',
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
-    options: { container: 'ts', target: 'stream', writeChunkBytes: 188 },
-    notes: 'MPEG-TS streamed in many tiny 188-byte-aligned writes; stresses small-write paths.',
-  },
-  {
-    id: 'webm_streaming_target',
-    asset: 'vp9_1080p_10s.webm',
-    from: 'webm',
-    to: 'webm',
-    videoCodecs: ['vp9'],
-    audioCodecs: ['opus'],
-    options: { container: 'webm', target: 'stream' },
-    notes: 'Streaming WebM (live-profile clusters); re-import + playback.',
-  },
+/** The whole streaming-output family: base shapes + ttfb + fragmented/faststart + ts/webm-live +
+ *  size-ladder + metamorphic invariants. */
+export const streamingOutputScenarios: Scenario[] = [
+  ...streamingBaseScenarios,
+  ...streamingTtfbScenarios,
+  ...streamingFragmentedFastStartScenarios,
+  ...streamingTsWebmLiveScenarios,
+  ...streamingSizeLadderScenarios,
+  ...streamingMetamorphicScenarios,
 ];
-
-export const streamingOutputScenarios: Scenario[] = STREAM_CASES.map((c) =>
-  defineScenario({
-    id: `streaming-output/${c.id}`,
-    op: 'remux',
-    input: c.asset,
-    options: c.options,
-    requires: {
-      operations: ['remux'],
-      containersIn: [c.from],
-      containersOut: [c.to],
-      ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
-      ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-      ...(c.features ? { features: c.features } : {}),
-    },
-    oracles: ['reference-reimport', 'playback-smoke'],
-    metrics: [...STREAM_METRICS],
-    ...(c.notes ? { notes: c.notes } : {}),
-  }),
-);
 
 export default streamingOutputScenarios;

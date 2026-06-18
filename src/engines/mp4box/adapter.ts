@@ -8,8 +8,24 @@
  *   - probe   : read `moov` → NormalizedMetadata.
  *   - demux   : walk sample tables → encoded PacketInfo table (the WebCodecs demux fast path).
  *   - remux   : ISOBMFF → FRAGMENTED-MP4 (fMP4/CMAF) via setSegmentOptions/onSegment (the fragmenter).
- * Everything else (transcode/decodeFrames/seek-to-frame/trim/mux/decrypt) needs decode/encode or a
+ * Everything else (transcode/decodeFrames/seek-to-frame/trim/decrypt) needs decode/encode or a
  * non-ISOBMFF container and is therefore NOT declared — the runner records those as NA(engine).
+ *
+ * ── Why `mux` is NOT declared (honest NA, not a hidden capability) ───────────────────────────────
+ * The dossier (§2.4 / §7 A.3+A.7 / §8) confirms mp4box CAN mux already-encoded WebCodecs chunks into
+ * MP4 (addTrack/addSample/getBuffer — all present in mp4box@2.3.0). The reason we still leave `mux`
+ * undeclared is a HARNESS-CONTRACT constraint, not a library limit: the runner's mux dispatch
+ * (src/core/runner.ts executeOp `case 'mux'`) requires `scenario.options.tracks` (an EncodedTracks
+ * payload) and its own doc-comment states "assembl[ing] EncodedTracks … is out of scope here — the
+ * suite feeds options.tracks". But src/scenarios/mux/index.ts supplies ONLY `{ container }` and never
+ * a `tracks` payload. So declaring `mux:true` would pass negotiate() and then THROW
+ * "mux scenario requires options.tracks" inside executeOp → a hard ERROR cell — strictly worse than
+ * the current honest NA(engine) "-". Per the suite's honesty rule, an unrunnable cell that ERRORs is
+ * an OVER-claim, not honest capability. Wiring the runner to demux→tracks would fix it, but
+ * src/core/runner.ts and src/scenarios/** are outside this adapter's write scope. We therefore keep
+ * `mux` undeclared (and the method a fail-loud throw) and record the divergence-from-§8 here so the
+ * gap is explicit. If/when the harness feeds options.tracks, declaring mux + implementing the §2.4
+ * addTrack/addSample/getBuffer path (containersOut already 'mp4'; reject non-mp4) is the honest upgrade.
  *
  * ── UPGRADE 0.5.4 -> 2.3.0 (this is a rewrite) ──────────────────────────────────────────────────
  * The 2.x line is a TypeScript+ESM rewrite that SHIPS its own `.d.ts`, so we import the real typed
@@ -113,18 +129,75 @@ function trackType(t: Mp4Track): TrackType {
  */
 function canonicalCodec(codec: string): string {
   const c = codec.toLowerCase();
-  // Video
-  if (c.startsWith('avc1') || c.startsWith('avc3')) return 'h264';
-  if (c.startsWith('hev1') || c.startsWith('hvc1')) return 'hevc';
+  // Video. (avc1/avc3/avc2/avc4 all carry an avcC; hev1/hvc1 carry hvcC.)
+  if (c.startsWith('avc1') || c.startsWith('avc3') || c.startsWith('avc2') || c.startsWith('avc4')) return 'h264';
+  if (c.startsWith('hev1') || c.startsWith('hvc1') || c.startsWith('hev2') || c.startsWith('hvc2')) return 'hevc';
   if (c.startsWith('vp08') || c === 'vp8') return 'vp8';
   if (c.startsWith('vp09') || c === 'vp9') return 'vp9';
   if (c.startsWith('av01')) return 'av1';
-  // Audio
-  if (c.startsWith('mp4a.40') || c.startsWith('mp4a.67')) return 'aac';
+  // Audio. NB: `mp4aSampleEntry.getCodec()` appends `.<OTI>[.<DSI>]` ONLY when an `esds` ESD is
+  // present and parsed; QuickTime/MOV audio frequently exposes the BARE token 'mp4a' (no '.40.2'
+  // suffix) because the ESD's OTI is absent — so we must canonicalize bare 'mp4a' to AAC, not just
+  // the suffixed 'mp4a.40.*'. (Verified in node_modules/mp4box dist: getCodec returns `baseCodec`
+  // ('mp4a') when `!esds.esd`. Golden h264_1080p_5s.mov audio codec === 'aac'.) OTI 0x40/0x67 = AAC.
+  if (c === 'mp4a' || c === 'aac' || c.startsWith('mp4a.40') || c.startsWith('mp4a.67')) return 'aac';
   if (c.startsWith('opus')) return 'opus';
+  // OTI 0x6b/0x69 = MP3; bare 'mp3'/'.mp3' tokens too.
   if (c.startsWith('mp4a.6b') || c.startsWith('mp4a.69') || c === 'mp3' || c === '.mp3') return 'mp3';
   if (c.startsWith('flac') || c.startsWith('fla')) return 'flac';
   return c;
+}
+
+/**
+ * Encrypted-track codec unwrap (CENC). For protected tracks, mp4box's `getInfo()` reports
+ * `track.codec` as the SAMPLE-ENTRY type 'encv'/'enca' (and 'encs'/'encu' for sys/subtitle) because
+ * `encvSampleEntry`/`encaSampleEntry` inherit the BASE `SampleEntry.getCodec()` (= `type.replace('.','')`)
+ * — they carry NO avcC/esds-aware getCodec. The ORIGINAL four-cc lives in the OriginalFormatBox:
+ *   stsd → encv/enca sampleEntry → sinf (ProtectionSchemeInfoBox) → frma.data_format ('avc1'/'mp4a').
+ * The suite's probe is documented to report container/track WITHOUT decrypting (dossier A.11/A.12), so
+ * we resolve `frma.data_format` and canonicalize THAT. Returns the unwrapped four-cc, or undefined when
+ * the track is not an `enc*` protected entry (caller then uses `track.codec` verbatim).
+ *
+ * Type-correct, no internal imports: `stsd.entries` are public `SampleEntry`s; `SampleEntry` (a
+ * `ContainerBox`) exposes the generic `boxes: Box[]`, and each `Box` has a typed `.type`. We locate
+ * `sinf`→`frma` by fourcc on `.boxes`, then read the `data_format` string through a minimal structural
+ * shape (the concrete `frmaBox`/`sinfBox` classes are NOT part of mp4box's public entry exports).
+ */
+const ENCRYPTED_ENTRY_TYPES = new Set(['encv', 'enca', 'encs', 'encu', 'enct', 'encm']);
+
+interface BoxNode {
+  type: string;
+  boxes?: BoxNode[];
+  data_format?: string;
+}
+
+function findChildBox(node: BoxNode | undefined, fourcc: string): BoxNode | undefined {
+  if (!node || !node.boxes) return undefined;
+  for (const b of node.boxes) {
+    if (b && b.type === fourcc) return b;
+  }
+  return undefined;
+}
+
+function unwrapEncryptedCodec(file: Mp4ISOFile, trackId: number, rawCodec: string): string | undefined {
+  if (!ENCRYPTED_ENTRY_TYPES.has(rawCodec.toLowerCase())) return undefined;
+  // Defensive: only enc* tracks reach here; a malformed/partial box tree must never turn a clean
+  // probe into an ERROR — on any surprise we fall back to the wrapper four-cc (caller uses t.codec).
+  try {
+    // getTrackById → trakBox; mdia.minf.stbl.stsd.entries[] are SampleEntry boxes.
+    const trak = file.getTrackById(trackId);
+    const entries = trak?.mdia?.minf?.stbl?.stsd?.entries;
+    if (!entries || !entries.length) return undefined;
+    // Find the protected entry (its type matches the rawCodec) — fall back to the first entry.
+    const entry =
+      (entries.find((e) => (e as unknown as BoxNode).type === rawCodec) ?? entries[0]) as unknown as BoxNode;
+    const sinf = findChildBox(entry, 'sinf');
+    const frma = findChildBox(sinf, 'frma');
+    const fmt = frma?.data_format;
+    return typeof fmt === 'string' && fmt.length ? fmt : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -161,8 +234,12 @@ function canonicalContainer(brands: string[] | undefined): string {
   return 'mp4';
 }
 
-/** Build NormalizedMetadata from an mp4box `Movie` (getInfo() result). */
-function toNormalizedMetadata(info: Mp4Movie): NormalizedMetadata {
+/**
+ * Build NormalizedMetadata from an mp4box `Movie` (getInfo() result). The owning `ISOFile` is threaded
+ * in so the encrypted-track codec unwrap (frma.data_format) and any box-tree lookups can resolve the
+ * ORIGINAL codec for CENC `encv`/`enca` sample entries (getInfo() only exposes the wrapper four-cc).
+ */
+function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetadata {
   // Movie duration: prefer mvhd duration/timescale; for fragmented files where mvhd.duration is 0,
   // fall back to the fragment duration ratio getInfo() exposes as {num, den}.
   let durationSec: number | null = null;
@@ -171,14 +248,23 @@ function toNormalizedMetadata(info: Mp4Movie): NormalizedMetadata {
   } else if (info.fragment_duration && info.fragment_duration.den > 0 && info.fragment_duration.num > 0) {
     durationSec = info.fragment_duration.num / info.fragment_duration.den;
   }
+  // Movie-level fragment seconds, reused as the fps denominator for fragmented video tracks whose
+  // per-track tkhd.duration is 0 (mvhd/tkhd duration is 0 in a fragmented init segment).
+  const movieFragSec =
+    info.fragment_duration && info.fragment_duration.den > 0 && info.fragment_duration.num > 0
+      ? info.fragment_duration.num / info.fragment_duration.den
+      : 0;
 
   const tracks: NormalizedTrack[] = info.tracks.map((t): NormalizedTrack => {
     const type = trackType(t);
     const trackDurSec = t.timescale > 0 ? t.duration / t.timescale : 0;
     const lang = t.language && t.language !== 'und' ? t.language : null;
+    // Unwrap CENC-protected sample entries ('encv'/'enca') to their original four-cc before
+    // canonicalizing; non-encrypted tracks pass `t.codec` straight through.
+    const rawCodec = unwrapEncryptedCodec(file, t.id, t.codec) ?? t.codec;
     const track: NormalizedTrack = {
       type,
-      codec: canonicalCodec(t.codec),
+      codec: canonicalCodec(rawCodec),
       bitrate: typeof t.bitrate === 'number' && Number.isFinite(t.bitrate) ? Math.round(t.bitrate) : null,
       language: lang,
     };
@@ -186,7 +272,11 @@ function toNormalizedMetadata(info: Mp4Movie): NormalizedMetadata {
       track.width = t.video?.width ?? (Math.round(t.track_width) || undefined);
       track.height = t.video?.height ?? (Math.round(t.track_height) || undefined);
       // Average fps over the track (sample count / track-seconds). VFR tracks report an average.
-      if (trackDurSec > 0 && t.nb_samples > 0) track.fps = t.nb_samples / trackDurSec;
+      // For FRAGMENTED files the per-track duration is 0 (no samples in the moov), so fall back to
+      // the movie-level fragment duration: fps = nb_samples / fragment_seconds. (cenc_ctr.mp4:
+      // 150 / 5.0214 = 29.87, matching golden 29.872 within the ±0.05 fps oracle tolerance.)
+      const fpsDenSec = trackDurSec > 0 ? trackDurSec : movieFragSec;
+      if (fpsDenSec > 0 && t.nb_samples > 0) track.fps = t.nb_samples / fpsDenSec;
       const rot = rotationFromMatrix(t.matrix);
       if (rot !== undefined) track.rotation = rot;
     } else if (type === 'audio') {
@@ -239,8 +329,11 @@ export class Mp4boxEngine implements MediaEngine {
     return {
       // HONEST: mp4box parses boxes (probe), walks sample tables (demux), and fragments ISOBMFF
       // (remux → fMP4). It NEVER produces pixels (decodeFrames/seek-to-frame), re-encodes
-      // (transcode), trims frame-accurately, muxes encoded tracks from scratch in this adapter, or
-      // decrypts — those are omitted so the runner negotiates NA(engine).
+      // (transcode), or trims frame-accurately → those are omitted so the runner negotiates
+      // NA(engine). `mux` is library-capable (dossier §2.4) but left UNDECLARED because the harness
+      // never feeds options.tracks (declaring it would ERROR, not contest — see header). `decrypt`
+      // is genuinely impossible (CENC signalling parsed, no AES). Omissions here are true NAs, not
+      // hidden features.
       operations: {
         probe: true,
         demux: true,
@@ -257,7 +350,9 @@ export class Mp4boxEngine implements MediaEngine {
       // Parses CENC signalling (pssh/senc/...) but does NOT decrypt → declare none.
       encryption: [],
       // 'fragmented'        : remux produces fMP4/CMAF.
-      // 'metadata:read'     : probe reads duration/dims/fps/rotation/brands/language.
+      // 'metadata:read'     : probe reads duration/dims/fps/rotation/brands/language; unwraps CENC
+      //                       'encv'/'enca' to the original codec via sinf→frma.data_format, and
+      //                       derives video fps from fragment_duration for fragmented inputs.
       // 'webcodecs:demux-feed': demux output feeds WebCodecs EncodedVideoChunk/description.
       // 'webcodecs:independent': probe/demux/remux are pure-JS and never touch the browser codec
       //                          gate, so the runner must not browser-gate them on codec availability.
@@ -332,9 +427,11 @@ export class Mp4boxEngine implements MediaEngine {
   // ── probe ──────────────────────────────────────────────────────────────────────────────────
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const bytes = await input.arrayBuffer();
-    // moov-only: discard mdat (createFile()/keepMdatData=false) for minimal peak memory.
-    const { info } = await this.parseToInfo(bytes, false);
-    return toNormalizedMetadata(info);
+    // moov-only: discard mdat (createFile()/keepMdatData=false) for minimal peak memory. We still
+    // need the parsed `file` to resolve CENC `encv`/`enca` → original codec via frma.data_format
+    // (the OriginalFormatBox lives in the moov's stsd, so it is present even with mdat discarded).
+    const { file, info } = await this.parseToInfo(bytes, false);
+    return toNormalizedMetadata(file, info);
   }
 
   // ── demux ──────────────────────────────────────────────────────────────────────────────────
@@ -347,7 +444,7 @@ export class Mp4boxEngine implements MediaEngine {
   async demux(input: MediaInput): Promise<DemuxResult> {
     const bytes = await input.arrayBuffer();
     const { file, info } = await this.parseToInfo(bytes, true);
-    const metadata = toNormalizedMetadata(info);
+    const metadata = toNormalizedMetadata(file, info);
 
     // mp4box track id → index in info.tracks, so PacketInfo.trackIndex indexes NormalizedMetadata.tracks.
     const idToIndex = new Map<number, number>();
@@ -450,9 +547,16 @@ export class Mp4boxEngine implements MediaEngine {
     throw new Error(`${ENGINE_ID}: trim not supported (keyframe-bounded DIY only; not declared)`);
   }
 
-  // mux/decrypt are optional on MediaEngine and intentionally NOT implemented/declared here.
+  // mux/decrypt are optional on MediaEngine. mp4box CAN mux encoded chunks into MP4 (dossier §2.4),
+  // but the runner does not feed `options.tracks`, so declaring it would ERROR rather than contest
+  // (see header "Why `mux` is NOT declared"). Kept present + fail-loud so a future mis-wired direct
+  // call surfaces a clear error; capabilities() does NOT declare it → runner negotiates NA(engine).
+  // `decrypt` is genuinely impossible (parses CENC signalling, performs no AES) and is simply absent.
   async mux(_tracks: EncodedTracks, _opts: { container: string }): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: mux not supported (not declared)`);
+    throw new Error(
+      `${ENGINE_ID}: mux is undeclared in this harness (runner does not supply options.tracks); ` +
+        `mp4box can addTrack/addSample/getBuffer per dossier §2.4 once tracks are fed`,
+    );
   }
 }
 

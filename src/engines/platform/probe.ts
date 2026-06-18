@@ -2,15 +2,21 @@
  * src/engines/platform/probe.ts — best-effort NormalizedMetadata from raw platform APIs.
  *
  * Raw platform probing is limited: an HTMLVideoElement exposes duration + intrinsic dimensions but
- * NOT the codec fourcc, fps, channel layout, or bitrate. To fill codec/dims we use the inline
- * demuxers (MP4/WebM) which read the sample-description boxes directly. For containers neither
- * demuxer parses, we degrade to a <video>-only probe (duration + a single video track with unknown
- * codec). This is declared honestly in capabilities() and reflected in the returned metadata.
+ * NOT the codec fourcc, fps, channel layout, or bitrate. To fill codec/dims (and the AUDIO track
+ * codec/sampleRate/channels) we use the inline demuxers (MP4/WebM) which read the sample-description
+ * boxes directly and enumerate EVERY track in container order — so a multi-track golden's track list
+ * (video + audio[…]) is matched. For containers neither demuxer parses, we degrade to a <video>-only
+ * probe (duration + a single video track with unknown codec). This is declared honestly in
+ * capabilities() and reflected in the returned metadata.
+ *
+ * SOURCES (dossier research/dossiers/platform.md §2 probe / §A.11 metadata-read, researched 2026-06-17):
+ *   - WebCodecs API: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
+ *   - MediaCapabilities.decodingInfo: https://developer.mozilla.org/en-US/docs/Web/API/MediaCapabilities/decodingInfo
  */
 
 import type { MediaInput, NormalizedMetadata, NormalizedTrack } from '../../core/engine.ts';
-import { demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
-import { demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+import { demuxMp4Tracks, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import { demuxWebmTracks, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 
 /** Map a MIME / asset id hint to a canonical container token. */
 function containerFromMime(mime: string, bytes: Uint8Array): string {
@@ -128,44 +134,68 @@ export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number 
   const tracks: NormalizedTrack[] = [];
   let durationSec: number | null = null;
 
-  // Inline demux for video codec/dims/fps when the container is parseable.
-  let demuxFps: number | undefined;
+  // Inline demux for the FULL track list (video codec/dims/fps + audio codec/sampleRate/channels) in
+  // container order, when the container is parseable.
   let demuxDuration: number | null = null;
   try {
     if (container === 'mp4' || container === 'mov' || looksLikeMp4(bytes)) {
-      const t = demuxMp4Video(bytes);
-      const track: NormalizedTrack = {
-        type: 'video',
-        codec: t.config.codec,
-        width: t.config.codedWidth,
-        height: t.config.codedHeight,
-        bitrate: null,
-        language: null,
-      };
-      const fps = fpsFromSamples(t.samples);
-      if (fps !== undefined) {
-        track.fps = fps;
-        demuxFps = fps;
+      let maxDuration: number | null = null;
+      for (const t of demuxMp4Tracks(bytes)) {
+        if (t.kind === 'video') {
+          const track: NormalizedTrack = {
+            type: 'video',
+            codec: t.config.codec,
+            width: t.config.codedWidth,
+            height: t.config.codedHeight,
+            bitrate: null,
+            language: null,
+          };
+          const fps = fpsFromSamples(t.samples);
+          if (fps !== undefined) track.fps = fps;
+          tracks.push(track);
+        } else {
+          tracks.push({
+            type: 'audio',
+            codec: t.config.codec,
+            sampleRate: t.config.sampleRate,
+            channels: t.config.channels,
+            bitrate: null,
+            language: null,
+          });
+        }
+        const d = durationFromSamples(t.samples);
+        if (d !== null) maxDuration = Math.max(maxDuration ?? 0, d);
       }
-      tracks.push(track);
-      demuxDuration = durationFromSamples(t.samples);
+      demuxDuration = maxDuration;
     } else if (container === 'webm' || container === 'mkv' || looksLikeWebm(bytes)) {
-      const t = demuxWebmVideo(bytes);
-      const track: NormalizedTrack = {
-        type: 'video',
-        codec: t.config.codec,
-        width: t.config.codedWidth,
-        height: t.config.codedHeight,
-        bitrate: null,
-        language: null,
-      };
-      const fps = fpsFromSamples(t.samples);
-      if (fps !== undefined) {
-        track.fps = fps;
-        demuxFps = fps;
+      let maxDuration: number | null = null;
+      for (const t of demuxWebmTracks(bytes)) {
+        if (t.kind === 'video') {
+          const track: NormalizedTrack = {
+            type: 'video',
+            codec: t.config.codec,
+            width: t.config.codedWidth,
+            height: t.config.codedHeight,
+            bitrate: null,
+            language: null,
+          };
+          const fps = fpsFromSamples(t.samples);
+          if (fps !== undefined) track.fps = fps;
+          tracks.push(track);
+        } else {
+          tracks.push({
+            type: 'audio',
+            codec: t.config.codec,
+            sampleRate: t.config.sampleRate,
+            channels: t.config.channels,
+            bitrate: null,
+            language: null,
+          });
+        }
+        const d = durationFromSamples(t.samples);
+        if (d !== null) maxDuration = Math.max(maxDuration ?? 0, d);
       }
-      tracks.push(track);
-      demuxDuration = durationFromSamples(t.samples);
+      demuxDuration = maxDuration;
     }
   } catch (e) {
     // Unsupported variant (fragmented MP4, exotic MKV): leave tracks for the <video> probe to fill.
@@ -188,13 +218,12 @@ export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number 
       // Likely audio-only or a container <video> played without video — declare an unknown track.
       tracks.push({ type: 'other', codec: 'unknown', bitrate: null, language: null });
     }
-  } else if (tracks[0] && (!tracks[0].width || !tracks[0].height) && ve.width && ve.height) {
-    // Fill dims from <video> if the demuxer didn't have them.
+  } else if (tracks[0] && tracks[0].type === 'video' && (!tracks[0].width || !tracks[0].height) && ve.width && ve.height) {
+    // Fill the VIDEO track's dims from <video> if the demuxer didn't have them.
     tracks[0].width = ve.width;
     tracks[0].height = ve.height;
   }
 
-  void demuxFps;
   const meta: NormalizedMetadata = { container, durationSec, tracks };
   return meta;
 }

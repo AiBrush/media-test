@@ -211,6 +211,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     window.__SUITE_ERROR__ = msg;
   } finally {
     hideProgress();
+    matrix.finish(); // clear any lingering in-flight cell spinner (run ended / aborted).
     runBtn.disabled = false;
     // Stash results for the launcher (window.__RESULTS__) regardless of partial failure.
     window.__RESULTS__ = results;

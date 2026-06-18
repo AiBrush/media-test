@@ -86,11 +86,19 @@ const ENGINE_ID = 'remotion-webcodecs@4.0.479';
 type WebcodecsModule = typeof import('@remotion/webcodecs');
 type BufferWriterModule = typeof import('@remotion/webcodecs/buffer');
 type MediaParserModule = typeof import('@remotion/media-parser');
+type WebReaderModule = typeof import('@remotion/media-parser/web');
 
 interface LibHandle {
   wc: WebcodecsModule;
   bufferWriter: BufferWriterModule['bufferWriter'];
   mp: MediaParserModule;
+  /**
+   * The HTTP/Blob-aware reader. Passed to parseMedia/convertMedia alongside `src: input.url` so the
+   * lib resolves m3u8 sibling segments from the base URL and exercises the dossier §A.1/§A.14
+   * HTTP-Range lazy-read fast path (read header/duration cheaply instead of force-buffering the whole
+   * file). Mirrors the proven-honest sibling remotion-media-parser adapter.
+   */
+  webReader: WebReaderModule['webReader'];
 }
 
 /** The config we drive the lib with (best-path per dossier §0.9), surfaced as configUsed (§8.5). */
@@ -160,6 +168,14 @@ function make2dCanvas(width: number, height: number): {
 export class RemotionWebcodecsEngine implements MediaEngine {
   readonly id = ENGINE_ID;
 
+  /**
+   * The best-path config this engine drives (§8.5). Surfaced so the runner records it in the report
+   * (hardware WebCodecs + OffscreenCanvas-2D pixel backend + streaming/backpressure pipeline +
+   * in-memory bufferWriter). Previously CONFIG_USED was exported but never attached, so the report
+   * recorded `configUsed === undefined` for this engine.
+   */
+  readonly configUsed = CONFIG_USED;
+
   private lib: LibHandle | null = null;
 
   // ── capabilities (HONEST, dossier §10) ───────────────────────────────────────────────────────
@@ -176,10 +192,21 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       },
       containersIn: [...CONTAINERS_IN],
       containersOut: [...CONTAINERS_OUT], // mp4, webm, wav (the only three it can write)
-      // Encode-side video codecs (per dossier §3.3): mp4->h264/hevc, webm->vp8/vp9. No AV1/ProRes.
-      videoCodecs: ['h264', 'hevc', 'vp8', 'vp9'],
-      // Encode-side audio codecs (per dossier §3.4): mp4->aac, webm->opus, wav->PCM(s16).
-      audioCodecs: ['aac', 'opus', 'pcm-s16'],
+      // READ-side superset: the codecs @remotion/media-parser can probe / demux / decode-identify.
+      // The runner's negotiate() Pass-1 uses this single flat list to gate ALL ops including the
+      // read-only probe/demux/decode paths, so it must reflect the lib's full READ reach, NOT just the
+      // (narrower) ENCODE union. Output-codec honesty is protected separately: the ENCODE restriction
+      // is still enforced for transcode/remux by canonicalToRemotionVideo/Audio (which return null →
+      // throw for non-encodable codecs), the containersOut:['mp4','webm','wav'] gate, and negotiate()
+      // Pass-2's WebCodecs VideoEncoder/AudioEncoder.isConfigSupported feature-detect. So widening the
+      // read union does NOT enable any false-PASS encode. Mirrors the proven-honest sibling
+      // remotion-media-parser adapter, which drives the IDENTICAL parseMedia read path.
+      //
+      // Video read set (MediaParserVideoCodec ⊇ these): adds 'av1' (encode-side has no av1 path).
+      videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
+      // Audio read set (MediaParserAudioCodec ⊇ these): adds mp3/flac/vorbis + pcm-s24/pcm-f32 that
+      // media-parser reads but @remotion/webcodecs cannot encode (encode is aac/opus/pcm-s16 only).
+      audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32'],
       // No decrypt API.
       encryption: [],
       // Pixel transforms are limited to resize + rotate (90° multiples) on OffscreenCanvas 2D.
@@ -196,12 +223,13 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * pay the codec-spin-up cost.
    */
   async init(): Promise<void> {
-    const [wc, bufferMod, mp] = await Promise.all([
+    const [wc, bufferMod, mp, webMod] = await Promise.all([
       import('@remotion/webcodecs'),
       import('@remotion/webcodecs/buffer'),
       import('@remotion/media-parser'),
+      import('@remotion/media-parser/web'),
     ]);
-    this.lib = { wc, bufferWriter: bufferMod.bufferWriter, mp };
+    this.lib = { wc, bufferWriter: bufferMod.bufferWriter, mp, webReader: webMod.webReader };
 
     // Encoder warm-up (best-effort; never fails init). Spin up + tear down a hardware-preferred
     // VideoEncoder so the codec implementation is resident before the first measured operation.
@@ -225,11 +253,14 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * `metadata` field and flattened best-effort.
    */
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    const { mp } = this.mustLib();
-    const src = await input.blob();
+    const { mp, webReader } = this.mustLib();
 
     const result = await mp.parseMedia({
-      src,
+      // src: input.url + webReader (NOT a buffered Blob): lets the lib resolve hls m3u8 sibling .ts
+      // segments from the base URL, and exercises the HTTP-Range lazy-read fast path so longform
+      // inputs report duration cheaply instead of force-buffering the whole file (dossier §A.1/§A.14).
+      src: input.url,
+      reader: webReader,
       acknowledgeRemotionLicense: true,
       fields: {
         container: true,
@@ -246,28 +277,40 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   /**
    * Emit a packet table by attaching sample callbacks for every track. Returning a sample callback
    * forces a full parse (dossier §2). Each MediaParserSample carries `timestamp` (PTS, microseconds),
-   * `decodingTimestamp` (DTS, microseconds), `data` (size), and `type` ('key'|'delta'). Track index
-   * is assigned in track-declaration order to match the metadata's track list.
+   * `decodingTimestamp` (DTS, microseconds), `data` (size), and `type` ('key'|'delta').
+   *
+   * trackIndex must match the container's STABLE stream order (the golden-packets oracle anchors
+   * trackIndex to the ffprobe stream index, e.g. multitrack = video:0,audio:1,audio:2). media-parser
+   * may FIRE onVideoTrack/onAudioTrack in a different order than the stream order, so we DO NOT index
+   * by first-announcement order (that would invert indices for files where an audio track is announced
+   * before video, FAILing the per-track size compare). Instead each sample is tagged with its raw
+   * `trackId`, and after the parse we assign the final 0-based trackIndex from result.tracks ordered by
+   * ascending trackId (= container stream order), remapping every packet. The metadata track list is
+   * sorted the same way so packets[i].trackIndex aligns with metadata.tracks[trackIndex].
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
-    const { mp } = this.mustLib();
-    const src = await input.blob();
+    const { mp, webReader } = this.mustLib();
 
-    const packets: PacketInfo[] = [];
-    // Stable trackId -> index map built as tracks are announced (declaration order).
-    const trackIndexById = new Map<number, number>();
-    let nextIndex = 0;
-    const indexFor = (trackId: number): number => {
-      let idx = trackIndexById.get(trackId);
-      if (idx === undefined) {
-        idx = nextIndex++;
-        trackIndexById.set(trackId, idx);
-      }
-      return idx;
+    // Collect packets tagged with the raw container trackId; index is resolved AFTER the parse.
+    const tagged: Array<{ trackId: number; packet: Omit<PacketInfo, 'trackIndex'> }> = [];
+    const onSample = (trackId: number) => (
+      sample: import('@remotion/media-parser').MediaParserVideoSample
+        | import('@remotion/media-parser').MediaParserAudioSample,
+    ): void => {
+      tagged.push({
+        trackId,
+        packet: {
+          size: sample.data.byteLength,
+          ptsUs: Math.round(sample.timestamp),
+          dtsUs: Math.round(sample.decodingTimestamp),
+          keyframe: sample.type === 'key',
+        },
+      });
     };
 
     const result = await mp.parseMedia({
-      src,
+      src: input.url,
+      reader: webReader,
       acknowledgeRemotionLicense: true,
       fields: {
         container: true,
@@ -275,37 +318,33 @@ export class RemotionWebcodecsEngine implements MediaEngine {
         tracks: true,
         metadata: true,
       },
-      onVideoTrack: ({ track }) => {
-        const trackIndex = indexFor(track.trackId);
-        return (sample) => {
-          packets.push({
-            trackIndex,
-            size: sample.data.byteLength,
-            ptsUs: Math.round(sample.timestamp),
-            dtsUs: Math.round(sample.decodingTimestamp),
-            keyframe: sample.type === 'key',
-          });
-        };
-      },
-      onAudioTrack: ({ track }) => {
-        const trackIndex = indexFor(track.trackId);
-        return (sample) => {
-          packets.push({
-            trackIndex,
-            size: sample.data.byteLength,
-            ptsUs: Math.round(sample.timestamp),
-            dtsUs: Math.round(sample.decodingTimestamp),
-            keyframe: sample.type === 'key',
-          });
-        };
-      },
+      onVideoTrack: ({ track }) => onSample(track.trackId),
+      onAudioTrack: ({ track }) => onSample(track.trackId),
     });
+
+    // Stable trackId -> 0-based index in ascending-trackId order (= container stream order). Tracks
+    // that emitted samples but were not in result.tracks (defensive) are appended after, preserving
+    // their relative trackId order, so no packet is dropped.
+    const indexByTrackId = new Map<number, number>();
+    let nextIndex = 0;
+    for (const t of [...result.tracks].sort((a, b) => a.trackId - b.trackId)) {
+      if (!indexByTrackId.has(t.trackId)) indexByTrackId.set(t.trackId, nextIndex++);
+    }
+    for (const { trackId } of tagged) {
+      if (!indexByTrackId.has(trackId)) indexByTrackId.set(trackId, nextIndex++);
+    }
+
+    const packets: PacketInfo[] = tagged.map(({ trackId, packet }) => ({
+      trackIndex: indexByTrackId.get(trackId)!,
+      ...packet,
+    }));
 
     const metadata = normalizeMetadata(
       result.container,
       result.durationInSeconds,
       result.tracks,
       result.metadata,
+      indexByTrackId,
     );
     return { metadata, packets };
   }
@@ -377,8 +416,11 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       rotate?: number;
     },
   ): Promise<MediaBytes> {
-    const { wc, bufferWriter, mp } = this.mustLib();
-    const src = await input.blob();
+    const { wc, bufferWriter, mp, webReader } = this.mustLib();
+    // src: input.url + webReader (NOT a buffered Blob) so hls m3u8 sibling segments resolve from the
+    // base URL and the lib's HTTP-Range lazy reads work; a bare Blob has no base URL and force-buffers
+    // the whole file (dossier §A.1/§A.14). Mirrors the sibling remotion-media-parser adapter.
+    const src = input.url;
 
     // Probe (fast, header-only) to size the MP4 moov in one pass (dossier §4.6).
     let expectedDurationInSeconds: number | null = null;
@@ -386,6 +428,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     try {
       const probed = await mp.parseMedia({
         src,
+        reader: webReader,
         acknowledgeRemotionLicense: true,
         fields: { durationInSeconds: true, fps: true },
       });
@@ -401,6 +444,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     // param (it would be an excess property); we only pass it to parseMedia above.
     const result = await wc.convertMedia({
       src,
+      reader: webReader,
       container: opts.container,
       videoCodec: opts.videoCodec,
       audioCodec: opts.audioCodec,
@@ -435,8 +479,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * re-index so the digest list is presentation-ordered (matching the golden frame ordering).
    */
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
-    const { wc, mp } = this.mustLib();
-    const src = await input.blob();
+    const { wc, mp, webReader } = this.mustLib();
+    const src = input.url;
     const max = opts?.maxFrames ?? Infinity;
 
     const captured: Array<{ img: ImageData; ptsUs: number }> = [];
@@ -446,6 +490,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 
     await mp.parseMedia({
       src,
+      reader: webReader,
       acknowledgeRemotionLicense: true,
       fields: { tracks: true },
       onVideoTrack: ({ track }) => {
@@ -527,8 +572,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * decodeFrames.
    */
   async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    const { wc, mp } = this.mustLib();
-    const src = await input.blob();
+    const { wc, mp, webReader } = this.mustLib();
+    const src = input.url;
     const targetUs = Math.max(0, tUs);
 
     let best: { img: ImageData; ptsUs: number } | null = null;
@@ -540,6 +585,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 
     await mp.parseMedia({
       src,
+      reader: webReader,
       controller,
       acknowledgeRemotionLicense: true,
       fields: { tracks: true },
@@ -635,14 +681,26 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 /**
  * Normalize a media-parser parse result into the suite's NormalizedMetadata. media-parser tracks use
  * a fixed 1_000_000 timescale; widths/heights and codec are read off the typed track shapes.
+ *
+ * When `indexByTrackId` is supplied (demux path) the track list is ordered so tracks[i] is the track
+ * whose assigned trackIndex is i — i.e. it matches the packet trackIndex assignment exactly. Without
+ * it (probe path) tracks keep media-parser's natural order.
  */
 function normalizeMetadata(
   container: import('@remotion/media-parser').MediaParserContainer,
   durationInSeconds: number | null,
   tracks: import('@remotion/media-parser').MediaParserTrack[],
   metadata: import('@remotion/media-parser').MediaParserMetadataEntry[] | undefined,
+  indexByTrackId?: Map<number, number>,
 ): NormalizedMetadata {
-  const normalized: NormalizedTrack[] = tracks.map((t) => normalizeTrack(t));
+  const ordered = indexByTrackId
+    ? [...tracks].sort(
+        (a, b) =>
+          (indexByTrackId.get(a.trackId) ?? Number.MAX_SAFE_INTEGER) -
+          (indexByTrackId.get(b.trackId) ?? Number.MAX_SAFE_INTEGER),
+      )
+    : tracks;
+  const normalized: NormalizedTrack[] = ordered.map((t) => normalizeTrack(t));
 
   const meta: NormalizedMetadata = {
     container: parserContainerToCanonical(container),

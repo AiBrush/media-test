@@ -15,8 +15,14 @@
  *
  * Until then: `capabilities()` declares NOTHING, so the runner negotiates NA(engine) for every
  * scenario — the placeholder shows up in the matrix as a real, not-yet-capable engine rather than a
- * silent gap. `registerAibrushMedia()` is provided but is NOT called automatically; nothing wires
- * this engine into a run until someone opts in (so the placeholder never pollutes a comparison).
+ * silent gap. NOTE: `registerAibrushMedia()` IS wired into the live matrix — `src/app/register.ts`
+ * (ENGINE_WIRINGS) calls it from `registerAll()`, which `src/app/main.ts` runs unconditionally at
+ * startup, so this engine is registered on EVERY run by design. That is harmless precisely BECAUSE
+ * `capabilities()` is empty: the runner's Pass-1 negotiation (src/core/runner.ts, `negotiate()`)
+ * resolves the first declared `requires.operations` token to NA(engine) and short-circuits, so every
+ * scenario renders `-` and none of the throwing method bodies below is ever reached. The placeholder
+ * therefore contributes only honest NA(engine) columns — it never benches, never wins a case, and
+ * never invokes a stub method. (It is harmless because caps are empty, NOT because it is unregistered.)
  *
  * No run-time bytes of any kind: no package to vendor, no WASM/Worker, no CDN/unpkg/toBlobURL — the
  * adapter is pure local TypeScript and is already fully hermetic and offline (§0.8).
@@ -143,9 +149,19 @@ export class AibrushMediaEngine implements MediaEngine {
 }
 
 /**
- * Register the aibrush-media placeholder. Present so it CAN be added to a run on demand, but NOT
- * called from any module's import side effects — the placeholder stays out of comparisons until
- * someone explicitly opts in (e.g. when starting to bring up the real implementation).
+ * Register the aibrush-media placeholder into the engine registry.
+ *
+ * WIRING (current truth): this IS invoked on every run — `src/app/register.ts` lists `aibrush-media`
+ * in ENGINE_WIRINGS and `registerAll()` calls it; `src/app/main.ts` runs `registerAll()`
+ * unconditionally at startup. So the placeholder is auto-registered and enters the live matrix by
+ * design, where its empty `capabilities()` make every scenario negotiate to NA(engine) → `-` (the
+ * intended visible, honest gap of §0). It stays harmless because caps are empty — not because it is
+ * unregistered. To take it OUT of runs, remove the `aibrush-media` entry from `ENGINE_WIRINGS` in
+ * `src/app/register.ts` (that file owns the wiring; this adapter only owns the honest empty engine).
+ *
+ * Idempotency: `registerEngine` throws on a duplicate id (`registry.ts`), but `registerAll()` wraps
+ * each wiring in try/catch, so a re-entry (HMR / double init) surfaces as `engines[].ok=false` in the
+ * RegistrationReport rather than a thrown crash.
  */
 export function registerAibrushMedia(): void {
   registerEngine(ENGINE_ID, () => new AibrushMediaEngine());

@@ -1,0 +1,18 @@
+{
+  "container": "webm",
+  "durationSec": 2,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "vp9",
+      "width": 1,
+      "height": 1,
+      "fps": 30,
+      "bitrate": 7032,
+      "language": null
+    }
+  ],
+  "tags": {
+    "encoder": "Lavf"
+  }
+}

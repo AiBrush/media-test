@@ -66,7 +66,9 @@ export class Meter {
     const longtaskMs = this.longtaskMs;
     this.detachObserver();
 
-    const peakMemoryBytes = await peakMemoryBytes_();
+    // Bounded: never let the (Chromium-rate-limited) memory probe stall the cell for minutes.
+    // On overrun, peak memory is recorded as unavailable (null); timing metrics below are unaffected.
+    const peakMemoryBytes = await peakMemoryBytesBounded_();
 
     const sample: MetricSample = { wallMs, peakMemoryBytes };
 
@@ -195,6 +197,40 @@ async function peakMemoryBytes_(): Promise<number | null> {
 
   // 3. Unavailable (WebKit / Firefox).
   return null;
+}
+
+/**
+ * Hard cap (ms) on the peak-memory probe. measureUserAgentSpecificMemory is rate-limited by Chromium
+ * to ~one resolution per ~20 s (anti-fingerprinting), and Meter.end() runs it on EVERY warmup and
+ * measured iteration. Awaiting it unbounded made a single perf cell stall for minutes (the bench's own
+ * 300 s cap was the only thing eventually freeing it). We race the probe against this timeout and, on
+ * overrun, record peak memory as unavailable (null) — honest, never fabricated — so a cell never blocks
+ * more than ~PEAK_MEMORY_TIMEOUT_MS on memory. Timing metrics are unaffected (snapped before this
+ * await); a null peak memory is dropped by bench()/report as "no value".
+ */
+const PEAK_MEMORY_TIMEOUT_MS = 1500;
+
+/** Sentinel distinguishing "probe timed out" from a genuine null/number the probe returned. */
+const PEAK_MEMORY_TIMED_OUT = Symbol('peak-memory-timeout');
+
+/**
+ * Best-effort peak memory, BOUNDED: resolves with the probe's value if it settles within
+ * PEAK_MEMORY_TIMEOUT_MS, otherwise null (unavailable). Never rejects; the timer is always cleared.
+ */
+async function peakMemoryBytesBounded_(): Promise<number | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<typeof PEAK_MEMORY_TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(PEAK_MEMORY_TIMED_OUT), PEAK_MEMORY_TIMEOUT_MS);
+  });
+  try {
+    // peakMemoryBytes_ swallows its own errors and resolves to number|null, so the race cannot reject.
+    const result = await Promise.race([peakMemoryBytes_(), timeout]);
+    return result === PEAK_MEMORY_TIMED_OUT ? null : result;
+  } catch {
+    return null;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Public peak-memory probe (see {@link MeasureContext}); null when no API is available. */

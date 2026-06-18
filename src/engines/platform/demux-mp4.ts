@@ -1,13 +1,26 @@
 /**
  * src/engines/platform/demux-mp4.ts — a MINIMAL ISO-BMFF (MP4/MOV) demuxer, just enough to feed
- * WebCodecs VideoDecoder: it parses the moov sample tables (stbl) and emits the first video track's
- * encoded samples in DECODE order with PTS/DTS and keyframe flags, plus the codec description
- * (avcC / hvcC / vpcC) needed for the decoder config.
+ * WebCodecs VideoDecoder AND to enumerate the container's tracks (video + audio) for probe/demux.
+ * It parses each track's moov sample tables (stbl) and emits the encoded samples in DECODE order with
+ * PTS/DTS and keyframe flags, plus the video codec description (avcC / hvcC / vpcC) needed for the
+ * decoder config and the audio descriptor (esds → AAC) needed for honest probe metadata.
  *
  * Scope (HONEST): progressive (non-fragmented) MP4/MOV with a contiguous moov. This is NOT a general
- * MP4 parser — it does not handle moof/traf fragments, edit lists, or multi-track muxing. It throws
- * a typed {@link UnsupportedMp4Error} when it meets something it cannot handle so callers can fall
- * back to a <video>-element frame grab. AV bytes are never mutated.
+ * MP4 parser — it does not handle moof/traf fragments. It enumerates every 'vide'/'soun' trak so the
+ * normalized metadata + packet table match a multi-track golden; it throws a typed
+ * {@link UnsupportedMp4Error} when it meets something it cannot handle so callers can fall back to a
+ * <video>-element frame grab. AV bytes are never mutated.
+ *
+ * SOURCES (dossier research/dossiers/platform.md §2 demux / §5 description seam, researched 2026-06-17):
+ *   - WebCodecs API: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
+ *   - VideoDecoder.configure (description/extradata): https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder/configure
+ *   - AVC codec registration (avcC = description ⇒ avc format): https://www.w3.org/TR/webcodecs-avc-codec-registration/
+ *
+ * ROBUSTNESS (§A.16 deep-edge): every sample-table parser bounds its declared entry_count against the
+ * bytes actually remaining in the box (boundEntryCount) so a fuzzed/truncated moov with a huge
+ * entry_count degrades to a clean {@link UnsupportedMp4Error} (→ NA/FAIL) instead of reading/allocating
+ * past the buffer (OOB/OOM). be32() coerces undefined bytes to 0, so an unbounded loop would otherwise
+ * push millions of phantom entries.
  */
 
 import { be16, be24, be32, be64, fourcc, Reader } from './bytes.ts';
@@ -17,6 +30,19 @@ export class UnsupportedMp4Error extends Error {
     super(message);
     this.name = 'UnsupportedMp4Error';
   }
+}
+
+/**
+ * Clamp a full-box `entry_count` to what the box can actually hold: each entry is `entrySize` bytes
+ * starting at `entriesStart`, and the box ends at `boxEnd`. A fuzzed moov can declare e.g. 0xFFFFFFFF
+ * entries in a 20-byte box; without this bound the table parsers would iterate billions of times,
+ * reading undefined bytes (be32 → 0) and allocating an enormous array (OOM/hang). We never read more
+ * entries than fit; if the declared count exceeds capacity, the table is malformed → caller throws.
+ */
+function boundEntryCount(declared: number, entriesStart: number, entrySize: number, boxEnd: number): number {
+  if (!Number.isFinite(declared) || declared < 0) return 0;
+  const capacity = Math.max(0, Math.floor((boxEnd - entriesStart) / Math.max(1, entrySize)));
+  return Math.min(declared, capacity);
 }
 
 /** A canonical video codec token + the WebCodecs description blob (codec-private data). */
@@ -44,6 +70,29 @@ export interface Mp4VideoTrack {
   config: Mp4VideoConfig;
   samples: Mp4Sample[];
 }
+
+/** A canonical audio codec token + the per-track audio parameters probe metadata needs. */
+export interface Mp4AudioConfig {
+  /** canonical token: 'aac' (the only audio sample-entry the inline demuxer identifies in MP4/MOV) */
+  codec: string;
+  sampleRate: number;
+  channels: number;
+  timescale: number;
+}
+
+export interface Mp4AudioTrack {
+  config: Mp4AudioConfig;
+  samples: Mp4Sample[];
+}
+
+/**
+ * Every track the inline demuxer can enumerate, in CONTAINER ORDER (the trak order inside moov), so a
+ * consumer can assign trackIndex 0,1,2,… to match a multi-track golden's layout. `kind` distinguishes
+ * the discriminated union; unknown/unparseable traks are skipped (honest: we only emit what we read).
+ */
+export type Mp4Track =
+  | ({ kind: 'video' } & Mp4VideoTrack)
+  | ({ kind: 'audio' } & Mp4AudioTrack);
 
 /** A located top-level/child box. */
 interface Box {
@@ -187,16 +236,50 @@ function parseStsd(
   return out;
 }
 
+/** Map an audio sample-entry fourcc to a canonical codec token (only AAC is identified here). */
+function audioCodecTokenForEntry(entryType: string): string | undefined {
+  // 'mp4a' is the AAC (MPEG-4 Audio) sample entry; its esds names the precise object type but for
+  // probe metadata the canonical token is 'aac'. Other entries (Opus 'Opus', AC-3 'ac-3', ALAC
+  // 'alac', …) are not identified by this minimal demuxer → skipped honestly.
+  return entryType === 'mp4a' ? 'aac' : undefined;
+}
+
+/**
+ * Parse an AudioSampleEntry (mp4a) for codec token + sampleRate + channels. Layout (ISO-BMFF
+ * AudioSampleEntry, verified against the corpus): bodyStart + 6 reserved + 2 data_ref_idx + 8
+ * reserved + 2 channelcount + 2 samplesize + 2 predefined + 2 reserved + 4 samplerate(16.16 fixed),
+ * then child boxes (esds/btrt) from bodyStart + 28. The 16.16 sample rate's integer part is the rate
+ * for the common 0..65535 Hz range (48000 fits). We do not need esds contents for the token (mp4a ⇒
+ * aac), only its presence as the AAC marker.
+ */
+function parseAudioStsd(
+  buf: Uint8Array,
+  stsd: Box,
+): { token: string; sampleRate: number; channels: number } | undefined {
+  const entriesStart = stsd.bodyStart + 8;
+  const entry = [...iterBoxes(buf, entriesStart, stsd.bodyEnd)][0];
+  if (!entry) return undefined;
+  const token = audioCodecTokenForEntry(entry.type);
+  if (!token) return undefined;
+  const channels = be16(buf, entry.bodyStart + 16);
+  // samplerate is a 16.16 fixed-point in the AudioSampleEntry; the integer (high 16 bits) is the rate.
+  const sampleRate = be32(buf, entry.bodyStart + 24) >>> 16;
+  return { token, sampleRate, channels };
+}
+
 /** Time-to-sample (stts): array of {count, delta} → per-sample duration (in track timescale). */
 function parseStts(buf: Uint8Array, stts: Box): number[] {
-  const count = be32(buf, stts.bodyStart + 4);
-  let off = stts.bodyStart + 8;
+  const entriesStart = stts.bodyStart + 8;
+  const count = boundEntryCount(be32(buf, stts.bodyStart + 4), entriesStart, 8, stts.bodyEnd);
+  let off = entriesStart;
   const durations: number[] = [];
   for (let i = 0; i < count; i++) {
     const sampleCount = be32(buf, off);
     const delta = be32(buf, off + 4);
     off += 8;
-    for (let j = 0; j < sampleCount; j++) durations.push(delta);
+    // Guard the inner expansion too: a fuzzed sampleCount must not balloon the array past the file.
+    const expand = Math.min(sampleCount, buf.length);
+    for (let j = 0; j < expand; j++) durations.push(delta);
   }
   return durations;
 }
@@ -204,15 +287,17 @@ function parseStts(buf: Uint8Array, stts: Box): number[] {
 /** Composition-time-to-sample (ctts): per-sample PTS-DTS offset (signed in v1). Optional. */
 function parseCtts(buf: Uint8Array, ctts: Box): number[] {
   const version = buf[ctts.bodyStart] ?? 0;
-  const count = be32(buf, ctts.bodyStart + 4);
-  let off = ctts.bodyStart + 8;
+  const entriesStart = ctts.bodyStart + 8;
+  const count = boundEntryCount(be32(buf, ctts.bodyStart + 4), entriesStart, 8, ctts.bodyEnd);
+  let off = entriesStart;
   const offsets: number[] = [];
   for (let i = 0; i < count; i++) {
     const sampleCount = be32(buf, off);
     const raw = be32(buf, off + 4);
     const offset = version === 1 ? (raw | 0) : raw; // v1 signed, v0 unsigned
     off += 8;
-    for (let j = 0; j < sampleCount; j++) offsets.push(offset);
+    const expand = Math.min(sampleCount, buf.length);
+    for (let j = 0; j < expand; j++) offsets.push(offset);
   }
   return offsets;
 }
@@ -220,8 +305,9 @@ function parseCtts(buf: Uint8Array, ctts: Box): number[] {
 /** Sync-sample table (stss): 1-based sample numbers that are keyframes. Absent ⇒ all keyframes. */
 function parseStss(buf: Uint8Array, stss: Box | undefined): Set<number> | null {
   if (!stss) return null;
-  const count = be32(buf, stss.bodyStart + 4);
-  let off = stss.bodyStart + 8;
+  const entriesStart = stss.bodyStart + 8;
+  const count = boundEntryCount(be32(buf, stss.bodyStart + 4), entriesStart, 4, stss.bodyEnd);
+  let off = entriesStart;
   const set = new Set<number>();
   for (let i = 0; i < count; i++) {
     set.add(be32(buf, off));
@@ -233,13 +319,18 @@ function parseStss(buf: Uint8Array, stss: Box | undefined): Set<number> | null {
 /** Sample-size table (stsz): default_size + per-sample sizes. */
 function parseStsz(buf: Uint8Array, stsz: Box): number[] {
   const defaultSize = be32(buf, stsz.bodyStart + 4);
-  const count = be32(buf, stsz.bodyStart + 8);
+  const declared = be32(buf, stsz.bodyStart + 8);
   const sizes: number[] = [];
   if (defaultSize !== 0) {
+    // Fixed-size: cap by what the rest of the FILE could hold (sizes are not stored, but a fuzzed
+    // sample_count must not allocate billions of entries).
+    const count = Math.min(declared, buf.length);
     for (let i = 0; i < count; i++) sizes.push(defaultSize);
     return sizes;
   }
-  let off = stsz.bodyStart + 12;
+  const entriesStart = stsz.bodyStart + 12;
+  const count = boundEntryCount(declared, entriesStart, 4, stsz.bodyEnd);
+  let off = entriesStart;
   for (let i = 0; i < count; i++) {
     sizes.push(be32(buf, off));
     off += 4;
@@ -249,8 +340,9 @@ function parseStsz(buf: Uint8Array, stsz: Box): number[] {
 
 /** Sample-to-chunk (stsc): runs of {first_chunk, samples_per_chunk}. */
 function parseStsc(buf: Uint8Array, stsc: Box): Array<{ firstChunk: number; samplesPerChunk: number }> {
-  const count = be32(buf, stsc.bodyStart + 4);
-  let off = stsc.bodyStart + 8;
+  const entriesStart = stsc.bodyStart + 8;
+  const count = boundEntryCount(be32(buf, stsc.bodyStart + 4), entriesStart, 12, stsc.bodyEnd);
+  let off = entriesStart;
   const runs: Array<{ firstChunk: number; samplesPerChunk: number }> = [];
   for (let i = 0; i < count; i++) {
     runs.push({ firstChunk: be32(buf, off), samplesPerChunk: be32(buf, off + 4) });
@@ -263,15 +355,17 @@ function parseStsc(buf: Uint8Array, stsc: Box): Array<{ firstChunk: number; samp
 function parseChunkOffsets(buf: Uint8Array, stco: Box | undefined, co64: Box | undefined): number[] {
   const offsets: number[] = [];
   if (co64) {
-    const count = be32(buf, co64.bodyStart + 4);
-    let off = co64.bodyStart + 8;
+    const entriesStart = co64.bodyStart + 8;
+    const count = boundEntryCount(be32(buf, co64.bodyStart + 4), entriesStart, 8, co64.bodyEnd);
+    let off = entriesStart;
     for (let i = 0; i < count; i++) {
       offsets.push(Number(be64(buf, off)));
       off += 8;
     }
   } else if (stco) {
-    const count = be32(buf, stco.bodyStart + 4);
-    let off = stco.bodyStart + 8;
+    const entriesStart = stco.bodyStart + 8;
+    const count = boundEntryCount(be32(buf, stco.bodyStart + 4), entriesStart, 4, stco.bodyEnd);
+    let off = entriesStart;
     for (let i = 0; i < count; i++) {
       offsets.push(be32(buf, off));
       off += 4;
@@ -294,46 +388,32 @@ function hdlrType(buf: Uint8Array, hdlr: Box): string {
   return fourcc(buf, hdlr.bodyStart + 8);
 }
 
-/**
- * Demux the first video track of a progressive MP4/MOV into ordered encoded samples + decoder
- * config. Throws {@link UnsupportedMp4Error} for fragmented MP4, no moov, or no decodable video.
- */
-export function demuxMp4Video(bytes: Uint8Array): Mp4VideoTrack {
-  const fileEnd = bytes.length;
-  const moov = findBox(bytes, 0, fileEnd, 'moov');
-  if (!moov) {
-    if (findBox(bytes, 0, fileEnd, 'moof')) {
-      throw new UnsupportedMp4Error('fragmented MP4 (moof) is not supported by the inline demuxer');
-    }
-    throw new UnsupportedMp4Error('no moov box (not a progressive MP4 or truncated)');
-  }
+/** A located stbl + the track media timescale, shared by the video and audio sample builders. */
+interface TrackStbl {
+  stbl: Box;
+  timescale: number;
+}
 
-  // Find a 'vide' trak.
-  let videoTrak: Box | undefined;
-  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
-    if (trak.type !== 'trak') continue;
-    const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
-    if (!mdia) continue;
-    const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
-    if (hdlr && hdlrType(bytes, hdlr) === 'vide') {
-      videoTrak = trak;
-      break;
-    }
-  }
-  if (!videoTrak) throw new UnsupportedMp4Error('no video track found in moov');
-
-  const mdia = findBox(bytes, videoTrak.bodyStart, videoTrak.bodyEnd, 'mdia')!;
+/** Locate the mdia → minf → stbl of a trak and its media timescale, or throw {@link UnsupportedMp4Error}. */
+function locateStbl(bytes: Uint8Array, trak: Box): TrackStbl {
+  const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+  if (!mdia) throw new UnsupportedMp4Error('track missing mdia');
   const mdhd = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'mdhd');
   const timescale = mdhd ? parseMdhdTimescale(bytes, mdhd) : 1000;
   const minf = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'minf');
   if (!minf) throw new UnsupportedMp4Error('track missing minf');
   const stbl = findBox(bytes, minf.bodyStart, minf.bodyEnd, 'stbl');
   if (!stbl) throw new UnsupportedMp4Error('track missing stbl');
+  return { stbl, timescale: timescale || 1000 };
+}
 
-  const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
-  if (!stsd) throw new UnsupportedMp4Error('track missing stsd');
-  const sampleDesc = parseStsd(bytes, stsd);
-
+/**
+ * Walk a track's sample tables (stts/ctts/stsz/stsc/stco|co64/stss) into ordered encoded samples with
+ * PTS/DTS/keyframe, normalizing the timeline so the earliest PTS is 0 (mirrors edit-list / negative-CTS
+ * priming so timestamps line up with golden/ffprobe). Shared by video and audio tracks. Throws
+ * {@link UnsupportedMp4Error} on incomplete/truncated tables.
+ */
+function buildSamplesFromStbl(bytes: Uint8Array, stbl: Box, timescale: number): Mp4Sample[] {
   const sttsBox = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stts');
   const stszBox = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsz');
   const stscBox = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsc');
@@ -356,7 +436,6 @@ export function demuxMp4Video(bytes: Uint8Array): Mp4VideoTrack {
   if (sampleCount === 0) throw new UnsupportedMp4Error('no samples in track');
 
   // Expand stsc into a per-sample chunk membership to compute each sample's byte offset.
-  // Build, for each sample, its file offset by walking chunks.
   const sampleOffsets = new Array<number>(sampleCount);
   let sampleIdx = 0;
   for (let r = 0; r < stsc.length && sampleIdx < sampleCount; r++) {
@@ -399,30 +478,100 @@ export function demuxMp4Video(bytes: Uint8Array): Mp4VideoTrack {
     dtsTicks += dur;
   }
 
-  // Normalize the presentation timeline so the earliest PTS is 0. This mirrors what a player does
-  // with an edit list / negative-CTS lead (B-frame reorder offset), so our timestamps line up with
-  // golden / ffprobe frame timestamps. PTS and DTS are shifted by the same amount to keep the
-  // decode timeline self-consistent for WebCodecs.
+  // Normalize the presentation timeline so the earliest PTS is 0. PTS and DTS are shifted by the same
+  // amount to keep the decode timeline self-consistent for WebCodecs. The golden-packets oracle
+  // forgives a CONSTANT per-track origin offset, so each track's independent priming (e.g. audio's
+  // edit-list lead) lines up after first-packet alignment.
   const shift = Number.isFinite(minPtsTicks) ? minPtsTicks : 0;
   const toUs = (ticks: number) => Math.round((ticks * 1_000_000) / timescale);
-  const samples: Mp4Sample[] = raw.map((s) => ({
+  return raw.map((s) => ({
     data: bytes.subarray(s.offset, s.offset + s.size).slice(),
     dtsUs: toUs(s.dtsTicks - shift),
     ptsUs: toUs(s.ptsTicks - shift),
     durationUs: toUs(s.durTicks),
     keyframe: s.keyframe,
   }));
+}
 
-  const config: Mp4VideoConfig = {
-    codec: sampleDesc.token,
-    codecString: sampleDesc.codecString,
-    codedWidth: sampleDesc.width,
-    codedHeight: sampleDesc.height,
-    timescale,
-  };
-  if (sampleDesc.description) config.description = sampleDesc.description;
+/**
+ * Enumerate EVERY parseable track (video + audio) of a progressive MP4/MOV in CONTAINER ORDER (moov
+ * trak order), so a caller can assign trackIndex 0,1,2,… to match a multi-track golden's layout and
+ * emit honest probe metadata (video codec/dims/fps + audio codec/sampleRate/channels). Skips traks
+ * whose handler/sample-entry this minimal demuxer cannot identify (honest: only what we read). Throws
+ * {@link UnsupportedMp4Error} for fragmented MP4 / no moov / no usable track.
+ */
+export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
+  const fileEnd = bytes.length;
+  const moov = findBox(bytes, 0, fileEnd, 'moov');
+  if (!moov) {
+    if (findBox(bytes, 0, fileEnd, 'moof')) {
+      throw new UnsupportedMp4Error('fragmented MP4 (moof) is not supported by the inline demuxer');
+    }
+    throw new UnsupportedMp4Error('no moov box (not a progressive MP4 or truncated)');
+  }
 
-  return { config, samples };
+  const tracks: Mp4Track[] = [];
+  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+    if (!mdia) continue;
+    const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+    const handler = hdlr ? hdlrType(bytes, hdlr) : '';
+
+    if (handler === 'vide') {
+      const { stbl, timescale } = locateStbl(bytes, trak);
+      const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
+      if (!stsd) throw new UnsupportedMp4Error('video track missing stsd');
+      const sampleDesc = parseStsd(bytes, stsd);
+      const samples = buildSamplesFromStbl(bytes, stbl, timescale);
+      const config: Mp4VideoConfig = {
+        codec: sampleDesc.token,
+        codecString: sampleDesc.codecString,
+        codedWidth: sampleDesc.width,
+        codedHeight: sampleDesc.height,
+        timescale,
+      };
+      if (sampleDesc.description) config.description = sampleDesc.description;
+      tracks.push({ kind: 'video', config, samples });
+    } else if (handler === 'soun') {
+      const { stbl, timescale } = locateStbl(bytes, trak);
+      const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
+      if (!stsd) continue; // no sample description → can't identify; skip honestly
+      const audioDesc = parseAudioStsd(bytes, stsd);
+      if (!audioDesc) continue; // sample entry not one we identify (e.g. non-AAC) → skip
+      // Audio sample tables can be malformed in fuzzed input; degrade by skipping THIS track rather
+      // than failing the whole demux (the video track may still be perfectly readable).
+      let samples: Mp4Sample[];
+      try {
+        samples = buildSamplesFromStbl(bytes, stbl, timescale);
+      } catch {
+        continue;
+      }
+      const config: Mp4AudioConfig = {
+        codec: audioDesc.token,
+        sampleRate: audioDesc.sampleRate,
+        channels: audioDesc.channels,
+        timescale,
+      };
+      tracks.push({ kind: 'audio', config, samples });
+    }
+    // Other handlers (text/hint/meta) are not enumerated.
+  }
+
+  if (tracks.length === 0) throw new UnsupportedMp4Error('no decodable video/audio track found in moov');
+  return tracks;
+}
+
+/**
+ * Demux the first video track of a progressive MP4/MOV into ordered encoded samples + decoder
+ * config. Thin wrapper over {@link demuxMp4Tracks}. Throws {@link UnsupportedMp4Error} for fragmented
+ * MP4, no moov, or no decodable video track.
+ */
+export function demuxMp4Video(bytes: Uint8Array): Mp4VideoTrack {
+  const tracks = demuxMp4Tracks(bytes);
+  const video = tracks.find((t): t is { kind: 'video' } & Mp4VideoTrack => t.kind === 'video');
+  if (!video) throw new UnsupportedMp4Error('no video track found in moov');
+  return { config: video.config, samples: video.samples };
 }
 
 /** Cheap container sniff: an MP4/MOV begins with an 'ftyp' (or 'styp'/'moov'/'free'/'skip') box. */

@@ -26,6 +26,22 @@
  * ffmpeg emits straight-alpha, top-left, tight RGBA (`-pix_fmt rgba -f rawvideo`), which we slice
  * per frame and hash with the shared {@link sha256Hex}. Digests stay engine-independent.
  *
+ * HARDENING (2026-06-18, audited findings):
+ *   • configUsed is a PROPERTY (not a method) so the runner records the §8.5 best-path config by value
+ *     (engine.ts:174 / runner.ts:956); mirrors platform/mediabunny/mp4box.
+ *   • capabilities() declares mux:true and mux() is implemented via the dossier `-c copy` file path
+ *     (§4 line 108, §10 A.3/A.7) — was a false-NA + throwing stub. av1 mux stays NA via the codec gate.
+ *   • 'hls' is filtered from containersIn (a single .m3u8 in MEMFS can't reach sibling segments —
+ *     declaring it turns a clean NA into a runtime ERROR), mirroring the existing containersOut filter.
+ *     refs: §6 (container coverage), FAQ; https://ffmpegwasm.netlify.app/docs/overview/
+ *   • runInfo()/demux() read execs now pass exec(args, timeoutMs) so fuzzed/truncated inputs can't
+ *     wedge the worker (§9 item 10, §11; https://ffmpegwasm.netlify.app/docs/getting-started/usage/ ,
+ *     https://github.com/ffmpegwasm/ffmpeg.wasm/discussions/699 ).
+ *   • 'metadata:write' is gated OFF (over-claim: the runner drops options.tags before remux) but
+ *     remux() still honors tags so it can be re-enabled once the runner forwards them.
+ *   • av1 stays OUT of videoCodecs (decode-only can't be expressed in the flat round-trip list while
+ *     'webcodecs:independent' short-circuits negotiate Pass-2; adding it would over-claim av1 ENCODE).
+ *
  * ───────────────────────────────────────────────────────────────────────────────────────────────
  * Researched 2026-06-17 against the installed packages and the official docs:
  *   @ffmpeg/ffmpeg 0.12.15 · @ffmpeg/util 0.12.2 · @ffmpeg/core(-mt) 0.12.10
@@ -138,6 +154,18 @@ const FALLBACK_CONTAINERS_OUT = ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3'
 
 /** AV_NOPTS_VALUE (INT64_MIN) — framecrc prints it for packets with no pts/dts. */
 const AV_NOPTS = -9223372036854775808;
+
+/**
+ * In-engine per-exec timeout (ms) for the READ paths that ingest UNTRUSTED bytes — runInfo()'s
+ * `ffmpeg -i` and demux()'s `-c copy -f framecrc`. The robustness dimension feeds fuzzed/truncated
+ * inputs (dossier §9.10/§11/§A.16); `exec(args, timeoutMs)` is the documented guard so a pathological
+ * demux can't WEDGE the worker. The runner's outer Promise.race (runner.ts withTimeout) only frees the
+ * JS promise — it does NOT terminate the wasm computation, so a wedged exec would corrupt the reused
+ * FFmpeg instance for the next iteration. ffmpeg's exec returns 1 (NOT a throw) on timeout, so the
+ * existing `!/^Input #/` log checks turn a timed-out read into a clean throw → graceful-failure PASS.
+ * Generous enough that a legitimately large-but-valid input still completes (read-only, no encode).
+ */
+const READ_EXEC_TIMEOUT_MS = 60_000;
 
 /** Parse `Duration: HH:MM:SS.ms` from an `ffmpeg -i` log; null if absent/`N/A`. */
 function parseDurationSecFromLog(log: string): number | null {
@@ -319,6 +347,201 @@ function parseFramecrcPackets(out: string): PacketInfo[] {
   return packets;
 }
 
+// ── Bitstream reconstruction for mux() (pure byte logic; no library types) ─────────────────────────
+//
+// mux() takes opaque EncodedTrack chunks (WebCodecs-style: length-prefixed AVCC/HVCC for H.264/HEVC,
+// raw AAC for AAC) + a `description` (avcC/hvcC/AudioSpecificConfig). FFmpeg muxes from FILES, so we
+// rebuild each track as a demuxable ELEMENTARY STREAM in MEMFS, then `-c copy` mux. These converters
+// are exact and standards-defined (ISO 14496-15 avcC/hvcC, ISO 13818-7 ADTS, ISO 14496-3 ASC).
+
+/** big-endian uint16 at offset. */
+function be16(b: Uint8Array, o: number): number {
+  return ((b[o]! << 8) | b[o + 1]!) >>> 0;
+}
+
+/**
+ * Convert a length-prefixed NAL unit buffer (AVCC/HVCC sample: each NAL preceded by an N-byte big-
+ * endian length) into Annex-B (each NAL preceded by the 0x00000001 start code). Returns the rebuilt
+ * bytes. Defensive against truncation: stops cleanly if a declared length runs past the buffer.
+ *
+ * Two passes (sum-then-copy) so we never spread a large NAL through Array.push (which would blow the
+ * argument-count limit on big keyframe slices) — payloads are copied via TypedArray.set only.
+ */
+function lengthPrefixedToAnnexB(data: Uint8Array, nalLengthSize: number): Uint8Array {
+  // Pass 1: walk the NALs to compute the exact output size (4-byte start code per NAL + payload).
+  let outLen = 0;
+  let p = 0;
+  while (p + nalLengthSize <= data.length) {
+    let len = 0;
+    for (let i = 0; i < nalLengthSize; i++) len = (len << 8) | data[p + i]!;
+    p += nalLengthSize;
+    if (len <= 0 || p + len > data.length) break; // truncated/garbage → stop, don't read OOB
+    outLen += 4 + len;
+    p += len;
+  }
+  // Pass 2: emit start code + payload for each NAL.
+  const out = new Uint8Array(outLen);
+  let w = 0;
+  p = 0;
+  while (p + nalLengthSize <= data.length) {
+    let len = 0;
+    for (let i = 0; i < nalLengthSize; i++) len = (len << 8) | data[p + i]!;
+    p += nalLengthSize;
+    if (len <= 0 || p + len > data.length) break;
+    out[w] = 0x00;
+    out[w + 1] = 0x00;
+    out[w + 2] = 0x00;
+    out[w + 3] = 0x01;
+    w += 4;
+    out.set(data.subarray(p, p + len), w);
+    w += len;
+    p += len;
+  }
+  return out;
+}
+
+/** NAL length size (1/2/4) from an avcC box (byte 4, low 2 bits + 1). Defaults to 4 if absent. */
+function nalLengthSizeFromAvcC(desc?: Uint8Array): number {
+  if (desc && desc.length > 4) return (desc[4]! & 0x03) + 1;
+  return 4;
+}
+/** NAL length size (1/2/4) from an hvcC box (byte 21, low 2 bits + 1). Defaults to 4 if absent. */
+function nalLengthSizeFromHvcC(desc?: Uint8Array): number {
+  if (desc && desc.length > 21) return (desc[21]! & 0x03) + 1;
+  return 4;
+}
+
+/**
+ * Extract SPS/PPS param sets from an avcC (AVCDecoderConfigurationRecord) as Annex-B
+ * (start-code-prefixed), to be prepended once before the first coded sample. Layout (ISO 14496-15):
+ *   [0]=1, [1..3]=profile/compat/level, [4]=0xFC|lenSizeMinus1, [5]=0xE0|numSPS,
+ *   then numSPS × (u16 len + SPS), then numPPS(u8) + numPPS × (u16 len + PPS).
+ * Returns empty if the record is absent/too short (caller then relies on in-band param sets).
+ */
+function paramSetsFromAvcC(desc?: Uint8Array): Uint8Array {
+  if (!desc || desc.length < 7 || desc[0] !== 1) return new Uint8Array(0);
+  const START = [0x00, 0x00, 0x00, 0x01];
+  const out: number[] = [];
+  let p = 5;
+  const numSps = desc[p]! & 0x1f;
+  p += 1;
+  for (let i = 0; i < numSps && p + 2 <= desc.length; i++) {
+    const len = be16(desc, p);
+    p += 2;
+    if (p + len > desc.length) return Uint8Array.from(out);
+    out.push(...START, ...desc.subarray(p, p + len));
+    p += len;
+  }
+  if (p >= desc.length) return Uint8Array.from(out);
+  const numPps = desc[p]!;
+  p += 1;
+  for (let i = 0; i < numPps && p + 2 <= desc.length; i++) {
+    const len = be16(desc, p);
+    p += 2;
+    if (p + len > desc.length) return Uint8Array.from(out);
+    out.push(...START, ...desc.subarray(p, p + len));
+    p += len;
+  }
+  return Uint8Array.from(out);
+}
+
+/**
+ * Extract VPS/SPS/PPS NAL arrays from an hvcC (HEVCDecoderConfigurationRecord) as Annex-B. The record
+ * header is 22 bytes, then numOfArrays(u8); each array = [arrayCompleteness/type(u8)][numNalus(u16)]
+ * then numNalus × (u16 len + NAL). Returns empty if absent/too short.
+ */
+function paramSetsFromHvcC(desc?: Uint8Array): Uint8Array {
+  if (!desc || desc.length < 23 || desc[0] !== 1) return new Uint8Array(0);
+  const START = [0x00, 0x00, 0x00, 0x01];
+  const out: number[] = [];
+  let p = 22;
+  const numArrays = desc[p]!;
+  p += 1;
+  for (let a = 0; a < numArrays && p + 3 <= desc.length; a++) {
+    p += 1; // array_completeness + NAL_unit_type
+    const numNalus = be16(desc, p);
+    p += 2;
+    for (let n = 0; n < numNalus && p + 2 <= desc.length; n++) {
+      const len = be16(desc, p);
+      p += 2;
+      if (p + len > desc.length) return Uint8Array.from(out);
+      out.push(...START, ...desc.subarray(p, p + len));
+      p += len;
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+/** AAC sampling-frequency table (ISO 14496-3) → index for the ADTS header. */
+const AAC_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+
+/**
+ * Audio object type / sampling-frequency-index / channel-config parsed from an AudioSpecificConfig
+ * (the AAC `description`): 5 bits objectType, 4 bits freqIndex, 4 bits channelConfig. Falls back to
+ * AAC-LC + the track's declared sampleRate/channels when no ASC is present.
+ */
+function aacParamsFromAsc(
+  desc: Uint8Array | undefined,
+  sampleRate: number,
+  channels: number,
+): { objectType: number; freqIndex: number; channelConfig: number } {
+  let objectType = 2; // AAC-LC
+  let freqIndex = AAC_SAMPLE_RATES.indexOf(sampleRate);
+  let channelConfig = channels;
+  if (desc && desc.length >= 2) {
+    objectType = (desc[0]! >> 3) & 0x1f;
+    freqIndex = ((desc[0]! & 0x07) << 1) | (desc[1]! >> 7);
+    channelConfig = (desc[1]! >> 3) & 0x0f;
+  }
+  if (freqIndex < 0 || freqIndex > 12) freqIndex = 4; // 44100 fallback
+  if (channelConfig <= 0) channelConfig = 2;
+  if (objectType <= 0) objectType = 2;
+  return { objectType, freqIndex, channelConfig };
+}
+
+/**
+ * Wrap one raw AAC access unit in a 7-byte ADTS header so the `.aac`/ADTS demuxer can read it.
+ * profile field = objectType-1 (ADTS encodes MPEG-4 audio object type minus one).
+ */
+function adtsWrap(
+  aac: Uint8Array,
+  p: { objectType: number; freqIndex: number; channelConfig: number },
+): Uint8Array {
+  const frameLen = aac.length + 7;
+  if (frameLen > 0x1fff) {
+    // ADTS frame length is 13 bits; a single AAC AU never realistically exceeds this, but guard it.
+    throw new Error(`${ENGINE_ID}: AAC access unit too large for ADTS (${frameLen} bytes)`);
+  }
+  const profile = (p.objectType - 1) & 0x03;
+  const hdr = new Uint8Array(7);
+  hdr[0] = 0xff;
+  hdr[1] = 0xf1; // MPEG-4, no CRC
+  hdr[2] = (profile << 6) | ((p.freqIndex & 0x0f) << 2) | ((p.channelConfig >> 2) & 0x01);
+  hdr[3] = ((p.channelConfig & 0x03) << 6) | ((frameLen >> 11) & 0x03);
+  hdr[4] = (frameLen >> 3) & 0xff;
+  hdr[5] = ((frameLen & 0x07) << 5) | 0x1f;
+  hdr[6] = 0xfc;
+  const out = new Uint8Array(frameLen);
+  out.set(hdr, 0);
+  out.set(aac, 7);
+  return out;
+}
+
+/** Concatenate Uint8Arrays into one buffer. */
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
 /**
  * Canonical container token for a MediaInput, derived from its id/url suffix. FFmpeg's `Input #0,
  * mov,mp4,m4a,3gp,…` line reports a comma-joined demuxer family, not a single canonical token, so
@@ -373,19 +596,26 @@ export class FfmpegWasmEngine implements MediaEngine {
   private logTail: string[] = [];
   /** Capability set built from the runtime probe in init(). */
   private caps: CapabilitySet | null = null;
-  /** Resolved best-path config (recorded per §8.5). */
-  private config: FfmpegWasmConfig | null = null;
+
+  /**
+   * The best-path config chosen at init(), recorded into the report per §8.5 (coreBuild mt/st,
+   * wasmThreads, crossOriginIsolated, vendored core URLs). This MUST be a PROPERTY, not a method:
+   * the MediaEngine contract types it `readonly configUsed?: object` (engine.ts:174) and the runner
+   * reads it as a VALUE (`result.env.configUsed = engine.configUsed`, runner.ts:956-957). A method
+   * is structurally assignable to `object` (so tsc stays green) but is always-truthy and serializes
+   * to nothing — silently dropping the best-path record. We mirror platform/adapter.ts (a mutable
+   * field reassigned in init()) since our config is resolved at init() (mt, or the st fallback).
+   * Optional/undefined before init() to match the contract's `readonly configUsed?: object` (which
+   * is `object | undefined`, NOT nullable); the runner's `if (engine.configUsed)` guard skips it
+   * pre-init anyway.
+   */
+  configUsed?: FfmpegWasmConfig;
 
   capabilities(): CapabilitySet {
     // Prefer the runtime-probed caps; before init() return the conservative documented-build set so
     // the runner can still pre-negotiate. (init() replaces this with the EXACT probed set.)
     if (this.caps) return this.caps;
     return this.staticCapabilities();
-  }
-
-  /** The best-path config chosen at init(), for the runner to record (§8.5). null before init(). */
-  configUsed(): FfmpegWasmConfig | null {
-    return this.config;
   }
 
   /** Conservative documented-build capabilities used before init()/probe completes. */
@@ -399,7 +629,9 @@ export class FfmpegWasmEngine implements MediaEngine {
         decodeFrames: true,
         seek: true,
         trim: true,
+        mux: true, // documented core strength (dossier §4/§10 A.3); kept in sync with probed set.
       },
+      // FALLBACK_CONTAINERS_IN/OUT already exclude 'hls' (unreachable multi-file playlist from MEMFS).
       containersIn: [...FALLBACK_CONTAINERS_IN],
       containersOut: [...FALLBACK_CONTAINERS_OUT],
       videoCodecs: [...FALLBACK_VIDEO],
@@ -410,7 +642,16 @@ export class FfmpegWasmEngine implements MediaEngine {
   }
 
   /** Feature flags. 'webcodecs:independent' opts ffmpeg.wasm out of the per-browser WebCodecs gate
-   *  (it owns software codecs). 'fanout' is NOT declared (single-MediaBytes can't carry N outputs). */
+   *  (it owns software codecs). 'fanout' is NOT declared (single-MediaBytes can't carry N outputs).
+   *
+   *  'metadata:write' is deliberately NOT declared even though ffmpeg genuinely writes tags (dossier
+   *  §A.11) and remux() honors `opts.tags` below: the metadata-WRITE scenarios drive the op via the
+   *  runner's remux dispatch (runner.ts:433), which calls remux(input, { container }) and DROPS
+   *  `options.tags` before the adapter ever sees them. So declaring the feature would negotiate those
+   *  cases as runnable and then guarantee a FAIL (no tags reach the file, golden-metadata mismatches)
+   *  — an over-claim, which the standing rules rank as worse than an honest NA. We keep the engine-
+   *  side implementation ready (remux writes -metadata when tags are present) so flipping this flag
+   *  back on is a one-liner once the shared runner.ts forwards options.tags to remux(). */
   private featureList(): string[] {
     return [
       'resize', // -vf scale / zscale
@@ -419,7 +660,6 @@ export class FfmpegWasmEngine implements MediaEngine {
       'trim:frame-accurate', // output-seek re-encode
       'fragmented', // -movflags frag_keyframe+empty_moov
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
-      'metadata:write', // -metadata + -c copy
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
     ];
   }
@@ -562,7 +802,8 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
 
     this.ff = activeFf;
-    this.config = activeConfig;
+    // Record the resolved best-path config as a PROPERTY the runner reads by value (§8.5).
+    this.configUsed = activeConfig;
 
     // Build HONEST capabilities from a runtime probe of the actual vendored core.
     this.caps = await this.probeCapabilities(activeFf);
@@ -622,6 +863,13 @@ export class FfmpegWasmEngine implements MediaEngine {
 
     // HLS is multi-file/pathed; not deliverable as a single MediaBytes → exclude from declared out.
     containersOut = containersOut.filter((c) => c !== 'hls');
+    // HLS the same way on the INPUT side: ffmpeg's `-formats` lists the hls/applehttp DEMUXER, but a
+    // multi-variant `.m3u8` playlist references sibling `.ts`/`.m4s` segments by relative path. Those
+    // siblings are UNREACHABLE from a single file written into MEMFS (we hand ffmpeg one blob, not a
+    // directory tree), so an hls probe/demux would not error cleanly — it would fail mid-run trying to
+    // open segment URLs. Declaring `hls` in containersIn therefore turns a clean NA into a runtime
+    // ERROR. Drop it so hls-input scenarios negotiate an honest NA_ENGINE on the container.
+    containersIn = containersIn.filter((c) => c !== 'hls');
 
     return {
       operations: {
@@ -632,6 +880,10 @@ export class FfmpegWasmEngine implements MediaEngine {
         decodeFrames: true,
         seek: true,
         trim: true,
+        // mux is a documented core strength (dossier §4/§10 A.3/A.7): container WRITE from already-
+        // encoded tracks via `-i vid -i aud -c copy out`. Declared so it is not a false-NA; the
+        // genuinely-unencodable av1 mux row stays NA via the codec gate (av1 absent from videoCodecs).
+        mux: true,
       },
       containersIn,
       containersOut,
@@ -678,7 +930,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     this.logTail = [];
     this.caps = null;
-    this.config = null;
+    this.configUsed = undefined;
   }
 
   private requireFf(): FFmpeg {
@@ -688,7 +940,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   /** `-threads N` for thread-aware encoders (mt fast path). Empty on the single-thread core. */
   private threadArgs(): string[] {
-    const n = this.config?.wasmThreads ?? 1;
+    const n = this.configUsed?.wasmThreads ?? 1;
     return n > 1 ? ['-threads', String(n)] : [];
   }
 
@@ -765,7 +1017,9 @@ export class FfmpegWasmEngine implements MediaEngine {
     const ff = this.requireFf();
     this.logTail = [];
     try {
-      await ff.exec(['-hide_banner', '-i', inName]);
+      // timeoutMs guards fuzzed/truncated inputs from hanging the worker (§9.10/§11). On timeout exec
+      // returns 1 (no throw) and no Input block is logged → the check below throws a clean error.
+      await ff.exec(['-hide_banner', '-i', inName], READ_EXEC_TIMEOUT_MS);
     } catch {
       /* exec may reject on the deliberate "no output file" abort; the log is captured regardless */
     }
@@ -824,7 +1078,12 @@ export class FfmpegWasmEngine implements MediaEngine {
       this.logTail = [];
       let exitCode: number | null = null;
       try {
-        exitCode = await ff.exec(['-hide_banner', '-i', inName, '-c', 'copy', '-f', 'framecrc', crcName]);
+        // timeoutMs guards fuzzed/truncated inputs from wedging the worker (§9.10/§11/§A.16). On
+        // timeout exec returns 1 (no throw); the Input-block + readText checks below then throw clean.
+        exitCode = await ff.exec(
+          ['-hide_banner', '-i', inName, '-c', 'copy', '-f', 'framecrc', crcName],
+          READ_EXEC_TIMEOUT_MS,
+        );
       } catch {
         /* a hard demux error rejects; surfaced below once we've inspected the log/output */
       }
@@ -860,7 +1119,10 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── remux ────────────────────────────────────────────────────────────────────────────────────
 
-  async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
+  async remux(
+    input: MediaInput,
+    opts: { container: string; tags?: Record<string, string> },
+  ): Promise<MediaBytes> {
     const base = this.scratch();
     const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
@@ -870,6 +1132,14 @@ export class FfmpegWasmEngine implements MediaEngine {
       const args = ['-i', inName, '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         args.push('-movflags', '+faststart');
+      }
+      // Metadata WRITE (dossier §A.11): `-metadata key=value` per tag, still lossless under -c copy.
+      // The 'metadata:write' feature is gated OFF in featureList() until the runner forwards tags to
+      // remux(), but the implementation is kept correct so it works for any direct caller / once wired.
+      if (opts.tags) {
+        for (const [k, v] of Object.entries(opts.tags)) {
+          if (k) args.push('-metadata', `${k}=${v ?? ''}`);
+        }
       }
       args.push(outName);
       await this.run(args);
@@ -1101,12 +1371,104 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
-  // ── undeclared optional methods (mux/decrypt) ─────────────────────────────────────────────────
-  // Not declared in capabilities() → runner negotiates NA(engine); present only to satisfy the
-  // optional-method shape if a caller reaches for them directly.
+  // ── mux ──────────────────────────────────────────────────────────────────────────────────────
+  //
+  // Container WRITE from already-encoded tracks — a documented core strength (dossier §4 line 108,
+  // §10 A.3/A.7). EncodedTracks hands us opaque coded chunks (WebCodecs-style framing) + a codec
+  // `description` (avcC/hvcC/AudioSpecificConfig), which ffmpeg's argv/file model can't consume
+  // directly. So we rebuild each track as a demuxable ELEMENTARY STREAM in MEMFS, then stream-copy
+  // them together: `-i v.h264 -i a.aac -c copy [-movflags +faststart] out` (dossier §4 mux row).
+  //
+  // SCOPE/HONESTY: we reconstruct the codecs whose elementary-stream framing is exactly defined and
+  // verifiable from the chunk data — H.264 & HEVC (length-prefixed → Annex-B, param sets from
+  // avcC/hvcC) and AAC (raw AU → ADTS). For codecs that need a full intermediate CONTAINER to be
+  // demuxable (VP8/VP9 → IVF, Opus/Vorbis → Ogg, AV1) we throw a CLEAR error rather than emit a
+  // guessed/garbage stream — an honest failure, never silent corruption. AV1 additionally never
+  // reaches here: 'av1' is absent from videoCodecs (no encoder in the build), so the av1 mux row
+  // negotiates a correct NA_ENGINE on the codec gate before mux() is called.
+  //
+  // NOTE (harness dependency, outside this adapter): the runner does not yet assemble EncodedTracks
+  // for mux scenarios (runner.ts:444-448 throws 'mux scenario requires options.tracks'), so these
+  // cells currently ERROR at the runner before mux() runs. Declaring mux + implementing it here is
+  // the honest engine-side state; the track-assembly wiring is owned by src/core/runner.ts.
 
-  async mux(_tracks: EncodedTracks, _opts: { container: string }): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: mux from EncodedTracks not implemented`);
+  async mux(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes> {
+    const realTracks = tracks.tracks.filter((t) => t.type === 'video' || t.type === 'audio');
+    if (realTracks.length === 0) {
+      throw new Error(`${ENGINE_ID}: mux requires at least one audio/video track`);
+    }
+
+    const base = this.scratch();
+    const inputNames: string[] = [];
+    const outName = `${base}.out.${containerExt(opts.container)}`;
+    try {
+      // 1) Materialize each track as an elementary stream ffmpeg can demux.
+      for (let ti = 0; ti < realTracks.length; ti++) {
+        const t = realTracks[ti]!;
+        const codec = canonicalCodec(t.codec);
+        const { name, bytes } = this.buildElementaryStream(t, codec, `${base}.t${ti}`);
+        await this.requireFf().writeFile(name, bytes);
+        inputNames.push(name);
+      }
+
+      // 2) Stream-copy mux: one -i per elementary stream, then -map each so every track lands.
+      const args: string[] = [];
+      for (const n of inputNames) args.push('-i', n);
+      for (let i = 0; i < inputNames.length; i++) args.push('-map', String(i));
+      args.push('-c', 'copy');
+      if (opts.container === 'mp4' || opts.container === 'mov') {
+        args.push('-movflags', '+faststart');
+      }
+      args.push(outName);
+
+      await this.run(args, READ_EXEC_TIMEOUT_MS);
+      const muxed = await this.readBinary(outName);
+      return { bytes: muxed, mime: containerMime(opts.container), container: opts.container };
+    } finally {
+      await this.cleanup([...inputNames, outName]);
+    }
+  }
+
+  /**
+   * Rebuild one EncodedTrack as a demuxable elementary-stream file (name + bytes) for mux()'s
+   * `-c copy`. Throws an honest error for codecs we cannot frame as a bare elementary stream.
+   */
+  private buildElementaryStream(
+    track: EncodedTracks['tracks'][number],
+    codec: string,
+    baseName: string,
+  ): { name: string; bytes: Uint8Array } {
+    const chunks = track.chunks ?? [];
+    if (codec === 'h264' || codec === 'hevc') {
+      const nalLen =
+        codec === 'h264'
+          ? nalLengthSizeFromAvcC(track.description)
+          : nalLengthSizeFromHvcC(track.description);
+      const params =
+        codec === 'h264' ? paramSetsFromAvcC(track.description) : paramSetsFromHvcC(track.description);
+      const parts: Uint8Array[] = [];
+      let first = true;
+      for (const c of chunks) {
+        // Prepend the param sets (Annex-B) once, before the first sample, so a raw .h264/.hevc
+        // elementary stream is self-contained (avcC/hvcC out-of-band config is otherwise lost).
+        if (first && params.length > 0) parts.push(params);
+        first = false;
+        parts.push(lengthPrefixedToAnnexB(c.data, nalLen));
+      }
+      const ext = codec === 'h264' ? 'h264' : 'hevc';
+      return { name: `${baseName}.${ext}`, bytes: concatBytes(parts) };
+    }
+    if (codec === 'aac') {
+      const params = aacParamsFromAsc(track.description, track.sampleRate ?? 0, track.channels ?? 0);
+      const parts: Uint8Array[] = [];
+      for (const c of chunks) parts.push(adtsWrap(c.data, params));
+      return { name: `${baseName}.aac`, bytes: concatBytes(parts) };
+    }
+    // Codecs that need a full intermediate container to be demuxable: fail honestly (never guess).
+    throw new Error(
+      `${ENGINE_ID}: mux cannot reconstruct an elementary stream for codec '${codec}' ` +
+        `(only h264/hevc/aac are framed from EncodedTracks here; ${codec} needs a container muxer)`,
+    );
   }
 }
 

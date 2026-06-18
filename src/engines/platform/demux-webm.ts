@@ -1,12 +1,18 @@
 /**
  * src/engines/platform/demux-webm.ts — a MINIMAL Matroska/WebM (EBML) demuxer, just enough to feed
- * WebCodecs VideoDecoder: it walks Segment → Info (TimestampScale), Tracks (codec/dims/CodecPrivate)
- * and Clusters (SimpleBlock / BlockGroup) to emit the first video track's frames with timestamps and
- * keyframe flags.
+ * WebCodecs VideoDecoder AND to enumerate the container's tracks (video + audio) for probe/demux:
+ * it walks Segment → Info (TimestampScale), Tracks (codec/dims/CodecPrivate + audio rate/channels)
+ * and Clusters (SimpleBlock / BlockGroup) to emit each track's frames with timestamps and keyframe
+ * flags.
  *
  * Scope (HONEST): unencrypted, non-lacing (or fixed/EBML lacing handled) WebM/MKV with VP8/VP9/AV1
- * (and H.264/HEVC-in-MKV). It does NOT implement seeking via Cues, chapters, or block lacing edge
- * cases beyond the common path; on anything it can't handle it throws {@link UnsupportedWebmError}.
+ * (and H.264/HEVC-in-MKV) video, plus Opus/Vorbis/AAC audio tracks (enumerated for metadata + packet
+ * tables). It does NOT implement seeking via Cues, chapters, or block lacing edge cases beyond the
+ * common path; on anything it can't handle it throws {@link UnsupportedWebmError}.
+ *
+ * SOURCES (dossier research/dossiers/platform.md §2 demux, researched 2026-06-17):
+ *   - WebCodecs API: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
+ *   - WebCodecs codec selection: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Codec_selection
  */
 
 export class UnsupportedWebmError extends Error {
@@ -37,6 +43,27 @@ export interface WebmVideoTrack {
   config: WebmVideoConfig;
   samples: WebmSample[];
 }
+
+export interface WebmAudioConfig {
+  codec: string; // canonical token: 'opus' | 'vorbis' | 'aac'
+  sampleRate: number;
+  channels: number;
+  timescaleNs: number;
+}
+
+export interface WebmAudioTrack {
+  config: WebmAudioConfig;
+  samples: WebmSample[];
+}
+
+/**
+ * Every track the demuxer can enumerate, in CONTAINER ORDER (Tracks declaration order), so a caller
+ * can assign trackIndex 0,1,2,… to match a multi-track golden's layout. Unknown/unparseable tracks are
+ * skipped (honest: only what we read).
+ */
+export type WebmTrack =
+  | ({ kind: 'video' } & WebmVideoTrack)
+  | ({ kind: 'audio' } & WebmAudioTrack);
 
 // ── EBML primitives ──────────────────────────────────────────────────────────────────────────
 
@@ -102,6 +129,9 @@ const ID = {
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
+  Audio: 0xe1,
+  SamplingFrequency: 0xb5, // EBML float (Hz)
+  Channels: 0x9f,
   Cluster: 0x1f43b675,
   Timestamp: 0xe7, // cluster timestamp
   SimpleBlock: 0xa3,
@@ -255,6 +285,20 @@ function codecFromCodecId(codecId: string): { token: string; codecString: string
   }
 }
 
+/** Map a Matroska audio CodecID to a canonical token (for probe metadata + packet enumeration). */
+function audioCodecFromCodecId(codecId: string): string | undefined {
+  switch (codecId) {
+    case 'A_OPUS':
+      return 'opus';
+    case 'A_VORBIS':
+      return 'vorbis';
+    case 'A_AAC':
+      return 'aac';
+    default:
+      return undefined; // A_MPEG/L3, A_PCM/…, A_FLAC etc. not identified by this minimal demuxer
+  }
+}
+
 /** ASCII/UTF-8 string from element body. */
 function readString(buf: Uint8Array, start: number, end: number): string {
   let s = '';
@@ -266,11 +310,20 @@ function readString(buf: Uint8Array, start: number, end: number): string {
   return s;
 }
 
+/** Internal per-track descriptor collected from the Tracks element, in declaration order. */
+interface WebmTrackDesc {
+  trackNumber: number;
+  track: WebmTrack; // config + (initially empty) samples, filled from clusters
+}
+
 /**
- * Demux the first video track of a WebM/MKV into ordered frames + decoder config. WebM frames are
- * stored in PTS order (no B-frames for VP8/VP9; PTS==DTS). Throws {@link UnsupportedWebmError}.
+ * Enumerate EVERY parseable track (video + audio) of a WebM/MKV in CONTAINER ORDER (Tracks declaration
+ * order), each with its ordered frames from the Clusters, so a caller can assign trackIndex 0,1,2,… to
+ * match a multi-track golden and emit honest probe metadata. WebM frames are in PTS order (no B-frames
+ * for VP8/VP9; PTS==DTS). Tracks whose codec this minimal demuxer cannot identify are skipped (honest).
+ * Throws {@link UnsupportedWebmError} for a missing Segment or when NO track is parseable.
  */
-export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
+export function demuxWebmTracks(bytes: Uint8Array): WebmTrack[] {
   const end = bytes.length;
   // Top level: EBML header then Segment.
   let segment: Element | undefined;
@@ -283,8 +336,7 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
   if (!segment) throw new UnsupportedWebmError('no Segment element (not a WebM/MKV)');
 
   let timescaleNs = 1_000_000; // default 1ms
-  let trackNumber: number | undefined;
-  let config: WebmVideoConfig | undefined;
+  const descs: WebmTrackDesc[] = []; // in Tracks declaration order
 
   // Walk segment children for Info + Tracks; collect clusters lazily after.
   const clusters: Element[] = [];
@@ -302,6 +354,8 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
         let codecPrivate: Uint8Array | undefined;
         let width = 0;
         let height = 0;
+        let audioChannels = 0;
+        let audioSampleRate = 0;
         for (const f of children(bytes, te.bodyStart, te.bodyEnd)) {
           switch (f.id) {
             case ID.TrackNumber:
@@ -322,16 +376,24 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
                 else if (v.id === ID.PixelHeight) height = readUint(bytes, v.bodyStart, v.bodyEnd - v.bodyStart);
               }
               break;
+            case ID.Audio:
+              for (const a of children(bytes, f.bodyStart, f.bodyEnd)) {
+                if (a.id === ID.SamplingFrequency) audioSampleRate = readFloat(bytes, a.bodyStart, a.bodyEnd - a.bodyStart);
+                else if (a.id === ID.Channels) audioChannels = readUint(bytes, a.bodyStart, a.bodyEnd - a.bodyStart);
+              }
+              break;
             default:
               break;
           }
         }
-        // TrackType 1 == video. Take the first decodable video track.
-        if (ttype === 1 && tnum !== undefined && !config) {
+        if (tnum === undefined) continue;
+
+        if (ttype === 1) {
+          // Video track. Skip (don't fail the whole demux) if the codec is unidentified — another
+          // track may still be usable.
           const codec = codecFromCodecId(codecId);
-          if (!codec) throw new UnsupportedWebmError(`unsupported WebM/MKV codec: ${codecId}`);
-          trackNumber = tnum;
-          config = {
+          if (!codec) continue;
+          const config: WebmVideoConfig = {
             codec: codec.token,
             codecString: codec.codecString,
             codedWidth: width,
@@ -345,19 +407,42 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
           // (it triggers a null-`.trim()` TypeError in Chrome's native config parser). Drop it here so
           // every consumer (oracle-helpers + adapter) gets a clean, decodable config.
           if (codecPrivate && codecUsesDescription(codec.token)) config.description = codecPrivate;
+          descs.push({ trackNumber: tnum, track: { kind: 'video', config, samples: [] } });
+        } else if (ttype === 2) {
+          // Audio track. Enumerate for metadata + packets; skip unidentified codecs honestly.
+          const token = audioCodecFromCodecId(codecId);
+          if (!token) continue;
+          const config: WebmAudioConfig = {
+            codec: token,
+            sampleRate: Math.round(audioSampleRate) || 0,
+            channels: audioChannels || 0,
+            timescaleNs,
+          };
+          descs.push({ trackNumber: tnum, track: { kind: 'audio', config, samples: [] } });
         }
+        // Other track types (subtitle/button/control) are not enumerated.
       }
     } else if (el.id === ID.Cluster) {
       clusters.push(el);
     }
   }
 
-  if (!config || trackNumber === undefined) throw new UnsupportedWebmError('no video track found in WebM/MKV');
-  config.timescaleNs = timescaleNs;
+  if (descs.length === 0) throw new UnsupportedWebmError('no video/audio track found in WebM/MKV');
+
+  // Keep timescale consistent on every track config (Info may follow Tracks in some files).
+  for (const d of descs) d.track.config.timescaleNs = timescaleNs;
 
   const tickToUs = (ticks: number) => Math.round((ticks * timescaleNs) / 1000);
+  const byTrackNumber = new Map<number, WebmTrackDesc>();
+  for (const d of descs) byTrackNumber.set(d.trackNumber, d);
 
-  const samples: WebmSample[] = [];
+  // Single pass over clusters → route each block's frames to its track by track number.
+  const push = (trackNum: number, frame: Uint8Array, ptsUs: number, durationUs: number, keyframe: boolean): void => {
+    const d = byTrackNumber.get(trackNum);
+    if (!d) return; // block for a track we didn't enumerate (e.g. unidentified codec) → ignore
+    d.track.samples.push({ data: frame, ptsUs, dtsUs: ptsUs, durationUs, keyframe });
+  };
+
   for (const cluster of clusters) {
     let clusterTs = 0;
     // First pass to find the cluster Timestamp (it precedes blocks per spec, but be tolerant).
@@ -369,12 +454,10 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
     }
     for (const c of children(bytes, cluster.bodyStart, cluster.bodyEnd)) {
       if (c.id === ID.SimpleBlock) {
-        const block = parseBlock(bytes, c.bodyStart, c.bodyEnd, trackNumber);
+        const block = parseBlock(bytes, c.bodyStart, c.bodyEnd);
         if (!block) continue;
         const ptsUs = tickToUs(clusterTs + block.relTs);
-        for (const frame of block.frames) {
-          samples.push({ data: frame, ptsUs, dtsUs: ptsUs, durationUs: 0, keyframe: block.keyframe });
-        }
+        for (const frame of block.frames) push(block.track, frame, ptsUs, 0, block.keyframe);
       } else if (c.id === ID.BlockGroup) {
         // BlockGroup: a Block + optional ReferenceBlock (presence ⇒ not a keyframe) + BlockDuration.
         let blockEl: Element | undefined;
@@ -386,33 +469,51 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
           else if (g.id === ID.BlockDuration) durationTicks = readUint(bytes, g.bodyStart, g.bodyEnd - g.bodyStart);
         }
         if (!blockEl) continue;
-        const block = parseBlock(bytes, blockEl.bodyStart, blockEl.bodyEnd, trackNumber);
+        const block = parseBlock(bytes, blockEl.bodyStart, blockEl.bodyEnd);
         if (!block) continue;
         const ptsUs = tickToUs(clusterTs + block.relTs);
         const keyframe = !hasReference;
-        for (const frame of block.frames) {
-          samples.push({ data: frame, ptsUs, dtsUs: ptsUs, durationUs: tickToUs(durationTicks), keyframe });
-        }
+        for (const frame of block.frames) push(block.track, frame, ptsUs, tickToUs(durationTicks), keyframe);
       }
     }
   }
 
-  if (samples.length === 0) throw new UnsupportedWebmError('no frames decoded from WebM/MKV clusters');
-  // Sort by PTS to be safe (clusters are ordered, but defensive).
-  samples.sort((a, b) => a.ptsUs - b.ptsUs);
-  return { config, samples };
+  // Sort each track's samples by PTS (clusters are ordered, but defensive) and drop tracks with no
+  // frames (a declared track that produced no packets would mismatch a golden's layout).
+  const out: WebmTrack[] = [];
+  for (const d of descs) {
+    if (d.track.samples.length === 0) continue;
+    d.track.samples.sort((a, b) => a.ptsUs - b.ptsUs);
+    out.push(d.track);
+  }
+  if (out.length === 0) throw new UnsupportedWebmError('no frames decoded from WebM/MKV clusters');
+  return out;
+}
+
+/**
+ * Demux the first video track of a WebM/MKV into ordered frames + decoder config. Thin wrapper over
+ * {@link demuxWebmTracks}. Throws {@link UnsupportedWebmError} when no video track is present.
+ */
+export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
+  const tracks = demuxWebmTracks(bytes);
+  const video = tracks.find((t): t is { kind: 'video' } & WebmVideoTrack => t.kind === 'video');
+  if (!video) throw new UnsupportedWebmError('no video track found in WebM/MKV');
+  return { config: video.config, samples: video.samples };
 }
 
 interface ParsedBlock {
+  track: number; // block's track number (caller routes frames to the matching track)
   relTs: number; // signed int16 relative timestamp
   keyframe: boolean;
   frames: Uint8Array[];
 }
 
-/** Parse a (Simple)Block body: track vint, int16 rel ts, flags, then frame(s) (handles lacing). */
-function parseBlock(buf: Uint8Array, start: number, end: number, wantTrack: number): ParsedBlock | undefined {
+/**
+ * Parse a (Simple)Block body: track vint, int16 rel ts, flags, then frame(s) (handles lacing).
+ * Returns the block's track number so the caller can route frames to the right track (multi-track).
+ */
+function parseBlock(buf: Uint8Array, start: number, end: number): ParsedBlock | undefined {
   const { value: track, next } = readVint(buf, start, false);
-  if (track !== wantTrack) return undefined;
   let pos = next;
   const relTs = ((buf[pos] as number) << 8) | (buf[pos + 1] as number);
   const signedRelTs = relTs > 0x7fff ? relTs - 0x10000 : relTs;
@@ -425,7 +526,7 @@ function parseBlock(buf: Uint8Array, start: number, end: number, wantTrack: numb
   const frames: Uint8Array[] = [];
   if (lacing === 0) {
     frames.push(buf.subarray(pos, end).slice());
-    return { relTs: signedRelTs, keyframe, frames };
+    return { track, relTs: signedRelTs, keyframe, frames };
   }
 
   // Laced: first byte is (numFrames - 1).
@@ -473,7 +574,7 @@ function parseBlock(buf: Uint8Array, start: number, end: number, wantTrack: numb
   }
   void consumed;
   frames.push(buf.subarray(pos, end).slice());
-  return { relTs: signedRelTs, keyframe, frames };
+  return { track, relTs: signedRelTs, keyframe, frames };
 }
 
 /** Cheap sniff: WebM/MKV starts with the EBML header magic 0x1A45DFA3. */

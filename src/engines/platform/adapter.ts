@@ -5,15 +5,23 @@
  * injects into oracles — see ./oracle-helpers.ts).
  *
  * capabilities() is HONEST about what raw platform APIs can really do:
- *   - probe        ✓  <video> metadata (duration/dims) + inline MP4/WebM demux for codec/dims/fps
- *   - demux        ✓  inline MINIMAL MP4 (progressive) + WebM/MKV sample extraction (video track)
+ *   - probe        ✓  inline MP4/WebM demux enumerates EVERY track (video codec/dims/fps + audio
+ *                      codec/sampleRate/channels) in container order; <video> fills duration/dims
+ *   - demux        ✓  inline MINIMAL MP4 (progressive) + WebM/MKV sample extraction for ALL tracks
+ *                      (video=trackIndex 0, audio=1,…) so the packet table matches multi-track golden
  *   - decodeFrames ✓  WebCodecs VideoDecoder (inline demux feeds it); <video> fallback for others
  *   - seek         ✓  HTMLVideoElement.currentTime + drawImage frame grab
- *   - transcode    ✓ (LIMITED) decode→canvas→MediaRecorder→webm (lossy, real-time, video-only)
+ *   - transcode    ✓ (LIMITED) <video>→canvas→MediaRecorder→webm/mp4 (lossy, real-time, video-only;
+ *                      WebM on Chromium/FF, MP4 on Safari — resolved at runtime via recorderMimeFor())
  *   - remux        ✗  NA: raw platform cannot losslessly rewrap encoded samples into a new container
  *   - trim         ✗  NA: no frame-accurate cut without a real muxer
  *   - mux          ✗  NA: MediaRecorder re-encodes a live stream; it can't accept opaque EncodedTracks
  *   - decrypt      ✗  NA: EME drives protected playback to the screen, not byte/frame export
+ *
+ * Audio: the inline demuxers ENUMERATE audio tracks/packets (AAC in MP4/MOV; Opus/Vorbis/AAC in
+ * WebM/MKV) so capabilities().audioCodecs honestly declares ['aac','opus','vorbis'] — this is a
+ * PROBE/DEMUX (track-identification) statement, NOT an audio transcode/mux claim (the transcode path
+ * drops audio and declares no audio encode; the runner only gates audio ENCODE on transcode/mux ops).
  *
  * RULES followed: TS strict; ESM .ts imports; `import type` for types; built-in APIs only (nothing
  * heavy to dynamically import); Worker-aware (decodeFrames via WebCodecs works in a Worker; <video>
@@ -36,8 +44,11 @@
  *       https://www.w3.org/TR/webcodecs-avc-codec-registration/
  *   - Chrome WebCodecs best practices (Worker, queueSize>2, transferable, close, OffscreenCanvas):
  *       https://developer.chrome.com/docs/web-platform/best-practices/webcodecs
- *   - MediaRecorder.isTypeSupported + cross-browser format reality:
+ *   - MediaRecorder.isTypeSupported + cross-browser format reality (WebM on Chromium/FF, MP4 on Safari):
  *       https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/isTypeSupported_static
+ *       https://media-codings.com/articles/recording-cross-browser-compatible-media
+ *   - MediaCapabilities.decodingInfo (probe codec decodable/smooth/powerEfficient):
+ *       https://developer.mozilla.org/en-US/docs/Web/API/MediaCapabilities/decodingInfo
  *   - ImageDecoder / MSE / MediaCapabilities (per-op references): see research/dossiers/platform.md §10
  *
  * The documented BEST path (§0.9/§3) — hardware WebCodecs, streaming, transferable frames,
@@ -62,8 +73,8 @@ import { registerEngine } from '../../core/registry.ts';
 import { decodeBytesToFrames, playbackSmoke } from './oracle-helpers.ts';
 import { decodeWithVideoElement, decodeWithWebCodecs, grabFrameAt } from './decode.ts';
 import type { DecodeInput } from './decode.ts';
-import { demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
-import { demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+import { demuxMp4Tracks, demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import { demuxWebmTracks, demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 import { probeInput } from './probe.ts';
 import { canMediaRecorderTranscode, recorderMimeFor, transcodeViaRecorder } from './transcode.ts';
 import { warmupPlatform } from './warmup.ts';
@@ -89,8 +100,15 @@ export interface PlatformConfigUsed {
   /** §0.9 ordering for any pixel work (resize/color) */
   pixelBackend: 'webgpu>webgl>offscreen2d';
   frameTransfer: 'transferable';
+  /** the decodeFrames/seek decode path: WebCodecs VideoDecoder (inline-demux-fed), <video> fallback */
   decode: 'VideoDecoder';
-  encode: 'VideoEncoder+MediaRecorder(out)';
+  /**
+   * the transcode/encode path the adapter ACTUALLY runs. HONEST: transcode.ts does NOT construct a
+   * VideoEncoder — it decodes via a <video> element, paints to a 2D canvas, captures the stream and
+   * re-encodes through MediaRecorder. (Previously this read 'VideoEncoder+MediaRecorder(out)', which
+   * described a VideoEncoder pipeline the engine never instantiates — an apples-to-oranges configUsed.)
+   */
+  encode: '<video>→canvas→MediaRecorder(out)';
 }
 
 /** Thrown for operations this engine honestly does not implement. The runner records NA_ENGINE. */
@@ -144,7 +162,7 @@ export class PlatformEngine implements MediaEngine {
     pixelBackend: 'webgpu>webgl>offscreen2d',
     frameTransfer: 'transferable',
     decode: 'VideoDecoder',
-    encode: 'VideoEncoder+MediaRecorder(out)',
+    encode: '<video>→canvas→MediaRecorder(out)',
   };
 
   /** Result of init()'s UNTIMED hardware probe + decoder warmup (null until init() runs). */
@@ -176,14 +194,28 @@ export class PlatformEngine implements MediaEngine {
       // Inputs the inline demux + <video> can read. We can PROBE more than we can DEMUX, but the
       // common axis here is "containers the engine accepts as input for some op".
       containersIn: ['mp4', 'mov', 'webm', 'mkv'],
-      // The only container raw platform can WRITE is what MediaRecorder muxes (webm broadly; mp4 on
-      // Safari). We declare webm; mp4-out is browser-conditional and surfaces via recorderMimeFor().
-      containersOut: ['webm'],
+      // Containers raw platform can WRITE via MediaRecorder: WebM broadly (Chromium/Firefox) and MP4
+      // on Safari (OS encoder). Both are declared; the actual per-browser container is resolved at
+      // runtime by recorderMimeFor() (returns null → NotApplicableError → honest NA), and the runner's
+      // Pass-2 VideoEncoder.isConfigSupported gate narrows the target codec (e.g. mp4+av1 stays
+      // NA_BROWSER where the browser lacks AV1 encode). Declaring only ['webm'] previously false-NA'd
+      // every mp4-out transcode AND over-claimed webm-out on Safari (which only records MP4). (Dossier
+      // §A.3, §6: MediaRecorder = WebM on Chromium/FF, MP4 on Safari.)
+      containersOut: ['webm', 'mp4'],
       // Codecs WebCodecs commonly decodes (declared; runtime feature-detect narrows per browser).
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
-      // Audio decode/encode is not part of the platform engine's exercised ops (no audio op here);
-      // declare none to avoid implying audio transcode/mux we don't perform.
-      audioCodecs: [],
+      // Audio codecs the inline demuxers ENUMERATE (probe/demux read the audio sample tables → track
+      // codec/sampleRate/channels + audio packets). Declaring these lifts the false-NA_ENGINE that
+      // previously hid platform from the entire probe/demux/metadata/extract-metadata corpus (every
+      // such scenario lists an audio codec; runner Pass-1 NA_ENGINE'd platform on the first one).
+      // This does NOT over-claim audio TRANSCODE/MUX: the transcode path drops audio and declares no
+      // audio encode, and the runner only requires audio ENCODE support for transcode/mux ops (so an
+      // audio re-encode platform cannot do stays correctly blocked). The runner's Pass-2 gate still
+      // requires WebCodecs AUDIO DECODE for read ops, so vorbis (no WebCodecs decode string) surfaces
+      // as NA_BROWSER on browsers lacking it — distinct from NA_ENGINE, never collapsed. Matches the
+      // mp4box / remotion-media-parser / web-demuxer convention (a demuxer declares the audio codecs
+      // it can identify). (Dossier §2 probe/demux, §A.7, §A.11 'fps/codec ✓'.)
+      audioCodecs: ['aac', 'opus', 'vorbis'],
       encryption: [],
       // 'alpha' decode is possible via WebCodecs alpha:'keep' on VP8/VP9; 'resize' via canvas in the
       // transcode path. We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
@@ -217,8 +249,11 @@ export class PlatformEngine implements MediaEngine {
   }
 
   /**
-   * Demux to a packet table from the inline MP4/WebM extractors. Honest NA for containers neither
-   * parser handles (TS/OGG/HLS/etc.) — we cannot demux those with raw platform APIs.
+   * Demux to a packet table from the inline MP4/WebM extractors. Emits packets for EVERY enumerated
+   * track (video + audio) with a CONTAINER-ORDER trackIndex (video=0, audio=1,…) so the packet table's
+   * count + trackIndex layout match a multi-track golden (golden-packets compares per-track, forgiving a
+   * constant per-track timestamp origin). Honest NA for containers neither parser handles
+   * (TS/OGG/HLS/etc.) — we cannot demux those with raw platform APIs.
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
     const ab = await input.arrayBuffer();
@@ -227,25 +262,23 @@ export class PlatformEngine implements MediaEngine {
 
     try {
       if (looksLikeMp4(bytes)) {
-        const t = demuxMp4Video(bytes);
-        const packets: PacketInfo[] = t.samples.map((s) => ({
-          trackIndex: 0,
-          size: s.data.length,
-          ptsUs: s.ptsUs,
-          dtsUs: s.dtsUs,
-          keyframe: s.keyframe,
-        }));
+        const tracks = demuxMp4Tracks(bytes);
+        const packets: PacketInfo[] = [];
+        tracks.forEach((t, trackIndex) => {
+          for (const s of t.samples) {
+            packets.push({ trackIndex, size: s.data.length, ptsUs: s.ptsUs, dtsUs: s.dtsUs, keyframe: s.keyframe });
+          }
+        });
         return { metadata: meta, packets };
       }
       if (looksLikeWebm(bytes)) {
-        const t = demuxWebmVideo(bytes);
-        const packets: PacketInfo[] = t.samples.map((s) => ({
-          trackIndex: 0,
-          size: s.data.length,
-          ptsUs: s.ptsUs,
-          dtsUs: s.dtsUs,
-          keyframe: s.keyframe,
-        }));
+        const tracks = demuxWebmTracks(bytes);
+        const packets: PacketInfo[] = [];
+        tracks.forEach((t, trackIndex) => {
+          for (const s of t.samples) {
+            packets.push({ trackIndex, size: s.data.length, ptsUs: s.ptsUs, dtsUs: s.dtsUs, keyframe: s.keyframe });
+          }
+        });
         return { metadata: meta, packets };
       }
     } catch (e) {
@@ -262,14 +295,27 @@ export class PlatformEngine implements MediaEngine {
   }
 
   /**
-   * LIMITED transcode: decode→canvas→MediaRecorder→webm. Lossy, real-time-bound, video-only. NA if
-   * MediaRecorder/captureStream is unavailable or the requested container can't be recorded.
+   * LIMITED transcode: <video>→canvas→MediaRecorder→webm/mp4. Lossy, real-time-bound, VIDEO-ONLY.
+   * NA if MediaRecorder/captureStream is unavailable or the requested container can't be recorded.
+   *
+   * HONEST AUDIO GUARD: the recorder path captures only the canvas (video) stream and DROPS audio, so
+   * a transcode that REQUESTS an audio track (opts.audio) cannot be fulfilled — we declare it NA rather
+   * than silently emit an audio-less file that the video-only ssim/playback oracles would wrongly PASS.
+   * (capabilities().audioCodecs is declared for probe/demux track-identification; it must not be read as
+   * an audio-transcode claim. This guard keeps the two honest.) opts.variants (fanout) is gated out
+   * earlier by the undeclared 'fanout' feature, so the recorder never receives a multi-rendition request.
    */
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     if (!canMediaRecorderTranscode()) {
       throw new NotApplicableError(
         'transcode',
         'requires DOM + MediaRecorder + canvas.captureStream (unavailable in this realm)',
+      );
+    }
+    if (opts.audio) {
+      throw new NotApplicableError(
+        'transcode',
+        'the MediaRecorder canvas-capture path is video-only and drops audio; cannot produce the requested audio track',
       );
     }
     const mime = recorderMimeFor(opts.container, opts.video?.codec);

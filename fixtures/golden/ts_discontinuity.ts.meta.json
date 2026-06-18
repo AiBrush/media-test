@@ -1,0 +1,23 @@
+{
+  "container": "ts",
+  "durationSec": 600.605,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "h264",
+      "width": 320,
+      "height": 240,
+      "fps": 30,
+      "bitrate": 2526,
+      "language": null
+    },
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 98721,
+      "language": null
+    }
+  ]
+}

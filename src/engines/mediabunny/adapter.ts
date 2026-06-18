@@ -9,9 +9,34 @@
  *   - https://mediabunny.dev/guide/packets-and-samples     (EncodedPacketSink / *SampleSink / CanvasSink)
  *   - https://mediabunny.dev/guide/writing-media-files      (Output / *PacketSource / BufferTarget)
  *   - https://mediabunny.dev/guide/converting-media-files   (Conversion best path: streaming-lockstep)
- *   - https://mediabunny.dev/guide/supported-formats-and-codecs
+ *   - https://mediabunny.dev/guide/supported-formats-and-codecs (HLS read + per-container codec matrix)
+ *   - https://mediabunny.dev/api/                            (Input/Conversion/OutputFormat reference)
  * Local ground truth: node_modules/mediabunny/dist/modules/src/{conversion,encode,decode,media-sink,
- *   input,input-track,codec}.d.ts.
+ *   input,input-track,codec,input-format}.d.ts.
+ *
+ * HARDENING (2026-06-18, this revision; all changes confined to this adapter):
+ *   - capabilities().containersIn now includes 'hls'. mediabunny reads HLS (dossier §5/§A.2;
+ *     ALL_FORMATS includes HlsInputFormat — input-format.js) and probe()/demux() open with no
+ *     container hint, so the read genuinely succeeds. Omitting it was a FALSE NA on the reference
+ *     engine. (HLS stays OUT of containersOut: HlsOutputFormat needs a PathedTarget, not BufferTarget.)
+ *   - buildVideoOptions bakes rotation into pixels (allowRotationMetadata:false) when the caller
+ *     requests an explicit `rotate`, matching the "normalize/bake rotation" intent. Without it,
+ *     mediabunny keeps the angle as ISOBMFF rotation METADATA (conversion.js canUseRotationMetadata)
+ *     and pixels stay rotated. Cite: conversion.d.ts ConversionVideoOptions.allowRotationMetadata.
+ *   - buildAudioOptions no longer pins bitrate=QUALITY_HIGH for same-codec audio: that defeated
+ *     mediabunny's lossless audio COPY fast-path (conversion.js requires `!trackOptions.bitrate`).
+ *     mediabunny supplies QUALITY_HIGH itself only inside its re-encode branch, so leaving bitrate
+ *     unset is the dossier's "copy whenever possible" path and lossless for unchanged audio.
+ *   - 'fanout' removed from capabilities().features: the suite's single-blob MediaBytes contract
+ *     can carry only ONE rendition, so transcode() emits variants[0] and cannot deliver a true
+ *     1→N ABR ladder. Declaring it let the ladder scenario score green on a single 1080p rung
+ *     (over-claim). Removing it makes that scenario negotiate NA_ENGINE honestly. (mediabunny CAN
+ *     fan out natively via ConversionVideoOptions[] — conversion.d.ts:45 — but the contract can't
+ *     surface N outputs, so the honest move is to drop the claim, not fake the green.)
+ *   - metadataFromInput reads duration via the cheap getDurationFromMetadata() FIRST and only falls
+ *     back to computeDuration() when metadata yields null (dossier §4.1 cheap path; longform/edge
+ *     probes require duration without a full sample scan / OOM). computeDuration walks all fragments
+ *     on fragmented/CMAF inputs; the metadata-first order avoids that wall-time/peak-memory inflation.
  *
  * Implements `MediaEngine` (src/core/engine.ts) entirely against the real mediabunny API. This is
  * the comparison baseline, so it is the most complete adapter and judges only observable behavior
@@ -121,9 +146,33 @@ function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
 }
 
+/** True when the asset is an HLS playlist (explicit container hint or an .m3u8/.m3u URL). */
+function isHlsAsset(input: MediaInput, container?: string): boolean {
+  if (container === 'hls') return true;
+  const u = input.url.split(/[?#]/, 1)[0] ?? '';
+  return /\.m3u8?$/i.test(u);
+}
+
 /** Build a mediabunny Input from a corpus asset. Restricts formats to the asset's container when
- *  known (faster, deterministic), else accepts ALL_FORMATS. */
+ *  known (faster, deterministic), else accepts ALL_FORMATS.
+ *
+ *  SOURCE CHOICE: normal single-file assets use a buffered BlobSource (the dossier best path — the
+ *  whole asset is already in memory, so reads are local with zero network round-trips). HLS is the
+ *  exception: mediabunny's HlsInputFormat REQUIRES a PathedSource (input-format.js `_canReadInput`
+ *  throws "HLS inputs require InputOptions.source to be a PathedSource" otherwise) because it must
+ *  resolve the playlist's relative segment URIs against a base path — a flat BlobSource has none. We
+ *  therefore back HLS with a UrlSource(input.url) (UrlSource extends PathedSource), which fetches the
+ *  m3u8 and its sibling segments over Range. This is what makes the declared containersIn:'hls'
+ *  honest rather than a runtime throw. Cite: source.d.ts UrlSource/PathedSource; input-format.js. */
 async function openInput(mb: MB, input: MediaInput, container?: string): Promise<Input> {
+  if (isHlsAsset(input, container)) {
+    // PathedSource (UrlSource) is mandatory for HLS segment resolution; restrict to HLS format so the
+    // playlist is parsed as HLS (and the source's _usedForHls flag is set).
+    return new mb.Input({
+      source: new mb.UrlSource(input.url),
+      formats: [mb.HLS],
+    });
+  }
   const blob = await input.blob();
   const formats: InputFormat[] = [];
   if (container) {
@@ -220,14 +269,23 @@ async function metadataFromInput(input: Input): Promise<NormalizedMetadata> {
   const format = await input.getFormat();
   const container = canonicalContainerFromFormat(format.name);
 
-  // Prefer precise duration; fall back to metadata duration; else null.
+  // Duration via the CHEAP metadata path first (dossier §4.1): getDurationFromMetadata() reads the
+  // container's declared duration (mvhd/Segment-duration/etc.) WITHOUT scanning samples, so longform
+  // and fragmented/CMAF inputs don't pay a full-fragment walk (computeDuration(Infinity) must walk
+  // every moof to find the last packet → wall-time + peak-memory inflation; the longform/edge probes
+  // explicitly require duration "cheaply, not by scanning every sample, no OOM"). Only when metadata
+  // yields null/non-finite do we fall back to the precise computeDuration() scan.
   let durationSec: number | null = null;
   try {
-    const d = await input.computeDuration();
-    durationSec = Number.isFinite(d) ? d : null;
+    const meta = await input.getDurationFromMetadata();
+    durationSec = meta != null && Number.isFinite(meta) ? meta : null;
   } catch {
+    durationSec = null;
+  }
+  if (durationSec === null) {
     try {
-      durationSec = await input.getDurationFromMetadata();
+      const d = await input.computeDuration();
+      durationSec = Number.isFinite(d) ? d : null;
     } catch {
       durationSec = null;
     }
@@ -338,7 +396,17 @@ async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<Conv
   // dossier §4.6/§A.8.
   if (typeof v.width === 'number' && typeof v.height === 'number') opts.fit = 'fill';
   if (typeof v.fps === 'number') opts.frameRate = v.fps;
-  if (typeof v.rotate === 'number') opts.rotate = (((v.rotate % 360) + 360) % 360) as Rotation;
+  if (typeof v.rotate === 'number') {
+    opts.rotate = (((v.rotate % 360) + 360) % 360) as Rotation;
+    // The rotate cases are NORMALIZE-rotation cases (e.g. h264_rotate_normalize: bake a rotated
+    // source's 90° display rotation into upright pixels). By default mediabunny keeps the resulting
+    // angle as ISOBMFF rotation METADATA whenever the output container supports it
+    // (conversion.js canUseRotationMetadata), so the coded pixels stay rotated and only the
+    // container flag changes. Forcing allowRotationMetadata:false bakes the total rotation
+    // (innate + requested) into the frames, which is the intended "normalized" output.
+    // Cite: conversion.d.ts ConversionVideoOptions.allowRotationMetadata; dossier §4.6.
+    opts.allowRotationMetadata = false;
+  }
 
   // No codec requested → this may end up a lossless copy (no encode); keep the best-path hint and
   // return (the Conversion only applies hardwareAcceleration when it actually transcodes).
@@ -395,9 +463,19 @@ async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<Conv
   return opts;
 }
 
-/** Build mediabunny ConversionAudioOptions from a TranscodeOptions.audio block. */
+/**
+ * Build mediabunny ConversionAudioOptions from a TranscodeOptions.audio block.
+ *
+ * IMPORTANT: leave `bitrate` UNSET unless the caller pinned a numeric one. mediabunny's lossless
+ * audio COPY fast-path requires `!trackOptions.bitrate` (node_modules/mediabunny .../conversion.js
+ * the same-codec/same-params copy condition), and mediabunny itself defaults to QUALITY_HIGH only
+ * INSIDE its re-encode branch (`trackOptions.bitrate ?? QUALITY_HIGH`). Eagerly pinning QUALITY_HIGH
+ * here would force a needless lossy re-encode for any same-codec/same-param audio (slower + fidelity
+ * loss); not setting it preserves the dossier's "copy whenever possible" path while still getting a
+ * sensible bitrate when a re-encode is genuinely required.
+ */
 function buildAudioOptions(
-  mb: MB,
+  _mb: MB,
   a: NonNullable<TranscodeOptions['audio']>,
 ): ConversionAudioOptions {
   const opts: ConversionAudioOptions = {};
@@ -408,7 +486,6 @@ function buildAudioOptions(
   if (typeof a.sampleRate === 'number') opts.sampleRate = a.sampleRate;
   if (typeof a.channels === 'number') opts.numberOfChannels = a.channels;
   if (typeof a.bitrate === 'number') opts.bitrate = a.bitrate;
-  else if (a.codec) opts.bitrate = mb.QUALITY_HIGH;
   return opts;
 }
 
@@ -486,9 +563,12 @@ export class MediabunnyEngine implements MediaEngine {
         mux: true,
         decrypt: true,
       },
-      // Read side: every container mediabunny can demux/probe.
-      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'],
-      // Write side: every container mediabunny can mux. (HLS is multi-file/pathed → excluded here.)
+      // Read side: every container mediabunny can demux/probe. HLS is dossier-confirmed readable
+      // (§5/§A.2) and is in ALL_FORMATS, so probe()/demux() (which open with no container hint)
+      // genuinely parse it — omitting it was a false NA on the reference engine.
+      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'hls', 'wav', 'mp3', 'flac', 'ogg', 'adts'],
+      // Write side: every container mediabunny can mux. (HLS is multi-file/pathed — HlsOutputFormat
+      // needs a PathedTarget, incompatible with BufferTarget → excluded from the write side.)
       containersOut: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'],
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'],
@@ -501,9 +581,14 @@ export class MediabunnyEngine implements MediaEngine {
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'resize', // Conversion video width/height
-        'rotate', // Conversion video rotate + rotation metadata
+        'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
         'alpha', // VP9 alpha (WebM/MKV) via alpha:'keep'
-        'fanout', // Conversion video/audio fan-out (1→N renditions)
+        // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
+        // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
+        // returns a SINGLE blob, so transcode() can only deliver variants[0] — it cannot surface the
+        // N separate renditions an ABR ladder needs. Declaring 'fanout' would let the ladder scenario
+        // score green on one rung (over-claim); dropping it makes that scenario negotiate NA_ENGINE
+        // honestly until the contract can carry multiple outputs.
       ],
     };
   }
@@ -604,11 +689,14 @@ export class MediabunnyEngine implements MediaEngine {
 
   // ── transcode ──────────────────────────────────────────────────────────────────────────────
   /**
-   * Codec / resolution / fps / bitrate / rotate transcode via Conversion. When `opts.variants` is
-   * set this is a FAN-OUT (1→N renditions): mediabunny supports it natively by returning an array
-   * of ConversionVideoOptions from the per-track callback. For the suite's single-bytes contract we
-   * produce the FIRST variant's bytes; mediabunny would write all N renditions into one output if
-   * the format allows. (Multi-rendition delivery is HLS/ABR territory — see notes in the summary.)
+   * Codec / resolution / fps / bitrate / rotate transcode via Conversion.
+   *
+   * NOTE on `opts.variants` (ABR ladder): mediabunny natively fans out (ConversionVideoOptions[]),
+   * but the suite's MediaBytes contract returns a SINGLE blob, so we cannot deliver N separate
+   * renditions. We therefore DO NOT declare the 'fanout' feature (capabilities()), which makes the
+   * ladder scenario negotiate NA_ENGINE rather than scoring on one rung. If a caller still passes
+   * `variants` we transcode the FIRST rung only (a defined, non-crashing fallback) — but no green
+   * number is claimed for the ladder because the capability is undeclared.
    */
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     const format = makeOutputFormat(opts.container);

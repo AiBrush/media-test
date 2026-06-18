@@ -1,5 +1,9 @@
 /**
- * src/scenarios/performance/index.ts — the headline performance battery (§8.1 / §A.14).
+ * src/scenarios/performance/index.ts — the headline performance battery (§8.1 / §A.14) + the extended
+ * per-op sweep (§8.2), size axis (§5.3), decode/encode/seek + resource metrics (§A.14), and metamorphic
+ * deep-edge (§A.16). Aggregates every performance topic file into the single `performanceScenarios`
+ * array that src/scenarios/index.ts imports (the only seam this writer may feed without editing
+ * src/scenarios/index.ts).
  *
  * These are the Mediabunny-parity headline cases, run for EVERY framework. Each declares a single
  * `primaryMetric` (the one number the per-case leaderboard ranks engines by, §9). Correctness still
@@ -11,18 +15,43 @@
  *   - performance/convert-webm-resize-320x180   (transcode → WebM, resize)        → 'framesPerSec'
  *   - performance/bundle-size                   (offline per-engine min+gzip)      → 'bundleSize'
  *
- * BIG-READ ASSET (§8.1): the three throughput cases run against the largest 1080p H.264 file in the
- * corpus so that probe/demux/transcode throughput is dominated by real work, not fixed per-call
- * overhead — exactly the "big read" Mediabunny benchmarks against. The manifest's current largest
- * 1080p H.264 asset is `h264_1080p_30s.mp4` (~31 MB, 30 s). A dedicated, much larger big-read asset
- * (`BIG_READ_ASSET` below) is the INTENDED headline input; it is referenced here by its canonical id
- * so the runner and golden filenames line up the moment the bake produces it. Until the bake adds
- * it, the case still resolves correctness against `h264_1080p_30s.mp4` golden — see BAKE NOTE.
+ * EXTENDED cases (added in the sibling files, all exported through this array):
+ *   - op-sweep.ts          §8.2 per-op TIMED throughput, ranked: probe→opsPerSec, demux→packetsPerSec,
+ *                          remux→throughputRealtime, transcode→encodeFps.
+ *   - decode-encode-seek.ts §A.14 decodeFps↑ / encodeFps↑ / seekMs↓ headline-adjacent cases.
+ *   - size-ladder.ts       §5.3 size axis tiny→…→massive (ops/packets/peakMemory) + OOM-resistance.
+ *   - resource.ts          §A.14 peakMemory↓ and longtasks↓ ranked on the heavy convert workload.
+ *   - metamorphic.ts       §A.16 transcode-idempotent / probe-duration / decode(remux(x)) / VFR.
+ *
+ * HONESTY BOUNDARY — §A.14 metrics deliberately NOT given a standalone case (see _shared.ts header for
+ * the full mechanism): loadInit (cold+warm, §8.4/§0.7), timeToFirstFrame/timeToFirstByte (§A.14 'ms↓'),
+ * sourceReads (§A.14 'count↓ = lazier'), and per-FEATURE bundle-size (§8.1 asks per-feature + total).
+ * The runner produces NO sample for any of these (it never times init() into loadInitMs, never records
+ * first-byte/first-frame markers, never wraps the source in CountingSource, and the bundleSizeKb
+ * injection does not exist), and adding that wiring lives in runner/app/engine — OUTSIDE this writer's
+ * scope. A scenario whose primaryMetric can never receive a sample is a permanently-blank leaderboard
+ * cell that READS as measured (the silent-hole anti-pattern the spec calls worse than an honest
+ * omission). So these are documented as known gaps + the exact one-line wiring each needs, rather than
+ * shipped as dead cases that fabricate the appearance of coverage. The existing bundle-size case below
+ * is itself NA until that injection lands (see its comment); we do not multiply that hole.
+ *
+ * BIG-READ ASSET (§8.1): the throughput cases run against the largest 1080p H.264 file with FULL golden
+ * so throughput is dominated by real work, not per-call overhead — exactly the "big read" Mediabunny
+ * benchmarks against. The corpus's largest fully-golden 1080p H.264 asset is `h264_1080p_30s.mp4`
+ * (~31 MB, 30 s). A dedicated, much larger big-read asset (`BIG_READ_ASSET` below) is the INTENDED
+ * headline input; the size-ladder file additionally wires the manifest's large/huge/massive rungs by
+ * their canonical ids so the runner + golden filenames line up the moment the bake produces them (until
+ * then those rungs resolve to a clean golden-absent FAIL / NA — never a fabricated number). See BAKE NOTE.
  */
 
 import type { TranscodeOptions } from '../../core/engine.ts';
 import type { MetricId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import { opSweepScenarios } from './op-sweep.ts';
+import { decodeEncodeSeekScenarios } from './decode-encode-seek.ts';
+import { sizeLadderScenarios } from './size-ladder.ts';
+import { resourceScenarios } from './resource.ts';
+import { metamorphicScenarios } from './metamorphic.ts';
 
 /**
  * BAKE NOTE — big-read asset.
@@ -221,10 +250,17 @@ const bundleSize: Scenario = defineScenario({
 // ── battery ──────────────────────────────────────────────────────────────────────────────────────
 
 export const performanceScenarios: Scenario[] = [
+  // Original Mediabunny-parity headlines (§8.1).
   extractMetadata,
   iterateVideoPackets,
   convertWebmResize,
   bundleSize,
+  // Extended battery (§8.2 sweep, §A.14 fps/seek/resource, §5.3 size axis, §A.16 metamorphic).
+  ...opSweepScenarios,
+  ...decodeEncodeSeekScenarios,
+  ...sizeLadderScenarios,
+  ...resourceScenarios,
+  ...metamorphicScenarios,
 ];
 
 export default performanceScenarios;

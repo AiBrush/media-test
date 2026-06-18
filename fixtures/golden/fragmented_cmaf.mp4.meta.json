@@ -1,0 +1,26 @@
+{
+  "container": "mp4",
+  "durationSec": 4.021,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "h264",
+      "width": 1280,
+      "height": 720,
+      "fps": 29.841,
+      "bitrate": 2765369,
+      "language": "und"
+    },
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 128463,
+      "language": "und"
+    }
+  ],
+  "tags": {
+    "major_brand": "iso5"
+  }
+}

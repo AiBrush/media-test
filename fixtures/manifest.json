@@ -548,6 +548,21 @@
       "notes": "huge bucket (~500-700 MB) self-contained big-read asset: large 1080p H.264 .mov for metadata-extract / packet-iterate / convert throughput at scale (mirrors Mediabunny's published-chart input shape). Generated offline, no network needed — always present after a full bake. The REAL BigBuckBunny1080pH264.mov is additionally available as the 'provided' entry big_buck_bunny_1080p_h264.mov for published-chart parity."
     },
     {
+      "id": "huge_vp9_1080p_240s.webm",
+      "family": "size-ladder",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "huge",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 240s (4 min) + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 34 -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 96k, -f webm. Targets ~500-700 MB to land in the 'huge' band. WebM/VP9 twin of huge_h264_1080p_600s.mov so the huge rung crosses BOTH major container/codec families (§5.3 worked example). VERY slow (VP9 sw encode of long 1080p); gated by --skip-longform.",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "huge bucket (~500-700 MB) WebM/VP9 big-read twin. §5.3 requires at least one asset per major container/codec per bucket — this pairs with huge_h264_1080p_600s.mov so the size axis crosses the format axis at the huge rung. Generated offline; --skip-longform omits it during quick bakes."
+    },
+    {
       "id": "big_buck_bunny_1080p_h264.mov",
       "family": "big-read",
       "container": "mov",
@@ -595,6 +610,21 @@
       "notes": "massive bucket (~1-1.4 GB, 2h, ~216k video frames) low-bitrate 1080p. Exercises lazy/partial reading, streaming demux, peak-memory and OOM-resistance, and many-thousand-sample sample-table parsing. Generated offline but slow; --skip-longform omits it. Real multi-hour camera/broadcast captures may additionally be supplied as 'provided'."
     },
     {
+      "id": "massive_vp9_1080p_2h.webm",
+      "family": "stress",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "massive",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 7200s (2h) + sine 48k mono, libvpx-vp9 -b:v 700k -maxrate 800k -bufsize 1600k (low bitrate, capped) -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 64k, -f webm. Low-bitrate long-form so the file lands ~1-1.4 GB / many-thousand-sample with bounded encode time. WebM/VP9 twin of massive_h264_1080p_2h.mp4 so the massive rung crosses BOTH major families (§5.3). VERY slow + very large; gated by --skip-longform.",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "massive bucket (~1-1.4 GB, 2h) low-bitrate 1080p WebM/VP9 twin. Pairs with massive_h264_1080p_2h.mp4 so lazy-read / streaming / peak-memory / OOM-resistance + many-sample stress is exercised in both major container/codec families. Generated offline but slow; --skip-longform omits it."
+    },
+    {
       "id": "zero_length.mp4",
       "family": "stress",
       "container": "mp4",
@@ -620,6 +650,122 @@
       "sha256": "4b6461cf10b34646bd53312143c9e24f4e83e777be116be0630d2fcbb9a0d15d",
       "sizeBytes": 373248,
       "notes": "Truncated MP4 (incomplete moov/mdat). Robustness: graceful failure or partial-but-safe handling. micro-ish robustness rung."
+    },
+    {
+      "id": "video_1x1.webm",
+      "family": "deep-edge",
+      "container": "webm",
+      "codecs": [
+        "vp9"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 4x4@30 2s then -vf scale=1:1, libvpx-vp9 yuv420p -b:v 0 -crf 40, -f webm (video-only). libx264/yuv420p cannot encode 1x1 — VP9 carries the literal 1x1 honestly; the H.264-family degenerate twin is video_2x2_h264.mp4.",
+      "sha256": "8209b24672931652ea19110893b4183fd46c88f14bf86b279a4c440e248e37df",
+      "sizeBytes": 1758,
+      "notes": "Deep edge (§A.16 '0x0 or 1x1 video'): a 1x1 VP9 WebM. Degenerate minimal dimensions; probe/decode must report 1x1 without divide-by-zero / aspect crashes. video-only (no audio track)."
+    },
+    {
+      "id": "video_2x2_h264.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 2x2@30 2s, libx264 yuv420p CRF30 -g 30 closed GOP, +faststart, no audio. Smallest EVEN-dimension H.264 (libx264 rejects 1x1 / odd dimensions under yuv420p). MP4/H.264 degenerate-size twin of video_1x1.webm.",
+      "sha256": "2b64824caa62ad2ca378e57dd4c37baeed2926fd1f0c813ab4f0fe2174d7c9d0",
+      "sizeBytes": 2653,
+      "notes": "Deep edge (§A.16 '0x0 or 1x1 video', H.264 family): 2x2 is the smallest valid even-dimension H.264. Pairs with video_1x1.webm so the tiny-dimension edge crosses both major families. video-only."
+    },
+    {
+      "id": "video_240fps.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 320x240@240 2s, libx264 yuv420p CRF28 -g 240 closed GOP, +faststart, no audio. The high-fps end of §A.16 'extreme fps (1 fps, 240 fps)'.",
+      "sha256": "4974dc00c8ffc816657a3cfedc0804c0d7f2045e054a528008c444fb08050eb0",
+      "sizeBytes": 152644,
+      "notes": "Deep edge (§A.16 'extreme fps'): 240 fps video. avg_frame_rate must report 240; per-frame PTS spacing ~4.17 ms. The 1-fps end is covered by micro_h264_1frame.mp4 (rate=1). video-only."
+    },
+    {
+      "id": "fragmented_cmaf.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg testsrc2 1280x720@30 4s + sine 48k stereo, libx264 yuv420p + AAC 128k, -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4. CMAF-style fragmented MP4: empty moov (init) + moof/mdat fragments (media), self-contained moofs.",
+      "sha256": "60e1d30350b924b1d874d57aa66773fc6667f4bddbee9f7054a377090e130beb",
+      "sizeBytes": 1458236,
+      "notes": "Deep edge (§A.16 'fragmented/CMAF init+media split'): unencrypted fragmented MP4 so the fragmentation edge is isolated from encryption (cenc_ctr.mp4 is fragmented AND encrypted). Probe/demux must handle empty-moov + moof fragments and init/media separation."
+    },
+    {
+      "id": "mislabeled_h264.webm",
+      "family": "deep-edge",
+      "container": "mp4",
+      "declaredExtension": "webm",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 320x240@30 2s + sine, libx264 yuv420p + AAC, -movflags +faststart, -f mp4 written to a .webm-named file (the -f mp4 forces the MP4 muxer regardless of extension). The bytes begin with 'ftyp...' (ISOBMFF), NOT the EBML magic 1A45DFA3.",
+      "sha256": "283297d6d316810027e9961cb256192aa498cdfe36bbdd46cff83204f799c2fa",
+      "sizeBytes": 70916,
+      "notes": "Deep edge (§A.16 'mismatched container/codec (h264 mislabeled)'): genuine H.264/MP4 bytes inside a file whose .webm extension LIES about the container. `container` here is the TRUE container (mp4); `declaredExtension` records the lie. The probe oracle must trust sniffed content over the extension/MIME. Golden meta is derived from the real (mp4) bytes."
+    },
+    {
+      "id": "gapless_aac.m4a",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg sine 440Hz 44.1k stereo 1.013s (non-frame-aligned), AAC 96k, -movflags +faststart -f mp4. AAC always carries encoder delay (priming) + end padding; the odd duration makes the padding non-trivial. iTunSMPB / edit-list gapless info present.",
+      "sha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "sizeBytes": 13504,
+      "notes": "Deep edge (§A.16 'gapless audio (encoder delay/padding)'): the decoded sample count after trimming encoder delay + padding must match the nominal 1.013 s (no gap on loop). Tests whether the engine honors edit lists / iTunSMPB priming."
+    },
+    {
+      "id": "audio_6ch_51.m4a",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg sine 440Hz 48k 3s, -af pan=5.1|c0=c0|... (fan mono to 5.1), AAC 256k, -movflags +faststart -f mp4. A 6-channel (5.1) AAC track; the rest of the audio corpus is mono/stereo.",
+      "sha256": "74a7339c4cfb9cd196ed59b6070c60271c4c0e86e3aa2d6a2975e2a66233af1a",
+      "sizeBytes": 98381,
+      "notes": "Deep edge (§A.16 'variable channel count'): 6-channel 5.1 AAC. Probe must report channels=6 / layout=5.1; downmix-to-stereo and channel-layout-aware DSP are exercised against a non-stereo source."
+    },
+    {
+      "id": "ts_discontinuity.ts",
+      "family": "deep-edge",
+      "container": "ts",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "Two independently-timestamped MPEG-TS segments byte-concatenated: segA at t=0, segB muxed with -output_ts_offset 600 (-muxpreload 0 -muxdelay 0), so the joined stream's PTS jumps ~+597 s at the splice. TS is packet-boundary concatenable. Deterministic (no reliance on fragile 33-bit PCR-wrap emission).",
+      "sha256": "0ce2a31f7bc035f0bb30255819208097c0714fc5fc30669afe41b79f190b71f3",
+      "sizeBytes": 189692,
+      "notes": "Deep edge (§A.16 'timestamp wraparound / discontinuity (TS)'): a real forward PTS discontinuity at the segment splice. The demux oracle must tolerate the jump (no negative-duration, no hang, no OOM) — mirrors a PCR wrap / stream splice."
     },
     {
       "id": "image.jpg",
