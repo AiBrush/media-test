@@ -555,7 +555,7 @@ export async function runOne(
 
     // 4) Robustness path: mutate → expect graceful failure within the timeout.
     if (isRobustness && scenario.mutate) {
-      return await runRobustness(engine, scenario, primaryInput, finalize);
+      return await runRobustness(engine, scenario, primaryInput, finalize, opts);
     }
 
     // 5) FUNCTIONAL PASS FIRST — execute the op (timeout-guarded), then run all oracles.
@@ -680,6 +680,7 @@ async function runRobustness(
     reason?: string,
     bench?: ScenarioResult['bench'],
   ) => ScenarioResult,
+  opts: RunOneOptions | undefined,
 ): Promise<ScenarioResult> {
   let verdict: RobustnessVerdict;
   let opResult: OpResult | undefined;
@@ -706,7 +707,7 @@ async function runRobustness(
   // When the op threw, opResult is undefined → empty output fields → graceful-failure infers PASS.
   // When it returned output, we pass it through → graceful-failure FAILs it as suspicious.
   const golden: GoldenStore = await loadGolden(input.id).catch(() => ({}) as GoldenStore);
-  const ctx = buildOracleContext(scenario, input, opResult ?? {}, golden, undefined);
+  const ctx = buildOracleContext(scenario, input, opResult ?? {}, golden, opts);
 
   const oracleOutcomes: OracleOutcome[] = [];
   for (const oracle of scenario.oracles) {

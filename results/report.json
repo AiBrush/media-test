@@ -1,6 +1,6 @@
 {
   "suiteVersion": "0.1.0",
-  "generatedAtIso": "2026-06-18T13:47:46.107Z",
+  "generatedAtIso": "2026-06-18T14:01:02.096Z",
   "referenceEngineId": "mediabunny",
   "engines": [
     "aibrush-media@dev",
@@ -3844,9 +3844,8 @@
             "durationMs": 22
           },
           "metadata/rotation_decode_read_h264_rotated90": {
-            "status": "FAIL",
-            "reason": "oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)",
-            "durationMs": 100
+            "status": "PASS",
+            "durationMs": 1955
           },
           "metadata/rotation_survives_mp4_mkv": {
             "status": "FAIL",
@@ -3897,9 +3896,8 @@
             "durationMs": 13
           },
           "mux/aac_to_adts": {
-            "status": "ERROR",
-            "reason": "mux scenario requires options.tracks (EncodedTracks)",
-            "durationMs": 0
+            "status": "PASS",
+            "durationMs": 13124
           },
           "mux/audio_only_aac_to_mp4": {
             "status": "ERROR",
@@ -4493,9 +4491,8 @@
             "durationMs": 5
           },
           "remux/aac_adts_adts_to_mp4": {
-            "status": "FAIL",
-            "reason": "oracle 'reference-reimport' failed: no ctx.referenceEngine injected",
-            "durationMs": 548
+            "status": "PASS",
+            "durationMs": 16453
           },
           "remux/aac_adts_adts_to_ts": {
             "status": "FAIL",
@@ -4557,8 +4554,8 @@
           },
           "remux/h264_bframes_1080p_mp4_to_mkv": {
             "status": "FAIL",
-            "reason": "oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)",
-            "durationMs": 668
+            "reason": "oracle 'decoded-frames-bitexact' failed: 11/12 frame digests differ; frame 1: sha256 c5db9c90…f533 vs golden 1a9d7baf…a62d; frame 2: sha256 6b3c7c08…e567 vs golden df09f706…b048; frame 3: sha256 5a2bc839…aa3d vs golden a0232e68…5876; frame 4: sha256 7a72d007…65fd vs golden e5806581…bf51; frame 5: sha256 00091ea3…7daf vs golden 7f0ee685…91e2; frame 6: sha256 9d86fdb8…a2e6 vs golden dc9efcbf…5d5b",
+            "durationMs": 1983
           },
           "remux/h264_in_mkv_mkv_to_mov": {
             "status": "FAIL",
@@ -9144,9 +9141,9 @@
             "durationMs": 506
           },
           "performance/size-ladder-extract-metadata-huge": {
-            "status": "ERROR",
-            "reason": "failed to fetch corpus asset 'huge_h264_1080p_600s.mov' (404 Not Found)",
-            "durationMs": 1
+            "status": "NA_ENGINE",
+            "reason": "engine does not declare input container 'mov'",
+            "durationMs": 0
           },
           "performance/size-ladder-extract-metadata-large": {
             "status": "ERROR",
@@ -11789,9 +11786,8 @@
             "durationMs": 176
           },
           "demux/h264_multitrack": {
-            "status": "ERROR",
-            "reason": "readAVPacket pipeline failed: AVPacketReader.create failed (null reader)",
-            "durationMs": 116
+            "status": "PASS",
+            "durationMs": 3504
           },
           "demux/h264_rotated90": {
             "status": "ERROR",
@@ -14022,7 +14018,13 @@
           "metadata/read_opus": {},
           "metadata/read_pcm_s16be": {},
           "metadata/read_vp9_1080p_10s": {},
-          "metadata/rotation_decode_read_h264_rotated90": {},
+          "metadata/rotation_decode_read_h264_rotated90": {
+            "wallMedianMs": 102.00499999523163,
+            "wallP95Ms": 102.00499999523163,
+            "primaryMetric": "wall",
+            "primaryValueMedian": 102.00499999523163,
+            "primaryUnit": "ms"
+          },
           "metadata/rotation_survives_mp4_mkv": {},
           "metadata/tagedit_no_corrupt_audio_flac": {},
           "metadata/tagedit_no_corrupt_video_mp4_mkv": {},
@@ -14033,7 +14035,16 @@
           "metadata/write_mp3_id3": {},
           "metadata/write_mp4_tags": {},
           "metadata/write_ogg_vorbiscomment": {},
-          "mux/aac_to_adts": {},
+          "mux/aac_to_adts": {
+            "wallMedianMs": 12.169999986886978,
+            "wallP95Ms": 12.169999986886978,
+            "throughputRealtime": 1453.7681146862126,
+            "peakMemoryBytes": 0,
+            "longtaskMs": 291,
+            "primaryMetric": "throughputRealtime",
+            "primaryValueMedian": 1453.7681146862126,
+            "primaryUnit": "x-realtime"
+          },
           "mux/audio_only_aac_to_mp4": {},
           "mux/av1_opus_to_mp4": {},
           "mux/drop_audio_track_subset_to_mp4": {},
@@ -14204,7 +14215,16 @@
           "probe/wav_f32": {},
           "probe/wav_s16": {},
           "probe/wav_s24": {},
-          "remux/aac_adts_adts_to_mp4": {},
+          "remux/aac_adts_adts_to_mp4": {
+            "wallMedianMs": 5.444999992847443,
+            "wallP95Ms": 5.444999992847443,
+            "throughputRealtime": 1964.9363410541587,
+            "peakMemoryBytes": 17216668,
+            "longtaskMs": 0,
+            "primaryMetric": "throughputRealtime",
+            "primaryValueMedian": 1964.9363410541587,
+            "primaryUnit": "x-realtime"
+          },
           "remux/aac_adts_adts_to_ts": {},
           "remux/av1_720p_5s_webm_to_mkv": {},
           "remux/av1_720p_5s_webm_to_mp4": {
@@ -15798,7 +15818,13 @@
           "demux/h264_4k_10s": {},
           "demux/h264_bframes_1080p": {},
           "demux/h264_in_mkv": {},
-          "demux/h264_multitrack": {},
+          "demux/h264_multitrack": {
+            "wallMedianMs": 144.7199999988079,
+            "wallP95Ms": 144.7199999988079,
+            "primaryMetric": "wall",
+            "primaryValueMedian": 144.7199999988079,
+            "primaryUnit": "ms"
+          },
           "demux/h264_rotated90": {},
           "demux/h264_ts": {},
           "demux/h264_vfr": {},
@@ -29653,12 +29679,12 @@
       "conformancePctByEngine": {
         "aibrush-media@dev": 0,
         "ffmpeg.wasm@0.12.15": 75,
-        "mediabunny@1.48.0": 27.4,
+        "mediabunny@1.48.0": 28.5,
         "mp4box@2.3.0": 63,
         "platform@chrome-149": 46.6,
-        "remotion-media-parser@4.0.479": 53.3,
+        "remotion-media-parser@4.0.479": 53.8,
         "remotion-webcodecs@4.0.479": 46.5,
-        "web-demuxer@4.0.0": 36
+        "web-demuxer@4.0.0": 37.1
       },
       "winners": [
         {
@@ -30247,21 +30273,24 @@
         {
           "scenarioId": "demux/h264_multitrack",
           "family": "demux",
-          "primaryMetric": null,
-          "winner": null,
-          "winnerValue": null,
+          "primaryMetric": "wall",
+          "winner": "web-demuxer@4.0.0",
+          "winnerValue": 144.7199999988079,
           "runnerUp": null,
           "runnerUpValue": null,
           "marginPct": null,
-          "flag": "none",
+          "flag": "uncontested",
           "eligible": [
             "mediabunny@1.48.0",
             "mp4box@2.3.0",
             "platform@chrome-149",
             "remotion-media-parser@4.0.479",
-            "remotion-webcodecs@4.0.479"
+            "remotion-webcodecs@4.0.479",
+            "web-demuxer@4.0.0"
           ],
-          "coWinners": []
+          "coWinners": [
+            "web-demuxer@4.0.0"
+          ]
         },
         {
           "scenarioId": "demux/h264_rotated90",
@@ -30977,15 +31006,19 @@
         {
           "scenarioId": "metadata/rotation_decode_read_h264_rotated90",
           "family": "metadata",
-          "primaryMetric": null,
-          "winner": null,
-          "winnerValue": null,
+          "primaryMetric": "wall",
+          "winner": "mediabunny@1.48.0",
+          "winnerValue": 102.00499999523163,
           "runnerUp": null,
           "runnerUpValue": null,
           "marginPct": null,
-          "flag": "none",
-          "eligible": [],
-          "coWinners": []
+          "flag": "uncontested",
+          "eligible": [
+            "mediabunny@1.48.0"
+          ],
+          "coWinners": [
+            "mediabunny@1.48.0"
+          ]
         },
         {
           "scenarioId": "metadata/rotation_survives_mp4_mkv",
@@ -31133,15 +31166,19 @@
         {
           "scenarioId": "mux/aac_to_adts",
           "family": "mux",
-          "primaryMetric": null,
-          "winner": null,
-          "winnerValue": null,
+          "primaryMetric": "throughputRealtime",
+          "winner": "mediabunny@1.48.0",
+          "winnerValue": 1453.7681146862126,
           "runnerUp": null,
           "runnerUpValue": null,
           "marginPct": null,
-          "flag": "none",
-          "eligible": [],
-          "coWinners": []
+          "flag": "uncontested",
+          "eligible": [
+            "mediabunny@1.48.0"
+          ],
+          "coWinners": [
+            "mediabunny@1.48.0"
+          ]
         },
         {
           "scenarioId": "mux/audio_only_aac_to_mp4",
@@ -33062,15 +33099,19 @@
         {
           "scenarioId": "remux/aac_adts_adts_to_mp4",
           "family": "remux",
-          "primaryMetric": null,
-          "winner": null,
-          "winnerValue": null,
+          "primaryMetric": "throughputRealtime",
+          "winner": "mediabunny@1.48.0",
+          "winnerValue": 1964.9363410541587,
           "runnerUp": null,
           "runnerUpValue": null,
           "marginPct": null,
-          "flag": "none",
-          "eligible": [],
-          "coWinners": []
+          "flag": "uncontested",
+          "eligible": [
+            "mediabunny@1.48.0"
+          ],
+          "coWinners": [
+            "mediabunny@1.48.0"
+          ]
         },
         {
           "scenarioId": "remux/aac_adts_adts_to_ts",
@@ -63881,8 +63922,8 @@
     {
       "engineId": "mediabunny@1.48.0",
       "isReference": false,
-      "conformancePct": 30,
-      "conformancePassCount": 84,
+      "conformancePct": 31.1,
+      "conformancePassCount": 87,
       "conformanceAdmissibleCount": 280,
       "perfIndexByBrowser": {
         "chromium": null,
@@ -63901,18 +63942,18 @@
       "robustnessRate": null,
       "robustnessPassCount": 0,
       "robustnessTotal": 0,
-      "wins": 25,
+      "wins": 28,
       "winsByBrowser": {
-        "chromium": 15,
+        "chromium": 18,
         "brave": 10
       },
-      "uncontestedWins": 24,
+      "uncontestedWins": 27,
       "perfIndexVsWinnerByBrowser": {
-        "chromium": 0.55,
+        "chromium": 0.63,
         "brave": 1
       },
       "bundleSizeKb": 165.2,
-      "verdict": "25 wins (1 contested, 24 uncontested) · perf 1× vs winners · 30% conformant · 165.2 kB bundle"
+      "verdict": "28 wins (1 contested, 27 uncontested) · perf 1× vs winners · 31.1% conformant · 165.2 kB bundle"
     },
     {
       "engineId": "mp4box@2.3.0",
@@ -63984,9 +64025,9 @@
     {
       "engineId": "remotion-media-parser@4.0.479",
       "isReference": false,
-      "conformancePct": 53.3,
+      "conformancePct": 53.8,
       "conformancePassCount": 49,
-      "conformanceAdmissibleCount": 92,
+      "conformanceAdmissibleCount": 91,
       "perfIndexByBrowser": {
         "chromium": null,
         "brave": null
@@ -64012,7 +64053,7 @@
         "brave": null
       },
       "bundleSizeKb": 72.6,
-      "verdict": "1 win · perf 0.06× vs winners · 53.3% conformant · 72.6 kB bundle"
+      "verdict": "1 win · perf 0.06× vs winners · 53.8% conformant · 72.6 kB bundle"
     },
     {
       "engineId": "remotion-webcodecs@4.0.479",
@@ -64052,8 +64093,8 @@
     {
       "engineId": "web-demuxer@4.0.0",
       "isReference": false,
-      "conformancePct": 36,
-      "conformancePassCount": 32,
+      "conformancePct": 37.1,
+      "conformancePassCount": 33,
       "conformanceAdmissibleCount": 89,
       "perfIndexByBrowser": {
         "chromium": null,
@@ -64069,18 +64110,18 @@
       "robustnessRate": null,
       "robustnessPassCount": 0,
       "robustnessTotal": 0,
-      "wins": 1,
+      "wins": 2,
       "winsByBrowser": {
-        "chromium": 1,
+        "chromium": 2,
         "brave": 0
       },
-      "uncontestedWins": 1,
+      "uncontestedWins": 2,
       "perfIndexVsWinnerByBrowser": {
-        "chromium": 0.13,
+        "chromium": 0.22,
         "brave": null
       },
       "bundleSizeKb": 43.2,
-      "verdict": "1 win (0 contested, 1 uncontested) · perf 0.13× vs winners · 36% conformant · 43.2 kB bundle"
+      "verdict": "2 wins (0 contested, 2 uncontested) · perf 0.22× vs winners · 37.1% conformant · 43.2 kB bundle"
     }
   ],
   "caveats": [

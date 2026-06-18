@@ -1,6 +1,6 @@
 # Browser Media-Engine Benchmark Report
 
-Reference engine: `mediabunny` · Suite 0.1.0 · Generated 2026-06-18T13:47:46.107Z
+Reference engine: `mediabunny` · Suite 0.1.0 · Generated 2026-06-18T14:01:02.096Z
 
 Engines: `aibrush-media@dev`, `ffmpeg.wasm@0.12.15`, `mediabunny@1.48.0`, `mp4box@2.3.0`, `platform@chrome-149`, `remotion-media-parser@4.0.479`, `remotion-webcodecs@4.0.479`, `web-demuxer@4.0.0` · Browsers: chromium, brave · Scenarios: 338
 
@@ -12,12 +12,12 @@ All deltas are **within a single browser, vs the reference engine, on the same c
 
 | # | Engine | Wins | Conf % | Robust % | Bundle | Breadth | Verdict |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `mediabunny@1.48.0` | 25 (24 unc.) | 30% | — | 165.2 kB | 7 | 25 wins (1 contested, 24 uncontested) · perf 1× vs winners · 30% conformant · 165.2 kB bundle |
+| 1 | `mediabunny@1.48.0` | 28 (27 unc.) | 31.1% | — | 165.2 kB | 7 | 28 wins (1 contested, 27 uncontested) · perf 1× vs winners · 31.1% conformant · 165.2 kB bundle |
 | 2 | `remotion-webcodecs@4.0.479` | 7 (7 unc.) | 46.5% | — | 94 kB | 6 | 7 wins (0 contested, 7 uncontested) · perf 0.15× vs winners · 46.5% conformant · 94 kB bundle |
 | 3 | `mp4box@2.3.0` | 3 (2 unc.) | 63% | — | 41.3 kB | 5 | 3 wins (1 contested, 2 uncontested) · perf 0.25× vs winners · 63% conformant · 41.3 kB bundle |
 | 4 | `ffmpeg.wasm@0.12.15` | 2 | 75% | — | 1.4 kB | 1 | 2 wins · perf 0.74× vs winners · 75% conformant · 1.4 kB bundle |
-| 5 | `remotion-media-parser@4.0.479` | 1 | 53.3% | — | 72.6 kB | 4 | 1 win · perf 0.06× vs winners · 53.3% conformant · 72.6 kB bundle |
-| 6 | `web-demuxer@4.0.0` | 1 (1 unc.) | 36% | — | 43.2 kB | 4 | 1 win (0 contested, 1 uncontested) · perf 0.13× vs winners · 36% conformant · 43.2 kB bundle |
+| 5 | `web-demuxer@4.0.0` | 2 (2 unc.) | 37.1% | — | 43.2 kB | 4 | 2 wins (0 contested, 2 uncontested) · perf 0.22× vs winners · 37.1% conformant · 43.2 kB bundle |
+| 6 | `remotion-media-parser@4.0.479` | 1 | 53.8% | — | 72.6 kB | 4 | 1 win · perf 0.06× vs winners · 53.8% conformant · 72.6 kB bundle |
 | 7 | `platform@chrome-149` | 0 | 47.2% | — | — | 4 | 0 wins · perf 0.9× vs winners · 47.2% conformant |
 | 8 | `aibrush-media@dev` | 0 | 0% | — | — | 0 | 0 wins · 0% conformant |
 
@@ -29,12 +29,12 @@ _Wins = cases where the engine was the fastest CORRECT engine; co-winners of a t
 | --- | --- | --- |
 | `aibrush-media@dev` | 0% | 0% |
 | `ffmpeg.wasm@0.12.15` | 75% | 0% |
-| `mediabunny@1.48.0` | 27.4% | 100% |
+| `mediabunny@1.48.0` | 28.5% | 100% |
 | `mp4box@2.3.0` | 63% | 0% |
 | `platform@chrome-149` | 46.6% | 100% |
-| `remotion-media-parser@4.0.479` | 53.3% | 0% |
+| `remotion-media-parser@4.0.479` | 53.8% | 0% |
 | `remotion-webcodecs@4.0.479` | 46.5% | 0% |
-| `web-demuxer@4.0.0` | 36% | 0% |
+| `web-demuxer@4.0.0` | 37.1% | 0% |
 
 ## Browser: chromium
 
@@ -86,7 +86,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `demux/h264_4k_10s` | — | N/A | — | Pass (53 ms) | Pass (56 ms) | Pass (63 ms) | Pass (478 ms) | Pass (2.07 s) | ERROR |
 | `demux/h264_bframes_1080p` | — | N/A | — | FAIL | Pass (33 ms) | Pass (38 ms) | FAIL | FAIL | ERROR |
 | `demux/h264_in_mkv` | — | N/A | — | Pass (20 ms) | N/A | Pass (20 ms) | N/A | Pass (82 ms) | ERROR |
-| `demux/h264_multitrack` | — | N/A | — | Pass (16 ms) | Pass (24 ms) | Pass (24 ms) | Pass (163 ms) | Pass (177 ms) | ERROR |
+| `demux/h264_multitrack` | wall (ms) | N/A | — | Pass (16 ms) | Pass (24 ms) | Pass (24 ms) | Pass (163 ms) | Pass (177 ms) | Pass (145 ms) |
 | `demux/h264_rotated90` | — | N/A | — | Pass (14 ms) | Pass (20 ms) | Pass (18 ms) | Pass (110 ms) | Pass (115 ms) | ERROR |
 | `demux/h264_ts` | — | N/A | — | Pass (88 ms) | N/A | N/A | FAIL | FAIL | ERROR |
 | `demux/h264_vfr` | — | N/A | — | FAIL | Pass (15 ms) | Pass (17 ms) | FAIL | FAIL | ERROR |
@@ -134,7 +134,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/read_opus` | — | N/A | — | Pass (7 ms) | N/A | N/A | N/A | N/A | N/A |
 | `metadata/read_pcm_s16be` | — | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
 | `metadata/read_vp9_1080p_10s` | — | N/A | — | Pass (22 ms) | N/A | FAIL | FAIL | FAIL | Pass (60 ms) |
-| `metadata/rotation_decode_read_h264_rotated90` | — | N/A | — | FAIL | N/A | FAIL | N/A | FAIL | FAIL |
+| `metadata/rotation_decode_read_h264_rotated90` | wall (ms) | N/A | — | Pass (102 ms) | N/A | FAIL | N/A | FAIL | FAIL |
 | `metadata/rotation_survives_mp4_mkv` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/tagedit_no_corrupt_audio_flac` | — | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
 | `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
@@ -145,7 +145,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/write_mp3_id3` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/write_mp4_tags` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/write_ogg_vorbiscomment` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
-| `mux/aac_to_adts` | — | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
+| `mux/aac_to_adts` | throughputRealtime (x-realtime) | N/A | — | Pass (12.17 ms) | N/A | N/A | N/A | N/A | N/A |
 | `mux/audio_only_aac_to_mp4` | — | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
 | `mux/av1_opus_to_mp4` | — | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
 | `mux/drop_audio_track_subset_to_mp4` | — | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
@@ -215,7 +215,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `performance/size-ladder-demux-peak-memory-huge` | — | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-demux-peak-memory-large` | — | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-demux-peak-memory-large4k` | — | N/A | — | Pass (52 ms) | Pass (53 ms) | Pass (60 ms) | Pass (506 ms) | Pass (2.12 s) | ERROR |
-| `performance/size-ladder-extract-metadata-huge` | — | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
+| `performance/size-ladder-extract-metadata-huge` | — | N/A | — | ERROR | ERROR | ERROR | N/A | ERROR | ERROR |
 | `performance/size-ladder-extract-metadata-large` | — | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-extract-metadata-large4k` | — | N/A | — | Pass (35 ms) | Pass (41 ms) | Pass (46 ms) | Pass (37 ms) | Pass (12 ms) | Pass (83 ms) |
 | `performance/size-ladder-extract-metadata-massive` | — | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
@@ -273,7 +273,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `probe/wav_f32` | — | N/A | — | Pass (9 ms) | N/A | N/A | ERROR | ERROR | N/A |
 | `probe/wav_s16` | — | N/A | — | Pass (4 ms) | N/A | N/A | Pass (7 ms) | Pass (6 ms) | N/A |
 | `probe/wav_s24` | — | N/A | — | Pass (5 ms) | N/A | N/A | Pass (11 ms) | Pass (4 ms) | N/A |
-| `remux/aac_adts_adts_to_mp4` | — | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
+| `remux/aac_adts_adts_to_mp4` | throughputRealtime (x-realtime) | N/A | — | Pass (5.44 ms) | N/A | N/A | N/A | FAIL | N/A |
 | `remux/aac_adts_adts_to_ts` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/av1_720p_5s_webm_to_mkv` | — | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/av1_720p_5s_webm_to_mp4` | throughputRealtime (x-realtime) | N/A | — | Pass (23.18 ms) | N/A | N/A | N/A | FAIL | N/A |
@@ -429,7 +429,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `demux/h264_4k_10s` | — | — | — | — | 5 | no winner |
 | `demux/h264_bframes_1080p` | — | — | — | — | 2 | no winner |
 | `demux/h264_in_mkv` | — | — | — | — | 3 | no winner |
-| `demux/h264_multitrack` | — | — | — | — | 5 | no winner |
+| `demux/h264_multitrack` | `web-demuxer@4.0.0` (uncontested) | 144.72 ms | — | — | 6 | uncontested |
 | `demux/h264_rotated90` | — | — | — | — | 5 | no winner |
 | `demux/h264_ts` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
 | `demux/h264_vfr` | — | — | — | — | 2 | no winner |
@@ -477,7 +477,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/read_opus` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
 | `metadata/read_pcm_s16be` | — | — | — | — | 0 | no winner |
 | `metadata/read_vp9_1080p_10s` | — | — | — | — | 2 | no winner |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | 0 | no winner |
+| `metadata/rotation_decode_read_h264_rotated90` | `mediabunny@1.48.0` (uncontested) | 102 ms | — | — | 1 | uncontested |
 | `metadata/rotation_survives_mp4_mkv` | — | — | — | — | 0 | no winner |
 | `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | 0 | no winner |
 | `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | 0 | no winner |
@@ -488,7 +488,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/write_mp3_id3` | — | — | — | — | 0 | no winner |
 | `metadata/write_mp4_tags` | — | — | — | — | 0 | no winner |
 | `metadata/write_ogg_vorbiscomment` | — | — | — | — | 0 | no winner |
-| `mux/aac_to_adts` | — | — | — | — | 0 | no winner |
+| `mux/aac_to_adts` | `mediabunny@1.48.0` (uncontested) | 1453.77 x-realtime | — | — | 1 | uncontested |
 | `mux/audio_only_aac_to_mp4` | — | — | — | — | 0 | no winner |
 | `mux/av1_opus_to_mp4` | — | — | — | — | 0 | no winner |
 | `mux/drop_audio_track_subset_to_mp4` | — | — | — | — | 0 | no winner |
@@ -616,7 +616,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `probe/wav_f32` | `mediabunny@1.48.0` (uncontested) | — | — | — | 1 | uncontested |
 | `probe/wav_s16` | — | — | — | — | 3 | no winner |
 | `probe/wav_s24` | — | — | — | — | 3 | no winner |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | 0 | no winner |
+| `remux/aac_adts_adts_to_mp4` | `mediabunny@1.48.0` (uncontested) | 1964.94 x-realtime | — | — | 1 | uncontested |
 | `remux/aac_adts_adts_to_ts` | — | — | — | — | 0 | no winner |
 | `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | 0 | no winner |
 | `remux/av1_720p_5s_webm_to_mp4` | `mediabunny@1.48.0` (uncontested) | 537.92 x-realtime | — | — | 1 | uncontested |
@@ -772,7 +772,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `demux/h264_4k_10s` | N/A | — | Pass (53 ms) | Pass (56 ms) | Pass (63 ms) | Pass (478 ms) | Pass (2.07 s) | ERROR |
 | `demux/h264_bframes_1080p` | N/A | — | FAIL | Pass (33 ms) | Pass (38 ms) | FAIL | FAIL | ERROR |
 | `demux/h264_in_mkv` | N/A | — | Pass (20 ms) | N/A | Pass (20 ms) | N/A | Pass (82 ms) | ERROR |
-| `demux/h264_multitrack` | N/A | — | Pass (16 ms) | Pass (24 ms) | Pass (24 ms) | Pass (163 ms) | Pass (177 ms) | ERROR |
+| `demux/h264_multitrack` | N/A | — | Pass (16 ms) | Pass (24 ms) | Pass (24 ms) | Pass (163 ms) | Pass (177 ms) | Pass (145 ms) |
 | `demux/h264_rotated90` | N/A | — | Pass (14 ms) | Pass (20 ms) | Pass (18 ms) | Pass (110 ms) | Pass (115 ms) | ERROR |
 | `demux/h264_ts` | N/A | — | Pass (88 ms) | N/A | N/A | FAIL | FAIL | ERROR |
 | `demux/h264_vfr` | N/A | — | FAIL | Pass (15 ms) | Pass (17 ms) | FAIL | FAIL | ERROR |
@@ -820,7 +820,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/read_opus` | N/A | — | Pass (7 ms) | N/A | N/A | N/A | N/A | N/A |
 | `metadata/read_pcm_s16be` | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
 | `metadata/read_vp9_1080p_10s` | N/A | — | Pass (22 ms) | N/A | FAIL | FAIL | FAIL | Pass (60 ms) |
-| `metadata/rotation_decode_read_h264_rotated90` | N/A | — | FAIL | N/A | FAIL | N/A | FAIL | FAIL |
+| `metadata/rotation_decode_read_h264_rotated90` | N/A | — | Pass (102 ms) | N/A | FAIL | N/A | FAIL | FAIL |
 | `metadata/rotation_survives_mp4_mkv` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/tagedit_no_corrupt_audio_flac` | N/A | — | N/A | N/A | N/A | N/A | N/A | N/A |
 | `metadata/tagedit_no_corrupt_video_mp4_mkv` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
@@ -831,7 +831,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `metadata/write_mp3_id3` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/write_mp4_tags` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `metadata/write_ogg_vorbiscomment` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
-| `mux/aac_to_adts` | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
+| `mux/aac_to_adts` | N/A | — | Pass (12.17 ms) | N/A | N/A | N/A | N/A | N/A |
 | `mux/audio_only_aac_to_mp4` | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
 | `mux/av1_opus_to_mp4` | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
 | `mux/drop_audio_track_subset_to_mp4` | N/A | — | ERROR | N/A | N/A | N/A | N/A | N/A |
@@ -901,7 +901,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `performance/size-ladder-demux-peak-memory-huge` | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-demux-peak-memory-large` | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-demux-peak-memory-large4k` | N/A | — | Pass (52 ms) | Pass (53 ms) | Pass (60 ms) | Pass (506 ms) | Pass (2.12 s) | ERROR |
-| `performance/size-ladder-extract-metadata-huge` | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
+| `performance/size-ladder-extract-metadata-huge` | N/A | — | ERROR | ERROR | ERROR | N/A | ERROR | ERROR |
 | `performance/size-ladder-extract-metadata-large` | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
 | `performance/size-ladder-extract-metadata-large4k` | N/A | — | Pass (35 ms) | Pass (41 ms) | Pass (46 ms) | Pass (37 ms) | Pass (12 ms) | Pass (83 ms) |
 | `performance/size-ladder-extract-metadata-massive` | N/A | — | ERROR | ERROR | ERROR | ERROR | ERROR | ERROR |
@@ -959,7 +959,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 | `probe/wav_f32` | N/A | — | Pass (9 ms) | N/A | N/A | ERROR | ERROR | N/A |
 | `probe/wav_s16` | N/A | — | Pass (4 ms) | N/A | N/A | Pass (7 ms) | Pass (6 ms) | N/A |
 | `probe/wav_s24` | N/A | — | Pass (5 ms) | N/A | N/A | Pass (11 ms) | Pass (4 ms) | N/A |
-| `remux/aac_adts_adts_to_mp4` | N/A | — | FAIL | N/A | N/A | N/A | FAIL | N/A |
+| `remux/aac_adts_adts_to_mp4` | N/A | — | Pass (5.44 ms) | N/A | N/A | N/A | FAIL | N/A |
 | `remux/aac_adts_adts_to_ts` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/av1_720p_5s_webm_to_mkv` | N/A | — | FAIL | N/A | N/A | N/A | N/A | N/A |
 | `remux/av1_720p_5s_webm_to_mp4` | N/A | — | Pass (23.18 ms) | N/A | N/A | N/A | FAIL | N/A |
@@ -1471,7 +1471,6 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `mediabunny@1.48.0` · `metadata/read_flac_seektable` — **N/A**: browser cannot decode audio codec 'flac' (WebCodecs AudioDecoder.isConfigSupported=false)
 - `mediabunny@1.48.0` · `metadata/read_no_tags_recorder_webm` — **ERROR**: failed to fetch corpus asset 'recorder_headerless.webm' (404 Not Found)
 - `mediabunny@1.48.0` · `metadata/read_pcm_s16be` — **N/A**: engine does not declare input container 'aiff'
-- `mediabunny@1.48.0` · `metadata/rotation_decode_read_h264_rotated90` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `metadata/rotation_survives_mp4_mkv` — **FAIL**: oracle 'property-invariant' failed: [decode(remux(x))==decode(x)] no golden frames = decode(x) to compare against (frame-bake pending)
 - `mediabunny@1.48.0` · `metadata/tagedit_no_corrupt_audio_flac` — **N/A**: browser cannot decode audio codec 'flac' (WebCodecs AudioDecoder.isConfigSupported=false)
 - `mediabunny@1.48.0` · `metadata/tagedit_no_corrupt_video_mp4_mkv` — **FAIL**: oracle 'property-invariant' failed: [decode(remux(x))==decode(x)] no golden frames = decode(x) to compare against (frame-bake pending)
@@ -1480,7 +1479,6 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `mediabunny@1.48.0` · `metadata/write_mp3_id3` — **FAIL**: oracle 'reference-reimport' failed: no ctx.referenceEngine injected
 - `mediabunny@1.48.0` · `metadata/write_mp4_tags` — **FAIL**: oracle 'reference-reimport' failed: no ctx.referenceEngine injected
 - `mediabunny@1.48.0` · `metadata/write_ogg_vorbiscomment` — **FAIL**: oracle 'reference-reimport' failed: no ctx.referenceEngine injected
-- `mediabunny@1.48.0` · `mux/aac_to_adts` — **ERROR**: mux scenario requires options.tracks (EncodedTracks)
 - `mediabunny@1.48.0` · `mux/audio_only_aac_to_mp4` — **ERROR**: mux scenario requires options.tracks (EncodedTracks)
 - `mediabunny@1.48.0` · `mux/av1_opus_to_mp4` — **ERROR**: mux scenario requires options.tracks (EncodedTracks)
 - `mediabunny@1.48.0` · `mux/drop_audio_track_subset_to_mp4` — **ERROR**: mux scenario requires options.tracks (EncodedTracks)
@@ -1565,7 +1563,6 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `mediabunny@1.48.0` · `probe/recorder_headerless` — **ERROR**: failed to fetch corpus asset 'recorder_headerless.webm' (404 Not Found)
 - `mediabunny@1.48.0` · `probe/truncated-header-graceful` — **FAIL**: oracle 'graceful-failure' failed: runner reported 'crash' on malformed input (not graceful)
 - `mediabunny@1.48.0` · `probe/vp8_720p_10s` — **N/A**: browser cannot decode audio codec 'vorbis' (WebCodecs AudioDecoder.isConfigSupported=false)
-- `mediabunny@1.48.0` · `remux/aac_adts_adts_to_mp4` — **FAIL**: oracle 'reference-reimport' failed: no ctx.referenceEngine injected
 - `mediabunny@1.48.0` · `remux/aac_adts_adts_to_ts` — **FAIL**: oracle 'reference-reimport' failed: no ctx.referenceEngine injected
 - `mediabunny@1.48.0` · `remux/av1_720p_5s_webm_to_mkv` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `remux/av1_720p_5s_webm_to_webm` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
@@ -1576,7 +1573,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `mediabunny@1.48.0` · `remux/h264_1080p_30s_mp4_to_ts` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `remux/h264_1080p_5s_mov_to_mkv` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `remux/h264_1080p_5s_mov_to_ts` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
-- `mediabunny@1.48.0` · `remux/h264_bframes_1080p_mp4_to_mkv` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
+- `mediabunny@1.48.0` · `remux/h264_bframes_1080p_mp4_to_mkv` — **FAIL**: oracle 'decoded-frames-bitexact' failed: 11/12 frame digests differ; frame 1: sha256 c5db9c90…f533 vs golden 1a9d7baf…a62d; frame 2: sha256 6b3c7c08…e567 vs golden df09f706…b048; frame 3: sha256 5a2bc839…aa3d vs golden a0232e68…5876; frame 4: sha256 7a72d007…65fd vs golden e5806581…bf51; frame 5: sha256 00091ea3…7daf vs golden 7f0ee685…91e2; frame 6: sha256 9d86fdb8…a2e6 vs golden dc9efcbf…5d5b
 - `mediabunny@1.48.0` · `remux/h264_in_mkv_mkv_to_mov` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `remux/h264_in_mkv_mkv_to_mp4` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
 - `mediabunny@1.48.0` · `remux/h264_in_mkv_mkv_to_ts` — **FAIL**: oracle 'decoded-frames-bitexact' failed: no golden frame digests to compare (fixtures/golden/<id>.frames.json absent or pending; frame-bake must run — not an engine defect)
@@ -2392,7 +2389,7 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `remotion-media-parser@4.0.479` · `performance/seek-ms` — **N/A**: engine does not declare operation 'seek'
 - `remotion-media-parser@4.0.479` · `performance/size-ladder-demux-peak-memory-huge` — **ERROR**: failed to fetch corpus asset 'huge_h264_1080p_600s.mov' (404 Not Found)
 - `remotion-media-parser@4.0.479` · `performance/size-ladder-demux-peak-memory-large` — **ERROR**: failed to fetch corpus asset 'large_h264_1080p_120s.mp4' (404 Not Found)
-- `remotion-media-parser@4.0.479` · `performance/size-ladder-extract-metadata-huge` — **ERROR**: failed to fetch corpus asset 'huge_h264_1080p_600s.mov' (404 Not Found)
+- `remotion-media-parser@4.0.479` · `performance/size-ladder-extract-metadata-huge` — **N/A**: engine does not declare input container 'mov'
 - `remotion-media-parser@4.0.479` · `performance/size-ladder-extract-metadata-large` — **ERROR**: failed to fetch corpus asset 'large_h264_1080p_120s.mp4' (404 Not Found)
 - `remotion-media-parser@4.0.479` · `performance/size-ladder-extract-metadata-massive` — **ERROR**: failed to fetch corpus asset 'massive_h264_1080p_2h.mp4' (404 Not Found)
 - `remotion-media-parser@4.0.479` · `performance/size-ladder-iterate-packets-huge` — **ERROR**: failed to fetch corpus asset 'huge_h264_1080p_600s.mov' (404 Not Found)
@@ -2848,7 +2845,6 @@ _Each completed cell is formatted as `Pass (<execution time>)` or `N/A`. Indicat
 - `web-demuxer@4.0.0` · `demux/h264_4k_10s` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
 - `web-demuxer@4.0.0` · `demux/h264_bframes_1080p` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
 - `web-demuxer@4.0.0` · `demux/h264_in_mkv` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
-- `web-demuxer@4.0.0` · `demux/h264_multitrack` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
 - `web-demuxer@4.0.0` · `demux/h264_rotated90` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
 - `web-demuxer@4.0.0` · `demux/h264_ts` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
 - `web-demuxer@4.0.0` · `demux/h264_vfr` — **ERROR**: readAVPacket pipeline failed: AVPacketReader.create failed (null reader)
@@ -3558,7 +3554,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `metadata/read_opus` | — | — | — | — | — |
 | `metadata/read_pcm_s16be` | — | — | — | — | — |
 | `metadata/read_vp9_1080p_10s` | — | — | — | — | — |
-| `metadata/rotation_decode_read_h264_rotated90` | — | — | — | — | — |
+| `metadata/rotation_decode_read_h264_rotated90` | 102 | 102 | — | — | — |
 | `metadata/rotation_survives_mp4_mkv` | — | — | — | — | — |
 | `metadata/tagedit_no_corrupt_audio_flac` | — | — | — | — | — |
 | `metadata/tagedit_no_corrupt_video_mp4_mkv` | — | — | — | — | — |
@@ -3569,7 +3565,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `metadata/write_mp3_id3` | — | — | — | — | — |
 | `metadata/write_mp4_tags` | — | — | — | — | — |
 | `metadata/write_ogg_vorbiscomment` | — | — | — | — | — |
-| `mux/aac_to_adts` | — | — | — | — | — |
+| `mux/aac_to_adts` | 12.2 | 12.2 | 1453.77× | 0 B | 291 |
 | `mux/audio_only_aac_to_mp4` | — | — | — | — | — |
 | `mux/av1_opus_to_mp4` | — | — | — | — | — |
 | `mux/drop_audio_track_subset_to_mp4` | — | — | — | — | — |
@@ -3697,7 +3693,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `probe/wav_f32` | — | — | — | — | — |
 | `probe/wav_s16` | — | — | — | — | — |
 | `probe/wav_s24` | — | — | — | — | — |
-| `remux/aac_adts_adts_to_mp4` | — | — | — | — | — |
+| `remux/aac_adts_adts_to_mp4` | 5.4 | 5.4 | 1964.94× | 16.42 MiB | 0 |
 | `remux/aac_adts_adts_to_ts` | — | — | — | — | — |
 | `remux/av1_720p_5s_webm_to_mkv` | — | — | — | — | — |
 | `remux/av1_720p_5s_webm_to_mp4` | 23.2 | 23.2 | 537.92× | 28.41 MiB | 0 |
@@ -4886,7 +4882,7 @@ _No admissible benchmarks (no green conformance gate)._
 | `demux/h264_4k_10s` | — | — | — | — | — |
 | `demux/h264_bframes_1080p` | — | — | — | — | — |
 | `demux/h264_in_mkv` | — | — | — | — | — |
-| `demux/h264_multitrack` | — | — | — | — | — |
+| `demux/h264_multitrack` | 144.7 | 144.7 | — | — | — |
 | `demux/h264_rotated90` | — | — | — | — | — |
 | `demux/h264_ts` | — | — | — | — | — |
 | `demux/h264_vfr` | — | — | — | — | — |
@@ -7637,12 +7633,12 @@ _No admissible benchmarks (no green conformance gate)._
 | --- | --- | --- | --- | --- | --- | --- |
 | `aibrush-media@dev` | 0% | 0 / 0 | — | — | 0 (—) | — |
 | `ffmpeg.wasm@0.12.15` | 75% | 3 / 4 | — | — | 1 (performance) | — |
-| `mediabunny@1.48.0` | 30% | 84 / 280 | — | — | 7 (demux, metadata, mux, performance, probe, remux, trim) | — |
+| `mediabunny@1.48.0` | 31.1% | 87 / 280 | — | — | 7 (demux, metadata, mux, performance, probe, remux, trim) | — |
 | `mp4box@2.3.0` | 63% | 51 / 81 | — | — | 5 (demux, metadata, performance, probe, streaming-output) | — |
 | `platform@chrome-149` | 47.2% | 42 / 89 | — | — | 4 (demux, metadata, performance, probe) | — |
-| `remotion-media-parser@4.0.479` | 53.3% | 49 / 92 | — | — | 4 (demux, metadata, performance, probe) | — |
+| `remotion-media-parser@4.0.479` | 53.8% | 49 / 91 | — | — | 4 (demux, metadata, performance, probe) | — |
 | `remotion-webcodecs@4.0.479` | 46.5% | 67 / 144 | — | — | 6 (demux, metadata, performance, probe, remux, streaming-output) | — |
-| `web-demuxer@4.0.0` | 36% | 32 / 89 | — | — | 4 (demux, metadata, performance, probe) | — |
+| `web-demuxer@4.0.0` | 37.1% | 33 / 89 | — | — | 4 (demux, metadata, performance, probe) | — |
 
 _Perf index = geometric mean of throughput ratios vs reference, per browser, over co-passing scenarios. >1.00× = faster than reference on average; null/— = no co-passing scenario to compare._
 

@@ -548,6 +548,10 @@ async function decodedFramesBitexact(ctx: OracleContext): Promise<OracleOutcome>
         'frame-bake must run — not an engine defect)',
     );
   }
+  const compareWant = goldenFramesForDecodeCompare(ctx, want);
+  if (!compareWant.length) {
+    return fail(oracle, 'scenario requested 0 golden frames to compare');
+  }
 
   // SEEK op: the candidate is the single landed frame (ctx.seek.frame). It is NOT part of an indexed
   // sequence, so we must match it to golden BY PTS, not by the engine's arbitrary frame index — an
@@ -592,7 +596,7 @@ async function decodedFramesBitexact(ctx: OracleContext): Promise<OracleOutcome>
   } else if (ctx.output) {
     let sink: FrameSink | null | undefined;
     try {
-      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: compareWant.length });
     } catch (err) {
       return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
     }
@@ -601,7 +605,14 @@ async function decodedFramesBitexact(ctx: OracleContext): Promise<OracleOutcome>
     return fail(oracle, 'no decoded frames, seek frame, or output bytes on ctx to compare');
   }
 
-  return compareDigests(oracle, got, want);
+  return compareDigests(oracle, got, compareWant);
+}
+
+function goldenFramesForDecodeCompare(ctx: OracleContext, frames: FrameDigest[]): FrameDigest[] {
+  const maxFrames = readNumberOption(ctx.scenario.options, ['maxFrames']);
+  if (maxFrames === undefined) return frames;
+  const n = Math.max(0, Math.floor(maxFrames));
+  return frames.slice(0, n);
 }
 
 /** Compare a decoded sink's digests against golden digests, matched by index (then ptsUs fallback). */

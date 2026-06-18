@@ -35,7 +35,7 @@
  */
 
 import { LADDER, mp4H264In, perfCase, T_FAST, T_HUGE, T_LARGE } from './_shared.ts';
-import type { Scenario } from '../../core/scenario.ts';
+import type { Requires, Scenario } from '../../core/scenario.ts';
 
 interface Rung {
   key: string;
@@ -60,13 +60,18 @@ function bakeNote(r: Rung): string {
     : `golden NOT baked → NA/golden-absent FAIL until the bake adds ${r.asset} + golden`;
 }
 
+function h264AacRequiresForRung(r: Rung, op: Requires['operations'][number]): Requires {
+  if (!r.asset.toLowerCase().endsWith('.mov')) return mp4H264In(op);
+  return { operations: [op], containersIn: ['mov'], videoCodecs: ['h264'], audioCodecs: ['aac'] };
+}
+
 // extract-metadata across the ladder → ops/sec (per-call overhead at small sizes, real cost at large).
 const extractLadder: Scenario[] = RUNGS.map((r) =>
   perfCase({
     id: `performance/size-ladder-extract-metadata-${r.key}`,
     op: 'probe',
     input: r.asset,
-    requires: mp4H264In('probe'),
+    requires: h264AacRequiresForRung(r, 'probe'),
     oracles: ['golden-metadata'],
     metrics: ['opsPerSec', 'wall'],
     primary: 'opsPerSec',
@@ -83,7 +88,7 @@ const iterateLadder: Scenario[] = RUNGS.map((r) =>
     id: `performance/size-ladder-iterate-packets-${r.key}`,
     op: 'demux',
     input: r.asset,
-    requires: mp4H264In('demux'),
+    requires: h264AacRequiresForRung(r, 'demux'),
     oracles: ['golden-packets'],
     metrics: ['packetsPerSec', 'throughputRealtime', 'wall'],
     primary: 'packetsPerSec',
@@ -104,7 +109,7 @@ const memoryPressure: Scenario[] = MEMORY_RUNGS.map((r) =>
     id: `performance/size-ladder-demux-peak-memory-${r.key}`,
     op: 'demux',
     input: r.asset,
-    requires: mp4H264In('demux'),
+    requires: h264AacRequiresForRung(r, 'demux'),
     oracles: ['golden-packets'],
     metrics: ['peakMemory', 'packetsPerSec', 'wall'],
     primary: 'peakMemory',

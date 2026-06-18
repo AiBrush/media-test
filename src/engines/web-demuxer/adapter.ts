@@ -39,7 +39,7 @@
  *   await d.load(file);                            // File | URL string
  *   await d.getMediaInfo();                        // WebMediaInfo { format_name, duration, streams[] }
  *   await d.getAVStreams();                        // WebAVStream[]
- *   d.readAVPacket(0,endSec,avMediaType,perTypeIdx) // ReadableStream<WebAVPacket> (low-level demux, multi-track)
+ *   d.readAVPacket(0,endSec,avMediaType,stream.index) // ReadableStream<WebAVPacket> (low-level demux, multi-track)
  *   await d.getDecoderConfig('video'|'audio')      // VideoDecoderConfig | AudioDecoderConfig
  *   await d.seek('video', tSec)                    // EncodedVideoChunk (BACKWARD = nearest keyframe)
  *   d.read('video', start?, end?)                  // ReadableStream<EncodedVideoChunk>
@@ -107,6 +107,8 @@ const AV_MEDIA_AUDIO = 1 as AVMediaType; // AVMEDIA_TYPE_AUDIO
 const AV_MEDIA_SUBTITLE = 3 as AVMediaType; // AVMEDIA_TYPE_SUBTITLE
 
 const ENGINE_ID = 'web-demuxer@4.0.0';
+
+type PacketizedTrackType = Extract<TrackType, 'video' | 'audio' | 'subtitle'>;
 
 /** seconds → integer microseconds (web-demuxer's raw packet/stream times are in seconds). */
 function secToUs(sec: number): number {
@@ -197,9 +199,13 @@ function trackTypeOf(stream: WebAVStream): TrackType {
   }
 }
 
-/** Map a suite TrackType to web-demuxer's numeric AVMediaType for readAVPacket's `streamType` arg.
- *  Returns undefined for 'other' (data/attachment) streams the adapter does not packetize. */
-function avMediaTypeOf(type: TrackType): AVMediaType | undefined {
+/** Type guard for streams the low-level packet API can address by media type + stream index. */
+function isPacketizedTrackType(type: TrackType): type is PacketizedTrackType {
+  return type === 'video' || type === 'audio' || type === 'subtitle';
+}
+
+/** Map a packetized suite TrackType to web-demuxer's numeric AVMediaType for readAVPacket's `streamType` arg. */
+function avMediaTypeOf(type: PacketizedTrackType): AVMediaType {
   switch (type) {
     case 'video':
       return AV_MEDIA_VIDEO;
@@ -207,8 +213,6 @@ function avMediaTypeOf(type: TrackType): AVMediaType | undefined {
       return AV_MEDIA_AUDIO;
     case 'subtitle':
       return AV_MEDIA_SUBTITLE;
-    default:
-      return undefined;
   }
 }
 
@@ -364,8 +368,8 @@ export class WebDemuxerEngine implements MediaEngine {
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis'],
       encryption: [],
       // 'metadata:read' : probe reads container/duration/dims/fps/rotation/language/tags.
-      // 'multitrack'    : demux reads EVERY stream (incl. 2nd+ same-type tracks) via per-stream
-      //                   readAVPacket(streamIndex) and labels each packet with its absolute index.
+      // 'multitrack'    : demux reads EVERY stream (incl. 2nd+ same-type tracks) via each stream's
+      //                   absolute WebAVStream.index and labels each packet with that same index.
       // 'rotation:read' : surfaces WebAVStream.rotation in NormalizedTrack.rotation.
       // 'seek:keyframe' : seek() lands on the preceding keyframe (AVSEEK_FLAG_BACKWARD).
       // 'webcodecs:independent' : probe/demux are pure WASM and never touch the browser codec gate, so
@@ -456,15 +460,15 @@ export class WebDemuxerEngine implements MediaEngine {
    * path that the v4 "refactor read_av_packet to non-ASYNCIFY" release made work cross-browser.
    *
    * Stream addressing (verified against node_modules/web-demuxer/dist/web-demuxer.{d.ts,js}):
-   *   - `readAVPacket(start, end, streamType, streamIndex, seekFlag)` selects the `streamIndex`-th
-   *     stream OF THAT `streamType` (the FFmpeg av_find_best_stream wanted_stream_nb convention; the
-   *     per-type ordinal, NOT the absolute container index). `streamIndex` defaults to -1 = best.
+   *   - `readAVPacket(start, end, streamType, streamIndex, seekFlag)` passes `streamIndex` through to
+   *     web-demuxer's AVPacketReader as the media stream's absolute WebAVStream.index. `streamIndex`
+   *     defaults to -1 = best stream.
    *   - The convenience `readMediaPacket(type, …)` hardwires that streamIndex to undefined → -1, so it
    *     can read ONLY the best stream of each type and SILENTLY DROPS additional same-type tracks. We
-   *     therefore call readAVPacket directly with each stream's per-type ordinal so multi-track inputs
+   *     therefore call readAVPacket directly with each stream's absolute index so multi-track inputs
    *     (e.g. video + 2 audio) are read in full. (`read('video')`, used by decodeFrames below, is this
    *     very readAVPacket path — there is no "AVPacketReader.create failed" limitation in v4.)
-   *   - trackIndex is set to the ABSOLUTE WebAVStream.index so it lines up with the
+   *   - trackIndex is set to the same absolute WebAVStream.index so it lines up with the
    *     NormalizedMetadata.tracks ordering (getMediaInfo().streams / getAVStreams() are index-aligned).
    *
    * Each WebAVPacket carries only a presentation timestamp (SECONDS) and a 0|1 keyframe flag; there
@@ -479,20 +483,14 @@ export class WebDemuxerEngine implements MediaEngine {
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;
 
-    // Per-type running ordinal: the Nth video/audio/subtitle stream, in container order. This is the
-    // `streamIndex` readAVPacket expects (best-stream -1 convention), distinct from the absolute index.
-    const perTypeCount: Partial<Record<'video' | 'audio' | 'subtitle', number>> = {};
-
     const packets: PacketInfo[] = [];
     for (const stream of streams) {
       const type = trackTypeOf(stream);
+      if (!isPacketizedTrackType(type)) continue; // skip data/attachment streams we don't packetize
       const avType = avMediaTypeOf(type);
-      if (avType === undefined) continue; // skip data/attachment streams we don't packetize
-      const perTypeIndex = perTypeCount[type as 'video' | 'audio' | 'subtitle'] ?? 0;
-      perTypeCount[type as 'video' | 'audio' | 'subtitle'] = perTypeIndex + 1;
 
-      const trackIndex = stream.index; // absolute index → aligns with metadata.tracks
-      const reader = d.readAVPacket(0, endSec, avType, perTypeIndex).getReader();
+      const trackIndex = stream.index; // absolute index → aligns with metadata.tracks and AVPacketReader
+      const reader = d.readAVPacket(0, endSec, avType, trackIndex).getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
