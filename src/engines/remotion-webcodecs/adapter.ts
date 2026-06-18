@@ -253,6 +253,11 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * `metadata` field and flattened best-effort.
    */
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
+    if (isHlsInput(input)) {
+      const { metadata, packets } = await this.demux(input);
+      return withVideoFpsFromPackets(metadata, packets);
+    }
+
     const { mp, webReader } = this.mustLib();
 
     const result = await mp.parseMedia({
@@ -746,6 +751,38 @@ function normalizeTrack(t: import('@remotion/media-parser').MediaParserTrack): N
     bitrate: null,
     language: null,
   };
+}
+
+function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketInfo[]): NormalizedMetadata {
+  const tracks = metadata.tracks.map((track, trackIndex) => {
+    if (track.type !== 'video' || track.fps != null) return track;
+    const fps = fpsFromTrackPackets(
+      packets.filter((packet) => packet.trackIndex === trackIndex),
+      metadata.durationSec,
+    );
+    return fps == null ? track : { ...track, fps };
+  });
+  return { ...metadata, tracks };
+}
+
+function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {
+  if (!packets.length) return null;
+  if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
+    return packets.length / durationSec;
+  }
+  if (packets.length < 2) return null;
+  const pts = packets.map((packet) => packet.ptsUs).sort((a, b) => a - b);
+  const spanUs = pts[pts.length - 1]! - pts[0]!;
+  return spanUs > 0 ? ((pts.length - 1) * 1_000_000) / spanUs : null;
+}
+
+function isHlsInput(input: MediaInput): boolean {
+  const mime = (input.mime || '').toLowerCase();
+  if (mime.includes('mpegurl') || mime.includes('x-mpegurl') || mime.includes('vnd.apple.mpegurl')) {
+    return true;
+  }
+  const u = (input.url || input.id || '').toLowerCase();
+  return u.endsWith('.m3u8');
 }
 
 /** Flatten media-parser's metadata entries to a string map (best-effort, descriptive tags only). */

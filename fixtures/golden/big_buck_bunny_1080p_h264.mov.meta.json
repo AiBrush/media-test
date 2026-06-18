@@ -1,0 +1,32 @@
+{
+  "container": "mov",
+  "durationSec": 596.462,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "fps": 24,
+      "bitrate": 9282573,
+      "language": "eng"
+    },
+    {
+      "type": "other",
+      "codec": "",
+      "bitrate": 9725434,
+      "language": "eng"
+    },
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sampleRate": 48000,
+      "channels": 6,
+      "bitrate": 437605,
+      "language": "eng"
+    }
+  ],
+  "tags": {
+    "major_brand": "qt  "
+  }
+}

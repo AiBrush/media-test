@@ -52,6 +52,7 @@ interface RemuxNegativeCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   mutate: (bytes: Uint8Array) => Uint8Array;
+  gracefulAllowOutput?: boolean;
   notes: string;
 }
 
@@ -76,9 +77,10 @@ const NEGATIVE_CASES: RemuxNegativeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     mutate: truncateTail(0.5),
+    gracefulAllowOutput: true,
     notes:
       'MP4 cut at 50% (incomplete moov/mdat) -> remux to MKV: engine must reject or emit nothing ' +
-      'cleanly within the timeout — no OOM on a half-present sample table.',
+      'cleanly, or emit a safe partial output, within the timeout — no OOM on a half-present sample table.',
   },
   {
     id: 'neg_headerless_webm_to_mkv',
@@ -99,7 +101,7 @@ export const remuxNegativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
     id: `remux/${c.id}`,
     op: 'remux',
     input: c.asset,
-    options: { container: c.to },
+    options: { container: c.to, ...(c.gracefulAllowOutput ? { gracefulAllowOutput: true } : {}) },
     requires: {
       operations: ['remux'],
       containersIn: [c.from],

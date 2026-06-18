@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Browser Media-Engine Conformance &amp; Benchmark Suite</title>
+    <title>Browser Media-Engine Benchmark Suite</title>
     <!--
       Suite app entry (§4, §2). Vite serves src/app/main.ts as a module; opening this file via the
       static server (scripts/serve.sh) runs the whole battery in any browser. No bundler-specific
@@ -150,7 +150,7 @@
         margin: 1.6rem 0;
       }
 
-      /* ── "How it works" pillars ─────────────────────────────────────────────────────────────── */
+      /* ── benchmark flow ─────────────────────────────────────────────────────────────────────── */
       .pillars {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -491,6 +491,7 @@
       }
       .status.NA_ENGINE,
       .status.NA_BROWSER,
+      .status.NA_ASSET,
       .status.SKIPPED {
         color: var(--na);
       }
@@ -684,7 +685,7 @@
   <body>
     <header class="hero fade-seq">
       <span class="hero-badge">browser-only · library-agnostic</span>
-      <h1>Browser Media-Engine Conformance &amp; Benchmark Suite</h1>
+      <h1>Browser Media-Engine Benchmark Suite</h1>
       <p class="subtitle">
         Every number is produced in-page, gated by a library-independent oracle, reported vs the
         reference engine. <strong>The comparison is the product.</strong>
@@ -705,7 +706,7 @@
       <h2>How it works</h2>
       <div class="pillars">
         <div class="pillar functional">
-          <h3>① Functional — is it correct?</h3>
+          <h3>① Correctness gate</h3>
           <p>
             Each engine's output is checked by library-independent oracles: golden metadata &amp;
             packet tables, bit-exact decoded frames, SSIM/PSNR for lossy ops, and re-import with the
@@ -713,7 +714,7 @@
           </p>
         </div>
         <div class="pillar performance">
-          <h3>② Performance — how fast, how cheap?</h3>
+          <h3>② Benchmark timing</h3>
           <p>
             Headline throughput &amp; cost, measured in-page over warmup + iterations: ops/s,
             packets/s, frames/s, wall <code>ms</code>, <code>×RT</code> (realtime), peak memory,
@@ -721,17 +722,17 @@
           </p>
         </div>
         <div class="pillar robustness">
-          <h3>③ Robustness — does it fail gracefully?</h3>
+          <h3>③ Issue surfacing</h3>
           <p>
             Malformed and mutated inputs must reject or throw within a timeout — never crash, hang,
-            or OOM — and metamorphic invariants must hold across equivalent transforms.
+            or OOM. Any correctness, timing, timeout, or invariant problem is raised in the matrix.
           </p>
         </div>
       </div>
       <p class="about-note">
-        Results stream live into the matrix below and are tallied in the scoreboard, then reported
-        against the <strong>reference engine</strong>. Pick engines + scenarios and press
-        <strong>Run matrix</strong>, or drive it headlessly with <code>scripts/run.sh</code>.
+        One benchmark run does the whole job: gate correctness, measure admissible performance, and
+        surface issues against the <strong>reference engine</strong>. Pick features + scenarios and press
+        <strong>Run selected features</strong>, or drive it with <code>scripts/run.sh</code>.
       </p>
     </section>
 
@@ -743,30 +744,25 @@
     <section id="controls-section" class="fade-seq" style="animation-delay: 0.15s">
       <h2>Controls</h2>
       <div class="controls" id="controls">
-        <fieldset id="engines-fs">
-          <legend>Engines</legend>
-          <div id="engines-list" class="muted">Registering engines…</div>
+        <fieldset id="features-fs">
+          <legend>Features</legend>
+          <div id="features-list" class="muted">Registering feature groups…</div>
         </fieldset>
         <fieldset id="scenarios-fs">
           <legend>Scenarios</legend>
           <div id="scenarios-list" class="muted">Registering scenarios…</div>
         </fieldset>
+        <fieldset id="engines-fs">
+          <legend>Engines</legend>
+          <div id="engines-list" class="muted">Registering engines…</div>
+        </fieldset>
         <fieldset id="options-fs">
           <legend>Options</legend>
           <label class="opt"
-            >Pillar
-            <select id="pillar">
-              <option value="all">all</option>
-              <option value="functional">functional</option>
-              <option value="performance">performance</option>
-              <option value="robustness">robustness</option>
-            </select>
-          </label>
-          <label class="opt"
-            >Warmup <input type="number" id="warmup" min="0" max="20" value="3" style="width: 4rem"
+            >Warmup <input type="number" id="warmup" min="0" max="20" value="1" style="width: 4rem"
           /></label>
           <label class="opt"
-            >Iters <input type="number" id="iters" min="1" max="50" value="6" style="width: 4rem"
+            >Iters <input type="number" id="iters" min="1" max="50" value="1" style="width: 4rem"
           /></label>
           <label class="opt"
             >Browser tag
@@ -781,7 +777,8 @@
         </fieldset>
       </div>
       <div class="actions">
-        <button id="run" class="primary">Run matrix</button>
+        <button id="run" class="primary">Run selected features</button>
+        <button id="select-all-features" type="button">All features</button>
         <button id="select-all-eng" type="button">All engines</button>
         <button id="select-all-scn" type="button">All scenarios</button>
         <button id="download" type="button" disabled>Download results JSON</button>

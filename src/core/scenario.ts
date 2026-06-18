@@ -76,6 +76,62 @@ export type ScenarioFamily =
   | 'robustness'
   | 'performance'; // headline §8.1 cases (perf/extract-metadata, iterate-packets, convert+resize, bundle-size)
 
+export const SCENARIO_FAMILY_ORDER: ScenarioFamily[] = [
+  'probe',
+  'demux',
+  'remux',
+  'transcode',
+  'decode-seek',
+  'trim',
+  'mux',
+  'encryption',
+  'metadata',
+  'streaming-output',
+  'audio-dsp',
+  'robustness',
+  'performance',
+];
+
+export const SCENARIO_FAMILY_LABELS: Record<ScenarioFamily, string> = {
+  probe: 'Probe',
+  demux: 'Demux',
+  remux: 'Remux',
+  transcode: 'Transcode',
+  'decode-seek': 'Decode + seek',
+  trim: 'Trim',
+  mux: 'Mux',
+  encryption: 'Encryption',
+  metadata: 'Metadata',
+  'streaming-output': 'Streaming output',
+  'audio-dsp': 'Audio DSP',
+  robustness: 'Robustness',
+  performance: 'Performance',
+};
+
+export interface ScenarioFeatureGroup {
+  id: ScenarioFamily;
+  label: string;
+  scenarios: Scenario[];
+}
+
+export function scenarioAssetIds(scenario: Pick<ScenarioSpec, 'input'>): string[] {
+  return Array.isArray(scenario.input) ? scenario.input : [scenario.input];
+}
+
+export function groupScenariosByFeature(scenarios: Scenario[]): ScenarioFeatureGroup[] {
+  const byFamily = new Map<ScenarioFamily, Scenario[]>();
+  for (const scenario of scenarios) {
+    const items = byFamily.get(scenario.family);
+    if (items) items.push(scenario);
+    else byFamily.set(scenario.family, [scenario]);
+  }
+  return SCENARIO_FAMILY_ORDER.filter((family) => byFamily.has(family)).map((family) => ({
+    id: family,
+    label: SCENARIO_FAMILY_LABELS[family],
+    scenarios: byFamily.get(family) ?? [],
+  }));
+}
+
 /** Per-oracle tunables (e.g. SSIM/PSNR floors, duration tolerance) overriding defaults. */
 export interface OracleTolerances {
   ssimMin?: number;
@@ -140,10 +196,11 @@ export function defineScenario(spec: ScenarioSpec): Scenario {
 // ── Result types (produced by runner.ts, consumed by report.ts) ──
 
 /**
- * NA is split: NA_ENGINE (engine did not declare the capability) vs NA_BROWSER (browser lacks the
- * WebCodecs codec / API). These must never be collapsed (anti-pattern §15).
+ * NA is split: NA_ENGINE (engine did not declare the capability), NA_BROWSER (browser lacks the
+ * WebCodecs codec / API), and NA_ASSET (the corpus asset is intentionally absent/unbaked).
+ * These must never be collapsed in machine-readable results (anti-pattern §15).
  */
-export type ResultStatus = 'PASS' | 'FAIL' | 'NA_ENGINE' | 'NA_BROWSER' | 'ERROR' | 'SKIPPED';
+export type ResultStatus = 'PASS' | 'FAIL' | 'NA_ENGINE' | 'NA_BROWSER' | 'NA_ASSET' | 'ERROR' | 'SKIPPED';
 
 export interface OracleOutcome {
   oracle: OracleId;

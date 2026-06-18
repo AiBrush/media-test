@@ -14,15 +14,15 @@
 import type { BenchSummary, MetricId, MetricSample } from './scenario.ts';
 
 export interface BenchOptions {
-  /** unmeasured priming iterations run before measurement (default 3). */
+  /** unmeasured priming iterations run before measurement (default 1). */
   warmup?: number;
-  /** measured iterations whose samples feed the summary (default 6). */
+  /** measured iterations whose samples feed the summary (default 1). */
   iters?: number;
   /** |deltaPct| at or below this (floored at 3) is reported as within-noise (default 3). */
   noiseBandPct?: number;
 }
 
-export const DEFAULT_BENCH: Required<BenchOptions> = { warmup: 3, iters: 6, noiseBandPct: 3 };
+export const DEFAULT_BENCH: Required<BenchOptions> = { warmup: 1, iters: 1, noiseBandPct: 3 };
 
 /** Hard floor on the noise band — we never claim a difference smaller than this (§10). */
 const MIN_NOISE_BAND_PCT = 3;

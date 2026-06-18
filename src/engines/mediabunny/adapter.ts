@@ -164,29 +164,32 @@ function isHlsAsset(input: MediaInput, container?: string): boolean {
 /** Build a mediabunny Input from a corpus asset. Restricts formats to the asset's container when
  *  known (faster, deterministic), else accepts ALL_FORMATS.
  *
- *  SOURCE CHOICE: normal single-file assets use a buffered BlobSource (the dossier best path — the
- *  whole asset is already in memory, so reads are local with zero network round-trips). HLS is the
- *  exception: mediabunny's HlsInputFormat REQUIRES a PathedSource (input-format.js `_canReadInput`
- *  throws "HLS inputs require InputOptions.source to be a PathedSource" otherwise) because it must
- *  resolve the playlist's relative segment URIs against a base path — a flat BlobSource has none. We
- *  therefore back HLS with a UrlSource(input.url) (UrlSource extends PathedSource), which fetches the
- *  m3u8 and its sibling segments over Range. This is what makes the declared containersIn:'hls'
- *  honest rather than a runtime throw. Cite: source.d.ts UrlSource/PathedSource; input-format.js. */
+ *  SOURCE CHOICE: normal corpus assets use UrlSource so Mediabunny can range-read headers/sample
+ *  tables instead of forcing Chromium to materialize huge files as Blobs. Mutated robustness inputs
+ *  are the exception: the runner rewrites bytes in memory, so those must use BlobSource to ensure the
+ *  engine sees the corrupted payload. HLS also requires a PathedSource because playlists resolve
+ *  sibling segment/key URLs relative to the playlist path. */
 async function openInput(mb: MB, input: MediaInput, container?: string): Promise<Input> {
   if (isHlsAsset(input, container)) {
-    // PathedSource (UrlSource) is mandatory for HLS segment resolution; restrict to HLS format so the
-    // playlist is parsed as HLS (and the source's _usedForHls flag is set).
+    // PathedSource (UrlSource) is mandatory for HLS segment resolution. The library's HLS_FORMATS
+    // keeps HLS first while also allowing child TS/MP4/AAC/MP3 segments to be recognized.
     return new mb.Input({
       source: new mb.UrlSource(input.url),
-      formats: [mb.HLS],
+      formats: mb.HLS_FORMATS,
     });
   }
-  const blob = await input.blob();
   const formats: InputFormat[] = [];
   if (container) {
     const f = inputFormatForContainer(container);
     if (f) formats.push(f);
   }
+  if (!input.mutated) {
+    return new mb.Input({
+      source: new mb.UrlSource(input.url),
+      formats: formats.length ? formats : mb.ALL_FORMATS,
+    });
+  }
+  const blob = await input.blob();
   return new mb.Input({
     source: new mb.BlobSource(blob),
     formats: formats.length ? formats : mb.ALL_FORMATS,
@@ -664,6 +667,7 @@ export class MediabunnyEngine implements MediaEngine {
         'resize', // Conversion video width/height
         'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
         'alpha', // VP9 alpha (WebM/MKV) via alpha:'keep'
+        'hls:aes128', // read/probe AES-128 HLS playlists; decrypt() still does not expose hls-aes128
         // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
         // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
         // returns a SINGLE blob, so transcode() can only deliver variants[0] — it cannot surface the

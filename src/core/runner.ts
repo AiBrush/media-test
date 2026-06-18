@@ -46,6 +46,7 @@ import type {
   OracleOutcome,
   Requires,
   Scenario,
+  ScenarioFamily,
   ScenarioResult,
   RunEnv,
 } from './scenario.ts';
@@ -75,6 +76,15 @@ const SUITE_VERSION = '0.1.0';
 
 /** Base URL the served corpus lives under (static files; HTTP Range supported). */
 const FIXTURES_MEDIA_BASE = '/fixtures/media';
+const FIXTURES_MANIFEST_URL = '/fixtures/manifest.json';
+
+interface FixtureManifestAsset {
+  id?: string;
+  sha256?: string | null;
+  sizeBytes?: number | null;
+}
+
+let fixtureManifestPromise: Promise<Map<string, FixtureManifestAsset> | undefined> | undefined;
 
 /**
  * Map a robustness `mutate` outcome (graceful failure expected) — the runner records `graceful`
@@ -151,7 +161,20 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
 
   const requiredVideo = requires.videoCodecs ?? [];
   const requiredAudio = requires.audioCodecs ?? [];
-  const needsCodecConfig = requiredVideo.length > 0 || requiredAudio.length > 0;
+
+  // Determine whether this scenario asks the browser to configure codecs. Parser-only operations
+  // (probe/demux/remux copy) do not need WebCodecs decode support just to read packets/metadata; the
+  // old flat gate incorrectly blocked cases like FLAC demux in Chromium. Decode/seek/decrypt need
+  // decode support, while transcode/mux additionally need encode support for target codecs.
+  const producesEncodedOutput =
+    requires.operations.includes('transcode') || requires.operations.includes('mux');
+  const needsDecodeConfig =
+    requires.operations.includes('decodeFrames') ||
+    requires.operations.includes('seek') ||
+    requires.operations.includes('transcode') ||
+    requires.operations.includes('trim') ||
+    requires.operations.includes('decrypt');
+  const needsCodecConfig = (requiredVideo.length > 0 || requiredAudio.length > 0) && (producesEncodedOutput || needsDecodeConfig);
 
   if (needsCodecConfig && !support.webcodecs) {
     return {
@@ -160,12 +183,6 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
       reason: 'browser does not expose WebCodecs (VideoDecoder/AudioDecoder unavailable)',
     };
   }
-
-  // Determine whether this scenario only reads/decodes (probe/demux/decode/seek/trim/remux) or also
-  // produces encoded output (transcode/mux). Decode-side ops need decode support; encode-producing
-  // ops additionally need encode support for the target codec.
-  const producesEncodedOutput =
-    requires.operations.includes('transcode') || requires.operations.includes('mux');
 
   for (const vc of requiredVideo) {
     const canDecode = support.videoDecode[vc] === true;
@@ -178,7 +195,7 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
           reason: `browser cannot encode video codec '${vc}' (WebCodecs VideoEncoder.isConfigSupported=false)`,
         };
       }
-    } else if (!canDecode) {
+    } else if (needsDecodeConfig && !canDecode) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -198,7 +215,7 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
           reason: `browser cannot encode audio codec '${ac}' (WebCodecs AudioEncoder.isConfigSupported=false)`,
         };
       }
-    } else if (!canDecode) {
+    } else if (needsDecodeConfig && !canDecode) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -222,6 +239,8 @@ export interface RunOptions {
   browser: BrowserName;
   engineIds?: string[]; // default: all registered
   scenarioIds?: string[]; // default: all registered
+  featureIds?: ScenarioFamily[]; // feature/family-first filter, e.g. probe|demux|remux
+  operations?: Operation[]; // optional op-level filter, e.g. demux|remux
   pillar?: 'functional' | 'performance' | 'robustness' | 'all'; // default 'all'
   benchOptions?: BenchOptions;
   onResult?: (r: ScenarioResult) => void;
@@ -268,13 +287,74 @@ function mimeForAssetId(id: string): string {
   return 'application/octet-stream';
 }
 
+/** Absolute URL for a corpus asset served as a static file at `/fixtures/media/<id>`. */
+function mediaAssetUrl(assetId: string): string {
+  const path = `${FIXTURES_MEDIA_BASE}/${assetId}`;
+  return new URL(path, globalThis.location?.href ?? 'http://localhost/').href;
+}
+
+async function fixtureManifestById(): Promise<Map<string, FixtureManifestAsset> | undefined> {
+  if (!fixtureManifestPromise) {
+    fixtureManifestPromise = (async () => {
+      try {
+        const url = new URL(FIXTURES_MANIFEST_URL, globalThis.location?.href ?? 'http://localhost/').href;
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) return undefined;
+        const manifest = (await res.json()) as { assets?: FixtureManifestAsset[] };
+        const byId = new Map<string, FixtureManifestAsset>();
+        for (const asset of manifest.assets ?? []) {
+          if (typeof asset.id === 'string' && asset.id) byId.set(asset.id, asset);
+        }
+        return byId;
+      } catch {
+        return undefined;
+      }
+    })();
+  }
+  return fixtureManifestPromise;
+}
+
+async function missingAssetReason(assetId: string): Promise<string | undefined> {
+  const manifest = await fixtureManifestById();
+  if (manifest) {
+    const entry = manifest.get(assetId);
+    if (!entry) {
+      return `asset missing: '${assetId}' (not declared in fixtures/manifest.json)`;
+    }
+    if (entry.sha256 == null || entry.sizeBytes == null) {
+      return `asset missing: '${assetId}' (manifest entry is not baked: sha256/sizeBytes is null)`;
+    }
+  }
+
+  const url = mediaAssetUrl(assetId);
+  let res: Response;
+  try {
+    res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+  } catch (err) {
+    return `asset missing: '${assetId}' (${errMessage(err)})`;
+  }
+  if (res.ok) return undefined;
+
+  if (res.status === 405 || res.status === 501) {
+    try {
+      const ranged = await fetch(url, { cache: 'no-store', headers: { Range: 'bytes=0-0' } });
+      if (ranged.ok || ranged.status === 206) return undefined;
+      return `asset missing: '${assetId}' (${ranged.status} ${ranged.statusText})`;
+    } catch (err) {
+      return `asset missing: '${assetId}' (${errMessage(err)})`;
+    }
+  }
+
+  return `asset missing: '${assetId}' (${res.status} ${res.statusText})`;
+}
+
 /**
  * Build a `MediaInput` for a corpus asset served as a static file at `/fixtures/media/<id>`.
  * `blob()`/`arrayBuffer()` fetch lazily and cache; an optional `mutate` (robustness) rewrites the
  * bytes after fetch so the engine is fed corrupted input.
  */
 function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8Array): MediaInput {
-  const url = `${FIXTURES_MEDIA_BASE}/${assetId}`;
+  const url = mediaAssetUrl(assetId);
   const mime = mimeForAssetId(assetId);
 
   let cached: Promise<ArrayBuffer> | undefined;
@@ -301,6 +381,7 @@ function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8A
     id: assetId,
     url,
     mime,
+    mutated: typeof mutate === 'function',
     async arrayBuffer(): Promise<ArrayBuffer> {
       return applyMutate(await fetchBytes());
     },
@@ -319,15 +400,18 @@ function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8A
  * (performance additionally enables the bench step); 'robustness' runs only the robustness family.
  */
 function scenarioMatchesPillar(scenario: Scenario, pillar: NonNullable<RunOptions['pillar']>): boolean {
-  const isRobustness = scenario.family === 'robustness' || typeof scenario.mutate === 'function';
+  const usesGracefulFailurePath =
+    scenario.family === 'robustness' ||
+    typeof scenario.mutate === 'function' ||
+    scenario.oracles.includes('graceful-failure');
   switch (pillar) {
     case 'all':
       return true;
     case 'robustness':
-      return isRobustness;
+      return usesGracefulFailurePath;
     case 'functional':
     case 'performance':
-      return !isRobustness;
+      return !usesGracefulFailurePath;
   }
 }
 
@@ -368,6 +452,7 @@ function withTimeout<T>(p: Promise<T>, timeoutMs: number | undefined): Promise<T
 interface OpResult {
   output?: MediaBytes;
   metadata?: NormalizedMetadata;
+  probeMetadatas?: Array<{ input: MediaInput; metadata: NormalizedMetadata; golden?: GoldenStore }>;
   demux?: DemuxResult;
   frames?: FrameSink;
   seek?: { landedPtsUs: number; frame: FrameDigest };
@@ -429,8 +514,14 @@ async function executeOp(engine: MediaEngine, scenario: Scenario, inputs: MediaI
   const op: Operation = scenario.op;
   const input = inputs[0]!;
   switch (op) {
-    case 'probe':
-      return { metadata: await engine.probe(input) };
+    case 'probe': {
+      if (inputs.length === 1) return { metadata: await engine.probe(input) };
+      const probeMetadatas: Array<{ input: MediaInput; metadata: NormalizedMetadata }> = [];
+      for (const probeInput of inputs) {
+        probeMetadatas.push({ input: probeInput, metadata: await engine.probe(probeInput) });
+      }
+      return { metadata: probeMetadatas[0]?.metadata, probeMetadatas };
+    }
     case 'demux':
       return { demux: await engine.demux(input) };
     case 'remux':
@@ -483,6 +574,16 @@ function mediaSecFromContext(golden: GoldenStore, opResult: OpResult): number | 
   return undefined;
 }
 
+function isGoldenBakeGap(outcome: OracleOutcome): boolean {
+  const detail = (outcome.detail ?? '').toLowerCase();
+  return (
+    detail.includes('no golden frame') ||
+    detail.includes('golden frames pending') ||
+    detail.includes('frame-bake pending') ||
+    detail.includes('frame-bake must run')
+  );
+}
+
 // ── runOne ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -501,7 +602,10 @@ export async function runOne(
   const startedAtIso = new Date(startedAt).toISOString();
   const pillar = opts?.pillar ?? 'all';
   const wantsPerformance = pillar === 'all' || pillar === 'performance';
-  const isRobustness = scenario.family === 'robustness' || typeof scenario.mutate === 'function';
+  const usesGracefulFailurePath =
+    scenario.family === 'robustness' ||
+    typeof scenario.mutate === 'function' ||
+    scenario.oracles.includes('graceful-failure');
 
   const base: Omit<ScenarioResult, 'status' | 'oracleOutcomes'> = {
     engineId: engine.id,
@@ -527,6 +631,15 @@ export async function runOne(
   });
 
   try {
+    const assetIds = Array.isArray(scenario.input) ? scenario.input : [scenario.input];
+    if (assetIds.length === 0) {
+      return finalize('ERROR', [], 'scenario declares no input asset');
+    }
+    for (const assetId of assetIds) {
+      const missing = await missingAssetReason(assetId);
+      if (missing) return finalize('NA_ASSET', [], missing);
+    }
+
     // 1) Negotiate (declared ∧ runtime) — NA short-circuits, never benched.
     const caps = engine.capabilities();
     const neg = negotiate(caps, support, scenario.requires);
@@ -546,15 +659,11 @@ export async function runOne(
     }
 
     // 3) Build MediaInput(s) from the served corpus. Robustness scenarios mutate bytes first.
-    const assetIds = Array.isArray(scenario.input) ? scenario.input : [scenario.input];
-    if (assetIds.length === 0) {
-      return finalize('ERROR', [], 'scenario declares no input asset');
-    }
     const inputs = assetIds.map((id) => buildMediaInput(id, scenario.mutate));
     const primaryInput = inputs[0]!;
 
-    // 4) Robustness path: mutate → expect graceful failure within the timeout.
-    if (isRobustness && scenario.mutate) {
+    // 4) Graceful-failure path: malformed/degenerate inputs expect clean reject/return within timeout.
+    if (usesGracefulFailurePath) {
       return await runRobustness(engine, scenario, primaryInput, finalize, opts);
     }
 
@@ -571,6 +680,17 @@ export async function runOne(
 
     // 6) Assemble OracleContext (inject decode/playback hooks + reference engine + golden).
     const golden: GoldenStore = await loadGolden(primaryInput.id);
+    if (opResult.probeMetadatas?.length) {
+      opResult = {
+        ...opResult,
+        probeMetadatas: await Promise.all(
+          opResult.probeMetadatas.map(async (entry) => ({
+            ...entry,
+            golden: await loadGolden(entry.input.id),
+          })),
+        ),
+      };
+    }
     const ctx = buildOracleContext(scenario, primaryInput, opResult, golden, opts);
 
     // 7) Run every declared oracle; PASS iff all green, else FAIL with first failure's detail.
@@ -587,6 +707,9 @@ export async function runOne(
     }
     const firstFail = oracleOutcomes.find((o) => !o.pass);
     if (firstFail) {
+      if (isGoldenBakeGap(firstFail)) {
+        return finalize('NA_ASSET', oracleOutcomes, `oracle '${firstFail.oracle}' unavailable: ${firstFail.detail}`);
+      }
       return finalize('FAIL', oracleOutcomes, `oracle '${firstFail.oracle}' failed: ${firstFail.detail ?? 'no detail'}`);
     }
 
@@ -650,6 +773,9 @@ function buildOracleContext(
     playbackSmoke,
     ...(opResult.output ? { output: opResult.output } : {}),
     ...(opResult.metadata ? { metadata: opResult.metadata } : {}),
+    ...(opResult.probeMetadatas?.length
+      ? { probeMetadatas: opResult.probeMetadatas as OracleContext['probeMetadatas'] }
+      : {}),
     ...(opResult.demux ? { demux: opResult.demux } : {}),
     ...(opResult.frames ? { frames: opResult.frames } : {}),
     ...(opResult.seek ? { seek: opResult.seek } : {}),
@@ -658,8 +784,8 @@ function buildOracleContext(
 }
 
 /**
- * Robustness execution: feed mutated bytes, expect the engine to fail GRACEFULLY (throw/reject)
- * within the timeout — no crash/hang/OOM. Verdict mapping (§11):
+ * Robustness/graceful-failure execution: feed malformed/degenerate bytes, expect the engine to handle
+ * them GRACEFULLY within the timeout — no crash/hang/OOM. Verdict mapping (§11):
  *   - engine throws/rejects within timeout → graceful (the desired behavior). We route to the
  *     oracle with NO output populated; `graceful-failure` infers PASS from output-absence.
  *   - engine overruns the timeout          → timeout → FAIL (no crash/hang/OOM allowed).
@@ -810,7 +936,8 @@ function estimatedFrameCount(golden: GoldenStore): number | undefined {
 
 /**
  * Build engines from registry factories, detect env + support ONCE per run, iterate
- * engineIds × scenarioIds, run each cell, fire onResult/onProgress, and collect ScenarioResult[].
+ * scenarioIds × engineIds, run each feature/scenario across all engines, fire onResult/onProgress,
+ * and collect ScenarioResult[].
  * Scenarios are filtered by pillar (robustness family vs functional/performance). The reference
  * engine (if registered and distinct) is constructed once and injected for 'reference-reimport'.
  */
@@ -839,7 +966,14 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         return acc;
       }, [])
     : listScenarios();
-  const scenarios = allScenarios.filter((s) => scenarioMatchesPillar(s, pillar));
+  const featureSet = opts.featureIds?.length ? new Set(opts.featureIds) : undefined;
+  const opSet = opts.operations?.length ? new Set(opts.operations) : undefined;
+  const scenarios = allScenarios.filter(
+    (s) =>
+      scenarioMatchesPillar(s, pillar) &&
+      (!featureSet || featureSet.has(s.family)) &&
+      (!opSet || opSet.has(s.op)),
+  );
 
   // Detect environment + codec support once (per-browser, per-run).
   const [env, support]: [EnvInfo, CodecSupport] = await Promise.all([detectEnv(), detectCodecSupport()]);
@@ -859,31 +993,29 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const total = engineIds.length * scenarios.length;
   let done = 0;
 
-  for (const engineId of engineIds) {
+  for (const scenario of scenarios) {
+    for (const engineId of engineIds) {
     const reg = getEngine(engineId);
     if (!reg) {
       // Unknown engine id: surface as ERROR cells rather than throwing the whole matrix.
-      for (const scenario of scenarios) {
-        const r: ScenarioResult = {
-          engineId,
-          browser: opts.browser,
-          scenarioId: scenario.id,
-          family: scenario.family,
-          status: 'ERROR',
-          oracleOutcomes: [],
-          reason: `unknown engine id: ${engineId}`,
-          env: { ...runEnvBase, engineId },
-        };
-        results.push(r);
-        opts.onResult?.(r);
-        done += 1;
-        opts.onProgress?.(done, total, `${engineId} / ${scenario.id}`);
-      }
+      const r: ScenarioResult = {
+        engineId,
+        browser: opts.browser,
+        scenarioId: scenario.id,
+        family: scenario.family,
+        status: 'ERROR',
+        oracleOutcomes: [],
+        reason: `unknown engine id: ${engineId}`,
+        env: { ...runEnvBase, engineId },
+      };
+      results.push(r);
+      opts.onResult?.(r);
+      done += 1;
+      opts.onProgress?.(done, total, `${scenario.id} / ${engineId}`);
       continue;
     }
 
-    for (const scenario of scenarios) {
-      const label = `${engineId} / ${scenario.id}`;
+      const label = `${scenario.id} / ${engineId}`;
       // Fresh engine per (engine, scenario) cell → clean memory (§10.2).
       let engine: MediaEngine | undefined;
       let result: ScenarioResult;

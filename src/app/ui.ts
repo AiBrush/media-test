@@ -107,6 +107,14 @@ export interface PickerItem {
   checked?: boolean;
 }
 
+export interface FeaturePickerItem {
+  id: string;
+  label: string;
+  count: number;
+  title?: string;
+  checked?: boolean;
+}
+
 /** Render a checkbox list into a container; returns a getter for the currently-checked ids. */
 function renderChecklist(containerId: string, name: string, items: PickerItem[]): () => string[] {
   const host = $(containerId);
@@ -133,6 +141,19 @@ export function renderEnginePicker(items: PickerItem[]): () => string[] {
   const registered = items.filter((i) => !i.disabled).length;
   fillChip('chip-engines', [el('b', {}, String(registered)), ' engines'], 'ok');
   return renderChecklist('engines-list', 'engine', items);
+}
+
+export function renderFeaturePicker(items: FeaturePickerItem[]): () => string[] {
+  return renderChecklist(
+    'features-list',
+    'feature',
+    items.map((item) => ({
+      id: item.id,
+      label: `${item.label} (${item.count})`,
+      title: item.title,
+      checked: item.checked,
+    })),
+  );
 }
 
 export function renderScenarioPicker(items: PickerItem[]): () => string[] {
@@ -199,8 +220,8 @@ export class MatrixView {
   private cells = new Map<string, HTMLTableCellElement>();
   private results: ScenarioResult[] = [];
   /**
-   * The order the runner (runMatrix) actually executes cells in: engine-major, i.e. for each
-   * engine, every scenario in turn (NOT the table's scenario-major visual layout). We can't see a
+   * The order the runner (runMatrix) actually executes cells in: scenario-major, i.e. for each
+   * feature/scenario, every engine in turn. We can't see a
    * "cell started" hook from the core, so we derive the in-flight cell from this order: the cell
    * after the most recently-resolved one is the one currently executing. This is best-effort UX —
    * keyed off the resolved result so a real status always lands even if ordering is imperfect.
@@ -228,9 +249,9 @@ export class MatrixView {
     this.resolved.clear();
     this.runningCell = null;
     this.stopScoreboardTimers();
-    // Mirror runMatrix's engine-major iteration so we can guess the in-flight cell from order.
+    // Mirror runMatrix's scenario-major iteration so we can guess the in-flight cell from order.
     this.execOrder = [];
-    for (const e of engines) for (const s of scenarios) this.execOrder.push(this.key(e, s));
+    for (const s of scenarios) for (const e of engines) this.execOrder.push(this.key(e, s));
     clear(this.host);
 
     if (engines.length === 0 || scenarios.length === 0) {
@@ -342,7 +363,7 @@ export class MatrixView {
           skip++;
           break;
         default:
-          na++; // NA_ENGINE | NA_BROWSER — kept together in the headline, split stays in the matrix
+          na++; // NA_ENGINE | NA_BROWSER | NA_ASSET — grouped in the headline, split in raw results
       }
     }
     setStatNum('stat-total', this.results.length);

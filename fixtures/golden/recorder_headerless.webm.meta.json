@@ -1,0 +1,26 @@
+{
+  "container": "webm",
+  "durationSec": 3.084,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "vp8",
+      "width": 320,
+      "height": 240,
+      "fps": 30,
+      "bitrate": 499095,
+      "language": "eng"
+    },
+    {
+      "type": "audio",
+      "codec": "opus",
+      "sampleRate": 48000,
+      "channels": 2,
+      "bitrate": 499095,
+      "language": "eng"
+    }
+  ],
+  "tags": {
+    "encoder": "Chrome"
+  }
+}

@@ -19,7 +19,8 @@ import { listEngines, listScenarios, getReferenceEngineId, getEngine } from '../
 import { runMatrix } from '../core/runner.ts';
 import type { RunOptions } from '../core/runner.ts';
 import type { BrowserName } from '../core/engine.ts';
-import type { ScenarioResult } from '../core/scenario.ts';
+import { groupScenariosByFeature } from '../core/scenario.ts';
+import type { ScenarioFamily, ScenarioResult } from '../core/scenario.ts';
 import type { ResultStatus } from '../core/scenario.ts';
 import { installFrameBakeControl } from '../core/frame-bake.ts';
 import { registerAll } from './register.ts';
@@ -27,6 +28,7 @@ import type { RegistrationReport } from './register.ts';
 import {
   renderEnv,
   renderEnginePicker,
+  renderFeaturePicker,
   renderScenarioPicker,
   setAllChecked,
   renderRegistrationBanner,
@@ -48,13 +50,16 @@ interface SuiteControl {
   referenceEngineId: string;
   /** all registered ids, so the launcher can resolve --engine/--pillar against reality. */
   engineIds: string[];
+  featureIds: ScenarioFamily[];
   scenarioIds: string[];
   ready: true;
 }
 
 interface SuiteRunFilter {
   engineIds?: string[];
+  featureIds?: ScenarioFamily[];
   scenarioIds?: string[];
+  operations?: RunOptions['operations'];
   pillar?: RunOptions['pillar'];
   browser?: BrowserName;
   warmup?: number;
@@ -76,6 +81,7 @@ let env: EnvInfo;
 let support: CodecSupport;
 let registration: RegistrationReport;
 let getCheckedEngines: () => string[] = () => [];
+let getCheckedFeatures: () => string[] = () => [];
 let getCheckedScenarios: () => string[] = () => [];
 const matrix = new MatrixView('results');
 
@@ -101,7 +107,20 @@ async function boot(): Promise<void> {
     enginePickers.map((p) => ({ ...p, disabled: p.id.startsWith('(failed)'), checked: !p.id.startsWith('(failed)') })),
   );
 
-  const scenarioPickers = listScenarios().map((s) => ({ id: s.id, label: s.id, title: s.notes }));
+  const scenarioGroups = groupScenariosByFeature(listScenarios());
+  getCheckedFeatures = renderFeaturePicker(
+    scenarioGroups.map((g) => ({
+      id: g.id,
+      label: g.label,
+      count: g.scenarios.length,
+      title: `${g.scenarios.length} ${g.label.toLowerCase()} scenario(s)`,
+      checked: true,
+    })),
+  );
+
+  const scenarioPickers = scenarioGroups
+    .flatMap((g) => g.scenarios)
+    .map((s) => ({ id: s.id, label: s.id, title: s.notes }));
   getCheckedScenarios = renderScenarioPicker(scenarioPickers.map((p) => ({ ...p, title: p.title ?? '' })));
 
   // Registration banner: report any family/engine that didn't wire up.
@@ -124,6 +143,7 @@ async function boot(): Promise<void> {
     registration,
     referenceEngineId,
     engineIds: listEngines().map((e) => e.id),
+    featureIds: scenarioGroups.map((g) => g.id),
     scenarioIds: listScenarios().map((s) => s.id),
     ready: true,
   };
@@ -135,6 +155,7 @@ function wireControls(): void {
   getEl<HTMLButtonElement>('run').addEventListener('click', () => {
     void runFromUi();
   });
+  getEl<HTMLButtonElement>('select-all-features').addEventListener('click', () => setAllChecked('features-list', true));
   getEl<HTMLButtonElement>('select-all-eng').addEventListener('click', () => setAllChecked('engines-list', true));
   getEl<HTMLButtonElement>('select-all-scn').addEventListener('click', () => setAllChecked('scenarios-list', true));
   getEl<HTMLButtonElement>('download').addEventListener('click', downloadResults);
@@ -151,11 +172,11 @@ function resolveBrowser(explicit?: BrowserName | 'auto'): BrowserName {
 /** Run driven by the on-page controls. */
 async function runFromUi(): Promise<ScenarioResult[]> {
   const engineIds = getCheckedEngines();
+  const featureIds = getCheckedFeatures() as ScenarioFamily[];
   const scenarioIds = getCheckedScenarios();
-  const pillar = getEl<HTMLSelectElement>('pillar').value as RunOptions['pillar'];
-  const warmup = Number(getEl<HTMLInputElement>('warmup').value) || 3;
-  const iters = Number(getEl<HTMLInputElement>('iters').value) || 6;
-  return runFromFilter({ engineIds, scenarioIds, pillar, warmup, iters });
+  const warmup = Number(getEl<HTMLInputElement>('warmup').value) || 1;
+  const iters = Number(getEl<HTMLInputElement>('iters').value) || 1;
+  return runFromFilter({ engineIds, featureIds, scenarioIds, pillar: 'all', warmup, iters });
 }
 
 /** Run driven by an explicit filter (the headless launcher path + the UI path funnel here). */
@@ -169,7 +190,21 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
 
   const browser = resolveBrowser(filter.browser);
   const engineIds = filter.engineIds && filter.engineIds.length ? filter.engineIds : undefined;
-  const scenarioIds = filter.scenarioIds && filter.scenarioIds.length ? filter.scenarioIds : undefined;
+  const featureSet = filter.featureIds?.length ? new Set(filter.featureIds) : undefined;
+  const opSet = filter.operations?.length ? new Set(filter.operations) : undefined;
+  const requestedScenarioIds = filter.scenarioIds && filter.scenarioIds.length ? filter.scenarioIds : undefined;
+  const scenarioIds = requestedScenarioIds
+    ? listScenarios()
+        .filter((s) => requestedScenarioIds.includes(s.id))
+        .filter((s) => !featureSet || featureSet.has(s.family))
+        .filter((s) => !opSet || opSet.has(s.op))
+        .map((s) => s.id)
+    : featureSet || opSet
+      ? listScenarios()
+          .filter((s) => !featureSet || featureSet.has(s.family))
+          .filter((s) => !opSet || opSet.has(s.op))
+          .map((s) => s.id)
+      : undefined;
 
   // Resolve the matrix layout we will draw (so empty selections still produce a sensible grid).
   // Columns MUST use the id each engine reports in its results (engine.id), NOT the registration id:
@@ -197,12 +232,14 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   const opts: RunOptions = {
     browser,
     pillar: filter.pillar ?? 'all',
-    benchOptions: { warmup: filter.warmup ?? 3, iters: filter.iters ?? 6 },
+    benchOptions: { warmup: filter.warmup ?? 1, iters: filter.iters ?? 1 },
     onResult: (r) => matrix.update(r),
     onProgress: (done, total, label) => setProgress(done, total, label),
   };
   if (engineIds) opts.engineIds = engineIds;
   if (scenarioIds) opts.scenarioIds = scenarioIds;
+  if (filter.featureIds?.length) opts.featureIds = filter.featureIds;
+  if (filter.operations?.length) opts.operations = filter.operations;
 
   let results: ScenarioResult[] = [];
   try {
@@ -241,6 +278,7 @@ function summaryStatusLabel(status: ResultStatus): string {
       return 'Pass';
     case 'NA_ENGINE':
     case 'NA_BROWSER':
+    case 'NA_ASSET':
       return 'N/A';
     case 'FAIL':
       return 'Fail';

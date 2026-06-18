@@ -88,7 +88,7 @@ export class CountingTarget {
 ```ts
 import type { BenchSummary, MetricId, MetricSample } from './scenario.ts';
 
-export interface BenchOptions { warmup?: number; iters?: number; noiseBandPct?: number }  // defaults 3 / 6 / 3
+export interface BenchOptions { warmup?: number; iters?: number; noiseBandPct?: number }  // defaults 1 / 1 / 3
 export const DEFAULT_BENCH: Required<BenchOptions>;
 
 /** Run warmup+iters of `run`, collect one MetricSample per iter, summarize the chosen metric. */

@@ -574,7 +574,7 @@ const RECIPES = {
       return {
         skipped: true,
         reason:
-          'cbcs (pattern) encryption requires Bento4 (mp4encrypt --method MPEG-CENC --scheme cbcs) ' +
+          'cbcs (pattern) encryption requires Bento4 (mp4encrypt --method MPEG-CBCS) ' +
           'or shaka packager; neither is installed. ffmpeg cannot emit cbcs. Decrypt oracle → NA.',
       };
     }
@@ -601,8 +601,7 @@ const RECIPES = {
         const res = spawnSync(
           'mp4encrypt',
           [
-            '--method', 'MPEG-CENC',
-            '--encryption-scheme', 'cbcs',
+            '--method', 'MPEG-CBCS',
             '--key', `1:${keyHex}:random`,
             '--property', `1:KID:${kidHex}`,
             plain,

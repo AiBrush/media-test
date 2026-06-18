@@ -270,8 +270,8 @@
       "genMethod": "cbcs pattern encryption (AES-CBC w/ pattern). ffmpeg mov muxer -encryption_scheme cenc-aes-ctr only covers ctr; cbcs requires shaka/Bento4 (mp4encrypt --method MPEG-CENC scheme cbcs).",
       "sourceUrl": null,
       "acquire": "If Bento4 (mp4encrypt) or shaka packager is installed on the bake host, bake.mjs generates cenc_cbcs.mp4 automatically (source effectively becomes generated) — install one and re-run `bun fixtures/bake.mjs cenc_cbcs.mp4`. Otherwise produce it manually: `mp4encrypt --method MPEG-CENC --encryption-scheme cbcs --key 1:0123456789abcdef0123456789abcdef:random --property 1:KID:abcdef00112233445566778899aabbcc <plain_h264_aac.mp4> fixtures/media/cenc_cbcs.mp4`, where <plain_h264_aac.mp4> is the cenc_ctr.mp4 cleartext baseline (libx264 yuv420p + AAC, +faststart). Record key/KID into fixtures/golden/cenc_cbcs.mp4.keys.json for the decrypt oracle.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "1b3f92f5c62c82e4d9483cee3d8678f8884a85ab77c3032389a0a2e70e5d966c",
+      "sizeBytes": 2201135,
       "notes": "CENC cbcs (pattern) encrypted MP4. ffmpeg cannot emit cbcs; needs Bento4/shaka. provided (SKIPPED with reason / MISSING ASSETS) when those binaries are absent; decrypt oracle then NA(asset-missing)."
     },
     {
@@ -426,8 +426,8 @@
       "sizeBucket": "tiny",
       "genMethod": "IN-BROWSER MediaRecorder capture (canvas.captureStream + MediaRecorder, video/webm). Cannot be produced by ffmpeg: MediaRecorder WebM is non-seekable / cluster-only / lacks a cues/duration header. Baked by a one-time browser pass (see bake.mjs RECORDER_NOTE).",
       "acquire": "Open fixtures/tools/record-fixture.html in a browser, click Record (~3s), save the download as fixtures/media/recorder_headerless.webm, then re-run `bun fixtures/bake.mjs recorder_headerless.webm` to checksum it.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "4423ec5c7a9f50c6615190e642cdd8c0f501284b304a5a7824e226cd4e39c82d",
+      "sizeBytes": 192412,
       "notes": "Headerless/streaming MediaRecorder WebM. NOT faked by ffmpeg. Produced via tools/record-fixture.html in a browser, then dropped into fixtures/media/. bake.mjs records it as SKIPPED(browser-capture) until present."
     },
     {
@@ -513,8 +513,8 @@
       "source": "generated",
       "sizeBucket": "large",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 120s + sine 48k stereo, libx264 yuv420p CRF23 -g 60 closed GOP, AAC 128k, +faststart. ~100-150 MB. Sustained throughput + memory for the MP4/H.264 family. Slow to generate.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "efa6dd569d4d17f178bb47f371e6c94aa4ff130a01288419d487827078ff02a5",
+      "sizeBytes": 89573913,
       "notes": "large bucket (~100 MB) 1080p H.264 MP4. Sustained metadata-extract / packet-iterate / convert throughput; memory pressure."
     },
     {
@@ -528,8 +528,8 @@
       "source": "generated",
       "sizeBucket": "large",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 120s + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 34 -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 96k, -f webm. ~80-150 MB. Large WebM/VP9 so the large rung crosses container/codec. VERY slow to generate (VP9 sw encode of 120s 1080p).",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "3e1647a4fec29df5c0c0080b722c91ee48627af823e262a2eea9136ad6a91a32",
+      "sizeBytes": 102363592,
       "notes": "large bucket (~100 MB) 1080p VP9 WebM. Pairs with large_h264_1080p_120s.mp4 so the large rung covers both major families. Generation is slow; use --skip-longform or --subset to defer."
     },
     {
@@ -543,8 +543,8 @@
       "source": "generated",
       "sizeBucket": "huge",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 600s (10 min) + sine 48k stereo, libx264 yuv420p CRF23 -g 60 closed GOP, AAC 128k, -f mov +faststart. Targets ~500-700 MB to mirror the BigBuckBunny1080pH264.mov 'huge' bucket. This is the SELF-CONTAINED, deterministic, network-free 'big read' asset (BigBuckBunny-style 1080p H.264 .mov) the suite always has. VERY slow + large to generate; gated by --skip-longform.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "319bcf37ab6c54b9ed191ade74f4e37e2b633c7dd31026ba98eba1ad50751767",
+      "sizeBytes": 447748594,
       "notes": "huge bucket (~500-700 MB) self-contained big-read asset: large 1080p H.264 .mov for metadata-extract / packet-iterate / convert throughput at scale (mirrors Mediabunny's published-chart input shape). Generated offline, no network needed — always present after a full bake. The REAL BigBuckBunny1080pH264.mov is additionally available as the 'provided' entry big_buck_bunny_1080p_h264.mov for published-chart parity."
     },
     {
@@ -558,8 +558,8 @@
       "source": "generated",
       "sizeBucket": "huge",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 240s (4 min) + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 34 -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 96k, -f webm. Targets ~500-700 MB to land in the 'huge' band. WebM/VP9 twin of huge_h264_1080p_600s.mov so the huge rung crosses BOTH major container/codec families (§5.3 worked example). VERY slow (VP9 sw encode of long 1080p); gated by --skip-longform.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "5889cd623ce48c8fd44e0c9b5500c2509e1628aa61a42dacdcf2d67612b144f8",
+      "sizeBytes": 204722698,
       "notes": "huge bucket (~500-700 MB) WebM/VP9 big-read twin. §5.3 requires at least one asset per major container/codec per bucket — this pairs with huge_h264_1080p_600s.mov so the size axis crosses the format axis at the huge rung. Generated offline; --skip-longform omits it during quick bakes."
     },
     {
@@ -575,8 +575,8 @@
       "genMethod": "REAL BigBuckBunny1080pH264.mov (~691 MiB) — Mediabunny's own published-benchmark input (test-instructions.md §5.1 'Big read file', §5.3 'huge' bucket). The bake CANNOT fetch a sha256-pinned copy: the exact 691 MiB file Mediabunny benchmarks is an internal/private asset with no published checksum, so a TOFU download cannot be honestly 'pinned'. It is therefore source:'provided' (drop-in) rather than fetched. The synthetic huge_h264_1080p_600s.mov covers the same big-read role deterministically and is always present; THIS asset is the optional published-chart-parity twin.",
       "sourceUrl": "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov",
       "acquire": "Obtain the real Big Buck Bunny 1080p H.264 .mov (Blender Foundation, CC-BY 3.0). Canonical source: https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov (~691 MiB; the Blender Peach mirror — this is the same content Mediabunny benchmarks). Download it, then `shasum -a 256 big_buck_bunny_1080p_h264.mov` to compute its sha256, drop it at fixtures/media/big_buck_bunny_1080p_h264.mov, record that sha256 + sizeBytes into this manifest entry, and re-run `bun fixtures/bake.mjs big_buck_bunny_1080p_h264.mov --golden-only` to derive golden. ALTERNATIVELY, to make the bake auto-fetch it, set the env var BBB_MOV_SHA256=<the sha256 you trust> and re-run the bake: bake.mjs will download from sourceUrl, verify against BBB_MOV_SHA256, and on match treat it as fetched (offline-once). Without a trusted sha256 the bake will NOT silently download (no unpinned TOFU).",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "dc2146a2b1172def56730143ad80cd1825b7fad15f1fc9c23a4e7d01a741ac11",
+      "sizeBytes": 725106140,
       "expectedSizeBytes": 725106140,
       "notes": "huge bucket / big-read PARITY asset: the actual file behind Mediabunny's published 1080p H.264 .mov chart. provided (drop-in or pin-then-fetch via BBB_MOV_SHA256). Until present, big-read parity cases are NA(asset-missing); the deterministic huge_h264_1080p_600s.mov keeps the huge rung populated regardless. expectedSizeBytes ~691 MiB is approximate (Blender Peach mirror); verify after download."
     },
@@ -590,8 +590,8 @@
       "source": "generated",
       "sizeBucket": "large",
       "genMethod": "ffmpeg sine 440Hz 48k mono 3600s, AAC 64k, -f mp4 (m4a). Long duration for streaming/seek/memory stress.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "74cf9cc3bd689083dc0da0b620e0bd99e29c6fd50891be324fa56f0068ae71ad",
+      "sizeBytes": 29659705,
       "notes": "Multi-hour audio (1h, ~28 MB at 64k). Many-samples / long-duration seek + streaming. Large; generation is slow. Use --skip-longform or --subset to skip during quick bakes."
     },
     {
@@ -605,8 +605,8 @@
       "source": "generated",
       "sizeBucket": "massive",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 7200s (2h) + sine 48k mono, libx264 yuv420p -b:v 1200k (low bitrate, capped) -g 60 closed GOP, AAC 64k, +faststart. Low-bitrate long-form so the file lands ~1-1.4 GB / many-thousand-sample with bounded encode time. Lazy-read / streaming / peak-memory / OOM-resistance + many-samples sample-table stress. VERY slow + very large; gated by --skip-longform.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "6353e5f1dc03d0b81958e7489b2f749ea33bf7fb37bb03bc53bd5150d2d3120d",
+      "sizeBytes": 1144400182,
       "notes": "massive bucket (~1-1.4 GB, 2h, ~216k video frames) low-bitrate 1080p. Exercises lazy/partial reading, streaming demux, peak-memory and OOM-resistance, and many-thousand-sample sample-table parsing. Generated offline but slow; --skip-longform omits it. Real multi-hour camera/broadcast captures may additionally be supplied as 'provided'."
     },
     {
@@ -620,8 +620,8 @@
       "source": "generated",
       "sizeBucket": "massive",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 7200s (2h) + sine 48k mono, libvpx-vp9 -b:v 700k -maxrate 800k -bufsize 1600k (low bitrate, capped) -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 64k, -f webm. Low-bitrate long-form so the file lands ~1-1.4 GB / many-thousand-sample with bounded encode time. WebM/VP9 twin of massive_h264_1080p_2h.mp4 so the massive rung crosses BOTH major families (§5.3). VERY slow + very large; gated by --skip-longform.",
-      "sha256": null,
-      "sizeBytes": null,
+      "sha256": "afdd2e1abcc4e5cd956df5dde6e02d8bd3cf5cc2a55ee01362ebac1b4b3ae828",
+      "sizeBytes": 774820023,
       "notes": "massive bucket (~1-1.4 GB, 2h) low-bitrate 1080p WebM/VP9 twin. Pairs with massive_h264_1080p_2h.mp4 so lazy-read / streaming / peak-memory / OOM-resistance + many-sample stress is exercised in both major container/codec families. Generated offline but slow; --skip-longform omits it."
     },
     {

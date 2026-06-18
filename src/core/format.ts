@@ -6,21 +6,21 @@
  *   - `N/A`                       — the framework or the browser genuinely cannot run the case
  *
  * This module is the ONE place that collapses the richer internal `ScenarioResult.status`
- * (`PASS | FAIL | NA_ENGINE | NA_BROWSER | ERROR | SKIPPED`) down to that display vocabulary. It is
+ * (`PASS | FAIL | NA_ENGINE | NA_BROWSER | NA_ASSET | ERROR | SKIPPED`) down to that display vocabulary. It is
  * deliberately pure (no DOM, no Node API) so BOTH the in-page live matrix (`src/app/ui.ts`) and the
  * markdown report (`src/core/report.ts`, which also runs under bun/in a Worker) share identical logic.
  *
  * IMPORTANT — we collapse, we do NOT mask. The internal status is preserved verbatim everywhere
- * (`ScenarioResult.status`, `report.json`): this function only chooses what a HUMAN sees. The two NA
- * flavors fold into one `N/A` (the reader does not care whether the engine or the browser is the
- * gap), but FAIL / ERROR / SKIPPED are NEVER silently relabelled as `Pass` or `N/A` — a wrong/broken
+ * (`ScenarioResult.status`, `report.json`): this function only chooses what a HUMAN sees. The NA
+ * flavors fold into one `N/A` (the reader does not need the table to distinguish engine, browser, or
+ * asset gaps), but FAIL / ERROR / SKIPPED are NEVER silently relabelled as `Pass` or `N/A` — a wrong/broken
  * cell stays visibly wrong so it is fixed, not hidden (anti-pattern: do not classify a bug as N/A).
  * Once every targeted cell is genuinely PASS or NA, the surface naturally contains only Pass/N/A.
  */
 
 import type { ResultStatus } from './scenario.ts';
 
-/** The single collapsed "not applicable" marker shown for both NA_ENGINE and NA_BROWSER. */
+/** The single collapsed "not applicable" marker shown for all NA_* statuses. */
 export const NA_DISPLAY = 'N/A';
 
 /** Placeholder for a cell that was never run (no result for the triple). */
@@ -67,7 +67,7 @@ export function pickExecutionMs(r: DisplayResult): number | undefined {
 }
 
 /**
- * THE human-facing per-cell string. PASS with a time → `Pass (<time>)`; NA_ENGINE/NA_BROWSER →
+ * THE human-facing per-cell string. PASS with a time → `Pass (<time>)`; NA_* →
  * `N/A`. A PASS missing any timing source, plus FAIL, ERROR and SKIPPED, are returned as raw internal
  * markers so an unfixed cell stays visibly broken rather than being masked as a pass or an N/A.
  * Callers that have driven their targeted matrix to all-PASS-or-NA with timing will therefore only
@@ -81,6 +81,7 @@ export function visibleResult(r: DisplayResult): string {
     }
     case 'NA_ENGINE':
     case 'NA_BROWSER':
+    case 'NA_ASSET':
       return NA_DISPLAY;
     case 'FAIL':
     case 'ERROR':
@@ -93,5 +94,5 @@ export function visibleResult(r: DisplayResult): string {
 
 /** True when the status collapses to the single user-facing `N/A` marker. */
 export function isNaStatus(status: ResultStatus | null | undefined): boolean {
-  return status === 'NA_ENGINE' || status === 'NA_BROWSER';
+  return status === 'NA_ENGINE' || status === 'NA_BROWSER' || status === 'NA_ASSET';
 }

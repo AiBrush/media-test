@@ -408,6 +408,7 @@ interface GracefulCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   mutate: (bytes: Uint8Array) => Uint8Array;
+  gracefulAllowOutput?: boolean;
   notes: string;
 }
 
@@ -428,6 +429,7 @@ const GRACEFUL_CASES: GracefulCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     mutate: identityBytes(),
+    gracefulAllowOutput: true,
     notes:
       'Header-truncated H.264 MP4 (the corpus truncated_h264.mp4 is already a partial/broken file): demux ' +
       'must reject cleanly or yield a clean partial+EOF, never a corrupt packet table or a hang.',
@@ -467,6 +469,7 @@ const gracefulScenarios: Scenario[] = GRACEFUL_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
+    ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
     mutate: c.mutate,
     timeoutMs: GRACEFUL_TIMEOUT_MS,
     notes: c.notes,

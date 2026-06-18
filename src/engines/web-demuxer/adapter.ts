@@ -431,10 +431,15 @@ export class WebDemuxerEngine implements MediaEngine {
     return this.demuxer;
   }
 
-  /** Load a MediaInput into the demuxer worker. web-demuxer's load() takes a File|URL string; we
-   *  wrap the asset bytes as a File so reads stay same-origin (no run-time fetch). */
+  /** Load a MediaInput into the demuxer worker. web-demuxer's load() takes a File|URL string. Normal
+   *  corpus assets use their same-origin URL so huge probes do not materialize multi-GB Blobs; mutated
+   *  robustness inputs use a File so the rewritten bytes are what the engine reads. */
   private async loadInput(input: MediaInput): Promise<WebDemuxerType> {
     const d = this.requireDemuxer();
+    if (!input.mutated) {
+      await d.load(input.url);
+      return d;
+    }
     const blob = await input.blob();
     const name = input.id || 'input';
     // File extends Blob; the worker reads from it via FFmpeg's IO shim. Type set from the blob.

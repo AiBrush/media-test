@@ -14,7 +14,8 @@
  * Usage (normally invoked by scripts/run.sh, but runnable directly):
  *   bun scripts/launch.mjs --base-url http://localhost:5173 --browser chromium \
  *        [--engine <id>] [--pillar functional|performance|robustness|all] \
- *        [--scenario <id>] [--out results/raw] [--warmup N] [--iters N] [--timeout-ms MS] [--headed]
+ *        [--feature <id>] [--operation <op>] [--scenario <id>] \
+ *        [--out results/raw] [--warmup N] [--iters N] [--timeout-ms MS] [--headed]
  *
  * --engine/--scenario/--pillar are forwarded as a run filter. --engine/--scenario may repeat or be
  * comma-separated. Output: results/raw/<browser>-<timestamp>.json (the same payload the in-page
@@ -34,6 +35,8 @@ const opts = {
   baseUrl: 'http://localhost:5173',
   browser: 'brave', // default to a REAL, non-headless browser (user mandate: no headless testing)
   engines: /** @type {string[]} */ ([]),
+  features: /** @type {string[]} */ ([]),
+  operations: /** @type {string[]} */ ([]),
   scenarios: /** @type {string[]} */ ([]),
   pillar: 'all',
   out: 'results/raw',
@@ -52,6 +55,8 @@ for (let i = 0; i < argv.length; i++) {
     case '--base-url': opts.baseUrl = next(); break;
     case '--browser': opts.browser = next(); break;
     case '--engine': opts.engines.push(...list(next())); break;
+    case '--feature': opts.features.push(...list(next())); break;
+    case '--operation': opts.operations.push(...list(next())); break;
     case '--scenario': opts.scenarios.push(...list(next())); break;
     case '--pillar': opts.pillar = next(); break;
     case '--out': opts.out = next(); break;
@@ -60,7 +65,7 @@ for (let i = 0; i < argv.length; i++) {
     case '--timeout-ms': opts.timeoutMs = Number(next()); break;
     case '--headed': opts.headed = true; break;
     case '-h': case '--help':
-      console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS]');
+      console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--feature id] [--operation op] [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS]');
       process.exit(0);
     default:
       console.error(`launch.mjs: unknown arg '${a}'`);
@@ -161,13 +166,22 @@ try {
     browser: opts.browser,
     pillar: opts.pillar,
     ...(opts.engines.length ? { engineIds: opts.engines } : {}),
+    ...(opts.features.length ? { featureIds: opts.features } : {}),
+    ...(opts.operations.length ? { operations: opts.operations } : {}),
     ...(opts.scenarios.length ? { scenarioIds: opts.scenarios } : {}),
     ...(Number.isFinite(opts.warmup) ? { warmup: opts.warmup } : {}),
     ...(Number.isFinite(opts.iters) ? { iters: opts.iters } : {}),
   };
 
   // Trigger the run IN THE PAGE (the page measures; we only kick it off and await completion).
-  console.log(`[launch] ${opts.browser} running matrix (pillar=${opts.pillar}${opts.engines.length ? `, engines=${opts.engines.join(',')}` : ''})…`);
+  console.log(
+    `[launch] ${opts.browser} running matrix (` +
+      `pillar=${opts.pillar}` +
+      `${opts.features.length ? `, features=${opts.features.join(',')}` : ''}` +
+      `${opts.operations.length ? `, operations=${opts.operations.join(',')}` : ''}` +
+      `${opts.engines.length ? `, engines=${opts.engines.join(',')}` : ''}` +
+      `)…`,
+  );
   await page.evaluate((f) => {
     // Fire and forget inside the page; we poll __RUN_DONE__ from the driver so a very long run does
     // not exceed a single evaluate() call's bound.
@@ -252,6 +266,7 @@ function summaryStatusLabel(status) {
       return 'Pass';
     case 'NA_ENGINE':
     case 'NA_BROWSER':
+    case 'NA_ASSET':
       return 'N/A';
     case 'FAIL':
       return 'Fail';

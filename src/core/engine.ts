@@ -17,6 +17,8 @@ export interface MediaInput {
   /** served static URL; supports HTTP Range */
   url: string;
   mime: string;
+  /** true when robustness logic rewrites bytes before the engine receives them */
+  mutated?: boolean;
   blob(): Promise<Blob>;
   arrayBuffer(): Promise<ArrayBuffer>;
 }

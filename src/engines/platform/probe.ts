@@ -100,7 +100,11 @@ async function probeViaVideoElement(
 
 /** Estimate fps from demuxed samples as average sample rate; fall back to median interval. */
 function fpsFromSamples(samples: Array<{ ptsUs: number; durationUs?: number }>): number | undefined {
-  if (samples.length < 2) return undefined;
+  if (samples.length === 0) return undefined;
+  if (samples.length === 1) {
+    const durationUs = samples[0]?.durationUs;
+    return durationUs && durationUs > 0 ? Math.round((1_000_000 / durationUs) * 1000) / 1000 : undefined;
+  }
 
   let minStart = Number.POSITIVE_INFINITY;
   let maxEnd = Number.NEGATIVE_INFINITY;

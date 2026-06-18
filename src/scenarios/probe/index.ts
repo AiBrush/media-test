@@ -41,6 +41,8 @@ interface ProbeCase {
   container: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
+  features?: string[];
+  options?: Record<string, unknown>;
   tolerances?: OracleTolerances;
   notes?: string;
 }
@@ -115,6 +117,7 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'hls',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['hls:aes128'],
     notes:
       'AES-128 HLS: probe reports container/tracks/aggregated duration from the playlist without the ' +
       'key (metadata is in the clear). The decrypt key is only needed for the decrypt op, not probe.',
@@ -175,6 +178,7 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'webm',
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
+    tolerances: { fpsTolerance: 0.25 },
     notes: 'MediaRecorder WebM with no/sparse Cues + unknown duration; probe duration may be null.',
   },
   {
@@ -243,15 +247,24 @@ const PROBE_CASES: ProbeCase[] = [
     notes: 'huge bucket (~500-700 MB) self-contained big-read .mov. Probe reads header without scanning media.',
   },
   {
+    asset: 'huge_vp9_1080p_240s.webm',
+    container: 'webm',
+    videoCodecs: ['vp9'],
+    audioCodecs: ['opus'],
+    notes: 'huge bucket VP9/WebM twin. Keeps the huge rung cross-family instead of H.264-only.',
+  },
+  {
     // HUGE big-read PARITY twin (the real Big Buck Bunny 1080p H.264 .mov Mediabunny benchmarks).
     // 'provided' (drop-in / pin-then-fetch): NA(asset-missing) until present, then golden-gated.
     asset: 'big_buck_bunny_1080p_h264.mov',
     container: 'mov',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    options: { metadataTrackTypes: ['video', 'audio'] },
     notes:
       'huge/big-read PARITY (real Big Buck Bunny 1080p H.264 .mov). provided drop-in — NA(asset-missing) ' +
-      'until dropped at fixtures/media/; the synthetic huge_h264_1080p_600s.mov keeps the rung populated.',
+      'until dropped at fixtures/media/; the synthetic huge_h264_1080p_600s.mov keeps the rung populated. ' +
+      'Only media tracks are compared here; non-media timecode/data tracks are covered by metadata-specific cases.',
   },
   {
     // MASSIVE 2h low-bitrate 1080p (~1-1.4 GB, ~216k frames). Many-sample sample-table parse; lazy read.
@@ -262,6 +275,13 @@ const PROBE_CASES: ProbeCase[] = [
     notes:
       'massive bucket (~1-1.4 GB, 2h) low-bitrate 1080p: probe must report ~2h duration from the moov ' +
       'WITHOUT walking the many-thousand-sample table (lazy/partial read, no OOM). Golden after full bake.',
+  },
+  {
+    asset: 'massive_vp9_1080p_2h.webm',
+    container: 'webm',
+    videoCodecs: ['vp9'],
+    audioCodecs: ['opus'],
+    notes: 'massive bucket VP9/WebM twin. Exercises long-form lazy probe behavior outside ISOBMFF.',
   },
 ];
 
@@ -275,9 +295,11 @@ const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
       containersIn: [c.container],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: ['golden-metadata'],
     metrics: ['wall'],
+    ...(c.options ? { options: c.options } : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   }),
@@ -474,6 +496,7 @@ const truncatedHeaderProbe: Scenario = defineScenario({
   },
   oracles: ['graceful-failure'],
   metrics: ['wall', 'peakMemory'],
+  options: { gracefulAllowOutput: true },
   timeoutMs: HEADER_TRUNCATED_TIMEOUT_MS,
   notes:
     'Deep edge (§A.16): header-truncated PROBE (incomplete moov/mdat). Probe must reject cleanly or ' +

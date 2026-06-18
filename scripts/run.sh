@@ -8,6 +8,8 @@
 # Flags (all optional; sensible defaults):
 #   --engine <id>        run only this engine (repeatable / comma-separated). Default: all registered.
 #   --browser <name>     brave|chromium|webkit|firefox (repeatable / comma-separated). Default: brave.
+#   --feature <id>       run only this feature family (probe|demux|remux|...). Repeatable / CSV.
+#   --operation <op>     run only this operation (probe|demux|remux|...). Repeatable / CSV.
 #   --pillar <name>      functional|performance|robustness|all. Default: all.
 #   --scenario <id>      run only this scenario (repeatable / comma-separated).
 #   --port <n>           static server port. Default: an EPHEMERAL FREE port is auto-selected (so a
@@ -32,6 +34,8 @@ cd "${ROOT_DIR}"
 # ── defaults ─────────────────────────────────────────────────────────────────────────────────
 BROWSERS=()
 ENGINES=()
+FEATURES=()
+OPERATIONS=()
 SCENARIOS=()
 PILLAR="all"
 PORT=""            # empty ⇒ auto-select a free ephemeral port (see port selection below)
@@ -51,6 +55,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine) append_csv ENGINES "$2"; shift 2 ;;
     --browser) append_csv BROWSERS "$2"; shift 2 ;;
+    --feature) append_csv FEATURES "$2"; shift 2 ;;
+    --operation) append_csv OPERATIONS "$2"; shift 2 ;;
     --scenario) append_csv SCENARIOS "$2"; shift 2 ;;
     --pillar) PILLAR="$2"; shift 2 ;;
     --port) PORT="$2"; PORT_EXPLICIT=1; shift 2 ;;
@@ -212,6 +218,8 @@ LAUNCH_COMMON=(--base-url "${BASE_URL}" --pillar "${PILLAR}" --out "results/raw"
 # bash 3.2 + set -u: expanding an EMPTY array as "${arr[@]}" raises 'unbound variable', so guard on
 # length first (${#arr[@]} is always safe). Empty ENGINES/SCENARIOS ⇒ run all (no filter forwarded).
 if [[ ${#ENGINES[@]} -gt 0 ]]; then for e in "${ENGINES[@]}"; do LAUNCH_COMMON+=(--engine "${e}"); done; fi
+if [[ ${#FEATURES[@]} -gt 0 ]]; then for f in "${FEATURES[@]}"; do LAUNCH_COMMON+=(--feature "${f}"); done; fi
+if [[ ${#OPERATIONS[@]} -gt 0 ]]; then for o in "${OPERATIONS[@]}"; do LAUNCH_COMMON+=(--operation "${o}"); done; fi
 if [[ ${#SCENARIOS[@]} -gt 0 ]]; then for s in "${SCENARIOS[@]}"; do LAUNCH_COMMON+=(--scenario "${s}"); done; fi
 
 OVERALL=0

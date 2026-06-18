@@ -277,20 +277,18 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * Choose the parse source for an input, and record the reader mode into config.
    *
    *  - HLS (.m3u8): keep `src: input.url` + explicit webReader so the parser can resolve the playlist's
-   *    relative sibling .ts segments from the base URL (a buffered Blob has no base URL). HLS has no
-   *    robustness mutate() case for this engine, so feeding the URL loses nothing on the robustness
-   *    pillar; it also exercises the genuine HTTP-Range lazy-read path ('http-range' feature).
-   *  - Everything else: `src: await input.blob()`. The runner applies the robustness mutate()
+   *    relative sibling .ts segments from the base URL (a buffered Blob has no base URL). This also
+   *    exercises the genuine HTTP-Range lazy-read path ('http-range' feature).
+   *  - Normal single-file corpus assets: also use `src: input.url` + webReader so huge/massive
+   *    metadata benchmarks stay lazy and do not force Chromium to allocate multi-GB Blobs.
+   *  - Mutated robustness inputs: use `src: await input.blob()`. The runner applies mutate()
    *    (fuzz/truncate/bit-flip) through blob()/arrayBuffer() while url serves the PRISTINE file, so a
-   *    Blob is REQUIRED for the parser to actually see corrupted bytes and fail cleanly
-   *    (graceful-failure PASS). On non-mutated runs the Blob is the real file, so functional probes/
-   *    demux are byte-identical to the URL path. Single-file containers (mp4/webm/ts/mp3/flac/wav/adts)
-   *    have no sibling-segment resolution to lose.
+   *    Blob is REQUIRED for the parser to actually see corrupted bytes and fail cleanly.
    */
   private async chooseSrcOptions(
     input: MediaInput,
   ): Promise<{ src: string | Blob; reader?: typeof webReader }> {
-    if (isHlsInput(input)) {
+    if (isHlsInput(input) || !input.mutated) {
       this.config = { ...this.config, reader: 'webReader' };
       return { src: input.url, reader: webReader };
     }
@@ -342,6 +340,11 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * resolve, and the HTTP-Range lazy-read path runs).
    */
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
+    if (isHlsInput(input)) {
+      const { metadata, packets } = await this.demux(input);
+      return withVideoFpsFromPackets(metadata, packets);
+    }
+
     const srcOptions = await this.chooseSrcOptions(input);
     const result = await this.runParse<{
       durationInSeconds: number | null;
@@ -548,6 +551,29 @@ export class RemotionMediaParserEngine implements MediaEngine {
 
     return meta;
   }
+}
+
+function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketInfo[]): NormalizedMetadata {
+  const tracks = metadata.tracks.map((track, trackIndex) => {
+    if (track.type !== 'video' || track.fps != null) return track;
+    const fps = fpsFromTrackPackets(
+      packets.filter((packet) => packet.trackIndex === trackIndex),
+      metadata.durationSec,
+    );
+    return fps == null ? track : { ...track, fps };
+  });
+  return { ...metadata, tracks };
+}
+
+function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {
+  if (!packets.length) return null;
+  if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
+    return packets.length / durationSec;
+  }
+  if (packets.length < 2) return null;
+  const pts = packets.map((packet) => packet.ptsUs).sort((a, b) => a - b);
+  const spanUs = pts[pts.length - 1]! - pts[0]!;
+  return spanUs > 0 ? ((pts.length - 1) * 1_000_000) / spanUs : null;
 }
 
 // ── module-level helpers ──────────────────────────────────────────────────────────────────────

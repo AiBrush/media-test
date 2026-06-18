@@ -50,14 +50,18 @@ const AUDIO_CASES: RemuxCase[] = [
     notes: 'Opus OGG->MKV: lossless audio re-wrap into full Matroska (vs the WebM-restricted profile).',
   },
 
-  // ── FLAC -> OGG: FLAC is a legal Ogg-mapped codec (Ogg FLAC). Reverse-ish of the flac->mkv cell,
-  //    onto a different container family. mediabunny Ogg WRITE + FLAC codec → lossless re-wrap. ──
+  // ── FLAC -> OGG: FLAC is a legal Ogg-mapped codec (Ogg FLAC), but not every browser engine/muxer
+  //    can COPY FLAC into Ogg. Require an explicit feature so a transcode-to-Opus path is not scored
+  //    as a lossless remux. ──
   {
     asset: 'flac_seektable.flac',
     from: 'flac',
     to: 'ogg',
     audioCodecs: ['flac'],
-    notes: 'FLAC->OGG (Ogg-mapped FLAC): lossless re-wrap; SEEKTABLE/native-frame layout changes, samples identical.',
+    features: ['remux:flac-in-ogg'],
+    notes:
+      'FLAC->OGG (Ogg-mapped FLAC): lossless re-wrap only for engines that explicitly declare ' +
+      'remux:flac-in-ogg; transcode-to-Opus is not accepted as remux.',
   },
 
   // ── AAC ADTS -> MPEG-TS audio: §A.3 lists MPEG-TS as a write target; an ADTS AAC elementary stream

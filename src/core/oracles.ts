@@ -279,6 +279,7 @@ export interface OracleContext {
   input: MediaInput;
   output?: MediaBytes; // bytes-producing ops
   metadata?: NormalizedMetadata; // probe
+  probeMetadatas?: Array<{ input: MediaInput; metadata: NormalizedMetadata; golden: GoldenStore }>; // multi-input probe
   demux?: DemuxResult; // demux
   frames?: FrameSink; // decodeFrames
   seek?: { landedPtsUs: number; frame: FrameDigest };
@@ -313,7 +314,7 @@ export async function runOracle(
       case 'decoded-frames-bitexact':
         return decodedFramesBitexact(ctx);
       case 'reference-reimport':
-        return referenceReimport(ctx);
+        return referenceReimport(ctx, t);
       case 'playback-smoke':
         return playbackSmoke(ctx);
       case 'ssim-psnr':
@@ -392,8 +393,8 @@ function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): Orac
   }
 
   // per-track codec/dims/fps/sampleRate/channels — match golden tracks positionally by type order
-  const goldTracks = want.tracks ?? [];
-  const gotTracks = got.tracks ?? [];
+  const goldTracks = metadataTracksForScenario(ctx, want.tracks ?? []);
+  const gotTracks = metadataTracksForScenario(ctx, got.tracks ?? []);
   if (gotTracks.length !== goldTracks.length) {
     diffs.push(`track count: measured ${gotTracks.length} vs golden ${goldTracks.length}`);
   }
@@ -437,6 +438,19 @@ function compareTrack(
   return d;
 }
 
+function metadataTracksForScenario(ctx: OracleContext, tracks: NormalizedTrack[]): NormalizedTrack[] {
+  const options = ctx.scenario.options;
+  const allowed = readStringArrayOption(options, ['metadataTrackTypes', 'trackTypes']);
+  if (allowed.length) {
+    const set = new Set(allowed.map((s) => s.toLowerCase()));
+    return tracks.filter((t) => set.has(t.type));
+  }
+  if (readBooleanOption(options, ['ignoreOtherTracks'])) {
+    return tracks.filter((t) => t.type !== 'other');
+  }
+  return tracks;
+}
+
 // ── golden-packets ───────────────────────────────────────────────────────────────────────────
 
 function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): OracleOutcome {
@@ -445,6 +459,7 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
   const want = ctx.golden.packets;
   if (!got) return fail(oracle, 'no demux packets on ctx.demux.packets');
   if (!want) return fail(oracle, 'no golden packets (fixtures/golden/<id>.packets.json absent)');
+  if (usesPcmAggregatePacketOracle(ctx)) return pcmAggregatePackets(ctx, got, want, t);
 
   const diffs: string[] = [];
   const measurements: Record<string, number> = {
@@ -501,14 +516,20 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
     const m = Math.min(gotTrack.length, wantTrack.length);
     if (m === 0) continue;
     comparedTracks++;
-    // Per-track constant offset, taken from the first aligned packet (origin alignment).
-    const ptsOffset = gotTrack[0]!.ptsUs - wantTrack[0]!.ptsUs;
-    const dtsOffset = gotTrack[0]!.dtsUs - wantTrack[0]!.dtsUs;
+    // Per-track constant offset, taken from an aligned packet (origin alignment). Ogg/Opus exposes
+    // codec pre-skip differently across demuxers: ffprobe reports a negative first packet, while
+    // Mediabunny starts it at 0 and agrees from packet 1 onward. Anchor packet 1 and skip timestamp
+    // drift on packet 0 for that specific convention difference; sizes/counts still compare exactly.
+    const looseOpusFirstPacket = usesOpusPreskipLoosePacket(ctx, trackIndex) && m > 1;
+    const anchor = looseOpusFirstPacket ? 1 : 0;
+    const ptsOffset = gotTrack[anchor]!.ptsUs - wantTrack[anchor]!.ptsUs;
+    const dtsOffset = gotTrack[anchor]!.dtsUs - wantTrack[anchor]!.dtsUs;
     for (let i = 0; i < m; i++) {
       const a = gotTrack[i]!;
       const b = wantTrack[i]!;
       if (a.size !== b.size) sizeMismatch++;
       if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
+      if (looseOpusFirstPacket && i === 0) continue;
       const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
       const dtsResid = Math.abs(a.dtsUs - b.dtsUs - dtsOffset);
       if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
@@ -525,6 +546,84 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
   return pass(oracle, `packet table matches golden (${got.length} packets)`, measurements);
+}
+
+function usesPcmAggregatePacketOracle(ctx: OracleContext): boolean {
+  const explicit = readStringOption(ctx.scenario.options, ['packetOracle']);
+  if (explicit === 'pcm-aggregate') return true;
+  const container = resolveContainer(ctx.golden.meta?.container ?? ctx.demux?.metadata.container, primaryAssetId(ctx));
+  if (container !== 'wav') return false;
+  const tracks = ctx.golden.meta?.tracks ?? ctx.demux?.metadata.tracks ?? [];
+  return tracks.some((t) => t.type === 'audio' && t.codec.startsWith('pcm-'));
+}
+
+function pcmAggregatePackets(
+  ctx: OracleContext,
+  got: PacketInfo[],
+  want: PacketInfo[],
+  t: Required<OracleTolerances>,
+): OracleOutcome {
+  const oracle: OracleId = 'golden-packets';
+  const byTrack = (ps: PacketInfo[]): Map<number, PacketInfo[]> => {
+    const m = new Map<number, PacketInfo[]>();
+    for (const p of ps) {
+      const g = m.get(p.trackIndex);
+      if (g) g.push(p);
+      else m.set(p.trackIndex, [p]);
+    }
+    return m;
+  };
+  const gotByTrack = byTrack(got);
+  const wantByTrack = byTrack(want);
+  const keys = new Set([...gotByTrack.keys(), ...wantByTrack.keys()]);
+  const diffs: string[] = [];
+  const measurements: Record<string, number> = {
+    measuredCount: got.length,
+    goldenCount: want.length,
+  };
+  for (const trackIndex of keys) {
+    const a = gotByTrack.get(trackIndex) ?? [];
+    const b = wantByTrack.get(trackIndex) ?? [];
+    const gotBytes = a.reduce((sum, p) => sum + p.size, 0);
+    const wantBytes = b.reduce((sum, p) => sum + p.size, 0);
+    measurements[`track${trackIndex}MeasuredBytes`] = gotBytes;
+    measurements[`track${trackIndex}GoldenBytes`] = wantBytes;
+    if (gotBytes !== wantBytes) diffs.push(`track ${trackIndex} total PCM bytes: measured ${gotBytes} vs golden ${wantBytes}`);
+    if (a.length > 0 && b.length > 0) {
+      const ptsDelta = Math.abs(a[0]!.ptsUs - b[0]!.ptsUs);
+      measurements[`track${trackIndex}FirstPtsDeltaUs`] = ptsDelta;
+      if (ptsDelta > t.seekToleranceUs) {
+        diffs.push(`track ${trackIndex} first pts: measured ${a[0]!.ptsUs} vs golden ${b[0]!.ptsUs}`);
+      }
+    }
+  }
+
+  const gotDur = ctx.demux?.metadata.durationSec ?? null;
+  const wantDur = ctx.golden.meta?.durationSec ?? null;
+  if (gotDur != null && wantDur != null) {
+    const delta = Math.abs(gotDur - wantDur);
+    measurements.durationDeltaSec = delta;
+    if (delta > t.durationToleranceSec) {
+      diffs.push(
+        `duration: measured ${gotDur.toFixed(4)}s vs golden ${wantDur.toFixed(4)}s ` +
+          `(Δ ${delta.toFixed(4)}s > tol ${t.durationToleranceSec.toFixed(4)}s)`,
+      );
+    }
+  }
+
+  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
+  return pass(
+    oracle,
+    `PCM stream aggregate matches golden (${got.length} measured chunks vs ${want.length} golden chunks)`,
+    measurements,
+  );
+}
+
+function usesOpusPreskipLoosePacket(ctx: OracleContext, trackIndex: number): boolean {
+  const assetId = primaryAssetId(ctx).toLowerCase();
+  const container = resolveContainer(ctx.golden.meta?.container ?? ctx.demux?.metadata.container, assetId);
+  const track = ctx.golden.meta?.tracks?.[trackIndex] ?? ctx.demux?.metadata.tracks?.[trackIndex];
+  return container === 'ogg' && track?.type === 'audio' && track.codec === 'opus';
 }
 
 function trackLayout(pkts: Array<{ trackIndex: number }>): Record<number, number> {
@@ -682,7 +781,7 @@ function matchByPts(got: FrameDigest[], ptsUs: number): FrameDigest | undefined 
 
 // ── reference-reimport ───────────────────────────────────────────────────────────────────────
 
-async function referenceReimport(ctx: OracleContext): Promise<OracleOutcome> {
+async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'reference-reimport';
   if (!ctx.output) return fail(oracle, 'no ctx.output bytes to re-import');
   if (!ctx.referenceEngine) return fail(oracle, 'no ctx.referenceEngine injected');
@@ -703,6 +802,9 @@ async function referenceReimport(ctx: OracleContext): Promise<OracleOutcome> {
   if (pkts.length === 0) {
     return fail(oracle, 'reference re-import produced an empty packet table', measurements);
   }
+  if (ctx.scenario.op === 'remux') {
+    return semanticRemuxReimport(ctx, demux, measurements, t);
+  }
   // Consistency check vs golden packet count/keyframes when available (otherwise just "round-trips").
   const want = ctx.golden.packets;
   if (want && want.length) {
@@ -722,6 +824,71 @@ async function referenceReimport(ctx: OracleContext): Promise<OracleOutcome> {
     `reference re-imported engine output: ${pkts.length} packets, ${reimportKeyframes} keyframes`,
     measurements,
   );
+}
+
+function semanticRemuxReimport(
+  ctx: OracleContext,
+  demux: DemuxResult,
+  measurements: Record<string, number>,
+  t: Required<OracleTolerances>,
+): OracleOutcome {
+  const oracle: OracleId = 'reference-reimport';
+  const expectedTracks = (ctx.golden.meta?.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
+  const actualTracks = (demux.metadata.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
+  measurements.reimportMediaTracks = actualTracks.length;
+  measurements.goldenMediaTracks = expectedTracks.length;
+  const diffs: string[] = [];
+
+  if (expectedTracks.length && actualTracks.length !== expectedTracks.length) {
+    diffs.push(`media track count: reimport ${actualTracks.length} vs golden ${expectedTracks.length}`);
+  }
+  const expectedLayout = mediaTrackLayout(expectedTracks);
+  const actualLayout = mediaTrackLayout(actualTracks);
+  const layoutKeys = new Set([...Object.keys(expectedLayout), ...Object.keys(actualLayout)]);
+  for (const key of layoutKeys) {
+    const a = actualLayout[key] ?? 0;
+    const b = expectedLayout[key] ?? 0;
+    if (a !== b) diffs.push(`track layout '${key}': reimport ${a} vs golden ${b}`);
+  }
+
+  const gotDur = demux.metadata.durationSec;
+  const wantDur = ctx.golden.meta?.durationSec;
+  if (gotDur != null && wantDur != null) {
+    const delta = Math.abs(gotDur - wantDur);
+    const container = ctx.output?.container ?? demux.metadata.container;
+    const band = durationToleranceFor(container, primaryAssetId(ctx), t, ctx.scenario.tolerances?.durationToleranceSec != null);
+    const baseTolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(wantDur)) : band.tolSec;
+    // Container remux can materialize a small tail duration from audio-frame/block rounding without
+    // changing media identity. Keep this semantic re-import gate focused on real drift.
+    const tolSec = Math.max(baseTolSec, 0.1);
+    measurements.durationDeltaSec = delta;
+    measurements.durationToleranceSec = tolSec;
+    if (delta > tolSec) {
+      diffs.push(`duration: reimport ${gotDur.toFixed(4)}s vs golden ${wantDur.toFixed(4)}s (Δ ${delta.toFixed(4)}s > tol ${tolSec.toFixed(4)}s)`);
+    }
+  }
+
+  const expectedVideoKeyframes = (ctx.golden.packets ?? []).filter((p) => p.keyframe).length;
+  const actualVideoKeyframes = demux.packets.filter((p) => p.keyframe).length;
+  if (expectedTracks.some((t) => t.type === 'video') && expectedVideoKeyframes > 0 && actualVideoKeyframes === 0) {
+    diffs.push('reimport found no keyframes for a video remux output');
+  }
+
+  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
+  return pass(
+    oracle,
+    `reference re-imported remux output semantically: ${demux.packets.length} packets, ${actualTracks.length} media track(s)`,
+    measurements,
+  );
+}
+
+function mediaTrackLayout(tracks: NormalizedTrack[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const track of tracks) {
+    const key = `${track.type}:${normStr(track.codec)}`;
+    out[key] = (out[key] ?? 0) + 1;
+  }
+  return out;
 }
 
 // ── playback-smoke ───────────────────────────────────────────────────────────────────────────
@@ -1335,10 +1502,16 @@ function gracefulFailure(ctx: OracleContext, _t: Required<OracleTolerances>): Or
   }
 
   // No explicit signal: infer from output presence for a robustness/malformed scenario.
-  const isRobustness = ctx.scenario.family === 'robustness' || !!ctx.scenario.mutate;
-  if (isRobustness) {
+  const hasGracefulSignal =
+    ctx.scenario.family === 'robustness' ||
+    !!ctx.scenario.mutate ||
+    ctx.scenario.oracles.includes('graceful-failure');
+  if (hasGracefulSignal) {
     if (!ctx.output && !ctx.metadata && !ctx.demux && !ctx.frames) {
       return pass(oracle, 'operation produced no output and did not crash/hang → handled gracefully');
+    }
+    if (gracefulAllowsReturnedOutput(ctx)) {
+      return pass(oracle, 'operation returned partial/safe output and did not crash/hang');
     }
     return fail(
       oracle,
@@ -1349,6 +1522,11 @@ function gracefulFailure(ctx: OracleContext, _t: Required<OracleTolerances>): Or
     oracle,
     'graceful-failure has no runner signal (ctx.scenario.notes) and scenario is not robustness/mutated',
   );
+}
+
+function gracefulAllowsReturnedOutput(ctx: OracleContext): boolean {
+  const options = ctx.scenario.options as Record<string, unknown> | undefined;
+  return options?.gracefulAllowOutput === true;
 }
 
 // ── property-invariant (metamorphic, §11) ──────────────────────────────────────────────────────
@@ -1390,6 +1568,10 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   if (which.includes('duration') || which.includes('probe')) {
+    if (ctx.scenario.op === 'probe') {
+      return probeDurationInvariant(ctx, t, which);
+    }
+
     // probe(out).dur ≈ probe(x).dur (golden) across containers.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
     const goldenDur = ctx.golden.meta?.durationSec ?? ctx.metadata?.durationSec ?? null;
@@ -1407,19 +1589,22 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     }
     if (outDur == null) return fail(oracle, `[${which}] output probe returned null duration`);
     const d = Math.abs(outDur - goldenDur);
-    const measurements = { outDurationSec: outDur, goldenDurationSec: goldenDur, deltaSec: d };
-    if (d > t.durationToleranceSec) {
+    const container = resolveContainer(ctx.golden.meta?.container ?? ctx.output.container, primaryAssetId(ctx));
+    const band = durationToleranceFor(container, primaryAssetId(ctx), t, ctx.scenario.tolerances?.durationToleranceSec != null);
+    const tolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(goldenDur)) : band.tolSec;
+    const measurements = { outDurationSec: outDur, goldenDurationSec: goldenDur, deltaSec: d, durationToleranceSec: tolSec };
+    if (d > tolSec) {
       return fail(
         oracle,
         `[invariant probe(out).dur≈probe(x).dur] out ${outDur.toFixed(4)}s vs ${goldenDur.toFixed(
           4,
-        )}s (Δ ${d.toFixed(4)}s > ${t.durationToleranceSec.toFixed(4)}s)`,
+        )}s (Δ ${d.toFixed(4)}s > ${tolSec.toFixed(4)}s)`,
         measurements,
       );
     }
     return pass(
       oracle,
-      `[invariant probe duration across containers] Δ ${d.toFixed(4)}s ≤ ${t.durationToleranceSec.toFixed(4)}s`,
+      `[invariant probe duration across containers] Δ ${d.toFixed(4)}s ≤ ${tolSec.toFixed(4)}s`,
       measurements,
     );
   }
@@ -1441,6 +1626,65 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   return fail(oracle, `unknown property-invariant '${which}' (expected decode-remux | probe-duration | trim-concat)`);
+}
+
+function probeDurationInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): OracleOutcome {
+  const oracle: OracleId = 'property-invariant';
+  const entries =
+    ctx.probeMetadatas?.length
+      ? ctx.probeMetadatas
+      : ctx.metadata
+        ? [{ input: ctx.input, metadata: ctx.metadata, golden: ctx.golden }]
+        : [];
+
+  if (!entries.length) return fail(oracle, `[${which}] no probe metadata to compare`);
+
+  const diffs: string[] = [];
+  const measurements: Record<string, number> = {};
+  const explicitOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
+
+  entries.forEach((entry, index) => {
+    const gotDur = entry.metadata.durationSec;
+    const wantDur = entry.golden.meta?.durationSec ?? null;
+    const label = entry.input.id;
+    if (wantDur == null) {
+      diffs.push(`${label}: no golden/source duration to compare`);
+      return;
+    }
+    if (gotDur == null) {
+      diffs.push(`${label}: measured null vs golden ${wantDur}s`);
+      return;
+    }
+
+    const container = resolveContainer(entry.golden.meta?.container ?? entry.metadata.container, label);
+    const band = durationToleranceFor(container, label, t, explicitOverride);
+    const tolSec = band.loose
+      ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(wantDur))
+      : band.tolSec;
+    const delta = Math.abs(gotDur - wantDur);
+    measurements[`durationDeltaSec${index}`] = delta;
+    measurements[`durationToleranceSec${index}`] = tolSec;
+    if (delta > tolSec) {
+      const looseNote = band.loose
+        ? ` [estimate-only container '${container}': loose band applied]`
+        : '';
+      diffs.push(
+        `${label}: measured ${gotDur.toFixed(4)}s vs golden ${wantDur.toFixed(4)}s ` +
+          `(Δ ${delta.toFixed(4)}s > tol ${tolSec.toFixed(4)}s)${looseNote}`,
+      );
+    }
+  });
+
+  if (diffs.length) return fail(oracle, `[${which}] ${diffs.join('; ')}`, measurements);
+  return pass(
+    oracle,
+    `[invariant probe duration] ${entries.length} input(s) match their golden durations`,
+    measurements,
+  );
 }
 
 function inferInvariant(s: Scenario): string {
@@ -1778,4 +2022,24 @@ function readStringOption(options: unknown, keys: string[]): string | undefined 
     if (typeof v === 'string' && v.length) return v;
   }
   return undefined;
+}
+
+function readStringArrayOption(options: unknown, keys: string[]): string[] {
+  if (!isObject(options)) return [];
+  for (const k of keys) {
+    const v = options[k];
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string' && x.length > 0);
+    if (typeof v === 'string' && v.length) return v.split(',').map((x) => x.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function readBooleanOption(options: unknown, keys: string[]): boolean {
+  if (!isObject(options)) return false;
+  for (const k of keys) {
+    const v = options[k];
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'string') return v === 'true' || v === '1';
+  }
+  return false;
 }

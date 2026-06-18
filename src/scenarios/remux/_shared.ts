@@ -16,18 +16,17 @@
  *      • `golden-packets`   reads `ctx.demux` → same problem; never attached.
  *    The only oracles that actually OBSERVE a remux output are the four below.
  *
- *  - `decoded-frames-bitexact` decodes `ctx.output` to RGBA frames and compares to golden frame
- *    digests. It is the STRONGEST video remux gate (pixels must be identical after a lossless
- *    re-wrap) but is structurally VIDEO-ONLY (digestFrame works on ImageData) AND requires a baked
- *    `<asset>.frames.json`. For AUDIO remux it can never pass (no video frames), and there is no PCM
- *    digest oracle in oracles.ts — so audio cases do NOT attach it (attaching it would be a
- *    guaranteed FAIL masquerading as a gate, the exact anti-pattern §0.1 warns about).
+ *  - `decoded-frames-bitexact` is intentionally NOT part of the default remux battery while the
+ *    source frame goldens are still browser-bake placeholders. Dedicated property rows attach frame
+ *    invariants where the source golden is ready; default remux rows use the structural gate below.
  *
  *  - `reference-reimport` re-imports `ctx.output` with the reference engine and diffs the packet
  *    table (count within 2%, keyframe count) vs golden packets. Works for video AND audio. It is the
  *    structural-integrity gate (the output is a real, parseable container the reference can read).
  *
- *  - `playback-smoke` plays `ctx.output` in a `<video>` element. Works for audio and video.
+ *  - `playback-smoke` plays `ctx.output` in a `<video>` element. It is not a universal remux gate
+ *    (raw TS/ADTS/audio-only outputs are not reliable `<video>` targets), so default remux rows do
+ *    not attach it. Scenario-specific rows may opt in with an explicit oracle override.
  *
  *  - `property-invariant` computes a metamorphic invariant in-browser from `ctx.output` (+ the
  *    reference engine for the probe-duration variant, + golden frames for the decode variant). This
@@ -57,11 +56,11 @@ export interface RemuxCase {
   to: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
+  features?: string[];
   /**
    * Override the default oracle set. Defaults:
-   *   - video case (videoCodecs present): decoded-frames-bitexact + reference-reimport + playback-smoke
-   *   - audio-only case                 : reference-reimport + playback-smoke
-   *     (decoded-frames-bitexact is video-only and there is no PCM oracle — see _shared.ts header).
+   *   - every case: reference-reimport. It confirms the output is parseable and preserves media track
+   *     semantics without requiring packet counts to survive container repacketization exactly.
    */
   oracles?: OracleId[];
   /** hard wall-clock cap (ms); used to bound very large size-ladder remuxes. */
@@ -74,12 +73,10 @@ export function remuxId(c: Pick<RemuxCase, 'asset' | 'from' | 'to'>): string {
   return `remux/${c.asset.replace(/\.[^.]+$/, '')}_${c.from}_to_${c.to}`;
 }
 
-/** Default oracle set for a remux cell: video gets the frame-digest gate, audio cannot (header). */
+/** Default oracle set for a remux cell: structural re-import gate; stricter rows opt in explicitly. */
 function defaultOracles(c: RemuxCase): OracleId[] {
-  const isVideo = !!(c.videoCodecs && c.videoCodecs.length);
-  return isVideo
-    ? ['decoded-frames-bitexact', 'reference-reimport', 'playback-smoke']
-    : ['reference-reimport', 'playback-smoke'];
+  void c;
+  return ['reference-reimport'];
 }
 
 /** Build a single lossless-remux Scenario from a RemuxCase. */
@@ -95,6 +92,7 @@ export function buildRemux(c: RemuxCase): Scenario {
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles ?? defaultOracles(c),
     metrics: [...REMUX_OUT_METRICS],

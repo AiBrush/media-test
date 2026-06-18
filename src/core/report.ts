@@ -17,9 +17,9 @@
  *      unit) for each engine × case that PASSed, "N/A" where the framework genuinely cannot run the
  *      case, and FAIL where the output was wrong. The conformance LETTER is secondary.
  *
- * NA distinction — model vs presentation: the data model and `report.json` KEEP NA_ENGINE and
- * NA_BROWSER DISTINCT (spec §0.6/§10/§14 forbid collapsing them in the machine-readable twin, and
- * `ResultStatus` carries both). The USER DIRECTIVE (this rework) overrides only the *markdown
+ * NA distinction — model vs presentation: the data model and `report.json` KEEP NA_ENGINE,
+ * NA_BROWSER, and NA_ASSET DISTINCT (spec §0.6/§10/§14 forbid collapsing them in the
+ * machine-readable twin, and `ResultStatus` carries all three). The USER DIRECTIVE overrides only the *markdown
  * presentation*: `report.md` renders BOTH as a single user-facing "N/A" (the `-ᵇ` browser-specific
  * marker is gone) because the reader does not care about browser-specific gaps. JSON consumers are
  * unaffected; only the human-facing rendering collapses. See `naLabelMd` / `statusLabelMd`.
@@ -214,7 +214,7 @@ const CAVEATS: string[] = [
   'NEVER compare a raw number across browsers or across machines. Every delta in this report is "vs the reference engine, on the SAME browser, on the same corpus." Cross-browser comparison is invalid by construction — that is why the report is grouped by browser.',
   'Hardware codec sessions are the real parallelism ceiling, not navigator.hardwareConcurrency. Contention for a limited number of hardware decode/encode sessions can dominate timing for codec-bound workloads.',
   'No measurement -> no claim. No green correctness oracle -> no admissible benchmark: a perf number is reported only after the engine produced correct output for that engine x browser x scenario. A speedup with wrong output is a regression, not a win.',
-  'N/A = not supported by the framework or by the browser/runtime. The machine-readable report.json keeps the two internal not-applicable statuses distinct; the human-facing table intentionally folds them into one marker.',
+  'N/A = not supported by the framework, browser/runtime, or currently available corpus assets. The machine-readable report.json keeps the internal not-applicable statuses distinct; the human-facing table intentionally folds them into one marker.',
   'Runs assume AC power and a quiesced machine. Differences within the noise band are reported as within-noise and are NOT claimed as improvements or regressions.',
 ];
 
@@ -227,7 +227,7 @@ export function buildReport(input: ReportInput): ReportOutput {
 
   const engines = uniqueSorted(input.results.map((r) => r.engineId), referenceEngineId);
   const browsers = orderBrowsers(uniqueRaw(input.results.map((r) => r.browser)));
-  const scenarios = uniqueSorted(input.results.map((r) => r.scenarioId));
+  const scenarios = uniqueRaw(input.results.map((r) => r.scenarioId));
 
   const byKey = indexResults(input.results);
 
@@ -1161,7 +1161,7 @@ function fmtMetricValue(value: number, metric: MetricId | null): string {
  *     functional-only oracle case). Honest: we never invent a number (§0.6/§14).
  *   - FAIL / ERROR → shown as FAIL / ERROR. Correctness GATES the number (§0.1): a wrong output is a
  *     clearly-marked non-number, NEVER a benchmark value.
- *   - NA_ENGINE / NA_BROWSER → a single collapsed "N/A" (the framework genuinely cannot run the case;
+ *   - NA_* → a single collapsed "N/A" (the framework genuinely cannot run the case;
  *     best-effort attempted). The `-ᵇ` distinction is intentionally dropped here (see `statusLabelMd`).
  *   - SKIPPED / not-run → SKIPPED / — .
  */
