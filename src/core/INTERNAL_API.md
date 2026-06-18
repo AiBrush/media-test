@@ -6,6 +6,17 @@
 > `scenario.ts` (already committed). Use `.ts` extension on relative imports (bundler resolution,
 > `verbatimModuleSyntax` on → use `import type` for type-only imports).
 
+## scenario.ts (the case model — "Scenario" IS the spec's "case")
+```ts
+// MetricId (extended §8/§A.14). Higher-is-better: throughputRealtime, decodeFps, encodeFps,
+//   opsPerSec, packetsPerSec, framesPerSec. Lower-is-better: wall, peakMemory, sourceReads,
+//   targetWrites, bytesOut, longtasks, seekMs, timeToFirstByte, timeToFirstFrame, loadInit, bundleSize.
+// ScenarioSpec.primaryMetric?: MetricId  — the metric the per-case winner is ranked by (default metrics[0]).
+// ScenarioResult.primaryMetric?: MetricId — runner copies it through so report.ts can rank winners.
+// MetricSample gained: opsPerSec, packetsPerSec, framesPerSec, seekMs, timeToFirstByteMs,
+//   timeToFirstFrameMs, loadInitMs, bundleSizeKb (all optional).
+```
+
 ## feature-detect.ts
 ```ts
 import type { BrowserName } from './engine.ts';
@@ -39,7 +50,15 @@ export interface MeasureContext {
   targetWrites?: number;    // from CountingTarget
   decodedFrames?: number;
   encodedFrames?: number;
+  ops?: number;             // repeated ops -> opsPerSec   (headline: extract-metadata)
+  packets?: number;         // demuxed packets -> packetsPerSec (headline: iterate-packets)
+  frames?: number;          // converted frames -> framesPerSec (headline: convert+resize)
+  seeks?: number;           // seeks performed -> seekMs (mean ms/seek)
+  firstByteMs?: number;     // -> timeToFirstByteMs  (relative to begin())
+  firstFrameMs?: number;    // -> timeToFirstFrameMs (relative to begin())
 }
+// load/init time (loadInit) + bundle size (bundleSize) are set by the runner/build OUTSIDE the Meter
+// (§0.7): init() is awaited before begin(); bundle is an offline build metric.
 
 /** One measured op. Captures wall (performance.now), longtasks (PerformanceObserver), peak mem. */
 export class Meter {
@@ -162,10 +181,19 @@ export interface ReportInput {
 export interface ReportOutput { markdown: string; json: unknown }
 export function buildReport(input: ReportInput): ReportOutput;
 ```
-Report sections (§12): (1) capability matrix, (2) conformance matrix + conformance %, (3) benchmark
-matrix, (4) Δ-vs-reference (within-browser only; vocabulary faster/slower/within-noise/gained/
-regressed/NA), (5) per-engine scorecard. Plus the browser caveats (§13) written in. Emit JSON too.
-NEVER compare numbers across browsers.
+Report sections: **🏆 Leaderboard** (wins per engine + verdict — THE deliverable, §9) · per-browser
+**Winners** (one CaseWinner per case: fastest CORRECT engine, value, margin, flag
+contested/tie/uncontested/none) · conformance summary · conformance matrix · benchmark matrix ·
+Δ-vs-reference (within-browser only; faster/slower/within-noise/gained/regressed/NA) · per-engine
+scorecard. Plus the browser caveats (§13). Emit JSON too. NEVER compare raw numbers across browsers
+(win COUNTS may be summed; timing magnitudes may not).
+
+Winner determination (`computeCaseWinner`, §9): eligible = oracle PASS only; rank by the case's
+primary metric (`ScenarioResult.primaryMetric`, else inferred via PRIMARY_METRIC_PRIORITY — first
+metric present in all eligible results); winner = rank 1; margin = direction-normalized Δ% over rank
+2; co-winners within `WINNER_NOISE_BAND_PCT` (3%) = `tie`; single eligible = `uncontested`.
+Exported types: `CaseWinner`, `BrowserSection.winners`, `EngineScorecard.{wins, winsByBrowser,
+uncontestedWins, perfIndexVsWinnerByBrowser, bundleSizeKb, verdict}`.
 
 ## Adapter notes
 - All adapters implement `MediaEngine` from `engine.ts`. `capabilities()` must be HONEST (declare

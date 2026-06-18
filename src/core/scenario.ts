@@ -4,6 +4,10 @@
  *
  * A Scenario NEVER names a library. It declares (operation, input asset, options,
  * required-capabilities, oracles, metrics). The runner negotiates it against each engine × browser.
+ *
+ * TERMINOLOGY: a "Scenario" here IS the spec's "case" (test-instructions.md §6–§9). The codebase
+ * uses `Scenario`/`scenarios/` as the authoritative internal term; "case" in the spec and report
+ * prose refers to the same thing. We deliberately did NOT rename to `cases/` — it is pure churn.
  */
 
 import type { BrowserName, EncryptionScheme, Operation, TranscodeOptions } from './engine.ts';
@@ -45,7 +49,17 @@ export type MetricId =
   | 'bytesOut'
   | 'longtasks'
   | 'decodeFps'
-  | 'encodeFps';
+  | 'encodeFps'
+  // ── headline benchmarks (§8.1 / §A.14), higher-is-better ──
+  | 'opsPerSec' // extract-metadata: repeated probe → ops/s
+  | 'packetsPerSec' // iterate-video-packets: demux → packets/s
+  | 'framesPerSec' // convert/transcode throughput (distinct from decode/encode fps)
+  // ── latency / cost metrics (§8.3 / §A.14), lower-is-better ──
+  | 'seekMs' // ms per seek
+  | 'timeToFirstByte' // ms to first output byte
+  | 'timeToFirstFrame' // ms to first decoded/rendered frame
+  | 'loadInit' // ms to init() (load+compile+warmup) — reported separately per §0.7, NEVER folded into op timing
+  | 'bundleSize'; // kB min+gzip — the one build-time metric
 
 export type ScenarioFamily =
   | 'probe'
@@ -59,7 +73,8 @@ export type ScenarioFamily =
   | 'metadata'
   | 'streaming-output'
   | 'audio-dsp'
-  | 'robustness';
+  | 'robustness'
+  | 'performance'; // headline §8.1 cases (perf/extract-metadata, iterate-packets, convert+resize, bundle-size)
 
 /** Per-oracle tunables (e.g. SSIM/PSNR floors, duration tolerance) overriding defaults. */
 export interface OracleTolerances {
@@ -80,6 +95,12 @@ export interface ScenarioSpec {
   requires: Requires;
   oracles: OracleId[];
   metrics: MetricId[];
+  /**
+   * The metric the per-case WINNER is ranked by (§9). Defaults to metrics[0] when omitted. This is
+   * the single number the leaderboard compares across engines for this case (e.g. 'opsPerSec' for
+   * extract-metadata, 'packetsPerSec' for iterate-packets, 'bundleSize' for the bundle case).
+   */
+  primaryMetric?: MetricId;
   tolerances?: OracleTolerances;
   /** robustness: a transform that mutates the input bytes before feeding the engine */
   mutate?: (bytes: Uint8Array) => Uint8Array;
@@ -143,6 +164,16 @@ export interface MetricSample {
   longtaskMs?: number;
   decodeFps?: number;
   encodeFps?: number;
+  // headline (higher-is-better)
+  opsPerSec?: number;
+  packetsPerSec?: number;
+  framesPerSec?: number;
+  // latency / cost (lower-is-better)
+  seekMs?: number;
+  timeToFirstByteMs?: number;
+  timeToFirstFrameMs?: number;
+  loadInitMs?: number; // set by the runner OUTSIDE the timed op window (§0.7), not by the Meter
+  bundleSizeKb?: number; // set from the offline per-engine build, not measured at run time
 }
 
 /** Aggregated bench statistics over the measured iterations (see bench.ts). */
@@ -168,6 +199,12 @@ export interface ScenarioResult {
   oracleOutcomes: OracleOutcome[];
   /** per-metric aggregated stats; present only when status === 'PASS' (correctness gates benches) */
   bench?: Partial<Record<MetricId, BenchSummary>>;
+  /**
+   * The scenario's primary ranking metric (§9), copied by the runner from ScenarioSpec.primaryMetric
+   * so report.ts can rank winners without re-reading the scenario registry. Optional: report.ts falls
+   * back to inferring it from the bench keys when absent.
+   */
+  primaryMetric?: MetricId;
   /** environment captured at run time (browser build, GPU string, suite/engine versions) */
   env?: RunEnv;
   startedAtIso?: string;
@@ -183,4 +220,6 @@ export interface RunEnv {
   gpu?: string;
   corpusChecksum?: string;
   acPower?: boolean;
+  /** §8.5: the engine's best-path config (engine.configUsed), recorded so a number is reproducible. */
+  configUsed?: object;
 }

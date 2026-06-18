@@ -1,6 +1,6 @@
 {
-  "$schema": "manifest of the static media corpus. sha256 + sizeBytes are filled by fixtures/bake.mjs after generation; commit this file (media itself is git-ignored). Asset ids are canonical and MUST match scenarios + golden filenames exactly.",
-  "suiteCorpusVersion": "1",
+  "$schema": "manifest of the static media corpus. sha256 + sizeBytes are filled by fixtures/bake.mjs after generation; commit this file (media itself is git-ignored). Asset ids are canonical and MUST match scenarios + golden filenames exactly. Every entry declares `source` (generated|fetched|captured|provided) and `sizeBucket` (empty|micro|tiny|small|medium|large|huge|massive) per test-instructions.md §5.3/§5.4. For `provided` assets the bake CANNOT make/fetch them deterministically: keep the entry, set sha256/sizeBytes null until dropped in at fixtures/media/<id>, and the bake prints a MISSING ASSETS block (drop path + where to obtain + expected size/sha256).",
+  "suiteCorpusVersion": "2",
   "assets": [
     {
       "id": "h264_1080p_30s.mp4",
@@ -10,10 +10,12 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "medium",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 30s + sine 48k stereo, libx264 yuv420p CRF20 -g 60 closed GOP, AAC 128k, +faststart, -fflags +bitexact",
       "sha256": "6d9562aa3b0d3bdd5cb67647fa71fef2f676ddfd2d375d8048e4e967d95bdf03",
       "sizeBytes": 31258790,
-      "notes": "Baseline H.264/AAC progressive MP4. Workhorse for probe/demux/remux/transcode/decode/trim."
+      "notes": "Baseline H.264/AAC progressive MP4. Workhorse for probe/demux/remux/transcode/decode/trim. medium bucket (~10-30 MB) default workhorse."
     },
     {
       "id": "h264_4k_10s.mp4",
@@ -23,6 +25,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "large",
       "genMethod": "ffmpeg testsrc2 3840x2160@30 10s + sine 48k stereo, libx264 yuv420p CRF24 -g 60 level 5.2, AAC 128k, +faststart",
       "sha256": "213b71b0d026257a70e6b3b166f03b00a01b68e717c28330e046487ede87694d",
       "sizeBytes": 26210089,
@@ -36,6 +40,8 @@
         "hevc",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "medium",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 10s + sine 48k stereo, libx265 yuv420p CRF24 -tag:v hvc1, AAC 128k, +faststart",
       "sha256": "3f5cfcc9332f375885acc23f1ec9e626162d7266ac836865bad3c3da6d3a8fb7",
       "sizeBytes": 11061061,
@@ -49,6 +55,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "medium",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 10s, libx264 -bf 3 -b_strategy 2 open-GOP (no -g forced IDR), pts!=dts reorder, AAC 128k, +faststart",
       "sha256": "b854ecab8810e4bfd966e8f528da9b3115c4106238f108649018fe36ac45ab21",
       "sizeBytes": 10755491,
@@ -62,6 +70,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 base 30fps then setpts to irregular timestamps (VFR) via -vsync vfr + setpts, libx264, AAC 128k, +faststart",
       "sha256": "0f126ff4956210da801b61aeda6619d6dbf113ba316d3cbcfea103ce9b4e5ea6",
       "sizeBytes": 2279109,
@@ -75,6 +85,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 10s, libx264, then -metadata:s:v rotate=90 (display matrix), AAC 128k, +faststart",
       "sha256": "04d75954b237f74a2119cf12446c9cf3b8b1fb263fa32e0e0e26e1102be61695",
       "sizeBytes": 4369242,
@@ -89,6 +101,8 @@
         "aac",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 10s video + two distinct sine audio tracks (440Hz, 880Hz) mapped as separate AAC streams, +faststart",
       "sha256": "e75ce8df0e8d99572078e76925918c9567fa3b2d7e4ff9f2168de0c0d8a3f56d",
       "sizeBytes": 4531581,
@@ -102,6 +116,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 5s + sine 48k stereo, libx264, AAC 128k, -f mov",
       "sha256": "106015a554b71258d02d0cc99415b258b9c36d4f29bb64c685667748141f61bc",
       "sizeBytes": 4396408,
@@ -115,6 +131,8 @@
         "vp9",
         "opus"
       ],
+      "source": "generated",
+      "sizeBucket": "medium",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 10s + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 32 -row-mt 1, libopus 96k, -f webm",
       "sha256": "2fc7d368edd6fa2ac1ce7c538c5b643ec7d46867fb1026cf1f6daa76de9fa8dc",
       "sizeBytes": 9293670,
@@ -128,6 +146,8 @@
         "vp8",
         "vorbis"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 10s + sine 48k stereo, libvpx (vp8) -b:v 1M, libvorbis q4, -f webm",
       "sha256": "53351c291d14153c5bed2e79d0d8fcda936b72e64f34b3022e375a5226ec7b44",
       "sizeBytes": 1292430,
@@ -141,6 +161,8 @@
         "av1",
         "opus"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 5s + sine 48k stereo, libsvtav1 -crf 35 -preset 8, libopus 96k, -f webm",
       "sha256": "c19b7323432f19517f74c1e36914abfe838e00879df168f9c5be1a4ad97ad383",
       "sizeBytes": 1940749,
@@ -153,6 +175,8 @@
       "codecs": [
         "vp9"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg testsrc2 with generated alpha (format=yuva420p via geq/alpha ramp) 640x480@30 5s, libvpx-vp9 -pix_fmt yuva420p (alpha channel), -auto-alt-ref 0, -f webm",
       "sha256": "3f130b8eadd0dc36b3992124e37a879938a89730487e48a9e8a5c41202d5c4c3",
       "sizeBytes": 748970,
@@ -166,6 +190,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 10s + sine, libx264, AAC, -f matroska",
       "sha256": "56300bb8ec5dd8e9d83031c0c9e5d9cb4cc552fc905399f77cf46046c03af783",
       "sizeBytes": 4365473,
@@ -179,6 +205,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg testsrc2 1280x720@30 10s + sine, libx264 -bsf:v h264_mp4toannexb, AAC -bsf:a aac_adtstoasc, -f mpegts",
       "sha256": "aebc6a057defeffed6f03b5ffac3cd5bf1b0fe0b30ef71f7d570f8ca146ded76",
       "sizeBytes": 4633636,
@@ -192,10 +220,12 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg ... -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_filename hls_vod_%03d.ts hls_vod.m3u8 (playlist + sibling .ts segments)",
       "sha256": "ab6ccc5dd1f54106cdae019b3a34a1e6a3689deec9ee657c00b89b41acaf9e5f",
       "sizeBytes": 278,
-      "notes": "Unencrypted HLS VOD: playlist + TS segments. sha256/size are of the .m3u8 playlist; segments are siblings (each in manifest as hls_vod_NNN.ts is NOT separately listed — bake records them in golden notes)."
+      "notes": "Unencrypted HLS VOD: playlist + TS segments. sha256/size are of the .m3u8 playlist; segments are siblings (each in manifest as hls_vod_NNN.ts is NOT separately listed — bake records them in golden notes). sizeBucket reflects the playlist; the segment set totals ~small."
     },
     {
       "id": "hls_aes128.m3u8",
@@ -205,6 +235,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg -hls_key_info_file key_info -f hls (AES-128 segment encryption). KEY URI + IV in playlist; key bytes + IV recorded in golden for the decrypt oracle.",
       "sha256": "ba0bec7b7ab3e76b13e1861a6e12e002ddfff1a25b516c52fc4b4ef09aa82bb9",
       "sizeBytes": 378,
@@ -218,6 +250,8 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg -encryption_scheme cenc-aes-ctr -encryption_key <hex> -encryption_kid <hex> over the H.264/AAC baseline fragmented MP4. Key/KID/IV recorded in golden for decrypt oracle.",
       "sha256": "442c34d54937b2fd52bc4aa6f089af059dab733c0abd617ea626ee4169050b54",
       "sizeBytes": 2209644,
@@ -231,10 +265,14 @@
         "h264",
         "aac"
       ],
+      "source": "provided",
+      "sizeBucket": "small",
       "genMethod": "cbcs pattern encryption (AES-CBC w/ pattern). ffmpeg mov muxer -encryption_scheme cenc-aes-ctr only covers ctr; cbcs requires shaka/Bento4 (mp4encrypt --method MPEG-CENC scheme cbcs).",
+      "sourceUrl": null,
+      "acquire": "If Bento4 (mp4encrypt) or shaka packager is installed on the bake host, bake.mjs generates cenc_cbcs.mp4 automatically (source effectively becomes generated) — install one and re-run `bun fixtures/bake.mjs cenc_cbcs.mp4`. Otherwise produce it manually: `mp4encrypt --method MPEG-CENC --encryption-scheme cbcs --key 1:0123456789abcdef0123456789abcdef:random --property 1:KID:abcdef00112233445566778899aabbcc <plain_h264_aac.mp4> fixtures/media/cenc_cbcs.mp4`, where <plain_h264_aac.mp4> is the cenc_ctr.mp4 cleartext baseline (libx264 yuv420p + AAC, +faststart). Record key/KID into fixtures/golden/cenc_cbcs.mp4.keys.json for the decrypt oracle.",
       "sha256": null,
       "sizeBytes": null,
-      "notes": "CENC cbcs (pattern) encrypted MP4. ffmpeg cannot emit cbcs; needs Bento4/shaka. SKIPPED with reason when those binaries are absent."
+      "notes": "CENC cbcs (pattern) encrypted MP4. ffmpeg cannot emit cbcs; needs Bento4/shaka. provided (SKIPPED with reason / MISSING ASSETS) when those binaries are absent; decrypt oracle then NA(asset-missing)."
     },
     {
       "id": "wav_s16.wav",
@@ -243,6 +281,8 @@
       "codecs": [
         "pcm-s16"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_s16le, -f wav",
       "sha256": "b8fa54b231e00fe7a56b800c4792d990690a950480a98359c87c604cad597333",
       "sizeBytes": 960044,
@@ -255,6 +295,8 @@
       "codecs": [
         "pcm-s24"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_s24le, -f wav",
       "sha256": "87f3a3599c6dfd6a2a6fb681db0471325a7e2306b5ffd83f82317a640f8e7cec",
       "sizeBytes": 1440068,
@@ -267,6 +309,8 @@
       "codecs": [
         "pcm-f32"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_f32le, -f wav",
       "sha256": "1f09d13a8ee905046b49808eb4333673e0b8cd0baee3e8b1c72749b4bb9612f4",
       "sizeBytes": 1920058,
@@ -279,6 +323,8 @@
       "codecs": [
         "pcm-s16be"
       ],
+      "source": "generated",
+      "sizeBucket": "small",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, -c:a pcm_s16be, -f aiff (big-endian PCM; WAVE/RIFF cannot carry pcm_s16be, AIFF is the natural big-endian PCM container)",
       "sha256": "316f3916d7ce8b719ab93c1b9682cc409914546f2ae51b0b95229722fb879010",
       "sizeBytes": 960054,
@@ -291,6 +337,8 @@
       "codecs": [
         "mp3"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 44.1k stereo 10s, libmp3lame VBR (-q:a 2) which writes a Xing/Info header (TOC + frame count)",
       "sha256": "f27e1f381399657f845fa3c4edf197418f72cedb9ccf457583fb54f2bc85caa9",
       "sizeBytes": 64166,
@@ -303,6 +351,8 @@
       "codecs": [
         "mp3"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 44.1k stereo 10s, libmp3lame CBR (-b:a 128k) with -write_xing 0 (no Xing/TOC)",
       "sha256": "568c0cbacac879c1eab7d04d6b6676ccf60794fd40097cb9b11ea870e5dc8a54",
       "sizeBytes": 160516,
@@ -315,6 +365,8 @@
       "codecs": [
         "flac"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 10s, -c:a flac (default writes a SEEKTABLE metadata block)",
       "sha256": "887eeba6aa922ec6a56290bd23138be23c6b85f6f1d51899844545c0b1710214",
       "sizeBytes": 142933,
@@ -327,6 +379,8 @@
       "codecs": [
         "flac"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 10s, -c:a flac then strip SEEKTABLE via -map_metadata -1 + metaflac --remove (or -frame_size to suppress); if no metaflac, encode and note SEEKTABLE may persist.",
       "sha256": "1ac743597dc17a511f226b76ac1c20b66f17c052c7d24e140c748ce86669d378",
       "sizeBytes": 142933,
@@ -339,6 +393,8 @@
       "codecs": [
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 10s, -c:a aac -f adts (raw ADTS stream)",
       "sha256": "34e6ade0d91d4f09d3c89dace4416d316de853760e7ed58901869c2097fdc005",
       "sizeBytes": 163811,
@@ -351,6 +407,8 @@
       "codecs": [
         "opus"
       ],
+      "source": "generated",
+      "sizeBucket": "tiny",
       "genMethod": "ffmpeg sine 440Hz 48k stereo 10s, libopus 96k, -f ogg",
       "sha256": "e51b5c9df2a0431387d379c4770196b11884cf2bbc2f3f5c8324343ded70bd19",
       "sizeBytes": 145910,
@@ -364,10 +422,148 @@
         "vp8",
         "opus"
       ],
+      "source": "captured",
+      "sizeBucket": "tiny",
       "genMethod": "IN-BROWSER MediaRecorder capture (canvas.captureStream + MediaRecorder, video/webm). Cannot be produced by ffmpeg: MediaRecorder WebM is non-seekable / cluster-only / lacks a cues/duration header. Baked by a one-time browser pass (see bake.mjs RECORDER_NOTE).",
+      "acquire": "Open fixtures/tools/record-fixture.html in a browser, click Record (~3s), save the download as fixtures/media/recorder_headerless.webm, then re-run `bun fixtures/bake.mjs recorder_headerless.webm` to checksum it.",
       "sha256": null,
       "sizeBytes": null,
       "notes": "Headerless/streaming MediaRecorder WebM. NOT faked by ffmpeg. Produced via tools/record-fixture.html in a browser, then dropped into fixtures/media/. bake.mjs records it as SKIPPED(browser-capture) until present."
+    },
+    {
+      "id": "empty_audio.wav",
+      "family": "size-ladder",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "empty",
+      "genMethod": "Zero-payload WAV: a valid 44-byte RIFF/WAVE header with a 0-length data chunk (ffmpeg sine duration 0 -c:a pcm_s16le -f wav). Distinct from zero_length.mp4 (which is a true 0-byte file): this one is a *structurally valid but empty-media* container, exercising the 'no samples' edge separately from the 'no bytes' edge.",
+      "sha256": "4872b61c768dff943f9e021453d816f06e35adc8edd88ef183301f03e31b94a5",
+      "sizeBytes": 44,
+      "notes": "empty bucket (structurally-valid container, zero media). probe should report duration 0 / no samples without crashing; demux yields 0 packets."
+    },
+    {
+      "id": "micro_h264_1frame.mp4",
+      "family": "size-ladder",
+      "container": "mp4",
+      "codecs": [
+        "h264"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 320x240@1 -frames:v 1, libx264 yuv420p, +faststart, no audio. A single-keyframe ~1 KB MP4. Header/edge robustness + minimal-decode latency.",
+      "sha256": "825b79c207cfaa9aea7777e7d775450f688add71316f368c15c2f9f525bb9124",
+      "sizeBytes": 5546,
+      "notes": "micro bucket (~1 KB). Exactly one keyframe; smallest valid playable MP4 in the corpus. probe/demux/decode-1-frame edge."
+    },
+    {
+      "id": "micro_audio_short.m4a",
+      "family": "size-ladder",
+      "container": "mp4",
+      "codecs": [
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg sine 440Hz 44.1k mono 0.1s, AAC 32k, -f mp4 (m4a). ~1-2 KB audio MP4 for micro-bucket audio probe/demux latency.",
+      "sha256": "a1ea1274f597de001b803a9bfad990101959b139985f8706413a7eb9a8362982",
+      "sizeBytes": 1369,
+      "notes": "micro bucket audio (~1-2 KB). Few AAC frames; init-overhead-dominated probe latency."
+    },
+    {
+      "id": "tiny_h264_360p_2s.mp4",
+      "family": "size-ladder",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "tiny",
+      "genMethod": "ffmpeg testsrc2 640x360@30 2s + sine 48k stereo, libx264 yuv420p CRF26 -g 60, AAC 96k, +faststart. ~100 KB. probe/demux latency + init overhead at the tiny scale.",
+      "sha256": "c16adae2fef8717174b8b63f2ab06520df9e02cd1412b58a0d558c9d7e866be2",
+      "sizeBytes": 172807,
+      "notes": "tiny bucket (~100 KB) 360p MP4. Size-ladder representative for the MP4/H.264 family."
+    },
+    {
+      "id": "tiny_vp9_360p_2s.webm",
+      "family": "size-ladder",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "tiny",
+      "genMethod": "ffmpeg testsrc2 640x360@30 2s + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 40 -row-mt 1, libopus 64k, -f webm. ~100 KB. Size-ladder tiny for the WebM/VP9 family (crosses the size axis with the format axis).",
+      "sha256": "7da25ae6e3d1d63ff67baf9a3e00cd6f354e054a47e8a1a616d4021377596afa",
+      "sizeBytes": 154771,
+      "notes": "tiny bucket (~100 KB) 360p WebM. Pairs with tiny_h264_360p_2s.mp4 so the tiny rung covers both major container/codec families."
+    },
+    {
+      "id": "large_h264_1080p_120s.mp4",
+      "family": "size-ladder",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "large",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 120s + sine 48k stereo, libx264 yuv420p CRF23 -g 60 closed GOP, AAC 128k, +faststart. ~100-150 MB. Sustained throughput + memory for the MP4/H.264 family. Slow to generate.",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "large bucket (~100 MB) 1080p H.264 MP4. Sustained metadata-extract / packet-iterate / convert throughput; memory pressure."
+    },
+    {
+      "id": "large_vp9_1080p_120s.webm",
+      "family": "size-ladder",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "large",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 120s + sine 48k stereo, libvpx-vp9 -b:v 0 -crf 34 -row-mt 1 -deadline good -cpu-used 5 -g 60, libopus 96k, -f webm. ~80-150 MB. Large WebM/VP9 so the large rung crosses container/codec. VERY slow to generate (VP9 sw encode of 120s 1080p).",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "large bucket (~100 MB) 1080p VP9 WebM. Pairs with large_h264_1080p_120s.mp4 so the large rung covers both major families. Generation is slow; use --skip-longform or --subset to defer."
+    },
+    {
+      "id": "huge_h264_1080p_600s.mov",
+      "family": "size-ladder",
+      "container": "mov",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "huge",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 600s (10 min) + sine 48k stereo, libx264 yuv420p CRF23 -g 60 closed GOP, AAC 128k, -f mov +faststart. Targets ~500-700 MB to mirror the BigBuckBunny1080pH264.mov 'huge' bucket. This is the SELF-CONTAINED, deterministic, network-free 'big read' asset (BigBuckBunny-style 1080p H.264 .mov) the suite always has. VERY slow + large to generate; gated by --skip-longform.",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "huge bucket (~500-700 MB) self-contained big-read asset: large 1080p H.264 .mov for metadata-extract / packet-iterate / convert throughput at scale (mirrors Mediabunny's published-chart input shape). Generated offline, no network needed — always present after a full bake. The REAL BigBuckBunny1080pH264.mov is additionally available as the 'provided' entry big_buck_bunny_1080p_h264.mov for published-chart parity."
+    },
+    {
+      "id": "big_buck_bunny_1080p_h264.mov",
+      "family": "big-read",
+      "container": "mov",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "provided",
+      "sizeBucket": "huge",
+      "genMethod": "REAL BigBuckBunny1080pH264.mov (~691 MiB) — Mediabunny's own published-benchmark input (test-instructions.md §5.1 'Big read file', §5.3 'huge' bucket). The bake CANNOT fetch a sha256-pinned copy: the exact 691 MiB file Mediabunny benchmarks is an internal/private asset with no published checksum, so a TOFU download cannot be honestly 'pinned'. It is therefore source:'provided' (drop-in) rather than fetched. The synthetic huge_h264_1080p_600s.mov covers the same big-read role deterministically and is always present; THIS asset is the optional published-chart-parity twin.",
+      "sourceUrl": "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov",
+      "acquire": "Obtain the real Big Buck Bunny 1080p H.264 .mov (Blender Foundation, CC-BY 3.0). Canonical source: https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov (~691 MiB; the Blender Peach mirror — this is the same content Mediabunny benchmarks). Download it, then `shasum -a 256 big_buck_bunny_1080p_h264.mov` to compute its sha256, drop it at fixtures/media/big_buck_bunny_1080p_h264.mov, record that sha256 + sizeBytes into this manifest entry, and re-run `bun fixtures/bake.mjs big_buck_bunny_1080p_h264.mov --golden-only` to derive golden. ALTERNATIVELY, to make the bake auto-fetch it, set the env var BBB_MOV_SHA256=<the sha256 you trust> and re-run the bake: bake.mjs will download from sourceUrl, verify against BBB_MOV_SHA256, and on match treat it as fetched (offline-once). Without a trusted sha256 the bake will NOT silently download (no unpinned TOFU).",
+      "sha256": null,
+      "sizeBytes": null,
+      "expectedSizeBytes": 725106140,
+      "notes": "huge bucket / big-read PARITY asset: the actual file behind Mediabunny's published 1080p H.264 .mov chart. provided (drop-in or pin-then-fetch via BBB_MOV_SHA256). Until present, big-read parity cases are NA(asset-missing); the deterministic huge_h264_1080p_600s.mov keeps the huge rung populated regardless. expectedSizeBytes ~691 MiB is approximate (Blender Peach mirror); verify after download."
     },
     {
       "id": "longform_1h_audio.m4a",
@@ -376,20 +572,39 @@
       "codecs": [
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "large",
       "genMethod": "ffmpeg sine 440Hz 48k mono 3600s, AAC 64k, -f mp4 (m4a). Long duration for streaming/seek/memory stress.",
       "sha256": null,
       "sizeBytes": null,
-      "notes": "Multi-hour audio (1h). Large; generation is slow. Use --subset to skip during quick bakes."
+      "notes": "Multi-hour audio (1h, ~28 MB at 64k). Many-samples / long-duration seek + streaming. Large; generation is slow. Use --skip-longform or --subset to skip during quick bakes."
+    },
+    {
+      "id": "massive_h264_1080p_2h.mp4",
+      "family": "stress",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "massive",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 7200s (2h) + sine 48k mono, libx264 yuv420p -b:v 1200k (low bitrate, capped) -g 60 closed GOP, AAC 64k, +faststart. Low-bitrate long-form so the file lands ~1-1.4 GB / many-thousand-sample with bounded encode time. Lazy-read / streaming / peak-memory / OOM-resistance + many-samples sample-table stress. VERY slow + very large; gated by --skip-longform.",
+      "sha256": null,
+      "sizeBytes": null,
+      "notes": "massive bucket (~1-1.4 GB, 2h, ~216k video frames) low-bitrate 1080p. Exercises lazy/partial reading, streaming demux, peak-memory and OOM-resistance, and many-thousand-sample sample-table parsing. Generated offline but slow; --skip-longform omits it. Real multi-hour camera/broadcast captures may additionally be supplied as 'provided'."
     },
     {
       "id": "zero_length.mp4",
       "family": "stress",
       "container": "mp4",
       "codecs": [],
+      "source": "generated",
+      "sizeBucket": "empty",
       "genMethod": "Empty 0-byte file written directly (no ffmpeg). Degenerate input for graceful-failure oracle.",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "sizeBytes": 0,
-      "notes": "Zero-length file. Engines must fail gracefully (no crash/hang/OOM)."
+      "notes": "Zero-length file (true 0 bytes). Engines must fail gracefully (no crash/hang/OOM). Complements empty_audio.wav (valid-but-empty container)."
     },
     {
       "id": "truncated_h264.mp4",
@@ -399,10 +614,12 @@
         "h264",
         "aac"
       ],
+      "source": "generated",
+      "sizeBucket": "micro",
       "genMethod": "Generate the H.264/AAC baseline (short), then truncate to ~60% of its bytes (head -c) so the moov/mdat is incomplete.",
       "sha256": "4b6461cf10b34646bd53312143c9e24f4e83e777be116be0630d2fcbb9a0d15d",
       "sizeBytes": 373248,
-      "notes": "Truncated MP4 (incomplete moov/mdat). Robustness: graceful failure or partial-but-safe handling."
+      "notes": "Truncated MP4 (incomplete moov/mdat). Robustness: graceful failure or partial-but-safe handling. micro-ish robustness rung."
     },
     {
       "id": "image.jpg",
@@ -411,6 +628,8 @@
       "codecs": [
         "mjpeg"
       ],
+      "source": "generated",
+      "sizeBucket": "micro",
       "genMethod": "ffmpeg testsrc2 1 frame 640x480, -frames:v 1 -f image2 image.jpg",
       "sha256": "3c79114a1af58e0146c2981f8ff26115441386821d83c23cf5f0ded058d3dd2a",
       "sizeBytes": 21713,
@@ -423,6 +642,8 @@
       "codecs": [
         "png"
       ],
+      "source": "generated",
+      "sizeBucket": "micro",
       "genMethod": "ffmpeg testsrc2 1 frame 640x480, -frames:v 1 image.png",
       "sha256": "1557d8f3839d3294f84ad73b99bebf929b14e10e3a6a33367e608e53722ee352",
       "sizeBytes": 33993,
@@ -435,6 +656,8 @@
       "codecs": [
         "webp"
       ],
+      "source": "generated",
+      "sizeBucket": "micro",
       "genMethod": "ffmpeg testsrc2 1 frame 640x480, -frames:v 1 -c:v libwebp image.webp",
       "sha256": "97035941c7d8c62cc4e53bd9fd2933b201462f3e09f6e6d1d3b3512a4398b9e8",
       "sizeBytes": 9990,

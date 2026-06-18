@@ -115,16 +115,99 @@ interface Element {
   id: number;
   size: number; // -1 if unknown
   bodyStart: number;
-  bodyEnd: number; // exclusive; for unknown-size, == buf.length (best effort)
+  bodyEnd: number; // exclusive; resolved (see resolveUnknownEnd) for unknown-size masters
   next: number; // offset after this element
 }
 
-/** Read one element header at `pos`. */
+// Extra Segment-level (level-1) element IDs we don't otherwise constant above, used only as
+// unknown-size boundary markers.
+const ID_Cues = 0x1c53bb6b;
+const ID_Chapters = 0x1043a770;
+const ID_Tags = 0x1254c367;
+const ID_SeekHead = 0x114d9b74;
+const ID_Attachments = 0x1941a469;
+
+/**
+ * For an UNKNOWN-SIZE master with the given `id`, the set of element IDs that TERMINATE it (its
+ * siblings/ancestors), or `null` if we don't special-case unbounded masters of this type.
+ *
+ * WHY this matters (the WebM-streaming bug): WebCodecs-based muxers (mediabunny, remotion-webcodecs,
+ * the browser's own MediaRecorder) write WebM in a LIVE/streaming style where the `Segment` AND every
+ * `Cluster` carry an "unknown size" (the all-ones vint `01 FF FF FF FF FF FF FF`) because the writer
+ * can't know the length up front. A naive reader treats an unknown-size element as spanning to its
+ * parent's end (EOF for the Segment), so the FIRST Cluster swallows every later Cluster and only the
+ * first cluster's frames are recovered — the decoder then sees 1 corrupt EOF-spanning "frame" instead
+ * of the real stream (the exact failure on mediabunny's convert-webm-resize WebM). Per EBML, an
+ * unknown-size master ends at the next element whose ID is a valid sibling/ancestor. The two masters
+ * we ever see unbounded are:
+ *   - Segment  → ended only by another Segment or a new top-level EBML header (its children
+ *                Info/Tracks/Cluster/… must NOT terminate it).
+ *   - Cluster  → ended by the next Cluster or ANY Segment-level sibling (Cues/Tags/SeekHead/Info/
+ *                Tracks/Chapters/Attachments) or a new Segment/EBML.
+ */
+function unknownEndBoundary(id: number): ReadonlySet<number> | null {
+  if (id === ID.Segment) return new Set<number>([ID.Segment, ID.EBML]);
+  if (id === ID.Cluster) {
+    return new Set<number>([
+      ID.Cluster,
+      ID.Info,
+      ID.Tracks,
+      ID_Cues,
+      ID_Chapters,
+      ID_Tags,
+      ID_SeekHead,
+      ID_Attachments,
+      ID.Segment,
+      ID.EBML,
+    ]);
+  }
+  return null; // other unknown-size masters (rare in our path) fall back to parentEnd
+}
+
+/**
+ * Resolve the real end (exclusive) of an UNKNOWN-SIZE master whose body starts at `bodyStart`, by
+ * scanning forward (vint-aligned) for the next element ID in `boundary`. Returns `hardEnd` (parent
+ * end / EOF) if no boundary is found. At each step it reads an element header; a boundary ID stops the
+ * scan there, otherwise it skips that child's body by its declared size. A nested unknown-size child
+ * (which this minimal demuxer can't bound) also stops the scan at `hardEnd`.
+ */
+function resolveUnknownEnd(buf: Uint8Array, bodyStart: number, hardEnd: number, boundary: ReadonlySet<number>): number {
+  let pos = bodyStart;
+  while (pos + 1 < hardEnd) {
+    let id: number;
+    let afterId: number;
+    let size: number;
+    let afterSize: number;
+    try {
+      ({ id, next: afterId } = readId(buf, pos));
+      ({ size, next: afterSize } = readSize(buf, afterId));
+    } catch {
+      return hardEnd; // malformed tail — treat the rest as this master's body
+    }
+    if (pos > bodyStart && boundary.has(id)) return pos; // sibling/ancestor boundary → end here
+    if (size === -1) return hardEnd; // nested unknown-size child: can't bound precisely
+    const childEnd = afterSize + size;
+    if (childEnd <= pos || childEnd > hardEnd) return hardEnd; // no progress / overrun → bail
+    pos = childEnd;
+  }
+  return hardEnd;
+}
+
+/** Read one element header at `pos`. Unknown-size Segment/Cluster get a resolved {@link bodyEnd}. */
 function readElement(buf: Uint8Array, pos: number, parentEnd: number): Element {
   const { id, next: afterId } = readId(buf, pos);
   const { size, next: afterSize } = readSize(buf, afterId);
   const bodyStart = afterSize;
-  const bodyEnd = size === -1 ? parentEnd : Math.min(bodyStart + size, parentEnd);
+  let bodyEnd: number;
+  if (size === -1) {
+    // Unknown size: resolve to the next sibling/ancestor boundary so a streaming (unknown-size)
+    // Segment/Cluster doesn't swallow the rest of the file. Masters we don't special-case span to
+    // parentEnd (best effort), matching the prior behavior.
+    const boundary = unknownEndBoundary(id);
+    bodyEnd = boundary ? resolveUnknownEnd(buf, bodyStart, parentEnd, boundary) : parentEnd;
+  } else {
+    bodyEnd = Math.min(bodyStart + size, parentEnd);
+  }
   return { id, size, bodyStart, bodyEnd, next: bodyEnd };
 }
 
@@ -143,6 +226,15 @@ function* children(buf: Uint8Array, start: number, end: number): Generator<Eleme
     if (el.next <= pos) return; // no forward progress → bail
     pos = el.next;
   }
+}
+
+/**
+ * Whether a codec's CodecPrivate should be forwarded to WebCodecs as the decoder `description`.
+ * VP8/VP9 carry config in-band and WebCodecs ignores (and can be broken by) a description; avc1/hvc1
+ * need their avcC/hvcC, and AV1's av1C is consumed by Chrome — so keep the description for those.
+ */
+function codecUsesDescription(token: string): boolean {
+  return token !== 'vp8' && token !== 'vp9';
 }
 
 /** Map a Matroska CodecID string to a canonical token + WebCodecs codec string. */
@@ -246,7 +338,13 @@ export function demuxWebmVideo(bytes: Uint8Array): WebmVideoTrack {
             codedHeight: height,
             timescaleNs,
           };
-          if (codecPrivate) config.description = codecPrivate;
+          // Attach CodecPrivate as the WebCodecs `description` ONLY for codecs that consume one.
+          // VP8/VP9 carry their config in-band and WebCodecs ignores the description; moreover a WebM
+          // VP9 CodecPrivate (the "VP9 Codec Feature Metadata" blob written by mediabunny /
+          // remotion-webcodecs) is NOT a valid WebCodecs description and corrupts the decoder config
+          // (it triggers a null-`.trim()` TypeError in Chrome's native config parser). Drop it here so
+          // every consumer (oracle-helpers + adapter) gets a clean, decodable config.
+          if (codecPrivate && codecUsesDescription(codec.token)) config.description = codecPrivate;
         }
       }
     } else if (el.id === ID.Cluster) {

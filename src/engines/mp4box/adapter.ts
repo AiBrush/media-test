@@ -1,29 +1,52 @@
 /**
- * src/engines/mp4box/adapter.ts — MediaEngine adapter for mp4box.js@0.5.4.
+ * src/engines/mp4box/adapter.ts — MediaEngine adapter for mp4box.js (npm `mp4box`) @ 2.3.0.
  *
- * ROLE: DEMUX / PROBE specialist for the ISO-BMFF family (MP4 / MOV, including fragmented). mp4box.js
- * is a pure-JS box parser + sample-table walker: it reads the `moov` (probe) and walks the sample
- * tables to hand back encoded samples (demux). It does NOT decode, encode, transcode, remux, mux,
- * trim, or decrypt — so `capabilities()` declares ONLY `probe` and `demux`. Everything else is left
- * undeclared, which the runner records as NA(engine) (never a fabricated pass).
+ * ROLE: ISO-BMFF (MP4 / MOV, incl. fragmented-MP4 / CMAF) PARSER + FRAGMENTER. mp4box.js is a
+ * pure-JS box parser, sample-table walker, and on-the-fly fragmenter/segmenter + box writer. It does
+ * NOT decode or encode media (no pixels, no PCM, no re-encode) and handles ONLY ISOBMFF. So this
+ * adapter declares — and implements — exactly three operations:
+ *   - probe   : read `moov` → NormalizedMetadata.
+ *   - demux   : walk sample tables → encoded PacketInfo table (the WebCodecs demux fast path).
+ *   - remux   : ISOBMFF → FRAGMENTED-MP4 (fMP4/CMAF) via setSegmentOptions/onSegment (the fragmenter).
+ * Everything else (transcode/decodeFrames/seek-to-frame/trim/mux/decrypt) needs decode/encode or a
+ * non-ISOBMFF container and is therefore NOT declared — the runner records those as NA(engine).
  *
- * Lib API used (verified against node_modules/mp4box/dist/mp4box.all.js — there are no shipped
- * typings, so a local ambient module lives in ./mp4box.d.ts):
- *   - MP4Box.createFile() → ISOFile
- *   - isoFile.onReady = (info) => …       // fired once `moov` is parsed; info = getInfo() shape
- *   - isoFile.onError = (msg) => …
- *   - isoFile.appendBuffer(ab)            // ab.fileStart REQUIRED (0 for a whole-file append)
- *   - isoFile.flush()                     // signal end of input
- *   - isoFile.setExtractionOptions(id, user, { nbSamples })  // mark a track for extraction
- *   - isoFile.onSamples = (id, user, samples[]) => …         // demuxed samples (cts/dts/size/is_sync/data)
- *   - isoFile.start() / stop()
+ * ── UPGRADE 0.5.4 -> 2.3.0 (this is a rewrite) ──────────────────────────────────────────────────
+ * The 2.x line is a TypeScript+ESM rewrite that SHIPS its own `.d.ts`, so we import the real typed
+ * surface (no local ambient module). Breaking-change deltas honored here:
+ *   • `onError(module, message)` now takes TWO args (was one string in 0.5.x).
+ *   • `onReady(info: Movie)` — info is the `Movie` shape from `getInfo()`.
+ *   • `appendBuffer(MP4BoxBuffer)` — buffers are `MP4BoxBuffer` (carry `fileStart`); build via
+ *     `MP4BoxBuffer.fromArrayBuffer(ab, fileStart)`.
+ *   • `discardMdatData` DEFAULTS TO TRUE since 1.0.0 — with it true, `setExtractionOptions`/
+ *     `setSegmentOptions` warn and produce NO samples. So demux/remux MUST use `createFile(true)`
+ *     (= keepMdatData, → discardMdatData=false) to retain media bytes. Probe stays `createFile()`
+ *     (discard mdat) — it only needs the `moov`, the memory-optimal path.
+ *   • `initializeSegmentation()` now returns `{ tracks:[{id,user}], buffer }` — a SINGLE combined
+ *     init segment (not the 0.5.x array of per-track init segments).
+ *   • 2.x enforces a UNIFORM `nbSamples` across all segmented tracks.
+ *   • `DataStream` default endianness is now BIG_ENDIAN (we still pass it explicitly for the
+ *     avcC/hvcC/vpcC/av1C description serialization path used by demux description bytes).
  *
- * Timestamps from mp4box are in each track's `timescale` ticks; we convert to microseconds for the
- * normalized PacketInfo/metadata contracts in engine.ts.
+ * ── BEST PATH (dossier §3 / §0.9) ───────────────────────────────────────────────────────────────
+ * mp4box is pure-JS, single-threaded, CPU-only: NO WASM / SIMD / WebGPU / threads. Its "fast path" is
+ * lazy/streaming IO + feeding hardware WebCodecs — NOT internal acceleration. This adapter records
+ * that reality in configUsed. Heavy work in init() is just the dynamic import (UNTIMED, §0.7).
+ *
+ * ── DOCS RESEARCHED (2026-06-17, mp4box@2.3.0) ──────────────────────────────────────────────────
+ *   - npm:        https://www.npmjs.com/package/mp4box
+ *   - repo/README: https://github.com/gpac/mp4box.js / https://github.com/gpac/mp4box.js/blob/main/README.md
+ *   - docs/demos: https://gpac.github.io/mp4box.js/ , https://gpac.github.io/mp4box.js/test/
+ *   - releases:   https://github.com/gpac/mp4box.js/releases (v2.3.0, 2025-11-22)
+ *   - 1.0.0 TS announcement (discardMdatData / big-endian DataStream breaking changes):
+ *                 https://gpac.io/2025/06/19/announcing-mp4box-js-1-0-0-with-typescript-support/
+ *   - WebCodecs demux fast-path (avcC/hvcC/vpcC/av1C description, streaming sink, Worker):
+ *                 https://w3c.github.io/webcodecs/samples/video-decode-display/ (demuxer_mp4.js)
+ *   - in-repo dossier: research/dossiers/mp4box.md
+ *   - verified against installed dist: node_modules/mp4box/dist/mp4box.all.{js,d.ts} +
+ *     node_modules/mp4box/dist/log-DO1-_KSL.d.ts (ISOFile @1153, getInfo @6448, processSamples
+ *     @6577, createFile @8212, Movie/Track/Sample @4475/4432/4399).
  */
-
-import MP4Box from 'mp4box';
-import type { ISOFile, MP4ArrayBuffer, MP4Info, MP4Sample, MP4Track } from 'mp4box';
 
 import { registerEngine } from '../../core/registry.ts';
 import type {
@@ -42,27 +65,41 @@ import type {
   TranscodeOptions,
 } from '../../core/engine.ts';
 
-const ENGINE_ID = 'mp4box.js@0.5.4';
+// 2.x ships real types — import the typed surface directly (no local ambient module).
+type Mp4boxModule = typeof import('mp4box');
+type Mp4Movie = import('mp4box').Movie;
+type Mp4Track = import('mp4box').Track;
+type Mp4Sample = import('mp4box').Sample;
+type Mp4ISOFile = import('mp4box').ISOFile;
 
-/** Wrap an ArrayBuffer with the `fileStart` mp4box requires for `appendBuffer`. */
-function asMP4ArrayBuffer(buf: ArrayBuffer, fileStart = 0): MP4ArrayBuffer {
-  const ab = buf as MP4ArrayBuffer;
-  ab.fileStart = fileStart;
-  return ab;
-}
+const ENGINE_ID = 'mp4box@2.3.0';
 
-/** Map mp4box's handler-derived track `type` string to our canonical TrackType. */
-function trackType(t: MP4Track): TrackType {
+/** The chosen best-path config, surfaced as configUsed (dossier §3). mp4box is pure-JS/CPU-only. */
+const CONFIG_USED = {
+  backend: 'pure-js' as const,
+  hwAccel: false,
+  wasmThreads: 0,
+  worker: false, // run inline; mp4box needs no Worker and the suite shell drives it directly
+  pipeline: 'whole-file-append(MP4BoxBuffer+fileStart)',
+  rangeReads: false, // corpus assets fit in memory; we append the whole file once for determinism
+  discardMdatDataProbe: true, // probe drops mdat (moov-only) for minimal peak memory
+  discardMdatDataDemuxRemux: false, // demux/remux keep mdat (createFile(true)) so samples survive
+  segmentRapAlignement: true, // fragmenter starts each segment on a RAP
+};
+
+// ── pure helpers (no lib dependency) ──────────────────────────────────────────────────────────────
+
+/** Map mp4box's handler-derived track `type` to our canonical TrackType. */
+function trackType(t: Mp4Track): TrackType {
   switch (t.type) {
     case 'video':
       return 'video';
     case 'audio':
       return 'audio';
     case 'subtitles':
-    case 'subtitle':
       return 'subtitle';
     default:
-      // Distinguish by which media-header sub-object mp4box populated, as a fallback.
+      // Fallback by which media-header sub-object getInfo populated.
       if (t.video) return 'video';
       if (t.audio) return 'audio';
       return 'other';
@@ -70,9 +107,9 @@ function trackType(t: MP4Track): TrackType {
 }
 
 /**
- * Map an MP4 MIME codecs token (e.g. 'avc1.640028', 'hev1.1.6.L93.B0', 'mp4a.40.2') to our canonical
- * lowercase codec token. Returns the raw token lowercased if unrecognized (honest: we surface what
- * the file declares rather than guessing a canonical id that may be wrong).
+ * Map an MP4 MIME codecs token (e.g. 'avc1.640028', 'hev1.1.6.L93.B0', 'mp4a.40.2', 'vp09.00.10.08',
+ * 'av01.0.04M.08') to our canonical lowercase token. Unrecognized → the raw token lowercased (honest:
+ * surface what the file declares rather than guess a canonical id that may be wrong).
  */
 function canonicalCodec(codec: string): string {
   const c = codec.toLowerCase();
@@ -87,24 +124,25 @@ function canonicalCodec(codec: string): string {
   if (c.startsWith('opus')) return 'opus';
   if (c.startsWith('mp4a.6b') || c.startsWith('mp4a.69') || c === 'mp3' || c === '.mp3') return 'mp3';
   if (c.startsWith('flac') || c.startsWith('fla')) return 'flac';
-  if (c.startsWith('alac')) return 'alac';
-  if (c.startsWith('ec-3')) return 'eac3';
-  if (c.startsWith('ac-3')) return 'ac3';
   return c;
 }
 
 /**
- * Derive clockwise rotation degrees from the tkhd transform matrix, if present. mp4box exposes the
- * 9-element fixed-point matrix [a,b,u, c,d,v, x,y,w]; a/b/c/d are 16.16 fixed-point. We classify the
- * four canonical orientations (0/90/180/270) which cover every rotated-video fixture; non-orthogonal
- * matrices are reported as 0 (we do not fabricate an angle we cannot trust).
+ * Derive clockwise rotation degrees from the tkhd transform matrix, if present. getInfo() exposes the
+ * 9-element fixed-point matrix [a,b,u, c,d,v, x,y,w]; a/b/c/d are 16.16 fixed-point. Classify the four
+ * canonical orientations (0/90/180/270) — non-orthogonal matrices report `undefined` (we never
+ * fabricate an angle we cannot trust).
  */
-function rotationFromMatrix(matrix: Int32Array | number[] | undefined): number | undefined {
+function rotationFromMatrix(
+  matrix: Int32Array | Uint32Array | number[] | undefined,
+): number | undefined {
   if (!matrix || matrix.length < 9) return undefined;
-  const a = Number(matrix[0]) / 65536;
-  const b = Number(matrix[1]) / 65536;
-  const c = Number(matrix[3]) / 65536;
-  const d = Number(matrix[4]) / 65536;
+  // u32 fields can carry the sign bit of a negative 16.16 value; normalize through Int32.
+  const f = (raw: number | undefined): number => (raw === undefined ? 0 : (raw | 0) / 65536);
+  const a = f(matrix[0]);
+  const b = f(matrix[1]);
+  const c = f(matrix[3]);
+  const d = f(matrix[4]);
   const eq = (x: number, y: number) => Math.abs(x - y) < 0.01;
   if (eq(a, 1) && eq(b, 0) && eq(c, 0) && eq(d, 1)) return 0;
   if (eq(a, 0) && eq(b, 1) && eq(c, -1) && eq(d, 0)) return 90;
@@ -113,29 +151,42 @@ function rotationFromMatrix(matrix: Int32Array | number[] | undefined): number |
   return undefined;
 }
 
-/** Build the normalized metadata from an mp4box `MP4Info`. */
-function toNormalizedMetadata(info: MP4Info): NormalizedMetadata {
-  const durationSec =
-    info.timescale > 0 && info.duration > 0
-      ? info.duration / info.timescale
-      : null;
+/**
+ * Pick the canonical container token. getInfo() does not separately tag mov vs mp4, so we inspect the
+ * ftyp brands: the QuickTime brand 'qt  ' (and 'qt') marks a MOV; everything else in the ISOBMFF
+ * family normalizes to 'mp4'.
+ */
+function canonicalContainer(brands: string[] | undefined): string {
+  if (brands && brands.some((b) => b === 'qt  ' || b === 'qt')) return 'mov';
+  return 'mp4';
+}
+
+/** Build NormalizedMetadata from an mp4box `Movie` (getInfo() result). */
+function toNormalizedMetadata(info: Mp4Movie): NormalizedMetadata {
+  // Movie duration: prefer mvhd duration/timescale; for fragmented files where mvhd.duration is 0,
+  // fall back to the fragment duration ratio getInfo() exposes as {num, den}.
+  let durationSec: number | null = null;
+  if (info.timescale > 0 && info.duration > 0) {
+    durationSec = info.duration / info.timescale;
+  } else if (info.fragment_duration && info.fragment_duration.den > 0 && info.fragment_duration.num > 0) {
+    durationSec = info.fragment_duration.num / info.fragment_duration.den;
+  }
 
   const tracks: NormalizedTrack[] = info.tracks.map((t): NormalizedTrack => {
     const type = trackType(t);
     const trackDurSec = t.timescale > 0 ? t.duration / t.timescale : 0;
+    const lang = t.language && t.language !== 'und' ? t.language : null;
     const track: NormalizedTrack = {
       type,
       codec: canonicalCodec(t.codec),
-      bitrate: typeof t.bitrate === 'number' && isFinite(t.bitrate) ? Math.round(t.bitrate) : null,
-      language: t.language && t.language !== 'und' ? t.language : null,
+      bitrate: typeof t.bitrate === 'number' && Number.isFinite(t.bitrate) ? Math.round(t.bitrate) : null,
+      language: lang,
     };
     if (type === 'video') {
-      track.width = t.video?.width ?? t.track_width;
-      track.height = t.video?.height ?? t.track_height;
-      // fps from sample count over track duration (averaged; VFR tracks report an average fps).
-      if (trackDurSec > 0 && t.nb_samples > 0) {
-        track.fps = t.nb_samples / trackDurSec;
-      }
+      track.width = t.video?.width ?? (Math.round(t.track_width) || undefined);
+      track.height = t.video?.height ?? (Math.round(t.track_height) || undefined);
+      // Average fps over the track (sample count / track-seconds). VFR tracks report an average.
+      if (trackDurSec > 0 && t.nb_samples > 0) track.fps = t.nb_samples / trackDurSec;
       const rot = rotationFromMatrix(t.matrix);
       if (rot !== undefined) track.rotation = rot;
     } else if (type === 'audio') {
@@ -145,107 +196,166 @@ function toNormalizedMetadata(info: MP4Info): NormalizedMetadata {
     return track;
   });
 
-  return {
-    // mp4box parses the ISO-BMFF family; we report 'mp4' (MOV shares the same box structure and is
-    // not separately distinguishable from the parsed moov alone). Fragmentation is a `tags` flag.
-    container: 'mp4',
+  const meta: NormalizedMetadata = {
+    container: canonicalContainer(info.brands),
     durationSec,
     tracks,
-    tags: {
-      brands: info.brands.join(','),
-      ...(info.isFragmented ? { fragmented: 'true' } : {}),
-    },
   };
+  const tags: Record<string, string> = {};
+  if (info.brands && info.brands.length) tags.brands = info.brands.join(',');
+  if (info.isFragmented) tags.fragmented = 'true';
+  if (info.mime) tags.mime = info.mime;
+  if (Object.keys(tags).length) meta.tags = tags;
+  return meta;
+}
+
+/** Concatenate ArrayBuffers/Uint8Arrays into one Uint8Array (fMP4 init + media segments). */
+function concatBuffers(parts: Array<ArrayBuffer | Uint8Array>): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p instanceof Uint8Array ? p.byteLength : p.byteLength;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    const u8 = p instanceof Uint8Array ? p : new Uint8Array(p);
+    out.set(u8, off);
+    off += u8.byteLength;
+  }
+  return out;
 }
 
 /**
- * Drive an ISOFile to the `onReady`/`onError` resolution by appending the whole file. mp4box parses
- * progressively but a single whole-file append + flush is the simplest correct path for the test
- * corpus (assets fit comfortably in memory; CountingSource accounting is handled by the runner).
- */
-function parseToInfo(bytes: ArrayBuffer): Promise<{ file: ISOFile; info: MP4Info }> {
-  return new Promise((resolve, reject) => {
-    const file = MP4Box.createFile();
-    let settled = false;
-    file.onError = (msg: string) => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(`mp4box parse error: ${msg}`));
-    };
-    file.onReady = (info: MP4Info) => {
-      if (settled) return;
-      settled = true;
-      resolve({ file, info });
-    };
-    try {
-      file.appendBuffer(asMP4ArrayBuffer(bytes, 0));
-      file.flush();
-    } catch (e) {
-      if (!settled) {
-        settled = true;
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-      return;
-    }
-    // If neither onReady nor onError fired, the moov was never parsed (truncated / not ISO-BMFF).
-    if (!settled) {
-      settled = true;
-      reject(new Error('mp4box: moov not found (not an ISO-BMFF/MP4 file or moov truncated)'));
-    }
-  });
-}
-
-/**
- * mp4box.js engine: probe + demux for ISO-BMFF (MP4/MOV, incl. fragmented). Pure-JS, no WASM, no
- * WebCodecs — so it has no init()/dispose() and never decodes pixels (no decodeFrames/seek).
+ * mp4box.js engine (2.3.0): probe + demux + remux-to-fragmented-MP4 for the ISO-BMFF family.
+ * Pure-JS — init() only dynamically imports the lib (UNTIMED); there is no WASM/Worker to spin up.
  */
 export class Mp4boxEngine implements MediaEngine {
   readonly id = ENGINE_ID;
 
+  private mp4box: Mp4boxModule | null = null;
+
+  /** The best-path config chosen; recorded per §8.5 / surfaced to the harness. */
+  readonly configUsed = CONFIG_USED;
+
   capabilities(): CapabilitySet {
     return {
-      // HONEST: mp4box only reads boxes and walks sample tables. It produces metadata (probe) and
-      // encoded samples (demux). It never produces bytes (remux/transcode/trim/mux/decrypt) or
-      // pixels (decodeFrames/seek), so those operations are deliberately omitted (→ NA(engine)).
+      // HONEST: mp4box parses boxes (probe), walks sample tables (demux), and fragments ISOBMFF
+      // (remux → fMP4). It NEVER produces pixels (decodeFrames/seek-to-frame), re-encodes
+      // (transcode), trims frame-accurately, muxes encoded tracks from scratch in this adapter, or
+      // decrypts — those are omitted so the runner negotiates NA(engine).
       operations: {
         probe: true,
         demux: true,
+        remux: true,
       },
-      // ISO-BMFF only. 'mov' shares the box structure mp4box parses. Fragmented MP4 is supported and
+      // ISO-BMFF only. 'mov' shares the box structure; fragmented-MP4/CMAF are the same family,
       // surfaced via the 'fragmented' feature, not a separate container token.
       containersIn: ['mp4', 'mov'],
-      containersOut: [], // produces no container bytes
-      // Codecs mp4box can identify/demux from an MP4 sample table. It does not decode them; it walks
-      // the table and forwards encoded samples regardless, but we declare the ones we map to a
-      // canonical token and that appear in the MP4 corpus.
-      videoCodecs: ['h264', 'hevc', 'vp9', 'av1'],
-      audioCodecs: ['aac', 'opus', 'flac', 'mp3'],
-      encryption: [], // mp4box can parse `pssh`/`senc` but this adapter does not decrypt
-      // 'webcodecs:independent': mp4box is pure-JS demux/probe and never touches WebCodecs, so the
-      // runner must not browser-gate its (declared) codecs on WebCodecs.isConfigSupported.
-      features: ['fragmented', 'webcodecs:independent'],
+      // Remux writes FRAGMENTED MP4 (fMP4/CMAF), container token 'mp4'.
+      containersOut: ['mp4'],
+      // Codecs mp4box can IDENTIFY / DEMUX from the sample table (it does not decode/encode them).
+      videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
+      audioCodecs: ['aac', 'opus', 'mp3', 'flac'],
+      // Parses CENC signalling (pssh/senc/...) but does NOT decrypt → declare none.
+      encryption: [],
+      // 'fragmented'        : remux produces fMP4/CMAF.
+      // 'metadata:read'     : probe reads duration/dims/fps/rotation/brands/language.
+      // 'webcodecs:demux-feed': demux output feeds WebCodecs EncodedVideoChunk/description.
+      // 'webcodecs:independent': probe/demux/remux are pure-JS and never touch the browser codec
+      //                          gate, so the runner must not browser-gate them on codec availability.
+      features: ['fragmented', 'metadata:read', 'webcodecs:demux-feed', 'webcodecs:independent'],
     };
   }
 
+  /** UNTIMED (§0.7): dynamically import the (pure-JS) lib. No WASM/Worker/encoder warmup needed. */
+  async init(): Promise<void> {
+    if (!this.mp4box) {
+      this.mp4box = await import('mp4box');
+    }
+  }
+
+  async dispose(): Promise<void> {
+    // Pure-JS, no global resources/workers held between operations; drop the module handle so a fresh
+    // engine per Worker/iter starts clean for peak-memory accounting.
+    this.mp4box = null;
+  }
+
+  private lib(): Mp4boxModule {
+    if (!this.mp4box) throw new Error(`${ENGINE_ID}: init() must run before operations (lib not loaded)`);
+    return this.mp4box;
+  }
+
+  /** Wrap an ArrayBuffer as the MP4BoxBuffer (carrying fileStart) that appendBuffer requires. */
+  private makeBuffer(ab: ArrayBuffer, fileStart = 0): import('mp4box').MP4BoxBuffer {
+    return this.lib().MP4BoxBuffer.fromArrayBuffer(ab, fileStart);
+  }
+
+  /**
+   * Drive an ISOFile to its onReady/onError resolution by appending the whole file then flush()ing.
+   * `keepMdatData` MUST be true for demux/remux (else discardMdatData drops media and no samples are
+   * produced); probe leaves it false (moov-only, minimal memory). 2.x onError takes (module, message).
+   */
+  private parseToInfo(
+    bytes: ArrayBuffer,
+    keepMdatData: boolean,
+  ): Promise<{ file: Mp4ISOFile; info: Mp4Movie }> {
+    const MP4Box = this.lib();
+    return new Promise((resolve, reject) => {
+      const file = MP4Box.createFile(keepMdatData);
+      let settled = false;
+      file.onError = (module: string, message: string) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`mp4box parse error [${module}]: ${message}`));
+      };
+      file.onReady = (info: Mp4Movie) => {
+        if (settled) return;
+        settled = true;
+        resolve({ file, info });
+      };
+      try {
+        file.appendBuffer(this.makeBuffer(bytes, 0));
+        file.flush();
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+        return;
+      }
+      // Neither onReady nor onError fired → no moov was parsed (truncated / not ISO-BMFF).
+      if (!settled) {
+        settled = true;
+        reject(new Error('mp4box: moov not found (not an ISO-BMFF/MP4 file, or moov truncated)'));
+      }
+    });
+  }
+
+  // ── probe ──────────────────────────────────────────────────────────────────────────────────
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const bytes = await input.arrayBuffer();
-    const { info } = await parseToInfo(bytes);
+    // moov-only: discard mdat (createFile()/keepMdatData=false) for minimal peak memory.
+    const { info } = await this.parseToInfo(bytes, false);
     return toNormalizedMetadata(info);
   }
 
+  // ── demux ──────────────────────────────────────────────────────────────────────────────────
+  /**
+   * Walk the sample tables → a global, decode-ordered PacketInfo table. Timestamps convert from each
+   * sample's `timescale` ticks to microseconds (ptsUs from cts, dtsUs from dts — B-frame reorder is
+   * observable through cts != dts). keepMdatData=true so samples carry data; we read only the scalar
+   * fields we need and release sample memory as we go.
+   */
   async demux(input: MediaInput): Promise<DemuxResult> {
     const bytes = await input.arrayBuffer();
-    const { file, info } = await parseToInfo(bytes);
+    const { file, info } = await this.parseToInfo(bytes, true);
     const metadata = toNormalizedMetadata(info);
 
-    // Map mp4box track id → index in info.tracks, so PacketInfo.trackIndex matches metadata.tracks
-    // ordering (the contract: trackIndex indexes into NormalizedMetadata.tracks).
+    // mp4box track id → index in info.tracks, so PacketInfo.trackIndex indexes NormalizedMetadata.tracks.
     const idToIndex = new Map<number, number>();
     info.tracks.forEach((t, i) => idToIndex.set(t.id, i));
 
     const packets: PacketInfo[] = [];
 
-    file.onSamples = (id: number, _user: unknown, samples: MP4Sample[]) => {
+    file.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
       const trackIndex = idToIndex.get(id) ?? -1;
       for (const s of samples) {
         const ts = s.timescale > 0 ? s.timescale : 1;
@@ -257,44 +367,79 @@ export class Mp4boxEngine implements MediaEngine {
           keyframe: !!s.is_sync,
         });
       }
-      // Free sample memory as we go; we have already copied the scalar fields we need.
-      const lastNumber = samples.length ? samples[samples.length - 1]!.number + 1 : 0;
-      if (lastNumber > 0) file.releaseUsedSamples(id, lastNumber);
+      // Free decoded sample memory once scalars are copied (we keep no `data`).
+      const last = samples.length ? samples[samples.length - 1] : undefined;
+      if (last) file.releaseUsedSamples(id, last.number + 1);
     };
 
-    // Extract every track. Large nbSamples keeps callback overhead low; mp4box still chunks at EOF.
+    // Extract every track; large nbSamples keeps callback overhead low (mp4box still chunks at EOF).
     for (const t of info.tracks) {
       file.setExtractionOptions(t.id, null, { nbSamples: 100_000 });
     }
     file.start();
-    file.flush(); // synchronous: flush drives processSamples to completion for in-memory data
+    file.flush(); // synchronous for whole-file input: drives processSamples to completion
     file.stop();
 
-    // mp4box delivers samples in per-track order; sort to global decode order (dts then trackIndex)
-    // for a stable, engine-independent packet table the golden-packets oracle can compare against.
-    packets.sort((a, b) => (a.dtsUs - b.dtsUs) || (a.trackIndex - b.trackIndex));
-
+    // Stable, engine-independent global decode order: dts then trackIndex.
+    packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
     return { metadata, packets };
   }
 
-  // ── Undeclared operations: mp4box does none of these. They throw so a mis-wired runner fails
-  //    loudly; capabilities() does NOT declare them, so the runner negotiates NA(engine) and never
-  //    calls them in practice. ──────────────────────────────────────────────────────────────────
+  // ── remux (FRAGMENTER) ───────────────────────────────────────────────────────────────────────
+  /**
+   * ISO-BMFF → FRAGMENTED-MP4 (fMP4 / CMAF). This is mp4box's documented "fragmenter" path:
+   * setSegmentOptions per track → initializeSegmentation() (one combined init segment) → onSegment
+   * (media fragments) → start()/flush(). We concatenate the init segment + every media fragment (in
+   * arrival order) into one playable fragmented-MP4 byte buffer. Cross-family conversion (to
+   * mkv/webm/ts/wav/...) is IMPOSSIBLE for mp4box, so any non-mp4 target throws.
+   */
+  async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
+    if (opts.container !== 'mp4') {
+      throw new Error(
+        `${ENGINE_ID}: remux only targets fragmented 'mp4' (ISO-BMFF→fMP4); '${opts.container}' is out of scope`,
+      );
+    }
+    const bytes = await input.arrayBuffer();
+    const { file, info } = await this.parseToInfo(bytes, true); // keep mdat or no media is fragmented
 
-  async remux(_input: MediaInput, _opts: { container: string }): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: remux not supported (probe/demux specialist)`);
+    if (!info.tracks.length) throw new Error(`${ENGINE_ID}: remux found no tracks to fragment`);
+
+    const mediaSegments: Uint8Array[] = [];
+    file.onSegment = (_id, _user, buffer) => {
+      mediaSegments.push(new Uint8Array(buffer));
+    };
+
+    // 2.x requires a UNIFORM nbSamples across all segmented tracks; rapAlignement starts segments on
+    // a RAP (CMAF-friendly). Use the documented default of 1000 samples per segment.
+    const NB_SAMPLES = 1000;
+    for (const t of info.tracks) {
+      file.setSegmentOptions(t.id, null, { nbSamples: NB_SAMPLES, rapAlignement: true });
+    }
+
+    // One combined init segment (ftyp + moov with mvex), then media fragments via onSegment.
+    const init = file.initializeSegmentation();
+    file.start();
+    file.flush(); // synchronous for whole-file input: emits all media segments
+    file.stop();
+
+    const out = concatBuffers([init.buffer, ...mediaSegments]);
+    return { bytes: out, mime: 'video/mp4', container: 'mp4' };
   }
 
+  // ── Undeclared operations: mp4box does none of these. They throw so a mis-wired runner fails
+  //    loudly; capabilities() does NOT declare them, so the runner negotiates NA(engine). ──────────
+
   async transcode(_input: MediaInput, _opts: TranscodeOptions): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: transcode not supported (no encoder/decoder)`);
+    throw new Error(`${ENGINE_ID}: transcode not supported (no encoder/decoder — ISOBMFF parser only)`);
   }
 
   async decodeFrames(_input: MediaInput, _opts?: { maxFrames?: number }): Promise<FrameSink> {
-    throw new Error(`${ENGINE_ID}: decodeFrames not supported (no decoder)`);
+    throw new Error(`${ENGINE_ID}: decodeFrames not supported (no decoder — pair with WebCodecs)`);
   }
 
   async seek(_input: MediaInput, _tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    throw new Error(`${ENGINE_ID}: seek-to-frame not supported (no decoder)`);
+    // mp4box can seek to a byte offset of the previous RAP, but cannot produce a decoded FrameDigest.
+    throw new Error(`${ENGINE_ID}: seek-to-frame not supported (no decoder — RAP→byte-offset only)`);
   }
 
   async trim(
@@ -302,16 +447,21 @@ export class Mp4boxEngine implements MediaEngine {
     _range: { startUs: number; endUs: number },
     _opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: trim not supported (no writer)`);
+    throw new Error(`${ENGINE_ID}: trim not supported (keyframe-bounded DIY only; not declared)`);
   }
 
-  // mux/decrypt are optional on MediaEngine and intentionally not implemented here.
+  // mux/decrypt are optional on MediaEngine and intentionally NOT implemented/declared here.
   async mux(_tracks: EncodedTracks, _opts: { container: string }): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: mux not supported`);
+    throw new Error(`${ENGINE_ID}: mux not supported (not declared)`);
   }
 }
 
-/** Register the mp4box engine factory under its versioned id. */
-export function registerMp4box(): void {
-  registerEngine(ENGINE_ID, () => new Mp4boxEngine());
+/**
+ * Register helper for Phase D to wire the registry (this file does NOT register at import time —
+ * "Register NOTHING; Phase D wires registry"). Phase D calls registerMp4box() where it assembles the
+ * engine list. The registry KEY defaults to 'mp4box'; the engine reports its own versioned id.
+ */
+export function registerMp4box(opts?: { id?: string; reference?: boolean }): void {
+  const id = opts?.id ?? 'mp4box';
+  registerEngine(id, () => new Mp4boxEngine(), { reference: opts?.reference ?? false });
 }

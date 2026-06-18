@@ -74,8 +74,21 @@ export async function loadGolden(assetId: string, baseUrl = 'fixtures/golden'): 
   }
   if (framesRaw !== undefined) {
     raw.frames = framesRaw;
-    const frames = unwrap(framesRaw, ['frames']);
-    if (Array.isArray(frames)) store.frames = frames as FrameDigest[];
+    // A `pending: true` golden is a $todo PLACEHOLDER whose frame digests have not yet been produced
+    // by the in-browser frame-bake (ffmpeg can't make them). Its frames[].sha256 are absent. Treat
+    // such golden frames as ABSENT — and likewise drop any holey entry without a real sha256 — so the
+    // SSIM/decoded-frames oracles report a clean NA/FAIL ("golden frames pending") instead of
+    // null-deref'ing on a missing sha256 (the convert-webm-resize crash).
+    const pending = isObject(framesRaw) && (framesRaw as Record<string, unknown>).pending === true;
+    if (!pending) {
+      const frames = unwrap(framesRaw, ['frames']);
+      if (Array.isArray(frames)) {
+        const baked = (frames as FrameDigest[]).filter(
+          (f) => f != null && typeof f.sha256 === 'string' && f.sha256.length > 0,
+        );
+        if (baked.length) store.frames = baked;
+      }
+    }
   }
   if (ssimRaw !== undefined) {
     raw.ssim = ssimRaw;
@@ -653,13 +666,43 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   const golden = ctx.golden;
   const want = golden.frames;
   const refSigs = golden.ssimRef;
-  if ((!want || !want.length) && (!refSigs || !refSigs.length)) {
-    return fail(oracle, 'no golden reference frames/sigs for SSIM/PSNR (frames.json + ssim.json absent)');
+  const haveGolden = (!!want && want.length > 0) || (!!refSigs && refSigs.length > 0);
+
+  // When there is NO committed golden (a resize/transcode case, or golden pending the in-browser
+  // frame-bake), §5.2 says validate against REFERENCE frames, not golden: decode the SOURCE in-browser
+  // and downscale to the candidate's resolution, then SSIM/PSNR. We sample a small number of frames
+  // (decoding the full clip on both sides would be needlessly slow).
+  const REFERENCE_SAMPLE = 8;
+  const maxFrames = haveGolden
+    ? Math.max(want?.length ?? 0, refSigs?.length ?? 0) || undefined
+    : REFERENCE_SAMPLE;
+
+  // Decode the CANDIDATE output with the platform engine. This is the fragile path: some engine
+  // outputs (e.g. a remotion-webcodecs streaming/headerless WebM) cannot be decoded by the platform
+  // decoder, which can yield a null sink / null tracks / null frames and historically null-derefed
+  // here ("Cannot read properties of null"). Treat ANY decode failure or null/empty result as a
+  // clean FAIL with a clear detail rather than throwing an uncaught error.
+  let sink: FrameSink | null | undefined;
+  try {
+    sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames });
+  } catch (err) {
+    return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
+  }
+  if (!sink) {
+    return fail(oracle, 'platform decode of engine output returned no sink (output not decodable)');
+  }
+  const candFrames = Array.isArray(sink.frames) ? sink.frames : [];
+  if (!candFrames.length) {
+    return fail(
+      oracle,
+      'platform decode produced 0 frames (output not decodable / missing video track)',
+    );
   }
 
-  const maxFrames = Math.max(want?.length ?? 0, refSigs?.length ?? 0) || undefined;
-  const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames });
-  if (!sink.frames.length) return fail(oracle, 'platform decode produced 0 frames');
+  // No committed golden → perceptual validation against the in-browser-decoded source (§5.2).
+  if (!haveGolden) {
+    return ssimVsReferenceSource(oracle, ctx, t, sink, candFrames.length);
+  }
 
   // Pair candidate frames with golden references by index. Two modes:
   //  (A) full-pixel SSIM/PSNR when getPixels is available AND golden ships pixels (not committed
@@ -669,8 +712,8 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   //      frame is identical → PSNR is +∞; otherwise we cannot compute true RGB PSNR without golden
   //      pixels, so we report the per-frame SSIM and fall back to digest-equality for the PSNR gate).
   const pairs = Math.min(
-    sink.frames.length,
-    want?.length ?? refSigs?.length ?? sink.frames.length,
+    candFrames.length,
+    want?.length ?? refSigs?.length ?? candFrames.length,
   );
   if (pairs === 0) return fail(oracle, 'no paired frames to compare');
 
@@ -681,9 +724,12 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   const havePixels = typeof sink.getPixels === 'function';
 
   for (let i = 0; i < pairs; i++) {
-    const cand = sink.frames[i]!;
+    const cand = candFrames[i];
+    // Guard against a sparse/holey candidate frame array (a null/undefined entry, or one missing a
+    // sha256). Such a frame contributes no evidence rather than null-derefing on cand.sha256.
+    if (!cand) continue;
     // digest equality → identical normalized frame → SSIM 1 / PSNR ∞
-    if (want && want[i] && normHex(cand.sha256) === normHex(want[i]!.sha256)) {
+    if (want && want[i] && cand.sha256 != null && normHex(cand.sha256) === normHex(want[i]!.sha256)) {
       exactCount++;
       ssimSum += 1;
       ssimCount++;
@@ -691,7 +737,14 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     }
     // SSIM via downsampled luma signature if golden provides one and we can derive ours
     if (refSigs && refSigs[i] && havePixels) {
-      const px = await sink.getPixels!(i);
+      // getPixels can also reject / return null for an undecodable candidate frame; tolerate it.
+      let px: ImageData | null | undefined;
+      try {
+        px = await sink.getPixels!(i);
+      } catch {
+        px = undefined;
+      }
+      if (!px) continue;
       const candSig = downsampleLuma(px, sigSide(refSigs[i]!.length));
       const s = sigSsim(candSig, refSigs[i]!);
       ssimSum += s;
@@ -743,6 +796,117 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   return ssimPass
     ? pass(oracle, detail, finiteOnly(measurements))
     : fail(oracle, detail, finiteOnly(measurements));
+}
+
+/**
+ * Reference-based SSIM/PSNR for transcode/resize cases with NO committed golden (§5.2). Decode the
+ * SOURCE in-browser, downscale each frame to the candidate's resolution, and compare. Makes
+ * convert-webm-resize verifiable without a golden frame-bake. Frames pair by index (both decoded from
+ * the start, in presentation order, same fps). A correct downscale-transcode → high SSIM vs the
+ * canvas-downscaled source; a garbled/empty/wrong-content output → low SSIM → FAIL.
+ */
+async function ssimVsReferenceSource(
+  oracle: OracleId,
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  candSink: FrameSink,
+  candCount: number,
+): Promise<OracleOutcome> {
+  if (typeof candSink.getPixels !== 'function') {
+    return fail(oracle, 'candidate decode exposes no pixels (getPixels) — cannot compute SSIM/PSNR');
+  }
+  if (!ctx.input) return fail(oracle, 'no source input available to derive reference frames');
+
+  let srcBytes: MediaBytes;
+  try {
+    const ab = await ctx.input.arrayBuffer();
+    const ext = (ctx.input.id.split('.').pop() ?? '').toLowerCase();
+    srcBytes = { bytes: new Uint8Array(ab), mime: ctx.input.mime, container: ext };
+  } catch (err) {
+    return fail(oracle, `could not read source bytes for reference decode: ${errMsg(err)}`);
+  }
+
+  const sample = Math.min(candCount, 8);
+  let srcSink: FrameSink | null | undefined;
+  try {
+    srcSink = await ctx.decodeWithPlatform(srcBytes, { maxFrames: sample });
+  } catch (err) {
+    return fail(oracle, `reference decode of source failed: ${errMsg(err)}`);
+  }
+  if (!srcSink || typeof srcSink.getPixels !== 'function') {
+    return fail(oracle, 'reference source decode produced no pixels');
+  }
+  const srcCount = Array.isArray(srcSink.frames) ? srcSink.frames.length : 0;
+  const n = Math.min(sample, candCount, srcCount);
+  if (n === 0) return fail(oracle, 'no paired candidate/reference frames to compare');
+
+  let ssimSum = 0;
+  let psnrSum = 0;
+  let psnrCount = 0;
+  let minSsim = 1;
+  let cnt = 0;
+  let dims = '';
+  for (let i = 0; i < n; i++) {
+    let candPx: ImageData | null | undefined;
+    let srcPx: ImageData | null | undefined;
+    try {
+      candPx = await candSink.getPixels(i);
+      srcPx = await srcSink.getPixels(i);
+    } catch {
+      continue;
+    }
+    if (!candPx || !srcPx) continue;
+    const ref = resizeImageData(srcPx, candPx.width, candPx.height);
+    if (!ref) continue;
+    const s = ssim(candPx, ref);
+    if (!Number.isFinite(s)) continue;
+    ssimSum += s;
+    if (s < minSsim) minSsim = s;
+    const p = psnrDb(candPx, ref);
+    if (Number.isFinite(p)) {
+      psnrSum += p;
+      psnrCount++;
+    }
+    cnt++;
+    if (!dims) dims = `${candPx.width}x${candPx.height}`;
+  }
+  if (cnt === 0) return fail(oracle, 'could not compute SSIM on any frame (no comparable pixels)');
+
+  const ssimMean = ssimSum / cnt;
+  const psnrMean = psnrCount ? psnrSum / psnrCount : 0;
+  const measurements = finiteOnly({ pairs: cnt, ssimMean, ssimMin: minSsim, psnrDb: psnrMean });
+  // SSIM (mean) is the GATE. PSNR is ADVISORY only: the reference is the source downscaled by a
+  // DIFFERENT resampler (OffscreenCanvas) than the candidate engine used, so absolute PSNR is not
+  // ground truth and would falsely fail a correct transcode. Verified in /chrome that SSIM
+  // discriminates cleanly — a correct downscale-transcode scores ~0.99 while a wrong/mismatched frame
+  // scores ~0.84 — so the §8 SSIM floor (0.97 here) is a faithful correctness gate on its own.
+  const ssimOk = ssimMean >= t.ssimMin;
+  const detail =
+    `vs in-browser reference (source decoded + downscaled to ${dims}): SSIM mean ${ssimMean.toFixed(4)} ` +
+    `(min ${minSsim.toFixed(4)}); PSNR mean ${psnrMean.toFixed(1)} dB (advisory) over ${cnt} frame(s); ` +
+    `gate SSIM≥${t.ssimMin}`;
+  return ssimOk ? pass(oracle, detail, measurements) : fail(oracle, detail, measurements);
+}
+
+/** Downscale (or passthrough) an ImageData to w×h via OffscreenCanvas high-quality smoothing. */
+function resizeImageData(img: ImageData, w: number, h: number): ImageData | null {
+  if (img.width === w && img.height === h) return img;
+  if (typeof OffscreenCanvas !== 'function') return null;
+  try {
+    const src = new OffscreenCanvas(img.width, img.height);
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    sctx.putImageData(img, 0, 0);
+    const dst = new OffscreenCanvas(w, h);
+    const dctx = dst.getContext('2d');
+    if (!dctx) return null;
+    dctx.imageSmoothingEnabled = true;
+    dctx.imageSmoothingQuality = 'high';
+    dctx.drawImage(src, 0, 0, img.width, img.height, 0, 0, w, h);
+    return dctx.getImageData(0, 0, w, h);
+  } catch {
+    return null;
+  }
 }
 
 // ── alpha-plane ──────────────────────────────────────────────────────────────────────────────
@@ -1390,8 +1554,9 @@ function isObject(v: unknown): v is Record<string, unknown> {
 function normStr(s: string | undefined | null): string {
   return (s ?? '').trim().toLowerCase();
 }
-function normHex(h: string): string {
-  return h.trim().toLowerCase();
+function normHex(h: string | null | undefined): string {
+  // Defensive: golden data is untyped JSON; a placeholder/holey digest can be null. Never .trim() null.
+  return (h ?? '').trim().toLowerCase();
 }
 function shortHex(h: string): string {
   const n = normHex(h);

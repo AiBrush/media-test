@@ -1,0 +1,23 @@
+{
+  "mediabunny@1.48.0": 165.2,
+  "mediabunny": 165.2,
+  "mp4box@2.3.0": 41.3,
+  "mp4box": 41.3,
+  "web-demuxer@4.0.0": 43.2,
+  "web-demuxer": 43.2,
+  "remotion-media-parser@4.0.479": 72.6,
+  "remotion-media-parser": 72.6,
+  "remotion-webcodecs@4.0.479": 94,
+  "remotion-webcodecs": 94,
+  "ffmpeg.wasm@0.12.15": 1.4,
+  "ffmpeg.wasm": 1.4,
+  "platform@chrome-149": 0,
+  "platform": 0,
+  "platform@chrome": 0,
+  "platform@firefox": 0,
+  "platform@webkit": 0,
+  "platform@safari": 0,
+  "platform@browser": 0,
+  "aibrush-media@dev": 0,
+  "aibrush-media": 0
+}

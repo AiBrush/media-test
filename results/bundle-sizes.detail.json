@@ -1,0 +1,64 @@
+{
+  "mediabunny@1.48.0": {
+    "kBytesGzip": 165.2,
+    "kBytesRaw": 648.9,
+    "imports": [
+      "mediabunny"
+    ],
+    "note": "Pure-JS/TS library; no separate WASM/Worker asset. Full shipped JS cost."
+  },
+  "mp4box@2.3.0": {
+    "kBytesGzip": 41.3,
+    "kBytesRaw": 178.1,
+    "imports": [
+      "mp4box"
+    ],
+    "note": "Pure-JS demux/mux library; no separate WASM. Full shipped JS cost."
+  },
+  "web-demuxer@4.0.0": {
+    "kBytesGzip": 43.2,
+    "kBytesRaw": 110.5,
+    "imports": [
+      "web-demuxer"
+    ],
+    "note": "JS wrapper bundled here; the FFmpeg-based .wasm is a RUN-TIME asset loaded separately and is excluded from the shipped-JS number."
+  },
+  "remotion-media-parser@4.0.479": {
+    "kBytesGzip": 72.6,
+    "kBytesRaw": 258.7,
+    "imports": [
+      "@remotion/media-parser",
+      "@remotion/media-parser/web"
+    ],
+    "note": "Pure-TS, zero-dependency parser. The optional /worker entry is loaded lazily at run time and is excluded."
+  },
+  "remotion-webcodecs@4.0.479": {
+    "kBytesGzip": 94,
+    "kBytesRaw": 335.8,
+    "imports": [
+      "@remotion/webcodecs",
+      "@remotion/webcodecs/buffer"
+    ],
+    "note": "WebCodecs-based; the optional /worker entry is loaded lazily at run time and is excluded."
+  },
+  "ffmpeg.wasm@0.12.15": {
+    "kBytesGzip": 1.4,
+    "kBytesRaw": 3.3,
+    "imports": [
+      "@ffmpeg/ffmpeg"
+    ],
+    "note": "Only the @ffmpeg/ffmpeg JS WRAPPER is shipped JS. ffmpeg-core.js/.wasm/.worker.js (the multi-MB core) load at RUN TIME from the local vendor dir and are EXCLUDED from the shipped-JS number (they are runtime assets, not bundled JS)."
+  },
+  "platform@chrome-149": {
+    "kBytesGzip": 0,
+    "kBytesRaw": 0,
+    "imports": [],
+    "note": "No third-party library shipped (uses built-in WebCodecs/<video>/MediaRecorder). Shipped-library cost is 0 kB by construction. The engine id is navigator-derived (platform@<family>-<major>); compare.mjs falls back to a platform@* prefix match so every browser variant joins."
+  },
+  "aibrush-media@dev": {
+    "kBytesGzip": 0,
+    "kBytesRaw": 0,
+    "imports": [],
+    "note": "Placeholder/stub adapter — pure local TypeScript, imports no third-party library and ships no run-time bytes (no package/WASM/Worker/CDN). Shipped-library cost is 0 kB by construction. Currently NA(engine) (declares no operations), so this cell does not rank; the id is emitted so the bundle-size map covers all 8 engine ids."
+  }
+}

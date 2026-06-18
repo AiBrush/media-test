@@ -1,12 +1,37 @@
 /**
  * src/engines/mediabunny/adapter.ts — the REFERENCE engine adapter (mediabunny@1.48.0).
  *
+ * Dossier: research/dossiers/mediabunny.md (researched 2026-06-17, installed 1.48.0).
+ * Primary docs cited:
+ *   - https://mediabunny.dev/guide/introduction          (WebCodecs orchestrator, zero-WASM core)
+ *   - https://mediabunny.dev/guide/installation           (local ESM from node_modules; no CDN — §0.8)
+ *   - https://mediabunny.dev/guide/reading-media-files     (Input/sources, dispose/using)
+ *   - https://mediabunny.dev/guide/packets-and-samples     (EncodedPacketSink / *SampleSink / CanvasSink)
+ *   - https://mediabunny.dev/guide/writing-media-files      (Output / *PacketSource / BufferTarget)
+ *   - https://mediabunny.dev/guide/converting-media-files   (Conversion best path: streaming-lockstep)
+ *   - https://mediabunny.dev/guide/supported-formats-and-codecs
+ * Local ground truth: node_modules/mediabunny/dist/modules/src/{conversion,encode,decode,media-sink,
+ *   input,input-track,codec}.d.ts.
+ *
  * Implements `MediaEngine` (src/core/engine.ts) entirely against the real mediabunny API. This is
  * the comparison baseline, so it is the most complete adapter and judges only observable behavior
  * (bytes/metadata/frames in → out). All timestamps are converted to MICROSECONDS via mediabunny's
  * `EncodedPacket.microsecondTimestamp` / `microsecondDuration` (and seconds*1e6 where mediabunny
  * only gives seconds). Frame digests use the shared normalization (digest.ts) so they line up with
  * golden data and other engines.
+ *
+ * BEST PATH (dossier §6, recorded as `configUsed`): hardware-accelerated WebCodecs for all coded
+ * video/audio (no WASM, no CPU codec); `hardwareAcceleration: 'prefer-hardware'` on every decoder
+ * sink and on every Conversion video block; a `CanvasSink` ring-buffer (`poolSize`) keeps VRAM
+ * constant during repeated frame extraction; the Conversion API runs read→decode→encode→mux in
+ * streaming lockstep with automatic backpressure (queue depth auto-managed — no manual
+ * encode/decodeQueueSize tuning). No SharedArrayBuffer / COOP+COEP required by mediabunny itself.
+ *
+ * LOAD/INIT (dossier §3, rule §0.7 — UNTIMED): the mediabunny module is DYNAMICALLY IMPORTED inside
+ * init() (so module parse/instantiate is excluded from the measured window) and the WebCodecs
+ * feature-detection caches are WARMED there (getDecodable + getEncodable codec probes build memoized
+ * maps and configure throw-away codecs) so the first measured op pays no isConfigSupported / codec
+ * warm-up cost. dispose() drops the namespace handle for clean peak-memory accounting.
  *
  * mediabunny surface used (verified against installed 1.48.0 .d.ts):
  *   Input, BlobSource, ALL_FORMATS, <format singletons>  — reading/probing/demuxing
@@ -17,33 +42,27 @@
  *   Conversion (.init/.execute, video/audio/trim/fan-out) — remux/transcode/trim
  *   Output + <OutputFormat> + BufferTarget + Encoded*PacketSource — mux from encoded tracks
  *   IsobmffInputFormatOptions.resolveKeyId                — CENC decrypt at read time
+ *   getDecodable + getEncodable codec probes              — init() WebCodecs warm-up (untimed)
  */
 
-import {
+import type {
   Input,
-  BlobSource,
-  ALL_FORMATS,
-  EncodedPacketSink,
   EncodedPacket,
-  CanvasSink,
-  VideoSampleSink,
-  Conversion,
-  Output,
+  InputFormat,
+  InputTrack,
+  InputVideoTrack,
+  InputAudioTrack,
+  ConversionOptions,
+  ConversionVideoOptions,
+  ConversionAudioOptions,
+  VideoCodec,
+  AudioCodec,
+  Rotation,
   BufferTarget,
-  EncodedVideoPacketSource,
-  EncodedAudioPacketSource,
-  QUALITY_HIGH,
-  type InputFormat,
-  type InputTrack,
-  type InputVideoTrack,
-  type InputAudioTrack,
-  type ConversionOptions,
-  type ConversionVideoOptions,
-  type ConversionAudioOptions,
-  type VideoCodec,
-  type AudioCodec,
-  type Rotation,
 } from 'mediabunny';
+
+/** The mediabunny module namespace, loaded lazily in init() (rule §0.7 — untimed). */
+type MB = typeof import('mediabunny');
 
 import type {
   CapabilitySet,
@@ -75,6 +94,28 @@ import {
 } from './codecs.ts';
 import { digestImageData } from './digest.ts';
 
+/**
+ * The dossier best-path config (§6), recorded verbatim as `configUsed`. Static, deterministic, and
+ * exposed via {@link MediabunnyEngine.configUsed} so the runner can record it per §8.5.
+ */
+export const MEDIABUNNY_CONFIG = {
+  backend: 'webcodecs',
+  pixelBackend: 'webgl2/canvas',
+  hwAccel: 'prefer-hardware',
+  wasmThreads: 0,
+  pipeline: 'streaming-lockstep',
+  queueDepth: 'auto',
+  coreBuild: 'pure-ts-esm',
+  sharedArrayBuffer: false,
+  coopCoep: 'not-required',
+  canvasPoolSize: 4,
+} as const;
+
+/** WebCodecs hardware-acceleration hint forced to the GPU engine (dossier §6). */
+const HW_ACCEL = MEDIABUNNY_CONFIG.hwAccel;
+/** CanvasSink ring-buffer size keeping VRAM constant during repeated frame extraction (dossier §6). */
+const CANVAS_POOL_SIZE = MEDIABUNNY_CONFIG.canvasPoolSize;
+
 /** seconds → integer microseconds (mediabunny exposes most times in seconds). */
 function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
@@ -82,16 +123,16 @@ function secToUs(sec: number): number {
 
 /** Build a mediabunny Input from a corpus asset. Restricts formats to the asset's container when
  *  known (faster, deterministic), else accepts ALL_FORMATS. */
-async function openInput(input: MediaInput, container?: string): Promise<Input> {
+async function openInput(mb: MB, input: MediaInput, container?: string): Promise<Input> {
   const blob = await input.blob();
   const formats: InputFormat[] = [];
   if (container) {
     const f = inputFormatForContainer(container);
     if (f) formats.push(f);
   }
-  return new Input({
-    source: new BlobSource(blob),
-    formats: formats.length ? formats : ALL_FORMATS,
+  return new mb.Input({
+    source: new mb.BlobSource(blob),
+    formats: formats.length ? formats : mb.ALL_FORMATS,
   });
 }
 
@@ -225,39 +266,155 @@ async function metadataFromInput(input: Input): Promise<NormalizedMetadata> {
   return meta;
 }
 
-/** Build mediabunny ConversionVideoOptions from a TranscodeVideoOptions block. */
-function buildVideoOptions(v: TranscodeVideoOptions): ConversionVideoOptions {
+/**
+ * Codecs whose WebCodecs encoders are routinely WGPU/hardware-poor and pixel-format/bitrate-picky:
+ * VP9 and VP8 hardware encoders are scarce, and (when present) commonly REJECT small frames at a low
+ * target bitrate. Forcing `hardwareAcceleration:'prefer-hardware'` on these is what made
+ * convert-webm-resize-320x180 ERROR ("This specific encoder configuration (vp09.00.11.08, 120000
+ * bps, 320x180, hardware...) is not supported"). For these codecs we DON'T force hardware — we let
+ * the encodability probe below pick the working acceleration mode (software is the reliable path).
+ */
+const SOFTWARE_PREFERRED_ENCODE: ReadonlySet<VideoCodec> = new Set<VideoCodec>(['vp9', 'vp8']);
+
+/**
+ * A sensible default video bitrate (bits/sec) for a re-encode when the caller didn't pin one.
+ * mediabunny's QUALITY_* presets scale bitrate by pixel count × codec-efficiency, so at small output
+ * sizes the VP9 QUALITY_HIGH target collapses to ~120 kbps for 320×180 — a rate hardware VP9
+ * encoders reject (the exact bug here). We therefore use a numeric, resolution-aware target with an
+ * absolute floor so small renditions never get a starvation bitrate, and we DON'T hand WebCodecs a
+ * `Quality` whose resolved value is unknowably low. Reference (the QUALITY_HIGH→120 kbps collapse):
+ * node_modules/mediabunny .../encode.js `Quality._toVideoBitrate` (3 Mbps @1080p × (px/ref)^0.95 ×
+ * codecEff × factor). For 320×180 our floor gives a healthy 300 kbps instead of the rejected 120 kbps.
+ */
+function defaultVideoBitrate(codec: VideoCodec | undefined, width?: number, height?: number): number {
+  // Resolution-aware target (per-pixel coefficient × pixel count × codec efficiency) with an
+  // absolute floor so even tiny frames clear WebCodecs encoder minimums. The floor (300 kbps) sits
+  // far above the VP9 hardware-reject point (~120 kbps for 320×180) that caused the bug; the
+  // coefficient scales the rate cleanly upward for larger boxes (≈4.4 Mbps for VP9 720p, ≈10 Mbps
+  // for 1080p), and codec efficiency trims it for the more efficient codecs.
+  const MIN_BITRATE = 300_000;
+  const PER_PIXEL = 6; // bits/sec per output pixel (≈ 30fps × 0.2 bpp reference)
+  const px = (width && width > 0 ? width : 1280) * (height && height > 0 ? height : 720);
+  const efficiency: Record<string, number> = { avc: 1.0, hevc: 0.7, vp9: 0.8, av1: 0.6, vp8: 1.1 };
+  const eff = (codec && efficiency[codec]) || 1.0;
+  const target = Math.round(px * PER_PIXEL * eff);
+  return Math.max(MIN_BITRATE, target);
+}
+
+/**
+ * Build mediabunny ConversionVideoOptions from a TranscodeVideoOptions block.
+ *
+ * Best path (dossier §6): for codecs with solid hardware encoders (H.264/HEVC/AV1) we still PREFER
+ * the GPU engine. But the encode config is PROBED with `canEncodeVideo` (WebCodecs
+ * isConfigSupported) before committing, so we never hand the Conversion a config the browser will
+ * reject mid-transcode (which surfaces as a hard ERROR). For VP9/VP8 — whose hardware encoders are
+ * scarce and reject small-frame/low-bitrate configs — we don't force hardware and let the probe
+ * choose the working acceleration mode (software). We also use a sane numeric bitrate instead of the
+ * QUALITY_HIGH preset (which collapses to ~120 kbps for VP9 @320×180 and gets rejected).
+ *
+ * If NO acceleration mode can encode the requested codec/size at all, we throw a clear
+ * browser-limitation error. (In practice the runner's pre-flight NA(browser) gate — which probes
+ * `VideoEncoder.isConfigSupported` for the codec — fires first, so a genuinely unencodable codec is
+ * reported as NA(browser), not ERROR.)
+ */
+async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<ConversionVideoOptions> {
   const opts: ConversionVideoOptions = {};
+  let codec: VideoCodec | undefined;
   if (v.codec) {
-    const mb = canonicalToMediabunnyVideo(v.codec);
-    if (mb) opts.codec = mb;
+    const c = canonicalToMediabunnyVideo(v.codec);
+    if (c) {
+      codec = c;
+      opts.codec = c;
+    }
   }
   if (typeof v.width === 'number') opts.width = v.width;
   if (typeof v.height === 'number') opts.height = v.height;
+  // mediabunny's Conversion requires a `fit` algorithm whenever BOTH width and height are set
+  // (it rejects width+height with no fit: "When both options.video.width and options.video.height
+  // are provided, ..."). The suite's resize cases (e.g. convert-webm-resize-320x180) ask for an
+  // exact output box, so use 'fill' (stretch to the exact WxH) — matching the dossier's
+  // "resize 320×180" benchmark. (When only one dimension is given mediabunny derives the other
+  // from the aspect ratio and no fit is needed.) Cite: conversion.d.ts ConversionVideoOptions.fit;
+  // dossier §4.6/§A.8.
+  if (typeof v.width === 'number' && typeof v.height === 'number') opts.fit = 'fill';
   if (typeof v.fps === 'number') opts.frameRate = v.fps;
-  if (typeof v.bitrate === 'number') opts.bitrate = v.bitrate;
-  else if (v.codec) opts.bitrate = QUALITY_HIGH; // sensible default when re-encoding
   if (typeof v.rotate === 'number') opts.rotate = (((v.rotate % 360) + 360) % 360) as Rotation;
+
+  // No codec requested → this may end up a lossless copy (no encode); keep the best-path hint and
+  // return (the Conversion only applies hardwareAcceleration when it actually transcodes).
+  if (!codec) {
+    opts.hardwareAcceleration = HW_ACCEL;
+    return opts;
+  }
+
+  // Choose the encode bitrate: honor an explicit caller bitrate, else a sane resolution-aware target
+  // (NOT the QUALITY_HIGH preset, which collapses to a hardware-rejected ~120 kbps for VP9@320×180).
+  const bitrate: number =
+    typeof v.bitrate === 'number' && v.bitrate > 0
+      ? v.bitrate
+      : defaultVideoBitrate(codec, v.width, v.height);
+  opts.bitrate = bitrate;
+
+  // Decide the acceleration mode by PROBING actual encodability (isConfigSupported), in preference
+  // order. For VP9/VP8 software is the reliable path (hardware is scarce + picky); for the others we
+  // try hardware first (best-path), then fall back so a missing hardware encoder still succeeds.
+  const probeW = v.width && v.width > 0 ? v.width : undefined;
+  const probeH = v.height && v.height > 0 ? v.height : undefined;
+  const modes: NonNullable<ConversionVideoOptions['hardwareAcceleration']>[] =
+    SOFTWARE_PREFERRED_ENCODE.has(codec)
+      ? ['prefer-software', 'no-preference']
+      : [HW_ACCEL, 'no-preference', 'prefer-software'];
+
+  let chosen: NonNullable<ConversionVideoOptions['hardwareAcceleration']> | null = null;
+  for (const mode of modes) {
+    const ok = await mb
+      .canEncodeVideo(codec, {
+        ...(probeW !== undefined ? { width: probeW } : {}),
+        ...(probeH !== undefined ? { height: probeH } : {}),
+        bitrate,
+        hardwareAcceleration: mode,
+      })
+      .catch(() => false);
+    if (ok) {
+      chosen = mode;
+      break;
+    }
+  }
+
+  if (!chosen) {
+    // Genuinely unencodable in this browser. Surface a clear browser-limitation message; the runner
+    // normally short-circuits this codec to NA(browser) in pre-flight before we reach here.
+    throw new Error(
+      `mediabunny transcode: browser cannot encode ${codec} at ` +
+        `${probeW ?? '?'}x${probeH ?? '?'} @ ${bitrate} bps with any acceleration mode ` +
+        `(WebCodecs VideoEncoder.isConfigSupported=false) — NA(browser)`,
+    );
+  }
+
+  opts.hardwareAcceleration = chosen;
   return opts;
 }
 
 /** Build mediabunny ConversionAudioOptions from a TranscodeOptions.audio block. */
-function buildAudioOptions(a: NonNullable<TranscodeOptions['audio']>): ConversionAudioOptions {
+function buildAudioOptions(
+  mb: MB,
+  a: NonNullable<TranscodeOptions['audio']>,
+): ConversionAudioOptions {
   const opts: ConversionAudioOptions = {};
   if (a.codec) {
-    const mb = canonicalToMediabunnyAudio(a.codec);
-    if (mb) opts.codec = mb;
+    const codec = canonicalToMediabunnyAudio(a.codec);
+    if (codec) opts.codec = codec;
   }
   if (typeof a.sampleRate === 'number') opts.sampleRate = a.sampleRate;
   if (typeof a.channels === 'number') opts.numberOfChannels = a.channels;
   if (typeof a.bitrate === 'number') opts.bitrate = a.bitrate;
-  else if (a.codec) opts.bitrate = QUALITY_HIGH;
+  else if (a.codec) opts.bitrate = mb.QUALITY_HIGH;
   return opts;
 }
 
 /** Run a Conversion to completion and return the resulting bytes. */
-async function runConversion(opts: ConversionOptions, container: string): Promise<MediaBytes> {
-  const conversion = await Conversion.init(opts);
+async function runConversion(mb: MB, opts: ConversionOptions, container: string): Promise<MediaBytes> {
+  const conversion = await mb.Conversion.init(opts);
   if (!conversion.isValid) {
     const reasons = conversion.discardedTracks.map((d) => d.reason).join(', ');
     throw new Error(
@@ -298,8 +455,22 @@ class CapturedFrameSink implements FrameSink {
 export class MediabunnyEngine implements MediaEngine {
   readonly id: string;
 
+  /** The dossier best-path config (§6), recorded by the runner per §8.5 / returned as configUsed. */
+  readonly configUsed = MEDIABUNNY_CONFIG;
+
+  /** mediabunny namespace, loaded in init() (rule §0.7 — untimed). null until init() runs. */
+  private mb: MB | null = null;
+
   constructor(id = 'mediabunny@1.48.0') {
     this.id = id;
+  }
+
+  /** Return the loaded namespace or throw if init() was skipped (loud failure, no fake pass). */
+  private get lib(): MB {
+    if (!this.mb) {
+      throw new Error(`${this.id}: init() must be awaited before any operation (mediabunny not loaded)`);
+    }
+    return this.mb;
   }
 
   capabilities(): CapabilitySet {
@@ -337,21 +508,41 @@ export class MediabunnyEngine implements MediaEngine {
     };
   }
 
+  /**
+   * Load mediabunny + WARM WebCodecs (dossier §3, rule §0.7 — UNTIMED). Doing the dynamic import
+   * here keeps module parse/instantiate out of the measured window; the getDecodable + getEncodable
+   * codec probes build mediabunny's memoized capability maps (canDecode/canEncode memos) and
+   * configure throw-away codecs, so the first measured op pays no isConfigSupported warm-up.
+   * Failures (e.g. WebCodecs absent) propagate so the runner records ERROR rather than a fake pass.
+   */
   async init(): Promise<void> {
-    // mediabunny is statically imported (reference engine); nothing heavy to load.
+    const mb = await import('mediabunny');
+    this.mb = mb;
+
+    // Warm WebCodecs feature-detection caches (best-effort; never block init on probe failures).
+    const VIDEO: VideoCodec[] = ['avc', 'hevc', 'vp9', 'av1', 'vp8'];
+    const AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'vorbis', 'flac'];
+    await Promise.allSettled([
+      mb.getDecodableVideoCodecs(VIDEO),
+      mb.getDecodableAudioCodecs(AUDIO),
+      mb.getEncodableVideoCodecs(VIDEO, { width: 1280, height: 720, bitrate: mb.QUALITY_HIGH }),
+      mb.getEncodableAudioCodecs(AUDIO),
+    ]);
   }
 
   async dispose(): Promise<void> {
-    // No global resources held between operations.
+    // Drop the namespace handle so a fresh per-Worker/per-iter engine starts from a clean slate.
+    // mediabunny holds no global state (no WASM, no worker) — per-op Inputs/Outputs already dispose.
+    this.mb = null;
   }
 
   // ── probe ──────────────────────────────────────────────────────────────────────────────────
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      return await metadataFromInput(mb);
+      return await metadataFromInput(mbInput);
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -365,16 +556,16 @@ export class MediabunnyEngine implements MediaEngine {
    * non-monotonic ptsUs values. `keyframe` uses the packet's bitstream-verified type.
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const metadata = await metadataFromInput(mb);
-      const tracks = await mb.getTracks();
+      const metadata = await metadataFromInput(mbInput);
+      const tracks = await mbInput.getTracks();
       const packets: PacketInfo[] = [];
 
       for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
         const track = tracks[trackIndex];
         if (!track) continue;
-        const sink = new EncodedPacketSink(track);
+        const sink = new this.lib.EncodedPacketSink(track);
         // verifyKeyPackets gives accurate keyframe flags. NOTE: mediabunny rejects metadataOnly +
         // verifyKeyPackets together, and the packet table needs byteLength, so we load full packets.
         for await (const pkt of sink.packets(undefined, undefined, {
@@ -393,7 +584,7 @@ export class MediabunnyEngine implements MediaEngine {
 
       return { metadata, packets };
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -402,12 +593,12 @@ export class MediabunnyEngine implements MediaEngine {
   async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
     const format = makeOutputFormat(opts.container);
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const output = new Output({ format, target: new BufferTarget() });
-      return await runConversion({ input: mb, output }, opts.container);
+      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
+      return await runConversion(this.lib, { input: mbInput, output }, opts.container);
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -423,18 +614,18 @@ export class MediabunnyEngine implements MediaEngine {
     const format = makeOutputFormat(opts.container);
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const output = new Output({ format, target: new BufferTarget() });
-      const convOpts: ConversionOptions = { input: mb, output };
+      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
+      const convOpts: ConversionOptions = { input: mbInput, output };
 
       const videoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
-      if (videoSpec) convOpts.video = buildVideoOptions(videoSpec);
-      if (opts.audio) convOpts.audio = buildAudioOptions(opts.audio);
+      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec);
+      if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio);
 
-      return await runConversion(convOpts, opts.container);
+      return await runConversion(this.lib, convOpts, opts.container);
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -445,18 +636,26 @@ export class MediabunnyEngine implements MediaEngine {
    * reads back tight — exactly the normalization the digest rule requires.
    */
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const videoTrack = await mb.getPrimaryVideoTrack();
+      const videoTrack = await mbInput.getPrimaryVideoTrack();
       if (!videoTrack) throw new Error('mediabunny decodeFrames: no video track in input');
 
-      const sink = new CanvasSink(videoTrack, { alpha: await videoTrack.canBeTransparent() });
+      // Best path (dossier §6): hardware-accelerated WebCodecs decode into a pooled canvas ring
+      // buffer (constant VRAM). CanvasSink bakes in rotation metadata and yields straight-alpha
+      // top-left pixels — exactly the normalization the digest rule requires.
+      const sink = new this.lib.CanvasSink(videoTrack, {
+        alpha: await videoTrack.canBeTransparent(),
+        poolSize: CANVAS_POOL_SIZE,
+        decoderOptions: { hardwareAcceleration: HW_ACCEL },
+      });
       const out = new CapturedFrameSink();
       const max = opts?.maxFrames ?? Infinity;
 
       let index = 0;
       for await (const wrapped of sink.canvases()) {
         if (index >= max) break;
+        // Copy out of the pooled canvas immediately (the ring buffer will reuse it).
         const img = imageDataFromCanvas(wrapped.canvas);
         const digest = await digestImageData(img, index, secToUs(wrapped.timestamp));
         out.push(img, digest);
@@ -464,7 +663,7 @@ export class MediabunnyEngine implements MediaEngine {
       }
       return out;
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -472,12 +671,12 @@ export class MediabunnyEngine implements MediaEngine {
   /** Seek to tUs and return the landed frame's pts + digest. VideoSampleSink.getSample returns the
    *  last frame with start ≤ t (presentation order), i.e. the frame visible at that timestamp. */
   async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const videoTrack = await mb.getPrimaryVideoTrack();
+      const videoTrack = await mbInput.getPrimaryVideoTrack();
       if (!videoTrack) throw new Error('mediabunny seek: no video track in input');
 
-      const sink = new VideoSampleSink(videoTrack);
+      const sink = new this.lib.VideoSampleSink(videoTrack, { hardwareAcceleration: HW_ACCEL });
       const sample = await sink.getSample(tUs / 1e6);
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
       try {
@@ -489,7 +688,7 @@ export class MediabunnyEngine implements MediaEngine {
         sample.close();
       }
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -508,22 +707,23 @@ export class MediabunnyEngine implements MediaEngine {
     const format = makeOutputFormat(opts.container);
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
-    const mb = await openInput(input);
+    const mbInput = await openInput(this.lib, input);
     try {
-      const output = new Output({ format, target: new BufferTarget() });
+      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
       const convOpts: ConversionOptions = {
-        input: mb,
+        input: mbInput,
         output,
         trim: { start: range.startUs / 1e6, end: range.endUs / 1e6 },
       };
       // Frame-accurate boundaries force a transcode of the boundary region; ask for it explicitly
-      // so the requested start/end are honored exactly rather than snapped to key frames.
+      // so the requested start/end are honored exactly rather than snapped to key frames. Carry the
+      // best-path hardware-acceleration hint (dossier §6) into that re-encode.
       if (opts.frameAccurate) {
-        convOpts.video = { forceTranscode: true };
+        convOpts.video = { forceTranscode: true, hardwareAcceleration: HW_ACCEL };
       }
-      return await runConversion(convOpts, opts.container);
+      return await runConversion(this.lib, convOpts, opts.container);
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 
@@ -537,7 +737,8 @@ export class MediabunnyEngine implements MediaEngine {
     const format = makeOutputFormat(opts.container);
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
-    const output = new Output({ format, target: new BufferTarget() });
+    const mb = this.lib;
+    const output = new mb.Output({ format, target: new mb.BufferTarget() });
 
     interface Pending {
       add: (pkt: EncodedPacket, meta?: EncodedVideoChunkMetadata | EncodedAudioChunkMetadata) => Promise<void>;
@@ -550,13 +751,13 @@ export class MediabunnyEngine implements MediaEngine {
       if (t.type === 'video') {
         const mbCodec = canonicalToMediabunnyVideo(t.codec) as VideoCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported video codec '${t.codec}'`);
-        const source = new EncodedVideoPacketSource(mbCodec);
+        const source = new mb.EncodedVideoPacketSource(mbCodec);
         output.addVideoTrack(source);
         pendings.push({ add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata), track: t, isVideo: true });
       } else if (t.type === 'audio') {
         const mbCodec = canonicalToMediabunnyAudio(t.codec) as AudioCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported audio codec '${t.codec}'`);
-        const source = new EncodedAudioPacketSource(mbCodec);
+        const source = new mb.EncodedAudioPacketSource(mbCodec);
         output.addAudioTrack(source);
         pendings.push({ add: (p, m) => source.add(p, m as EncodedAudioChunkMetadata), track: t, isVideo: false });
       } else {
@@ -573,7 +774,7 @@ export class MediabunnyEngine implements MediaEngine {
       for (let i = 0; i < track.chunks.length; i++) {
         const c = track.chunks[i];
         if (!c) continue;
-        const pkt = new EncodedPacket(
+        const pkt = new mb.EncodedPacket(
           c.data,
           c.keyframe ? 'key' : 'delta',
           c.ptsUs / 1e6,
@@ -630,11 +831,12 @@ export class MediabunnyEngine implements MediaEngine {
     if (opts.scheme !== 'cenc-ctr' && opts.scheme !== 'cenc-cbcs') {
       throw new Error(`mediabunny decrypt: unsupported scheme '${opts.scheme}'`);
     }
+    const mb = this.lib;
     const keyBytes = hexToBytes(key.keyHex);
     const blob = await input.blob();
-    const mb = new Input({
-      source: new BlobSource(blob),
-      formats: ALL_FORMATS,
+    const mbInput = new mb.Input({
+      source: new mb.BlobSource(blob),
+      formats: mb.ALL_FORMATS,
       formatOptions: {
         isobmff: {
           // Resolve every requested key id to the supplied key. Fixtures here are single-key; if a
@@ -647,11 +849,11 @@ export class MediabunnyEngine implements MediaEngine {
     try {
       const format = makeOutputFormat('mp4');
       if (!format) throw new Error('mediabunny decrypt: mp4 output unavailable');
-      const output = new Output({ format, target: new BufferTarget() });
+      const output = new mb.Output({ format, target: new mb.BufferTarget() });
       // No transform: copy decrypted (plaintext) samples straight through.
-      return await runConversion({ input: mb, output }, 'mp4');
+      return await runConversion(mb, { input: mbInput, output }, 'mp4');
     } finally {
-      mb.dispose();
+      mbInput.dispose();
     }
   }
 }

@@ -76,6 +76,46 @@ export interface EngineScorecard {
   robustnessRate: number | null;
   robustnessPassCount: number;
   robustnessTotal: number;
+  // ── leaderboard fields (§9) ──
+  /** cases this engine WON (sole winner or co-winner of a tie), summed over all browsers. */
+  wins: number;
+  winsByBrowser: Partial<Record<BrowserName, number>>;
+  /** uncontested wins (the engine was the only eligible one) — split out so a default win is visible. */
+  uncontestedWins: number;
+  /**
+   * Perf index vs the per-case WINNER: geomean of (this engine's value ÷ winner's value), normalized
+   * so 1.00 = always the fastest. ≤1; null when no rankable co-eligible case exists in that browser.
+   */
+  perfIndexVsWinnerByBrowser: Partial<Record<BrowserName, number | null>>;
+  /** bundle size kB (min+gzip), from the bundle-size case if present; null otherwise. */
+  bundleSizeKb: number | null;
+  /** one-line auto verdict (§10.2). */
+  verdict: string;
+}
+
+/**
+ * The per-case verdict (§9) — THE deliverable. For one scenario within one browser: the fastest
+ * CORRECT engine, its value, and the margin over the runner-up.
+ *   - `flag`: 'contested' (≥2 eligible, clear winner) · 'tie' (top engines within the noise band) ·
+ *     'uncontested' (only one engine eligible) · 'none' (no engine eligible, or no rankable metric).
+ *   - `coWinners`: engines tied with the winner inside the band (includes the winner). On a clear
+ *     win it is just [winner]; on a tie it lists all co-winners; '[]' when there is no winner.
+ */
+export interface CaseWinner {
+  scenarioId: string;
+  family: string;
+  /** the metric the ranking used; null when the case has no rankable measured metric. */
+  primaryMetric: MetricId | null;
+  winner: string | null;
+  winnerValue: number | null;
+  runnerUp: string | null;
+  runnerUpValue: number | null;
+  /** signed so POSITIVE == winner is better than runner-up, on the metric's natural direction. */
+  marginPct: number | null;
+  flag: 'contested' | 'tie' | 'uncontested' | 'none';
+  /** engines whose correctness oracle passed (the only ones eligible to win). */
+  eligible: string[];
+  coWinners: string[];
 }
 
 export interface BrowserSection {
@@ -86,6 +126,8 @@ export interface BrowserSection {
   bench: Record<string, Record<string, BenchCell>>; // [engineId][scenarioId]
   deltas: Record<string, Record<string, DeltaCell>>; // [engineId][scenarioId] (reference excluded)
   conformancePctByEngine: Record<string, number>;
+  /** per-case winner verdicts (§9), one per scenario, in scenario order. */
+  winners: CaseWinner[];
 }
 
 export interface ReportJson {
@@ -106,7 +148,43 @@ const EM_DASH = '—';
 const BROWSER_ORDER: BrowserName[] = ['chromium', 'webkit', 'firefox'];
 
 /** Primary throughput metric used for Δ + perf index, in priority order (first present wins). */
-const THROUGHPUT_METRICS: MetricId[] = ['throughputRealtime', 'decodeFps', 'encodeFps'];
+const THROUGHPUT_METRICS: MetricId[] = [
+  'opsPerSec',
+  'packetsPerSec',
+  'framesPerSec',
+  'throughputRealtime',
+  'decodeFps',
+  'encodeFps',
+];
+
+/**
+ * Priority order for INFERRING a case's primary ranking metric when results don't declare one
+ * (ScenarioResult.primaryMetric). Higher-is-better headline metrics first, then latency/cost ones,
+ * then generic timing. The first metric present in every eligible result wins (so the ranking is
+ * fair — every ranked engine actually measured it).
+ */
+const PRIMARY_METRIC_PRIORITY: MetricId[] = [
+  'opsPerSec',
+  'packetsPerSec',
+  'framesPerSec',
+  'decodeFps',
+  'encodeFps',
+  'throughputRealtime',
+  'seekMs',
+  'timeToFirstFrame',
+  'timeToFirstByte',
+  'bundleSize',
+  'loadInit',
+  'wall',
+  'peakMemory',
+  'bytesOut',
+  'sourceReads',
+  'targetWrites',
+  'longtasks',
+];
+
+/** Winner tie band (§9): rank-1 and rank-2 within max(noise, 3%) are co-winners (a tie). */
+const WINNER_NOISE_BAND_PCT = 3;
 
 /** §13 reproducibility caveats, written into every report verbatim. */
 const CAVEATS: string[] = [
@@ -136,7 +214,15 @@ export function buildReport(input: ReportInput): ReportOutput {
   );
 
   const scorecards = engines.map((engineId) =>
-    buildScorecard(engineId, engineId === referenceEngineId, browsers, scenarios, byKey, referenceEngineId),
+    buildScorecard(
+      engineId,
+      engineId === referenceEngineId,
+      browsers,
+      scenarios,
+      byKey,
+      referenceEngineId,
+      browserSections,
+    ),
   );
 
   const json: ReportJson = {
@@ -233,6 +319,11 @@ function buildBrowserSection(
     deltas[engineId] = deltaRow;
   }
 
+  // Per-case winners (§9) — the deliverable for this browser.
+  const winners = scenarios.map((scenarioId) =>
+    computeCaseWinner(browser, scenarioId, engines, byKey),
+  );
+
   return {
     browser,
     engines,
@@ -241,7 +332,133 @@ function buildBrowserSection(
     bench,
     deltas,
     conformancePctByEngine,
+    winners,
   };
+}
+
+// ── winner determination (§9) ──────────────────────────────────────────────────────────────────
+
+/**
+ * Determine the winner of ONE scenario within ONE browser:
+ *   1. Eligibility — only engines whose correctness oracle PASSed (rule §0.1) can win.
+ *   2. Pick the ranking metric — the engines' declared primaryMetric if shared, else inferred from
+ *      PRIMARY_METRIC_PRIORITY (first metric present in every eligible result).
+ *   3. Rank by that metric, direction-aware; winner = rank 1; margin = Δ% over rank 2.
+ *   4. tie when rank-1 and rank-2 are within max(noise, 3%); uncontested when only one is eligible.
+ */
+function computeCaseWinner(
+  browser: BrowserName,
+  scenarioId: string,
+  engines: string[],
+  byKey: Map<ResultKey, ScenarioResult>,
+): CaseWinner {
+  const eligibleResults = engines
+    .map((e) => getResult(byKey, e, browser, scenarioId))
+    .filter((r): r is ScenarioResult => !!r && r.status === 'PASS');
+  const eligible = eligibleResults.map((r) => r.engineId);
+  const family = eligibleResults[0]?.family ?? scenarioId.split('/')[0] ?? '';
+
+  const none: CaseWinner = {
+    scenarioId,
+    family,
+    primaryMetric: null,
+    winner: null,
+    winnerValue: null,
+    runnerUp: null,
+    runnerUpValue: null,
+    marginPct: null,
+    flag: 'none',
+    eligible,
+    coWinners: [],
+  };
+
+  if (eligibleResults.length === 0) return none;
+
+  const metric = primaryMetricForCase(eligibleResults);
+
+  // No rankable metric (e.g. a functional-only case with no admissible perf number). A single PASS
+  // is still an uncontested "win" on correctness; multiple PASSes with no metric cannot be ordered.
+  if (!metric) {
+    if (eligible.length === 1) {
+      return { ...none, winner: eligible[0] ?? null, flag: 'uncontested', coWinners: [eligible[0] ?? ''] };
+    }
+    return { ...none, flag: 'none' };
+  }
+
+  const higher = metricHigherIsBetter(metric);
+  const ranked = eligibleResults
+    .map((r) => ({ id: r.engineId, v: r.bench?.[metric]?.median }))
+    .filter((x): x is { id: string; v: number } => typeof x.v === 'number' && Number.isFinite(x.v))
+    .sort((a, b) => (higher ? b.v - a.v : a.v - b.v));
+
+  if (ranked.length === 0) return { ...none, primaryMetric: metric };
+
+  const top = ranked[0]!;
+  if (ranked.length === 1) {
+    return {
+      ...none,
+      primaryMetric: metric,
+      winner: top.id,
+      winnerValue: top.v,
+      flag: 'uncontested',
+      coWinners: [top.id],
+    };
+  }
+
+  const second = ranked[1]!;
+  const marginPct = relativeBetterPct(top.v, second.v, higher);
+  const band = WINNER_NOISE_BAND_PCT;
+  const coWinners = ranked
+    .filter((x) => Math.abs(relativeBetterPct(top.v, x.v, higher)) <= band)
+    .map((x) => x.id);
+  const flag = coWinners.length > 1 ? 'tie' : 'contested';
+
+  return {
+    scenarioId,
+    family,
+    primaryMetric: metric,
+    winner: top.id,
+    winnerValue: top.v,
+    runnerUp: second.id,
+    runnerUpValue: second.v,
+    marginPct: roundTo(marginPct, 2),
+    flag,
+    eligible,
+    coWinners,
+  };
+}
+
+/**
+ * Choose the metric a case is ranked by: the engines' declared primaryMetric when it is shared by
+ * every eligible result, else the first PRIMARY_METRIC_PRIORITY metric present in all of them, else
+ * the first present in any. null when no eligible result carries a measured metric.
+ */
+function primaryMetricForCase(results: ScenarioResult[]): MetricId | null {
+  const declared = results.map((r) => r.primaryMetric).filter((m): m is MetricId => !!m);
+  for (const m of declared) {
+    if (results.every((r) => r.bench?.[m])) return m;
+  }
+  for (const m of PRIMARY_METRIC_PRIORITY) {
+    if (results.every((r) => r.bench?.[m])) return m;
+  }
+  for (const m of PRIMARY_METRIC_PRIORITY) {
+    if (results.some((r) => r.bench?.[m])) return m;
+  }
+  return null;
+}
+
+/**
+ * Percentage by which `a` is BETTER than `b` on a metric (positive == a better), direction-aware and
+ * guarded against a zero/degenerate baseline. For higher-is-better: (a-b)/b·100; for lower: (b-a)/b·100.
+ */
+function relativeBetterPct(a: number, b: number, higherIsBetter: boolean): number {
+  if (b === 0) {
+    if (a === b) return 0;
+    // a strictly better than a zero baseline → treat as a large (capped) margin, not Infinity.
+    return 100;
+  }
+  const raw = ((a - b) / b) * 100;
+  return higherIsBetter ? raw : -raw;
 }
 
 function benchCellFrom(r: ScenarioResult): BenchCell {
@@ -342,6 +559,7 @@ function buildScorecard(
   scenarios: string[],
   byKey: Map<ResultKey, ScenarioResult>,
   referenceEngineId: string,
+  browserSections: BrowserSection[],
 ): EngineScorecard {
   let pass = 0;
   let admissible = 0;
@@ -377,19 +595,138 @@ function buildScorecard(
 
   const capabilityFamilies = [...families].sort();
 
+  // ── leaderboard aggregates (§9) ──
+  let wins = 0;
+  let uncontestedWins = 0;
+  const winsByBrowser: Partial<Record<BrowserName, number>> = {};
+  const perfIndexVsWinnerByBrowser: Partial<Record<BrowserName, number | null>> = {};
+  for (const section of browserSections) {
+    let browserWins = 0;
+    for (const w of section.winners) {
+      if (w.coWinners.includes(engineId)) {
+        browserWins++;
+        if (w.flag === 'uncontested') uncontestedWins++;
+      }
+    }
+    wins += browserWins;
+    winsByBrowser[section.browser] = browserWins;
+    perfIndexVsWinnerByBrowser[section.browser] = perfIndexVsWinnerFor(engineId, section, byKey);
+  }
+
+  const bundleSizeKb = engineBundleSizeKb(engineId, browsers, scenarios, byKey);
+  const conformancePct = admissible === 0 ? 0 : round1((pass / admissible) * 100);
+  const robustnessRate = robustnessTotal === 0 ? null : round1((robustnessPass / robustnessTotal) * 100);
+
+  const verdict = buildVerdict({
+    wins,
+    uncontestedWins,
+    perfIndexVsWinnerByBrowser,
+    conformancePct,
+    bundleSizeKb,
+    robustnessRate,
+    isReference,
+  });
+
   return {
     engineId,
     isReference,
-    conformancePct: admissible === 0 ? 0 : round1((pass / admissible) * 100),
+    conformancePct,
     conformancePassCount: pass,
     conformanceAdmissibleCount: admissible,
     perfIndexByBrowser,
     capabilityBreadth: capabilityFamilies.length,
     capabilityFamilies,
-    robustnessRate: robustnessTotal === 0 ? null : round1((robustnessPass / robustnessTotal) * 100),
+    robustnessRate,
     robustnessPassCount: robustnessPass,
     robustnessTotal,
+    wins,
+    winsByBrowser,
+    uncontestedWins,
+    perfIndexVsWinnerByBrowser,
+    bundleSizeKb,
+    verdict,
   };
+}
+
+/**
+ * Perf index vs the per-case WINNER for one browser: geomean of (engine value ÷ winner value),
+ * direction-normalized so every ratio is ≤1 and 1.00 = the engine was the winner on every case it
+ * could be ranked on. null when there is no rankable case the engine was eligible for.
+ */
+function perfIndexVsWinnerFor(
+  engineId: string,
+  section: BrowserSection,
+  byKey: Map<ResultKey, ScenarioResult>,
+): number | null {
+  let logSum = 0;
+  let count = 0;
+  for (const w of section.winners) {
+    const metric = w.primaryMetric;
+    if (!metric || w.winnerValue === null || !Number.isFinite(w.winnerValue)) continue;
+    const r = getResult(byKey, engineId, section.browser, w.scenarioId);
+    if (!r || r.status !== 'PASS') continue;
+    const val = r.bench?.[metric]?.median;
+    if (val === undefined || !Number.isFinite(val) || val <= 0) continue;
+    const winnerVal = w.winnerValue;
+    if (winnerVal <= 0) continue;
+    // ratio ≤ 1: higher-is-better → val/winner; lower-is-better → winner/val.
+    const ratio = metricHigherIsBetter(metric) ? val / winnerVal : winnerVal / val;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    logSum += Math.log(ratio);
+    count++;
+  }
+  if (count === 0) return null;
+  return round2(Math.exp(logSum / count));
+}
+
+/** Bundle size kB for an engine — the median of any measured `bundleSize` bench across the matrix. */
+function engineBundleSizeKb(
+  engineId: string,
+  browsers: BrowserName[],
+  scenarios: string[],
+  byKey: Map<ResultKey, ScenarioResult>,
+): number | null {
+  const vals: number[] = [];
+  for (const browser of browsers) {
+    for (const scenarioId of scenarios) {
+      const r = getResult(byKey, engineId, browser, scenarioId);
+      const v = r?.bench?.bundleSize?.median;
+      if (typeof v === 'number' && Number.isFinite(v)) vals.push(v);
+    }
+  }
+  if (vals.length === 0) return null;
+  vals.sort((a, b) => a - b);
+  return round1(vals[Math.floor((vals.length - 1) / 2)] ?? vals[0]!);
+}
+
+/** One-line factual verdict (§10.2) from the leaderboard aggregates. */
+function buildVerdict(s: {
+  wins: number;
+  uncontestedWins: number;
+  perfIndexVsWinnerByBrowser: Partial<Record<BrowserName, number | null>>;
+  conformancePct: number;
+  bundleSizeKb: number | null;
+  robustnessRate: number | null;
+  isReference: boolean;
+}): string {
+  const parts: string[] = [];
+  const contested = s.wins - s.uncontestedWins;
+  parts.push(
+    `${s.wins} win${s.wins === 1 ? '' : 's'}` +
+      (s.uncontestedWins ? ` (${contested} contested, ${s.uncontestedWins} uncontested)` : ''),
+  );
+  const idxs = Object.values(s.perfIndexVsWinnerByBrowser).filter(
+    (x): x is number => typeof x === 'number',
+  );
+  if (idxs.length) {
+    const best = Math.max(...idxs);
+    parts.push(`perf ${fmtNum(best)}× vs winners`);
+  }
+  parts.push(`${fmtNum(s.conformancePct)}% conformant`);
+  if (s.robustnessRate !== null) parts.push(`${fmtNum(s.robustnessRate)}% robust`);
+  if (s.bundleSizeKb !== null) parts.push(`${fmtNum(s.bundleSizeKb)} kB bundle`);
+  if (s.isReference) parts.push('reference');
+  return parts.join(' · ');
 }
 
 /**
@@ -446,6 +783,12 @@ function renderMarkdown(json: ReportJson): string {
   );
   out.push('');
 
+  // 0. THE LEADERBOARD — the headline deliverable (§9): wins per engine + verdict.
+  out.push('## 🏆 Leaderboard');
+  out.push('');
+  out.push(renderLeaderboard(json));
+  out.push('');
+
   // 1. Capability / conformance % summary (per browser).
   out.push('## 1. Conformance Summary');
   out.push('');
@@ -464,6 +807,11 @@ function renderMarkdown(json: ReportJson): string {
   // Per-browser groups: conformance matrix, benchmark matrix, Δ-vs-reference.
   for (const section of json.browserSections) {
     out.push(`## Browser: ${section.browser}`);
+    out.push('');
+
+    out.push('### Winners — one per case (🏆 = fastest correct engine)');
+    out.push('');
+    out.push(renderWinners(section, json.referenceEngineId));
     out.push('');
 
     out.push('### 2. Conformance matrix');
@@ -637,6 +985,81 @@ function renderScorecards(json: ReportJson): string {
     '',
     '_Perf index = geometric mean of throughput ratios vs reference, per browser, over co-passing scenarios. >1.00× = faster than reference on average; null/— = no co-passing scenario to compare._',
   ].join('\n');
+}
+
+function renderLeaderboard(json: ReportJson): string {
+  if (json.scorecards.length === 0) return '_No engines._';
+  const ranked = [...json.scorecards].sort(
+    (a, b) => b.wins - a.wins || b.conformancePct - a.conformancePct,
+  );
+  const header = ['#', 'Engine', 'Wins', 'Conf %', 'Robust %', 'Bundle', 'Breadth', 'Verdict'];
+  const rows: string[][] = [];
+  ranked.forEach((sc, i) => {
+    rows.push([
+      String(i + 1),
+      engineLabel(sc.engineId, json.referenceEngineId),
+      sc.uncontestedWins ? `${sc.wins} (${sc.uncontestedWins} unc.)` : String(sc.wins),
+      `${fmtNum(sc.conformancePct)}%`,
+      sc.robustnessRate === null ? EM_DASH : `${fmtNum(sc.robustnessRate)}%`,
+      sc.bundleSizeKb === null ? EM_DASH : `${fmtNum(sc.bundleSizeKb)} kB`,
+      String(sc.capabilityBreadth),
+      sc.verdict,
+    ]);
+  });
+  return [
+    mdTable(header, rows),
+    '',
+    '_Wins = cases where the engine was the fastest CORRECT engine; co-winners of a tie both count, ' +
+      '"unc." = uncontested (the only eligible engine). Win COUNTS are aggregated across browsers ' +
+      '(counts are safe to sum; raw timing numbers are not — see Caveats). Ranked by wins, then conformance._',
+  ].join('\n');
+}
+
+function renderWinners(section: BrowserSection, _referenceEngineId: string): string {
+  if (section.winners.length === 0) return '_No cases._';
+  const header = ['Case', 'Winner', 'Value', 'Runner-up', 'Margin', 'Eligible', 'Flag'];
+  const rows: string[][] = [];
+  for (const w of section.winners) {
+    rows.push([
+      `\`${w.scenarioId}\``,
+      winnerCell(w),
+      w.winnerValue === null ? EM_DASH : fmtMetricValue(w.winnerValue, w.primaryMetric),
+      w.runnerUp ? `\`${w.runnerUp}\`` : EM_DASH,
+      w.marginPct === null ? EM_DASH : `+${fmtNum(Math.abs(w.marginPct))}%`,
+      String(w.eligible.length),
+      winnerFlagLabel(w.flag),
+    ]);
+  }
+  return mdTable(header, rows);
+}
+
+function winnerCell(w: CaseWinner): string {
+  if (w.flag === 'tie') return `🤝 ${w.coWinners.map((e) => `\`${e}\``).join(', ')}`;
+  if (w.flag === 'uncontested') return w.winner ? `\`${w.winner}\` (uncontested)` : EM_DASH;
+  if (w.flag === 'none' || !w.winner) return EM_DASH;
+  return `🏆 \`${w.winner}\``;
+}
+
+function winnerFlagLabel(flag: CaseWinner['flag']): string {
+  switch (flag) {
+    case 'contested':
+      return 'contested';
+    case 'tie':
+      return 'tie';
+    case 'uncontested':
+      return 'uncontested';
+    case 'none':
+    default:
+      return 'no winner';
+  }
+}
+
+/** Format a metric value with its unit (bytes get human units; rates/ms get the metric unit). */
+function fmtMetricValue(value: number, metric: MetricId | null): string {
+  if (!Number.isFinite(value)) return EM_DASH;
+  if (metric === 'peakMemory' || metric === 'bytesOut') return fmtBytes(value);
+  const unit = metric ? metricUnit(metric) : '';
+  return `${fmtNum(round2(value))}${unit ? ` ${unit}` : ''}`;
 }
 
 // ── label / format helpers ───────────────────────────────────────────────────────────────────

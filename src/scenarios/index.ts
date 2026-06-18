@@ -21,6 +21,7 @@ import { demuxScenarios } from './demux/index.ts';
 import { encryptionScenarios } from './encryption/index.ts';
 import { metadataScenarios } from './metadata/index.ts';
 import { muxScenarios } from './mux/index.ts';
+import { performanceScenarios } from './performance/index.ts';
 import { probeScenarios } from './probe/index.ts';
 import { remuxScenarios } from './remux/index.ts';
 import { robustnessScenarios } from './robustness/index.ts';
@@ -42,6 +43,7 @@ export const scenariosByFamily: Record<ScenarioFamily, Scenario[]> = {
   'streaming-output': streamingOutputScenarios,
   'audio-dsp': audioDspScenarios,
   robustness: robustnessScenarios,
+  performance: performanceScenarios,
 };
 
 /** The full battery, flattened in family order. */

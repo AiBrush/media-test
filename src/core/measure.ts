@@ -17,6 +17,14 @@ export interface MeasureContext {
   targetWrites?: number; // from CountingTarget
   decodedFrames?: number;
   encodedFrames?: number;
+  // ── headline-throughput counts (→ per-second rates over the measured wall window) ──
+  ops?: number; // completed operations (e.g. repeated probes) -> opsPerSec
+  packets?: number; // demuxed packets counted -> packetsPerSec
+  frames?: number; // transcoded/converted frames -> framesPerSec
+  seeks?: number; // seeks performed -> seekMs = wall / seeks (mean ms per seek)
+  // ── latency markers captured BY THE OP, in ms relative to the measured begin() ──
+  firstByteMs?: number; // -> timeToFirstByteMs
+  firstFrameMs?: number; // -> timeToFirstFrameMs
 }
 
 /** PerformanceObserver longtask entries are durations in ms; the spec threshold is 50ms. */
@@ -79,6 +87,16 @@ export class Meter {
     if (ctx?.encodedFrames !== undefined && wallSec > 0) {
       sample.encodeFps = ctx.encodedFrames / wallSec;
     }
+
+    // Headline per-second rates over the measured window (§8.1). Each guards on a positive wall.
+    if (ctx?.ops !== undefined && wallSec > 0) sample.opsPerSec = ctx.ops / wallSec;
+    if (ctx?.packets !== undefined && wallSec > 0) sample.packetsPerSec = ctx.packets / wallSec;
+    if (ctx?.frames !== undefined && wallSec > 0) sample.framesPerSec = ctx.frames / wallSec;
+    // Mean ms per seek over the measured window.
+    if (ctx?.seeks !== undefined && ctx.seeks > 0) sample.seekMs = wallMs / ctx.seeks;
+    // Latency markers the op recorded relative to begin() (NOT load/init, which is untimed, §0.7).
+    if (ctx?.firstByteMs !== undefined) sample.timeToFirstByteMs = ctx.firstByteMs;
+    if (ctx?.firstFrameMs !== undefined) sample.timeToFirstFrameMs = ctx.firstFrameMs;
 
     return sample;
   }

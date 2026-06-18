@@ -1,17 +1,36 @@
 /**
- * src/engines/aibrush-media/adapter.ts — PLACEHOLDER adapter for the future `aibrush/media` library.
+ * src/engines/aibrush-media/adapter.ts — PLACEHOLDER / STUB adapter for the future `aibrush-media`
+ * library (the internal candidate the whole suite exists to evaluate: the "optimize / adopt / skip"
+ * decision).
  *
- * This is the drop-in slot for the candidate library the whole suite exists to evaluate (the
- * "optimize / adopt / skip" decision). It is intentionally a stub: `aibrush/media` does not exist as
- * a browser engine yet, so every operation is undeclared and every method throws. When the real
- * library lands, implement this adapter against its API exactly like any other engine (the
- * `_template` adapter documents the full checklist), flip the honest capabilities on, and the entire
- * existing scenario battery + report machinery measures it with zero scenario changes.
+ * This is the drop-in slot for that candidate. It is intentionally a stub: `aibrush-media` does NOT
+ * exist as a published browser engine today — there is no npm package, no GitHub repo, and no
+ * documentation for a browser media library named `aibrush-media`, `@aibrush/media`, or
+ * `aibrush/media` (verified 2026-06-17; see dossier Research log). Therefore the only honest research
+ * output is "it supports nothing": every operation is undeclared and every method throws. When the
+ * real library lands, implement this adapter against its API exactly like any other engine (the
+ * `_template` adapter documents the full checklist), flip the honest capabilities on, vendor its
+ * runtime artifacts locally, and the entire existing scenario battery + report machinery measures it
+ * with zero scenario changes.
  *
  * Until then: `capabilities()` declares NOTHING, so the runner negotiates NA(engine) for every
  * scenario — the placeholder shows up in the matrix as a real, not-yet-capable engine rather than a
  * silent gap. `registerAibrushMedia()` is provided but is NOT called automatically; nothing wires
  * this engine into a run until someone opts in (so the placeholder never pollutes a comparison).
+ *
+ * No run-time bytes of any kind: no package to vendor, no WASM/Worker, no CDN/unpkg/toBlobURL — the
+ * adapter is pure local TypeScript and is already fully hermetic and offline (§0.8).
+ *
+ * ─── SOURCES (research-first; cite dossier doc URLs + version researched) ───────────────────────
+ *   Dossier:        research/dossiers/aibrush-media.md  (this repo; status: PLACEHOLDER / stub)
+ *   Engine id:      aibrush-media@dev  (unpublished — no semver to pin)
+ *   Researched on:  2026-06-17
+ *   Contract:       src/core/engine.ts (MediaEngine + CapabilitySet + CANONICAL_* tokens)
+ *   Reference docs (context only; NONE describe a usable browser engine API):
+ *     - AiBrush Studio product docs (NOT a library):  https://docs.aibrush.co/
+ *     - MDN WebCodecs (what a future real engine would build on):
+ *         https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
+ *     - Mediabunny (the suite's reference engine, for dossier-shape comparison):  https://mediabunny.dev/
  */
 
 import { registerEngine } from '../../core/registry.ts';
@@ -60,7 +79,23 @@ export class AibrushMediaEngine implements MediaEngine {
     };
   }
 
-  // No init()/dispose() yet — there is nothing to load. Add them when the real library needs setup.
+  /**
+   * No-op. The §0.7 heavy-load window (dynamic import, WASM instantiate, Worker spawn, encoder
+   * warmup) lives here for real engines and is excluded from measured timing — but this placeholder
+   * has NOTHING to load, so init() does nothing. Replace with the real one-time setup when the
+   * library ships (and keep all heavy work inside it).
+   */
+  async init(): Promise<void> {
+    // intentionally empty — nothing to load.
+  }
+
+  /**
+   * No-op. Tears down whatever init() set up so peak memory is clean per Worker/iteration. The
+   * placeholder holds no resources, so there is nothing to release.
+   */
+  async dispose(): Promise<void> {
+    // intentionally empty — nothing to release.
+  }
 
   async probe(_input: MediaInput): Promise<NormalizedMetadata> {
     throw new Error(NOT_IMPLEMENTED);

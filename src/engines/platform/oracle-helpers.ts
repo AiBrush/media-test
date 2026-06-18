@@ -24,12 +24,22 @@ function toBytes(input: MediaBytes | Uint8Array): Uint8Array {
 
 /** Best-effort MIME for blob construction, used by the <video> fallback + playback smoke. */
 function mimeFor(input: MediaBytes | Uint8Array): string {
-  if (input instanceof Uint8Array) {
-    if (looksLikeMp4(input)) return 'video/mp4';
-    if (looksLikeWebm(input)) return 'video/webm';
-    return 'application/octet-stream';
+  const bytes = toBytes(input);
+  // Prefer a sniffed container type — it is more reliable for the <video> element than a possibly
+  // missing/wrong `mime` on the MediaBytes (e.g. an engine that emits a WebM blob with a null/blank
+  // mime). A correct top-level type ('video/webm' / 'video/mp4') is what makes Chrome pick the right
+  // demuxer for the playback fallback.
+  if (looksLikeWebm(bytes)) return 'video/webm';
+  if (looksLikeMp4(bytes)) return 'video/mp4';
+  if (!(input instanceof Uint8Array) && typeof input.mime === 'string' && input.mime.trim().length > 0) {
+    return input.mime;
   }
-  return input.mime || 'application/octet-stream';
+  return 'application/octet-stream';
+}
+
+/** True when a DOM <video> + canvas frame grab is possible in this realm (page main thread only). */
+function hasDom(): boolean {
+  return typeof document !== 'undefined' && typeof document.createElement === 'function';
 }
 
 /** Build a DecodeInput from whichever inline demuxer recognizes the bytes; null if neither does. */
@@ -90,9 +100,19 @@ function demuxToDecodeInput(bytes: Uint8Array, container?: string): DecodeInput 
 }
 
 /**
- * Decode arbitrary container bytes to normalized FrameDigests (+ getPixels) using WebCodecs with a
- * minimal inline demux for mp4/mov/webm/mkv. For containers the inline demuxer can't parse (e.g.
- * MPEG-TS, OGG, fragmented MP4), falls back to a <video> element frame grab (page main thread only).
+ * Decode arbitrary container bytes to normalized FrameDigests (+ getPixels).
+ *
+ * Strategy (robust for engine OUTPUT, which is the fragile case):
+ *   1. Try the inline demux (mp4/mov/webm/mkv) → WebCodecs `VideoDecoder`. Exact + Worker-safe.
+ *   2. If that throws (codec NA / config rejected) OR produces ZERO frames (e.g. the inline EBML
+ *      walk couldn't recover a streaming/unknown-size WebM's frames), AND a DOM is available, fall
+ *      back to a <video> element + OffscreenCanvas frame grab. A <video> element can play any
+ *      browser-playable container (incl. a VP9/Opus WebM that raw WebCodecs has no demuxer for), so
+ *      this is the reliable safety net that unblocked mediabunny's convert-webm-resize output.
+ *
+ * The WebCodecs path NEVER lets a null/blank codec string reach the browser (which would null-deref
+ * on Chrome's internal `codec.trim()`); see decode.ts `normalizeCodecString`. In a Worker (no DOM)
+ * the <video> fallback is unavailable, so a WebCodecs failure is surfaced honestly.
  *
  * Injected by the runner as `ctx.decodeWithPlatform`.
  */
@@ -100,22 +120,36 @@ export async function decodeBytesToFrames(input: MediaBytes | Uint8Array, opts?:
   const bytes = toBytes(input);
   const container = input instanceof Uint8Array ? undefined : input.container;
 
-  const decodeInput = demuxToDecodeInput(bytes, container);
+  // demuxToDecodeInput only throws on a non-Unsupported parse error (a bug); a recognized-but-
+  // unparseable container returns null. Guard it so any unexpected throw still routes to <video>.
+  let decodeInput: DecodeInput | null = null;
+  let demuxThrew: unknown;
+  try {
+    decodeInput = demuxToDecodeInput(bytes, container);
+  } catch (e) {
+    demuxThrew = e;
+  }
+
   if (decodeInput && decodeInput.samples.length > 0) {
     try {
-      return await decodeWithWebCodecs(decodeInput, opts);
+      const sink = await decodeWithWebCodecs(decodeInput, opts);
+      // A non-empty sink is a clean success. An EMPTY sink means the decoder accepted the config but
+      // emitted no frames (e.g. samples the inline demux mis-sliced) — prefer the <video> fallback
+      // when we can, rather than returning 0 frames to the oracle.
+      if (sink.frames.length > 0 || !hasDom()) return sink;
     } catch (err) {
-      // WebCodecs couldn't decode (codec unsupported in this browser / config rejected). Fall back
-      // to <video> if we have a DOM; otherwise surface the error honestly.
-      if (typeof document === 'undefined') throw err;
+      // WebCodecs couldn't decode (codec unsupported in this browser / config rejected / corrupt
+      // samples). Fall back to <video> if we have a DOM; otherwise surface the error honestly.
+      if (!hasDom()) throw err;
     }
   }
 
-  // Fallback: <video> element frame grab. Requires DOM (page main thread).
-  if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+  // Fallback: <video> element + OffscreenCanvas frame grab. Requires DOM (page main thread).
+  if (!hasDom()) {
+    if (demuxThrew) throw demuxThrew instanceof Error ? demuxThrew : new Error(String(demuxThrew));
     throw new Error(
-      'platform decodeBytesToFrames: inline demux did not recognize the container and no DOM is ' +
-        'available for the <video> fallback (running in a Worker?)',
+      'platform decodeBytesToFrames: could not decode via WebCodecs and no DOM is available for the ' +
+        '<video> fallback (running in a Worker?)',
     );
   }
   const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });

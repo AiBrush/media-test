@@ -38,6 +38,14 @@ const METRIC_FIELD: Record<MetricId, keyof MetricSample> = {
   longtasks: 'longtaskMs',
   decodeFps: 'decodeFps',
   encodeFps: 'encodeFps',
+  opsPerSec: 'opsPerSec',
+  packetsPerSec: 'packetsPerSec',
+  framesPerSec: 'framesPerSec',
+  seekMs: 'seekMs',
+  timeToFirstByte: 'timeToFirstByteMs',
+  timeToFirstFrame: 'timeToFirstFrameMs',
+  loadInit: 'loadInitMs',
+  bundleSize: 'bundleSizeKb',
 };
 
 const METRIC_UNIT: Record<MetricId, string> = {
@@ -50,6 +58,14 @@ const METRIC_UNIT: Record<MetricId, string> = {
   longtasks: 'ms',
   decodeFps: 'fps',
   encodeFps: 'fps',
+  opsPerSec: 'ops/s',
+  packetsPerSec: 'packets/s',
+  framesPerSec: 'fps',
+  seekMs: 'ms',
+  timeToFirstByte: 'ms',
+  timeToFirstFrame: 'ms',
+  loadInit: 'ms',
+  bundleSize: 'kB',
 };
 
 /** The only higher-is-better metrics; everything else is lower-is-better. */
@@ -57,6 +73,9 @@ const HIGHER_IS_BETTER: ReadonlySet<MetricId> = new Set<MetricId>([
   'throughputRealtime',
   'decodeFps',
   'encodeFps',
+  'opsPerSec',
+  'packetsPerSec',
+  'framesPerSec',
 ]);
 
 /** Canonical unit string for a metric ('ms' | 'x-realtime' | 'bytes' | 'count' | 'fps'). */

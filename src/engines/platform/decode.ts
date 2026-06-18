@@ -46,6 +46,43 @@ function hasVideoDecoder(): boolean {
 }
 
 /**
+ * Normalize a demuxed codec string into the exact form WebCodecs wants, or return `null` if it is
+ * not a usable codec string.
+ *
+ * WHY this exists: Chrome's `VideoDecoder.isConfigSupported`/`configure` run the `config.codec` value
+ * through an internal parser that calls `.trim()` on it. If `codec` is `null` (e.g. a demuxer that
+ * could not resolve the codec but still produced a track config), that native path throws an UNCAUGHT
+ * `TypeError: Cannot read properties of null (reading 'trim')`, which then surfaces as a confusing
+ * oracle failure on otherwise-valid output (observed decoding remotion-webcodecs' VP9/Opus WebM). We
+ * trim here and treat a null/empty/whitespace codec as "no usable codec" so the caller can fail
+ * cleanly with a clear message instead of letting a null reach the browser's `.trim()`.
+ */
+function normalizeCodecString(codec: string | null | undefined): string | null {
+  if (typeof codec !== 'string') return null;
+  const trimmed = codec.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Whether a codec carries its decoder configuration OUT-OF-BAND (in a `description` / extradata box)
+ * vs IN-BAND in the bitstream. Only avc1/hvc1 (and AV1's av1C, which Chrome does consume) use a
+ * description; VP8/VP9 carry everything in-band and Chrome's WebCodecs VP9 decoder makes NO use of
+ * the `description` field.
+ *
+ * This matters because some muxers (e.g. mediabunny, used by remotion-webcodecs) DO write a WebM
+ * `CodecPrivate` for VP9 — the "VP9 Codec Feature Metadata" blob, which is NOT a WebCodecs decoder
+ * description. Feeding that blob to `VideoDecoder` as `config.description` for VP9 corrupts the config
+ * and lands on the same null-`.trim()` native error. So for VP8/VP9 we DROP any demuxed description.
+ */
+function codecUsesDescription(codecString: string): boolean {
+  const c = codecString.toLowerCase();
+  if (c.startsWith('vp8') || c.startsWith('vp08') || c.startsWith('vp9') || c.startsWith('vp09')) {
+    return false;
+  }
+  return true; // avc1/avc3/hvc1/hev1/av01/… — keep the description when one is present
+}
+
+/**
  * Decode demuxed samples via WebCodecs. Resolves a FrameSink of up to `maxFrames` digests in
  * presentation order. Throws if VideoDecoder is unavailable or the config is unsupported.
  */
@@ -53,19 +90,33 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
   if (!hasVideoDecoder()) throw new Error('VideoDecoder/EncodedVideoChunk unavailable in this realm');
   const maxFrames = opts?.maxFrames ?? Number.POSITIVE_INFINITY;
 
+  // Guard the codec string BEFORE it reaches the browser. A null/empty codec would otherwise hit
+  // Chrome's native `.trim()` on the codec config and throw an uncaught TypeError; fail cleanly here.
+  const codec = normalizeCodecString(input.codecString);
+  if (codec === null) {
+    throw new Error(
+      `platform decode: missing/empty codec string (got ${JSON.stringify(input.codecString)}); ` +
+        'cannot configure VideoDecoder',
+    );
+  }
+
   const config: VideoDecoderConfig = {
-    codec: input.codecString,
+    codec,
     codedWidth: input.codedWidth || undefined,
     codedHeight: input.codedHeight || undefined,
   };
-  if (input.description) {
+  // Only attach the out-of-band description for codecs that actually use one. For VP8/VP9 the
+  // decoder ignores it, and a WebM-style VP9 CodecPrivate (e.g. from mediabunny/remotion-webcodecs)
+  // is NOT a valid WebCodecs description — passing it corrupts the config and trips the native
+  // null-`.trim()` path. So drop it for VP8/VP9 and keep it for avc1/hvc1/av01.
+  if (input.description && input.description.byteLength > 0 && codecUsesDescription(codec)) {
     // description must be a BufferSource; pass a fresh ArrayBuffer slice.
     config.description = input.description.slice().buffer;
   }
 
   const support = await VideoDecoder.isConfigSupported(config).catch(() => null);
   if (!support || support.supported !== true) {
-    throw new Error(`VideoDecoder config not supported: ${input.codecString}`);
+    throw new Error(`VideoDecoder config not supported: ${codec}`);
   }
 
   const sink = new RetainingFrameSink();

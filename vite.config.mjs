@@ -7,8 +7,8 @@
 //
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { extname, join, normalize } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join, normalize } from 'node:path';
 
 const MIME = {
   '.mp4': 'video/mp4',
@@ -60,6 +60,8 @@ function fixturesStatic() {
         res.setHeader('Content-Type', type);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Access-Control-Allow-Origin', '*');
+        // Under COEP: require-corp, every subresource needs a CORP header to be loadable.
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
         res.setHeader('Cache-Control', 'no-store');
 
         const range = req.headers['range'];
@@ -88,6 +90,73 @@ function fixturesStatic() {
   };
 }
 
+/**
+ * Cross-origin isolation (§8.5): set COOP:same-origin + COEP:require-corp on EVERY dev response so
+ * `crossOriginIsolated === true` → SharedArrayBuffer is available (ffmpeg.wasm multi-thread core, any
+ * mt-WASM framework) and performance.measureUserAgentSpecificMemory works (precise peak-memory).
+ * serve.sh exports VITE_COOP/VITE_COEP; default to the isolating pair. Registered FIRST so the headers
+ * are present on the HTML, JS modules, wasm, and workers alike. Without this, mt-WASM init HANGS.
+ */
+function crossOriginIsolation() {
+  const coop = process.env.VITE_COOP || 'same-origin';
+  const coep = process.env.VITE_COEP || 'require-corp';
+  return {
+    name: 'cross-origin-isolation',
+    configureServer(server) {
+      server.middlewares.use((_req, res, next) => {
+        res.setHeader('Cross-Origin-Opener-Policy', coop);
+        res.setHeader('Cross-Origin-Embedder-Policy', coep);
+        next();
+      });
+    },
+  };
+}
+
+/**
+ * Save endpoint (the /chrome-flow's persistence): POST /__save?path=results/... writes the request
+ * body to a file under results/. This is how the browser-driven run (Phase F) persists window.__RESULTS__
+ * to results/raw/ — the /chrome tool blocks data exfiltration through the page, so the page POSTs its
+ * results here and the dev server writes them. Strictly confined to the results/ tree.
+ */
+function saveEndpoint() {
+  const resultsRoot = join(process.cwd(), 'results');
+  return {
+    name: 'save-results',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0];
+        if (url !== '/__save') return next();
+        if (req.method !== 'POST') {
+          res.statusCode = 405;
+          return res.end('save: POST only');
+        }
+        const q = new URL(req.url || '', 'http://localhost');
+        const rel = q.searchParams.get('path') || '';
+        const filePath = normalize(join(process.cwd(), rel));
+        if (!filePath.startsWith(resultsRoot)) {
+          res.statusCode = 403;
+          return res.end('save: path must be under results/');
+        }
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          try {
+            mkdirSync(dirname(filePath), { recursive: true });
+            writeFileSync(filePath, Buffer.concat(chunks));
+            res.statusCode = 200;
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.end(`saved ${rel} (${Buffer.concat(chunks).length} bytes)`);
+          } catch (err) {
+            res.statusCode = 500;
+            res.end(`save error: ${err?.message || err}`);
+          }
+        });
+      });
+    },
+  };
+}
+
 export default {
-  plugins: [fixturesStatic()],
+  // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
+  plugins: [crossOriginIsolation(), saveEndpoint(), fixturesStatic()],
 };

@@ -15,7 +15,7 @@
 
 import { detectEnv, detectCodecSupport } from '../core/feature-detect.ts';
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
-import { listEngines, listScenarios, getReferenceEngineId } from '../core/registry.ts';
+import { listEngines, listScenarios, getReferenceEngineId, getEngine } from '../core/registry.ts';
 import { runMatrix } from '../core/runner.ts';
 import type { RunOptions } from '../core/runner.ts';
 import type { BrowserName } from '../core/engine.ts';
@@ -169,7 +169,24 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   const scenarioIds = filter.scenarioIds && filter.scenarioIds.length ? filter.scenarioIds : undefined;
 
   // Resolve the matrix layout we will draw (so empty selections still produce a sensible grid).
-  const drawEngines = engineIds ?? listEngines().map((e) => e.id);
+  // Columns MUST use the id each engine reports in its results (engine.id), NOT the registration id:
+  // the 4 original engines register under a short id ('mediabunny', 'platform', 'ffmpeg-wasm',
+  // 'mp4box') but their results carry a versioned .id ('mediabunny@1.48.0', 'platform@chrome-149',
+  // 'ffmpeg.wasm@0.12.15', 'mp4box@2.3.0'). Keying the matrix by the registration id left those four
+  // columns permanently empty ('·'). Map each selected/registered engine to its instance .id (cheap —
+  // constructors do no heavy work; load happens in init()), so columns match the streamed results.
+  const selectedEngineRegIds = engineIds ?? listEngines().map((e) => e.id);
+  const drawEngines = await Promise.all(
+    selectedEngineRegIds.map(async (rid) => {
+      const reg = getEngine(rid);
+      if (!reg) return rid;
+      try {
+        return (await reg.factory()).id ?? rid;
+      } catch {
+        return rid;
+      }
+    }),
+  );
   const drawScenarios = scenarioIds ?? listScenarios().map((s) => s.id);
   matrix.start(drawEngines, drawScenarios);
   setRunStatus(`running on ${browser}…`);

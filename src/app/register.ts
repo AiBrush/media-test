@@ -12,7 +12,7 @@
  * thrown. This is the one place that knows the concrete module paths; the rest of the app is generic.
  */
 
-import { listEngines, listScenarios, registerScenarios } from '../core/registry.ts';
+import { listEngines, listScenarios, registerEngine, registerScenarios } from '../core/registry.ts';
 import type { Scenario } from '../core/scenario.ts';
 
 export interface RegistrationReport {
@@ -52,7 +52,8 @@ const ENGINE_WIRINGS: EngineWiring[] = [
   {
     label: 'ffmpeg.wasm',
     register: async () => {
-      const mod = await import('../engines/ffmpeg-wasm/adapter.ts');
+      // ffmpeg-wasm exposes its register helper from register.ts (not adapter.ts).
+      const mod = await import('../engines/ffmpeg-wasm/register.ts');
       mod.registerFfmpegWasm();
     },
   },
@@ -61,6 +62,28 @@ const ENGINE_WIRINGS: EngineWiring[] = [
     register: async () => {
       const mod = await import('../engines/mp4box/adapter.ts');
       mod.registerMp4box();
+    },
+  },
+  {
+    label: 'remotion-media-parser',
+    register: async () => {
+      const mod = await import('../engines/remotion-media-parser/adapter.ts');
+      mod.registerRemotionMediaParser();
+    },
+  },
+  {
+    label: 'web-demuxer',
+    register: async () => {
+      const mod = await import('../engines/web-demuxer/adapter.ts');
+      mod.registerWebDemuxer();
+    },
+  },
+  {
+    label: 'remotion-webcodecs',
+    register: async () => {
+      // No register helper exported — wire the engine class directly via a fresh-per-iteration factory.
+      const mod = await import('../engines/remotion-webcodecs/adapter.ts');
+      registerEngine(new mod.RemotionWebcodecsEngine().id, () => new mod.RemotionWebcodecsEngine());
     },
   },
   {
@@ -112,6 +135,10 @@ const SCENARIO_WIRINGS: ScenarioWiring[] = [
   {
     family: 'audio-dsp',
     load: async () => (await import('../scenarios/audio-dsp/index.ts')).audioDspScenarios,
+  },
+  {
+    family: 'performance',
+    load: async () => (await import('../scenarios/performance/index.ts')).performanceScenarios,
   },
   {
     // Robustness family is appended last; its index export name is tolerated flexibly below.

@@ -1,0 +1,18 @@
+{
+  "container": "mp4",
+  "durationSec": 1,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "h264",
+      "width": 320,
+      "height": 240,
+      "fps": 1,
+      "bitrate": 37992,
+      "language": "und"
+    }
+  ],
+  "tags": {
+    "major_brand": "isom"
+  }
+}

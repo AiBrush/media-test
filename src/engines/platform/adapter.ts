@@ -18,6 +18,31 @@
  * RULES followed: TS strict; ESM .ts imports; `import type` for types; built-in APIs only (nothing
  * heavy to dynamically import); Worker-aware (decodeFrames via WebCodecs works in a Worker; <video>
  * paths guard for DOM and throw a clear NA-style error off the main thread).
+ *
+ * ─── SOURCES (dossier: research/dossiers/platform.md, researched 2026-06-17) ────────────────────
+ * There is NO package/version for `platform` — the "version" is the browser build (deriveId()). The
+ * authoritative specs/docs the dossier + this adapter are built against:
+ *   - WebCodecs API (interfaces, Worker note, secure context):
+ *       https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
+ *   - WebCodecs spec (W3C Working Draft, 8 June 2026):
+ *       https://www.w3.org/TR/webcodecs/
+ *   - Codec selection (full codec strings, isConfigSupported loops):
+ *       https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API/Codec_selection
+ *   - VideoDecoder.configure (description/extradata, rotation/flip):
+ *       https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder/configure
+ *   - VideoEncoder.isConfigSupported (normalized config, TypeError on invalid):
+ *       https://developer.mozilla.org/en-US/docs/Web/API/VideoEncoder/isConfigSupported_static
+ *   - AVC codec registration (avc.format avc/annexb; description present ⇒ avc, absent ⇒ annexb):
+ *       https://www.w3.org/TR/webcodecs-avc-codec-registration/
+ *   - Chrome WebCodecs best practices (Worker, queueSize>2, transferable, close, OffscreenCanvas):
+ *       https://developer.chrome.com/docs/web-platform/best-practices/webcodecs
+ *   - MediaRecorder.isTypeSupported + cross-browser format reality:
+ *       https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/isTypeSupported_static
+ *   - ImageDecoder / MSE / MediaCapabilities (per-op references): see research/dossiers/platform.md §10
+ *
+ * The documented BEST path (§0.9/§3) — hardware WebCodecs, streaming, transferable frames,
+ * decodeQueueSize>2 gating, close() promptly, OffscreenCanvas/WebGPU pixel work — is recorded via the
+ * readable `configUsed` field below; init() (UNTIMED, §0.7) probes hardware support + warms a decoder.
  */
 
 import type {
@@ -41,6 +66,32 @@ import { demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts
 import { demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 import { probeInput } from './probe.ts';
 import { canMediaRecorderTranscode, recorderMimeFor, transcodeViaRecorder } from './transcode.ts';
+import { warmupPlatform } from './warmup.ts';
+import type { WarmupResult } from './warmup.ts';
+
+/**
+ * The documented BEST-performance config for the platform engine (dossier §3, from the Chrome
+ * WebCodecs best-practices guide). Surfaced as a readable `configUsed` so the runner/report can
+ * record it per §8.5 ("a number is never an apples-to-oranges artifact of a slow API path"). The
+ * `hwAccel` field is refined at runtime by init()'s isConfigSupported probe (see PlatformEngine).
+ */
+export interface PlatformConfigUsed {
+  backend: 'webcodecs';
+  /** prefer-hardware, confirmed via isConfigSupported in init() (refined to false if none probed) */
+  hwAccel: boolean;
+  /** no WASM in the platform engine (everything ships in the browser, §7) */
+  wasmThreads: 0;
+  pipeline: 'streaming';
+  /** Chrome guide gates on encodeQueueSize/decodeQueueSize > 2 */
+  queueDepth: 2;
+  /** WebCodecs runs off-main-thread by design; <video>/MSE/recorder paths are DOM-bound */
+  worker: boolean;
+  /** §0.9 ordering for any pixel work (resize/color) */
+  pixelBackend: 'webgpu>webgl>offscreen2d';
+  frameTransfer: 'transferable';
+  decode: 'VideoDecoder';
+  encode: 'VideoEncoder+MediaRecorder(out)';
+}
 
 /** Thrown for operations this engine honestly does not implement. The runner records NA_ENGINE. */
 class NotApplicableError extends Error {
@@ -77,6 +128,27 @@ function deriveId(): string {
 
 export class PlatformEngine implements MediaEngine {
   readonly id: string;
+
+  /**
+   * The documented best-path config (dossier §3), readable by the runner/report so the chosen path
+   * is recorded per §8.5. `hwAccel`/`worker` start at the static best-path default and are refined by
+   * init()'s runtime hardware probe (isConfigSupported) — honest about what THIS browser confirmed.
+   */
+  configUsed: PlatformConfigUsed = {
+    backend: 'webcodecs',
+    hwAccel: true, // best-path intent (prefer-hardware); refined by init() probe
+    wasmThreads: 0,
+    pipeline: 'streaming',
+    queueDepth: 2,
+    worker: typeof document === 'undefined', // WebCodecs path runs in a Worker when no DOM
+    pixelBackend: 'webgpu>webgl>offscreen2d',
+    frameTransfer: 'transferable',
+    decode: 'VideoDecoder',
+    encode: 'VideoEncoder+MediaRecorder(out)',
+  };
+
+  /** Result of init()'s UNTIMED hardware probe + decoder warmup (null until init() runs). */
+  private warmup: WarmupResult | null = null;
 
   constructor() {
     this.id = deriveId();
@@ -119,12 +191,25 @@ export class PlatformEngine implements MediaEngine {
     };
   }
 
+  /**
+   * UNTIMED setup (§0.7). There is nothing to vendor/load for raw platform (§7), so init() does the
+   * documented BEST-path warmup instead: probe per-codec HARDWARE decode support via
+   * isConfigSupported('prefer-hardware') — "the only honest check" (§5) — and prime one decoder so the
+   * first MEASURED decode runs against an already-spun-up hardware pipeline (Chrome best-practices
+   * guide, §3). The probe also refines configUsed.hwAccel so the recorded config reflects what THIS
+   * browser actually confirmed (honest, never fabricated). Never throws: failure degrades to "not
+   * warmed" and the engine still works (just paying configure cost on the first op).
+   */
   async init(): Promise<void> {
-    // No heavy setup: platform APIs are built-in. Nothing to load.
+    this.warmup = await warmupPlatform();
+    // Refine the recorded config: hwAccel reflects whether ANY codec confirmed a hardware-preferred
+    // config; if the realm has no VideoDecoder at all, hwAccel is false.
+    this.configUsed = { ...this.configUsed, hwAccel: this.warmup.hwAccel };
   }
 
   async dispose(): Promise<void> {
-    // No persistent resources held between calls.
+    // Warmup decoder was closed inside warmupPlatform(); drop the probe result for clean peak memory.
+    this.warmup = null;
   }
 
   async probe(input: MediaInput): Promise<NormalizedMetadata> {

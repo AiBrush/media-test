@@ -164,6 +164,14 @@ export interface MediaEngine {
   /** stable, versioned id, e.g. 'mediabunny@1.48.0', 'ffmpeg.wasm@0.12', 'aibrush-media@dev' */
   readonly id: string;
   capabilities(): CapabilitySet;
+  /**
+   * The best-path configuration this engine drives (§0.9 / §8.5), recorded into the report so a
+   * number is never an apples-to-oranges artifact of a slow API path. Optional + additive: the
+   * runner reads it off the instance when present (e.g. { backend:'webgpu', wasmThreads:8 }).
+   * Typed as `object` (not Record) so adapters may declare a concrete config interface without an
+   * index signature; the runner serializes it for the report.
+   */
+  readonly configUsed?: object;
   init?(): Promise<void>;
   dispose?(): Promise<void>;
 

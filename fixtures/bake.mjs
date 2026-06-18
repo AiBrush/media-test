@@ -168,6 +168,48 @@ function ffprobeJson(args, label) {
   }
 }
 
+// ── Pinned fetch (offline-once, sha256-verified) ────────────────────────────────────────────────
+//
+// §0.8: nothing is fetched at RUN time. The bake MAY fetch a pinned, sha256-verified public URL
+// (§5.4 `fetched`). We DO NOT do unpinned trust-on-first-use: a download is only accepted if its
+// sha256 matches a trusted expected value (from the manifest entry's `sha256`, or an env override
+// such as BBB_MOV_SHA256). Without a trusted sha256 we refuse to download and leave the asset for
+// the MISSING ASSETS block — an unverifiable blob never silently enters the corpus.
+//
+// Returns 'ok' on a verified download, or a { skipped, reason } object otherwise (never throws so a
+// single un-pinned fetch can't abort the whole bake).
+async function fetchPinned(url, outPath, expectedSha256, label) {
+  if (!url) return { skipped: true, reason: `${label}: no sourceUrl to fetch from.` };
+  if (!expectedSha256) {
+    return {
+      skipped: true,
+      reason:
+        `${label}: refusing to download ${url} without a trusted sha256 to verify against ` +
+        '(no unpinned trust-on-first-use). Supply the checksum (manifest `sha256` or the documented ' +
+        'env override) to enable the pinned fetch, or drop the file in manually (see MISSING ASSETS).',
+    };
+  }
+  let buf;
+  try {
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok) return { skipped: true, reason: `${label}: HTTP ${res.status} fetching ${url}` };
+    buf = Buffer.from(await res.arrayBuffer());
+  } catch (e) {
+    return { skipped: true, reason: `${label}: network error fetching ${url}: ${String(e?.message || e)}` };
+  }
+  const got = createHash('sha256').update(buf).digest('hex');
+  if (got !== expectedSha256.toLowerCase()) {
+    return {
+      skipped: true,
+      reason:
+        `${label}: sha256 mismatch for ${url} — expected ${expectedSha256}, got ${got}. ` +
+        'Refusing to use an unverified download. Update the pinned checksum if you trust this source.',
+    };
+  }
+  writeFileSync(outPath, buf);
+  return 'ok';
+}
+
 // ── Recipes ──────────────────────────────────────────────────────────────────────────────────
 //
 // Each recipe is a generator function (id, paths) => 'ok' | { skipped, reason }. It writes the
@@ -653,6 +695,187 @@ const RECIPES = {
     return 'ok';
   },
 
+  // ── Size ladder (§5.3): one rung per bucket, crossing the size axis with the format axis ─────
+  // empty: a structurally-valid container with ZERO media (distinct from zero_length.mp4's 0 bytes).
+  'empty_audio.wav': (out) => {
+    // A valid 44-byte RIFF/WAVE header carrying a 0-length data chunk (the "no samples" edge, distinct
+    // from zero_length.mp4's "no bytes"). Written directly — DO NOT use ffmpeg `sine duration=0`:
+    // ffmpeg treats duration=0 as INFINITE and generates an unbounded file (it ran away to 88 GB).
+    // The canonical header below is deterministic + bit-exact (PCM s16le, 48 kHz, stereo, 0 data bytes).
+    const buf = Buffer.alloc(44);
+    buf.write('RIFF', 0, 'ascii');
+    buf.writeUInt32LE(36, 4); // ChunkSize = 36 + data(0)
+    buf.write('WAVE', 8, 'ascii');
+    buf.write('fmt ', 12, 'ascii');
+    buf.writeUInt32LE(16, 16); // Subchunk1Size (PCM)
+    buf.writeUInt16LE(1, 20); // AudioFormat = PCM
+    buf.writeUInt16LE(2, 22); // NumChannels = 2
+    buf.writeUInt32LE(48000, 24); // SampleRate
+    buf.writeUInt32LE(192000, 28); // ByteRate = 48000*2*2
+    buf.writeUInt16LE(4, 32); // BlockAlign = 2*2
+    buf.writeUInt16LE(16, 34); // BitsPerSample
+    buf.write('data', 36, 'ascii');
+    buf.writeUInt32LE(0, 40); // Subchunk2Size = 0
+    writeFileSync(out, buf);
+    return 'ok';
+  },
+  // micro (~1 KB): single-keyframe MP4 + few-frame audio MP4.
+  'micro_h264_1frame.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(320, 240, 1, 1),
+        ...BITEXACT, ...NOMETA,
+        '-frames:v', '1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '28', '-g', '1', '-keyint_min', '1',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'micro_h264_1frame.mp4',
+    );
+    return 'ok';
+  },
+  'micro_audio_short.m4a': (out) => {
+    ffmpeg(
+      ['-f', 'lavfi', '-i', SINE(440, 0.1, 44100, 1), ...BITEXACT, ...NOMETA, '-c:a', 'aac', '-b:a', '32k', '-ar', '44100', '-ac', '1', '-movflags', '+faststart', '-f', 'mp4', out],
+      'micro_audio_short.m4a',
+    );
+    return 'ok';
+  },
+  // tiny (~100 KB): 360p 2s in both major families so the rung crosses container/codec.
+  'tiny_h264_360p_2s.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(640, 360, 30, 2),
+        '-f', 'lavfi', '-i', SINE(440, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '26', '-g', '60', '-keyint_min', '60',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'tiny_h264_360p_2s.mp4',
+    );
+    return 'ok';
+  },
+  'tiny_vp9_360p_2s.webm': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(640, 360, 30, 2),
+        '-f', 'lavfi', '-i', SINE(440, 2),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', '40',
+        '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-g', '60',
+        '-c:a', 'libopus', '-b:a', '64k', '-ar', '48000', '-ac', '2',
+        '-f', 'webm',
+        out,
+      ],
+      'tiny_vp9_360p_2s.webm',
+    );
+    return 'ok';
+  },
+  // large (~100 MB): 120s 1080p in both major families. Slow; gated by --skip-longform.
+  'large_h264_1080p_120s.mp4': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: large 120s 1080p asset intentionally not generated this run.' };
+    }
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 120),
+        '-f', 'lavfi', '-i', SINE(440, 120),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-g', '60', '-keyint_min', '60',
+        '-preset', 'veryfast', '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'large_h264_1080p_120s.mp4',
+    );
+    return 'ok';
+  },
+  'large_vp9_1080p_120s.webm': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: large 120s 1080p VP9 asset intentionally not generated this run (VP9 sw encode is very slow).' };
+    }
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 120),
+        '-f', 'lavfi', '-i', SINE(440, 120),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', '34',
+        '-row-mt', '1', '-deadline', 'good', '-cpu-used', '5', '-g', '60',
+        '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+        '-f', 'webm',
+        out,
+      ],
+      'large_vp9_1080p_120s.webm',
+    );
+    return 'ok';
+  },
+  // huge (~500-700 MB): the SELF-CONTAINED big-read asset (BigBuckBunny-style 1080p H.264 .mov).
+  // Always present after a full bake; deterministic; no network. Slow + large; gated by --skip-longform.
+  'huge_h264_1080p_600s.mov': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: huge ~600s 1080p .mov big-read asset intentionally not generated this run.' };
+    }
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 600),
+        '-f', 'lavfi', '-i', SINE(440, 600),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-g', '60', '-keyint_min', '60',
+        '-preset', 'veryfast', '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        '-f', 'mov',
+        out,
+      ],
+      'huge_h264_1080p_600s.mov',
+    );
+    return 'ok';
+  },
+  // big-read PARITY: the REAL BigBuckBunny1080pH264.mov. provided/pin-then-fetch (see fetchPinned).
+  // ffmpeg cannot generate the real content; we only accept a sha256-verified download or a drop-in.
+  'big_buck_bunny_1080p_h264.mov': async (out, entry) => {
+    // A trusted sha256 may come from the manifest (once recorded) or the BBB_MOV_SHA256 env override.
+    const trusted = process.env.BBB_MOV_SHA256 || entry?.sha256 || null;
+    if (!trusted) {
+      return {
+        skipped: true,
+        reason:
+          'REAL BigBuckBunny1080pH264.mov: no trusted sha256 to verify a download (Mediabunny\'s exact ' +
+          '691 MiB benchmark file is unpinned/private). Not auto-fetched. Drop it in manually or set ' +
+          'BBB_MOV_SHA256=<sha256-you-trust> to enable the pinned fetch from sourceUrl. See MISSING ASSETS. ' +
+          '(The synthetic huge_h264_1080p_600s.mov keeps the huge/big-read rung populated regardless.)',
+      };
+    }
+    const res = await fetchPinned(entry?.sourceUrl, out, trusted, 'big_buck_bunny_1080p_h264.mov');
+    return res;
+  },
+
+  // ── massive (~1-1.4 GB, multi-hour): lazy-read / streaming / peak-memory / OOM resistance ─────
+  'massive_h264_1080p_2h.mp4': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: massive 2h 1080p asset intentionally not generated this run.' };
+    }
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 7200),
+        '-f', 'lavfi', '-i', SINE(440, 7200, 48000, 1),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-b:v', '1200k', '-maxrate', '1400k', '-bufsize', '2400k',
+        '-g', '60', '-keyint_min', '60', '-preset', 'veryfast', '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '64k', '-ar', '48000', '-ac', '1',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'massive_h264_1080p_2h.mp4',
+    );
+    return 'ok';
+  },
+
   // ── Recorder-origin (BROWSER capture — never faked) ─────────────────────────────────────────
   'recorder_headerless.webm': (_out) => {
     // A MediaRecorder WebM (cluster-only, no Cues/Duration in the header) cannot be produced by
@@ -1042,12 +1265,12 @@ function selected(assetId) {
   return flags.subset.some((term) => assetId.includes(term));
 }
 
-function main() {
+async function main() {
   mkdirSync(MEDIA_DIR, { recursive: true });
   mkdirSync(GOLDEN_DIR, { recursive: true });
 
   const manifest = loadManifest();
-  const summary = { generated: [], reused: [], skipped: [], golden: [], goldenPending: [], goldenSkipped: [], errors: [] };
+  const summary = { generated: [], reused: [], skipped: [], golden: [], goldenPending: [], goldenSkipped: [], errors: [], missing: [] };
 
   log('media-browser-test fixture bake');
   log(
@@ -1064,29 +1287,55 @@ function main() {
 
     const out = join(MEDIA_DIR, id);
 
+    // In golden-only mode we don't generate, but we still flag any provided/captured asset that
+    // hasn't been dropped in yet so the MISSING ASSETS block stays accurate.
+    if (flags.goldenOnly && !existsSync(out) && (entry.source === 'provided' || entry.source === 'captured')) {
+      summary.missing.push({ id, entry, reason: `source:'${entry.source}' and not present on disk (golden-only run).` });
+    }
+
     // 1. Generate media (unless golden-only).
     if (!flags.goldenOnly) {
       const recipe = RECIPES[id];
-      if (!recipe) {
-        summary.errors.push({ id, reason: 'no recipe defined in bake.mjs' });
-        log(`  ! ${id}: NO RECIPE — skipped (add one to RECIPES)`);
-        continue;
-      }
-
       const exists = existsSync(out);
+
       if (exists && !flags.force) {
-        // Idempotent: reuse the existing file, just refresh its checksum below.
+        // Idempotent: reuse the existing file (incl. drop-in `provided`/`captured` assets), just
+        // refresh its checksum below. This is how a manually-dropped 'provided' asset enters the
+        // corpus: on the next bake it is found on disk and checksummed like anything else.
         summary.reused.push(id);
         log(`  = ${id} (reuse existing)`);
+      } else if (!recipe) {
+        // No generator. For a `provided`/`captured` asset this is EXPECTED (the bake can't make it).
+        // Record it as MISSING (drop-in needed) rather than a hard error.
+        entry.sha256 = null;
+        entry.sizeBytes = null;
+        if (entry.source === 'provided' || entry.source === 'captured') {
+          summary.missing.push({ id, entry, reason: `source:'${entry.source}' and not present on disk (no generator).` });
+          log(`  ◌ ${id}: MISSING (${entry.source}; drop into fixtures/media/ — see MISSING ASSETS)`);
+        } else {
+          summary.errors.push({ id, reason: 'no recipe defined in bake.mjs' });
+          log(`  ! ${id}: NO RECIPE — skipped (add one to RECIPES)`);
+        }
+        continue;
       } else {
         try {
           mkdirSync(dirname(out), { recursive: true });
-          const res = recipe(out);
+          // Recipes may be sync or async (the pinned BigBuckBunny fetch is async). They also receive
+          // the manifest `entry` so fetch recipes can read sourceUrl / a recorded sha256.
+          const res = await recipe(out, entry);
           if (res && typeof res === 'object' && res.skipped) {
             entry.sha256 = null;
             entry.sizeBytes = null;
-            summary.skipped.push({ id, reason: res.reason });
-            log(`  ⨯ ${id}: SKIPPED — ${res.reason}`);
+            // A skipped `provided`/`captured` asset (cbcs without Bento4, BigBuckBunny without a
+            // trusted sha256, the recorder WebM) is a drop-in requirement → MISSING ASSETS, not a
+            // plain skip. Other skips (e.g. --skip-longform on a generated asset) stay informational.
+            if (entry.source === 'provided' || entry.source === 'captured') {
+              summary.missing.push({ id, entry, reason: res.reason });
+              log(`  ◌ ${id}: MISSING (${entry.source}) — ${res.reason}`);
+            } else {
+              summary.skipped.push({ id, reason: res.reason });
+              log(`  ⨯ ${id}: SKIPPED — ${res.reason}`);
+            }
             continue;
           }
           summary.generated.push(id);
@@ -1098,7 +1347,7 @@ function main() {
         }
       }
 
-      // Checksum + size into the manifest (covers both freshly-generated and reused files).
+      // Checksum + size into the manifest (covers freshly-generated, fetched, AND reused/drop-in files).
       if (existsSync(out)) {
         entry.sha256 = sha256File(out);
         entry.sizeBytes = statSync(out).size;
@@ -1170,8 +1419,10 @@ function main() {
   recordHlsSegments(summary);
 
   printSummary(summary);
+  printMissingAssets(summary);
 
-  // Exit non-zero if any hard error occurred (skips are not errors).
+  // Exit non-zero if any hard error occurred (skips and MISSING are NOT errors — MISSING is an
+  // expected, honest state for provided/captured assets the bake cannot produce, §5.4).
   if (summary.errors.length) process.exitCode = 1;
 }
 
@@ -1228,4 +1479,54 @@ function printSummary(s) {
   log('Re-run is idempotent: existing files are reused (use --force to regenerate).');
 }
 
-main();
+/**
+ * MISSING ASSETS block (§5.4). For every asset the bake could NOT produce/fetch (source:'provided'
+ * or 'captured' and not present, or a skipped provided fetch), print: the exact drop path, where to
+ * obtain it, and the expected size/sha256 when known. The suite marks dependent cases
+ * NA(asset-missing) until each file is dropped in and `bun fixtures/bake.mjs --golden-only` is re-run.
+ * This is printed to BOTH log and (always, even with --quiet) console so the orchestrator surfaces it.
+ */
+function printMissingAssets(s) {
+  // De-dupe by id (golden-only + generate passes can both push the same id).
+  const byId = new Map();
+  for (const m of s.missing) if (!byId.has(m.id)) byId.set(m.id, m);
+  const items = [...byId.values()];
+
+  // Always print the block (even under --quiet) so a wrapper/agent can relay it verbatim.
+  const out = (...m) => console.log(...m);
+  out('');
+  out('═══ MISSING ASSETS ═══════════════════════════════════════════════');
+  if (!items.length) {
+    out('  (none) — every corpus asset is generated, fetched, or already present.');
+    out('══════════════════════════════════════════════════════════════════');
+    return;
+  }
+  out(`  ${items.length} asset(s) the bake cannot produce in this environment. Drop each file into`);
+  out('  the path shown, then re-run `bun fixtures/bake.mjs --golden-only` to checksum + bake golden.');
+  out('  Until present, every case needing one is NA(asset-missing) (never FAIL, never fabricated).');
+  out('');
+  for (const { id, entry, reason } of items) {
+    const dropPath = `fixtures/media/${id}`;
+    const expSize =
+      entry?.expectedSizeBytes != null
+        ? `${entry.expectedSizeBytes} bytes (~${(entry.expectedSizeBytes / (1024 * 1024)).toFixed(0)} MiB)`
+        : entry?.sizeBytes != null
+          ? `${entry.sizeBytes} bytes`
+          : 'unknown (compute after acquisition)';
+    const expSha = entry?.sha256 || 'unknown (compute with `shasum -a 256` after acquisition, then record in manifest)';
+    out(`  • ${id}  [${entry?.sizeBucket ?? '?'} / ${entry?.source ?? '?'}]`);
+    out(`      drop at      : ${dropPath}`);
+    if (entry?.sourceUrl) out(`      obtain from  : ${entry.sourceUrl}`);
+    if (entry?.acquire) out(`      how          : ${entry.acquire}`);
+    out(`      expected size: ${expSize}`);
+    out(`      expected sha : ${expSha}`);
+    if (reason) out(`      why missing  : ${reason}`);
+    out('');
+  }
+  out('══════════════════════════════════════════════════════════════════');
+}
+
+main().catch((e) => {
+  console.error(`FATAL bake error: ${String(e?.stack || e?.message || e)}`);
+  process.exit(1);
+});

@@ -340,12 +340,22 @@ class TimeoutError extends Error {
   }
 }
 
-/** Race a promise against `scenario.timeoutMs`. No timeout configured ⇒ run unguarded. */
+/**
+ * Default timeout caps so a single hanging/pathologically-slow engine can NEVER stall the whole
+ * matrix (a genuine hang far exceeds these; a slow-but-working op stays under them). A scenario's
+ * own `timeoutMs` overrides the op cap (robustness sets tight ones). Discovered necessary in the
+ * first real browser run: ffmpeg-wasm init and mp4box's bench loop hung the matrix with no guard.
+ */
+const DEFAULT_OP_TIMEOUT_MS = 120_000; // one op call or one oracle
+const DEFAULT_INIT_TIMEOUT_MS = 120_000; // engine.init() (WASM compile/instantiate can be slow)
+const DEFAULT_BENCH_TIMEOUT_MS = 300_000; // the whole bench (warmup+iters) for one cell
+
+/** Race a promise against `timeoutMs`, defaulting to DEFAULT_OP_TIMEOUT_MS so nothing runs unguarded. */
 function withTimeout<T>(p: Promise<T>, timeoutMs: number | undefined): Promise<T> {
-  if (!timeoutMs || timeoutMs <= 0) return p;
+  const ms = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_OP_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new TimeoutError(timeoutMs)), timeoutMs);
+    timer = setTimeout(() => reject(new TimeoutError(ms)), ms);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer !== undefined) clearTimeout(timer);
@@ -515,8 +525,16 @@ export async function runOne(
       return finalize(neg.status, [], neg.reason);
     }
 
-    // 2) init() brackets expensive setup (excluded from measured timing).
-    if (engine.init) await engine.init();
+    // 2) init() brackets expensive setup (excluded from measured timing). Timeout-guarded so a
+    //    hanging WASM compile/instantiate (e.g. ffmpeg-wasm) becomes a clean ERROR, not a matrix stall.
+    if (engine.init) {
+      try {
+        await withTimeout(engine.init(), DEFAULT_INIT_TIMEOUT_MS);
+      } catch (err) {
+        if (err instanceof TimeoutError) return finalize('ERROR', [], `init timeout: ${err.message}`);
+        throw err;
+      }
+    }
 
     // 3) Build MediaInput(s) from the served corpus. Robustness scenarios mutate bytes first.
     const assetIds = Array.isArray(scenario.input) ? scenario.input : [scenario.input];
@@ -567,7 +585,20 @@ export async function runOne(
     if (!wantsPerformance || scenario.metrics.length === 0) {
       return finalize('PASS', oracleOutcomes);
     }
-    const benchResult = await runBench(engine, scenario, inputs, golden, opts?.benchOptions);
+    // Bench is timeout-guarded: correctness already PASSED, so a hung/too-slow bench records PASS
+    // WITHOUT a number (honest — eligible but unmeasured) instead of stalling the matrix forever.
+    let benchResult: ScenarioResult['bench'];
+    try {
+      benchResult = await withTimeout(
+        runBench(engine, scenario, inputs, golden, opts?.benchOptions),
+        DEFAULT_BENCH_TIMEOUT_MS,
+      );
+    } catch (err) {
+      if (err instanceof TimeoutError) {
+        return finalize('PASS', oracleOutcomes, `bench timeout: ${err.message}`);
+      }
+      throw err;
+    }
     return finalize('PASS', oracleOutcomes, undefined, benchResult);
   } catch (err) {
     return finalize('ERROR', [], errMessage(err));
@@ -722,11 +753,26 @@ async function runBench(
         const ctx: MeasureContext = {};
         const mediaSec = mediaSecFromContext(golden, opResult);
         if (mediaSec !== undefined) ctx.mediaSec = mediaSec;
-        if (opResult.output) {
-          ctx.bytesOut = opResult.output.bytes.byteLength;
-        }
+        // COUNTS that back the headline per-second metrics (§8.1). Without these the Meter has no
+        // numerator and opsPerSec/packetsPerSec/framesPerSec collapse to 0 (the first-run bug).
+        // Every single op execution is one operation → opsPerSec = 1/wall (e.g. probes/sec).
+        ctx.ops = 1;
+        if (opResult.output) ctx.bytesOut = opResult.output.bytes.byteLength;
+        if (opResult.demux) ctx.packets = opResult.demux.packets.length;
+        if (opResult.seek) ctx.seeks = 1;
         if (opResult.frames) {
+          // decodeFrames produced real frames → decode fps + frames/sec.
           ctx.decodedFrames = opResult.frames.frames.length;
+          ctx.frames = opResult.frames.frames.length;
+        } else if (opResult.output) {
+          // Frame-processing ops that return encoded bytes (transcode/remux/trim) carry no FrameSink;
+          // estimate processed frames from golden (fps × duration) so the convert+resize headline
+          // reports framesPerSec / encodeFps instead of a silent 0.
+          const f = estimatedFrameCount(golden);
+          if (f !== undefined) {
+            ctx.frames = f;
+            ctx.encodedFrames = f;
+          }
         }
         return meter.end(ctx);
       },
@@ -736,6 +782,19 @@ async function runBench(
   }
 
   return out;
+}
+
+/** Estimate frames processed from golden metadata (video fps × duration). Used for framesPerSec /
+ *  encodeFps on ops that return encoded bytes rather than a FrameSink (transcode/remux/trim). */
+function estimatedFrameCount(golden: GoldenStore): number | undefined {
+  const meta = golden?.meta;
+  if (!meta) return undefined;
+  const v = meta.tracks?.find((t) => t.type === 'video' && typeof t.fps === 'number' && t.fps > 0);
+  const dur = meta.durationSec;
+  if (v && typeof v.fps === 'number' && v.fps > 0 && typeof dur === 'number' && dur > 0) {
+    return Math.round(v.fps * dur);
+  }
+  return undefined;
 }
 
 // ── runMatrix ──────────────────────────────────────────────────────────────────────────────────
@@ -887,6 +946,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             /* swallow */
           }
         }
+      }
+
+      // §9: stamp the case's primary ranking metric so the report ranks winners precisely (it only
+      // infers as a fallback). §8.5: record the engine's best-path config into env for reproducibility.
+      if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
+        result.primaryMetric = scenario.primaryMetric;
+      }
+      if (engine?.configUsed && result.env) {
+        result.env = { ...result.env, configUsed: engine.configUsed };
       }
 
       results.push(result);
