@@ -28,6 +28,8 @@ const MIME = {
   '.png': 'image/png',
   '.webp': 'image/webp',
   '.json': 'application/json',
+  '.js': 'text/javascript; charset=utf-8',
+  '.wasm': 'application/wasm',
   '.key': 'application/octet-stream', // HLS AES-128 key
 };
 
@@ -86,6 +88,70 @@ function fixturesStatic() {
         res.setHeader('Content-Length', String(st.size));
         res.end(buf);
       });
+    },
+  };
+}
+
+/** Serve /vendor/ffmpeg-wasm/** raw, ahead of Vite transforms, for classic Emscripten workers. */
+function ffmpegVendorStatic() {
+  const publicPrefix = '/vendor/ffmpeg-wasm/';
+  const vendorRoot = join(process.cwd(), 'src', 'engines', 'ffmpeg-wasm', 'vendor');
+  const vendorRootPrefix = vendorRoot.endsWith('/') ? vendorRoot : `${vendorRoot}/`;
+
+  const serve = (req, res, next) => {
+    const url = (req.url || '').split('?')[0];
+    if (!url.startsWith(publicPrefix)) return next();
+
+    const rel = decodeURIComponent(url.slice(publicPrefix.length));
+    const filePath = normalize(join(vendorRoot, rel));
+    if (!(filePath === vendorRoot || filePath.startsWith(vendorRootPrefix)) || !existsSync(filePath)) {
+      res.statusCode = 404;
+      return res.end('ffmpeg vendor: not found');
+    }
+    const st = statSync(filePath);
+    if (st.isDirectory()) {
+      res.statusCode = 404;
+      return res.end('ffmpeg vendor: is a directory');
+    }
+
+    const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
+    const buf = readFileSync(filePath);
+    res.setHeader('Content-Type', type);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Cache-Control', 'no-store');
+
+    const range = req.headers['range'];
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      let start = m && m[1] ? parseInt(m[1], 10) : 0;
+      let end = m && m[2] ? parseInt(m[2], 10) : st.size - 1;
+      if (Number.isNaN(start)) start = 0;
+      if (Number.isNaN(end) || end >= st.size) end = st.size - 1;
+      if (start > end || start >= st.size) {
+        res.statusCode = 416;
+        res.setHeader('Content-Range', `bytes */${st.size}`);
+        return res.end();
+      }
+      res.statusCode = 206;
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+      return res.end(buf.subarray(start, end + 1));
+    }
+
+    res.statusCode = 200;
+    res.setHeader('Content-Length', String(st.size));
+    res.end(buf);
+  };
+
+  return {
+    name: 'ffmpeg-vendor-static',
+    configureServer(server) {
+      server.middlewares.use(serve);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(serve);
     },
   };
 }
@@ -158,5 +224,5 @@ function saveEndpoint() {
 
 export default {
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
-  plugins: [crossOriginIsolation(), saveEndpoint(), fixturesStatic()],
+  plugins: [crossOriginIsolation(), ffmpegVendorStatic(), saveEndpoint(), fixturesStatic()],
 };

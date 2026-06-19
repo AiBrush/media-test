@@ -87,16 +87,17 @@ type WebcodecsModule = typeof import('@remotion/webcodecs');
 type BufferWriterModule = typeof import('@remotion/webcodecs/buffer');
 type MediaParserModule = typeof import('@remotion/media-parser');
 type WebReaderModule = typeof import('@remotion/media-parser/web');
+type SourceOptions = { src: string | Blob; reader?: WebReaderModule['webReader'] };
 
 interface LibHandle {
   wc: WebcodecsModule;
   bufferWriter: BufferWriterModule['bufferWriter'];
   mp: MediaParserModule;
   /**
-   * The HTTP/Blob-aware reader. Passed to parseMedia/convertMedia alongside `src: input.url` so the
-   * lib resolves m3u8 sibling segments from the base URL and exercises the dossier §A.1/§A.14
-   * HTTP-Range lazy-read fast path (read header/duration cheaply instead of force-buffering the whole
-   * file). Mirrors the proven-honest sibling remotion-media-parser adapter.
+   * The HTTP reader. Passed to parseMedia/convertMedia alongside `src: input.url` for normal corpus
+   * assets so the lib resolves m3u8 sibling segments from the base URL and exercises the dossier
+   * §A.1/§A.14 HTTP-Range lazy-read fast path. Mutated robustness inputs intentionally bypass this
+   * reader and use Blob sources so the engine sees the rewritten bytes rather than the pristine URL.
    */
   webReader: WebReaderModule['webReader'];
 }
@@ -245,6 +246,22 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     return this.lib;
   }
 
+  /**
+   * Choose the native Remotion source for this MediaInput.
+   *
+   * Normal corpus assets keep the URL + webReader path because that is the fast, range-friendly path
+   * and the only correct path for HLS sibling segment resolution. Mutated robustness inputs must use
+   * a Blob, because `input.url` still points at the pristine fixture while `blob()`/`arrayBuffer()`
+   * are where the runner applies the corruption/truncation.
+   */
+  private async sourceOptions(input: MediaInput): Promise<SourceOptions> {
+    const { webReader } = this.mustLib();
+    if (isHlsInput(input) || !input.mutated) {
+      return { src: input.url, reader: webReader };
+    }
+    return { src: await input.blob() };
+  }
+
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
   /**
    * Probe with media-parser. We request the "fast" header fields plus `tracks` (gives per-track
@@ -258,14 +275,11 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       return withVideoFpsFromPackets(metadata, packets);
     }
 
-    const { mp, webReader } = this.mustLib();
+    const { mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
 
     const result = await mp.parseMedia({
-      // src: input.url + webReader (NOT a buffered Blob): lets the lib resolve hls m3u8 sibling .ts
-      // segments from the base URL, and exercises the HTTP-Range lazy-read fast path so longform
-      // inputs report duration cheaply instead of force-buffering the whole file (dossier §A.1/§A.14).
-      src: input.url,
-      reader: webReader,
+      ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: {
         container: true,
@@ -275,7 +289,12 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       },
     });
 
-    return normalizeMetadata(result.container, result.durationInSeconds, result.tracks, result.metadata);
+    const container = await canonicalContainerForInput(input, result.container);
+    const metadata = normalizeMetadata(container, result.durationInSeconds, result.tracks, result.metadata);
+    if (!needsWebmFpsFallback(input, metadata)) return metadata;
+
+    const fps = await parseSlowFpsFallback(mp, srcOptions);
+    return fps == null ? metadata : withSingleMissingVideoFps(metadata, fps);
   }
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
@@ -294,7 +313,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * sorted the same way so packets[i].trackIndex aligns with metadata.tracks[trackIndex].
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
-    const { mp, webReader } = this.mustLib();
+    const { mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
 
     // Collect packets tagged with the raw container trackId; index is resolved AFTER the parse.
     const tagged: Array<{ trackId: number; packet: Omit<PacketInfo, 'trackIndex'> }> = [];
@@ -314,8 +334,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     };
 
     const result = await mp.parseMedia({
-      src: input.url,
-      reader: webReader,
+      ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: {
         container: true,
@@ -344,8 +363,9 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       ...packet,
     }));
 
+    const container = await canonicalContainerForInput(input, result.container);
     const metadata = normalizeMetadata(
-      result.container,
+      container,
       result.durationInSeconds,
       result.tracks,
       result.metadata,
@@ -421,19 +441,15 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       rotate?: number;
     },
   ): Promise<MediaBytes> {
-    const { wc, bufferWriter, mp, webReader } = this.mustLib();
-    // src: input.url + webReader (NOT a buffered Blob) so hls m3u8 sibling segments resolve from the
-    // base URL and the lib's HTTP-Range lazy reads work; a bare Blob has no base URL and force-buffers
-    // the whole file (dossier §A.1/§A.14). Mirrors the sibling remotion-media-parser adapter.
-    const src = input.url;
+    const { wc, bufferWriter, mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
 
     // Probe (fast, header-only) to size the MP4 moov in one pass (dossier §4.6).
     let expectedDurationInSeconds: number | null = null;
     let expectedFrameRate: number | null = null;
     try {
       const probed = await mp.parseMedia({
-        src,
-        reader: webReader,
+        ...srcOptions,
         acknowledgeRemotionLicense: true,
         fields: { durationInSeconds: true, fps: true },
       });
@@ -448,8 +464,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     // NOTE: convertMedia sets acknowledgeRemotionLicense:true internally and does NOT accept it as a
     // param (it would be an excess property); we only pass it to parseMedia above.
     const result = await wc.convertMedia({
-      src,
-      reader: webReader,
+      ...srcOptions,
       container: opts.container,
       videoCodec: opts.videoCodec,
       audioCodec: opts.audioCodec,
@@ -484,8 +499,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * re-index so the digest list is presentation-ordered (matching the golden frame ordering).
    */
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
-    const { wc, mp, webReader } = this.mustLib();
-    const src = input.url;
+    const { wc, mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
     const max = opts?.maxFrames ?? Infinity;
 
     const captured: Array<{ img: ImageData; ptsUs: number }> = [];
@@ -494,8 +509,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     let stopped = false;
 
     await mp.parseMedia({
-      src,
-      reader: webReader,
+      ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: { tracks: true },
       onVideoTrack: ({ track }) => {
@@ -577,8 +591,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * decodeFrames.
    */
   async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    const { wc, mp, webReader } = this.mustLib();
-    const src = input.url;
+    const { wc, mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
     const targetUs = Math.max(0, tUs);
 
     let best: { img: ImageData; ptsUs: number } | null = null;
@@ -589,8 +603,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     const controller = mp.mediaParserController();
 
     await mp.parseMedia({
-      src,
-      reader: webReader,
+      ...srcOptions,
       controller,
       acknowledgeRemotionLicense: true,
       fields: { tracks: true },
@@ -692,7 +705,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
  * it (probe path) tracks keep media-parser's natural order.
  */
 function normalizeMetadata(
-  container: import('@remotion/media-parser').MediaParserContainer,
+  container: string,
   durationInSeconds: number | null,
   tracks: import('@remotion/media-parser').MediaParserTrack[],
   metadata: import('@remotion/media-parser').MediaParserMetadataEntry[] | undefined,
@@ -708,7 +721,7 @@ function normalizeMetadata(
   const normalized: NormalizedTrack[] = ordered.map((t) => normalizeTrack(t));
 
   const meta: NormalizedMetadata = {
-    container: parserContainerToCanonical(container),
+    container,
     durationSec: typeof durationInSeconds === 'number' && Number.isFinite(durationInSeconds)
       ? durationInSeconds
       : null,
@@ -719,6 +732,94 @@ function normalizeMetadata(
   if (tags && Object.keys(tags).length) meta.tags = tags;
 
   return meta;
+}
+
+async function canonicalContainerForInput(
+  input: MediaInput,
+  parsedContainer: import('@remotion/media-parser').MediaParserContainer,
+): Promise<string> {
+  const canonical = parserContainerToCanonical(parsedContainer);
+  if (canonical !== 'mp4') return canonical;
+
+  const brands = isoBmffBrandsFromPrefix(await readInputPrefix(input, 64));
+  return brands.some(isQuickTimeBrand) ? 'mov' : canonical;
+}
+
+async function readInputPrefix(input: MediaInput, length: number): Promise<Uint8Array | null> {
+  if (input.mutated) {
+    const bytes = new Uint8Array(await input.arrayBuffer());
+    return bytes.slice(0, length);
+  }
+
+  try {
+    const res = await fetch(input.url, {
+      cache: 'no-store',
+      headers: { Range: `bytes=0-${length - 1}` },
+    });
+    if (!res.ok) return null;
+    if (res.status === 206) {
+      return new Uint8Array(await res.arrayBuffer()).slice(0, length);
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) return new Uint8Array(await res.arrayBuffer()).slice(0, length);
+
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (total < length) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+    return concatPrefix(chunks, Math.min(total, length));
+  } catch {
+    return null;
+  }
+}
+
+function concatPrefix(chunks: Uint8Array[], length: number): Uint8Array {
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const take = Math.min(chunk.byteLength, length - offset);
+    out.set(chunk.subarray(0, take), offset);
+    offset += take;
+    if (offset >= length) break;
+  }
+  return out;
+}
+
+function isoBmffBrandsFromPrefix(prefix: Uint8Array | null): string[] {
+  if (!prefix || prefix.byteLength < 16 || ascii(prefix, 4, 8) !== 'ftyp') return [];
+  const boxSize = readUint32Be(prefix, 0);
+  const end = Math.min(boxSize > 0 ? boxSize : prefix.byteLength, prefix.byteLength);
+  const brands = [ascii(prefix, 8, 12)];
+  for (let i = 16; i + 4 <= end; i += 4) brands.push(ascii(prefix, i, i + 4));
+  return brands;
+}
+
+function readUint32Be(bytes: Uint8Array, offset: number): number {
+  return (
+    ((bytes[offset] ?? 0) * 0x1000000) +
+    ((bytes[offset + 1] ?? 0) << 16) +
+    ((bytes[offset + 2] ?? 0) << 8) +
+    (bytes[offset + 3] ?? 0)
+  );
+}
+
+function ascii(bytes: Uint8Array, start: number, end: number): string {
+  let out = '';
+  for (let i = start; i < end; i++) out += String.fromCharCode(bytes[i] ?? 0);
+  return out;
+}
+
+function isQuickTimeBrand(brand: string): boolean {
+  return brand === 'qt  ' || brand.trim() === 'qt';
 }
 
 function normalizeTrack(t: import('@remotion/media-parser').MediaParserTrack): NormalizedTrack {
@@ -765,13 +866,46 @@ function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketIn
   return { ...metadata, tracks };
 }
 
+function needsWebmFpsFallback(input: MediaInput, metadata: NormalizedMetadata): boolean {
+  if (metadata.container !== 'webm') return false;
+  const sourceHint = `${input.id || ''} ${input.url || ''} ${input.mime || ''}`.toLowerCase();
+  if (!sourceHint.includes('webm')) return false;
+
+  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
+  return videoTracks.length === 1 && videoTracks[0]?.fps == null;
+}
+
+async function parseSlowFpsFallback(mp: MediaParserModule, srcOptions: SourceOptions): Promise<number | null> {
+  const result = await mp.parseMedia({
+    ...srcOptions,
+    acknowledgeRemotionLicense: true,
+    fields: { slowFps: true },
+  });
+  const fps = result.slowFps;
+  return typeof fps === 'number' && Number.isFinite(fps) && fps > 0 ? fps : null;
+}
+
+function withSingleMissingVideoFps(metadata: NormalizedMetadata, fps: number): NormalizedMetadata {
+  let applied = false;
+  const tracks = metadata.tracks.map((track) => {
+    if (track.type !== 'video' || track.fps != null || applied) return track;
+    applied = true;
+    return { ...track, fps };
+  });
+  return applied ? { ...metadata, tracks } : metadata;
+}
+
 function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {
-  if (!packets.length) return null;
+  return fpsFromPts(packets.map((packet) => packet.ptsUs), durationSec);
+}
+
+function fpsFromPts(ptsUs: number[], durationSec: number | null): number | null {
+  if (!ptsUs.length) return null;
   if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
-    return packets.length / durationSec;
+    return ptsUs.length / durationSec;
   }
-  if (packets.length < 2) return null;
-  const pts = packets.map((packet) => packet.ptsUs).sort((a, b) => a - b);
+  if (ptsUs.length < 2) return null;
+  const pts = [...ptsUs].sort((a, b) => a - b);
   const spanUs = pts[pts.length - 1]! - pts[0]!;
   return spanUs > 0 ? ((pts.length - 1) * 1_000_000) / spanUs : null;
 }

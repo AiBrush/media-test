@@ -98,7 +98,7 @@ async function probeViaVideoElement(
   }
 }
 
-/** Estimate fps from demuxed samples as average sample rate; fall back to median interval. */
+/** Estimate fps from demuxed samples as average sample rate; fall back to observed PTS intervals. */
 function fpsFromSamples(samples: Array<{ ptsUs: number; durationUs?: number }>): number | undefined {
   if (samples.length === 0) return undefined;
   if (samples.length === 1) {
@@ -106,6 +106,7 @@ function fpsFromSamples(samples: Array<{ ptsUs: number; durationUs?: number }>):
     return durationUs && durationUs > 0 ? Math.round((1_000_000 / durationUs) * 1000) / 1000 : undefined;
   }
 
+  const hasDurations = samples.some((s) => (s.durationUs ?? 0) > 0);
   let minStart = Number.POSITIVE_INFINITY;
   let maxEnd = Number.NEGATIVE_INFINITY;
   for (const s of samples) {
@@ -113,11 +114,18 @@ function fpsFromSamples(samples: Array<{ ptsUs: number; durationUs?: number }>):
     maxEnd = Math.max(maxEnd, s.ptsUs + (s.durationUs || 0));
   }
   const spanUs = maxEnd - minStart;
-  if (Number.isFinite(spanUs) && spanUs > 0) {
+  if (hasDurations && Number.isFinite(spanUs) && spanUs > 0) {
     return Math.round(((samples.length * 1_000_000) / spanUs) * 1000) / 1000;
   }
 
   const sorted = samples.map((s) => s.ptsUs).sort((a, b) => a - b);
+  const ptsSpanUs = sorted[sorted.length - 1]! - sorted[0]!;
+  // WebM SimpleBlock packets usually omit per-frame durations. In that case last PTS - first PTS
+  // spans N-1 frame intervals; counting N frames over that span overstates 30fps as ~30.1fps.
+  if (Number.isFinite(ptsSpanUs) && ptsSpanUs > 0) {
+    return Math.round((((sorted.length - 1) * 1_000_000) / ptsSpanUs) * 1000) / 1000;
+  }
+
   const deltas: number[] = [];
   for (let i = 1; i < sorted.length; i++) {
     const d = sorted[i]! - sorted[i - 1]!;

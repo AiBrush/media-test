@@ -131,7 +131,7 @@ export interface RemotionMediaParserConfig {
    * parser). See chooseSrcOptions(). (dossier §3.3 points 2-3.)
    */
   reader: 'webReader' | 'blob';
-  fieldsTier: 'metadata-only' | 'full-parse(demux)';
+  fieldsTier: 'metadata-only' | 'full-parse(demux)' | 'full-parse(fps)';
   coreBuild: 'n/a';
   version: string;
 }
@@ -369,7 +369,19 @@ export class RemotionMediaParserEngine implements MediaEngine {
       'metadata-only',
     );
 
-    return this.toNormalizedMetadata(result);
+    const metadata = this.toNormalizedMetadata(result);
+    if (!needsSingleVideoFpsFallback(metadata)) return metadata;
+
+    const slow = await this.runParse<{ slowFps: number }>(
+      {
+        ...srcOptions,
+        acknowledgeRemotionLicense: ACK_LICENSE,
+        fields: { slowFps: true },
+      },
+      'full-parse(fps)',
+    );
+
+    return withSingleVideoFps(metadata, slow.slowFps);
   }
 
   // ── demux ──────────────────────────────────────────────────────────────────────────────────
@@ -562,6 +574,19 @@ function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketIn
     );
     return fps == null ? track : { ...track, fps };
   });
+  return { ...metadata, tracks };
+}
+
+function needsSingleVideoFpsFallback(metadata: NormalizedMetadata): boolean {
+  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
+  return videoTracks.length === 1 && videoTracks[0]?.fps == null;
+}
+
+function withSingleVideoFps(metadata: NormalizedMetadata, fps: number | null | undefined): NormalizedMetadata {
+  if (fps == null || !Number.isFinite(fps) || fps <= 0) return metadata;
+  const tracks = metadata.tracks.map((track) =>
+    track.type === 'video' && track.fps == null ? { ...track, fps } : track,
+  );
   return { ...metadata, tracks };
 }
 

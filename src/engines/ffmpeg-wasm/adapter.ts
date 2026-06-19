@@ -59,13 +59,16 @@
 
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
-// Same-origin, locally vendored core files (NO CDN, NO toBlobURL). `?url` makes Vite emit each file
-// verbatim as a same-origin asset and hand us its served URL string.
-import coreMtJsUrl from './vendor/core-mt/ffmpeg-core.js?url';
-import coreMtWasmUrl from './vendor/core-mt/ffmpeg-core.wasm?url';
-import coreMtWorkerUrl from './vendor/core-mt/ffmpeg-core.worker.js?url';
-import coreStJsUrl from './vendor/core/ffmpeg-core.js?url';
-import coreStWasmUrl from './vendor/core/ffmpeg-core.wasm?url';
+// Same-origin, locally vendored core files (NO CDN, NO toBlobURL). These are served by the
+// /vendor/ffmpeg-wasm/ raw-static Vite middleware. Do not import the Emscripten core files via
+// `?url`: Vite dev transforms `.js` assets into module-flavored code, while the mt core launches its
+// pthread helper with classic `new Worker(url)`, which would throw "Cannot use import statement
+// outside a module".
+const coreMtJsUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.js';
+const coreMtWasmUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.wasm';
+const coreMtWorkerUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.worker.js';
+const coreStJsUrl = '/vendor/ffmpeg-wasm/core/ffmpeg-core.js';
+const coreStWasmUrl = '/vendor/ffmpeg-wasm/core/ffmpeg-core.wasm';
 // The @ffmpeg/ffmpeg "class worker" — the essential worker FFmpeg.load() spawns. MUST be passed as
 // classWorkerURL under bundlers: its default './worker.js' does NOT resolve in Vite, so load() hangs
 // forever (verified — both mt and st cores stalled until this was supplied). worker.js has relative

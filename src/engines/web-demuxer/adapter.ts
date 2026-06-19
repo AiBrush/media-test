@@ -159,13 +159,29 @@ function canonicalCodec(name: string | undefined): string {
   }
 }
 
+function isoBmffContainerFromInput(input: MediaInput): 'mp4' | 'mov' | undefined {
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  if (name.endsWith('.mov')) return 'mov';
+  if (name.endsWith('.mp4') || name.endsWith('.m4a') || name.endsWith('.m4v')) return 'mp4';
+  return undefined;
+}
+
 /** Map an FFmpeg format_name list (e.g. 'mov,mp4,m4a,3gp,3g2,mj2') → a canonical container token. */
-function canonicalContainer(formatName: string | undefined): string {
+function canonicalContainer(formatName: string | undefined, input: MediaInput): string {
   const names = (formatName ?? '').toLowerCase().split(',').map((s) => s.trim());
   const has = (t: string) => names.some((n) => n === t || n.includes(t));
-  // Order matters: webm before matroska (webm is a matroska subset), mp4 before mov ambiguity.
+  // Order matters: webm before matroska (webm is a matroska subset).
   if (has('webm')) return 'webm';
   if (has('matroska') || has('mkv')) return 'mkv';
+
+  // FFmpeg exposes MOV/MP4/M4A/M4V through one demuxer family name. Use the corpus input suffix only
+  // to break that specific tie; otherwise the first MP4 token would mislabel real .mov inputs.
+  const isIsoBmffFamily = has('mov') && (has('mp4') || has('m4a') || has('m4v'));
+  if (isIsoBmffFamily) {
+    const hinted = isoBmffContainerFromInput(input);
+    if (hinted) return hinted;
+  }
+
   if (has('mp4') || has('m4a') || has('m4v')) return 'mp4';
   if (has('mov') || has('quicktime') || has('qt')) return 'mov';
   if (has('mpegts') || has('mpeg-ts') || has('mpegtsraw') || names.includes('ts')) return 'ts';
@@ -271,8 +287,8 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
 }
 
 /** Build NormalizedMetadata from a WebMediaInfo (+ its embedded streams). */
-function toNormalizedMetadata(info: WebMediaInfo): NormalizedMetadata {
-  const container = canonicalContainer(info.format_name);
+function toNormalizedMetadata(info: WebMediaInfo, input: MediaInput): NormalizedMetadata {
+  const container = canonicalContainer(info.format_name, input);
   const durationSec =
     Number.isFinite(info.duration) && info.duration > 0 ? info.duration : null;
   const tracks = (info.streams ?? []).map(normalizeStream);
@@ -453,7 +469,7 @@ export class WebDemuxerEngine implements MediaEngine {
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const d = await this.loadInput(input);
     const info = await d.getMediaInfo();
-    return toNormalizedMetadata(info);
+    return toNormalizedMetadata(info, input);
   }
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
@@ -482,7 +498,7 @@ export class WebDemuxerEngine implements MediaEngine {
   async demux(input: MediaInput): Promise<DemuxResult> {
     const d = await this.loadInput(input);
     const info = await d.getMediaInfo();
-    const metadata = toNormalizedMetadata(info);
+    const metadata = toNormalizedMetadata(info, input);
     const streams = await d.getAVStreams();
 
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
