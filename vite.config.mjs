@@ -7,7 +7,7 @@
 //
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, normalize } from 'node:path';
 
 const MIME = {
@@ -32,6 +32,68 @@ const MIME = {
   '.wasm': 'application/wasm',
   '.key': 'application/octet-stream', // HLS AES-128 key
 };
+
+function parseByteRange(range, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(range || '').trim());
+  if (!m) return null;
+
+  const startRaw = m[1];
+  const endRaw = m[2];
+  if (!startRaw && !endRaw) return null;
+
+  let start;
+  let end;
+  if (!startRaw) {
+    const suffix = Number.parseInt(endRaw, 10);
+    if (!Number.isFinite(suffix) || suffix <= 0) return null;
+    start = Math.max(size - suffix, 0);
+    end = size - 1;
+  } else {
+    start = Number.parseInt(startRaw, 10);
+    end = endRaw ? Number.parseInt(endRaw, 10) : size - 1;
+  }
+
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  if (end >= size) end = size - 1;
+  if (start > end || start >= size) return { unsatisfiable: true };
+  return { start, end };
+}
+
+function streamStaticFile(req, res, filePath, st, type, corp) {
+  res.setHeader('Content-Type', type);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', corp);
+  res.setHeader('Cache-Control', 'no-store');
+
+  const range = req.headers['range'];
+  const parsed = range ? parseByteRange(range, st.size) : null;
+  if (parsed?.unsatisfiable) {
+    res.statusCode = 416;
+    res.setHeader('Content-Range', `bytes */${st.size}`);
+    return res.end();
+  }
+
+  const start = parsed ? parsed.start : 0;
+  const end = parsed ? parsed.end : st.size - 1;
+  if (parsed) {
+    res.statusCode = 206;
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`);
+    res.setHeader('Content-Length', String(end - start + 1));
+  } else {
+    res.statusCode = 200;
+    res.setHeader('Content-Length', String(st.size));
+  }
+
+  if (req.method === 'HEAD') return res.end();
+
+  const stream = createReadStream(filePath, { start, end });
+  stream.on('error', (err) => {
+    if (!res.headersSent) res.statusCode = 500;
+    res.end(`static stream error: ${err?.message || err}`);
+  });
+  stream.pipe(res);
+}
 
 /** Serve /fixtures/** raw, with Range support, ahead of vite's transform pipeline. */
 function fixturesStatic() {
@@ -58,35 +120,8 @@ function fixturesStatic() {
         }
 
         const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
-        const buf = readFileSync(filePath);
-        res.setHeader('Content-Type', type);
-        res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Access-Control-Allow-Origin', '*');
         // Under COEP: require-corp, every subresource needs a CORP header to be loadable.
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-        res.setHeader('Cache-Control', 'no-store');
-
-        const range = req.headers['range'];
-        if (range) {
-          const m = /bytes=(\d*)-(\d*)/.exec(range);
-          let start = m && m[1] ? parseInt(m[1], 10) : 0;
-          let end = m && m[2] ? parseInt(m[2], 10) : st.size - 1;
-          if (Number.isNaN(start)) start = 0;
-          if (Number.isNaN(end) || end >= st.size) end = st.size - 1;
-          if (start > end || start >= st.size) {
-            res.statusCode = 416;
-            res.setHeader('Content-Range', `bytes */${st.size}`);
-            return res.end();
-          }
-          res.statusCode = 206;
-          res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`);
-          res.setHeader('Content-Length', String(end - start + 1));
-          return res.end(buf.subarray(start, end + 1));
-        }
-
-        res.statusCode = 200;
-        res.setHeader('Content-Length', String(st.size));
-        res.end(buf);
+        return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
       });
     },
   };
@@ -115,34 +150,7 @@ function ffmpegVendorStatic() {
     }
 
     const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
-    const buf = readFileSync(filePath);
-    res.setHeader('Content-Type', type);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-    res.setHeader('Cache-Control', 'no-store');
-
-    const range = req.headers['range'];
-    if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
-      let start = m && m[1] ? parseInt(m[1], 10) : 0;
-      let end = m && m[2] ? parseInt(m[2], 10) : st.size - 1;
-      if (Number.isNaN(start)) start = 0;
-      if (Number.isNaN(end) || end >= st.size) end = st.size - 1;
-      if (start > end || start >= st.size) {
-        res.statusCode = 416;
-        res.setHeader('Content-Range', `bytes */${st.size}`);
-        return res.end();
-      }
-      res.statusCode = 206;
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`);
-      res.setHeader('Content-Length', String(end - start + 1));
-      return res.end(buf.subarray(start, end + 1));
-    }
-
-    res.statusCode = 200;
-    res.setHeader('Content-Length', String(st.size));
-    res.end(buf);
+    return streamStaticFile(req, res, filePath, st, type, 'same-origin');
   };
 
   return {

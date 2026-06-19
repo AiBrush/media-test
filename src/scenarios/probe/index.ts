@@ -129,14 +129,20 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'CENC ctr: probe reports container/track/encryption scheme without decrypting.',
+    features: ['metadata:protected-tracks'],
+    notes:
+      'CENC ctr: probe reports protected MP4 track metadata (container/tracks/duration) without ' +
+      'decrypting. Encryption-scheme assertions wait until the normalized metadata shape carries it.',
   },
   {
     asset: 'cenc_cbcs.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'CENC cbcs: same — metadata only, no decrypt.',
+    features: ['metadata:protected-tracks'],
+    notes:
+      'CENC cbcs: probe reports protected MP4 track metadata without decrypting; no decrypt key is ' +
+      'needed for metadata-only validation.',
   },
 
   // ── Audio ──

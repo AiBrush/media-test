@@ -104,6 +104,7 @@ const MATRIX_CASES: RemuxCase[] = [
     to: 'webm',
     videoCodecs: ['av1'],
     audioCodecs: ['opus'],
+    features: ['remux:av1-opus-in-webm'],
     notes: 'AV1/Opus WebM->WebM identity re-mux: AV1 video through the WebM writer (av1C in Matroska).',
   },
 
@@ -127,6 +128,7 @@ const MATRIX_CASES: RemuxCase[] = [
     to: 'mp4',
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
+    features: ['remux:vp9-opus-in-mp4'],
     notes:
       'VP9/Opus WebM->MP4: VP9 is a legal ISO-BMFF sample entry (vp09 + vpcC) — lossless re-wrap, NOT ' +
       'a transcode (the legacy exclusion premise was factually wrong). Mirrors the av1 webm->mp4 cell.',

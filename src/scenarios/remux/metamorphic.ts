@@ -93,6 +93,7 @@ const PROPERTY_CASES: RemuxPropertyCase[] = [
     from: 'mp3',
     to: 'mp4',
     audioCodecs: ['mp3'],
+    features: ['remux:mp3-in-mp4'],
     notes: 'MP3->MP4 audio duration invariance: Xing frame count -> precise MP4 duration. Audio sample-fidelity proxy.',
   },
 

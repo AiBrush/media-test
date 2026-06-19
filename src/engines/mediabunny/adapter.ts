@@ -161,14 +161,21 @@ function isHlsAsset(input: MediaInput, container?: string): boolean {
   return /\.m3u8?$/i.test(u);
 }
 
+function isBlobUrl(url: string): boolean {
+  return /^blob:/i.test(url);
+}
+
 /** Build a mediabunny Input from a corpus asset. Restricts formats to the asset's container when
  *  known (faster, deterministic), else accepts ALL_FORMATS.
  *
  *  SOURCE CHOICE: normal corpus assets use UrlSource so Mediabunny can range-read headers/sample
  *  tables instead of forcing Chromium to materialize huge files as Blobs. Mutated robustness inputs
  *  are the exception: the runner rewrites bytes in memory, so those must use BlobSource to ensure the
- *  engine sees the corrupted payload. HLS also requires a PathedSource because playlists resolve
- *  sibling segment/key URLs relative to the playlist path. */
+ *  engine sees the corrupted payload. Blob URLs are already in-memory outputs from suite oracles, so
+ *  reading them through fetch-backed UrlSource (or Brave's Blob stream path) can trip the browser's
+ *  blob-resource memory/read errors; BufferSource consumes the already-owned bytes directly. HLS also
+ *  requires a PathedSource because playlists resolve sibling segment/key URLs relative to the playlist
+ *  path. */
 async function openInput(mb: MB, input: MediaInput, container?: string): Promise<Input> {
   if (isHlsAsset(input, container)) {
     // PathedSource (UrlSource) is mandatory for HLS segment resolution. The library's HLS_FORMATS
@@ -182,6 +189,13 @@ async function openInput(mb: MB, input: MediaInput, container?: string): Promise
   if (container) {
     const f = inputFormatForContainer(container);
     if (f) formats.push(f);
+  }
+  if (isBlobUrl(input.url)) {
+    const buffer = await input.arrayBuffer();
+    return new mb.Input({
+      source: new mb.BufferSource(buffer),
+      formats: formats.length ? formats : mb.ALL_FORMATS,
+    });
   }
   if (!input.mutated) {
     return new mb.Input({
@@ -664,10 +678,15 @@ export class MediabunnyEngine implements MediaEngine {
         'fastStart:reserve', // fastStart: 'reserve'
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'metadata:write', // Output.setMetadataTags / Conversion tags
+        'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
         'resize', // Conversion video width/height
         'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
         'alpha', // VP9 alpha (WebM/MKV) via alpha:'keep'
         'hls:aes128', // read/probe AES-128 HLS playlists; decrypt() still does not expose hls-aes128
+        'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
+        'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
+        'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
+        'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
         // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
         // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
         // returns a SINGLE blob, so transcode() can only deliver variants[0] — it cannot surface the

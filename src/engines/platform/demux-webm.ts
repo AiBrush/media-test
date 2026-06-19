@@ -319,8 +319,10 @@ interface WebmTrackDesc {
 /**
  * Enumerate EVERY parseable track (video + audio) of a WebM/MKV in CONTAINER ORDER (Tracks declaration
  * order), each with its ordered frames from the Clusters, so a caller can assign trackIndex 0,1,2,… to
- * match a multi-track golden and emit honest probe metadata. WebM frames are in PTS order (no B-frames
- * for VP8/VP9; PTS==DTS). Tracks whose codec this minimal demuxer cannot identify are skipped (honest).
+ * match a multi-track golden and emit honest probe metadata. VP8/VP9 WebM frames are effectively in
+ * PTS order (PTS==DTS), but H.264/HEVC-in-MKV may carry B-frame reorder where Matroska block order is
+ * the only decode-order signal this minimal demuxer has. Tracks whose codec this minimal demuxer
+ * cannot identify are skipped (honest).
  * Throws {@link UnsupportedWebmError} for a missing Segment or when NO track is parseable.
  */
 export function demuxWebmTracks(bytes: Uint8Array): WebmTrack[] {
@@ -478,12 +480,15 @@ export function demuxWebmTracks(bytes: Uint8Array): WebmTrack[] {
     }
   }
 
-  // Sort each track's samples by PTS (clusters are ordered, but defensive) and drop tracks with no
-  // frames (a declared track that produced no packets would mismatch a golden's layout).
+  // Sort PTS==DTS codecs defensively, but preserve Matroska block order for B-frame-capable codecs.
+  // The WebCodecs driver feeds samples in array order, then sorts decoded VideoFrames by PTS before
+  // digesting, so H.264/HEVC must keep container decode order here.
   const out: WebmTrack[] = [];
   for (const d of descs) {
     if (d.track.samples.length === 0) continue;
-    d.track.samples.sort((a, b) => a.ptsUs - b.ptsUs);
+    const keepBlockOrder =
+      d.track.kind === 'video' && (d.track.config.codec === 'h264' || d.track.config.codec === 'hevc');
+    if (!keepBlockOrder) d.track.samples.sort((a, b) => a.ptsUs - b.ptsUs);
     out.push(d.track);
   }
   if (out.length === 0) throw new UnsupportedWebmError('no frames decoded from WebM/MKV clusters');

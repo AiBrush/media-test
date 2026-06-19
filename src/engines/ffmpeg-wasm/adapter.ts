@@ -663,8 +663,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       'trim:frame-accurate', // output-seek re-encode
       'fragmented', // -movflags frag_keyframe+empty_moov
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
+      'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
       'packets:dts', // framecrc exposes packet dts separately from pts
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
+      'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
+      'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
     ];
   }
 
@@ -1132,10 +1135,15 @@ export class FfmpegWasmEngine implements MediaEngine {
     const outName = `${base}.out.${containerExt(opts.container)}`;
     await this.writeInput(input, inName);
     try {
-      // Stream copy: no re-encode, just rewrap. +faststart hint is mp4/mov-only.
-      const args = ['-i', inName, '-c', 'copy'];
+      // Stream copy: no re-encode, just rewrap. Explicitly map every input stream so ffmpeg's
+      // default "one stream per type" selection does not drop secondary audio tracks.
+      const args = ['-i', inName, '-map', '0', '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         args.push('-movflags', '+faststart');
+      } else if (opts.container === 'ts') {
+        // FFmpeg's MPEG-TS muxer defaults to a ~1.4s preload/start offset. Keep remuxed TS output
+        // origin-normalized so duration-based re-import checks measure media length, not PTS origin.
+        args.push('-muxdelay', '0', '-muxpreload', '0');
       }
       // Metadata WRITE (dossier §A.11): `-metadata key=value` per tag, still lossless under -c copy.
       // The 'metadata:write' feature is gated OFF in featureList() until the runner forwards tags to

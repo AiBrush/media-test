@@ -171,6 +171,23 @@ interface BoxNode {
   data_format?: string;
 }
 
+interface DescriptorNode {
+  tag?: number;
+  data?: unknown;
+  descs?: DescriptorNode[];
+}
+
+interface EsdsBoxNode extends BoxNode {
+  esd?: DescriptorNode;
+}
+
+interface AudioSampleEntryNode extends BoxNode {
+  version?: number;
+  extensions?: unknown;
+  esds?: EsdsBoxNode;
+  wave?: BoxNode & { esds?: EsdsBoxNode };
+}
+
 function findChildBox(node: BoxNode | undefined, fourcc: string): BoxNode | undefined {
   if (!node || !node.boxes) return undefined;
   for (const b of node.boxes) {
@@ -179,18 +196,26 @@ function findChildBox(node: BoxNode | undefined, fourcc: string): BoxNode | unde
   return undefined;
 }
 
+function sampleEntryForTrack(file: Mp4ISOFile, trackId: number, rawCodec?: string): BoxNode | undefined {
+  const trak = file.getTrackById(trackId);
+  const entries = trak?.mdia?.minf?.stbl?.stsd?.entries;
+  if (!entries || !entries.length) return undefined;
+  if (rawCodec) {
+    const wanted = rawCodec.toLowerCase();
+    const match = entries.find((e) => ((e as unknown as BoxNode).type ?? '').toLowerCase() === wanted);
+    if (match) return match as unknown as BoxNode;
+  }
+  return entries[0] as unknown as BoxNode;
+}
+
 function unwrapEncryptedCodec(file: Mp4ISOFile, trackId: number, rawCodec: string): string | undefined {
   if (!ENCRYPTED_ENTRY_TYPES.has(rawCodec.toLowerCase())) return undefined;
   // Defensive: only enc* tracks reach here; a malformed/partial box tree must never turn a clean
   // probe into an ERROR — on any surprise we fall back to the wrapper four-cc (caller uses t.codec).
   try {
     // getTrackById → trakBox; mdia.minf.stbl.stsd.entries[] are SampleEntry boxes.
-    const trak = file.getTrackById(trackId);
-    const entries = trak?.mdia?.minf?.stbl?.stsd?.entries;
-    if (!entries || !entries.length) return undefined;
-    // Find the protected entry (its type matches the rawCodec) — fall back to the first entry.
-    const entry =
-      (entries.find((e) => (e as unknown as BoxNode).type === rawCodec) ?? entries[0]) as unknown as BoxNode;
+    const entry = sampleEntryForTrack(file, trackId, rawCodec);
+    if (!entry) return undefined;
     const sinf = findChildBox(entry, 'sinf');
     const frma = findChildBox(sinf, 'frma');
     const fmt = frma?.data_format;
@@ -232,6 +257,104 @@ function rotationFromMatrix(
 function canonicalContainer(brands: string[] | undefined): string {
   if (brands && brands.some((b) => b === 'qt  ' || b === 'qt')) return 'mov';
   return 'mp4';
+}
+
+const AAC_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+] as const;
+const AAC_CHANNELS_BY_CONFIG = [undefined, 1, 2, 3, 4, 5, 6, 8] as const;
+
+function validAudioSampleRate(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 7350 && value <= 384000;
+}
+
+function validAudioChannels(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 32;
+}
+
+function bytesFromUnknown(value: unknown): Uint8Array | undefined {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (!value || typeof value !== 'object') return undefined;
+  const len = (value as { length?: unknown }).length;
+  if (typeof len !== 'number' || !Number.isFinite(len) || len < 0) return undefined;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    const b = (value as Record<number, unknown>)[i];
+    if (typeof b !== 'number') return undefined;
+    out[i] = b & 0xff;
+  }
+  return out;
+}
+
+function findDescriptorData(desc: DescriptorNode | undefined, tag: number): Uint8Array | undefined {
+  if (!desc) return undefined;
+  if (desc.tag === tag) {
+    const data = bytesFromUnknown(desc.data);
+    if (data) return data;
+  }
+  for (const child of desc.descs ?? []) {
+    const data = findDescriptorData(child, tag);
+    if (data) return data;
+  }
+  return undefined;
+}
+
+function audioSpecificConfigFromEntry(entry: AudioSampleEntryNode): Uint8Array | undefined {
+  const wave = (entry.wave ?? findChildBox(entry, 'wave')) as (BoxNode & { esds?: EsdsBoxNode }) | undefined;
+  const esds = entry.esds ?? wave?.esds ?? (findChildBox(entry, 'esds') as EsdsBoxNode | undefined);
+  return findDescriptorData(esds?.esd, 5);
+}
+
+function aacParamsFromAudioSpecificConfig(data: Uint8Array | undefined): {
+  sampleRate?: number;
+  channels?: number;
+} {
+  if (!data || data.length < 2) return {};
+  const first = data[0];
+  const second = data[1];
+  if (first === undefined || second === undefined) return {};
+  const freqIndex = ((first & 0x07) << 1) | (second >> 7);
+  const sampleRate = AAC_SAMPLE_RATES[freqIndex];
+  const channelConfig = (second >> 3) & 0x0f;
+  const channels = AAC_CHANNELS_BY_CONFIG[channelConfig];
+  return {
+    ...(validAudioSampleRate(sampleRate) ? { sampleRate } : {}),
+    ...(validAudioChannels(channels) ? { channels } : {}),
+  };
+}
+
+function quickTimeV2AudioParams(entry: AudioSampleEntryNode): { sampleRate?: number; channels?: number } {
+  if (entry.version !== 2) return {};
+  const ext = bytesFromUnknown(entry.extensions);
+  if (!ext || ext.byteLength < 16) return {};
+  const view = new DataView(ext.buffer, ext.byteOffset, ext.byteLength);
+  const sampleRateFloat = view.getFloat64(4, false);
+  const sampleRate = Number.isFinite(sampleRateFloat) ? Math.round(sampleRateFloat) : undefined;
+  const channels = view.getUint32(12, false);
+  return {
+    ...(validAudioSampleRate(sampleRate) ? { sampleRate } : {}),
+    ...(validAudioChannels(channels) ? { channels } : {}),
+  };
+}
+
+function audioParamsFromSampleEntry(
+  file: Mp4ISOFile,
+  trackId: number,
+  rawCodec: string,
+): { sampleRate?: number; channels?: number } {
+  try {
+    const entry = sampleEntryForTrack(file, trackId, rawCodec) as AudioSampleEntryNode | undefined;
+    if (!entry) return {};
+    const qtV2 = quickTimeV2AudioParams(entry);
+    const asc = aacParamsFromAudioSpecificConfig(audioSpecificConfigFromEntry(entry));
+    return {
+      sampleRate: qtV2.sampleRate ?? asc.sampleRate,
+      channels: qtV2.channels ?? asc.channels,
+    };
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -280,8 +403,11 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
       const rot = rotationFromMatrix(t.matrix);
       if (rot !== undefined) track.rotation = rot;
     } else if (type === 'audio') {
-      track.sampleRate = t.audio?.sample_rate;
-      track.channels = t.audio?.channel_count;
+      // QuickTime AudioSampleEntry v2 stores the real rate/channel count in the v2 extension (and
+      // AAC also repeats it in esds). mp4box's base getInfo() values can be legacy placeholders.
+      const audioParams = audioParamsFromSampleEntry(file, t.id, rawCodec);
+      track.sampleRate = audioParams.sampleRate ?? t.audio?.sample_rate;
+      track.channels = audioParams.channels ?? t.audio?.channel_count;
     }
     return track;
   });
@@ -353,10 +479,18 @@ export class Mp4boxEngine implements MediaEngine {
       // 'metadata:read'     : probe reads duration/dims/fps/rotation/brands/language; unwraps CENC
       //                       'encv'/'enca' to the original codec via sinf→frma.data_format, and
       //                       derives video fps from fragment_duration for fragmented inputs.
+      // 'metadata:protected-tracks': CENC protected sample entries are unwrapped for track metadata.
       // 'webcodecs:demux-feed': demux output feeds WebCodecs EncodedVideoChunk/description.
       // 'webcodecs:independent': probe/demux/remux are pure-JS and never touch the browser codec
       //                          gate, so the runner must not browser-gate them on codec availability.
-      features: ['fragmented', 'metadata:read', 'packets:dts', 'webcodecs:demux-feed', 'webcodecs:independent'],
+      features: [
+        'fragmented',
+        'metadata:read',
+        'metadata:protected-tracks',
+        'packets:dts',
+        'webcodecs:demux-feed',
+        'webcodecs:independent',
+      ],
     };
   }
 

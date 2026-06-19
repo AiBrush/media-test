@@ -93,6 +93,7 @@ const REMUX_CASES: RemuxCase[] = [
     to: 'mp4',
     videoCodecs: ['av1'],
     audioCodecs: ['opus'],
+    features: ['remux:av1-opus-in-mp4'],
     notes: 'AV1 + Opus are both legal in mp4 — lossless remux out of webm.',
   },
 
@@ -114,6 +115,7 @@ const REMUX_CASES: RemuxCase[] = [
     from: 'mp3',
     to: 'mp4',
     audioCodecs: ['mp3'],
+    features: ['remux:mp3-in-mp4'],
     notes: 'MP3 is legal in MP4 — lossless audio remux.',
   },
   {

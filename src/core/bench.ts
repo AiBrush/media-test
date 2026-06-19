@@ -88,8 +88,8 @@ export function metricHigherIsBetter(metric: MetricId): boolean {
   return HIGHER_IS_BETTER.has(metric);
 }
 
-/** Pull the chosen metric's numeric value out of a sample; null/undefined → NaN (dropped later). */
-function getMetricValue(metric: MetricId, sample: MetricSample): number {
+/** Pull the chosen metric's numeric value out of a sample; null/undefined -> NaN (dropped later). */
+export function metricSampleValue(metric: MetricId, sample: MetricSample): number {
   const raw = sample[METRIC_FIELD[metric]];
   return typeof raw === 'number' ? raw : Number.NaN;
 }
@@ -117,7 +117,7 @@ export async function bench(
   const values: number[] = [];
   for (let i = 0; i < iters; i++) {
     const sample = await run(warmup + i);
-    const value = getMetricValue(metric, sample);
+    const value = metricSampleValue(metric, sample);
     if (Number.isFinite(value)) values.push(value);
   }
 

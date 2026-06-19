@@ -87,6 +87,10 @@ import type {
 } from '../../core/engine.ts';
 
 import { digestImageData } from './digest.ts';
+import {
+  demuxProgressiveMp4SampleTable,
+  shouldUseProgressiveMp4SampleTableFastPath,
+} from './mp4-sample-table.ts';
 import { imageDataFromVideoFrame } from './raster.ts';
 
 // Type-only import of the library's public surface (avoids pulling the runtime into the suite shell;
@@ -107,8 +111,13 @@ const AV_MEDIA_AUDIO = 1 as AVMediaType; // AVMEDIA_TYPE_AUDIO
 const AV_MEDIA_SUBTITLE = 3 as AVMediaType; // AVMEDIA_TYPE_SUBTITLE
 
 const ENGINE_ID = 'web-demuxer@4.0.0';
+const AAC_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
+const AAC_CHANNELS_BY_CONFIG = [undefined, 1, 2, 3, 4, 5, 6, 8];
 
 type PacketizedTrackType = Extract<TrackType, 'video' | 'audio' | 'subtitle'>;
+type AacAudioConfig = { sampleRate: number; channels: number };
 
 /** seconds → integer microseconds (web-demuxer's raw packet/stream times are in seconds). */
 function secToUs(sec: number): number {
@@ -166,11 +175,25 @@ function isoBmffContainerFromInput(input: MediaInput): 'mp4' | 'mov' | undefined
   return undefined;
 }
 
+function matroskaContainerFromInput(input: MediaInput): 'mkv' | 'webm' | undefined {
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  if (name.endsWith('.mkv')) return 'mkv';
+  if (name.endsWith('.webm')) return 'webm';
+  return undefined;
+}
+
 /** Map an FFmpeg format_name list (e.g. 'mov,mp4,m4a,3gp,3g2,mj2') → a canonical container token. */
 function canonicalContainer(formatName: string | undefined, input: MediaInput): string {
   const names = (formatName ?? '').toLowerCase().split(',').map((s) => s.trim());
   const has = (t: string) => names.some((n) => n === t || n.includes(t));
-  // Order matters: webm before matroska (webm is a matroska subset).
+  // FFmpeg exposes Matroska and WebM through one demuxer family. Use the corpus input suffix to
+  // break that tie; otherwise any .mkv reported as "matroska,webm" would be mislabeled as WebM.
+  const isMatroskaFamily = has('matroska') && has('webm');
+  if (isMatroskaFamily) {
+    const hinted = matroskaContainerFromInput(input);
+    if (hinted) return hinted;
+  }
+
   if (has('webm')) return 'webm';
   if (has('matroska') || has('mkv')) return 'mkv';
 
@@ -245,6 +268,197 @@ function languageOf(tags: Record<string, string> | undefined): string | null {
   return lang && lang !== 'und' ? lang : null;
 }
 
+function withSupplementalStreamFields(stream: WebAVStream, supplemental: WebAVStream | undefined): WebAVStream {
+  if (!supplemental || trackTypeOf(stream) !== 'audio') return stream;
+  return {
+    ...stream,
+    sample_rate: stream.sample_rate || supplemental.sample_rate,
+    channels: stream.channels || supplemental.channels,
+  };
+}
+
+function streamsWithSupplementalFields(
+  streams: WebAVStream[],
+  supplementalStreams: WebAVStream[] | undefined,
+): WebAVStream[] {
+  if (!supplementalStreams?.length) return streams;
+  const supplementalByIndex = new Map(supplementalStreams.map((stream) => [stream.index, stream]));
+  return streams.map((stream) => withSupplementalStreamFields(stream, supplementalByIndex.get(stream.index)));
+}
+
+function aacAudioConfigFromAdts(data: Uint8Array): AacAudioConfig | null {
+  for (let i = 0; i + 6 < data.byteLength; i++) {
+    const b0 = data[i]!;
+    const b1 = data[i + 1]!;
+    if (b0 !== 0xff || (b1 & 0xf0) !== 0xf0 || (b1 & 0x06) !== 0) continue;
+
+    const b2 = data[i + 2]!;
+    const b3 = data[i + 3]!;
+    const frequencyIndex = (b2 >> 2) & 0x0f;
+    const sampleRate = AAC_SAMPLE_RATES[frequencyIndex];
+    const channelConfig = ((b2 & 0x01) << 2) | ((b3 >> 6) & 0x03);
+    const channels = AAC_CHANNELS_BY_CONFIG[channelConfig];
+    if (sampleRate && channels) return { sampleRate, channels };
+  }
+  return null;
+}
+
+function syncOffset(bytes: Uint8Array): number | null {
+  for (let offset = 0; offset < 188; offset++) {
+    let ok = true;
+    for (let i = 0; i < 5; i++) {
+      if (bytes[offset + i * 188] !== 0x47) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return offset;
+  }
+  return null;
+}
+
+function sectionStart(bytes: Uint8Array, payloadOffset: number, packetEnd: number): number | null {
+  if (payloadOffset >= packetEnd) return null;
+  const pointer = bytes[payloadOffset] ?? 0;
+  const start = payloadOffset + 1 + pointer;
+  return start + 3 <= packetEnd ? start : null;
+}
+
+function sectionLength(bytes: Uint8Array, start: number): number {
+  return ((bytes[start + 1]! & 0x0f) << 8) | bytes[start + 2]!;
+}
+
+function parsePatPmtPid(bytes: Uint8Array, start: number, packetEnd: number): number | null {
+  if (bytes[start] !== 0x00) return null;
+  const end = Math.min(start + 3 + sectionLength(bytes, start) - 4, packetEnd);
+  for (let pos = start + 8; pos + 4 <= end; pos += 4) {
+    const programNumber = (bytes[pos]! << 8) | bytes[pos + 1]!;
+    if (programNumber === 0) continue;
+    return ((bytes[pos + 2]! & 0x1f) << 8) | bytes[pos + 3]!;
+  }
+  return null;
+}
+
+function parsePmtAacPid(bytes: Uint8Array, start: number, packetEnd: number): number | null {
+  if (bytes[start] !== 0x02) return null;
+  const end = Math.min(start + 3 + sectionLength(bytes, start) - 4, packetEnd);
+  const programInfoLength = ((bytes[start + 10]! & 0x0f) << 8) | bytes[start + 11]!;
+  for (let pos = start + 12 + programInfoLength; pos + 5 <= end;) {
+    const streamType = bytes[pos]!;
+    const elementaryPid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+    const esInfoLength = ((bytes[pos + 3]! & 0x0f) << 8) | bytes[pos + 4]!;
+    if (streamType === 0x0f) return elementaryPid; // ISO/IEC 13818-7 ADTS AAC
+    pos += 5 + esInfoLength;
+  }
+  return null;
+}
+
+function payloadOffset(bytes: Uint8Array, packetStart: number): number | null {
+  const adaptationControl = (bytes[packetStart + 3]! >> 4) & 0x03;
+  if (adaptationControl !== 1 && adaptationControl !== 3) return null;
+  let offset = packetStart + 4;
+  if (adaptationControl === 3) offset += 1 + (bytes[offset] ?? 0);
+  const packetEnd = packetStart + 188;
+  return offset < packetEnd ? offset : null;
+}
+
+function stripPesHeader(payload: Uint8Array): Uint8Array {
+  if (
+    payload.byteLength >= 9 &&
+    payload[0] === 0x00 &&
+    payload[1] === 0x00 &&
+    payload[2] === 0x01
+  ) {
+    const headerLength = 9 + (payload[8] ?? 0);
+    return headerLength < payload.byteLength ? payload.subarray(headerLength) : new Uint8Array();
+  }
+  return payload;
+}
+
+function concatChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
+  const out = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function aacAudioConfigFromMpegTs(bytes: Uint8Array): AacAudioConfig | null {
+  const startOffset = syncOffset(bytes);
+  if (startOffset == null) return null;
+
+  let pmtPid: number | null = null;
+  let aacPid: number | null = null;
+  const chunks: Uint8Array[] = [];
+  let totalLength = 0;
+
+  for (let packetStart = startOffset; packetStart + 188 <= bytes.byteLength; packetStart += 188) {
+    if (bytes[packetStart] !== 0x47) continue;
+    const payloadUnitStart = (bytes[packetStart + 1]! & 0x40) !== 0;
+    const pid = ((bytes[packetStart + 1]! & 0x1f) << 8) | bytes[packetStart + 2]!;
+    const offset = payloadOffset(bytes, packetStart);
+    if (offset == null) continue;
+    const packetEnd = packetStart + 188;
+
+    if (payloadUnitStart && pid === 0) {
+      const start = sectionStart(bytes, offset, packetEnd);
+      if (start != null) pmtPid = parsePatPmtPid(bytes, start, packetEnd) ?? pmtPid;
+      continue;
+    }
+
+    if (payloadUnitStart && pmtPid != null && pid === pmtPid) {
+      const start = sectionStart(bytes, offset, packetEnd);
+      if (start != null) aacPid = parsePmtAacPid(bytes, start, packetEnd) ?? aacPid;
+      continue;
+    }
+
+    if (aacPid == null || pid !== aacPid) continue;
+    const payload = stripPesHeader(bytes.subarray(offset, packetEnd));
+    if (!payload.byteLength) continue;
+    chunks.push(payload);
+    totalLength += payload.byteLength;
+    if (totalLength >= 64 * 1024) break;
+  }
+
+  return chunks.length ? aacAudioConfigFromAdts(concatChunks(chunks, totalLength)) : null;
+}
+
+async function withTsAacMetadataFromInput(
+  input: MediaInput,
+  metadata: NormalizedMetadata,
+): Promise<NormalizedMetadata> {
+  if (metadata.container !== 'ts') return metadata;
+  const tracks = [...metadata.tracks];
+  const missingAacTracks: number[] = [];
+
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i]!;
+    if (
+      track.type !== 'audio' ||
+      track.codec !== 'aac' ||
+      (track.sampleRate != null && track.channels != null)
+    ) {
+      continue;
+    }
+    missingAacTracks.push(i);
+  }
+
+  if (missingAacTracks.length !== 1) return metadata;
+  const config = aacAudioConfigFromMpegTs(new Uint8Array(await input.arrayBuffer()));
+  if (!config) return metadata;
+  const trackIndex = missingAacTracks[0]!;
+  const track = tracks[trackIndex]!;
+  tracks[trackIndex] = {
+    ...track,
+    sampleRate: track.sampleRate ?? config.sampleRate,
+    channels: track.channels ?? config.channels,
+  };
+
+  return { ...metadata, tracks };
+}
+
 /** Normalize one WebAVStream to a NormalizedTrack. */
 function normalizeStream(stream: WebAVStream): NormalizedTrack {
   const type = trackTypeOf(stream);
@@ -286,12 +500,17 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
   };
 }
 
-/** Build NormalizedMetadata from a WebMediaInfo (+ its embedded streams). */
-function toNormalizedMetadata(info: WebMediaInfo, input: MediaInput): NormalizedMetadata {
+/** Build NormalizedMetadata from a WebMediaInfo (+ optional stream details from getAVStreams). */
+function toNormalizedMetadata(
+  info: WebMediaInfo,
+  input: MediaInput,
+  supplementalStreams?: WebAVStream[],
+): NormalizedMetadata {
   const container = canonicalContainer(info.format_name, input);
   const durationSec =
     Number.isFinite(info.duration) && info.duration > 0 ? info.duration : null;
-  const tracks = (info.streams ?? []).map(normalizeStream);
+  const streams = streamsWithSupplementalFields(info.streams ?? [], supplementalStreams);
+  const tracks = streams.map(normalizeStream);
 
   const meta: NormalizedMetadata = { container, durationSec, tracks };
 
@@ -302,7 +521,7 @@ function toNormalizedMetadata(info: WebMediaInfo, input: MediaInput): Normalized
   }
   // Hoist common per-stream tags (title/artist/…) from the first stream that carries them, since
   // FFmpeg attaches container-level metadata to streams in WebMediaInfo's shape.
-  for (const s of info.streams ?? []) {
+  for (const s of streams) {
     for (const [k, v] of Object.entries(s.tags ?? {})) {
       const key = k.toLowerCase();
       if (
@@ -386,6 +605,7 @@ export class WebDemuxerEngine implements MediaEngine {
       // 'metadata:read' : probe reads container/duration/dims/fps/rotation/language/tags.
       // 'multitrack'    : demux reads EVERY stream (incl. 2nd+ same-type tracks) via each stream's
       //                   absolute WebAVStream.index and labels each packet with that same index.
+      // 'metadata:protected-tracks' : probe reports encrypted MP4 track metadata without decrypting.
       // 'rotation:read' : surfaces WebAVStream.rotation in NormalizedTrack.rotation.
       // 'seek:keyframe' : seek() lands on the preceding keyframe (AVSEEK_FLAG_BACKWARD).
       // 'webcodecs:independent' : probe/demux are pure WASM and never touch the browser codec gate, so
@@ -393,6 +613,7 @@ export class WebDemuxerEngine implements MediaEngine {
       //                   see the file header for the full rationale + accepted decode/seek trade-off).
       features: [
         'metadata:read',
+        'metadata:protected-tracks',
         'multitrack',
         'rotation:read',
         'seek:keyframe',
@@ -469,7 +690,9 @@ export class WebDemuxerEngine implements MediaEngine {
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const d = await this.loadInput(input);
     const info = await d.getMediaInfo();
-    return toNormalizedMetadata(info, input);
+    const streams = await d.getAVStreams();
+    const metadata = toNormalizedMetadata(info, input, streams);
+    return withTsAacMetadataFromInput(input, metadata);
   }
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
@@ -496,10 +719,14 @@ export class WebDemuxerEngine implements MediaEngine {
    * is no DTS field, so we report dtsUs === ptsUs (honest: the lib exposes no decode timeline).
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
+    if (shouldUseProgressiveMp4SampleTableFastPath(input)) {
+      return demuxProgressiveMp4SampleTable(input);
+    }
+
     const d = await this.loadInput(input);
     const info = await d.getMediaInfo();
-    const metadata = toNormalizedMetadata(info, input);
     const streams = await d.getAVStreams();
+    const metadata = toNormalizedMetadata(info, input, streams);
 
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;

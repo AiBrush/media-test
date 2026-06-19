@@ -219,8 +219,10 @@ export class PlatformEngine implements MediaEngine {
       encryption: [],
       // 'alpha' decode is possible via WebCodecs alpha:'keep' on VP8/VP9; 'resize' via canvas in the
       // transcode path; 'packets:dts' comes from MP4 sample-table decode timestamps.
+      // 'metadata:protected-tracks' means the MP4 probe unwraps CENC `encv`/`enca` sample entries via
+      // sinf/frma to identify the original H.264/AAC track metadata without decrypting samples.
       // We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
-      features: ['resize', 'alpha', 'packets:dts'],
+      features: ['resize', 'alpha', 'packets:dts', 'metadata:protected-tracks'],
     };
   }
 

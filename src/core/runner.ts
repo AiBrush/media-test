@@ -59,7 +59,7 @@ import { getEngine, getReferenceEngineId, listEngines, listScenarios, getScenari
 import type { RegisteredEngine } from './registry.ts';
 import { detectCodecSupport, detectEnv } from './feature-detect.ts';
 import { Meter } from './measure.ts';
-import { bench } from './bench.ts';
+import { DEFAULT_BENCH, metricSampleValue, summarize } from './bench.ts';
 import { loadGolden, runOracle } from './oracles.ts';
 // The platform engine IS the browser-pure oracle decoder/player (§8). runMatrix injects these into
 // every cell so oracles that decode output / smoke-play it work without the caller wiring them.
@@ -861,11 +861,13 @@ async function runRobustness(
 }
 
 /**
- * Run `bench()` for each requested metric in fresh measured iterations. Each iteration re-builds
- * the input(s) (fresh byte source, clean read counters) and re-runs the op under a `Meter`,
- * returning one `MetricSample`. The op is re-executed once per metric × iteration so the chosen
- * metric is measured in isolation per the protocol (§10). Engine setup (init/dispose) brackets the
- * whole bench, not each iter — the engine is already init()'d here.
+ * Run the benchmark protocol in fresh measured iterations. Each iteration re-builds the input(s)
+ * (fresh byte source, clean read counters), re-runs the op under a `Meter`, and yields one
+ * `MetricSample` that can contain wall, memory, throughput, packet count, and long-task fields.
+ *
+ * Important for huge/massive assets: one measured op execution now feeds every requested metric.
+ * Running a multi-hour packet walk once per metric made at-scale demux rows multiply their media work
+ * by 3+ and could exhaust the whole browser-run timeout before results were saved.
  */
 async function runBench(
   engine: MediaEngine,
@@ -876,44 +878,57 @@ async function runBench(
 ): Promise<ScenarioResult['bench']> {
   const out: Partial<Record<MetricId, BenchSummary>> = {};
 
+  const warmup = benchOptions?.warmup ?? DEFAULT_BENCH.warmup;
+  const iters = benchOptions?.iters ?? DEFAULT_BENCH.iters;
+  const observeLongtasks = scenario.metrics.includes('longtasks');
+
+  const runSample = async (): Promise<MetricSample> => {
+    // Fresh input per iteration: re-fetch bytes (cache is per-MediaInput, so rebuild).
+    const freshInputs = inputs.map((i) => buildMediaInput(i.id, scenario.mutate));
+    const meter = new Meter({ observeLongtasks });
+    meter.begin();
+    const opResult = await withTimeout(executeOp(engine, scenario, freshInputs), scenario.timeoutMs);
+    const ctx: MeasureContext = {};
+    const mediaSec = mediaSecFromContext(golden, opResult);
+    if (mediaSec !== undefined) ctx.mediaSec = mediaSec;
+    // COUNTS that back the headline per-second metrics (§8.1). Without these the Meter has no
+    // numerator and opsPerSec/packetsPerSec/framesPerSec collapse to 0.
+    // Every single op execution is one operation -> opsPerSec = 1/wall (e.g. probes/sec).
+    ctx.ops = 1;
+    if (opResult.output) ctx.bytesOut = opResult.output.bytes.byteLength;
+    if (opResult.demux) ctx.packets = opResult.demux.packets.length;
+    if (opResult.seek) ctx.seeks = 1;
+    if (opResult.frames) {
+      // decodeFrames produced real frames -> decode fps + frames/sec.
+      ctx.decodedFrames = opResult.frames.frames.length;
+      ctx.frames = opResult.frames.frames.length;
+    } else if (opResult.output) {
+      // Frame-processing ops that return encoded bytes (transcode/remux/trim) carry no FrameSink;
+      // estimate processed frames from golden (fps x duration) so the convert+resize headline
+      // reports framesPerSec / encodeFps instead of a silent 0.
+      const f = estimatedFrameCount(golden);
+      if (f !== undefined) {
+        ctx.frames = f;
+        ctx.encodedFrames = f;
+      }
+    }
+    return meter.end(ctx);
+  };
+
+  for (let i = 0; i < warmup; i++) {
+    await runSample();
+  }
+
+  const samples: MetricSample[] = [];
+  for (let i = 0; i < iters; i++) {
+    samples.push(await runSample());
+  }
+
   for (const metric of scenario.metrics) {
-    const summary = await bench(
-      metric,
-      async (): Promise<MetricSample> => {
-        // Fresh input per iteration: re-fetch bytes (cache is per-MediaInput, so rebuild).
-        const freshInputs = inputs.map((i) => buildMediaInput(i.id, scenario.mutate));
-        const meter = new Meter({ observeLongtasks: metric === 'longtasks' });
-        meter.begin();
-        const opResult = await withTimeout(executeOp(engine, scenario, freshInputs), scenario.timeoutMs);
-        const ctx: MeasureContext = {};
-        const mediaSec = mediaSecFromContext(golden, opResult);
-        if (mediaSec !== undefined) ctx.mediaSec = mediaSec;
-        // COUNTS that back the headline per-second metrics (§8.1). Without these the Meter has no
-        // numerator and opsPerSec/packetsPerSec/framesPerSec collapse to 0 (the first-run bug).
-        // Every single op execution is one operation → opsPerSec = 1/wall (e.g. probes/sec).
-        ctx.ops = 1;
-        if (opResult.output) ctx.bytesOut = opResult.output.bytes.byteLength;
-        if (opResult.demux) ctx.packets = opResult.demux.packets.length;
-        if (opResult.seek) ctx.seeks = 1;
-        if (opResult.frames) {
-          // decodeFrames produced real frames → decode fps + frames/sec.
-          ctx.decodedFrames = opResult.frames.frames.length;
-          ctx.frames = opResult.frames.frames.length;
-        } else if (opResult.output) {
-          // Frame-processing ops that return encoded bytes (transcode/remux/trim) carry no FrameSink;
-          // estimate processed frames from golden (fps × duration) so the convert+resize headline
-          // reports framesPerSec / encodeFps instead of a silent 0.
-          const f = estimatedFrameCount(golden);
-          if (f !== undefined) {
-            ctx.frames = f;
-            ctx.encodedFrames = f;
-          }
-        }
-        return meter.end(ctx);
-      },
-      benchOptions,
-    );
-    out[metric] = summary;
+    const values = samples
+      .map((sample) => metricSampleValue(metric, sample))
+      .filter((value) => Number.isFinite(value));
+    out[metric] = summarize(metric, values, warmup);
   }
 
   return out;
@@ -951,7 +966,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   // `mp4box` → `mp4box.js@0.5.4`, `mediabunny` → `mediabunny@1.48.0`). Exact ids still match.
   const allEngines = listEngines();
   const engineIds = opts.engineIds
-    ? resolveEngineIds(opts.engineIds, allEngines)
+    ? await resolveEngineIds(opts.engineIds, allEngines)
     : allEngines.map((e) => e.id);
   // Resolve scenarios: requested ids or all registered, then filter by pillar. Unknown scenario ids
   // are WARNED and SKIPPED (not thrown) so the rest of the run proceeds.
@@ -1120,22 +1135,20 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
 
 /**
  * Resolve user-supplied engine args against the registry, forgiving short names. An arg matches a
- * registered engine when it equals the registration id (exact, case-sensitive first, then
- * case-insensitive) or is a case-insensitive prefix of it — so `mp4box` matches `mp4box.js@0.5.4`
- * and `mediabunny` matches `mediabunny@1.48.0`, while exact ids keep working unchanged. The
- * registration id is the engine's `.id` by convention (registerEngine stores `{ id }`), so matching
- * the registration id is equivalent to matching the engine's `.id` without constructing the engine.
+ * registered engine when it equals the registration id or the engine's reported `.id` (exact,
+ * case-sensitive first, then case-insensitive), or is a case-insensitive prefix of either — so
+ * `mp4box` matches `mp4box@2.3.0` and exact ids like `mediabunny@1.48.0` keep working unchanged.
  *
  * Unknown args are WARNED and SKIPPED (never thrown) so one bad `--engine` does not zero the matrix.
  * Order follows the user's args; duplicates (incl. two args resolving to the same engine) are
  * de-duplicated, preserving first-seen order.
  */
-function resolveEngineIds(requested: string[], registered: RegisteredEngine[]): string[] {
-  const ids = registered.map((e) => e.id);
+async function resolveEngineIds(requested: string[], registered: RegisteredEngine[]): Promise<string[]> {
+  const candidates = await engineIdCandidates(registered);
   const resolved: string[] = [];
   const seen = new Set<string>();
   for (const arg of requested) {
-    const match = matchEngineId(arg, ids);
+    const match = matchEngineId(arg, candidates);
     if (!match) {
       console.warn(
         `runMatrix: unknown engine id '${arg}' — skipping (no registered engine matches by id or prefix)`,
@@ -1150,22 +1163,44 @@ function resolveEngineIds(requested: string[], registered: RegisteredEngine[]): 
   return resolved;
 }
 
-/** Match one engine arg against the known registration ids (exact → ci-exact → ci-prefix). */
-function matchEngineId(arg: string, ids: string[]): string | undefined {
+interface EngineIdCandidate {
+  registryId: string;
+  aliases: string[];
+}
+
+async function engineIdCandidates(registered: RegisteredEngine[]): Promise<EngineIdCandidate[]> {
+  return Promise.all(
+    registered.map(async (e) => {
+      const aliases = [e.id];
+      try {
+        const engine = await e.factory();
+        if (engine.id && !aliases.includes(engine.id)) aliases.push(engine.id);
+      } catch {
+        // If a constructor ever fails, keep the registry id usable; init() will report real failures.
+      }
+      return { registryId: e.id, aliases };
+    }),
+  );
+}
+
+/** Match one engine arg against registration ids and reported engine ids (exact → ci-exact → ci-prefix). */
+function matchEngineId(arg: string, candidates: EngineIdCandidate[]): string | undefined {
   const lower = arg.toLowerCase();
   // Exact (case-sensitive) wins so a precise id is never shadowed by a looser candidate.
-  const exact = ids.find((id) => id === arg);
-  if (exact) return exact;
-  const ciExact = ids.find((id) => id.toLowerCase() === lower);
-  if (ciExact) return ciExact;
-  const prefix = ids.filter((id) => id.toLowerCase().startsWith(lower));
+  const exact = candidates.find((c) => c.aliases.some((id) => id === arg));
+  if (exact) return exact.registryId;
+  const ciExact = candidates.find((c) => c.aliases.some((id) => id.toLowerCase() === lower));
+  if (ciExact) return ciExact.registryId;
+  const prefix = candidates.filter((c) => c.aliases.some((id) => id.toLowerCase().startsWith(lower)));
   if (prefix.length >= 1) {
     if (prefix.length > 1) {
       console.warn(
-        `runMatrix: engine arg '${arg}' is an ambiguous prefix (${prefix.join(', ')}) — using '${prefix[0]}'`,
+        `runMatrix: engine arg '${arg}' is an ambiguous prefix (${prefix
+          .map((c) => c.aliases.join('|'))
+          .join(', ')}) — using '${prefix[0]?.registryId}'`,
       );
     }
-    return prefix[0];
+    return prefix[0]?.registryId;
   }
   return undefined;
 }

@@ -15,7 +15,7 @@
  */
 
 import type { MediaInput, NormalizedMetadata, NormalizedTrack } from '../../core/engine.ts';
-import { demuxMp4Tracks, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import { demuxMp4Tracks, looksLikeMp4, probeMp4Metadata, UnsupportedMp4Error } from './demux-mp4.ts';
 import { demuxWebmTracks, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 
 /** Map a MIME / asset id hint to a canonical container token. */
@@ -145,6 +145,11 @@ function durationFromSamples(samples: Array<{ ptsUs: number; durationUs: number 
   return maxEnd > 0 ? maxEnd / 1_000_000 : null;
 }
 
+function fpsFromSampleCount(sampleCount: number, durationUs: number | null): number | undefined {
+  if (sampleCount <= 0 || durationUs === null || durationUs <= 0) return undefined;
+  return Math.round(((sampleCount * 1_000_000) / durationUs) * 1000) / 1000;
+}
+
 /**
  * Probe an input to NormalizedMetadata. Uses inline demux (MP4/WebM) for codec/dims/fps when it can,
  * supplemented by a <video> element for an authoritative duration; otherwise a <video>-only probe.
@@ -222,8 +227,40 @@ export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number 
       demuxDuration = maxDuration;
     }
   } catch (e) {
-    // Unsupported variant (fragmented MP4, exotic MKV): leave tracks for the <video> probe to fill.
+    // Unsupported variants fall through to cheaper metadata-only probes or, finally, <video>.
     if (!(e instanceof UnsupportedMp4Error) && !(e instanceof UnsupportedWebmError)) throw e;
+    if (e instanceof UnsupportedMp4Error && (container === 'mp4' || container === 'mov' || looksLikeMp4(bytes))) {
+      try {
+        const meta = probeMp4Metadata(bytes);
+        for (const t of meta.tracks) {
+          if (t.kind === 'video') {
+            const track: NormalizedTrack = {
+              type: 'video',
+              codec: t.config.codec,
+              width: t.config.codedWidth,
+              height: t.config.codedHeight,
+              bitrate: null,
+              language: null,
+            };
+            const fps = fpsFromSampleCount(t.sampleCount, t.durationUs);
+            if (fps !== undefined) track.fps = fps;
+            tracks.push(track);
+          } else {
+            tracks.push({
+              type: 'audio',
+              codec: t.config.codec,
+              sampleRate: t.config.sampleRate,
+              channels: t.config.channels,
+              bitrate: null,
+              language: null,
+            });
+          }
+        }
+        demuxDuration = meta.durationSec;
+      } catch (fallbackErr) {
+        if (!(fallbackErr instanceof UnsupportedMp4Error)) throw fallbackErr;
+      }
+    }
   }
 
   // <video> probe for an authoritative duration + dims (page only). Audio-only containers and

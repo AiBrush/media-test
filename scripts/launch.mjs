@@ -126,9 +126,11 @@ if (browserCfg.executablePath) {
 console.log(`[launch] ${opts.browser} (real browser, non-headless) → ${pageUrl}`);
 const browser = await browserType.launch(launchOpts);
 let exitCode = 0;
+let page;
+let activeFilter = null;
 try {
   const context = await browser.newContext();
-  const page = await context.newPage();
+  page = await context.newPage();
 
   // Surface page console errors + warnings to the driver log (debugging only — not measurement).
   // Warnings matter here because the runner WARN+SKIPs unknown --engine/--scenario ids instead of
@@ -172,6 +174,7 @@ try {
     ...(Number.isFinite(opts.warmup) ? { warmup: opts.warmup } : {}),
     ...(Number.isFinite(opts.iters) ? { iters: opts.iters } : {}),
   };
+  activeFilter = filter;
 
   // Trigger the run IN THE PAGE (the page measures; we only kick it off and await completion).
   console.log(
@@ -212,15 +215,39 @@ try {
 
   const runError = await page.evaluate(() => window.__SUITE_ERROR__ ?? null);
 
+  await saveResultsPayload(page);
+
+  if (runError) {
+    console.error(`[launch] ${opts.browser} run reported an error (partial results saved): ${runError}`);
+    exitCode = 1;
+  }
+} catch (err) {
+  console.error(`[launch] ${opts.browser} FAILED: ${err?.message || err}`);
+  if (page) {
+    try {
+      await saveResultsPayload(page, `launcher failure: ${err?.message || err}`);
+    } catch (saveErr) {
+      console.error(`[launch] ${opts.browser} partial save failed: ${saveErr?.message || saveErr}`);
+    }
+  }
+  exitCode = 1;
+} finally {
+  await browser.close();
+}
+
+process.exit(exitCode);
+
+async function saveResultsPayload(page, partialReason) {
   // Collect the results payload the page exposes (same shape as the Download button).
-  const payload = await page.evaluate(() => ({
+  const payload = await page.evaluate((reason) => ({
     schema: 'media-browser-test/results@1',
     generatedAtIso: new Date().toISOString(),
     env: window.__SUITE__.env,
     support: window.__SUITE__.support,
     referenceEngineId: window.__SUITE__.referenceEngineId,
     results: window.__RESULTS__ ?? [],
-  }));
+    ...(reason ? { partialReason: reason } : {}),
+  }), partialReason ?? null);
 
   // Capture exact browser build for reproducibility (env.browserVersion may be UA-derived; the
   // Playwright build version is authoritative for the launcher record).
@@ -228,7 +255,7 @@ try {
     playwrightBrowser: opts.browser,
     playwrightVersion: browser.version?.() ?? null,
     pillar: opts.pillar,
-    filter,
+    filter: activeFilter,
   };
 
   const outDir = resolve(ROOT, opts.out);
@@ -243,22 +270,10 @@ try {
     counts[label] = (counts[label] ?? 0) + 1;
   }
   console.log(
-    `[launch] ${opts.browser} done: ${payload.results.length} results ` +
+    `[launch] ${opts.browser} ${partialReason ? 'partial' : 'done'}: ${payload.results.length} results ` +
       `(${Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' ')}) → ${outPath}`,
   );
-
-  if (runError) {
-    console.error(`[launch] ${opts.browser} run reported an error (partial results saved): ${runError}`);
-    exitCode = 1;
-  }
-} catch (err) {
-  console.error(`[launch] ${opts.browser} FAILED: ${err?.message || err}`);
-  exitCode = 1;
-} finally {
-  await browser.close();
 }
-
-process.exit(exitCode);
 
 function summaryStatusLabel(status) {
   switch (status) {

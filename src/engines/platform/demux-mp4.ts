@@ -94,6 +94,16 @@ export type Mp4Track =
   | ({ kind: 'video' } & Mp4VideoTrack)
   | ({ kind: 'audio' } & Mp4AudioTrack);
 
+export type Mp4MetadataTrack =
+  | ({ kind: 'video'; sampleCount: number; durationUs: number | null } & Mp4VideoTrack)
+  | ({ kind: 'audio'; sampleCount: number; durationUs: number | null } & Mp4AudioTrack);
+
+export interface Mp4MetadataProbe {
+  tracks: Mp4MetadataTrack[];
+  durationSec: number | null;
+  fragmented: boolean;
+}
+
 /** A located top-level/child box. */
 interface Box {
   type: string;
@@ -153,6 +163,15 @@ function codecTokenForEntry(entryType: string): string | undefined {
   }
 }
 
+/** Protected CENC entries (`encv`/`enca`) carry their real sample-entry fourcc in `sinf/frma`. */
+function originalFormatForProtectedEntry(buf: Uint8Array, childStart: number, entryEnd: number): string | undefined {
+  const sinf = findBox(buf, childStart, entryEnd, 'sinf');
+  if (!sinf) return undefined;
+  const frma = findBox(buf, sinf.bodyStart, sinf.bodyEnd, 'frma');
+  if (!frma || frma.bodyEnd - frma.bodyStart < 4) return undefined;
+  return fourcc(buf, frma.bodyStart);
+}
+
 /** Build the WebCodecs codec string from avcC (profile/compat/level bytes). */
 function avcCodecString(avcC: Uint8Array): string {
   // avcC: [0]=version,[1]=AVCProfileIndication,[2]=profile_compatibility,[3]=AVCLevelIndication
@@ -193,14 +212,15 @@ function parseStsd(
   const entriesStart = stsd.bodyStart + 8;
   const entry = [...iterBoxes(buf, entriesStart, stsd.bodyEnd)][0];
   if (!entry) throw new UnsupportedMp4Error('stsd has no sample entry');
-  const token = codecTokenForEntry(entry.type);
-  if (!token) throw new UnsupportedMp4Error(`unsupported video sample entry: ${entry.type}`);
-
   // VisualSampleEntry: 6 reserved + 2 data_ref_idx + 16 predefined/reserved, then width(2),height(2)
   // at offset bodyStart+24. Children (avcC/hvcC/vpcC/av1C) follow after the fixed 78-byte header.
   const w = be16(buf, entry.bodyStart + 24);
   const h = be16(buf, entry.bodyStart + 26);
   const childStart = entry.bodyStart + 78;
+  const entryType =
+    entry.type === 'encv' ? originalFormatForProtectedEntry(buf, childStart, entry.bodyEnd) ?? entry.type : entry.type;
+  const token = codecTokenForEntry(entryType);
+  if (!token) throw new UnsupportedMp4Error(`unsupported video sample entry: ${entry.type}`);
 
   let description: Uint8Array | undefined;
   let codecString: string;
@@ -259,12 +279,35 @@ function parseAudioStsd(
   const entriesStart = stsd.bodyStart + 8;
   const entry = [...iterBoxes(buf, entriesStart, stsd.bodyEnd)][0];
   if (!entry) return undefined;
-  const token = audioCodecTokenForEntry(entry.type);
+  const version = be16(buf, entry.bodyStart + 8);
+  const childStart = audioSampleEntryChildStart(entry.bodyStart, version);
+  const entryType =
+    entry.type === 'enca' ? originalFormatForProtectedEntry(buf, childStart, entry.bodyEnd) ?? entry.type : entry.type;
+  const token = audioCodecTokenForEntry(entryType);
   if (!token) return undefined;
-  const channels = be16(buf, entry.bodyStart + 16);
-  // samplerate is a 16.16 fixed-point in the AudioSampleEntry; the integer (high 16 bits) is the rate.
-  const sampleRate = be32(buf, entry.bodyStart + 24) >>> 16;
+  const qtV2 = parseQuickTimeAudioV2(buf, entry);
+  const channels = qtV2?.channels ?? be16(buf, entry.bodyStart + 16);
+  // Version 0/1 samplerate is a 16.16 fixed-point value; QuickTime version 2 stores a Float64.
+  const sampleRate = qtV2?.sampleRate ?? (be32(buf, entry.bodyStart + 24) >>> 16);
   return { token, sampleRate, channels };
+}
+
+function audioSampleEntryChildStart(bodyStart: number, version: number): number {
+  if (version === 1) return bodyStart + 44;
+  if (version === 2) return bodyStart + 64;
+  return bodyStart + 28;
+}
+
+function parseQuickTimeAudioV2(buf: Uint8Array, entry: Box): { sampleRate: number; channels: number } | undefined {
+  if (be16(buf, entry.bodyStart + 8) !== 2 || entry.bodyStart + 44 > entry.bodyEnd) return undefined;
+  const sampleRate = readFloat64BE(buf, entry.bodyStart + 32);
+  const channels = be32(buf, entry.bodyStart + 40);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || channels <= 0) return undefined;
+  return { sampleRate: Math.round(sampleRate), channels };
+}
+
+function readFloat64BE(buf: Uint8Array, offset: number): number {
+  return new DataView(buf.buffer, buf.byteOffset + offset, 8).getFloat64(0, false);
 }
 
 /** Time-to-sample (stts): array of {count, delta} → per-sample duration (in track timescale). */
@@ -294,7 +337,9 @@ function parseCtts(buf: Uint8Array, ctts: Box): number[] {
   for (let i = 0; i < count; i++) {
     const sampleCount = be32(buf, off);
     const raw = be32(buf, off + 4);
-    const offset = version === 1 ? (raw | 0) : raw; // v1 signed, v0 unsigned
+    // Some QuickTime/MOV files store signed composition offsets in a version-0 ctts box. Treat
+    // high-bit v0 values as signed to avoid turning -100 ticks into a multi-day PTS.
+    const offset = version === 1 || raw > 0x7fffffff ? (raw | 0) : raw;
     off += 8;
     const expand = Math.min(sampleCount, buf.length);
     for (let j = 0; j < expand; j++) offsets.push(offset);
@@ -380,6 +425,136 @@ function parseMdhdTimescale(buf: Uint8Array, mdhd: Box): number {
   // v0: creation(4) mod(4) timescale(4); v1: creation(8) mod(8) timescale(4)
   const tsOff = mdhd.bodyStart + (version === 1 ? 4 + 16 : 4 + 8);
   return be32(buf, tsOff);
+}
+
+function parseMdhdDurationTicks(buf: Uint8Array, mdhd: Box): number {
+  const version = buf[mdhd.bodyStart] ?? 0;
+  const durationOff = mdhd.bodyStart + (version === 1 ? 4 + 16 + 4 : 4 + 8 + 4);
+  if (version === 1) return durationOff + 8 <= mdhd.bodyEnd ? Number(be64(buf, durationOff)) : 0;
+  return durationOff + 4 <= mdhd.bodyEnd ? be32(buf, durationOff) : 0;
+}
+
+function parseTkhdTrackId(buf: Uint8Array, tkhd: Box): number | null {
+  const version = buf[tkhd.bodyStart] ?? 0;
+  const idOff = tkhd.bodyStart + (version === 1 ? 4 + 16 : 4 + 8);
+  return idOff + 4 <= tkhd.bodyEnd ? be32(buf, idOff) : null;
+}
+
+function childBoxes(buf: Uint8Array, box: Box): Box[] {
+  return [...iterBoxes(buf, box.bodyStart, box.bodyEnd)];
+}
+
+interface FragmentDefaults {
+  durationTicks?: number;
+}
+
+interface FragmentStats {
+  sampleCount: number;
+  maxEndTicks: number;
+  cursorTicks: number;
+}
+
+function parseTrexDefaults(buf: Uint8Array, moov: Box): Map<number, FragmentDefaults> {
+  const out = new Map<number, FragmentDefaults>();
+  const mvex = findBox(buf, moov.bodyStart, moov.bodyEnd, 'mvex');
+  if (!mvex) return out;
+  for (const trex of childBoxes(buf, mvex)) {
+    if (trex.type !== 'trex' || trex.bodyStart + 24 > trex.bodyEnd) continue;
+    const trackId = be32(buf, trex.bodyStart + 4);
+    const durationTicks = be32(buf, trex.bodyStart + 12);
+    out.set(trackId, durationTicks > 0 ? { durationTicks } : {});
+  }
+  return out;
+}
+
+function parseTfhd(
+  buf: Uint8Array,
+  tfhd: Box,
+  defaults: FragmentDefaults | undefined,
+): { trackId: number; durationTicks?: number } | null {
+  if (tfhd.bodyStart + 8 > tfhd.bodyEnd) return null;
+  const flags = be24(buf, tfhd.bodyStart + 1);
+  const trackId = be32(buf, tfhd.bodyStart + 4);
+  let off = tfhd.bodyStart + 8;
+  if (flags & 0x000001) off += 8; // base-data-offset
+  if (flags & 0x000002) off += 4; // sample-description-index
+  let durationTicks = defaults?.durationTicks;
+  if (flags & 0x000008) {
+    if (off + 4 > tfhd.bodyEnd) return { trackId, ...(durationTicks !== undefined ? { durationTicks } : {}) };
+    durationTicks = be32(buf, off);
+  }
+  return { trackId, ...(durationTicks !== undefined && durationTicks > 0 ? { durationTicks } : {}) };
+}
+
+function parseTfdtBaseTicks(buf: Uint8Array, tfdt: Box | undefined): number | undefined {
+  if (!tfdt) return undefined;
+  const version = buf[tfdt.bodyStart] ?? 0;
+  const off = tfdt.bodyStart + 4;
+  if (version === 1) return off + 8 <= tfdt.bodyEnd ? Number(be64(buf, off)) : undefined;
+  return off + 4 <= tfdt.bodyEnd ? be32(buf, off) : undefined;
+}
+
+function parseTrunStats(
+  buf: Uint8Array,
+  trun: Box,
+  defaultDurationTicks: number | undefined,
+): { sampleCount: number; durationTicks: number } {
+  if (trun.bodyStart + 8 > trun.bodyEnd) return { sampleCount: 0, durationTicks: 0 };
+  const flags = be24(buf, trun.bodyStart + 1);
+  const declaredSamples = be32(buf, trun.bodyStart + 4);
+  let off = trun.bodyStart + 8;
+  if (flags & 0x000001) off += 4; // data-offset
+  if (flags & 0x000004) off += 4; // first-sample-flags
+
+  const hasDuration = (flags & 0x000100) !== 0;
+  const perSampleBytes =
+    (hasDuration ? 4 : 0) +
+    ((flags & 0x000200) !== 0 ? 4 : 0) +
+    ((flags & 0x000400) !== 0 ? 4 : 0) +
+    ((flags & 0x000800) !== 0 ? 4 : 0);
+  const sampleCount = perSampleBytes > 0 ? boundEntryCount(declaredSamples, off, perSampleBytes, trun.bodyEnd) : declaredSamples;
+
+  if (!hasDuration) {
+    return { sampleCount, durationTicks: (defaultDurationTicks ?? 0) * sampleCount };
+  }
+
+  let durationTicks = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    durationTicks += be32(buf, off);
+    off += 4;
+    if (flags & 0x000200) off += 4; // sample-size
+    if (flags & 0x000400) off += 4; // sample-flags
+    if (flags & 0x000800) off += 4; // sample-composition-time-offset
+  }
+  return { sampleCount, durationTicks };
+}
+
+function parseFragmentStats(buf: Uint8Array, moov: Box): Map<number, FragmentStats> {
+  const defaults = parseTrexDefaults(buf, moov);
+  const stats = new Map<number, FragmentStats>();
+  for (const moof of iterBoxes(buf, 0, buf.length)) {
+    if (moof.type !== 'moof') continue;
+    for (const traf of childBoxes(buf, moof)) {
+      if (traf.type !== 'traf') continue;
+      const tfhd = findBox(buf, traf.bodyStart, traf.bodyEnd, 'tfhd');
+      if (!tfhd || tfhd.bodyStart + 8 > tfhd.bodyEnd) continue;
+      const trackId = be32(buf, tfhd.bodyStart + 4);
+      const base = parseTfhd(buf, tfhd, defaults.get(trackId));
+      if (!base) continue;
+      const trackStats = stats.get(base.trackId) ?? { sampleCount: 0, maxEndTicks: 0, cursorTicks: 0 };
+      let cursor = parseTfdtBaseTicks(buf, findBox(buf, traf.bodyStart, traf.bodyEnd, 'tfdt')) ?? trackStats.cursorTicks;
+      for (const trun of childBoxes(buf, traf)) {
+        if (trun.type !== 'trun') continue;
+        const run = parseTrunStats(buf, trun, base.durationTicks);
+        trackStats.sampleCount += run.sampleCount;
+        cursor += run.durationTicks;
+        trackStats.maxEndTicks = Math.max(trackStats.maxEndTicks, cursor);
+      }
+      trackStats.cursorTicks = Math.max(trackStats.cursorTicks, cursor);
+      stats.set(base.trackId, trackStats);
+    }
+  }
+  return stats;
 }
 
 /** hdlr handler_type fourcc (e.g. 'vide','soun'). */
@@ -560,6 +735,68 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
 
   if (tracks.length === 0) throw new UnsupportedMp4Error('no decodable video/audio track found in moov');
   return tracks;
+}
+
+/**
+ * Metadata-only MP4 probe. This intentionally accepts cases demuxMp4Tracks() rejects, such as
+ * fragmented MP4 and CENC-protected sample entries, because the clear MP4 headers still expose track
+ * shape and timing even though raw platform APIs cannot export decrypted packets.
+ */
+export function probeMp4Metadata(bytes: Uint8Array): Mp4MetadataProbe {
+  const moov = findBox(bytes, 0, bytes.length, 'moov');
+  if (!moov) throw new UnsupportedMp4Error('no moov box (not a progressive MP4 or truncated)');
+
+  const fragmentStats = parseFragmentStats(bytes, moov);
+  const fragmented = fragmentStats.size > 0 || findBox(bytes, 0, bytes.length, 'moof') !== undefined;
+  const tracks: Mp4MetadataTrack[] = [];
+  let durationSec: number | null = null;
+
+  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
+    const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
+    const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+    if (!mdia) continue;
+    const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+    const handler = hdlr ? hdlrType(bytes, hdlr) : '';
+    const mdhd = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'mdhd');
+    const { stbl, timescale } = locateStbl(bytes, trak);
+    const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
+    if (!stsd) continue;
+
+    const frag = trackId !== null ? fragmentStats.get(trackId) : undefined;
+    const mdhdDurationTicks = mdhd ? parseMdhdDurationTicks(bytes, mdhd) : 0;
+    const durationTicks = mdhdDurationTicks > 0 ? mdhdDurationTicks : frag?.maxEndTicks ?? 0;
+    const durationUs = durationTicks > 0 ? Math.round((durationTicks * 1_000_000) / timescale) : null;
+    if (durationUs !== null) durationSec = Math.max(durationSec ?? 0, durationUs / 1_000_000);
+    const sampleCount = frag?.sampleCount ?? 0;
+
+    if (handler === 'vide') {
+      const sampleDesc = parseStsd(bytes, stsd);
+      const config: Mp4VideoConfig = {
+        codec: sampleDesc.token,
+        codecString: sampleDesc.codecString,
+        codedWidth: sampleDesc.width,
+        codedHeight: sampleDesc.height,
+        timescale,
+      };
+      if (sampleDesc.description) config.description = sampleDesc.description;
+      tracks.push({ kind: 'video', config, samples: [], sampleCount, durationUs });
+    } else if (handler === 'soun') {
+      const audioDesc = parseAudioStsd(bytes, stsd);
+      if (!audioDesc) continue;
+      const config: Mp4AudioConfig = {
+        codec: audioDesc.token,
+        sampleRate: audioDesc.sampleRate,
+        channels: audioDesc.channels,
+        timescale,
+      };
+      tracks.push({ kind: 'audio', config, samples: [], sampleCount, durationUs });
+    }
+  }
+
+  if (tracks.length === 0) throw new UnsupportedMp4Error('no metadata-readable video/audio track found in moov');
+  return { tracks, durationSec, fragmented };
 }
 
 /**

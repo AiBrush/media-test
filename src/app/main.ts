@@ -233,7 +233,10 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     browser,
     pillar: filter.pillar ?? 'all',
     benchOptions: { warmup: filter.warmup ?? 1, iters: filter.iters ?? 1 },
-    onResult: (r) => matrix.update(r),
+    onResult: (r) => {
+      matrix.update(r);
+      window.__RESULTS__ = matrix.getResults();
+    },
     onProgress: (done, total, label) => setProgress(done, total, label),
   };
   if (engineIds) opts.engineIds = engineIds;
