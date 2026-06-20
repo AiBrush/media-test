@@ -41,21 +41,22 @@ import type { Scenario } from '../../core/scenario.ts';
 import type { TranscodeOptions } from '../../core/engine.ts';
 
 // decode fps — decode a bounded prefix; rank by decodeFps; gate by decoded-frames-bitexact.
-const DECODE_MAX_FRAMES = 300; // ~10 s @30fps: enough to be steady-state, bounded so the bench window is sane.
+const DECODE_MAX_FRAMES = 12; // matches the baked golden prefix and avoids retaining huge RGBA buffers.
 
 const decodeFps: Scenario = perfCase({
   id: 'performance/decode-fps',
   op: 'decodeFrames',
   input: BIG_READ_GOLDEN,
   options: { maxFrames: DECODE_MAX_FRAMES },
-  requires: mp4H264In('decodeFrames'),
+  requires: { ...mp4H264In('decodeFrames'), features: ['decode:golden-rgba'] },
   oracles: ['decoded-frames-bitexact'],
   metrics: ['decodeFps', 'framesPerSec', 'wall'],
   primary: 'decodeFps',
   timeoutMs: T_FAST,
   notes:
     `§A.14 decode-fps↑: decode ${DECODE_MAX_FRAMES} frames of ${BIG_READ_GOLDEN}, rank by decodeFps. ` +
-    `Gated by decoded-frames-bitexact (frames pending → honest FAIL/NA until the frame-bake fills golden).`,
+    `Gated by decoded-frames-bitexact against the browser/WebCodecs RGBA golden; engines whose decode ` +
+    `path cannot normalize to that golden declare no decode:golden-rgba feature and negotiate NA.`,
 });
 
 // encode fps — re-encode at SOURCE resolution to VP9/Opus WebM (encoder-bound, no downscale).
@@ -64,6 +65,7 @@ const ENCODE_SOURCE_RES: TranscodeOptions = {
   video: { codec: 'vp9', width: 1920, height: 1080 },
   audio: { codec: 'opus' },
 };
+const T_ENCODE_FPS = 120_000;
 
 const encodeFps: Scenario = perfCase({
   id: 'performance/encode-fps',
@@ -84,7 +86,7 @@ const encodeFps: Scenario = perfCase({
   // penalty), modest PSNR floor for cross-codec quantization. (ssim-psnr gates on SSIM mean; PSNR
   // floor is advisory in the reference-source path — see oracles.ts ssimVsReferenceSource.)
   tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
-  timeoutMs: T_FAST,
+  timeoutMs: T_ENCODE_FPS,
   notes:
     `§A.14 encode-fps↑: re-encode ${BIG_READ_GOLDEN} → WebM/VP9/Opus at SOURCE 1920×1080 (encoder-bound, ` +
     `no scaler), rank by encodeFps. Gated by ssim-psnr + playback-smoke. Distinct from the downscale convert.`,

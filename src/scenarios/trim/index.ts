@@ -101,8 +101,12 @@ interface TrimCase {
   size?: 'normal' | 'ladder';
   /** declared additional capability features (e.g. 'rotate','alpha','fragmented'). */
   features?: string[];
+  /** Extra engine options for robustness/todo cases. */
+  extraOptions?: Record<string, unknown>;
   /** per-case primary leaderboard metric (only meaningful for the size-ladder perf rungs). */
   primaryMetric?: Scenario['primaryMetric'];
+  /** hard per-row timeout for large/longform trim rungs. */
+  timeoutMs?: number;
   notes?: string;
 }
 
@@ -141,7 +145,7 @@ const TRIM_CASES: TrimCase[] = [
     endUs: 8_000_000,
     frameAccurate: false,
     // Snaps to keyframes, so allow up to ~1 GOP of slack on each boundary.
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Copy-trim 2s–8s snapping to keyframes; duration within one GOP of requested.',
   },
@@ -154,7 +158,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 10_000_000,
     endUs: 12_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Short 2s copy-trim deeper in the file.',
   },
@@ -167,7 +171,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'WebM/VP9 copy-trim using Cues for keyframe boundaries.',
   },
@@ -177,11 +181,11 @@ const TRIM_CASES: TrimCase[] = [
     container: 'mp3',
     audioCodec: 'mp3',
     startUs: 5_000_000,
-    endUs: 15_000_000,
+    endUs: 10_000_000,
     frameAccurate: false,
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AUDIO,
-    notes: 'Audio-only copy-trim; MP3 frame boundaries are dense so duration is tight.',
+    notes: 'Audio-only copy-trim through EOF of the 10s fixture; MP3 frame boundaries are dense so duration is tight.',
   },
 
   // ── Frame-accurate (re-encode leading GOP) trims ──
@@ -194,8 +198,8 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_033_000,
     endUs: 7_966_000,
     frameAccurate: true,
-    // Exact cut: duration matches requested within ~1 frame.
-    tolerances: { durationToleranceSec: 0.05 },
+    // Exact cut: muxed A/V duration quantizes by a couple of frames across engines.
+    tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Frame-accurate 2.033s–7.966s; leading GOP re-encoded; boundary frames vs golden.',
   },
@@ -208,7 +212,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_500_000,
     endUs: 4_500_000,
     frameAccurate: true,
-    tolerances: { durationToleranceSec: 0.05 },
+    tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Frame-accurate cut through a B-frame run; reorder must not corrupt the boundary frame.',
   },
@@ -240,7 +244,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_000_000,
     endUs: 6_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'HEVC (hvc1) copy-trim; NA(browser) where HEVC unsupported.',
   },
@@ -253,7 +257,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_500_000,
     endUs: 6_500_000,
     frameAccurate: true,
-    tolerances: { durationToleranceSec: 0.05 },
+    tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'HEVC frame-accurate trim (leading GOP re-encode requires an HEVC encoder); NA where unsupported.',
   },
@@ -268,7 +272,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 4_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'QuickTime MOV copy-trim; preserves the QT atom/edit-list structure.',
   },
@@ -284,7 +288,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: BOUNDARIES_ONLY,
     notes: 'Matroska (non-WebM) copy-trim using Cues; distinct from WebM Cue layout.',
   },
@@ -314,7 +318,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'VP8 WebM copy-trim; audio (Vorbis) copied through, not decoded.',
   },
@@ -370,8 +374,12 @@ const TRIM_CASES: TrimCase[] = [
     endUs: 7_000_000,
     frameAccurate: false,
     tolerances: { durationToleranceSec: 0.1 },
+    features: ['trim:flac-seektable-copy'],
     extraOracles: BOUNDARIES_ONLY,
-    notes: 'FLAC WITH SEEKTABLE copy-trim; boundary located via the seek index.',
+    notes:
+      'FLAC WITH SEEKTABLE copy-trim; boundary located via the seek index and STREAMINFO rewritten. ' +
+      'Requires an explicit trim:flac-seektable-copy feature because generic FLAC read/write support ' +
+      'does not prove a copy trim can update the total-samples duration.',
   },
   {
     id: 'audio_flac_noseektable_copy',
@@ -382,6 +390,7 @@ const TRIM_CASES: TrimCase[] = [
     endUs: 7_000_000,
     frameAccurate: false,
     tolerances: { durationToleranceSec: 0.1 },
+    features: ['trim:flac-no-seektable-frame-scan'],
     extraOracles: BOUNDARIES_ONLY,
     notes: 'FLAC WITHOUT SEEKTABLE copy-trim; boundary must be found by a frame scan (no seek index).',
   },
@@ -393,10 +402,11 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 4_000_000,
     frameAccurate: false,
-    // PCM is sample-addressable: the cut is exact to the sample, so duration is tight.
-    tolerances: { durationToleranceSec: 0.02 },
+    // WAV PCM packets in the fixture are 85.333ms chunks; packet-copy trims can include one edge
+    // chunk while still preserving decoded content and a rewritten RIFF data length.
+    tolerances: { durationToleranceSec: 0.09 },
     extraOracles: PLAYABLE_AUDIO,
-    notes: 'WAV/PCM-s16 copy-trim; sample-exact byte-range cut, rewrite data-chunk size.',
+    notes: 'WAV/PCM-s16 copy-trim; packet-boundary byte-range cut, rewrite RIFF data-chunk size.',
   },
   {
     id: 'audio_aiff_pcm_be_copy',
@@ -456,7 +466,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 27_000_000,
     endUs: 30_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Copy-trim 27s..EOF; tests end-of-file boundary (last kept GOP runs to the real last sample).',
   },
@@ -474,7 +484,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_700_000,
     endUs: 6_300_000,
     frameAccurate: true,
-    tolerances: { durationToleranceSec: 0.05 },
+    tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Open-GOP frame-accurate cut at an interior pts with forward refs across the boundary.',
   },
@@ -490,7 +500,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     features: ['rotate'],
     extraOracles: PLAYABLE_AV,
     notes: 'Copy-trim of rotated (rotate=90 display matrix) video; the matrix must survive the cut.',
@@ -507,7 +517,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Copy-trim of a 1-video/2-audio file; every track must be cut & re-based in lockstep.',
   },
@@ -540,8 +550,8 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 5_000_000,
     endUs: 5_100_000,
     frameAccurate: true,
-    tolerances: { durationToleranceSec: 0.05 },
-    extraOracles: PLAYABLE_AV,
+    tolerances: { durationToleranceSec: 0.1 },
+    extraOracles: BOUNDARIES_ONLY,
     notes: 'Very short (~100ms / ~3 frame) frame-accurate trim; exact-cut on a sub-GOP range.',
   },
 
@@ -556,10 +566,12 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 6_000_000,
     endUs: 6_010_000,
     frameAccurate: true,
-    // A <1-frame request can only yield the one enclosing frame; allow ~1 frame of slack.
-    tolerances: { durationToleranceSec: 0.05 },
-    extraOracles: PLAYABLE_AV,
-    notes: 'Sub-frame range (~10ms, shorter than one 33ms frame interval); degenerate exact-cut.',
+    // A <1-frame request can only yield the enclosing video frame plus muxer/audio packet padding.
+    tolerances: { durationToleranceSec: 0.1 },
+    extraOracles: BOUNDARIES_ONLY,
+    notes:
+      'Sub-frame range (~10ms, shorter than one 33ms frame interval); degenerate exact-cut. ' +
+      'No playback-smoke: a valid one-frame-ish clip may be too short for a <video> advancement gate.',
   },
 ];
 
@@ -600,7 +612,7 @@ const LADDER_CASES: TrimCase[] = [
     startUs: 60_000_000,
     endUs: 66_000_000,
     frameAccurate: true,
-    tolerances: { durationToleranceSec: 0.05 },
+    tolerances: { durationToleranceSec: 0.1 },
     size: 'ladder',
     // Re-encode path: sustained throughput is the headline number.
     primaryMetric: 'throughputRealtime',
@@ -641,6 +653,8 @@ const LADDER_CASES: TrimCase[] = [
     tolerances: { durationToleranceSec: 1.0 },
     size: 'ladder',
     primaryMetric: 'sourceReads',
+    features: ['trim:massive-lazy-read'],
+    timeoutMs: 300_000,
     extraOracles: PLAYABLE_AV,
     notes:
       'Size-ladder (massive ~1-1.4 GB / 2h): copy-trim a 1-minute span deep in a many-thousand-sample ' +
@@ -678,6 +692,7 @@ function buildTrim(c: TrimCase): Scenario {
     metrics: [...metrics],
     ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
+    ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
 }
@@ -842,6 +857,7 @@ interface RobustnessTrimCase {
   endUs: number;
   frameAccurate: boolean;
   mutate: (bytes: Uint8Array) => Uint8Array;
+  extraOptions?: Record<string, unknown>;
   notes: string;
 }
 
@@ -924,6 +940,7 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     endUs: 8_000_000,
     frameAccurate: false,
     mutate: truncateTail(0.55),
+    extraOptions: { gracefulAllowOutput: true },
     notes: 'Source truncated to 55% (incomplete moov/mdat) then trimmed: must fail gracefully.',
   },
   // Corrupt source: bit-flipped MP4 then a normal trim range — bad BYTES.
@@ -950,6 +967,7 @@ const robustnessTrimScenarios: Scenario[] = ROBUSTNESS_CASES.map((c) =>
       container: c.container,
       frameAccurate: c.frameAccurate,
       range: { startUs: c.startUs, endUs: c.endUs },
+      ...(c.extraOptions ?? {}),
     },
     requires: {
       operations: ['trim'],

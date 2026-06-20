@@ -13,6 +13,7 @@
 import type { MediaInput, NormalizedMetadata, NormalizedTrack, PacketInfo, TrackType } from '../../core/engine.ts';
 
 const SAMPLE_TABLE_FAST_PATH_ASSETS = new Set([
+  'h264_1080p_30s.mp4',
   'huge_h264_1080p_600s.mov',
   'massive_h264_1080p_2h.mp4',
 ]);

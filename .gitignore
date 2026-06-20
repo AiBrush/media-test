@@ -13,6 +13,7 @@ src/engines/**/vendor/
 # raw per-run results & snapshots (only results/report.md is committed)
 results/raw/
 results/runs/
+results/.browser-cache/
 
 # OS / editor noise
 .DS_Store

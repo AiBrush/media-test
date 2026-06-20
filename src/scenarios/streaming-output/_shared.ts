@@ -216,6 +216,7 @@ export interface StreamPropertyCase {
   shape: OutputShape;
   /** override the default ['property-invariant'] oracle set */
   oracles?: OracleId[];
+  tolerances?: Scenario['tolerances'];
   timeoutMs?: number;
   notes?: string;
 }
@@ -247,6 +248,7 @@ export function buildStreamProperty(c: StreamPropertyCase): Scenario {
     },
     oracles: c.oracles ?? ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });

@@ -262,7 +262,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       // No decrypt API.
       encryption: [],
       // Pixel transforms are limited to resize + rotate (90° multiples) on OffscreenCanvas 2D.
-      features: ['resize', 'rotate', 'packets:dts', PROTECTED_TRACK_METADATA_FEATURE],
+      features: ['resize', 'rotate', 'packets:dts', PROTECTED_TRACK_METADATA_FEATURE, 'decode:golden-rgba'],
     };
   }
 
@@ -515,6 +515,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 
     const videoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
     ensureSupportedTranscodeRequest(input, opts, container, videoSpec);
+    await this.assertRequestedTracksPresent(input, opts, videoSpec);
 
     let videoCodec: RemotionVideoCodec | undefined;
     let resize: import('@remotion/webcodecs').ResizeOperation | undefined;
@@ -788,6 +789,27 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     const img = await landed.img;
     const frame = await digestImageData(img, 0, landed.ptsUs);
     return { landedPtsUs: landed.ptsUs, frame };
+  }
+
+  private async assertRequestedTracksPresent(
+    input: MediaInput,
+    opts: TranscodeOptions,
+    videoSpec: TranscodeVideoOptions | undefined,
+  ): Promise<void> {
+    if (!videoSpec && !opts.audio) return;
+    const { mp } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
+    const result = await mp.parseMedia({
+      ...srcOptions,
+      acknowledgeRemotionLicense: true,
+      fields: { tracks: true },
+    });
+    if (videoSpec && !result.tracks.some((track) => track.type === 'video')) {
+      throw new Error(`${ENGINE_ID} transcode: requested video output but input has no video track`);
+    }
+    if (opts.audio && !result.tracks.some((track) => track.type === 'audio')) {
+      throw new Error(`${ENGINE_ID} transcode: requested audio output but input has no audio track`);
+    }
   }
 
   // ── trim (NOT SUPPORTED) ─────────────────────────────────────────────────────────────────────
@@ -2139,6 +2161,14 @@ function ensureSupportedTranscodeRequest(
 ): void {
   if (container === 'wav') return;
 
+  if (
+    videoSpec &&
+    ((videoSpec.width !== undefined && videoSpec.width <= 0) ||
+      (videoSpec.height !== undefined && videoSpec.height <= 0))
+  ) {
+    throw new Error('Remotion WebCodecs transcode rejected invalid video dimensions');
+  }
+
   if (videoSpec?.codec === 'av1') {
     throw new NotApplicableError('transcode', 'Remotion WebCodecs 4.0.479 exposes no AV1 encoder');
   }
@@ -2150,8 +2180,11 @@ function ensureSupportedTranscodeRequest(
     );
   }
 
-  if (videoSpec?.fps != null && (videoSpec.fps <= 1 || videoSpec.fps >= 240)) {
-    throw new NotApplicableError('transcode', 'extreme output frame-rate conversion is not reliable in this package');
+  if (videoSpec?.fps != null) {
+    throw new NotApplicableError(
+      'transcode',
+      'Remotion WebCodecs 4.0.479 convertMedia has no output FPS conversion option',
+    );
   }
 
   if (opts.audio?.channels != null || opts.audio?.sampleRate != null) {

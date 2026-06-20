@@ -66,6 +66,7 @@ const WRITE_TARGET_CASES: MuxCase[] = [
     containersIn: ['webm'],
     to: 'ogg',
     audioCodecs: ['vorbis'],
+    extraOptions: { trackSelect: ['audio:0'] },
     notes:
       'WRITE TARGET ogg (§A.3): demux the Vorbis audio track out of a WebM and mux it into OGG ' +
       '(Vorbis is the other native OGG payload). Audio-only OGG authoring.',

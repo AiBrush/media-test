@@ -214,6 +214,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 15 } },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
     optsInvariant: 'transcode-output-metadata',
@@ -230,6 +231,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 30 } },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
     optsInvariant: 'transcode-output-metadata',
@@ -588,6 +590,7 @@ const FPS_UP_CASES: VideoTranscodeCase[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 30 }, invariant: 'transcode-output-metadata' },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
     tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
@@ -603,6 +606,7 @@ const FPS_UP_CASES: VideoTranscodeCase[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 60 }, invariant: 'transcode-output-metadata' },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
     tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
@@ -1077,6 +1081,7 @@ interface SizeLadderCase {
   toAudio?: string;
   width: number;
   height: number;
+  tolerances?: OracleTolerances;
   timeoutMs?: number;
   notes: string;
 }
@@ -1092,6 +1097,7 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
     toVideo: 'h264',
     width: 320,
     height: 180,
+    tolerances: { ssimMin: 0.95, psnrMinDb: 22 },
     notes: 'TINY rung (~100 KB) transcode+resize → frames/sec. Init-overhead-dominated end of the curve.',
   },
   {
@@ -1159,7 +1165,7 @@ const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
     oracles: ['ssim-psnr'],
     metrics: ['framesPerSec', 'wall', 'encodeFps', 'peakMemory'],
     primaryMetric: 'framesPerSec',
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
@@ -1176,6 +1182,7 @@ interface ContainerWriteCase {
   id: string;
   toContainer: string;
   feature?: string;
+  tolerances?: OracleTolerances;
   browserPlayable: boolean;
   notes: string;
 }
@@ -1205,6 +1212,7 @@ const CONTAINER_WRITE_CASES: ContainerWriteCase[] = [
     id: 'h264_to_fragmented_mp4',
     toContainer: 'mp4',
     feature: 'fragmented',
+    tolerances: { ssimMin: 0.96, psnrMinDb: 34, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     browserPlayable: true,
     notes:
       'Transcode → fragmented MP4 / CMAF (A.3, fastStart:"fragmented"). Requires the declared ' +
@@ -1235,7 +1243,7 @@ const containerWriteScenarios: Scenario[] = CONTAINER_WRITE_CASES.map((c) => {
     },
     oracles,
     metrics: [...TC_METRICS],
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    tolerances: c.tolerances ?? { ssimMin: 0.98, psnrMinDb: 38, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes: c.notes,
   });
 });
@@ -1382,8 +1390,10 @@ const extremeFpsScenarios: Scenario[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 1 }, invariant: 'probe-duration' },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
+    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes: 'Extreme fps 1 (A.16). Heavy decimation; gated by duration-preservation (index SSIM unsound).',
   }),
   buildVideoScenario({
@@ -1394,8 +1404,10 @@ const extremeFpsScenarios: Scenario[] = [
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
+    features: ['fps'],
     opts: { container: 'mp4', video: { codec: 'h264', fps: 240 }, invariant: 'probe-duration' },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
+    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes: 'Extreme fps 240 (A.16). Heavy interpolation; gated by duration-preservation.',
   }),
 ];
@@ -1405,7 +1417,7 @@ const extremeResizeScenarios: Scenario[] = [
     id: 'transcode/extreme_resize_1x1',
     op: 'transcode',
     input: 'h264_1080p_30s.mp4',
-    options: { container: 'mp4', video: { codec: 'h264', width: 1, height: 1 } },
+    options: { container: 'mp4', video: { codec: 'h264', width: 1, height: 1 }, gracefulAllowOutput: true },
     requires: {
       operations: ['transcode'],
       containersIn: ['mp4'],
@@ -1418,10 +1430,12 @@ const extremeResizeScenarios: Scenario[] = [
     metrics: ['wall'],
     timeoutMs: TC_EDGE_TIMEOUT_MS,
     // Pass-through mutate routes the runner to the robustness path (throw=PASS, crash/hang=FAIL).
+    // 1x1 is valid-but-degenerate, so returned output is also an accepted non-crash path.
     mutate: (b) => b,
     notes:
       '1×1 resize (A.16 "0×0 or 1×1 video"). Must handle gracefully or correctly — a clean throw or a ' +
-      'sane minimal frame, never a crash/hang/OOM. graceful-failure gate via the robustness path.',
+      'sane minimal frame, never a crash/hang/OOM. graceful-failure allows returned output for this ' +
+      'valid-but-degenerate target via the robustness path.',
   }),
   defineScenario({
     id: 'transcode/extreme_resize_0x0',
@@ -1498,7 +1512,7 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    options: { container: 'mp4', video: { codec: 'h264' } },
+    options: { container: 'mp4', video: { codec: 'h264' }, gracefulAllowOutput: true },
     mutate: truncateTail60,
     notes:
       'Truncated H.264 (moov/mdat incomplete) → transcode (A.16 header-truncated, §5.1). Robustness path: ' +
@@ -1546,7 +1560,7 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     containersIn: ['mp4'], // deliberately mislabel a TS payload as MP4 input
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    options: { container: 'mp4', video: { codec: 'h264' } },
+    options: { container: 'mp4', video: { codec: 'h264' }, gracefulAllowOutput: true },
     mutate: (b) => b,
     notes:
       'Mislabeled container: a TS payload declared as mp4 input (A.16 "h264 mislabeled / mismatched ' +

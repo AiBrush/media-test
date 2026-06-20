@@ -3,6 +3,11 @@ import type { ScenarioResult } from '../core/scenario.ts';
 const DB_NAME = 'media-browser-test-results';
 const DB_VERSION = 1;
 const STORE = 'results';
+const INVALIDATED_PASS_KEYS = new Set([
+  'ffmpeg.wasm@0.12.15\u0000transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
+  'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_mkv',
+  'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_ts',
+]);
 
 export interface CachedScenarioResult extends ScenarioResult {
   cached?: true;
@@ -15,6 +20,10 @@ export interface ResultCache {
 
 function cacheKey(engineId: string, scenarioId: string, browser: string): string {
   return `${browser}\u0000${engineId}\u0000${scenarioId}`;
+}
+
+function shouldInvalidateCachedResult(result: ScenarioResult): boolean {
+  return result.status === 'PASS' && INVALIDATED_PASS_KEYS.has(`${result.engineId}\u0000${result.scenarioId}`);
 }
 
 export function isReusableResult(result: ScenarioResult | undefined): result is ScenarioResult {
@@ -47,7 +56,11 @@ export function createResultCache(): ResultCache | undefined {
         const req = tx.objectStore(STORE).get(key);
         req.onsuccess = () => {
           const row = req.result as { result?: ScenarioResult } | undefined;
-          resolve(row?.result ? { ...row.result, cached: true } : undefined);
+          if (!row?.result || shouldInvalidateCachedResult(row.result)) {
+            resolve(undefined);
+            return;
+          }
+          resolve({ ...row.result, cached: true });
         };
         req.onerror = () => reject(req.error ?? new Error('failed to read result cache'));
       });

@@ -11,6 +11,11 @@ import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
 import type { ScenarioResult } from '../core/scenario.ts';
 import { visibleResult } from '../core/format.ts';
 
+export interface MatrixCellRef {
+  engineId: string;
+  scenarioId: string;
+}
+
 // ── small DOM helpers ─────────────────────────────────────────────────────────────────────────
 
 function $<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -241,7 +246,7 @@ export class MatrixView {
   }
 
   /** Lay out an empty engine × scenario grid (scenarios as rows, engines as columns). */
-  start(engines: string[], scenarios: string[]): void {
+  start(engines: string[], scenarios: string[], options: { executionOrder?: MatrixCellRef[] } = {}): void {
     this.engines = engines;
     this.scenarios = scenarios;
     this.cells.clear();
@@ -250,8 +255,12 @@ export class MatrixView {
     this.runningCell = null;
     this.stopScoreboardTimers();
     // Mirror runMatrix's scenario-major iteration so we can guess the in-flight cell from order.
-    this.execOrder = [];
-    for (const s of scenarios) for (const e of engines) this.execOrder.push(this.key(e, s));
+    this.execOrder = options.executionOrder?.length
+      ? options.executionOrder.map((cell) => this.key(cell.engineId, cell.scenarioId))
+      : [];
+    if (!this.execOrder.length) {
+      for (const s of scenarios) for (const e of engines) this.execOrder.push(this.key(e, s));
+    }
     clear(this.host);
 
     if (engines.length === 0 || scenarios.length === 0) {

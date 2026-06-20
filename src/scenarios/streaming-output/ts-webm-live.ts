@@ -87,6 +87,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     shape: { container: 'ts', target: 'stream', writeChunkBytes: 188 },
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_ts_stream(x)).dur≈probe(x).dur: a TS streamed in tiny writes must still yield a sane ' +
       'duration on re-probe. MPEG-TS has no global duration (estimate-only → loose band in oracles.ts), ' +

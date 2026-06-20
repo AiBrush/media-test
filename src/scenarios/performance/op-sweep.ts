@@ -16,7 +16,8 @@
  *              remux output (they read ctx.metadata/ctx.demux, only set for probe/demux) — attaching
  *              them would be a wrong oracle. throughputRealtime is the natural rank for an I/O-bound copy.
  *   • transcode → ssim-psnr (perceptual, gates on golden frames once baked / reference-source fallback
- *                 today) + reference-reimport + playback-smoke. Ranked by encodeFps.
+ *                 today) + output-metadata invariant + playback-smoke. Ranked by encodeFps. Re-encode
+ *                 outputs may legitimately choose a different WebM packet/GOP layout than the source.
  *
  * METRIC CHOICES (all produced by the runner, all in report's PRIMARY_METRIC_PRIORITY):
  *   probe→opsPerSec, demux→packetsPerSec, remux→throughputRealtime, transcode→encodeFps. wall +
@@ -36,6 +37,8 @@ import {
   T_FAST,
 } from './_shared.ts';
 import type { Scenario } from '../../core/scenario.ts';
+
+const T_TRANSCODE_SWEEP = 120_000;
 
 // probe → ops/sec (distinct from the headline extract-metadata only in being part of the named sweep;
 // kept with a sweep-specific id so both appear without colliding).
@@ -91,21 +94,27 @@ const sweepRemux: Scenario = perfCase({
 });
 
 // transcode → WebM/VP9/Opus @180p → encode fps (heavy re-encode; perceptual gate).
+const CONVERT_OUTPUT_METADATA_TOLERANCES = {
+  ...CONVERT_TOLERANCES,
+  durationToleranceSec: 0.15,
+};
+
 const sweepTranscode: Scenario = perfCase({
   id: 'performance/op-sweep-transcode-webm',
   op: 'transcode',
   input: BIG_READ_GOLDEN,
-  options: CONVERT_320x180,
+  options: { ...CONVERT_320x180, invariant: 'transcode-output-metadata' },
   requires: CONVERT_REQUIRES,
-  oracles: ['ssim-psnr', 'reference-reimport', 'playback-smoke'],
+  oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
   metrics: ['encodeFps', 'framesPerSec', 'throughputRealtime', 'wall'],
   primary: 'encodeFps',
-  tolerances: CONVERT_TOLERANCES,
-  timeoutMs: T_FAST,
+  tolerances: CONVERT_OUTPUT_METADATA_TOLERANCES,
+  timeoutMs: T_TRANSCODE_SWEEP,
   notes:
     `§8.2 per-op sweep — TRANSCODE ${BIG_READ_GOLDEN} → WebM/VP9/Opus @320×180. Score = encode fps. ` +
     `Gated by ssim-psnr (perceptual; golden-frame path once baked, reference-source fallback today) + ` +
-    `reference-reimport + playback-smoke.`,
+    `property-invariant output metadata (container/codecs/dimensions/duration; no source packet-count ` +
+    `gate for re-encoded WebM) + playback-smoke.`,
 });
 
 export const opSweepScenarios: Scenario[] = [sweepProbe, sweepDemux, sweepRemux, sweepTranscode];

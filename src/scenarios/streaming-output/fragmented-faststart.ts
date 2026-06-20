@@ -97,6 +97,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     shape: { container: 'mp4', target: 'buffer' },
+    features: ['streaming:decode-equality'],
     notes:
       'Lossless-sample-copy premise for the fragmented/CMAF path: decode(remux(x))==decode(x) proves a ' +
       'plain mp4 remux preserves every decoded frame. The fragmented output copies the SAME coded ' +
@@ -114,6 +115,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     audioCodecs: ['aac'],
     shape: { container: 'mp4', fastStart: 'in-memory', target: 'buffer' },
     features: ['fastStart:in-memory'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_faststart(x)).dur≈probe(x).dur: relocating the moov to the front (progressive ' +
       'fastStart) must not change the reported duration. Works for the moov-first shape today (probe ' +
@@ -129,6 +131,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     audioCodecs: ['aac'],
     shape: { container: 'mp4', fastStart: 'reserve', target: 'stream', maximumPacketCount: 4096 },
     features: ['fastStart:reserve'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_reserve(x)).dur≈probe(x).dur: a reserved-forward-moov output (fastStart:"reserve", ' +
       'maximumPacketCount per track) must report the same duration as the source. The duration-side gate ' +

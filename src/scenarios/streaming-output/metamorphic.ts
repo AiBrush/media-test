@@ -39,6 +39,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['streaming:decode-equality'],
     shape: { container: 'mp4', target: 'buffer' },
     notes:
       'decode(remux_buffer(x))==decode(x): the BufferTarget output must decode to frames bit-identical ' +
@@ -52,6 +53,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['streaming:decode-equality'],
     shape: { container: 'mp4', target: 'stream' },
     notes:
       'decode(remux_stream(x))==decode(x): the StreamTarget output must decode IDENTICALLY to the buffer ' +
@@ -70,6 +72,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     shape: { container: 'mp4', target: 'buffer' },
+    tolerances: { durationToleranceSec: 0.125 },
     notes: 'probe(remux_buffer(x)).dur≈probe(x).dur: the buffered output must report the source duration.',
   },
   {
@@ -81,6 +84,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     shape: { container: 'mp4', target: 'stream' },
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_stream(x)).dur≈probe(x).dur: streaming the output incrementally must not change the ' +
       'reported duration vs the buffered/source duration. The duration-side cross-shape invariant.',
@@ -95,6 +99,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     audioCodecs: ['aac'],
     shape: { container: 'mp4', fragmented: true, target: 'stream' },
     features: ['fragmented'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_fragmented(x)).dur≈probe(x).dur: a fragmented/CMAF (moof/mdat) output legitimately ' +
       'grows (per-fragment moof overhead) but must report the SAME duration as the source. The duration ' +

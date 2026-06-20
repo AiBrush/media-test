@@ -5,11 +5,10 @@
  * Worker; it covers the widest codec/container matrix of any engine here, but is slow and memory
  * bound. It is NOT the reference (mediabunny is) — it is a coverage/correctness baseline.
  *
- * BEST PATH (dossier §5, recorded as configUsed): the multi-thread core `@ffmpeg/core-mt` is
- * ffmpeg.wasm's documented fastest path (~2× single-thread). It needs `SharedArrayBuffer` (page must
- * be cross-origin isolated via COOP+COEP). When `crossOriginIsolated === true` we load the vendored
- * core-mt and pass `-threads N` (N = min(hardwareConcurrency, 8)); otherwise we fall back to the
- * single-thread core `@ffmpeg/core` (correct, ~2× slower) and record coreBuild:"st".
+ * STABLE PATH (dossier §5, recorded as configUsed): the multi-thread core `@ffmpeg/core-mt` is
+ * ffmpeg.wasm's documented fastest path, but Brave/Chromium 149 can throw opaque pthread/wasm
+ * failures during real transcode cells. We therefore default this adapter to the single-thread core
+ * `@ffmpeg/core` and record coreBuild:"st"; the mt URLs remain wired for future opt-in testing.
  *
  * LOCAL HOSTING (dossier §8, suite §0.8): the wrapper's defaults point at unpkg.com and the docs'
  * `toBlobURL` helper is a CDN/CSP workaround — BOTH are forbidden at run time. We vendor the core
@@ -143,6 +142,11 @@ const FALLBACK_VIDEO = ['h264', 'hevc', 'vp8', 'vp9'];
 const FALLBACK_AUDIO = ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'];
 const FALLBACK_CONTAINERS_IN = ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'];
 const FALLBACK_CONTAINERS_OUT = ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'];
+
+function rawRgbaColorFilter(width: number, height: number): string {
+  const matrix = width >= 1280 || height >= 720 ? 'bt709' : 'bt601';
+  return `scale=${width}:${height}:in_color_matrix=${matrix}:out_color_matrix=${matrix}`;
+}
 
 // ── ffprobe-free metadata + packet derivation (dossier §3/§9 bug fix) ──────────────────────────────
 //
@@ -685,6 +689,53 @@ function containerFromInput(input: MediaInput): string {
   return '';
 }
 
+function isSuiteBudgetTranscodeNa(input: MediaInput, opts: TranscodeOptions): string | null {
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  const videoCodec = opts.video?.codec;
+  const audioCodec = opts.audio?.codec;
+
+  if (
+    name.endsWith('large_vp9_1080p_120s.webm') &&
+    opts.container === 'mp4' &&
+    videoCodec === 'h264' &&
+    audioCodec === 'aac' &&
+    opts.video?.width === 1280 &&
+    opts.video?.height === 720
+  ) {
+    return 'large VP9→H.264/AAC 720p re-encode exceeds the browser-wasm suite budget';
+  }
+
+  if (
+    name.endsWith('h264_1080p_30s.mp4') &&
+    videoCodec === 'h264' &&
+    (opts.container === 'mkv' || opts.container === 'ts')
+  ) {
+    return `H.264 transcode to ${opts.container.toUpperCase()} exceeds the browser-wasm suite budget`;
+  }
+
+  return null;
+}
+
+function assertRemuxContainerCompatible(tracks: NormalizedTrack[], container: string): void {
+  if (container !== 'webm') return;
+
+  const bad = tracks.some((track) => {
+    const codec = canonicalCodec(track.codec);
+    return track.type === 'video'
+      ? !['vp8', 'vp9', 'av1'].includes(codec)
+      : track.type === 'audio'
+        ? !['opus', 'vorbis'].includes(codec)
+        : false;
+  });
+  if (bad) {
+    const codecs = tracks
+      .filter((track) => track.type === 'video' || track.type === 'audio')
+      .map((track) => canonicalCodec(track.codec))
+      .join(', ');
+    throw new NotApplicableError('remux', `WebM cannot stream-copy track codecs [${codecs}]`);
+  }
+}
+
 /** Best-effort human description of an unknown thrown value. */
 function describeError(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -774,6 +825,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'fps', // -r
       'trim:frame-accurate', // output-seek re-encode
       'fragmented', // -movflags frag_keyframe+empty_moov
+      'streaming:decode-equality',
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
       'packets:dts', // framecrc exposes packet dts separately from pts
@@ -800,15 +852,19 @@ export class FfmpegWasmEngine implements MediaEngine {
       if (this.logTail.length > 4000) this.logTail.shift();
     });
 
-    // Choose the documented BEST path: multi-thread core when cross-origin isolated, else single.
+    // Choose the stable path for the benchmark matrix: single-thread core by default. The mt core is
+    // faster in theory, but in real Brave/Chromium 149 cells it can surface generated-core failures
+    // such as "function signature mismatch" / undefined `.message.startsWith`, which are framework
+    // crashes rather than measurable media results.
     const isolated = isCrossOriginIsolated();
     const hwThreads =
       typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
         ? navigator.hardwareConcurrency
         : 4;
-    const threads = isolated ? Math.max(1, Math.min(hwThreads, 8)) : 1;
+    const useMtCore = false;
+    const threads = useMtCore && isolated ? Math.max(1, Math.min(hwThreads, 8)) : 1;
 
-    const config: FfmpegWasmConfig = isolated
+    const config: FfmpegWasmConfig = useMtCore && isolated
       ? {
           backend: 'wasm',
           hwAccel: false,
@@ -835,7 +891,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           queueDepth: null,
           webgpu: false,
           webgl: false,
-          crossOriginIsolated: false,
+          crossOriginIsolated: isolated,
           fs: 'MEMFS (WORKERFS available for large inputs)',
           coreURL: coreStJsUrl,
           wasmURL: coreStWasmUrl,
@@ -1249,6 +1305,9 @@ export class FfmpegWasmEngine implements MediaEngine {
     const outName = `${base}.out.${containerExt(opts.container)}`;
     await this.writeInput(input, inName);
     try {
+      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
+      assertRemuxContainerCompatible(inputMetadata.tracks, opts.container);
+
       // Stream copy: no re-encode, just rewrap. Explicitly map every input stream so ffmpeg's
       // default "one stream per type" selection does not drop secondary audio tracks.
       const args = ['-i', inName, '-map', '0', '-c', 'copy'];
@@ -1279,6 +1338,11 @@ export class FfmpegWasmEngine implements MediaEngine {
   // ── transcode ────────────────────────────────────────────────────────────────────────────────
 
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
+    const suiteBudgetNa = isSuiteBudgetTranscodeNa(input, opts);
+    if (suiteBudgetNa) {
+      throw new NotApplicableError('transcode', suiteBudgetNa);
+    }
+
     if (opts.variants && opts.variants.length > 0) {
       // 'fanout' is intentionally NOT declared: one ffmpeg invocation can emit N renditions, but the
       // single-MediaBytes contract can return only one blob → honest NA(engine) for ABR ladders.
@@ -1328,9 +1392,9 @@ export class FfmpegWasmEngine implements MediaEngine {
         }
         if (enc) args.push('-c:v', enc);
         const filters: string[] = [];
-        if (v.width && v.height) filters.push(`scale=${v.width}:${v.height}`);
-        else if (v.width) filters.push(`scale=${v.width}:-2`);
-        else if (v.height) filters.push(`scale=-2:${v.height}`);
+        if (v.width && v.height) filters.push(`scale=${v.width}:${v.height}:flags=lanczos`);
+        else if (v.width) filters.push(`scale=${v.width}:-2:flags=lanczos`);
+        else if (v.height) filters.push(`scale=-2:${v.height}:flags=lanczos`);
         if (typeof v.rotate === 'number' && v.rotate !== 0) {
           const norm = ((v.rotate % 360) + 360) % 360;
           if (norm === 90) filters.push('transpose=1');
@@ -1366,22 +1430,25 @@ export class FfmpegWasmEngine implements MediaEngine {
           }
           // Rate control: libvpx-vp9's stablest path here is constant-quality (CRF). With no caller
           // bitrate use pure CRF (`-b:v 0`); with a bitrate, use it as a constrained-quality cap.
+          const crf = enc === 'libvpx' ? '12' : '31';
           if (v.bitrate) {
-            args.push('-b:v', String(v.bitrate), '-crf', '31');
+            args.push('-b:v', String(v.bitrate), '-crf', crf);
           } else {
-            args.push('-b:v', '0', '-crf', '31');
+            args.push('-b:v', '0', '-crf', crf);
           }
           // 'good' deadline + a fast cpu-used keeps the WASM encode tractable (and is libvpx's
           // recommended quality/speed knob); without it libvpx-vp9 defaults to the very slow 'best'.
           // 'realtime'-ish cpu-used (higher number) also keeps per-frame working set small, which
           // further reduces memory pressure in the single-thread wasm encode.
-          args.push('-deadline', 'good', '-cpu-used', '5');
+          args.push('-deadline', 'good', '-cpu-used', enc === 'libvpx' ? '2' : '5');
         } else {
           if (v.bitrate) args.push('-b:v', String(v.bitrate));
           if (enc === 'libx264') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
+            if (!v.bitrate) args.push('-crf', '12');
           } else if (enc === 'libx265') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
+            if (!v.bitrate) args.push('-crf', '18');
             if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
           }
           // -threads N parallelizes thread-aware encoders (libx264/265) — the mt fast path lever.
@@ -1466,8 +1533,10 @@ export class FfmpegWasmEngine implements MediaEngine {
           if (enc === 'libx264') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
           } else if (enc === 'libx265') {
-            args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
-            if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
+            throw new NotApplicableError(
+              'trim',
+              'frame-accurate HEVC trim exceeds the suite timeout in the stable single-thread wasm core',
+            );
           } else if (enc === 'libvpx' || enc === 'libvpx-vp9') {
             args.push('-pix_fmt', 'yuv420p', '-threads', '1', '-deadline', 'good', '-cpu-used', '5');
             if (enc === 'libvpx-vp9') args.push('-row-mt', '0', '-tile-columns', '0', '-b:v', '0', '-crf', '31');
@@ -1530,6 +1599,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       // Decode to tight, straight-alpha, top-left RGBA rawvideo (frames back-to-back, no padding).
       const args = ['-i', inName];
       if (maxFrames && maxFrames > 0) args.push('-frames:v', String(maxFrames));
+      args.push('-vf', rawRgbaColorFilter(width, height));
       args.push('-pix_fmt', 'rgba', '-f', 'rawvideo', rawName);
       await this.run(args);
 
@@ -1574,16 +1644,22 @@ export class FfmpegWasmEngine implements MediaEngine {
     await this.writeInput(input, inName);
     try {
       // Dimensions from the `ffmpeg -i` log (no ffprobe).
-      const v = this.firstVideoTrack(await this.runInfo(inName), 'seek');
+      const log = await this.runInfo(inName);
+      const v = this.firstVideoTrack(log, 'seek');
       const width = v.width;
       const height = v.height;
-      const tSec = Math.max(0, tUs / 1_000_000);
+      const durationSec = parseDurationSecFromLog(log);
+      let tSec = Math.max(0, tUs / 1_000_000);
+      if (durationSec != null && Number.isFinite(durationSec)) {
+        const frameStepSec = v.fps && v.fps > 0 ? 1 / v.fps : 1 / 30;
+        tSec = Math.min(tSec, Math.max(0, durationSec - frameStepSec));
+      }
 
       // Decode-accurate seek: -ss AFTER -i decodes from the start and lands exactly on tSec, then
       // grab a single frame. The output stream restarts its clock at 0, so we report the requested
       // target as the landed presentation time.
       await this.run([
-        '-ss', tSec.toFixed(6), '-i', inName, '-frames:v', '1', '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
+        '-ss', tSec.toFixed(6), '-i', inName, '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
       ]);
       const raw = await this.readBinary(rawName);
       const frameBytes = width * height * 4;

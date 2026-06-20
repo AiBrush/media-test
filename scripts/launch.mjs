@@ -22,7 +22,7 @@
  * Download button writes), plus a console summary line.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -107,7 +107,8 @@ try {
 
 const browserCfg = BROWSERS[opts.browser];
 const browserType = playwright[browserCfg.type];
-const pageUrl = `${opts.baseUrl.replace(/\/$/, '')}/index.html`;
+const pageUrl = `${opts.baseUrl.replace(/\/$/, '')}/index.html?autorun=0`;
+const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
 
 // NEVER headless. If a custom executablePath is required (Brave), verify it exists up front so we
 // fail with a clear message instead of a cryptic Playwright spawn error.
@@ -124,13 +125,16 @@ if (browserCfg.executablePath) {
 }
 
 console.log(`[launch] ${opts.browser} (real browser, non-headless) → ${pageUrl}`);
-const browser = await browserType.launch(launchOpts);
+const userDataDir = resolve(ROOT, 'results/.browser-cache', opts.browser);
+mkdirSync(userDataDir, { recursive: true });
+console.log(`[launch] ${opts.browser} profile/cache → ${userDataDir.replace(ROOT + '/', '')}`);
+const context = await browserType.launchPersistentContext(userDataDir, launchOpts);
+const browser = context.browser();
 let exitCode = 0;
 let page;
 let activeFilter = null;
 try {
-  const context = await browser.newContext();
-  page = await context.newPage();
+  page = context.pages()[0] ?? await context.newPage();
 
   // Surface page console errors + warnings to the driver log (debugging only — not measurement).
   // Warnings matter here because the runner WARN+SKIPs unknown --engine/--scenario ids instead of
@@ -163,10 +167,17 @@ try {
       `${suiteInfo.scenarioIds.length} scenarios; ref=${suiteInfo.referenceEngineId}`,
   );
 
+  const reusableResults = loadReusableResultsForSeed(opts.browser);
+  const seeded = await seedReusableResults(page, reusableResults);
+  if (seeded > 0) {
+    console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS/N/A result(s) into the page cache`);
+  }
+
   // Build the run filter from CLI flags. Empty arrays mean "all".
   const filter = {
     browser: opts.browser,
     pillar: opts.pillar,
+    reuseSuccessful: true,
     ...(opts.engines.length ? { engineIds: opts.engines } : {}),
     ...(opts.features.length ? { featureIds: opts.features } : {}),
     ...(opts.operations.length ? { operations: opts.operations } : {}),
@@ -198,14 +209,29 @@ try {
   // Poll for completion up to the timeout. Report progress occasionally.
   const start = Date.now();
   let lastLog = 0;
+  let lastSnapshotCount = -1;
   for (;;) {
     const done = await page.evaluate(() => window.__RUN_DONE__ === true);
     if (done) break;
-    if (Date.now() - start > opts.timeoutMs) {
+    const now = Date.now();
+    if (now - start > opts.timeoutMs) {
+      await saveResultsPayload(page, `launcher timeout snapshot after ${opts.timeoutMs}ms`, {
+        snapshot: true,
+        quiet: false,
+      });
       throw new Error(`run timed out after ${opts.timeoutMs}ms in ${opts.browser}`);
     }
-    const now = Date.now();
     if (now - lastLog > 15_000) {
+      const snapshot = await saveResultsPayload(page, 'incremental snapshot while run is still active', {
+        snapshot: true,
+        quiet: true,
+      });
+      if (snapshot.results.length !== lastSnapshotCount) {
+        console.log(
+          `[launch] ${opts.browser} snapshot: ${snapshot.results.length} results → ${snapshot.outPath.replace(ROOT + '/', '')}`,
+        );
+        lastSnapshotCount = snapshot.results.length;
+      }
       const label = await page.evaluate(() => document.getElementById('progress-label')?.textContent ?? '');
       if (label) console.log(`[launch] ${opts.browser} … ${label}`);
       lastLog = now;
@@ -232,12 +258,12 @@ try {
   }
   exitCode = 1;
 } finally {
-  await browser.close();
+  await context.close();
 }
 
 process.exit(exitCode);
 
-async function saveResultsPayload(page, partialReason) {
+async function saveResultsPayload(page, partialReason, options = {}) {
   // Collect the results payload the page exposes (same shape as the Download button).
   const payload = await page.evaluate((reason) => ({
     schema: 'media-browser-test/results@1',
@@ -260,8 +286,10 @@ async function saveResultsPayload(page, partialReason) {
 
   const outDir = resolve(ROOT, opts.out);
   mkdirSync(outDir, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const outPath = join(outDir, `${opts.browser}-${stamp}.json`);
+  const outPath = options.snapshot
+    ? join(outDir, '.partial', `${opts.browser}-${runStamp}.partial.json`)
+    : join(outDir, `${opts.browser}-${runStamp}.json`);
+  mkdirSync(dirname(outPath), { recursive: true });
   writeFileSync(outPath, JSON.stringify(payload, null, 2) + '\n');
 
   const counts = {};
@@ -269,10 +297,13 @@ async function saveResultsPayload(page, partialReason) {
     const label = summaryStatusLabel(r.status);
     counts[label] = (counts[label] ?? 0) + 1;
   }
-  console.log(
-    `[launch] ${opts.browser} ${partialReason ? 'partial' : 'done'}: ${payload.results.length} results ` +
-      `(${Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' ')}) → ${outPath}`,
-  );
+  if (!options.quiet) {
+    console.log(
+      `[launch] ${opts.browser} ${partialReason ? 'partial' : 'done'}: ${payload.results.length} results ` +
+        `(${Object.entries(counts).map(([k, v]) => `${k}:${v}`).join(' ')}) → ${outPath}`,
+    );
+  }
+  return { ...payload, outPath };
 }
 
 function summaryStatusLabel(status) {
@@ -292,4 +323,82 @@ function summaryStatusLabel(status) {
     default:
       return String(status || 'Unknown');
   }
+}
+
+function loadReusableResultsForSeed(browserName) {
+  const rawDir = resolve(ROOT, opts.out);
+  const files = resultFiles(rawDir).sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs);
+  const byKey = new Map();
+  for (const file of files) {
+    let payload;
+    try {
+      payload = JSON.parse(readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    const results = Array.isArray(payload.results) ? payload.results : Array.isArray(payload) ? payload : [];
+    for (const result of results) {
+      if (!result || result.browser !== browserName || !isReusableStatus(result.status)) continue;
+      byKey.set(`${result.browser}\0${result.engineId}\0${result.scenarioId}`, result);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function resultFiles(rawDir) {
+  const files = [];
+  if (existsSync(rawDir)) {
+    for (const name of readdirSync(rawDir)) {
+      const path = join(rawDir, name);
+      if (name.endsWith('.json')) files.push(path);
+    }
+  }
+  const partialDir = join(rawDir, '.partial');
+  if (existsSync(partialDir)) {
+    for (const name of readdirSync(partialDir)) {
+      const path = join(partialDir, name);
+      if (name.endsWith('.json')) files.push(path);
+    }
+  }
+  return files;
+}
+
+function isReusableStatus(status) {
+  return status === 'PASS' || status === 'NA_ENGINE' || status === 'NA_BROWSER' || status === 'NA_ASSET';
+}
+
+async function seedReusableResults(page, results) {
+  if (results.length === 0) return 0;
+  return await page.evaluate(async (rows) => {
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open('media-browser-test-results', 1);
+      req.onupgradeneeded = () => {
+        const database = req.result;
+        if (!database.objectStoreNames.contains('results')) {
+          database.createObjectStore('results', { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error('failed to open result cache'));
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('results', 'readwrite');
+        const store = tx.objectStore('results');
+        const updatedAtIso = new Date().toISOString();
+        for (const result of rows) {
+          store.put({
+            key: `${result.browser}\0${result.engineId}\0${result.scenarioId}`,
+            updatedAtIso,
+            result,
+          });
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error('failed to seed result cache'));
+      });
+    } finally {
+      db.close();
+    }
+    return rows.length;
+  }, results);
 }

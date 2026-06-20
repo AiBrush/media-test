@@ -16,7 +16,7 @@
 import { detectEnv, detectCodecSupport } from '../core/feature-detect.ts';
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
 import { listEngines, listScenarios, getReferenceEngineId, getEngine } from '../core/registry.ts';
-import { runMatrix } from '../core/runner.ts';
+import { buildExecutionOrder, runMatrix } from '../core/runner.ts';
 import type { RunOptions } from '../core/runner.ts';
 import type { BrowserName } from '../core/engine.ts';
 import { groupScenariosByFeature } from '../core/scenario.ts';
@@ -66,6 +66,8 @@ interface SuiteRunFilter {
   warmup?: number;
   iters?: number;
   reuseSuccessful?: boolean;
+  randomizeOrder?: boolean;
+  randomSeed?: string;
 }
 
 declare global {
@@ -87,6 +89,7 @@ let getCheckedFeatures: () => string[] = () => [];
 let getCheckedScenarios: () => string[] = () => [];
 const matrix = new MatrixView('results');
 const resultCache = createResultCache();
+let activeRunController: AbortController | null = null;
 
 async function boot(): Promise<void> {
   // 1. Environment + codec support (defensive — never throws).
@@ -152,16 +155,40 @@ async function boot(): Promise<void> {
   };
 
   setRunStatus(`ready · ${registration.engineCount} engines · ${registration.scenarioCount} scenarios`);
+  if (shouldAutoStart()) {
+    window.setTimeout(() => {
+      if (!activeRunController) void runFromUi();
+    }, 0);
+  }
 }
 
 function wireControls(): void {
   getEl<HTMLButtonElement>('run').addEventListener('click', () => {
+    if (activeRunController && !activeRunController.signal.aborted) {
+      stopActiveRun();
+      return;
+    }
     void runFromUi();
   });
   getEl<HTMLButtonElement>('select-all-features').addEventListener('click', () => setAllChecked('features-list', true));
   getEl<HTMLButtonElement>('select-all-eng').addEventListener('click', () => setAllChecked('engines-list', true));
   getEl<HTMLButtonElement>('select-all-scn').addEventListener('click', () => setAllChecked('scenarios-list', true));
   getEl<HTMLButtonElement>('download').addEventListener('click', downloadResults);
+}
+
+function shouldAutoStart(): boolean {
+  const autorun = new URLSearchParams(window.location.search).get('autorun');
+  return autorun !== '0' && autorun !== 'false';
+}
+
+function stopActiveRun(): void {
+  const controller = activeRunController;
+  if (!controller || controller.signal.aborted) return;
+  controller.abort();
+  const runBtn = getEl<HTMLButtonElement>('run');
+  runBtn.disabled = true;
+  runBtn.textContent = 'Stopping...';
+  setRunStatus('stopping after current cell…');
 }
 
 /** Resolve the browser tag: explicit selection wins, else the detected family. */
@@ -180,14 +207,32 @@ async function runFromUi(): Promise<ScenarioResult[]> {
   const warmup = Number(getEl<HTMLInputElement>('warmup').value) || 1;
   const iters = Number(getEl<HTMLInputElement>('iters').value) || 1;
   const reuseSuccessful = getEl<HTMLInputElement>('reuse-successful').checked;
-  return runFromFilter({ engineIds, featureIds, scenarioIds, pillar: 'all', warmup, iters, reuseSuccessful });
+  const randomizeOrder = getEl<HTMLInputElement>('randomize-order').checked;
+  return runFromFilter({
+    engineIds,
+    featureIds,
+    scenarioIds,
+    pillar: 'all',
+    warmup,
+    iters,
+    reuseSuccessful,
+    randomizeOrder,
+  });
 }
 
 /** Run driven by an explicit filter (the headless launcher path + the UI path funnel here). */
 async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResult[]> {
+  if (activeRunController && !activeRunController.signal.aborted) {
+    stopActiveRun();
+    return window.__RESULTS__ ?? [];
+  }
+  const controller = new AbortController();
+  activeRunController = controller;
+
   const runBtn = getEl<HTMLButtonElement>('run');
   const dlBtn = getEl<HTMLButtonElement>('download');
-  runBtn.disabled = true;
+  runBtn.disabled = false;
+  runBtn.textContent = 'Stop';
   dlBtn.disabled = true;
   window.__RUN_DONE__ = false;
   window.__RESULTS__ = undefined;
@@ -230,13 +275,20 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     }),
   );
   const drawScenarios = scenarioIds ?? listScenarios().map((s) => s.id);
-  matrix.start(drawEngines, drawScenarios);
-  setRunStatus(`running on ${browser}…`);
+  const randomizeOrder =
+    filter.randomizeOrder ?? getEl<HTMLInputElement>('randomize-order').checked;
+  const randomSeed = filter.randomSeed ?? `${Date.now()}:${Math.random()}`;
+  const executionOrder = buildExecutionOrder(drawEngines, drawScenarios, randomizeOrder, randomSeed);
+  matrix.start(drawEngines, drawScenarios, { executionOrder });
+  setRunStatus(`running on ${browser}${randomizeOrder ? ' · random row order' : ''}…`);
 
   const opts: RunOptions = {
     browser,
     pillar: filter.pillar ?? 'all',
     benchOptions: { warmup: filter.warmup ?? 1, iters: filter.iters ?? 1 },
+    randomizeOrder,
+    randomSeed,
+    signal: controller.signal,
     onResult: (r) => {
       matrix.update(r);
       window.__RESULTS__ = matrix.getResults();
@@ -252,7 +304,11 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   let results: ScenarioResult[] = [];
   try {
     results = await runMatrix(opts);
-    setRunStatus(`done · ${summarize(results)}`);
+    if (controller.signal.aborted) {
+      setRunStatus(`stopped · ${summarize(results)}`);
+    } else {
+      setRunStatus(`done · ${summarize(results)}`);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     setRunStatus(`run failed: ${msg}`);
@@ -265,6 +321,8 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     window.__RESULTS__ = results;
     window.__RUN_DONE__ = true;
     dlBtn.disabled = results.length === 0;
+    if (activeRunController === controller) activeRunController = null;
+    runBtn.textContent = controller.signal.aborted ? 'Continue run' : 'Run selected features';
   }
   return results;
 }

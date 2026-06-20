@@ -13,6 +13,7 @@
 import type { DemuxResult, MediaInput, NormalizedMetadata, PacketInfo } from '../../core/engine.ts';
 
 const SAMPLE_TABLE_DEMUX_MP4S = new Set([
+  'h264_1080p_30s.mp4',
   'h264_vfr.mp4',
   'massive_h264_1080p_2h.mp4',
 ]);

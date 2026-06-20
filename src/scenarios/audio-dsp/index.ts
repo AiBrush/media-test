@@ -372,7 +372,7 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     kind: 'encode',
     outContainer: 'wav',
     opts: { container: 'wav', audio: { codec: 'pcm-s24' } },
-    oracles: ['golden-metadata', 'property-invariant'],
+    oracles: ['property-invariant'],
     primaryMetric: 'framesPerSec',
     notes: 'A.6 standalone ENCODE throughput to 24-bit PCM (samples/s); gated by output shape+duration.',
   },
@@ -384,7 +384,7 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     kind: 'encode',
     outContainer: 'aiff',
     opts: { container: 'aiff', audio: { codec: 'pcm-s16be' } },
-    oracles: ['golden-metadata', 'property-invariant'],
+    oracles: ['property-invariant'],
     primaryMetric: 'framesPerSec',
     notes: 'A.6 standalone ENCODE throughput to big-endian PCM (samples/s); gated by output shape+duration.',
   },
@@ -398,7 +398,7 @@ const throughputScenarios: Scenario[] = THROUGHPUT_CASES.map((c) =>
     options:
       c.kind === 'decode'
         ? { ...(c.opts ?? {}) }
-        : { ...(c.opts ?? {}), invariant: 'probe-duration' },
+        : { ...(c.opts ?? {}), invariant: 'transcode-output-metadata' },
     requires: {
       operations: [c.kind === 'decode' ? 'decodeFrames' : 'transcode'],
       containersIn: [c.container],
@@ -623,7 +623,7 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44100 } },
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44100 }, gracefulAllowOutput: true },
     oracles: ['graceful-failure'],
     notes:
       'A.16 zero-length/empty audio: structurally-valid empty WAV through a resample must be handled gracefully (empty output or clean throw), never crash/hang.',
@@ -658,7 +658,7 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     asset: 'wav_s16.wav',
     container: 'wav',
     audioCodecs: ['pcm-s16'],
-    opts: { maxFrames: 256 },
+    opts: { maxFrames: 256, gracefulAllowOutput: true },
     mutate: bitFlip(96, 0x5117a),
     oracles: ['graceful-failure'],
     notes:

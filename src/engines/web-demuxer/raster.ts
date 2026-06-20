@@ -3,9 +3,10 @@
  * ImageData (tight RGBA, top-left origin, straight alpha) suitable for digesting.
  *
  * BYTE-FOR-BYTE equivalent to the relevant parts of src/engines/platform/raster.ts; kept
- * self-contained under the web-demuxer dir (this agent's writes are scoped here). A 2D canvas always
- * yields straight-alpha, top-left RGBA via getImageData, so canvas rasterization IS the
- * normalization step. drawImage applies any rotation/crop the frame carries.
+ * self-contained under the web-demuxer dir (this agent's writes are scoped here). Prefer
+ * VideoFrame.copyTo(RGBA) for untransformed frames so decode-frame digests match the platform/golden
+ * path and avoid canvas readback/color-conversion perturbations. Canvas remains the fallback for
+ * rotation/crop cases where drawImage is the correct presenter.
  *
  * Realm-aware: prefers OffscreenCanvas (works in Worker + page), falls back to a DOM <canvas>.
  */
@@ -58,11 +59,42 @@ function videoFrameDisplaySize(frame: VideoFrame): { width: number; height: numb
  * Draw a VideoFrame to a 2D canvas and read back normalized RGBA. drawImage applies any rotation /
  * crop the frame carries and produces straight-alpha top-left pixels at display size.
  */
-export function imageDataFromVideoFrame(frame: VideoFrame): ImageData {
+export async function imageDataFromVideoFrame(frame: VideoFrame): Promise<ImageData> {
   const { width, height } = videoFrameDisplaySize(frame);
   if (width <= 0 || height <= 0) throw new Error('VideoFrame has zero display size');
+
+  const copied = await imageDataViaCopyTo(frame, width, height);
+  if (copied) return copied;
+
   const canvas = makeCanvas2D(width, height);
   canvas.ctx.clearRect(0, 0, width, height);
   canvas.ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0, width, height);
   return canvas.getImageData();
+}
+
+async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: number): Promise<ImageData | null> {
+  const f = frame as unknown as {
+    codedWidth?: number;
+    codedHeight?: number;
+    visibleRect?: { x?: number; y?: number; width?: number; height?: number };
+    copyTo?: (destination: BufferSource, options?: { format?: string }) => Promise<unknown>;
+  };
+  const rect = f.visibleRect;
+  const untransformed =
+    (f.codedWidth ?? width) === width &&
+    (f.codedHeight ?? height) === height &&
+    (!rect ||
+      ((rect.x ?? 0) === 0 &&
+        (rect.y ?? 0) === 0 &&
+        (rect.width ?? width) === width &&
+        (rect.height ?? height) === height));
+  if (!untransformed || typeof f.copyTo !== 'function') return null;
+
+  try {
+    const rgba = new Uint8Array(width * height * 4);
+    await f.copyTo(rgba, { format: 'RGBA' });
+    return new ImageData(new Uint8ClampedArray(rgba), width, height);
+  } catch {
+    return null;
+  }
 }

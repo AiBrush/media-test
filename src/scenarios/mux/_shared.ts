@@ -131,6 +131,8 @@ export interface MuxCase {
   metrics?: readonly MetricId[];
   /** override the per-case ranking metric (§9) — set on perf-axis cases */
   primaryMetric?: MetricId;
+  /** Per-case oracle tolerances, e.g. cross-source mux duration rounding. */
+  tolerances?: Scenario['tolerances'];
   /**
    * Override the default oracle set. Default is derived from the target container:
    *   - reference-reimport is included ONLY for FAITHFUL_REIMPORT_TARGETS of an ISO-BMFF source
@@ -192,6 +194,7 @@ export function buildMux(c: MuxCase): Scenario {
     oracles,
     metrics: [...metrics],
     ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.mutate ? { mutate: c.mutate } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),

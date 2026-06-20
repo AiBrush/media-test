@@ -30,6 +30,11 @@
 import type { Scenario } from '../../core/scenario.ts';
 import { buildMuxPropertyAll, DECODE_MUX, type MuxPropertyCase, PROBE_DUR } from './_shared.ts';
 
+// VFR mux invariants require the engine's corpus-input→EncodedTracks path to preserve per-sample
+// timestamps. Engines that flatten the source to raw elementary streams before muxing cannot exercise
+// this row honestly, because raw H.264/ADTS inputs do not carry the original irregular MP4 PTS table.
+const VFR_MUX_TIMESTAMPS = 'mux:vfr-timestamps';
+
 const METAMORPHIC_CASES: MuxPropertyCase[] = [
   // ── probe(mux(x)).dur ≈ probe(x).dur across the container change (the faithful cross-container gate) ──
   {
@@ -118,11 +123,14 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: [VFR_MUX_TIMESTAMPS],
     tolerances: { durationToleranceSec: 0.125 },
     notes:
       'VFR through mux → mp4 (§A.16 VFR nominal vs real fps): irregular per-sample durations must be ' +
       'preserved; a constant-cadence-assuming muxer changes the total duration. probe(mux(x)).dur gates it. ' +
-      'Allows a 125 ms container-duration materialization band for VFR sample rounding, not the global gate.',
+      'Requires a timestamp-preserving corpus-input→EncodedTracks path; engines that flatten to raw ' +
+      'elementary streams are NA for this row. Allows a 125 ms container-duration materialization band ' +
+      'for VFR sample rounding, not the global gate.',
   },
   {
     id: 'prop_vfr_mux_duration_mp4_to_mkv',
@@ -132,11 +140,13 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: [VFR_MUX_TIMESTAMPS],
     tolerances: { durationToleranceSec: 0.125 },
     notes:
       'VFR through mux → mkv (§A.16): VFR timestamps re-authored as Matroska block timestamps; the ' +
       'materialized duration must match. Catches a muxer that quantizes VFR to a constant cadence while ' +
-      'allowing the same 125 ms VFR materialization band as the mp4 target.',
+      'requiring a timestamp-preserving corpus-input→EncodedTracks path and allowing the same 125 ms ' +
+      'VFR materialization band as the mp4 target.',
   },
 ];
 

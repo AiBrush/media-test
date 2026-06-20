@@ -248,13 +248,38 @@ export interface RunOptions {
   operations?: Operation[]; // optional op-level filter, e.g. demux|remux
   pillar?: 'functional' | 'performance' | 'robustness' | 'all'; // default 'all'
   benchOptions?: BenchOptions;
+  /** Shuffle the engine/scenario cell queue once at run start. */
+  randomizeOrder?: boolean;
+  /** Optional seed used when randomizeOrder is enabled, so UI highlighting can mirror the runner. */
+  randomSeed?: string;
   onResult?: (r: ScenarioResult) => void;
   onProgress?: (done: number, total: number, label: string) => void;
   /** Reuse cached PASS/NA cells and write every completed cell back to persistent storage. */
   resultReuse?: ResultReuseStore;
+  /** Optional cancellation signal. Aborts between cells so in-flight engine cleanup stays orderly. */
+  signal?: AbortSignal;
   /** optional override of the browser-pure oracle hooks; default to the platform engine's helpers */
   decodeWithPlatform?: OracleContext['decodeWithPlatform'];
   playbackSmoke?: OracleContext['playbackSmoke'];
+}
+
+export interface MatrixCellRef {
+  engineId: string;
+  scenarioId: string;
+}
+
+export function buildExecutionOrder(
+  engineIds: string[],
+  scenarioIds: string[],
+  randomizeOrder = false,
+  randomSeed = '',
+): MatrixCellRef[] {
+  const order: MatrixCellRef[] = [];
+  for (const scenarioId of scenarioIds) {
+    for (const engineId of engineIds) order.push({ engineId, scenarioId });
+  }
+  if (randomizeOrder && order.length > 1) shuffleInPlace(order, randomSeed);
+  return order;
 }
 
 /**
@@ -601,6 +626,17 @@ function isGoldenBakeGap(outcome: OracleOutcome): boolean {
   );
 }
 
+function decodeFrameGoldenGap(scenario: Scenario, golden: GoldenStore): string | null {
+  if (scenario.op !== 'decodeFrames') return null;
+  if (!scenario.oracles.some((oracle) => oracle === 'ssim-psnr' || oracle === 'decoded-frames-bitexact')) {
+    return null;
+  }
+  const hasFrames = (golden.frames?.length ?? 0) > 0;
+  const hasSsimRef = (golden.ssimRef?.length ?? 0) > 0;
+  if (hasFrames || hasSsimRef) return null;
+  return 'decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)';
+}
+
 // ── runOne ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -656,6 +692,12 @@ export async function runOne(
       const missing = await missingAssetReason(assetId);
       if (missing) return finalize('NA_ASSET', [], missing);
     }
+    let golden: GoldenStore | undefined;
+    if (scenario.op === 'decodeFrames') {
+      golden = await loadGolden(assetIds[0]!);
+      const goldenGap = decodeFrameGoldenGap(scenario, golden);
+      if (goldenGap) return finalize('NA_ASSET', [], goldenGap);
+    }
 
     // 1) Negotiate (declared ∧ runtime) — NA short-circuits, never benched.
     const caps = engine.capabilities();
@@ -699,7 +741,7 @@ export async function runOne(
     }
 
     // 6) Assemble OracleContext (inject decode/playback hooks + reference engine + golden).
-    const golden: GoldenStore = await loadGolden(primaryInput.id);
+    golden ??= await loadGolden(primaryInput.id);
     if (opResult.probeMetadatas?.length) {
       opResult = {
         ...opResult,
@@ -875,6 +917,9 @@ async function runRobustness(
 
   const firstFail = oracleOutcomes.find((o) => !o.pass);
   if (firstFail) {
+    if (isGoldenBakeGap(firstFail)) {
+      return finalize('NA_ASSET', oracleOutcomes, `oracle '${firstFail.oracle}' unavailable: ${firstFail.detail}`);
+    }
     return finalize(
       'FAIL',
       oracleOutcomes,
@@ -1031,11 +1076,21 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   };
 
   const results: ScenarioResult[] = [];
-  const total = engineIds.length * scenarios.length;
+  const scenarioById = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
+  const executionOrder = buildExecutionOrder(
+    engineIds,
+    scenarios.map((scenario) => scenario.id),
+    opts.randomizeOrder === true,
+    opts.randomSeed ?? '',
+  );
+  const total = executionOrder.length;
   let done = 0;
 
-  for (const scenario of scenarios) {
-    for (const engineId of engineIds) {
+  for (const cell of executionOrder) {
+    if (opts.signal?.aborted) break;
+    const scenario = scenarioById.get(cell.scenarioId);
+    if (!scenario) continue;
+    const engineId = cell.engineId;
     const reg = getEngine(engineId);
     if (!reg) {
       // Unknown engine id: surface as ERROR cells rather than throwing the whole matrix.
@@ -1073,6 +1128,33 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           reason: `failed to construct engine: ${errMessage(err)}`,
           env: { ...runEnvBase, engineId },
         };
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, label);
+        continue;
+      }
+
+      const preNeg = negotiate(engine.capabilities(), support, scenario.requires);
+      if (!preNeg.ok) {
+        result = {
+          engineId: engine.id,
+          browser: opts.browser,
+          scenarioId: scenario.id,
+          family: scenario.family,
+          status: preNeg.status,
+          oracleOutcomes: [],
+          reason: preNeg.reason,
+          env: { ...runEnvBase, engineId: engine.id },
+        };
+        if (engine.dispose) {
+          try {
+            await engine.dispose();
+          } catch {
+            /* swallow */
+          }
+        }
+        await opts.resultReuse?.put(result).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;
@@ -1172,7 +1254,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       opts.onResult?.(result);
       done += 1;
       opts.onProgress?.(done, total, label);
-    }
   }
 
   return results;
@@ -1208,6 +1289,35 @@ async function resolveEngineIds(requested: string[], registered: RegisteredEngin
     }
   }
   return resolved;
+}
+
+function shuffleInPlace<T>(items: T[], seed: string): void {
+  const rand = mulberry32(hashSeed(seed));
+  for (let i = items.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [items[i], items[j]] = [items[j]!, items[i]!];
+  }
+}
+
+function hashSeed(seed: string): number {
+  const text = seed || `${Date.now()}:${Math.random()}`;
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function mulberry32(seed: number): () => number {
+  let t = seed >>> 0;
+  return () => {
+    t += 0x6d2b79f5;
+    let x = t;
+    x = Math.imul(x ^ (x >>> 15), x | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 interface EngineIdCandidate {

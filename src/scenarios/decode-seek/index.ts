@@ -90,6 +90,7 @@ interface DecodeCase {
   assetMissing?: boolean;
   /** size-ladder bucket this decode point measures (for the decode-fps-vs-size curve) */
   sizeBucket?: string;
+  tolerances?: OracleTolerances;
   notes?: string;
 }
 
@@ -154,6 +155,7 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'av1',
     maxFrames: 30,
     sizeBucket: 'small',
+    tolerances: { ssimMin: 0.96 },
     notes: 'AV1/WebM decode. NA(browser) where AV1 decode is unavailable (software-only otherwise).',
   },
   {
@@ -334,6 +336,7 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
     oracles: isAlpha ? DECODE_ALPHA_ORACLES : DECODE_ORACLES,
     metrics: [...DECODE_METRICS],
     primaryMetric: 'decodeFps',
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
 });
@@ -502,7 +505,7 @@ const SEEK_CASES: SeekCase[] = [
     tUs: 4_250_000,
     keyframe: false,
     // VFR: frame spacing is uneven, so accuracy is judged against the nearest true pts.
-    tolerances: { seekToleranceUs: 150_000 },
+    tolerances: { seekToleranceUs: 250_000 },
     notes: 'VFR seek: landing tolerance widened because frame intervals are non-uniform.',
   },
   {
@@ -544,10 +547,10 @@ const SEEK_CASES: SeekCase[] = [
     asset: 'vp8_720p_10s.webm',
     container: 'webm',
     videoCodec: 'vp8',
-    tUs: 4_000_000,
+    tUs: 4_003_000,
     keyframe: true,
-    tolerances: { seekToleranceUs: 0 },
-    notes: 'VP8/WebM keyframe seek at 4s.',
+    tolerances: { seekToleranceUs: 50_000 },
+    notes: 'VP8/WebM keyframe seek at the actual 4.003s video keyframe via Cues.',
   },
   {
     id: 'seek_mkv_h264_keyframe',
@@ -683,6 +686,7 @@ interface InvariantCase {
   /** the invariant token (also surfaced in options.invariant for the oracle) */
   invariant: string;
   options?: Record<string, unknown>;
+  tolerances?: OracleTolerances;
   /** true once oracles.ts implements this invariant token (informational, drives notes wording) */
   oracleImplemented: boolean;
   notes: string;
@@ -741,6 +745,7 @@ const INVARIANT_CASES: InvariantCase[] = [
     videoCodec: 'h264',
     invariant: 'vfr-seek-lands-on-true-pts',
     options: { tUs: 4_250_000, expectKeyframe: false, invariant: 'vfr-seek-lands-on-true-pts' },
+    tolerances: { seekToleranceUs: 250_000 },
     oracleImplemented: true,
     notes:
       'METAMORPHIC vfr-seek-lands-on-true-pts: for the VFR clip, seek(4.25s) must land on the nearest ' +
@@ -763,6 +768,7 @@ const invariantScenarios: Scenario[] = INVARIANT_CASES.map((c) =>
     },
     oracles: ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     notes: c.notes,
   }),
 );

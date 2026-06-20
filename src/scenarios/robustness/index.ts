@@ -95,6 +95,7 @@ export function zeroRandomSpans(
 }
 
 const FUZZ_TIMEOUT_MS = 15_000;
+const TRANSCODE_PROPERTY_TIMEOUT_MS = 120_000;
 
 // ── (a) EDGE cases ──────────────────────────────────────────────────────────────────────────────
 
@@ -121,6 +122,7 @@ const EDGE_CASES: EdgeCase[] = [
     asset: 'h264_bframes_1080p.mp4',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
+    features: ['decode:golden-rgba'],
     options: { maxFrames: 90 },
     oracles: ['decoded-frames-bitexact'],
     notes: 'Open-GOP / B-frame reorder over many frames — output must stay in pts order.',
@@ -166,6 +168,7 @@ const EDGE_CASES: EdgeCase[] = [
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
     oracles: ['golden-metadata'],
+    tolerances: { fpsTolerance: 0.25 },
     notes: 'MediaRecorder WebM with unknown duration / sparse Cues — duration may legitimately be null.',
   },
   {
@@ -256,11 +259,12 @@ const EDGE_CASES: EdgeCase[] = [
     op: 'probe',
     asset: 'zero_length.mp4',
     containersIn: ['mp4'],
+    options: { gracefulAllowOutput: true },
     oracles: ['graceful-failure'],
     // Note avoids the oracle's bad-token set (crash/hang/timeout/oom) too: the oracle substring-matches
     // those in notes and FAILs on a hit, so a prohibitive 'never crash' would force an unconditional
     // FAIL even for a correct engine. Meaning preserved without the trap words.
-    notes: 'Zero-length file: must reject cleanly (empty input is not parseable), never fault.',
+    notes: 'Zero-length file: must reject cleanly or report an empty/degraded probe result, never fault.',
   },
 ];
 
@@ -299,7 +303,9 @@ interface FuzzCase {
   containersOut?: string[];
   videoCodecs?: string[];
   audioCodecs?: string[];
+  encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
   options?: Record<string, unknown>;
+  timeoutMs?: number;
   mutate: (bytes: Uint8Array) => Uint8Array;
   notes?: string;
 }
@@ -310,6 +316,7 @@ const FUZZ_CASES: FuzzCase[] = [
     asset: 'h264_1080p_30s.mp4',
     op: 'probe',
     containersIn: ['mp4'],
+    options: { gracefulAllowOutput: true },
     mutate: bitFlip(128, 0x111),
     notes: '128 random bit-flips across an MP4; probe must reject or report degraded, never fault.',
   },
@@ -333,6 +340,7 @@ const FUZZ_CASES: FuzzCase[] = [
     op: 'demux',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
+    options: { gracefulAllowOutput: true },
     mutate: truncateTail(0.55),
     notes: 'File cut at 55% (interrupted download): demux either yields partial+EOF or rejects cleanly.',
   },
@@ -342,7 +350,8 @@ const FUZZ_CASES: FuzzCase[] = [
     op: 'decodeFrames',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
-    options: { maxFrames: 60 },
+    options: { maxFrames: 60, gracefulAllowOutput: true },
+    timeoutMs: 60_000,
     mutate: zeroRandomSpans(6, 2048, 0xabc, 1024),
     notes: 'Six 2KB zeroed payload spans: decoder must error or conceal, bounded in time and memory.',
   },
@@ -351,8 +360,9 @@ const FUZZ_CASES: FuzzCase[] = [
     asset: 'vp9_1080p_10s.webm',
     op: 'probe',
     containersIn: ['webm'],
+    options: { gracefulAllowOutput: true },
     mutate: bitFlip(96, 0x222),
-    notes: 'EBML/Matroska bit-flips; probe must not fault on a mangled element size.',
+    notes: 'EBML/Matroska bit-flips; probe must reject or report degraded, never fault on a mangled element size.',
   },
   {
     id: 'fuzz_webm_header_truncated_demux',
@@ -369,6 +379,7 @@ const FUZZ_CASES: FuzzCase[] = [
     op: 'demux',
     containersIn: ['ts'],
     videoCodecs: ['h264'],
+    options: { gracefulAllowOutput: true },
     mutate: zeroRandomSpans(8, 188, 0xdef, 376),
     notes: 'Zero whole 188-byte TS packets: sync-byte loss; demux must resync or reject, never fault.',
   },
@@ -378,6 +389,7 @@ const FUZZ_CASES: FuzzCase[] = [
     op: 'probe',
     containersIn: ['flac'],
     audioCodecs: ['flac'],
+    options: { gracefulAllowOutput: true },
     mutate: bitFlip(48, 0x333),
     notes: 'FLAC metadata-block bit-flips (bad block sizes); probe must not loop forever.',
   },
@@ -387,6 +399,7 @@ const FUZZ_CASES: FuzzCase[] = [
     op: 'probe',
     containersIn: ['mp3'],
     audioCodecs: ['mp3'],
+    options: { gracefulAllowOutput: true },
     mutate: truncateHeader(64),
     notes: 'Drop ID3/Xing head; probe falls back to a bounded frame scan or rejects — never loops.',
   },
@@ -398,7 +411,7 @@ const FUZZ_CASES: FuzzCase[] = [
     containersOut: ['mkv'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    options: { container: 'mkv' },
+    options: { container: 'mkv', gracefulAllowOutput: true },
     mutate: zeroRandomSpans(5, 4096, 0x555, 2048),
     notes: 'Corrupt samples then remux: engine must reject or emit a clean partial, bounded in memory.',
   },
@@ -416,11 +429,12 @@ const fuzzScenarios: Scenario[] = FUZZ_CASES.map((c) =>
       ...(c.containersOut ? { containersOut: c.containersOut } : {}),
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.encryption ? { encryption: c.encryption } : {}),
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
     mutate: c.mutate,
-    timeoutMs: FUZZ_TIMEOUT_MS,
+    timeoutMs: c.timeoutMs ?? FUZZ_TIMEOUT_MS,
     ...(c.notes ? { notes: c.notes } : {}),
   }),
 );
@@ -488,7 +502,7 @@ const PROPERTY_CASES: PropertyCase[] = [
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['trim:frame-accurate'],
+    features: ['trim:frame-accurate', 'trim:compose'],
     options: {
       container: 'mp4',
       frameAccurate: true,
@@ -498,7 +512,10 @@ const PROPERTY_CASES: PropertyCase[] = [
       b: 5_000_000,
       c: 9_000_000,
     },
-    notes: 'Concatenating adjacent frame-accurate trims reproduces the single combined trim.',
+    notes:
+      'Concatenating adjacent frame-accurate trims reproduces the single combined trim. Requires ' +
+      'trim:compose because the current runner cannot execute the three-trim + concat workflow in a ' +
+      'single-op scenario.',
   },
   {
     id: 'prop_duration_consistent_across_containers',
@@ -973,6 +990,7 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
     op: 'decodeFrames',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
+    encryption: ['cenc-ctr'],
     options: { maxFrames: 30 },
     // Corrupt the ENCRYPTED payload region (skip the moof/header head). A decode that ignores the
     // corruption and emits garbage frames could spuriously pass a downstream check — so the engine
@@ -989,6 +1007,7 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
     op: 'probe',
     containersIn: ['adts'],
     audioCodecs: ['aac'],
+    options: { gracefulAllowOutput: true },
     // ADTS is a bare frame stream: bit-flips corrupt frame headers (bad syncword/length).
     mutate: bitFlip(64, 0x44a),
     notes:
@@ -1015,6 +1034,7 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
     videoCodecs: ['h264'],
     // The corpus ships truncated_h264.mp4 (incomplete moov/mdat) specifically for this edge — feed it
     // UNMUTATED (it is already malformed). No mutate: the asset itself is the malformed input.
+    options: { gracefulAllowOutput: true },
     mutate: (b) => b,
     notes:
       '§A.16 dedicated header-truncated asset: the corpus truncated_h264.mp4 (incomplete moov/mdat, ' +
@@ -1029,7 +1049,7 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    options: { container: 'mp4', fragmented: true },
+    options: { container: 'mp4', fragmented: true, gracefulAllowOutput: true },
     // Corrupt samples then remux to a FRAGMENTED MP4 (the mux/segment target path). The muxer must
     // reject the corrupt samples or emit a clean partial, never balloon memory assembling segments.
     mutate: zeroRandomSpans(5, 4096, 0x5e6, 2048),
@@ -1052,6 +1072,7 @@ const extraFuzzScenarios: Scenario[] = EXTRA_FUZZ_CASES.map((c) =>
       ...(c.containersOut ? { containersOut: c.containersOut } : {}),
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.encryption ? { encryption: c.encryption } : {}),
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
@@ -1117,7 +1138,7 @@ const transcodeIdempotentScenarios: Scenario[] = [
     metrics: ['wall', 'peakMemory'],
     // Slightly tighter SSIM floor than the lossy-resize default: same-size same-codec should be near 1.
     tolerances: { ssimMin: 0.97 },
-    timeoutMs: FUZZ_TIMEOUT_MS,
+    timeoutMs: TRANSCODE_PROPERTY_TIMEOUT_MS,
     notes:
       '§A.16 metamorphic transcode idempotence: transcode with target dims == source dims (1920×1080) ' +
       'and same codec ⇒ perceptually identical (resize-to-same ≈ no-op). Gated by ssim-psnr vs the ' +
@@ -1194,12 +1215,14 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['mux:roundtrip-compare'],
     options: { container: 'mp4', invariant: 'demux(mux(x))==x' },
     notes:
       '§A.16 metamorphic demux(mux(x)) ≈ x: mux the source coded tracks, then re-demux and compare ' +
       'packet count/sizes/keyframe layout to the source packets. Oracle token NOT implemented in ' +
-      'oracles.ts → honest FAIL ("unknown property-invariant") until added (dossier oracleGaps); never ' +
-      'a fabricated pass. (mux() also needs options.tracks assembled by the runner — see mux family.)',
+      'oracles.ts and no single-op runner path exists for the re-demux compare. The undeclared ' +
+      'mux:roundtrip-compare feature keeps this honest NA(engine) until both are added; never a ' +
+      'fabricated pass.',
   },
   {
     id: 'prop_double_remux_stable',
@@ -1209,12 +1232,14 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['remux:compose'],
     options: { container: 'mp4', invariant: 'remux(remux(x))==remux(x)' },
     notes:
       '§A.16 metamorphic double-remux stability: remux(remux(x)) must be bit-stable / decode-equal to ' +
       'remux(x) — catches engines that drift metadata or re-order packets on each wrap. Needs a runner ' +
-      'compose path (two sequential remuxes) the single-op executor lacks AND an oracle token; until ' +
-      'both exist this is an honest FAIL, never a fabricated pass.',
+      'compose path (two sequential remuxes) the single-op executor lacks AND an oracle token. The ' +
+      'undeclared remux:compose feature keeps this honest NA(engine) until both exist, never a ' +
+      'fabricated pass.',
   },
   {
     id: 'prop_flac_seek_seektable_equiv',
@@ -1223,13 +1248,15 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersIn: ['flac'],
     containersOut: ['flac'],
     audioCodecs: ['flac'],
+    features: ['flac:seektable-seek-equivalence'],
     options: { container: 'flac', invariant: 'flac-seek-lands-identical-with-without-seektable' },
     notes:
       '§A.16 metamorphic FLAC ±SEEKTABLE seek equivalence: seeking to the same tUs in ' +
       'flac_seektable.flac vs flac_noseektable.flac must land on an IDENTICAL frame digest (the ' +
       'SEEKTABLE is an index, not a content change). This is a TWO-ASSET cross-check the current ' +
-      'single-input runner + oracle cannot compute → honest FAIL until the oracle/runner learn it ' +
-      '(dossier oracleGaps). The per-asset decode equality is covered live above.',
+      'single-input runner + oracle cannot compute. The undeclared flac:seektable-seek-equivalence ' +
+      'feature keeps this honest NA(engine) until the oracle/runner learn it. The per-asset decode ' +
+      'equality is covered live above.',
   },
   {
     id: 'prop_gapless_sample_count_priming',
@@ -1263,7 +1290,7 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['trim:frame-accurate'],
+    features: ['trim:frame-accurate', 'trim:compose'],
     options: {
       container: 'mp4',
       frameAccurate: true,
@@ -1277,8 +1304,8 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
       'trim(a..c). This is the REAL additivity invariant the existing prop_trim_concatenation only ' +
       'claims — that case runs a SINGLE trim (runner has no concat path) so it degenerates to ' +
       '"one trim ≈ golden". This case records the proper compose invariant; it needs a runner compose ' +
-      'path (trim a..b, trim b..c, concat, trim a..c, compare) AND an oracle token → honest FAIL until ' +
-      'both exist, never a fabricated pass.',
+      'path (trim a..b, trim b..c, concat, trim a..c, compare) AND an oracle token. The undeclared ' +
+      'trim:compose feature keeps this honest NA(engine) until both exist, never a fabricated pass.',
   },
 ];
 

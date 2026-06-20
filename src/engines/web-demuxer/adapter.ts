@@ -102,6 +102,7 @@ import type {
   WebAVPacket,
   WebMediaInfo,
   AVMediaType,
+  AVSeekFlag,
 } from 'web-demuxer';
 
 /** AVMediaType numeric values (sync with FFmpeg libavutil/avutil.h; verified vs web-demuxer .d.ts).
@@ -109,6 +110,7 @@ import type {
 const AV_MEDIA_VIDEO = 0 as AVMediaType; // AVMEDIA_TYPE_VIDEO
 const AV_MEDIA_AUDIO = 1 as AVMediaType; // AVMEDIA_TYPE_AUDIO
 const AV_MEDIA_SUBTITLE = 3 as AVMediaType; // AVMEDIA_TYPE_SUBTITLE
+const AV_SEEK_FLAG_BACKWARD = 1 as AVSeekFlag; // AVSEEK_FLAG_BACKWARD
 
 const ENGINE_ID = 'web-demuxer@4.0.0';
 const AAC_SAMPLE_RATES = [
@@ -619,6 +621,7 @@ export class WebDemuxerEngine implements MediaEngine {
         'multitrack',
         'rotation:read',
         'seek:keyframe',
+        'decode:golden-rgba',
         'webcodecs:independent',
       ],
     };
@@ -871,7 +874,7 @@ export class WebDemuxerEngine implements MediaEngine {
     try {
       for (let i = 0; i < emit.length; i++) {
         const { ptsUs, frame } = emit[i]!;
-        const img = imageDataFromVideoFrame(frame);
+        const img = await imageDataFromVideoFrame(frame);
         const digest = await digestImageData(img, i, ptsUs);
         sink.add(digest, img);
       }
@@ -907,20 +910,20 @@ export class WebDemuxerEngine implements MediaEngine {
       throw new Error(`${ENGINE_ID}: VideoDecoder config not supported: ${config.codec}`);
     }
 
-    const tSec = Math.max(0, tUs / 1e6);
-    const chunk = (await d.seek('video', tSec)) as EncodedVideoChunk;
+    const mediaInfo = await d.getMediaInfo().catch(() => null);
+    const durationSec =
+      mediaInfo && Number.isFinite(mediaInfo.duration) && mediaInfo.duration > 0 ? mediaInfo.duration : null;
+    let targetSec = Math.max(0, tUs / 1e6);
+    if (durationSec != null) targetSec = Math.min(targetSec, Math.max(0, durationSec - 0.001));
+    const targetUs = Math.round(targetSec * 1e6);
+    const readEndSec = durationSec == null ? targetSec + 0.75 : Math.min(durationSec, targetSec + 0.75);
 
-    let landed: { ptsUs: number; frame: VideoFrame } | null = null;
+    const decoded: Array<{ ptsUs: number; frame: VideoFrame }> = [];
     let decodeError: Error | undefined;
 
     const decoder = new VideoDecoder({
       output: (frame) => {
-        // Keep the FIRST frame (the keyframe we seeked to); close any extras.
-        if (landed) {
-          frame.close();
-          return;
-        }
-        landed = { ptsUs: frame.timestamp, frame };
+        decoded.push({ ptsUs: Math.round(frame.timestamp), frame });
       },
       error: (e) => {
         decodeError = e instanceof Error ? e : new Error(String(e));
@@ -929,11 +932,27 @@ export class WebDemuxerEngine implements MediaEngine {
 
     try {
       decoder.configure(config);
-      // The seeked chunk lands on a keyframe (BACKWARD), so it decodes standalone.
-      decoder.decode(chunk);
+      const reader = d.read('video', targetSec, readEndSec, AV_SEEK_FLAG_BACKWARD).getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          decoder.decode(value as EncodedVideoChunk);
+        }
+      } finally {
+        try {
+          await reader.cancel();
+        } catch {
+          /* ignore */
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          /* ignore */
+        }
+      }
       await decoder.flush();
     } catch (e) {
-      if (landed) (landed as { frame: VideoFrame }).frame.close();
       throw e instanceof Error ? e : new Error(String(e));
     } finally {
       try {
@@ -943,16 +962,25 @@ export class WebDemuxerEngine implements MediaEngine {
       }
     }
 
+    let landed: { ptsUs: number; frame: VideoFrame } | null = null;
+    for (const candidate of decoded) {
+      if (candidate.ptsUs <= targetUs || !landed) landed = candidate;
+    }
     if (!landed) {
       throw decodeError ?? new Error(`${ENGINE_ID}: seek produced no frame at ${tUs}us`);
     }
-    const resolved = landed as { ptsUs: number; frame: VideoFrame };
     try {
-      const img = imageDataFromVideoFrame(resolved.frame);
-      const frame = await digestImageData(img, 0, resolved.ptsUs);
-      return { landedPtsUs: resolved.ptsUs, frame };
+      const img = await imageDataFromVideoFrame(landed.frame);
+      const frame = await digestImageData(img, 0, landed.ptsUs);
+      return { landedPtsUs: landed.ptsUs, frame };
     } finally {
-      resolved.frame.close();
+      for (const c of decoded) {
+        try {
+          c.frame.close();
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 

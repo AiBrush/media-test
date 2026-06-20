@@ -45,6 +45,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['mux:vfr-timestamps'],
     // mp4 target is faithful → add reference-reimport so dropped/duplicated samples also show up.
     oracles: ['property-invariant', 'reference-reimport'],
     notes:
@@ -60,6 +61,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['mux:vfr-timestamps'],
     // mkv reframes (SimpleBlock lacing) → no source-keyed reference-reimport; decode invariant only.
     notes:
       'B-FRAME mux → mkv (§A.16): same coded samples re-laced as Matroska SimpleBlocks; the muxer must ' +

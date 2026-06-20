@@ -259,7 +259,7 @@ export class PlatformEngine implements MediaEngine {
       // 'metadata:protected-tracks' means the MP4 probe unwraps CENC `encv`/`enca` sample entries via
       // sinf/frma to identify the original H.264/AAC track metadata without decrypting samples.
       // We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
-      features: ['resize', 'alpha', 'packets:dts', 'metadata:protected-tracks'],
+      features: ['resize', 'alpha', 'packets:dts', 'metadata:protected-tracks', 'decode:golden-rgba'],
     };
   }
 

@@ -839,13 +839,17 @@ export class MediabunnyEngine implements MediaEngine {
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
         'resize', // Conversion video width/height
+        'fps', // Conversion video frameRate
         'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
         'alpha', // VP9 alpha (WebM/MKV) via alpha:'keep'
+        'decode:golden-rgba', // VideoSample.copyTo(RGBA) matches the baked WebCodecs golden path
         'hls:aes128', // read/probe AES-128 HLS playlists; decrypt() still does not expose hls-aes128
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
         'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
+        'mux:vfr-timestamps', // prepareMuxTracks preserves per-packet PTS/duration from the source
+        'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
         // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
         // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
         // returns a SINGLE blob, so transcode() can only deliver variants[0] — it cannot surface the
@@ -1022,13 +1026,28 @@ export class MediabunnyEngine implements MediaEngine {
     const runtimeOpts = opts as TranscodeOptions & Record<string, unknown>;
     const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
+    const requestedVideoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
+    if (
+      requestedVideoSpec &&
+      ((requestedVideoSpec.width !== undefined && requestedVideoSpec.width <= 0) ||
+        (requestedVideoSpec.height !== undefined && requestedVideoSpec.height <= 0))
+    ) {
+      throw new Error('mediabunny transcode rejected invalid video dimensions');
+    }
 
     const mbInput = await openInput(this.lib, input);
     try {
       const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
       const convOpts: ConversionOptions = { input: mbInput, output };
 
-      const videoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
+      const videoSpec = requestedVideoSpec;
+      const tracks = await mbInput.getTracks();
+      if (videoSpec && !tracks.some((track) => track.isVideoTrack())) {
+        throw new Error('mediabunny transcode: requested video output but input has no video track');
+      }
+      if (opts.audio && !tracks.some((track) => track.isAudioTrack())) {
+        throw new Error('mediabunny transcode: requested audio output but input has no audio track');
+      }
       const alpha = alphaModeFrom(runtimeOpts);
       if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, alpha ? { alpha } : undefined);
       if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio);
@@ -1091,7 +1110,8 @@ export class MediabunnyEngine implements MediaEngine {
       if (!videoTrack) throw new Error('mediabunny seek: no video track in input');
 
       const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack));
-      const sample = await sink.getSample(tUs / 1e6);
+      const targetSec = Math.max(0, tUs / 1e6);
+      const sample = await sink.getSample(targetSec);
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
       try {
         const landedPtsUs = sample.microsecondTimestamp;
@@ -1118,6 +1138,13 @@ export class MediabunnyEngine implements MediaEngine {
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
+    if (range.startUs < 0) {
+      throw new Error(`mediabunny trim rejected negative start ${range.startUs}us`);
+    }
+    if (range.endUs <= range.startUs) {
+      throw new Error(`mediabunny trim rejected invalid range ${range.startUs}..${range.endUs}us`);
+    }
+
     const format = makeOutputFormat(opts.container);
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 

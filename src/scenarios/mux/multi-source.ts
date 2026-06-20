@@ -68,9 +68,11 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac', 'mp3'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       '3-TRACK ASSEMBLY: H.264 video + AAC audio + MP3 audio from three sources muxed into one MKV ' +
-      '(MKV holds AAC and MP3 audio tracks). Tests three-track layout + per-track index authoring.',
+      '(MKV holds AAC and MP3 audio tracks). Tests three-track layout + per-track index authoring; ' +
+      'duration allows one audio/video packet of cross-source mux rounding.',
   },
 
   // ── track DROP / subset: from the multitrack source, mux only a subset of demuxed tracks ──
