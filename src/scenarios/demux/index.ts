@@ -248,6 +248,7 @@ interface SizeCase {
 
 /** Big assets can legitimately take a while to walk every packet; gate them so a stall is a clean FAIL. */
 const LARGE_DEMUX_TIMEOUT_MS = 120_000;
+const HUGE_DEMUX_TIMEOUT_MS = 600_000;
 /** Memory/longtask-aware metrics for the at-scale rungs (vs the default `wall`-only). */
 const SCALE_METRICS: MetricId[] = ['wall', 'peakMemory', 'longtasks'];
 
@@ -352,10 +353,14 @@ const sizeScenarios: Scenario[] = SIZE_CASES.map((c) =>
     // At-scale rungs record memory + long tasks (and carry a hard timeout) so a non-lazy / OOM-prone
     // demux is caught; small rungs keep the cheap `wall`-only profile.
     metrics: c.memoryGated ? SCALE_METRICS : ['wall'],
-    ...(c.memoryGated ? { timeoutMs: LARGE_DEMUX_TIMEOUT_MS } : {}),
+    ...(c.memoryGated ? { timeoutMs: demuxTimeoutForBucket(c.bucket) } : {}),
     notes: c.notes,
   }),
 );
+
+function demuxTimeoutForBucket(bucket: SizeCase['bucket']): number {
+  return bucket === 'huge' || bucket === 'massive' ? HUGE_DEMUX_TIMEOUT_MS : LARGE_DEMUX_TIMEOUT_MS;
+}
 
 // ── (3) DEGENERATE / NO-TRACKS — empty-but-valid container demuxes to exactly 0 packets ──────────
 

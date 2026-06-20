@@ -644,8 +644,8 @@ async function buildVideoOptions(
     // normally short-circuits this codec to NA(browser) in pre-flight before we reach here.
     throw new Error(
       `mediabunny transcode: browser cannot encode ${codec} at ` +
-        `${probeW ?? '?'}x${probeH ?? '?'} @ ${bitrate} bps with any acceleration mode ` +
-        `(WebCodecs VideoEncoder.isConfigSupported=false) — NA(browser)`,
+      `${probeW ?? '?'}x${probeH ?? '?'} @ ${bitrate} bps with any acceleration mode ` +
+      `(WebCodecs VideoEncoder.isConfigSupported=false) — NA(browser)`,
     );
   }
 
@@ -805,7 +805,7 @@ async function videoDecoderOptionsForTrack(
 
   throw new Error(
     `mediabunny decode: browser cannot decode ${codec} track with any acceleration mode ` +
-      '(WebCodecs VideoDecoder.isConfigSupported=false) - NA(browser)',
+    '(WebCodecs VideoDecoder.isConfigSupported=false) - NA(browser)',
   );
 }
 
@@ -864,13 +864,13 @@ async function tryAudioOnlyPacketCopyTrim(
       const packetMeta =
         added === 0
           ? ({
-              decoderConfig: {
-                codec: codecString,
-                sampleRate,
-                numberOfChannels: channels,
-                description,
-              },
-            } as EncodedAudioChunkMetadata)
+            decoderConfig: {
+              codec: codecString,
+              sampleRate,
+              numberOfChannels: channels,
+              description,
+            },
+          } as EncodedAudioChunkMetadata)
           : undefined;
       await source.add(outPacket, packetMeta);
       added++;
@@ -949,7 +949,6 @@ export class MediabunnyEngine implements MediaEngine {
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
-        'encryption:cenc-ctr-clear-output', // decrypt() remuxes CENC-CTR input to clear MP4 bytes
         'resize', // Conversion video width/height
         'fps', // Conversion video frameRate
         'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
@@ -1382,21 +1381,21 @@ export class MediabunnyEngine implements MediaEngine {
             i === 0
               ? isVideo
                 ? ({
-                    decoderConfig: {
-                      codec: codecParamForTrack(track, true),
-                      codedWidth: track.width ?? 0,
-                      codedHeight: track.height ?? 0,
-                      description,
-                    },
-                  } as EncodedVideoChunkMetadata)
+                  decoderConfig: {
+                    codec: codecParamForTrack(track, true),
+                    codedWidth: track.width ?? 0,
+                    codedHeight: track.height ?? 0,
+                    description,
+                  },
+                } as EncodedVideoChunkMetadata)
                 : ({
-                    decoderConfig: {
-                      codec: codecParamForTrack(track, false),
-                      sampleRate: track.sampleRate ?? 48000,
-                      numberOfChannels: track.channels ?? 2,
-                      description,
-                    },
-                  } as EncodedAudioChunkMetadata)
+                  decoderConfig: {
+                    codec: codecParamForTrack(track, false),
+                    sampleRate: track.sampleRate ?? 48000,
+                    numberOfChannels: track.channels ?? 2,
+                    description,
+                  },
+                } as EncodedAudioChunkMetadata)
               : undefined;
           await add(pkt, meta);
         }

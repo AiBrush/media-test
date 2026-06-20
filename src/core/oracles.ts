@@ -1441,6 +1441,9 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     const last = frames[frames.length - 1]!.ptsUs;
     outDurationSec = (last - first) / 1e6;
   }
+  if (outDurationSec == null) {
+    outDurationSec = durationFromSimpleAudioContainer(ctx.output);
+  }
 
   if (range && outDurationSec != null) {
     const requestedSec = (range.endUs - range.startUs) / 1e6;
@@ -1499,6 +1502,82 @@ function readRange(options: unknown): { startUs: number; endUs: number } | undef
   const endUs = Number((r as Record<string, unknown>).endUs);
   if (Number.isFinite(startUs) && Number.isFinite(endUs)) return { startUs, endUs };
   return undefined;
+}
+
+function durationFromSimpleAudioContainer(out: MediaBytes): number | undefined {
+  if (out.container === 'wav') return durationFromWav(out.bytes);
+  if (out.container === 'aiff' || out.container === 'aif' || out.container === 'aifc') {
+    return durationFromAiff(out.bytes);
+  }
+  return undefined;
+}
+
+function durationFromWav(bytes: Uint8Array): number | undefined {
+  if (bytes.byteLength < 44 || ascii4(bytes, 0) !== 'RIFF' || ascii4(bytes, 8) !== 'WAVE') return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 12;
+  let sampleRate: number | undefined;
+  let blockAlign: number | undefined;
+  let dataBytes: number | undefined;
+  while (pos + 8 <= bytes.byteLength) {
+    const id = ascii4(bytes, pos);
+    const size = view.getUint32(pos + 4, true);
+    const dataPos = pos + 8;
+    if (dataPos + size > bytes.byteLength) break;
+    if (id === 'fmt ' && size >= 16) {
+      sampleRate = view.getUint32(dataPos + 4, true);
+      blockAlign = view.getUint16(dataPos + 12, true);
+    } else if (id === 'data') {
+      dataBytes = size;
+    }
+    pos = dataPos + size + (size % 2);
+  }
+  if (!sampleRate || !blockAlign || dataBytes === undefined) return undefined;
+  return dataBytes / blockAlign / sampleRate;
+}
+
+function durationFromAiff(bytes: Uint8Array): number | undefined {
+  if (
+    bytes.byteLength < 54 ||
+    ascii4(bytes, 0) !== 'FORM' ||
+    (ascii4(bytes, 8) !== 'AIFF' && ascii4(bytes, 8) !== 'AIFC')
+  ) {
+    return undefined;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 12;
+  while (pos + 8 <= bytes.byteLength) {
+    const id = ascii4(bytes, pos);
+    const size = view.getUint32(pos + 4, false);
+    const dataPos = pos + 8;
+    if (dataPos + size > bytes.byteLength) break;
+    if (id === 'COMM' && size >= 18) {
+      const frames = view.getUint32(dataPos + 2, false);
+      const sampleRate = readAiffExtended80(bytes, dataPos + 8);
+      if (sampleRate && sampleRate > 0) return frames / sampleRate;
+    }
+    pos = dataPos + size + (size % 2);
+  }
+  return undefined;
+}
+
+function readAiffExtended80(bytes: Uint8Array, offset: number): number | undefined {
+  if (offset + 10 > bytes.byteLength) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const signExp = view.getUint16(offset, false);
+  const sign = signExp & 0x8000 ? -1 : 1;
+  const exp = signExp & 0x7fff;
+  const hi = view.getUint32(offset + 2, false);
+  const lo = view.getUint32(offset + 6, false);
+  if (exp === 0 && hi === 0 && lo === 0) return 0;
+  if (exp === 0x7fff) return undefined;
+  const mantissa = hi * 2 ** 32 + lo;
+  return sign * mantissa * 2 ** (exp - 16383 - 63);
+}
+
+function ascii4(bytes: Uint8Array, offset: number): string {
+  if (offset + 4 > bytes.byteLength) return '';
+  return String.fromCharCode(bytes[offset]!, bytes[offset + 1]!, bytes[offset + 2]!, bytes[offset + 3]!);
 }
 
 function readGoldenTrimRange(ctx: OracleContext): { startUs: number; endUs: number } | undefined {

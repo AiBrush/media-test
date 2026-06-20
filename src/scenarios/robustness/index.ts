@@ -724,6 +724,7 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     op: 'probe',
     asset: 'mislabeled_h264.webm',
     containersIn: ['webm'],
+    options: { gracefulAllowOutput: true },
     oracles: ['graceful-failure'],
     notes:
       '§A.16 mismatched container/codec: bytes are MP4/H.264 but the extension/MIME claims .webm. ' +

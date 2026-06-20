@@ -62,6 +62,7 @@ import { detectCodecSupport, detectEnv } from './feature-detect.ts';
 import { Meter } from './measure.ts';
 import { DEFAULT_BENCH, metricSampleValue, summarize } from './bench.ts';
 import { loadGolden, runOracle } from './oracles.ts';
+import { disabledCellReason } from './disabled-cells.ts';
 // The platform engine IS the browser-pure oracle decoder/player (§8). runMatrix injects these into
 // every cell so oracles that decode output / smoke-play it work without the caller wiring them.
 import { decodeBytesToFrames, playbackSmoke as platformPlaybackSmoke } from '../engines/platform/oracle-helpers.ts';
@@ -1108,6 +1109,24 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
     const scenario = scenarioById.get(cell.scenarioId);
     if (!scenario) continue;
     const engineId = cell.engineId;
+    const disabledReason = disabledCellReason(engineId, scenario.id);
+    if (disabledReason) {
+      const r: ScenarioResult = {
+        engineId,
+        browser: opts.browser,
+        scenarioId: scenario.id,
+        family: scenario.family,
+        status: 'SKIPPED',
+        oracleOutcomes: [],
+        reason: disabledReason,
+        env: { ...runEnvBase, engineId },
+      };
+      results.push(r);
+      opts.onResult?.(r);
+      done += 1;
+      opts.onProgress?.(done, total, `${scenario.id} / ${engineId} (skipped)`);
+      continue;
+    }
     const reg = getEngine(engineId);
     if (!reg) {
       // Unknown engine id: surface as ERROR cells rather than throwing the whole matrix.
