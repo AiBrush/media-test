@@ -8,12 +8,10 @@
  * within the timeout, never crash/hang/OOM.
  *
  * HOW THESE GATE (oracles.ts `gracefulFailure` + runner.ts robustness path):
- *   - Each case carries a deterministic `mutate` that corrupts a VALID source asset. A scenario with a
- *     `mutate` function is (a) classified into the robustness PILLAR (runner.selectByPillar) and (b)
- *     routed through runner.runRobustness, which feeds the mutated bytes and expects engine.remux to
- *     throw/reject within `timeoutMs`. `gracefulFailure` then reads `!!ctx.scenario.mutate` as the
- *     robustness signal and PASSes iff no output was produced (graceful) — FAILs on a hang/timeout or
- *     on output emitted from clearly-malformed input.
+ *   - Each case points at a deterministic malformed fixture under `fixtures/media`. The
+ *     `graceful-failure` oracle routes the scenario through runner.runRobustness, which expects
+ *     engine.remux to throw/reject within `timeoutMs`. It PASSes iff no output was produced
+ *     (graceful) — FAILs on a hang/timeout or on output emitted from clearly-malformed input.
  *   - This file lives under src/scenarios/remux/ (so the id is `remux/...` and it ships with the
  *     family) while behaving as a robustness probe of the remux op — the cleanest way to add
  *     remux-targeted negatives without editing the robustness family.
@@ -28,21 +26,6 @@ import { defineScenario } from '../../core/scenario.ts';
 
 const REMUX_NEG_TIMEOUT_MS = 15_000;
 
-/** Zero the entire buffer (models an empty / all-zero input the remux sample-table parse must reject). */
-function zeroOutAll(): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => new Uint8Array(bytes.length);
-}
-
-/** Truncate to ~50%: a partial upload where moov/mdat (or the final cluster) is incomplete. */
-function truncateTail(fraction: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes.slice(0, Math.max(0, Math.floor(bytes.length * fraction)));
-}
-
-/** Drop the first `headerBytes` bytes so container magic / moov head is destroyed but payload remains. */
-function dropHeader(headerBytes: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => (bytes.length <= headerBytes ? new Uint8Array(0) : bytes.slice(headerBytes));
-}
-
 interface RemuxNegativeCase {
   id: string;
   /** valid base asset to corrupt before remuxing */
@@ -51,7 +34,6 @@ interface RemuxNegativeCase {
   to: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
-  mutate: (bytes: Uint8Array) => Uint8Array;
   gracefulAllowOutput?: boolean;
   notes: string;
 }
@@ -59,24 +41,22 @@ interface RemuxNegativeCase {
 const NEGATIVE_CASES: RemuxNegativeCase[] = [
   {
     id: 'neg_zeroed_mp4_to_mkv',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'remux_zeroed_mp4.mp4',
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    mutate: zeroOutAll(),
     notes:
       'All-zero MP4 bytes -> remux to MKV: the sample-table/box parse must reject cleanly (no codable ' +
       'stream), never crash/hang/OOM. (Targets the remux op specifically; robustness only zero-spans it.)',
   },
   {
     id: 'neg_truncated_mp4_to_mkv',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'remux_truncated_h264_50p.mp4',
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    mutate: truncateTail(0.5),
     gracefulAllowOutput: true,
     notes:
       'MP4 cut at 50% (incomplete moov/mdat) -> remux to MKV: engine must reject or emit nothing ' +
@@ -84,12 +64,11 @@ const NEGATIVE_CASES: RemuxNegativeCase[] = [
   },
   {
     id: 'neg_headerless_webm_to_mkv',
-    asset: 'vp9_1080p_10s.webm',
+    asset: 'remux_headerless_webm.webm',
     from: 'webm',
     to: 'mkv',
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
-    mutate: dropHeader(128),
     notes:
       'WebM with the EBML header destroyed -> remux to MKV: the demux stage of remux must reject the ' +
       'unparseable header gracefully rather than loop on a bogus element size.',
@@ -111,7 +90,6 @@ export const remuxNegativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     timeoutMs: REMUX_NEG_TIMEOUT_MS,
     notes: c.notes,
   }),

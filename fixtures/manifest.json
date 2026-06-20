@@ -808,6 +808,618 @@
       "sha256": "97035941c7d8c62cc4e53bd9fd2933b201462f3e09f6e6d1d3b3512a4398b9e8",
       "sizeBytes": 9990,
       "notes": "WebP image negative (still image, not a WebM video)."
+    },
+    {
+      "id": "h264_10bit_1080p_5s.mp4",
+      "family": "video-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 5s + sine, libx264 high10 yuv420p10le, AAC 128k, +faststart.",
+      "sha256": "8740ee5b8021559f2fe6287f28df81b2f156a8f48f152f8beb0db54d3ac7b7c4",
+      "sizeBytes": 5563936,
+      "notes": "10-bit H.264 High 10 MP4 fixture for decode/profile negotiation edges."
+    },
+    {
+      "id": "h264_open_gop_1080p.mp4",
+      "family": "video-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg testsrc2 1920x1080@30 5s + sine, libx264 open-gop with B-frames, AAC 128k, +faststart.",
+      "sha256": "3f07fdfefa56bd89206ec5abd249330f35b1f73bba3265c8f40e58e95eb77f61",
+      "sizeBytes": 4532479,
+      "notes": "Open-GOP/B-frame H.264 MP4 for first-frame decode and packet-reorder edges."
+    },
+    {
+      "id": "h264_1fps_30s.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 320x240@1 30s, libx264 yuv420p all-keyframe, +faststart, no audio.",
+      "sha256": "36ad3fd783e4993b751e2aef705f345500faf581d483b5d86a751745e119f46d",
+      "sizeBytes": 183419,
+      "notes": "Extreme low-fps video: 1 fps over 30 seconds. Complements video_240fps.mp4."
+    },
+    {
+      "id": "h264_video_only.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg testsrc2 1280x720@30 5s, libx264 yuv420p, +faststart, no audio.",
+      "sha256": "305806e31eb6b633641d74c9aa3f3a867ab6676ccb8093aef032392c97c65239",
+      "sizeBytes": 1740681,
+      "notes": "Video-only MP4 with no audio track for track-enumeration edges."
+    },
+    {
+      "id": "aac_audio_only.m4a",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg sine 440Hz 48k stereo 10s, AAC 128k, +faststart -f mp4.",
+      "sha256": "6037709f4170c5b0831445da5d6778f99ca4a91e1477246df1ccaaba8f65461f",
+      "sizeBytes": 163191,
+      "notes": "Audio-only M4A with no video track for track-enumeration edges."
+    },
+    {
+      "id": "wav_s16_44k1.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg sine 440Hz 44.1k stereo 10s, pcm_s16le WAV.",
+      "sha256": "be130ae7992f30db5bcb7489b6c61fe4ae4514eda5f4dff42afcf3b292051af1",
+      "sizeBytes": 1764044,
+      "notes": "44.1 kHz PCM WAV source for resample-to-48k tests."
+    },
+    {
+      "id": "wav_s16_mono.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg sine 440Hz 48k mono 10s, pcm_s16le WAV.",
+      "sha256": "8ac5d766308b81a8ee714a4d5a3ac09ab046c0574d165a3c4af9d54adf3139d7",
+      "sizeBytes": 960044,
+      "notes": "Mono PCM WAV source for upmix-to-stereo tests."
+    },
+    {
+      "id": "wav_5_1.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg sine 440Hz 48k mono 10s, pan=5.1, pcm_s16le WAV.",
+      "sha256": "82d8cae6d8d2d0f25be9d40ca9abf7c4afd3e93a9907de60278b5dc5d572fe65",
+      "sizeBytes": 5760068,
+      "notes": "5.1 PCM WAV for non-stereo probe and downmix tests."
+    },
+    {
+      "id": "pcm_s24be.aiff",
+      "family": "audio",
+      "container": "aiff",
+      "codecs": [
+        "pcm-s24be"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, pcm_s24be AIFF.",
+      "sha256": "1cf814e3921262828e3d9af0612b4b6b82fae4b16315ed44f0f45057de862d54",
+      "sizeBytes": 1440054,
+      "notes": "24-bit big-endian PCM AIFF source for endian/depth conversion."
+    },
+    {
+      "id": "pcm_s16.caf",
+      "family": "audio",
+      "container": "caf",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg sine 440Hz 48k stereo 5s, pcm_s16le CAF.",
+      "sha256": "5a0918492135a387ba9c0c9abbea8c4af795180a2e638bd38b14177bb0049cc1",
+      "sizeBytes": 960092,
+      "notes": "CAF container carrying 16-bit PCM audio for container-probe coverage."
+    },
+    {
+      "id": "longform_1h_audio_pcm.wav",
+      "family": "stress",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "huge",
+      "genMethod": "ffmpeg sine 440Hz 44.1k mono 3600s, pcm_s16le WAV.",
+      "sha256": "38dbcdfadd9a6f79d2996b17716bca092dc3e1138721d288d02aa7b36c58b4c6",
+      "sizeBytes": 317520044,
+      "notes": "One-hour PCM WAV longform audio stress fixture. Large by design; use --skip-longform for quick bakes."
+    },
+    {
+      "id": "demux_mp4_header_destroyed.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs copies h264_1080p_30s.mp4 and drops the first 256 bytes.",
+      "sha256": "2692e4a3a54a0e207397dababc2fca929280a85bc8564ac41cf7ca9eb12d1565",
+      "sizeBytes": 31258534,
+      "notes": "Intentionally malformed MP4 with destroyed ftyp/moov head for graceful demux failure."
+    },
+    {
+      "id": "demux_webm_header_destroyed.webm",
+      "family": "deep-edge",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs copies vp9_1080p_10s.webm and drops the first 128 bytes.",
+      "sha256": "82cfbbab5e4349607e8306445a42d2be0f2007f8a381626fc99af2ee005a12a4",
+      "sizeBytes": 9293542,
+      "notes": "Intentionally malformed WebM with destroyed EBML head for graceful demux failure."
+    },
+    {
+      "id": "remux_zeroed_mp4.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs zeroes every byte of h264_1080p_30s.mp4.",
+      "sha256": "6ece8933fc507b89803425d6d08a989f8567cc5e00a4c955ffa31b5cb070760d",
+      "sizeBytes": 31258790,
+      "notes": "Intentionally zeroed MP4-shaped fixture for negative remux input."
+    },
+    {
+      "id": "remux_truncated_h264_50p.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs keeps the first 50 percent of h264_1080p_30s.mp4.",
+      "sha256": "a594e60b783da6de5c869bf09ddaf97e50b7a859ca19829962ebde9fc336bc90",
+      "sizeBytes": 15629395,
+      "notes": "Intentionally truncated H.264 MP4 for negative remux input."
+    },
+    {
+      "id": "remux_headerless_webm.webm",
+      "family": "deep-edge",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs copies vp9_1080p_10s.webm and drops the first 128 bytes.",
+      "sha256": "82cfbbab5e4349607e8306445a42d2be0f2007f8a381626fc99af2ee005a12a4",
+      "sizeBytes": 9293542,
+      "notes": "Intentionally headerless WebM for negative remux input."
+    },
+    {
+      "id": "transcode_truncated_h264_60p.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs keeps the first 60 percent of h264_1080p_30s.mp4.",
+      "sha256": "d903dd0314bfbe6fc3baa8162546ce92142711375025d0bfad98a0b6ea9ed1eb",
+      "sizeBytes": 18755274,
+      "notes": "Intentionally truncated H.264 MP4 for negative transcode input."
+    },
+    {
+      "id": "trim_truncated_h264_55p.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs keeps the first 55 percent of h264_1080p_30s.mp4.",
+      "sha256": "5c03afd472ccfa61124a89d3ef626b37f4b0d6e0d0dd788e75beb62385e0f01d",
+      "sizeBytes": 17192334,
+      "notes": "Intentionally truncated H.264 MP4 for negative trim input."
+    },
+    {
+      "id": "trim_bitflipped_h264.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs applies 128 deterministic bit flips to h264_1080p_30s.mp4.",
+      "sha256": "7875ee6df71ed368eed8e83b441a241ccdeee9d9942b494c0b2c940d3b59b8f8",
+      "sizeBytes": 31258790,
+      "notes": "Intentionally bit-flipped H.264 MP4 for negative trim input."
+    },
+    {
+      "id": "cenc_ctr_senc_bitflip.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs applies deterministic bit flips to cenc_ctr.mp4.",
+      "sha256": "c64d7445ecfa080b9c7840dfba437fa81dd4714f90055ef17eef755c8decee54",
+      "sizeBytes": 2209644,
+      "notes": "Malformed CENC AES-CTR MP4 with corrupted protection/sample-encryption bytes."
+    },
+    {
+      "id": "cenc_ctr_protection_zeroed.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs zeroes deterministic protection/payload spans in cenc_ctr.mp4.",
+      "sha256": "d165dcd14d33c9372c85f1b42fb8354e1787e95511d2d3e95c7436aea14b62dd",
+      "sizeBytes": 2209644,
+      "notes": "Malformed CENC AES-CTR MP4 with zeroed protection/payload spans."
+    },
+    {
+      "id": "cenc_ctr_truncated_mdat.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs keeps the first 60 percent of cenc_ctr.mp4.",
+      "sha256": "3837e9ee3672bacfee5c886c22a78f84fc03385d0d4a79efc22eabbb951c0e51",
+      "sizeBytes": 1325786,
+      "notes": "Malformed CENC AES-CTR MP4 truncated mid-fragment."
+    },
+    {
+      "id": "metadata_garbled_id3_mp3.mp3",
+      "family": "deep-edge",
+      "container": "mp3",
+      "codecs": [
+        "mp3"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs corrupts a deterministic metadata/head span in mp3_xing.mp3.",
+      "sha256": "fe93036ca40941e85511985090121dbc0203ea3b46dd8d30aab75878342a6355",
+      "sizeBytes": 64166,
+      "notes": "Malformed MP3 with garbled ID3/Xing metadata region for metadata probe robustness."
+    },
+    {
+      "id": "metadata_garbled_ilst_mp4.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs corrupts a deterministic metadata/head span in h264_1080p_30s.mp4.",
+      "sha256": "1105fd490eeddbc531b722c59d5050c0aafb461f8de6b119fbdad8a2eda3178e",
+      "sizeBytes": 31258790,
+      "notes": "Malformed MP4 with garbled ftyp/moov/ilst metadata region for metadata probe robustness."
+    },
+    {
+      "id": "wav_header_truncated.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "fixtures/bake.mjs keeps the first 20 bytes of wav_s16.wav.",
+      "sha256": "d9d96e1ba93a660ecd842c321ec6f925e679404754e70b0d332a0ff6968088ea",
+      "sizeBytes": 20,
+      "notes": "Header-truncated WAV for audio parser robustness."
+    },
+    {
+      "id": "wav_fmt_corrupt.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs zeroes the canonical WAV fmt descriptor bytes in wav_s16.wav.",
+      "sha256": "f1ca300a54ca777ab5289b59135b0fd3447a33bb4bd92ebe8dce69a6e49592d0",
+      "sizeBytes": 960044,
+      "notes": "WAV with corrupt fmt descriptor for audio transcode robustness."
+    },
+    {
+      "id": "wav_bitflip.wav",
+      "family": "audio",
+      "container": "wav",
+      "codecs": [
+        "pcm-s16"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs applies 96 deterministic bit flips to wav_s16.wav.",
+      "sha256": "677570ddb7298cc8044dc7a885d7b7e541dff2d643836bdd7db5325239f2cb7a",
+      "sizeBytes": 960044,
+      "notes": "Bit-flipped PCM WAV for decode robustness."
+    },
+    {
+      "id": "aiff_header_truncated.aiff",
+      "family": "audio",
+      "container": "aiff",
+      "codecs": [
+        "pcm-s16be"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "fixtures/bake.mjs keeps the first 24 bytes of pcm_s16be.aiff.",
+      "sha256": "19fffc6f79c75049eb6dbad04770f2214297baac81c80888059dcfadf6a9db50",
+      "sizeBytes": 24,
+      "notes": "Header-truncated AIFF for audio parser robustness."
+    },
+    {
+      "id": "fuzz_mp4_bitflip.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs applies 128 deterministic bit flips to h264_1080p_30s.mp4.",
+      "sha256": "0f8e3471f66450a535829495b60697c68b2d5e5ed23a8829f006f351d987d1b8",
+      "sizeBytes": 31258790,
+      "notes": "Malformed MP4 fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_mp4_header_truncated.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs drops the first 256 bytes of h264_1080p_30s.mp4.",
+      "sha256": "2692e4a3a54a0e207397dababc2fca929280a85bc8564ac41cf7ca9eb12d1565",
+      "sizeBytes": 31258534,
+      "notes": "Header-truncated MP4 fuzz fixture for demux robustness."
+    },
+    {
+      "id": "fuzz_mp4_tail_truncated.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs keeps the first 55 percent of h264_1080p_30s.mp4.",
+      "sha256": "5c03afd472ccfa61124a89d3ef626b37f4b0d6e0d0dd788e75beb62385e0f01d",
+      "sizeBytes": 17192334,
+      "notes": "Tail-truncated MP4 fuzz fixture for demux robustness."
+    },
+    {
+      "id": "fuzz_mp4_zeroed_spans.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs zeroes six deterministic 2KB payload spans in h264_1080p_30s.mp4.",
+      "sha256": "f0141256686deed481f60bfb6e72eb1d8f66e19bc4d1c1a6d98bdbebcfef685d",
+      "sizeBytes": 31258790,
+      "notes": "MP4 with zeroed sample spans for decode robustness."
+    },
+    {
+      "id": "fuzz_webm_bitflip.webm",
+      "family": "deep-edge",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs applies 96 deterministic bit flips to vp9_1080p_10s.webm.",
+      "sha256": "52e2993b777eca736da6a37fda7b8835d3366515789a4b991fc9fcb6fefeb4d8",
+      "sizeBytes": 9293670,
+      "notes": "Malformed WebM fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_webm_header_truncated.webm",
+      "family": "deep-edge",
+      "container": "webm",
+      "codecs": [
+        "vp9",
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs drops the first 128 bytes of vp9_1080p_10s.webm.",
+      "sha256": "82cfbbab5e4349607e8306445a42d2be0f2007f8a381626fc99af2ee005a12a4",
+      "sizeBytes": 9293542,
+      "notes": "Header-truncated WebM fuzz fixture for demux robustness."
+    },
+    {
+      "id": "fuzz_ts_zeroed_spans.ts",
+      "family": "deep-edge",
+      "container": "ts",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs zeroes deterministic 188-byte TS packet spans in h264_ts.ts.",
+      "sha256": "f8e29114cff50cc02e31b2b1b71fc25912e4dfc09ac48de2edadba134391fbde",
+      "sizeBytes": 4633636,
+      "notes": "MPEG-TS with zeroed packets for demux robustness."
+    },
+    {
+      "id": "fuzz_flac_bitflip.flac",
+      "family": "deep-edge",
+      "container": "flac",
+      "codecs": [
+        "flac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs applies 48 deterministic bit flips to flac_seektable.flac.",
+      "sha256": "b3f44929eee837635c1d20672407d6cc8fa8eacf374d331ff7d76b2d54419606",
+      "sizeBytes": 142933,
+      "notes": "FLAC metadata/block fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_mp3_header_truncated.mp3",
+      "family": "deep-edge",
+      "container": "mp3",
+      "codecs": [
+        "mp3"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs drops the first 64 bytes of mp3_xing.mp3.",
+      "sha256": "6583045f6191a58c07a104fffed50f15ad0b3089dbfdf17154a7dfc0f65e5f17",
+      "sizeBytes": 64102,
+      "notes": "Header-truncated MP3 fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_remux_zeroed_spans.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs zeroes five deterministic 4KB spans in h264_1080p_30s.mp4.",
+      "sha256": "7e6551004311d480f3d336cb3afcd99f442a7e824351693358250d129377419b",
+      "sizeBytes": 31258790,
+      "notes": "Corrupt MP4 sample spans for remux robustness."
+    },
+    {
+      "id": "fuzz_encrypted_mp4_ciphertext.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs zeroes deterministic ciphertext spans in cenc_ctr.mp4.",
+      "sha256": "53ab4bd60cbc05fb839d1d87cf261ceb84be20106f6f7444bb212110585309c6",
+      "sizeBytes": 2209644,
+      "notes": "CENC AES-CTR MP4 with corrupted ciphertext spans for decrypt/decode robustness."
+    },
+    {
+      "id": "fuzz_adts_aac_bitflip.aac",
+      "family": "deep-edge",
+      "container": "adts",
+      "codecs": [
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs applies 64 deterministic bit flips to aac_adts.aac.",
+      "sha256": "290419b81c4571c4dd8343ab1ad878d8497dcfaafa49be5628ae80189cb558d2",
+      "sizeBytes": 163811,
+      "notes": "ADTS AAC bit-flip fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_ogg_opus_header_truncated.ogg",
+      "family": "deep-edge",
+      "container": "ogg",
+      "codecs": [
+        "opus"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "fixtures/bake.mjs drops the first 96 bytes of opus.ogg.",
+      "sha256": "ff6e27742549597c3875b1f8f7af6a21b4af813eba2e3db130b81c96e8f8743d",
+      "sizeBytes": 145814,
+      "notes": "Header-truncated OGG/Opus fuzz fixture for probe robustness."
+    },
+    {
+      "id": "fuzz_mux_target_corrupt_remux.mp4",
+      "family": "deep-edge",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "medium",
+      "genMethod": "fixtures/bake.mjs zeroes five deterministic 4KB spans in h264_1080p_30s.mp4.",
+      "sha256": "2394ec6bc8c5586afbb17c7c176444d1d5a06f75b3ce4aef0b1c29380724c0bd",
+      "sizeBytes": 31258790,
+      "notes": "Corrupt MP4 input for fragmented-MP4 mux target robustness."
     }
   ]
 }

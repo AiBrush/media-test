@@ -13,10 +13,9 @@
  *    write_flac note "audio samples must remain bit-identical" (proxied by duration for audio, since
  *    no PCM oracle exists; decode-pixel-exact for video).
  *  - NOT REALIZABLE here: reading the WRITTEN tag CONTENT back and asserting tags ⊇ T. The runner
- *    drops options.tags and never re-probes a remux output, and no oracle compares a tag map. That
- *    needs runner + oracle + model work (out of the scenario writer's scope). We keep options.tags on
- *    each case (self-documenting + future-proof) and record the gap in index.ts. We do NOT attach an
- *    oracle that pretends to check it.
+ *    forwards options.tags, but no oracle re-probes a remux output and compares a tag map. That needs
+ *    oracle + model work. We keep options.tags on each case and record the gap in index.ts. We do NOT
+ *    attach an oracle that pretends to check it.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -60,7 +59,7 @@ const WRITE_CASES: TagWriteCase[] = [
     notes:
       'Set MP4 ilst tags, re-observe: the output is a valid MP4 (reference-reimport) and the tag-only ' +
       'rewrite did NOT change decoded pixels (decode(remux(x))==decode(x)). Tag CONTENT readback is ' +
-      'not gated (runner drops options.tags + never re-probes — see index.ts oracleGaps).',
+      'not gated yet because no oracle re-probes ctx.output tags — see index.ts oracleGaps.',
   },
   {
     id: 'write_mkv_tags',
@@ -218,53 +217,30 @@ const noTagsRecorderRead: Scenario = defineScenario({
 
 // ── Malformed / truncated tag region: probe must fail GRACEFULLY ──────────────────────────────────
 
-/** Corrupt the leading metadata region (ID3v2 / ilst-bearing head) while leaving the audio payload. */
-function garbleHead(headBytes: number, seed = 0x7a9): (b: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    const n = Math.min(headBytes, out.length);
-    let a = seed >>> 0;
-    for (let i = 0; i < n; i++) {
-      a = (a + 0x6d2b79f5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      out[i] = (t ^ (t >>> 14)) & 0xff;
-    }
-    return out;
-  };
-}
-
 const META_NEGATIVE_CASES: MetaNegativeCase[] = [
   {
     id: 'neg_garbled_id3_mp3_probe',
-    asset: 'mp3_xing.mp3',
+    asset: 'metadata_garbled_id3_mp3.mp3',
     container: 'mp3',
     audioCodecs: ['mp3'],
-    // The ID3v2 header + Xing tag region sits in the first few hundred bytes; garble it so the tag
-    // parser hits an inconsistent size/frame structure but the MPEG payload remains.
-    mutate: garbleHead(320),
     gracefulAllowOutput: true,
     timeoutMs: 15_000,
     notes:
       'Malformed ID3 tag region (A.16 fuzz): the leading ID3v2/Xing bytes of an MP3 are garbled. probe ' +
       'may reject or recover by ignoring the corrupt tag region and returning safe structural metadata; ' +
-      'the required property is GRACEFUL handling — no crash/hang/OOM on the corrupt head.',
+      'the required property is GRACEFUL handling of the corrupt head.',
   },
   {
     id: 'neg_garbled_ilst_mp4_probe',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'metadata_garbled_ilst_mp4.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    // MP4 carries ilst/udta tags inside moov; garbling the head corrupts ftyp/moov structure the tag
-    // reader walks. A robust probe rejects cleanly rather than looping on a bogus atom size.
-    mutate: garbleHead(256),
     gracefulAllowOutput: true,
     timeoutMs: 15_000,
     notes:
       'Truncated/garbled ilst region (A.16 fuzz): the leading ftyp/moov bytes of an MP4 (where ' +
-      'udta/ilst tags live) are garbled. probe may reject or safely recover, but must not crash/hang/' +
-      'OOM on a bogus tag atom size.',
+      'udta/ilst tags live) are garbled. probe may reject or safely recover from a bogus tag atom size.',
   },
 ];
 

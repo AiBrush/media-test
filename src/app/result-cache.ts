@@ -13,9 +13,23 @@ export interface CachedScenarioResult extends ScenarioResult {
   cached?: true;
 }
 
+export interface CachedResultRow {
+  key: string;
+  updatedAtIso?: string;
+  result: ScenarioResult;
+  invalidated: boolean;
+}
+
 export interface ResultCache {
   get(engineId: string, scenarioId: string, browser: string): Promise<CachedScenarioResult | undefined>;
   put(result: ScenarioResult): Promise<void>;
+  list(): Promise<CachedResultRow[]>;
+}
+
+interface StoredResultRow {
+  key?: unknown;
+  updatedAtIso?: string;
+  result?: ScenarioResult;
 }
 
 function cacheKey(engineId: string, scenarioId: string, browser: string): string {
@@ -77,6 +91,37 @@ export function createResultCache(): ResultCache | undefined {
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error ?? new Error('failed to write result cache'));
       });
+    },
+    async list() {
+      const database = await db();
+      const rows = await new Promise<CachedResultRow[]>((resolve, reject) => {
+        const tx = database.transaction(STORE, 'readonly');
+        const req = tx.objectStore(STORE).openCursor();
+        const out: CachedResultRow[] = [];
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          const row = cursor.value as StoredResultRow;
+          if (row?.result) {
+            out.push({
+              key: typeof row.key === 'string' ? row.key : String(cursor.key),
+              updatedAtIso: row.updatedAtIso,
+              result: row.result,
+              invalidated: shouldInvalidateCachedResult(row.result),
+            });
+          }
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error ?? new Error('failed to list result cache'));
+        tx.oncomplete = () => resolve(out);
+        tx.onerror = () => reject(tx.error ?? new Error('failed to list result cache'));
+      });
+      return rows.sort(
+        (a, b) =>
+          a.result.browser.localeCompare(b.result.browser) ||
+          a.result.engineId.localeCompare(b.result.engineId) ||
+          a.result.scenarioId.localeCompare(b.result.scenarioId),
+      );
     },
   };
 }

@@ -8,13 +8,9 @@
  *   - mux with ZERO tracks / empty EncodedTracks must reject, not emit a 0-byte/garbage container.
  *
  * HOW THESE GATE (oracles.ts gracefulFailure + runner.ts runRobustness):
- *   Each case carries a deterministic `mutate`. A scenario with a `mutate` is routed through
- *   runner.runRobustness, which feeds the (here, unaltered — identity) bytes and expects the op to
- *   throw/reject within `timeoutMs`. `gracefulFailure` reads `!!ctx.scenario.mutate` as the robustness
- *   signal and PASSes iff NO output was produced (a clean throw/reject), FAILs on a crash/hang/timeout
- *   or on output emitted from a clearly-illegal mux. Identity mutate is the established way (demux/remux
- *   negative files) to route a NON-robustness-family case onto the graceful path without inventing a
- *   side channel.
+ *   The `graceful-failure` oracle routes each case through runner.runRobustness, which expects the op
+ *   to throw/reject within `timeoutMs`. It PASSes iff NO output was produced (a clean throw/reject),
+ *   FAILs on a crash/hang/timeout or on output emitted from a clearly-illegal mux.
  *
  * NEGOTIATION NOTE (why these reach the mux at all): negotiate() checks declared containerOut and
  * codec SEPARATELY — it does NOT model codec-in-container legality. An engine that declares BOTH `wav`
@@ -28,7 +24,7 @@
  */
 
 import type { Scenario } from '../../core/scenario.ts';
-import { buildMuxNegativeAll, identityBytes, type MuxNegativeCase } from './_shared.ts';
+import { buildMuxNegativeAll, type MuxNegativeCase } from './_shared.ts';
 
 const MUX_NEG_TIMEOUT_MS = 15_000;
 
@@ -40,7 +36,6 @@ const NEGATIVE_CASES: MuxNegativeCase[] = [
     containersIn: ['mp4'],
     to: 'wav',
     videoCodecs: ['h264'],
-    mutate: identityBytes(),
     notes:
       'ILLEGAL mux H.264 → wav (§A.16 mismatched container/codec): WAV is PCM-audio-only and cannot ' +
       'carry an H.264 video track. The muxer must reject cleanly (throw/reject) within the timeout — ' +
@@ -52,7 +47,6 @@ const NEGATIVE_CASES: MuxNegativeCase[] = [
     containersIn: ['mp4'],
     to: 'ogg',
     videoCodecs: ['h264'],
-    mutate: identityBytes(),
     notes:
       'ILLEGAL mux H.264 → ogg (§A.16): OGG carries Opus/Vorbis/FLAC/Theora, not H.264/AVC. The mux ' +
       'must reject the unrepresentable codec cleanly rather than write an invalid OGG.',
@@ -63,7 +57,6 @@ const NEGATIVE_CASES: MuxNegativeCase[] = [
     containersIn: ['webm'],
     to: 'adts',
     videoCodecs: ['vp9'],
-    mutate: identityBytes(),
     notes:
       'ILLEGAL mux VP9 → adts (§A.16): ADTS is a raw AAC elementary stream — it cannot hold a VP9 video ' +
       'track. The muxer must reject cleanly (no video payload is representable in ADTS).',
@@ -76,7 +69,6 @@ const NEGATIVE_CASES: MuxNegativeCase[] = [
     containersIn: ['wav'],
     to: 'mp4',
     audioCodecs: ['pcm-s16'],
-    mutate: identityBytes(),
     notes:
       'ZERO-TRACK / EMPTY mux (§A.16 no-tracks / zero-length): empty_audio.wav is a valid WAV with an ' +
       'EMPTY data chunk → its demux yields a track with no samples. Muxing zero/empty EncodedTracks must ' +

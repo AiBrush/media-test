@@ -37,6 +37,7 @@ import type {
   MediaInput,
   NormalizedMetadata,
   Operation,
+  RemuxOptions,
   TranscodeOptions,
 } from './engine.ts';
 import type {
@@ -505,6 +506,22 @@ function asContainerOpt(options: Scenario['options']): string {
   const c = (options as { container?: unknown } | undefined)?.container;
   return typeof c === 'string' ? c : 'mp4';
 }
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.entries(value as Record<string, unknown>).every(([, v]) => typeof v === 'string')
+  );
+}
+function asRemuxOpts(options: Scenario['options']): RemuxOptions {
+  const raw = (options ?? {}) as Record<string, unknown>;
+  const tags = raw['tags'];
+  return {
+    container: asContainerOpt(options),
+    ...(isStringRecord(tags) ? { tags } : {}),
+  };
+}
 function asTranscodeOpts(options: Scenario['options']): TranscodeOptions {
   const o = (options ?? {}) as Partial<TranscodeOptions>;
   return { ...o, container: typeof o.container === 'string' ? o.container : 'mp4' };
@@ -567,7 +584,7 @@ async function executeOp(engine: MediaEngine, scenario: Scenario, inputs: MediaI
     case 'demux':
       return { demux: await engine.demux(input) };
     case 'remux':
-      return { output: await engine.remux(input, { container: asContainerOpt(scenario.options) }) };
+      return { output: await engine.remux(input, asRemuxOpts(scenario.options)) };
     case 'transcode':
       return { output: await engine.transcode(input, asTranscodeOpts(scenario.options)) };
     case 'decodeFrames': {

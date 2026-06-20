@@ -806,46 +806,11 @@ const invariantTrimScenarios: Scenario[] = INVARIANT_CASES.map((c) =>
 );
 
 // ── ROBUSTNESS trim cases (§7) — degenerate ranges + corrupt sources → graceful failure ──────────
-// The runner routes a case to its graceful-failure path ONLY when (scenario.family==='robustness' ||
-// scenario.mutate is a function) AND scenario.mutate is present (runner.ts:548). Since these live in
-// the `trim` family, we supply a `mutate` to opt into that path. For BAD-RANGE cases the BYTES are
-// valid (the RANGE is the defect), so mutate is the IDENTITY transform — it only flags robustness
-// intent; the engine receives a well-formed file and an illegal range and must throw/reject cleanly
-// within the timeout (no crash/hang/OOM, never a fabricated output). For BAD-BYTE cases mutate is a
-// real, deterministic corruptor. Oracle: graceful-failure (oracles.ts:1151) — PASS iff the op threw
-// (no output) within timeout; FAIL on timeout or on a returned output for a malformed input.
+// The runner routes any case with the graceful-failure oracle to its robustness path. BAD-RANGE cases
+// feed a well-formed file and illegal range; BAD-BYTE cases point at deterministic malformed fixture
+// files. PASS iff the op throws/returns safely within timeout; FAIL on timeout or suspicious output.
 
 const ROBUSTNESS_TIMEOUT_MS = 15_000;
-
-/** Identity mutate: marks the case as robustness (routes to runRobustness) without altering bytes. */
-const identityMutate = (bytes: Uint8Array): Uint8Array => bytes;
-
-/** Deterministic tail-truncation (mulberry32-free; pure length cut): drop the moov-bearing tail. */
-function truncateTail(fraction: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes.slice(0, Math.max(0, Math.floor(bytes.length * fraction)));
-}
-
-/** Deterministic seeded bit-flips over the byte span (reproducible fuzz; leaves length intact). */
-function bitFlip(count: number, seed: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    if (out.length === 0) return out;
-    let a = seed >>> 0;
-    const rnd = () => {
-      a |= 0;
-      a = (a + 0x6d2b79f5) | 0;
-      let tt = Math.imul(a ^ (a >>> 15), 1 | a);
-      tt = (tt + Math.imul(tt ^ (tt >>> 7), 61 | tt)) ^ tt;
-      return ((tt ^ (tt >>> 14)) >>> 0) / 4294967296;
-    };
-    for (let i = 0; i < count; i++) {
-      const pos = Math.floor(rnd() * out.length);
-      const bit = 1 << Math.floor(rnd() * 8);
-      out[pos] = (out[pos] ?? 0) ^ bit;
-    }
-    return out;
-  };
-}
 
 interface RobustnessTrimCase {
   id: string;
@@ -856,7 +821,6 @@ interface RobustnessTrimCase {
   startUs: number;
   endUs: number;
   frameAccurate: boolean;
-  mutate: (bytes: Uint8Array) => Uint8Array;
   extraOptions?: Record<string, unknown>;
   notes: string;
 }
@@ -873,7 +837,6 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     startUs: 8_000_000,
     endUs: 2_000_000,
     frameAccurate: false,
-    mutate: identityMutate,
     notes: 'Inverted range (end<start) on a VALID file: trim must reject cleanly (graceful), no output.',
   },
   // Zero-length range (endUs == startUs).
@@ -886,7 +849,6 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     startUs: 5_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
-    mutate: identityMutate,
     notes: 'Zero-length range (end==start): either a clean empty-trim reject or graceful throw.',
   },
   // Negative startUs.
@@ -899,7 +861,6 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     startUs: -2_000_000,
     endUs: 4_000_000,
     frameAccurate: false,
-    mutate: identityMutate,
     notes: 'Negative startUs: out-of-domain range; trim must reject gracefully, never fabricate output.',
   },
   // start >= duration (seek-past-EOF range).
@@ -912,7 +873,6 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     startUs: 40_000_000,
     endUs: 45_000_000,
     frameAccurate: false,
-    mutate: identityMutate,
     notes: 'startUs ≥ duration (past EOF): nothing to cut; trim must reject gracefully.',
   },
   // endUs far past EOF (start valid). Some engines clamp (covered by h264_to_eof_copy); here both
@@ -926,34 +886,31 @@ const ROBUSTNESS_CASES: RobustnessTrimCase[] = [
     startUs: 50_000_000,
     endUs: 9_999_000_000,
     frameAccurate: false,
-    mutate: identityMutate,
     notes: 'Range entirely past EOF (50s..~2.7h on a 30s file): graceful reject, no hang/OOM.',
   },
   // Corrupt source: truncated MP4 (moov/mdat incomplete) then a normal trim range — bad BYTES.
   {
     id: 'robust_truncated_source',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'trim_truncated_h264_55p.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     audioCodec: 'aac',
     startUs: 2_000_000,
     endUs: 8_000_000,
     frameAccurate: false,
-    mutate: truncateTail(0.55),
     extraOptions: { gracefulAllowOutput: true },
     notes: 'Source truncated to 55% (incomplete moov/mdat) then trimmed: must fail gracefully.',
   },
   // Corrupt source: bit-flipped MP4 then a normal trim range — bad BYTES.
   {
     id: 'robust_bitflipped_source',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'trim_bitflipped_h264.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     audioCodec: 'aac',
     startUs: 2_000_000,
     endUs: 8_000_000,
     frameAccurate: false,
-    mutate: bitFlip(128, 0x7711),
     notes: '128 seeded bit-flips across the MP4 then trimmed: graceful reject/degrade, no crash.',
   },
 ];
@@ -979,7 +936,6 @@ const robustnessTrimScenarios: Scenario[] = ROBUSTNESS_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     timeoutMs: ROBUSTNESS_TIMEOUT_MS,
     notes: c.notes,
   }),

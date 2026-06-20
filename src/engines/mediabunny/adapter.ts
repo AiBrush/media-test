@@ -77,6 +77,7 @@ import type {
   InputTrack,
   InputVideoTrack,
   InputAudioTrack,
+  AudioSample,
   VideoSample,
   ConversionOptions,
   ConversionVideoOptions,
@@ -89,6 +90,12 @@ import type {
 
 /** The mediabunny module namespace, loaded lazily in init() (rule §0.7 — untimed). */
 type MB = typeof import('mediabunny');
+
+interface VideoTransformExtras {
+  alpha?: AlphaMode;
+  crop?: { x?: number; y?: number; left?: number; top?: number; width?: number; height?: number };
+  pad?: { width?: number; height?: number; color?: string };
+}
 
 import type {
   CapabilitySet,
@@ -189,6 +196,19 @@ function outputFormatOptionsFrom(opts?: Record<string, unknown>): OutputFormatOp
 function alphaModeFrom(opts?: Record<string, unknown>): AlphaMode | undefined {
   const alpha = opts?.alpha;
   return alpha === 'discard' || alpha === 'keep' ? alpha : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function videoTransformExtrasFrom(opts?: Record<string, unknown>): VideoTransformExtras {
+  const extra: VideoTransformExtras = {};
+  const alpha = alphaModeFrom(opts);
+  if (alpha) extra.alpha = alpha;
+  if (isPlainObject(opts?.crop)) extra.crop = opts.crop as VideoTransformExtras['crop'];
+  if (isPlainObject(opts?.pad)) extra.pad = opts.pad as VideoTransformExtras['pad'];
+  return extra;
 }
 
 async function durationFromInput(input: Input): Promise<number | null> {
@@ -517,7 +537,7 @@ function defaultVideoBitrate(codec: VideoCodec | undefined, width?: number, heig
 async function buildVideoOptions(
   mb: MB,
   v: TranscodeVideoOptions,
-  extra?: { alpha?: AlphaMode },
+  extra?: VideoTransformExtras,
 ): Promise<ConversionVideoOptions> {
   const opts: ConversionVideoOptions = {};
   let codec: VideoCodec | undefined;
@@ -530,6 +550,27 @@ async function buildVideoOptions(
   }
   if (typeof v.width === 'number') opts.width = v.width;
   if (typeof v.height === 'number') opts.height = v.height;
+  if (extra?.crop) {
+    const left = typeof extra.crop.left === 'number' ? extra.crop.left : extra.crop.x;
+    const top = typeof extra.crop.top === 'number' ? extra.crop.top : extra.crop.y;
+    const width = extra.crop.width;
+    const height = extra.crop.height;
+    if (
+      typeof left === 'number' &&
+      typeof top === 'number' &&
+      typeof width === 'number' &&
+      typeof height === 'number'
+    ) {
+      opts.crop = { left, top, width, height };
+      opts.width ??= width;
+      opts.height ??= height;
+    }
+  }
+  if (extra?.pad) {
+    if (typeof extra.pad.width === 'number') opts.width = extra.pad.width;
+    if (typeof extra.pad.height === 'number') opts.height = extra.pad.height;
+    opts.fit = 'contain';
+  }
   // mediabunny's Conversion requires a `fit` algorithm whenever BOTH width and height are set
   // (it rejects width+height with no fit: "When both options.video.width and options.video.height
   // are provided, ..."). The suite's resize cases (e.g. convert-webm-resize-320x180) ask for an
@@ -537,7 +578,7 @@ async function buildVideoOptions(
   // "resize 320×180" benchmark. (When only one dimension is given mediabunny derives the other
   // from the aspect ratio and no fit is needed.) Cite: conversion.d.ts ConversionVideoOptions.fit;
   // dossier §4.6/§A.8.
-  if (typeof v.width === 'number' && typeof v.height === 'number') opts.fit = 'fill';
+  if (typeof opts.width === 'number' && typeof opts.height === 'number' && !opts.fit) opts.fit = 'fill';
   if (typeof v.fps === 'number') opts.frameRate = v.fps;
   if (typeof v.rotate === 'number') {
     opts.rotate = (((v.rotate % 360) + 360) % 360) as Rotation;
@@ -624,8 +665,9 @@ async function buildVideoOptions(
  * sensible bitrate when a re-encode is genuinely required.
  */
 function buildAudioOptions(
-  _mb: MB,
+  mb: MB,
   a: NonNullable<TranscodeOptions['audio']>,
+  inputDurationSec?: number,
 ): ConversionAudioOptions {
   const opts: ConversionAudioOptions = {};
   if (a.codec) {
@@ -635,7 +677,75 @@ function buildAudioOptions(
   if (typeof a.sampleRate === 'number') opts.sampleRate = a.sampleRate;
   if (typeof a.channels === 'number') opts.numberOfChannels = a.channels;
   if (typeof a.bitrate === 'number') opts.bitrate = a.bitrate;
+  const process = buildAudioProcess(mb, a, inputDurationSec);
+  if (process) {
+    opts.forceTranscode = true;
+    opts.sampleFormat = 'f32';
+    opts.process = process;
+  }
   return opts;
+}
+
+function buildAudioProcess(
+  mb: MB,
+  a: NonNullable<TranscodeOptions['audio']>,
+  inputDurationSec?: number,
+): ConversionAudioOptions['process'] | undefined {
+  const audio = a as typeof a & {
+    gainDb?: number;
+    gainLinear?: number;
+    fade?: { inSec?: number; outSec?: number; curve?: string };
+  };
+  const gain =
+    typeof audio.gainLinear === 'number'
+      ? audio.gainLinear
+      : typeof audio.gainDb === 'number'
+        ? 10 ** (audio.gainDb / 20)
+        : 1;
+  const fade = audio.fade;
+  const fadeInSec = typeof fade?.inSec === 'number' && fade.inSec > 0 ? fade.inSec : 0;
+  const fadeOutSec = typeof fade?.outSec === 'number' && fade.outSec > 0 ? fade.outSec : 0;
+  if (gain === 1 && fadeInSec === 0 && fadeOutSec === 0) return undefined;
+  if (fadeOutSec > 0 && (inputDurationSec == null || !Number.isFinite(inputDurationSec) || inputDurationSec <= 0)) {
+    throw new Error('mediabunny audio fade-out requires a known input duration');
+  }
+
+  return (sample: AudioSample): AudioSample => {
+    const size = sample.allocationSize({ planeIndex: 0, format: 'f32' });
+    const data = new Float32Array(size / Float32Array.BYTES_PER_ELEMENT);
+    sample.copyTo(data, { planeIndex: 0, format: 'f32' });
+
+    const channels = sample.numberOfChannels;
+    const frames = sample.numberOfFrames;
+    const sampleRate = sample.sampleRate;
+    const fadeOutStartSec = inputDurationSec != null ? Math.max(0, inputDurationSec - fadeOutSec) : 0;
+    for (let frame = 0; frame < frames; frame++) {
+      const t = sample.timestamp + frame / sampleRate;
+      let scale = gain;
+      if (fadeInSec > 0 && t < fadeInSec) {
+        scale *= Math.max(0, Math.min(1, t / fadeInSec));
+      }
+      if (fadeOutSec > 0) {
+        if (t >= fadeOutStartSec) {
+          scale *= Math.max(0, Math.min(1, ((inputDurationSec ?? 0) - t) / fadeOutSec));
+        }
+      }
+      if (scale !== 1) {
+        const base = frame * channels;
+        for (let channel = 0; channel < channels; channel++) {
+          data[base + channel] = (data[base + channel] ?? 0) * scale;
+        }
+      }
+    }
+
+    return new mb.AudioSample({
+      data,
+      format: 'f32',
+      sampleRate,
+      numberOfChannels: channels,
+      timestamp: sample.timestamp,
+    });
+  };
 }
 
 /** Run a Conversion to completion and return the resulting bytes. */
@@ -835,13 +945,23 @@ export class MediabunnyEngine implements MediaEngine {
       features: [
         'fragmented', // fastStart: 'fragmented' (fMP4 / CMAF)
         'fastStart:reserve', // fastStart: 'reserve'
+        'fastStart:in-memory', // fastStart: 'in-memory' (moov-first in RAM before emit)
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
+        'encryption:cenc-ctr-clear-output', // decrypt() remuxes CENC-CTR input to clear MP4 bytes
         'resize', // Conversion video width/height
         'fps', // Conversion video frameRate
         'rotate', // Conversion video rotate, baked into pixels (allowRotationMetadata:false)
+        'crop', // ConversionVideoOptions.crop
+        'pad', // ConversionVideoOptions.fit='contain' into requested output box
         'alpha', // VP9 alpha (WebM/MKV) via alpha:'keep'
+        'alpha:transcode', // Conversion alpha:'keep' preserves alpha through VPx transcodes
+        'resample', // ConversionAudioOptions.sampleRate
+        'downmix', // ConversionAudioOptions.numberOfChannels
+        'upmix', // ConversionAudioOptions.numberOfChannels
+        'gain', // ConversionAudioOptions.process sample scaling
+        'fade', // ConversionAudioOptions.process deterministic envelope
         'decode:golden-rgba', // VideoSample.copyTo(RGBA) matches the baked WebCodecs golden path
         'hls:aes128', // read/probe AES-128 HLS playlists; decrypt() still does not expose hls-aes128
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
@@ -1048,11 +1168,11 @@ export class MediabunnyEngine implements MediaEngine {
       if (opts.audio && !tracks.some((track) => track.isAudioTrack())) {
         throw new Error('mediabunny transcode: requested audio output but input has no audio track');
       }
-      const alpha = alphaModeFrom(runtimeOpts);
-      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, alpha ? { alpha } : undefined);
-      if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio);
-
       const inputDuration = await durationFromInput(mbInput);
+      const videoExtras = videoTransformExtrasFrom(runtimeOpts);
+      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, videoExtras);
+      if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio, inputDuration ?? undefined);
+
       if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
 
       return await runConversion(this.lib, convOpts, opts.container);

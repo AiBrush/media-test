@@ -3,7 +3,8 @@
  *
  * Audio signal-processing conversions (spec A.9) + the audio-only deep edges / metamorphic
  * invariants from A.6 / A.16, all framework-blind. Conversions are expressed as `transcode` ops with
- * audio options; throughput probes as `transcode`/`decodeFrames`; robustness as mutate→graceful.
+ * audio options; throughput probes as `transcode`/`decodeFrames`; robustness as fixture-backed
+ * malformed inputs with `graceful-failure`.
  *
  * ── ORACLE HONESTY (the load-bearing decision in this file) ────────────────────────────────────
  * The standing rule is: correctness GATES every number, and "a wrong oracle that lets a fast-but-
@@ -35,9 +36,8 @@
  * Several cases reference assets the bake author produces alongside this battery (canonical ids the
  * dossier names): `wav_s16_mono.wav` (-ac 1), `wav_s16_44k1.wav` (genuine 44.1k source),
  * `wav_5_1.wav` (5.1 surround source), `pcm_s24be.aiff` (24-bit big-endian AIFF), and
- * `longform_1h_audio_pcm.wav` (multi-hour PCM). Until baked, the runner yields NA(asset-missing) for
- * those cells — never a false PASS — exactly as the corpus already does for `recorder_headerless.webm`
- * and `cenc_cbcs.mp4`. The already-baked `pcm_s16be.aiff` and `empty_audio.wav` are used as-is.
+ * `longform_1h_audio_pcm.wav` (multi-hour PCM). The already-baked `pcm_s16be.aiff` and
+ * `empty_audio.wav` are used as-is.
  */
 
 import type { OracleId, MetricId, Scenario } from '../../core/scenario.ts';
@@ -551,52 +551,6 @@ const edgeAudioScenarios: Scenario[] = EDGE_AUDIO_CASES.map((c) =>
 // These use the fully-functional `graceful-failure` oracle (no decode needed) and so are real,
 // gating coverage today. Mutate cases are deterministic (seeded) so a regression replays exactly.
 
-/** Tiny deterministic PRNG (mulberry32) — reproducible fuzz. */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Flip `count` bits at seeded positions; length preserved. */
-function bitFlip(count: number, seed: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    if (out.length === 0) return out;
-    const rnd = mulberry32(seed);
-    for (let i = 0; i < count; i++) {
-      const pos = Math.floor(rnd() * out.length);
-      const bit = 1 << Math.floor(rnd() * 8);
-      out[pos] = (out[pos] ?? 0) ^ bit;
-    }
-    return out;
-  };
-}
-
-/**
- * Truncate the WAV/AIFF header region: keep the first `keep` bytes only, destroying the data chunk
- * (and, for a small `keep`, the fmt/COMM header) — the classic "looks like a header, no/short
- * payload" corruption a PCM demuxer must reject cleanly rather than reading past the buffer.
- */
-function truncateAt(keep: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes.slice(0, Math.min(keep, bytes.length));
-}
-
-/** Zero the bytes that carry the RIFF/`fmt ` sample-rate & format fields (offsets ~16..36 in a
- *  canonical WAV header) so the format descriptor is corrupt but the magic survives. */
-function corruptWavFmt(): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    out.fill(0, 16, Math.min(36, out.length));
-    return out;
-  };
-}
-
 const AUDIO_FUZZ_TIMEOUT_MS = 15_000;
 
 interface RobustnessAudioCase {
@@ -607,7 +561,6 @@ interface RobustnessAudioCase {
   audioCodecs?: string[];
   outContainer?: string;
   opts?: Record<string, unknown>;
-  mutate?: (bytes: Uint8Array) => Uint8Array;
   oracles: OracleId[];
   notes?: string;
 }
@@ -616,7 +569,7 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
   {
     // empty_audio.wav is already baked (durationSec null, 0 samples) but was unused by audio-dsp.
     // A structurally-valid empty container fed to a CONVERSION must be handled gracefully: a sane
-    // empty output OR a clean throw — never a crash/hang. graceful-failure accepts either.
+    // empty output OR a clean throw. graceful-failure accepts either.
     id: 'edge_empty_audio_transcode',
     op: 'transcode',
     asset: 'empty_audio.wav',
@@ -626,51 +579,47 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44100 }, gracefulAllowOutput: true },
     oracles: ['graceful-failure'],
     notes:
-      'A.16 zero-length/empty audio: structurally-valid empty WAV through a resample must be handled gracefully (empty output or clean throw), never crash/hang.',
+      'A.16 zero-length/empty audio: structurally-valid empty WAV through a resample must be handled gracefully (empty output or clean throw).',
   },
   {
     id: 'fuzz_wav_header_truncated_probe',
     op: 'probe',
-    asset: 'wav_s16.wav',
+    asset: 'wav_header_truncated.wav',
     container: 'wav',
     audioCodecs: ['pcm-s16'],
-    mutate: truncateAt(20),
     oracles: ['graceful-failure'],
     notes:
-      'A.16 header-truncated WAV: only the first 20 bytes kept (fmt/data chunk gone); probe must reject cleanly, no read-past-buffer/crash/hang.',
+      'A.16 header-truncated WAV: only the first 20 bytes kept (fmt/data chunk gone); probe must reject cleanly.',
   },
   {
     id: 'fuzz_wav_fmt_corrupt_transcode',
     op: 'transcode',
-    asset: 'wav_s16.wav',
+    asset: 'wav_fmt_corrupt.wav',
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 1 } },
-    mutate: corruptWavFmt(),
     oracles: ['graceful-failure'],
     notes:
-      'A.16 bit-flipped/fuzzed RIFF fmt header (sample-rate/format zeroed): a downmix transcode must fail gracefully on the bad descriptor, no OOM/hang.',
+      'A.16 bit-flipped/fuzzed RIFF fmt header (sample-rate/format zeroed): a downmix transcode must fail gracefully on the bad descriptor.',
   },
   {
     id: 'fuzz_wav_bitflip_decode',
     op: 'decodeFrames',
-    asset: 'wav_s16.wav',
+    asset: 'wav_bitflip.wav',
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     opts: { maxFrames: 256, gracefulAllowOutput: true },
-    mutate: bitFlip(96, 0x5117a),
     oracles: ['graceful-failure'],
     notes:
-      'A.16 fuzzed PCM span: 96 bit-flips across a WAV; PCM decode must error/conceal without crash/hang/OOM.',
+      'A.16 fuzzed PCM span: 96 bit-flips across a WAV; PCM decode must error or conceal cleanly.',
   },
   {
     id: 'fuzz_aiff_header_truncated_probe',
     op: 'probe',
-    asset: 'pcm_s16be.aiff',
+    asset: 'aiff_header_truncated.aiff',
     container: 'aiff',
     audioCodecs: ['pcm-s16be'],
-    mutate: truncateAt(24),
     oracles: ['graceful-failure'],
     notes:
       'A.16 header-truncated AIFF: FORM/COMM header destroyed; big-endian PCM probe must reject cleanly.',
@@ -691,7 +640,6 @@ const robustnessAudioScenarios: Scenario[] = ROBUSTNESS_AUDIO_CASES.map((c) =>
     },
     oracles: c.oracles,
     metrics: ['wall', 'peakMemory'],
-    ...(c.mutate ? { mutate: c.mutate } : {}),
     timeoutMs: AUDIO_FUZZ_TIMEOUT_MS,
     ...(c.notes ? { notes: c.notes } : {}),
   }),

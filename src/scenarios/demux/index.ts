@@ -21,10 +21,9 @@
  *   (3) DEGENERATE / NO-TRACKS — an empty-but-valid audio container that must demux to exactly zero
  *       packets cleanly (golden is `[]`), proving an engine reports "no packets" rather than crashing
  *       or fabricating. Oracle: `golden-packets` (0 == 0 passes).
- *   (4) GRACEFUL-FAILURE     — zero-length and header-truncated containers fed to demux. These carry a
- *       deterministic `mutate` so the runner routes them through the robustness/graceful path (it gates
- *       on `scenario.mutate`), and the engine must reject/handle cleanly within the timeout — never
- *       crash/hang/OOM. Oracle: `graceful-failure`.
+ *   (4) GRACEFUL-FAILURE     — zero-length and header-truncated containers fed to demux from concrete
+ *       fixture files. The engine must reject/handle cleanly within the timeout. Oracle:
+ *       `graceful-failure`.
  *   (5) METAMORPHIC FLAC ±SEEKTABLE — `packets(flac_noseektable) == packets(flac_seektable)`: the
  *       packet enumeration must be identical with or without a SEEKTABLE metadata block. Implemented
  *       against `flac_noseektable`'s OWN independent golden (which the bake made equal to the seektable
@@ -377,28 +376,6 @@ const emptyAudioDemux: Scenario = defineScenario({
 
 // ── (4) GRACEFUL-FAILURE — zero-length / header-truncated demux must reject cleanly ──────────────
 
-/**
- * Drop the first `headerBytes` bytes so the container magic / box headers / EBML id are destroyed but
- * the media payload remains — the classic "looks like data, no parseable header" corruption a demuxer
- * must reject cleanly rather than mis-parsing into a corrupt packet table. Returns empty if the file
- * is shorter than the cut (degenerate → also unparseable).
- *
- * NOTE: attaching ANY `mutate` flips the runner onto its robustness/graceful execution path (it gates
- * on `family==='robustness' || typeof scenario.mutate === 'function'`), so these demux-family cases get
- * the graceful-failure inference (PASS on a clean throw/reject, FAIL on a crash/hang/timeout) WITHOUT
- * needing to live in the robustness family. The `graceful-failure` oracle would otherwise have no
- * runner signal for a plain functional demux case.
- */
-function truncateHeader(headerBytes: number): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => (bytes.length <= headerBytes ? new Uint8Array(0) : bytes.slice(headerBytes));
-}
-
-/** Identity passthrough — makes `scenario.mutate` truthy (→ robustness path) without altering an
- *  already-degenerate (zero-length) input. The engine must still reject the empty container cleanly. */
-function identityBytes(): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes;
-}
-
 const GRACEFUL_TIMEOUT_MS = 15_000;
 
 interface GracefulCase {
@@ -407,7 +384,6 @@ interface GracefulCase {
   container: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
-  mutate: (bytes: Uint8Array) => Uint8Array;
   gracefulAllowOutput?: boolean;
   notes: string;
 }
@@ -417,18 +393,15 @@ const GRACEFUL_CASES: GracefulCase[] = [
     id: 'graceful_zero_length',
     asset: 'zero_length.mp4',
     container: 'mp4',
-    mutate: identityBytes(),
     notes:
       'Zero-length container fed to demux: an empty file is not parseable, so demux must reject/handle ' +
-      'cleanly (throw/reject) within the timeout — never hang or crash. (mutate=identity routes it to the ' +
-      'graceful path.)',
+      'cleanly (throw/reject) within the timeout — never hang or crash.',
   },
   {
     asset: 'truncated_h264.mp4',
     id: 'graceful_truncated_h264',
     container: 'mp4',
     videoCodecs: ['h264'],
-    mutate: identityBytes(),
     gracefulAllowOutput: true,
     notes:
       'Header-truncated H.264 MP4 (the corpus truncated_h264.mp4 is already a partial/broken file): demux ' +
@@ -436,20 +409,18 @@ const GRACEFUL_CASES: GracefulCase[] = [
   },
   {
     id: 'graceful_mp4_header_destroyed',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'demux_mp4_header_destroyed.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
-    mutate: truncateHeader(256),
     notes:
       'Valid MP4 with its first 256 bytes (ftyp/moov head) dropped: demux must fail gracefully — the ' +
       'header is gone so no sane packet table can be produced.',
   },
   {
     id: 'graceful_webm_header_destroyed',
-    asset: 'vp9_1080p_10s.webm',
+    asset: 'demux_webm_header_destroyed.webm',
     container: 'webm',
     videoCodecs: ['vp9'],
-    mutate: truncateHeader(128),
     notes:
       'Valid WebM with its EBML header (first 128 bytes) destroyed: demux must reject cleanly, never ' +
       'loop on a mangled element size.',
@@ -470,7 +441,6 @@ const gracefulScenarios: Scenario[] = GRACEFUL_CASES.map((c) =>
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
     ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
-    mutate: c.mutate,
     timeoutMs: GRACEFUL_TIMEOUT_MS,
     notes: c.notes,
   }),

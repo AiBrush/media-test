@@ -222,6 +222,84 @@ const SINE = (freq, secs, rate = 48000, ch = 2) =>
 /** testsrc2 video lavfi source string. */
 const TESTSRC = (w, h, fps, secs) => `testsrc2=size=${w}x${h}:rate=${fps}:duration=${secs}`;
 
+// Deterministic malformed-fixture helpers. These intentionally produce real files on disk under
+// fixtures/media so robustness scenarios do not depend on in-memory mutation.
+function mutateFixture(sourceId, mutate) {
+  return (out) => {
+    const sourcePath = join(MEDIA_DIR, sourceId);
+    if (!existsSync(sourcePath)) {
+      return { skipped: true, reason: `source fixture '${sourceId}' is not present; bake it first.` };
+    }
+    const bytes = new Uint8Array(readFileSync(sourcePath));
+    writeFileSync(out, Buffer.from(mutate(bytes)));
+    return 'ok';
+  };
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function bitFlipFixture(count = 64, seed = 0x9e3779b9) {
+  return (bytes) => {
+    const out = bytes.slice();
+    if (out.length === 0) return out;
+    const rnd = mulberry32(seed);
+    for (let i = 0; i < count; i++) {
+      const pos = Math.floor(rnd() * out.length);
+      const bit = 1 << Math.floor(rnd() * 8);
+      out[pos] = (out[pos] ?? 0) ^ bit;
+    }
+    return out;
+  };
+}
+
+function truncateHeadFixture(headerBytes) {
+  return (bytes) => (bytes.length <= headerBytes ? new Uint8Array(0) : bytes.slice(headerBytes));
+}
+
+function truncateTailFixture(fraction) {
+  return (bytes) => bytes.slice(0, Math.max(0, Math.floor(bytes.length * fraction)));
+}
+
+function zeroAllFixture() {
+  return (bytes) => new Uint8Array(bytes.length);
+}
+
+function zeroRandomSpansFixture(spans = 4, spanLen = 1024, seed = 0x1234abcd, skipHead = 512) {
+  return (bytes) => {
+    const out = bytes.slice();
+    if (out.length <= skipHead) return out;
+    const rnd = mulberry32(seed);
+    const range = out.length - skipHead - spanLen;
+    if (range <= 0) return out;
+    for (let s = 0; s < spans; s++) {
+      const start = skipHead + Math.floor(rnd() * range);
+      out.fill(0, start, start + spanLen);
+    }
+    return out;
+  };
+}
+
+function truncateAtFixture(keep) {
+  return (bytes) => bytes.slice(0, Math.min(keep, bytes.length));
+}
+
+function corruptWavFmtFixture() {
+  return (bytes) => {
+    const out = bytes.slice();
+    out.fill(0, 16, Math.min(36, out.length));
+    return out;
+  };
+}
+
 /** @type {Record<string, (out: string) => ('ok' | { skipped: true, reason: string, extra?: any })>} */
 const RECIPES = {
   // ── Video MP4 / MOV ──────────────────────────────────────────────────────────────────────
@@ -356,6 +434,80 @@ const RECIPES = {
         out,
       ],
       'h264_1080p_5s.mov',
+    );
+    return 'ok';
+  },
+  'h264_10bit_1080p_5s.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 5),
+        '-f', 'lavfi', '-i', SINE(440, 5),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p10le', '-profile:v', 'high10', '-crf', '24',
+        '-g', '60', '-keyint_min', '60', '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'h264_10bit_1080p_5s.mp4',
+    );
+    return 'ok';
+  },
+  'h264_open_gop_1080p.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1920, 1080, 30, 5),
+        '-f', 'lavfi', '-i', SINE(440, 5),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22',
+        '-g', '60', '-keyint_min', '60', '-bf', '3',
+        '-x264-params', 'open-gop=1:b-adapt=2:scenecut=40',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'h264_open_gop_1080p.mp4',
+    );
+    return 'ok';
+  },
+  'h264_1fps_30s.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(320, 240, 1, 30),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '28',
+        '-g', '1', '-keyint_min', '1', '-x264-params', 'scenecut=0:bframes=0',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'h264_1fps_30s.mp4',
+    );
+    return 'ok';
+  },
+  'h264_video_only.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1280, 720, 30, 5),
+        ...BITEXACT, ...NOMETA,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '24',
+        '-g', '60', '-keyint_min', '60', '-x264-params', 'scenecut=0:bframes=0',
+        '-movflags', '+faststart',
+        out,
+      ],
+      'h264_video_only.mp4',
+    );
+    return 'ok';
+  },
+  'aac_audio_only.m4a': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', SINE(440, 10),
+        ...BITEXACT, ...NOMETA,
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart', '-f', 'mp4',
+        out,
+      ],
+      'aac_audio_only.m4a',
     );
     return 'ok';
   },
@@ -653,6 +805,35 @@ const RECIPES = {
     ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16be', '-ar', '48000', '-ac', '2', '-f', 'aiff', out], 'pcm_s16be.aiff');
     return 'ok';
   },
+  'wav_s16_44k1.wav': (out) => {
+    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 10, 44100), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2', '-f', 'wav', out], 'wav_s16_44k1.wav');
+    return 'ok';
+  },
+  'wav_s16_mono.wav': (out) => {
+    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 10, 48000, 1), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '1', '-f', 'wav', out], 'wav_s16_mono.wav');
+    return 'ok';
+  },
+  'wav_5_1.wav': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', SINE(440, 10, 48000, 1),
+        ...BITEXACT, ...NOMETA,
+        '-af', 'pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0',
+        '-c:a', 'pcm_s16le', '-ar', '48000', '-f', 'wav',
+        out,
+      ],
+      'wav_5_1.wav',
+    );
+    return 'ok';
+  },
+  'pcm_s24be.aiff': (out) => {
+    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s24be', '-ar', '48000', '-ac', '2', '-f', 'aiff', out], 'pcm_s24be.aiff');
+    return 'ok';
+  },
+  'pcm_s16.caf': (out) => {
+    ffmpeg(['-f', 'lavfi', '-i', SINE(440, 5), ...BITEXACT, ...NOMETA, '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2', '-f', 'caf', out], 'pcm_s16.caf');
+    return 'ok';
+  },
   'mp3_xing.mp3': (out) => {
     // VBR with Xing header (libmp3lame writes Xing/Info for VBR by default).
     ffmpeg(['-f', 'lavfi', '-i', SINE(440, 10, 44100), ...BITEXACT, ...NOMETA, '-c:a', 'libmp3lame', '-q:a', '2', '-ar', '44100', '-ac', '2', '-f', 'mp3', out], 'mp3_xing.mp3');
@@ -902,6 +1083,21 @@ const RECIPES = {
     );
     return 'ok';
   },
+  'longform_1h_audio_pcm.wav': (out) => {
+    if (flags.skipLongform) {
+      return { skipped: true, reason: '--skip-longform: 1h PCM WAV intentionally not generated this run.' };
+    }
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', SINE(440, 3600, 44100, 1),
+        ...BITEXACT, ...NOMETA,
+        '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '1', '-f', 'wav',
+        out,
+      ],
+      'longform_1h_audio_pcm.wav',
+    );
+    return 'ok';
+  },
   'zero_length.mp4': (out) => {
     // A genuine 0-byte file. No ffmpeg.
     writeFileSync(out, Buffer.alloc(0));
@@ -1148,6 +1344,39 @@ const RECIPES = {
       rmSafe(tmp);
     }
   },
+
+  // ── File-backed malformed/fuzz fixtures (§A.16) ─────────────────────────────────────────────
+  'demux_mp4_header_destroyed.mp4': mutateFixture('h264_1080p_30s.mp4', truncateHeadFixture(256)),
+  'demux_webm_header_destroyed.webm': mutateFixture('vp9_1080p_10s.webm', truncateHeadFixture(128)),
+  'remux_zeroed_mp4.mp4': mutateFixture('h264_1080p_30s.mp4', zeroAllFixture()),
+  'remux_truncated_h264_50p.mp4': mutateFixture('h264_1080p_30s.mp4', truncateTailFixture(0.5)),
+  'remux_headerless_webm.webm': mutateFixture('vp9_1080p_10s.webm', truncateHeadFixture(128)),
+  'transcode_truncated_h264_60p.mp4': mutateFixture('h264_1080p_30s.mp4', truncateTailFixture(0.6)),
+  'trim_truncated_h264_55p.mp4': mutateFixture('h264_1080p_30s.mp4', truncateTailFixture(0.55)),
+  'trim_bitflipped_h264.mp4': mutateFixture('h264_1080p_30s.mp4', bitFlipFixture(128, 0x7711)),
+  'cenc_ctr_senc_bitflip.mp4': mutateFixture('cenc_ctr.mp4', bitFlipFixture(96, 0x5e9c01)),
+  'cenc_ctr_protection_zeroed.mp4': mutateFixture('cenc_ctr.mp4', zeroRandomSpansFixture(4, 512, 0x5e9c02, 1024)),
+  'cenc_ctr_truncated_mdat.mp4': mutateFixture('cenc_ctr.mp4', truncateTailFixture(0.6)),
+  'metadata_garbled_id3_mp3.mp3': mutateFixture('mp3_xing.mp3', zeroRandomSpansFixture(1, 320, 0x1d3, 0)),
+  'metadata_garbled_ilst_mp4.mp4': mutateFixture('h264_1080p_30s.mp4', zeroRandomSpansFixture(1, 256, 0x1157, 0)),
+  'wav_header_truncated.wav': mutateFixture('wav_s16.wav', truncateAtFixture(20)),
+  'wav_fmt_corrupt.wav': mutateFixture('wav_s16.wav', corruptWavFmtFixture()),
+  'wav_bitflip.wav': mutateFixture('wav_s16.wav', bitFlipFixture(96, 0x5117a)),
+  'aiff_header_truncated.aiff': mutateFixture('pcm_s16be.aiff', truncateAtFixture(24)),
+  'fuzz_mp4_bitflip.mp4': mutateFixture('h264_1080p_30s.mp4', bitFlipFixture(128, 0x111)),
+  'fuzz_mp4_header_truncated.mp4': mutateFixture('h264_1080p_30s.mp4', truncateHeadFixture(256)),
+  'fuzz_mp4_tail_truncated.mp4': mutateFixture('h264_1080p_30s.mp4', truncateTailFixture(0.55)),
+  'fuzz_mp4_zeroed_spans.mp4': mutateFixture('h264_1080p_30s.mp4', zeroRandomSpansFixture(6, 2048, 0xabc, 1024)),
+  'fuzz_webm_bitflip.webm': mutateFixture('vp9_1080p_10s.webm', bitFlipFixture(96, 0x222)),
+  'fuzz_webm_header_truncated.webm': mutateFixture('vp9_1080p_10s.webm', truncateHeadFixture(128)),
+  'fuzz_ts_zeroed_spans.ts': mutateFixture('h264_ts.ts', zeroRandomSpansFixture(8, 188, 0xdef, 376)),
+  'fuzz_flac_bitflip.flac': mutateFixture('flac_seektable.flac', bitFlipFixture(48, 0x333)),
+  'fuzz_mp3_header_truncated.mp3': mutateFixture('mp3_xing.mp3', truncateHeadFixture(64)),
+  'fuzz_remux_zeroed_spans.mp4': mutateFixture('h264_1080p_30s.mp4', zeroRandomSpansFixture(5, 4096, 0x555, 2048)),
+  'fuzz_encrypted_mp4_ciphertext.mp4': mutateFixture('cenc_ctr.mp4', zeroRandomSpansFixture(6, 2048, 0xc0ffee, 2048)),
+  'fuzz_adts_aac_bitflip.aac': mutateFixture('aac_adts.aac', bitFlipFixture(64, 0x44a)),
+  'fuzz_ogg_opus_header_truncated.ogg': mutateFixture('opus.ogg', truncateHeadFixture(96)),
+  'fuzz_mux_target_corrupt_remux.mp4': mutateFixture('h264_1080p_30s.mp4', zeroRandomSpansFixture(5, 4096, 0x5e6, 2048)),
 };
 
 // ── Intentionally-broken robustness assets ───────────────────────────────────────────────────
@@ -1156,7 +1385,41 @@ const RECIPES = {
 // graceful-failure oracle. ffprobe failing to read them is the EXPECTED outcome, not a bake error,
 // so we skip golden (meta/packets/frames) derivation for them and record a clear "no golden
 // (intentionally broken)" note. They keep their checksum + size in the manifest.
-const EXPECT_GOLDEN_FAILURE = new Set(['zero_length.mp4', 'truncated_h264.mp4']);
+const EXPECT_GOLDEN_FAILURE = new Set([
+  'zero_length.mp4',
+  'truncated_h264.mp4',
+  'demux_mp4_header_destroyed.mp4',
+  'demux_webm_header_destroyed.webm',
+  'remux_zeroed_mp4.mp4',
+  'remux_truncated_h264_50p.mp4',
+  'remux_headerless_webm.webm',
+  'transcode_truncated_h264_60p.mp4',
+  'trim_truncated_h264_55p.mp4',
+  'trim_bitflipped_h264.mp4',
+  'cenc_ctr_senc_bitflip.mp4',
+  'cenc_ctr_protection_zeroed.mp4',
+  'cenc_ctr_truncated_mdat.mp4',
+  'metadata_garbled_id3_mp3.mp3',
+  'metadata_garbled_ilst_mp4.mp4',
+  'wav_header_truncated.wav',
+  'wav_fmt_corrupt.wav',
+  'wav_bitflip.wav',
+  'aiff_header_truncated.aiff',
+  'fuzz_mp4_bitflip.mp4',
+  'fuzz_mp4_header_truncated.mp4',
+  'fuzz_mp4_tail_truncated.mp4',
+  'fuzz_mp4_zeroed_spans.mp4',
+  'fuzz_webm_bitflip.webm',
+  'fuzz_webm_header_truncated.webm',
+  'fuzz_ts_zeroed_spans.ts',
+  'fuzz_flac_bitflip.flac',
+  'fuzz_mp3_header_truncated.mp3',
+  'fuzz_remux_zeroed_spans.mp4',
+  'fuzz_encrypted_mp4_ciphertext.mp4',
+  'fuzz_adts_aac_bitflip.aac',
+  'fuzz_ogg_opus_header_truncated.ogg',
+  'fuzz_mux_target_corrupt_remux.mp4',
+]);
 
 // ── Encryption secret + caveat side-channels (filled by recipes, consumed by golden bake) ────────
 
@@ -1284,6 +1547,7 @@ function canonicalCodec(name) {
     pcm_s24le: 'pcm-s24',
     pcm_f32le: 'pcm-f32',
     pcm_s16be: 'pcm-s16be',
+    pcm_s24be: 'pcm-s24be',
     mjpeg: 'mjpeg',
     png: 'png',
     webp: 'webp',

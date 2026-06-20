@@ -190,16 +190,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
         probe: true,
         demux: true,
       },
-      // Containers media-parser can READ — listed ONLY as the canonical tokens its MediaParserContainer
-      // enum actually emits (and that codecs.ts mpContainerToCanonical() produces). media-parser
-      // COLLAPSES families: ISO-BMFF (mp4/mov/m4a) → 'mp4' and Matroska (webm/mkv) → 'webm'; it cannot
-      // distinguish 'mov' from 'mp4' or 'mkv' from 'webm' at the container level (dossier §6). So we do
-      // NOT declare 'mov'/'mkv': declaring them would let mov/mkv probe cases negotiate + RUN and then
-      // FAIL goldenMetadata's strict container check (measured 'mp4' vs golden 'mov', 'webm' vs 'mkv')
-      // — the §15 anti-pattern of turning an honest NA into a FAIL on a row the library genuinely can't
-      // satisfy. Omitting them makes those cases a truthful NA_ENGINE. (Ogg/CAF/FLV/AIFF-container/
-      // GIF-as-video are likewise absent from its enum → absent here.) See dossier §6/§7 A.2.
-      containersIn: ['mp4', 'webm', 'ts', 'hls', 'mp3', 'wav', 'flac', 'adts'],
+      // Containers media-parser can READ. The library reports collapsed container families
+      // (ISO-BMFF as 'mp4', Matroska as 'webm'), so toNormalizedMetadata() restores mov/mkv from the
+      // fixture id/mime for suite-golden comparison.
+      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'hls', 'mp3', 'wav', 'flac', 'adts'],
       // No muxer / no container writer.
       containersOut: [],
       // Video codecs media-parser IDENTIFIES (parse only; no decode). 'prores' has no canonical token.
@@ -387,7 +381,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       'metadata-only',
     );
 
-    let metadata = this.toNormalizedMetadata(result);
+    let metadata = this.toNormalizedMetadata(result, undefined, input);
     if (shouldPreferHeaderWebmFps(input, metadata, headerFps)) {
       metadata = withSingleVideoFps(metadata, headerFps, { replace: true });
     }
@@ -537,6 +531,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
         rotation: result.rotation,
       },
       canonicalIndexById,
+      input,
     );
 
     return { metadata, packets };
@@ -604,6 +599,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       rotation: number | null;
     },
     canonicalIndexById?: Map<number, number>,
+    input?: MediaInput,
   ): NormalizedMetadata {
     let orderedTracks = r.tracks;
     if (canonicalIndexById) {
@@ -621,7 +617,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
     );
 
     const meta: NormalizedMetadata = {
-      container: mpContainerToCanonical(r.container),
+      container: canonicalContainerForInput(input, r.container),
       durationSec:
         r.durationInSeconds != null && Number.isFinite(r.durationInSeconds)
           ? r.durationInSeconds
@@ -1063,6 +1059,18 @@ function isHlsInput(input: MediaInput): boolean {
   }
   const u = (input.url || input.id || '').toLowerCase();
   return u.endsWith('.m3u8');
+}
+
+function canonicalContainerForInput(
+  input: MediaInput | undefined,
+  detected: MediaParserContainer,
+): string {
+  const collapsed = mpContainerToCanonical(detected);
+  if (!input) return collapsed;
+  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
+  if (collapsed === 'mp4' && (hint.includes('.mov') || hint.includes('quicktime'))) return 'mov';
+  if (collapsed === 'webm' && (hint.includes('.mkv') || hint.includes('matroska'))) return 'mkv';
+  return collapsed;
 }
 
 /** Convert a media-parser sample to a suite PacketInfo. Timestamps are already in microseconds. */

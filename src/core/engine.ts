@@ -157,6 +157,11 @@ export interface DecryptKey {
   ivHex?: string;
 }
 
+export interface RemuxOptions {
+  container: string;
+  tags?: Record<string, string>;
+}
+
 /**
  * The single interface every adapter implements. Optional methods (mux/decrypt) are declared via
  * capabilities(); the runner gates accordingly. init/dispose bracket expensive setup (WASM load,
@@ -179,7 +184,7 @@ export interface MediaEngine {
 
   probe(input: MediaInput): Promise<NormalizedMetadata>;
   demux(input: MediaInput): Promise<DemuxResult>;
-  remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes>;
+  remux(input: MediaInput, opts: RemuxOptions): Promise<MediaBytes>;
   transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes>;
   decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink>;
   seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }>;
@@ -215,6 +220,8 @@ export const CANONICAL_CONTAINERS = [
   'flac',
   'ogg',
   'adts',
+  'aiff',
+  'caf',
 ] as const;
 export type CanonicalContainer = (typeof CANONICAL_CONTAINERS)[number];
 
@@ -231,5 +238,6 @@ export const CANONICAL_AUDIO_CODECS = [
   'pcm-s24',
   'pcm-f32',
   'pcm-s16be',
+  'pcm-s24be',
 ] as const;
 export type CanonicalAudioCodec = (typeof CANONICAL_AUDIO_CODECS)[number];

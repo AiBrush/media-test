@@ -23,11 +23,10 @@
  *     Closing it needs (a) a tag-bearing corpus with semantic-key golden and (b) a SUBSET/semantic
  *     tag comparison in goldenMetadata (case/whitespace-normalized, ignoring container artifacts like
  *     major_brand/encoder).
- *   • TAG CONTENT (write→readback): the runner forwards only {container} to engine.remux and never
- *     re-probes the output, so options.tags never reaches an engine and no tag map is read back. A
- *     genuine `probe(writeTags(x,T)).tags ⊇ T` needs runner forwarding + re-probe + a tags-roundtrip
- *     oracle. We keep options.tags on every write case (future-proof + self-documenting) and gate the
- *     write with reference-reimport + property-invariant (valid container, media uncorrupted).
+ *   • TAG CONTENT (write→readback): the runner forwards options.tags to engine.remux, but no oracle
+ *     re-probes the output and compares a tag map. A genuine `probe(writeTags(x,T)).tags ⊇ T` needs a
+ *     tags-roundtrip oracle. We gate the write with reference-reimport + property-invariant (valid
+ *     container, media uncorrupted).
  *   • ROTATION VALUE: compareTrack never compares `track.rotation`, and there are no 180/270/-90
  *     rotated assets. We gate rotation by its OBSERVABLE DECODED EFFECT (decode read + survival), the
  *     only path expressible from a scenario file; a `rotation==90 ∧ width/height un-swapped` assertion

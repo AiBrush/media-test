@@ -6,7 +6,7 @@
  *      multi-track, headerless WebM, big-endian/24-bit PCM, cbcs boundaries, fastStart:reserve,
  *      fragmented/CMAF, multi-hour, zero-length). These should PASS (or honest-NA), proving the
  *      engine survives the hard inputs.
- *  (b) MALFORMED / FUZZ — take a VALID asset and corrupt its bytes via a `mutate` fn (bit-flip,
+ *  (b) MALFORMED / FUZZ — feed deterministic prebaked malformed fixture files (bit-flip,
  *      header truncation, random-span zeroing). The engine must FAIL GRACEFULLY (throw/reject)
  *      within `timeoutMs` — no crash/hang/OOM. Oracle: `graceful-failure`.
  *  (c) PROPERTY / METAMORPHIC — invariants computed in-browser: decode(remux(x))==decode(x),
@@ -15,84 +15,12 @@
  *  (d) IMAGE NEGATIVES — still images fed to a video/media op must produce a clean NA / graceful
  *      error, never a crash. Oracle: `graceful-failure`.
  *
- * The `mutate` helpers below are deterministic (seeded) so a fuzz failure is reproducible.
+ * The malformed fixtures are deterministic products of fixtures/bake.mjs, so a fuzz failure is
+ * reproducible without mutating bytes at runtime.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
-
-// ── Mutate helpers (deterministic; reproducible fuzz) ───────────────────────────────────────────
-
-/**
- * Tiny deterministic PRNG (mulberry32) so a mutate is reproducible from a fixed seed — a graceful-
- * failure regression can be replayed exactly rather than chasing a non-deterministic corruption.
- */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Flip `count` individual bits at pseudo-random byte/bit positions (seeded). Leaves length intact. */
-export function bitFlip(count = 64, seed = 0x9e3779b9): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    if (out.length === 0) return out;
-    const rnd = mulberry32(seed);
-    for (let i = 0; i < count; i++) {
-      const pos = Math.floor(rnd() * out.length);
-      const bit = 1 << Math.floor(rnd() * 8);
-      // noUncheckedIndexedAccess: read-with-default before the XOR write.
-      out[pos] = (out[pos] ?? 0) ^ bit;
-    }
-    return out;
-  };
-}
-
-/**
- * Truncate the header region: drop the first `headerBytes` bytes (default 256) so container magic /
- * box headers / EBML id are destroyed but the media payload remains — the classic "looks like data,
- * no parseable header" corruption a demuxer must reject cleanly.
- */
-export function truncateHeader(headerBytes = 256): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => (bytes.length <= headerBytes ? new Uint8Array(0) : bytes.slice(headerBytes));
-}
-
-/** Truncate the TAIL: keep only the first `fraction` of the file (default 60%) — simulates an
- *  interrupted download / partial upload where the moov or final cluster is missing. */
-export function truncateTail(fraction = 0.6): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes.slice(0, Math.max(0, Math.floor(bytes.length * fraction)));
-}
-
-/**
- * Zero out `spans` random byte runs (each `spanLen` bytes, default 4×1KB) in the payload region
- * (after the first `skipHead` bytes so the container header survives and parsing actually starts
- * before hitting the garbage). Models mid-stream corruption a decoder must survive or reject.
- */
-export function zeroRandomSpans(
-  spans = 4,
-  spanLen = 1024,
-  seed = 0x1234abcd,
-  skipHead = 512,
-): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => {
-    const out = bytes.slice();
-    if (out.length <= skipHead) return out;
-    const rnd = mulberry32(seed);
-    const range = out.length - skipHead - spanLen;
-    if (range <= 0) return out;
-    for (let s = 0; s < spans; s++) {
-      const start = skipHead + Math.floor(rnd() * range);
-      out.fill(0, start, start + spanLen);
-    }
-    return out;
-  };
-}
 
 const FUZZ_TIMEOUT_MS = 15_000;
 const TRANSCODE_PROPERTY_TIMEOUT_MS = 120_000;
@@ -296,7 +224,7 @@ const edgeScenarios: Scenario[] = EDGE_CASES.map((c) =>
 
 interface FuzzCase {
   id: string;
-  /** valid base asset to corrupt */
+  /** malformed fixture asset */
   asset: string;
   op: 'probe' | 'demux' | 'decodeFrames' | 'remux';
   containersIn: string[];
@@ -306,27 +234,24 @@ interface FuzzCase {
   encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
   options?: Record<string, unknown>;
   timeoutMs?: number;
-  mutate: (bytes: Uint8Array) => Uint8Array;
   notes?: string;
 }
 
 const FUZZ_CASES: FuzzCase[] = [
   {
     id: 'fuzz_mp4_bitflip_probe',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_mp4_bitflip.mp4',
     op: 'probe',
     containersIn: ['mp4'],
     options: { gracefulAllowOutput: true },
-    mutate: bitFlip(128, 0x111),
     notes: '128 random bit-flips across an MP4; probe must reject or report degraded, never fault.',
   },
   {
     id: 'fuzz_mp4_header_truncated_demux',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_mp4_header_truncated.mp4',
     op: 'demux',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
-    mutate: truncateHeader(256),
     // NOTE WORDING (§0.1): the graceful-failure oracle treats the words graceful/threw/rejected/
     // rejection/errored/handled in a scenario's own notes as a PASS signal BEFORE checking output
     // presence — so prose alone could pass an engine that still returns output for malformed input.
@@ -336,83 +261,75 @@ const FUZZ_CASES: FuzzCase[] = [
   },
   {
     id: 'fuzz_mp4_tail_truncated_demux',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_mp4_tail_truncated.mp4',
     op: 'demux',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     options: { gracefulAllowOutput: true },
-    mutate: truncateTail(0.55),
     notes: 'File cut at 55% (interrupted download): demux either yields partial+EOF or rejects cleanly.',
   },
   {
     id: 'fuzz_mp4_zeroed_spans_decode',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_mp4_zeroed_spans.mp4',
     op: 'decodeFrames',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     options: { maxFrames: 60, gracefulAllowOutput: true },
     timeoutMs: 60_000,
-    mutate: zeroRandomSpans(6, 2048, 0xabc, 1024),
     notes: 'Six 2KB zeroed payload spans: decoder must error or conceal, bounded in time and memory.',
   },
   {
     id: 'fuzz_webm_bitflip_probe',
-    asset: 'vp9_1080p_10s.webm',
+    asset: 'fuzz_webm_bitflip.webm',
     op: 'probe',
     containersIn: ['webm'],
     options: { gracefulAllowOutput: true },
-    mutate: bitFlip(96, 0x222),
     notes: 'EBML/Matroska bit-flips; probe must reject or report degraded, never fault on a mangled element size.',
   },
   {
     id: 'fuzz_webm_header_truncated_demux',
-    asset: 'vp9_1080p_10s.webm',
+    asset: 'fuzz_webm_header_truncated.webm',
     op: 'demux',
     containersIn: ['webm'],
     videoCodecs: ['vp9'],
-    mutate: truncateHeader(128),
     notes: 'EBML header destroyed; demux must reject cleanly.',
   },
   {
     id: 'fuzz_ts_zeroed_spans_demux',
-    asset: 'h264_ts.ts',
+    asset: 'fuzz_ts_zeroed_spans.ts',
     op: 'demux',
     containersIn: ['ts'],
     videoCodecs: ['h264'],
     options: { gracefulAllowOutput: true },
-    mutate: zeroRandomSpans(8, 188, 0xdef, 376),
     notes: 'Zero whole 188-byte TS packets: sync-byte loss; demux must resync or reject, never fault.',
   },
   {
     id: 'fuzz_flac_bitflip_probe',
-    asset: 'flac_seektable.flac',
+    asset: 'fuzz_flac_bitflip.flac',
     op: 'probe',
     containersIn: ['flac'],
     audioCodecs: ['flac'],
     options: { gracefulAllowOutput: true },
-    mutate: bitFlip(48, 0x333),
     notes: 'FLAC metadata-block bit-flips (bad block sizes); probe must not loop forever.',
   },
   {
     id: 'fuzz_mp3_header_truncated_probe',
-    asset: 'mp3_xing.mp3',
+    asset: 'fuzz_mp3_header_truncated.mp3',
     op: 'probe',
     containersIn: ['mp3'],
     audioCodecs: ['mp3'],
     options: { gracefulAllowOutput: true },
-    mutate: truncateHeader(64),
     notes: 'Drop ID3/Xing head; probe falls back to a bounded frame scan or rejects — never loops.',
   },
   {
     id: 'fuzz_remux_zeroed_spans',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_remux_zeroed_spans.mp4',
     op: 'remux',
     containersIn: ['mp4'],
     containersOut: ['mkv'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mkv', gracefulAllowOutput: true },
-    mutate: zeroRandomSpans(5, 4096, 0x555, 2048),
     notes: 'Corrupt samples then remux: engine must reject or emit a clean partial, bounded in memory.',
   },
 ];
@@ -433,7 +350,6 @@ const fuzzScenarios: Scenario[] = FUZZ_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     timeoutMs: c.timeoutMs ?? FUZZ_TIMEOUT_MS,
     ...(c.notes ? { notes: c.notes } : {}),
   }),
@@ -591,65 +507,11 @@ const imageNegativeScenarios: Scenario[] = IMAGE_NEGATIVE_CASES.map((c) =>
   }),
 );
 
-// ── Canonical ids for fixtures this family needs but the bake does not yet produce (§5.4) ─────────
-//
-// Same honest-asset-missing protocol the decode-seek family uses (see MISSING_DECODE_ASSETS): we
-// STILL register the case against the canonical asset id the bake must emit (recorded here + flagged
-// in each case's notes), so the moment the asset is baked the case activates and golden lines up.
-// Until then the runner records a distinct asset-missing failure (fetch of /fixtures/media/<id>
-// 404s) — never a fabricated value, never a silent skip. These ids are NOT in fixtures/manifest.json
-// yet; adding them there (and baking the bytes + golden) is the bake's job, not this writer's. This
-// is the OPPOSITE of the wav_s16be.wav bug fixed above: that was a typo'd id that will NEVER exist
-// and silently mis-tested WAV; these are real, intended corpus rungs the bake is expected to add.
-export const MISSING_ROBUSTNESS_ASSETS: ReadonlyArray<{ id: string; why: string }> = [
-  {
-    id: 'micro_h264_1x1_1s.mp4',
-    why: '§A.16 1×1 video: probe + 1-frame decode of a minimum-dimension (1×1) clip must not divide-by-zero in SSIM/luma. The corpus has micro_h264_1frame.mp4 (320×240) but no 1×1 micro asset.',
-  },
-  {
-    id: 'micro_h264_0x0_1s.mp4',
-    why: '§A.16 0×0 video: zero-dimension probe/decode → must be handled or rejected, not a crash/NaN. No 0×0 asset is baked.',
-  },
-  {
-    id: 'h264_1fps_30s.mp4',
-    why: "§A.16 extreme fps (1 fps): duration/fps reporting + frame pacing at a very low rate. (Shared canonical id with decode-seek's MISSING_DECODE_ASSETS — one bake satisfies both families.)",
-  },
-  {
-    id: 'h264_240fps_5s.mp4',
-    why: '§A.16 extreme fps (240 fps): duration/fps reporting + dense-timestamp pacing. Shared canonical id with decode-seek.',
-  },
-  {
-    id: 'h264_video_only.mp4',
-    why: '§A.16 video-only: an MP4 with a video track and NO audio track — track enumeration must not assume/require an audio track. (micro_h264_1frame.mp4 is also video-only but is a single-frame micro clip; this is a normal-length video-only MP4.)',
-  },
-  {
-    id: 'aac_audio_only.m4a',
-    why: '§A.16 audio-only: an MP4/M4A with an audio track and NO video track — probe/track enumeration must not assume a video track. (micro_audio_short.m4a covers the micro case; this is a normal-length audio-only file.)',
-  },
-  {
-    id: 'h264_es_mislabeled.webm',
-    why: "§A.16 mismatched container/codec: a raw H.264 elementary stream whose extension/MIME says .webm — the engine must detect the real format by CONTENT or reject, not trust the label. No mislabeled asset exists; bytes whose container disagrees with the extension cannot be produced by a byte-mutate of a valid asset without inventing the asset.",
-  },
-  {
-    id: 'h264_ts_pts_wrap.ts',
-    why: '§A.16 timestamp wraparound/discontinuity: an MPEG-TS clip with a 33-bit PTS/PCR wrap AND a discontinuity flag. Only the CLEAN h264_ts.ts exists today; a wrap/discontinuity must be authored into the stream (not a mutate).',
-  },
-  {
-    id: 'aac_gapless_priming.m4a',
-    why: '§A.16 gapless audio: an AAC stream carrying encoder delay (priming) + padding (iTunSMPB/edit list) so the decoded/trimmed sample count is correct only if priming is removed. No gapless-tagged asset exists.',
-  },
-  {
-    id: 'wav_varchannels.wav',
-    why: '§A.16 variable channel count: a stream whose channel layout changes mid-file — probe/decode must survive the transition. No variable-layout asset exists (and a single WAV header cannot express it; the bake must concatenate differing-layout segments in a container that allows it).',
-  },
-];
-
 // ── (e) SEEK EDGES (§A.16 seek-past-EOF / negative seek) ──────────────────────────────────────────
 //
 // EdgeCase.op already permits 'seek' but no edge case used it. These feed an out-of-range tUs to the
-// engine's seek() on the workhorse clip. The runner's robustness path (it returns → 'graceful', it
-// throws → 'graceful', it overruns → 'timeout'→FAIL) plus the graceful-failure oracle gives the
-// correct verdict for the spec's "clamp to last/first frame OR fail cleanly, never crash/hang/OOM":
+// engine's seek() on the workhorse clip. The runner's robustness path plus the graceful-failure
+// oracle gives the correct verdict for the spec's "clamp to last/first frame OR fail cleanly":
 //   - a clean CLAMP-return populates ctx.seek (NOT ctx.output/metadata/demux/frames), and the
 //     graceful-failure output-absence inference treats that as a pass (clamped without faulting);
 //   - a clean THROW also passes (op produced nothing);
@@ -709,14 +571,6 @@ const seekEdgeScenarios: Scenario[] = SEEK_EDGE_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
-    // IDENTITY mutate (bytes unchanged): this is REQUIRED to route the case through the runner's
-    // robustness path (runRobustness triggers on isRobustness && scenario.mutate). On that path BOTH a
-    // clean clamp-RETURN (ctx.seek set; graceful-failure infers pass from the absence of
-    // output/metadata/demux/frames) AND a clean THROW map to 'graceful'. WITHOUT a mutate the case
-    // would take the normal functional path where a clean throw becomes ERROR (not the desired pass)
-    // and graceful-failure has no robustness signal. The asset (h264_1080p_30s.mp4) is always present,
-    // so the identity mutate cannot mask a 404 (only present-asset cases use this trick).
-    mutate: (b) => b,
     timeoutMs: FUZZ_TIMEOUT_MS,
     notes: c.notes,
   }),
@@ -725,9 +579,8 @@ const seekEdgeScenarios: Scenario[] = SEEK_EDGE_CASES.map((c) =>
 // ── (f) STRUCTURE / SHAPE EDGES (§A.16) ───────────────────────────────────────────────────────────
 //
 // Probe/decode edges on UNUSUAL-but-valid stream SHAPES: audio-only, video-only, no-media,
-// degenerate dimensions, extreme fps, mislabeled container, TS wrap/discontinuity, gapless priming,
-// variable channel count. Each uses a real manifest asset where one already has the shape, otherwise
-// a canonical MISSING_ROBUSTNESS_ASSETS id (honest asset-missing until baked).
+// degenerate dimensions, extreme fps, mislabeled container, TS discontinuity, gapless priming,
+// and non-stereo channel layout. Each uses a concrete manifest asset under fixtures/media.
 //
 // Oracle choice is per-shape and HONEST:
 //   - golden-metadata where a correct, stable answer exists and golden can be baked (track
@@ -737,15 +590,8 @@ const seekEdgeScenarios: Scenario[] = SEEK_EDGE_CASES.map((c) =>
 //   - graceful-failure for the degenerate (0×0) and mislabeled cases where the only spec requirement
 //     is "do not fault; detect-by-content or reject" (no single correct metadata to assert).
 //
-// ROUTING NOTE for the graceful-failure shape edges (all asset-missing today): they carry NO mutate,
-// so they take the runner's NORMAL functional path. While the asset is unbaked the corpus fetch 404s
-// and the case surfaces as a distinct asset-missing ERROR naming the id (the decode-seek honest-NA
-// convention) — never a fabricated pass. (We deliberately do NOT add an identity mutate to route them
-// through runRobustness: an identity mutate would turn the 404 into a false graceful PASS, masking the
-// missing asset. The present-asset seek edges above CAN use the identity-mutate trick precisely
-// because their asset always exists. Once these assets are baked, a clean engine throw arrives as
-// ERROR rather than a graceful PASS on the normal path — a conservative misclassification, never
-// gameable; tightening it is a runner concern, not a scenario one.)
+// ROUTING NOTE: scenarios that use the graceful-failure oracle enter the runner's robustness path
+// directly; they no longer need an identity mutate just to be classified correctly.
 interface ShapeEdgeCase {
   id: string;
   op: 'probe' | 'decodeFrames';
@@ -755,8 +601,6 @@ interface ShapeEdgeCase {
   audioCodecs?: string[];
   options?: Record<string, unknown>;
   oracles: Scenario['oracles'];
-  /** true when the asset is a MISSING_ROBUSTNESS_ASSETS id (documented asset-missing until baked) */
-  assetMissing?: boolean;
   notes: string;
 }
 
@@ -780,11 +624,9 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     containersIn: ['mp4'],
     audioCodecs: ['aac'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 audio-only (normal length): MP4/M4A with an audio track and no video track. Fixture NOT ' +
-      'yet baked (§5.4) → distinct asset-missing failure until present, then golden-metadata gates ' +
-      'track enumeration. Complements the micro audio-only case above.',
+      '§A.16 audio-only (normal length): MP4/M4A with an audio track and no video track. Golden-metadata ' +
+      'gates track enumeration. Complements the micro audio-only case above.',
   },
   {
     id: 'edge_video_only_micro_probe',
@@ -804,10 +646,8 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 video-only (normal length): MP4 with a video track and no audio track. Fixture NOT yet ' +
-      'baked (§5.4) → asset-missing until present, then golden-metadata gates track enumeration.',
+      '§A.16 video-only (normal length): MP4 with a video track and no audio track. Golden-metadata gates track enumeration.',
   },
   {
     id: 'edge_no_media_tracks_probe',
@@ -821,45 +661,39 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
       'on the empty payload. Distinct from zero_length.mp4 (true 0 bytes → graceful-failure).',
   },
 
-  // degenerate dimensions — guard SSIM/luma divide-by-zero, zero-dim handling.
+  // degenerate dimensions — guard SSIM/luma divide-by-zero on the smallest valid media shapes.
   {
     id: 'edge_dims_1x1_probe',
     op: 'probe',
-    asset: 'micro_h264_1x1_1s.mp4',
-    containersIn: ['mp4'],
-    videoCodecs: ['h264'],
+    asset: 'video_1x1.webm',
+    containersIn: ['webm'],
+    videoCodecs: ['vp9'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 1×1 video: probe a minimum-dimension (1×1) clip; width/height must report 1×1 (golden). ' +
-      'Fixture NOT yet baked (§5.4) → asset-missing until present. Pairs with the decode-side 1×1 case.',
+      '§A.16 1×1 video: probe a minimum-dimension VP9/WebM clip; width/height must report 1×1 (golden).',
   },
   {
     id: 'edge_dims_1x1_decode',
     op: 'decodeFrames',
-    asset: 'micro_h264_1x1_1s.mp4',
-    containersIn: ['mp4'],
-    videoCodecs: ['h264'],
+    asset: 'video_1x1.webm',
+    containersIn: ['webm'],
+    videoCodecs: ['vp9'],
     options: { maxFrames: 1 },
     oracles: ['decoded-frames-bitexact'],
-    assetMissing: true,
     notes:
       '§A.16 1×1 decode: decode one 1×1 frame — exercises the SSIM/luma divide-by-zero guard in the ' +
-      'oracle pixel math on a degenerate dimension. Fixture NOT yet baked (§5.4) → asset-missing until present.',
+      'oracle pixel math on a degenerate dimension.',
   },
   {
-    id: 'edge_dims_0x0_probe',
+    id: 'edge_dims_2x2_h264_probe',
     op: 'probe',
-    asset: 'micro_h264_0x0_1s.mp4',
+    asset: 'video_2x2_h264.mp4',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
-    // 0×0 has no single correct metadata across engines; require only that the engine does not fault.
-    oracles: ['graceful-failure'],
-    assetMissing: true,
+    oracles: ['golden-metadata'],
     notes:
-      '§A.16 0×0 video: probe a zero-dimension clip. No single correct dimension answer exists across ' +
-      'engines, so the only requirement is no fault / no NaN-divide — verdict by output-absence, not ' +
-      'notes. Fixture NOT yet baked (§5.4) → asset-missing until present.',
+      '§A.16 minimum-dimension H.264: 2×2 is the smallest honest yuv420p H.264 fixture because ' +
+      'libx264 cannot encode 1×1/0×0 yuv420p as valid media.',
   },
 
   // extreme fps — duration/fps reporting + pacing under extremes.
@@ -870,54 +704,44 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 extreme fps (1 fps): probe must report ~1 fps and ~30s duration (golden). Fixture NOT ' +
-      'yet baked (§5.4) → asset-missing until present. Shared canonical id with decode-seek.',
+      '§A.16 extreme fps (1 fps): probe must report ~1 fps and ~30s duration (golden).',
   },
   {
     id: 'edge_extreme_fps_240_probe',
     op: 'probe',
-    asset: 'h264_240fps_5s.mp4',
+    asset: 'video_240fps.mp4',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 extreme fps (240 fps): probe must report ~240 fps and ~5s duration under dense timestamps ' +
-      '(golden). Fixture NOT yet baked (§5.4) → asset-missing until present. Shared canonical id with decode-seek.',
+      '§A.16 extreme fps (240 fps): probe must report ~240 fps under dense timestamps (golden).',
   },
 
   // mislabeled container/codec — detect-by-content or reject; never trust the label.
   {
     id: 'edge_mislabeled_container_probe',
     op: 'probe',
-    asset: 'h264_es_mislabeled.webm',
+    asset: 'mislabeled_h264.webm',
     containersIn: ['webm'],
     oracles: ['graceful-failure'],
-    assetMissing: true,
     notes:
-      '§A.16 mismatched container/codec: bytes are a raw H.264 elementary stream but the extension/MIME ' +
-      'claims .webm. The engine must detect the real format by content or reject — it must not blindly ' +
-      'trust the label and emit a bogus WebM probe. Verdict by output-absence (no valid WebM produced), ' +
-      'not notes. Fixture NOT yet baked (§5.4) → asset-missing until present.',
+      '§A.16 mismatched container/codec: bytes are MP4/H.264 but the extension/MIME claims .webm. ' +
+      'The engine must detect the real format by content or reject, never blindly trust the label.',
   },
 
   // MPEG-TS timestamp wraparound + discontinuity — demux/probe must unwrap or handle.
   {
     id: 'edge_ts_pts_wraparound_demux',
     op: 'probe',
-    asset: 'h264_ts_pts_wrap.ts',
+    asset: 'ts_discontinuity.ts',
     containersIn: ['ts'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
-      '§A.16 TS PTS/PCR wraparound + discontinuity: a 33-bit timestamp wrap and a discontinuity flag in ' +
-      'MPEG-TS. Probe duration must be derived with the wrap UNWRAPPED (golden encodes the true ' +
-      'duration; ts uses the estimate-only loose band). Only the clean h264_ts.ts is used today; this ' +
-      'wrap asset is NOT yet baked (§5.4) → asset-missing until present.',
+      '§A.16 MPEG-TS discontinuity: a joined TS stream with a timestamp jump. Probe duration must be ' +
+      'derived safely without negative-duration or hang behavior.',
   },
 
   // gapless audio (encoder delay/padding) — reported duration must reflect priming/padding handling.
@@ -929,32 +753,26 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
   {
     id: 'edge_gapless_priming_probe',
     op: 'probe',
-    asset: 'aac_gapless_priming.m4a',
+    asset: 'gapless_aac.m4a',
     containersIn: ['mp4'],
     audioCodecs: ['aac'],
     oracles: ['golden-metadata'],
-    assetMissing: true,
     notes:
       '§A.16 gapless audio: AAC with encoder delay (priming) + padding (iTunSMPB / edit list). A ' +
-      'priming-aware demuxer reports the trimmed gapless duration; golden encodes it. Fixture NOT yet ' +
-      'baked (§5.4) → asset-missing until present. The exact priming-removed decoded-sample-count check ' +
+      'priming-aware demuxer reports the trimmed gapless duration; golden encodes it. The exact priming-removed decoded-sample-count check ' +
       'is the honest-FAIL property-invariant prop_gapless_sample_count_priming below (no audio-sample oracle yet).',
   },
 
-  // variable channel count — probe/decode must survive a mid-stream layout change.
+  // non-stereo channel count — probe/decode must survive a non-default layout.
   {
-    id: 'edge_variable_channels_probe',
+    id: 'edge_5_1_channels_probe',
     op: 'probe',
-    asset: 'wav_varchannels.wav',
+    asset: 'wav_5_1.wav',
     containersIn: ['wav'],
     audioCodecs: ['pcm-s16'],
-    oracles: ['graceful-failure'],
-    assetMissing: true,
+    oracles: ['golden-metadata'],
     notes:
-      '§A.16 variable channel count: a stream whose channel layout varies mid-file. Probe/track ' +
-      'enumeration must not fault at the layout shift (no single stable channel count to assert across ' +
-      'engines, so the gate is no-fault, by output-absence not notes). Fixture NOT yet baked (§5.4) → ' +
-      'asset-missing until present.',
+      '§A.16 non-stereo channel count: a 5.1 PCM WAV must report channel layout without assuming stereo.',
   },
 ];
 
@@ -981,21 +799,17 @@ const shapeEdgeScenarios: Scenario[] = SHAPE_EDGE_CASES.map((c) =>
 //
 // Fuzz cases that fill the documented corpus holes: encrypted MP4 ciphertext corruption, ADTS/AAC,
 // OGG/Opus, the dedicated header-truncated asset, and a mux-target (corrupt-then-remux) path. All use
-// the graceful-failure oracle; the runner mutate path drives the verdict from output-absence. Wording
-// avoids the good-token set (§0.1).
+// the graceful-failure oracle; the runner drives the verdict from output-absence. Wording avoids the
+// good-token set (§0.1).
 const EXTRA_FUZZ_CASES: FuzzCase[] = [
   {
     id: 'fuzz_encrypted_mp4_ciphertext_decode',
-    asset: 'cenc_ctr.mp4',
+    asset: 'fuzz_encrypted_mp4_ciphertext.mp4',
     op: 'decodeFrames',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     encryption: ['cenc-ctr'],
     options: { maxFrames: 30 },
-    // Corrupt the ENCRYPTED payload region (skip the moof/header head). A decode that ignores the
-    // corruption and emits garbage frames could spuriously pass a downstream check — so the engine
-    // must error rather than emit frames from mangled ciphertext.
-    mutate: zeroRandomSpans(6, 2048, 0xc0ffee, 2048),
     notes:
       '§A.16 encrypted-MP4 fuzz: zero spans of the CENC (AES-CTR) ciphertext. The decrypt/decode path ' +
       'must error on the mangled ciphertext, not emit garbage frames that a downstream check could ' +
@@ -1003,25 +817,21 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
   },
   {
     id: 'fuzz_adts_aac_bitflip_probe',
-    asset: 'aac_adts.aac',
+    asset: 'fuzz_adts_aac_bitflip.aac',
     op: 'probe',
     containersIn: ['adts'],
     audioCodecs: ['aac'],
     options: { gracefulAllowOutput: true },
-    // ADTS is a bare frame stream: bit-flips corrupt frame headers (bad syncword/length).
-    mutate: bitFlip(64, 0x44a),
     notes:
       '§A.16 ADTS/AAC fuzz: bit-flips across a raw ADTS stream corrupt frame-header syncwords/lengths. ' +
       'Probe (header frame-scan) must not loop on a bad frame length and must reject or report degraded.',
   },
   {
     id: 'fuzz_ogg_opus_header_truncated_probe',
-    asset: 'opus.ogg',
+    asset: 'fuzz_ogg_opus_header_truncated.ogg',
     op: 'probe',
     containersIn: ['ogg'],
     audioCodecs: ['opus'],
-    // Drop the OGG capture pattern / OpusHead so the bitstream identity is destroyed.
-    mutate: truncateHeader(96),
     notes:
       '§A.16 OGG/Opus fuzz: drop the OGG capture-pattern + OpusHead head; probe must reject a stream ' +
       'with no identifiable bitstream rather than loop scanning for a page.',
@@ -1032,10 +842,8 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
     op: 'demux',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
-    // The corpus ships truncated_h264.mp4 (incomplete moov/mdat) specifically for this edge — feed it
-    // UNMUTATED (it is already malformed). No mutate: the asset itself is the malformed input.
+    // The corpus ships truncated_h264.mp4 (incomplete moov/mdat) specifically for this edge.
     options: { gracefulAllowOutput: true },
-    mutate: (b) => b,
     notes:
       '§A.16 dedicated header-truncated asset: the corpus truncated_h264.mp4 (incomplete moov/mdat, ' +
       'shipped for exactly this) fed to demux. Engine must yield a clean partial+EOF or reject, not ' +
@@ -1043,16 +851,13 @@ const EXTRA_FUZZ_CASES: FuzzCase[] = [
   },
   {
     id: 'fuzz_mux_target_corrupt_remux',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fuzz_mux_target_corrupt_remux.mp4',
     op: 'remux',
     containersIn: ['mp4'],
     containersOut: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mp4', fragmented: true, gracefulAllowOutput: true },
-    // Corrupt samples then remux to a FRAGMENTED MP4 (the mux/segment target path). The muxer must
-    // reject the corrupt samples or emit a clean partial, never balloon memory assembling segments.
-    mutate: zeroRandomSpans(5, 4096, 0x5e6, 2048),
     notes:
       '§A.16 mux-target fuzz: corrupt samples then remux into a FRAGMENTED MP4 (the segment/mux output ' +
       'path, distinct from the existing MKV-target remux fuzz). The muxer must reject or emit a clean ' +
@@ -1076,7 +881,6 @@ const extraFuzzScenarios: Scenario[] = EXTRA_FUZZ_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     timeoutMs: FUZZ_TIMEOUT_MS,
     notes: c.notes,
   }),
@@ -1261,7 +1065,7 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
   {
     id: 'prop_gapless_sample_count_priming',
     op: 'trim',
-    input: 'aac_gapless_priming.m4a',
+    input: 'gapless_aac.m4a',
     containersIn: ['mp4'],
     containersOut: ['mp4'],
     audioCodecs: ['aac'],
@@ -1280,7 +1084,7 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
       'priming(encoder-delay)+padding-removed total (AAC priming stripped), not raw frameCount×1024. ' +
       'No audio-SAMPLE oracle exists (decoded-frames-bitexact is RGBA-video-only) → honest FAIL ' +
       '("unknown property-invariant") until an audio-sample oracle is added (dossier oracleGaps); never ' +
-      'a fabricated pass. Fixture aac_gapless_priming.m4a also NOT yet baked (§5.4).',
+      'a fabricated pass.',
   },
   {
     id: 'prop_trim_additivity_compose',

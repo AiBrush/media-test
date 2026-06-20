@@ -30,14 +30,15 @@
  *     (engine.ts:174 / runner.ts:956); mirrors platform/mediabunny/mp4box.
  *   • capabilities() declares mux:true and mux() is implemented via the dossier `-c copy` file path
  *     (§4 line 108, §10 A.3/A.7) — was a false-NA + throwing stub. av1 mux stays NA via the codec gate.
- *   • 'hls' is filtered from containersIn (a single .m3u8 in MEMFS can't reach sibling segments —
- *     declaring it turns a clean NA into a runtime ERROR), mirroring the existing containersOut filter.
+ *   • HLS input playlists are declared only after we materialize sibling segments/keys into MEMFS.
+ *     FFmpeg's hls/applehttp demuxer can read the playlist, but only if the relative URIs it opens are
+ *     also present in the virtual filesystem.
  *     refs: §6 (container coverage), FAQ; https://ffmpegwasm.netlify.app/docs/overview/
  *   • runInfo()/demux() read execs now pass exec(args, timeoutMs) so fuzzed/truncated inputs can't
  *     wedge the worker (§9 item 10, §11; https://ffmpegwasm.netlify.app/docs/getting-started/usage/ ,
  *     https://github.com/ffmpegwasm/ffmpeg.wasm/discussions/699 ).
- *   • 'metadata:write' is gated OFF (over-claim: the runner drops options.tags before remux) but
- *     remux() still honors tags so it can be re-enabled once the runner forwards them.
+ *   • 'metadata:write' is declared because runner remux options forward tags and remux() writes them
+ *     as stream-copy metadata (`-metadata key=value`).
  *   • av1 stays OUT of videoCodecs (decode-only can't be expressed in the flat round-trip list while
  *     'webcodecs:independent' short-circuits negotiate Pass-2; adding it would over-claim av1 ENCODE).
  *
@@ -139,9 +140,47 @@ export interface FfmpegWasmConfig {
 
 /** Documented-build fallback used ONLY if the runtime probe parses to an empty set (defensive). */
 const FALLBACK_VIDEO = ['h264', 'hevc', 'vp8', 'vp9'];
-const FALLBACK_AUDIO = ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'];
-const FALLBACK_CONTAINERS_IN = ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'];
-const FALLBACK_CONTAINERS_OUT = ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'];
+const FALLBACK_AUDIO = [
+  'aac',
+  'opus',
+  'mp3',
+  'flac',
+  'vorbis',
+  'pcm-s16',
+  'pcm-s24',
+  'pcm-f32',
+  'pcm-s16be',
+  'pcm-s24be',
+];
+const FALLBACK_CONTAINERS_IN = [
+  'mp4',
+  'mov',
+  'mkv',
+  'webm',
+  'ts',
+  'hls',
+  'wav',
+  'mp3',
+  'flac',
+  'ogg',
+  'adts',
+  'aiff',
+  'caf',
+];
+const FALLBACK_CONTAINERS_OUT = [
+  'mp4',
+  'mov',
+  'mkv',
+  'webm',
+  'ts',
+  'wav',
+  'mp3',
+  'flac',
+  'ogg',
+  'adts',
+  'aiff',
+  'caf',
+];
 
 function rawRgbaColorFilter(width: number, height: number): string {
   const matrix = width >= 1280 || height >= 720 ? 'bt709' : 'bt601';
@@ -736,6 +775,71 @@ function assertRemuxContainerCompatible(tracks: NormalizedTrack[], container: st
   }
 }
 
+interface WrittenInput {
+  name: string;
+  cleanupPaths: string[];
+  inputOptions: string[];
+}
+
+function isHlsPlaylistInput(input: MediaInput, bytes?: Uint8Array): boolean {
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  if (name.endsWith('.m3u8')) return true;
+  if (input.mime.toLowerCase().includes('mpegurl')) return true;
+  if (!bytes || bytes.length < 7) return false;
+  return new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 32))).startsWith('#EXTM3U');
+}
+
+function rewriteHlsPlaylistUris(
+  playlist: string,
+  localBase: string,
+): { playlist: string; sidecars: Array<{ sourceUri: string; localName: string }> } {
+  const sidecars: Array<{ sourceUri: string; localName: string }> = [];
+  const seen = new Map<string, string>();
+  const localFor = (sourceUri: string): string => {
+    const existing = seen.get(sourceUri);
+    if (existing) return existing;
+    const localName = `${localBase}.hls${sidecars.length}${hlsUriExtension(sourceUri)}`;
+    seen.set(sourceUri, localName);
+    sidecars.push({ sourceUri, localName });
+    return localName;
+  };
+
+  const lines = playlist.split(/\r?\n/).map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+    if (trimmed.startsWith('#')) {
+      return line.replace(/\bURI=(?:"([^"]+)"|([^,]+))/g, (match, quoted: string | undefined, bare: string | undefined) => {
+        const sourceUri = quoted ?? bare?.trim();
+        if (!sourceUri) return match;
+        const localName = localFor(sourceUri);
+        return quoted !== undefined ? `URI="${localName}"` : `URI=${localName}`;
+      });
+    }
+
+    const leading = line.match(/^\s*/)?.[0] ?? '';
+    const trailing = line.match(/\s*$/)?.[0] ?? '';
+    return `${leading}${localFor(trimmed)}${trailing}`;
+  });
+
+  return { playlist: lines.join('\n'), sidecars };
+}
+
+function hlsUriExtension(uri: string): string {
+  const path = uri.split(/[?#]/)[0] ?? '';
+  const slash = path.lastIndexOf('/');
+  const file = slash >= 0 ? path.slice(slash + 1) : path;
+  const dot = file.lastIndexOf('.');
+  if (dot < 0 || dot === file.length - 1) return '.bin';
+  const ext = file.slice(dot).replace(/[^.\w-]/g, '');
+  return ext || '.bin';
+}
+
+function resolveHlsSidecarUrl(input: MediaInput, sourceUri: string): string {
+  const pageUrl = globalThis.location?.href ?? 'http://localhost/';
+  const inputUrl = new URL(input.url, pageUrl);
+  return new URL(sourceUri, inputUrl).href;
+}
+
 /** Best-effort human description of an unknown thrown value. */
 function describeError(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -797,27 +901,18 @@ export class FfmpegWasmEngine implements MediaEngine {
         trim: true,
         mux: true, // documented core strength (dossier §4/§10 A.3); kept in sync with probed set.
       },
-      // FALLBACK_CONTAINERS_IN/OUT already exclude 'hls' (unreachable multi-file playlist from MEMFS).
+      // HLS input is declared because writeInput() materializes playlist sidecars into MEMFS.
       containersIn: [...FALLBACK_CONTAINERS_IN],
       containersOut: [...FALLBACK_CONTAINERS_OUT],
       videoCodecs: [...FALLBACK_VIDEO],
       audioCodecs: [...FALLBACK_AUDIO],
-      encryption: [], // CENC/cbcs/ClearKey not in the build; HLS AES-128 unverified → none declared.
+      encryption: ['hls-aes128'], // transparent HLS demux decrypt only; no standalone decrypt op.
       features: this.featureList(),
     };
   }
 
   /** Feature flags. 'webcodecs:independent' opts ffmpeg.wasm out of the per-browser WebCodecs gate
-   *  (it owns software codecs). 'fanout' is NOT declared (single-MediaBytes can't carry N outputs).
-   *
-   *  'metadata:write' is deliberately NOT declared even though ffmpeg genuinely writes tags (dossier
-   *  §A.11) and remux() honors `opts.tags` below: the metadata-WRITE scenarios drive the op via the
-   *  runner's remux dispatch (runner.ts:433), which calls remux(input, { container }) and DROPS
-   *  `options.tags` before the adapter ever sees them. So declaring the feature would negotiate those
-   *  cases as runnable and then guarantee a FAIL (no tags reach the file, golden-metadata mismatches)
-   *  — an over-claim, which the standing rules rank as worse than an honest NA. We keep the engine-
-   *  side implementation ready (remux writes -metadata when tags are present) so flipping this flag
-   *  back on is a one-liner once the shared runner.ts forwards options.tags to remux(). */
+   *  (it owns software codecs). 'fanout' is NOT declared (single-MediaBytes can't carry N outputs). */
   private featureList(): string[] {
     return [
       'resize', // -vf scale / zscale
@@ -827,8 +922,17 @@ export class FfmpegWasmEngine implements MediaEngine {
       'fragmented', // -movflags frag_keyframe+empty_moov
       'streaming:decode-equality',
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
+      'fastStart:in-memory', // same moov-first output shape through MEMFS/BufferTarget
+      'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
       'packets:dts', // framecrc exposes packet dts separately from pts
+      'decode:golden-rgba', // decodeFrames emits the suite's normalized RGBA sha256 digests
+      'hls:aes128', // HLS demuxer handles EXT-X-KEY AES-128 when key URIs are materialized
+      'resample', // -ar
+      'downmix', // -ac N where N < input channels
+      'upmix', // -ac N where N > input channels
+      'gain', // -af volume
+      'fade', // -af afade
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
       'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
       'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
@@ -1038,13 +1142,6 @@ export class FfmpegWasmEngine implements MediaEngine {
 
     // HLS is multi-file/pathed; not deliverable as a single MediaBytes → exclude from declared out.
     containersOut = containersOut.filter((c) => c !== 'hls');
-    // HLS the same way on the INPUT side: ffmpeg's `-formats` lists the hls/applehttp DEMUXER, but a
-    // multi-variant `.m3u8` playlist references sibling `.ts`/`.m4s` segments by relative path. Those
-    // siblings are UNREACHABLE from a single file written into MEMFS (we hand ffmpeg one blob, not a
-    // directory tree), so an hls probe/demux would not error cleanly — it would fail mid-run trying to
-    // open segment URLs. Declaring `hls` in containersIn therefore turns a clean NA into a runtime
-    // ERROR. Drop it so hls-input scenarios negotiate an honest NA_ENGINE on the container.
-    containersIn = containersIn.filter((c) => c !== 'hls');
 
     return {
       operations: {
@@ -1064,7 +1161,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       containersOut,
       videoCodecs,
       audioCodecs,
-      encryption: [],
+      encryption: ['hls-aes128'],
       features: this.featureList(),
     };
   }
@@ -1161,24 +1258,52 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
-  /** Write a MediaInput's bytes into MEMFS under a chosen name; returns that name. */
-  private async writeInput(input: MediaInput, name: string): Promise<string> {
+  /** Write a MediaInput into MEMFS; HLS playlists also get their referenced segments/keys. */
+  private async writeInput(input: MediaInput, name: string): Promise<WrittenInput> {
     const bytes = copyBytes(await input.arrayBuffer());
-    await this.requireFf().writeFile(name, bytes);
-    return name;
+    const hls = isHlsPlaylistInput(input, bytes);
+    const inName = hls && !name.endsWith('.m3u8') ? `${name}.m3u8` : name;
+    const cleanupPaths = [inName];
+
+    try {
+      if (!hls) {
+        await this.requireFf().writeFile(inName, bytes);
+        return { name: inName, cleanupPaths, inputOptions: [] };
+      }
+
+      const playlistText = new TextDecoder().decode(bytes);
+      const materialized = rewriteHlsPlaylistUris(playlistText, inName);
+      await this.requireFf().writeFile(inName, new TextEncoder().encode(materialized.playlist));
+
+      for (const sidecar of materialized.sidecars) {
+        const res = await fetch(resolveHlsSidecarUrl(input, sidecar.sourceUri), { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(
+            `${ENGINE_ID}: failed to materialize HLS sidecar '${sidecar.sourceUri}' ` +
+              `(${res.status} ${res.statusText})`,
+          );
+        }
+        await this.requireFf().writeFile(sidecar.localName, copyBytes(await res.arrayBuffer()));
+        cleanupPaths.push(sidecar.localName);
+      }
+
+      return { name: inName, cleanupPaths, inputOptions: ['-allowed_extensions', 'ALL'] };
+    } catch (e) {
+      await this.cleanup(cleanupPaths);
+      throw e;
+    }
   }
 
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
 
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const base = this.scratch();
-    const inName = `${base}.in`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
-      const log = await this.runInfo(inName);
+      const log = await this.runInfo(written.name, written.inputOptions);
       return this.metadataFromLog(log, input);
     } finally {
-      await this.cleanup([inName]);
+      await this.cleanup(written.cleanupPaths);
     }
   }
 
@@ -1188,13 +1313,13 @@ export class FfmpegWasmEngine implements MediaEngine {
    * specified") AFTER it has printed the Input block — so a non-zero code here is EXPECTED and not an
    * error. We only fail if the log shows the input could not be opened/parsed at all.
    */
-  private async runInfo(inName: string): Promise<string> {
+  private async runInfo(inName: string, inputOptions: string[] = []): Promise<string> {
     const ff = this.requireFf();
     this.logTail = [];
     try {
       // timeoutMs guards fuzzed/truncated inputs from hanging the worker (§9.10/§11). On timeout exec
       // returns 1 (no throw) and no Input block is logged → the check below throws a clean error.
-      await ff.exec(['-hide_banner', '-i', inName], READ_EXEC_TIMEOUT_MS);
+      await ff.exec(['-hide_banner', ...inputOptions, '-i', inName], READ_EXEC_TIMEOUT_MS);
     } catch {
       /* exec may reject on the deliberate "no output file" abort; the log is captured regardless */
     }
@@ -1239,9 +1364,8 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   async demux(input: MediaInput): Promise<DemuxResult> {
     const base = this.scratch();
-    const inName = `${base}.in`;
     const crcName = `${base}.framecrc.txt`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
       const ff = this.requireFf();
 
@@ -1258,7 +1382,19 @@ export class FfmpegWasmEngine implements MediaEngine {
         // timeoutMs guards fuzzed/truncated inputs from wedging the worker (§9.10/§11/§A.16). On
         // timeout exec returns 1 (no throw); the Input-block + readText checks below then throw clean.
         exitCode = await ff.exec(
-          ['-hide_banner', '-i', inName, '-map', '0', '-c', 'copy', '-f', 'framecrc', crcName],
+          [
+            '-hide_banner',
+            ...written.inputOptions,
+            '-i',
+            written.name,
+            '-map',
+            '0',
+            '-c',
+            'copy',
+            '-f',
+            'framecrc',
+            crcName,
+          ],
           READ_EXEC_TIMEOUT_MS,
         );
       } catch {
@@ -1290,7 +1426,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
       return { metadata, packets };
     } finally {
-      await this.cleanup([inName, crcName]);
+      await this.cleanup([...written.cleanupPaths, crcName]);
     }
   }
 
@@ -1301,16 +1437,15 @@ export class FfmpegWasmEngine implements MediaEngine {
     opts: { container: string; tags?: Record<string, string> },
   ): Promise<MediaBytes> {
     const base = this.scratch();
-    const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
+      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
       assertRemuxContainerCompatible(inputMetadata.tracks, opts.container);
 
       // Stream copy: no re-encode, just rewrap. Explicitly map every input stream so ffmpeg's
       // default "one stream per type" selection does not drop secondary audio tracks.
-      const args = ['-i', inName, '-map', '0', '-c', 'copy'];
+      const args = [...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         args.push('-movflags', '+faststart');
       } else if (opts.container === 'ts') {
@@ -1319,8 +1454,6 @@ export class FfmpegWasmEngine implements MediaEngine {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }
       // Metadata WRITE (dossier §A.11): `-metadata key=value` per tag, still lossless under -c copy.
-      // The 'metadata:write' feature is gated OFF in featureList() until the runner forwards tags to
-      // remux(), but the implementation is kept correct so it works for any direct caller / once wired.
       if (opts.tags) {
         for (const [k, v] of Object.entries(opts.tags)) {
           if (k) args.push('-metadata', `${k}=${v ?? ''}`);
@@ -1331,7 +1464,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const bytes = await this.readBinary(outName);
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
-      await this.cleanup([inName, outName]);
+      await this.cleanup([...written.cleanupPaths, outName]);
     }
   }
 
@@ -1368,11 +1501,10 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
 
     const base = this.scratch();
-    const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
+      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
       const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
       const hasAudio = inputMetadata.tracks.some((t) => t.type === 'audio');
       if (opts.video && !hasVideo) {
@@ -1382,7 +1514,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         throw new NotApplicableError('transcode', 'requested an audio output but the input has no audio track');
       }
 
-      const args = ['-i', inName, '-map', '0'];
+      const args = [...written.inputOptions, '-i', written.name, '-map', '0'];
 
       if (opts.video) {
         const v = opts.video;
@@ -1460,11 +1592,46 @@ export class FfmpegWasmEngine implements MediaEngine {
 
       if (opts.audio) {
         const a = opts.audio;
+        const audioOpts = a as typeof a & {
+          gainDb?: number;
+          gainLinear?: number;
+          fade?: { inSec?: number; outSec?: number; curve?: string };
+        };
         const enc = a.codec ? audioEncoderName(a.codec) : null;
         if (a.codec && !enc) {
           throw new NotApplicableError('transcode', `no encoder for audio codec '${a.codec}'`);
         }
         if (enc) args.push('-c:a', enc);
+        const audioFilters: string[] = [];
+        const gain =
+          typeof audioOpts.gainLinear === 'number'
+            ? audioOpts.gainLinear
+            : typeof audioOpts.gainDb === 'number'
+              ? `${audioOpts.gainDb}dB`
+              : null;
+        if (gain !== null) audioFilters.push(`volume=${gain}`);
+        const fade = audioOpts.fade;
+        if (fade && typeof fade === 'object') {
+          const curve =
+            fade.curve === 'linear'
+              ? ''
+              : typeof fade.curve === 'string'
+                ? `:curve=${fade.curve}`
+                : '';
+          if (typeof fade.inSec === 'number' && fade.inSec > 0) {
+            audioFilters.push(`afade=t=in:st=0:d=${fade.inSec}${curve}`);
+          }
+          if (typeof fade.outSec === 'number' && fade.outSec > 0) {
+            const durationSec = inputMetadata.durationSec;
+            if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
+              const start = Math.max(0, durationSec - fade.outSec);
+              audioFilters.push(`afade=t=out:st=${start}:d=${fade.outSec}${curve}`);
+            } else {
+              throw new NotApplicableError('transcode', 'fade-out requires a known input duration');
+            }
+          }
+        }
+        if (audioFilters.length) args.push('-af', audioFilters.join(','));
         if (a.sampleRate) args.push('-ar', String(a.sampleRate));
         if (a.channels) args.push('-ac', String(a.channels));
         if (a.bitrate) args.push('-b:a', String(a.bitrate));
@@ -1488,7 +1655,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const bytes = await this.readBinary(outName);
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
-      await this.cleanup([inName, outName]);
+      await this.cleanup([...written.cleanupPaths, outName]);
     }
   }
 
@@ -1510,11 +1677,10 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
 
     const base = this.scratch();
-    const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
+      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
       const startSec = range.startUs / 1_000_000;
       const durationSec = (range.endUs - range.startUs) / 1_000_000;
       if (inputMetadata.durationSec !== null && startSec >= inputMetadata.durationSec) {
@@ -1523,7 +1689,17 @@ export class FfmpegWasmEngine implements MediaEngine {
       const args: string[] = [];
       if (opts.frameAccurate) {
         // Frame-accurate: -ss/-to AFTER -i forces decode+re-encode to land on exact frames.
-        args.push('-i', inName, '-map', '0', '-ss', startSec.toFixed(6), '-t', durationSec.toFixed(6));
+        args.push(
+          ...written.inputOptions,
+          '-i',
+          written.name,
+          '-map',
+          '0',
+          '-ss',
+          startSec.toFixed(6),
+          '-t',
+          durationSec.toFixed(6),
+        );
         const video = inputMetadata.tracks.find((t) => t.type === 'video');
         const audio = inputMetadata.tracks.find((t) => t.type === 'audio');
         if (video) {
@@ -1555,8 +1731,9 @@ export class FfmpegWasmEngine implements MediaEngine {
         args.push(
           '-ss',
           startSec.toFixed(6),
+          ...written.inputOptions,
           '-i',
-          inName,
+          written.name,
           '-map',
           '0',
           '-t',
@@ -1576,7 +1753,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const bytes = await this.readBinary(outName);
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
-      await this.cleanup([inName, outName]);
+      await this.cleanup([...written.cleanupPaths, outName]);
     }
   }
 
@@ -1584,20 +1761,19 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
     const base = this.scratch();
-    const inName = `${base}.in`;
     const rawName = `${base}.rgba`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
       // Learn dimensions + frame rate (from the `ffmpeg -i` log, no ffprobe) so we can slice the raw
       // stream and assign PTS.
-      const v = this.firstVideoTrack(await this.runInfo(inName), 'decodeFrames');
+      const v = this.firstVideoTrack(await this.runInfo(written.name, written.inputOptions), 'decodeFrames');
       const width = v.width;
       const height = v.height;
       const fps = v.fps && v.fps > 0 ? v.fps : 30;
       const maxFrames = opts?.maxFrames;
 
       // Decode to tight, straight-alpha, top-left RGBA rawvideo (frames back-to-back, no padding).
-      const args = ['-i', inName];
+      const args = [...written.inputOptions, '-i', written.name];
       if (maxFrames && maxFrames > 0) args.push('-frames:v', String(maxFrames));
       args.push('-vf', rawRgbaColorFilter(width, height));
       args.push('-pix_fmt', 'rgba', '-f', 'rawvideo', rawName);
@@ -1631,7 +1807,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         },
       };
     } finally {
-      await this.cleanup([inName, rawName]);
+      await this.cleanup([...written.cleanupPaths, rawName]);
     }
   }
 
@@ -1639,12 +1815,11 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
     const base = this.scratch();
-    const inName = `${base}.in`;
     const rawName = `${base}.rgba`;
-    await this.writeInput(input, inName);
+    const written = await this.writeInput(input, `${base}.in`);
     try {
       // Dimensions from the `ffmpeg -i` log (no ffprobe).
-      const log = await this.runInfo(inName);
+      const log = await this.runInfo(written.name, written.inputOptions);
       const v = this.firstVideoTrack(log, 'seek');
       const width = v.width;
       const height = v.height;
@@ -1659,7 +1834,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       // grab a single frame. The output stream restarts its clock at 0, so we report the requested
       // target as the landed presentation time.
       await this.run([
-        '-ss', tSec.toFixed(6), '-i', inName, '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
+        '-ss', tSec.toFixed(6), ...written.inputOptions, '-i', written.name, '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
       ]);
       const raw = await this.readBinary(rawName);
       const frameBytes = width * height * 4;
@@ -1671,7 +1846,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const landedPtsUs = Math.round(tSec * 1_000_000);
       return { landedPtsUs, frame: { index: 0, ptsUs: landedPtsUs, sha256, width, height } };
     } finally {
-      await this.cleanup([inName, rawName]);
+      await this.cleanup([...written.cleanupPaths, rawName]);
     }
   }
 
@@ -1700,11 +1875,10 @@ export class FfmpegWasmEngine implements MediaEngine {
         const input = inputs[inputIndex];
         if (!input) continue;
         const base = `${this.scratch()}.muxsrc${inputIndex}`;
-        const inName = `${base}.in`;
-        cleanup.push(inName);
-        await this.writeInput(input, inName);
+        const written = await this.writeInput(input, `${base}.in`);
+        cleanup.push(...written.cleanupPaths);
 
-        const metadata = this.metadataFromLog(await this.runInfo(inName), input);
+        const metadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
         const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
         for (let streamIndex = 0; streamIndex < metadata.tracks.length; streamIndex++) {
           const track = metadata.tracks[streamIndex]!;
@@ -1722,7 +1896,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
           const outName = `${base}.s${streamIndex}.${prep.ext}`;
           cleanup.push(outName);
-          const args = ['-i', inName, '-map', `0:${streamIndex}`, '-c', 'copy'];
+          const args = [...written.inputOptions, '-i', written.name, '-map', `0:${streamIndex}`, '-c', 'copy'];
           if (prep.bitstreamFilter) args.push(prep.bitstreamFilterKind, prep.bitstreamFilter);
           args.push('-f', prep.format, outName);
           await this.run(args, READ_EXEC_TIMEOUT_MS);

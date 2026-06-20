@@ -41,6 +41,7 @@ export const AUDIO_ENCODER: Record<string, string> = {
   'pcm-s24': 'pcm_s24le',
   'pcm-f32': 'pcm_f32le',
   'pcm-s16be': 'pcm_s16be',
+  'pcm-s24be': 'pcm_s24be',
 };
 
 /** Canonical video codec → the FFmpeg *decoder* name(s) we accept as proof the codec decodes. */
@@ -63,6 +64,7 @@ const AUDIO_DECODER_ALIASES: Record<CanonicalAudioCodec, string[]> = {
   'pcm-s24': ['pcm_s24le'],
   'pcm-f32': ['pcm_f32le'],
   'pcm-s16be': ['pcm_s16be'],
+  'pcm-s24be': ['pcm_s24be'],
 };
 
 /** Canonical container → FFmpeg demuxer/muxer name fragments to look for in `-formats`. */
@@ -78,6 +80,8 @@ const CONTAINER_DEMUX_NAMES: Record<CanonicalContainer, string[]> = {
   flac: ['flac'],
   ogg: ['ogg'],
   adts: ['aac'],
+  aiff: ['aiff'],
+  caf: ['caf'],
 };
 
 const CONTAINER_MUX_NAMES: Record<CanonicalContainer, string[]> = {
@@ -92,6 +96,8 @@ const CONTAINER_MUX_NAMES: Record<CanonicalContainer, string[]> = {
   flac: ['flac'],
   ogg: ['ogg'],
   adts: ['adts'],
+  aiff: ['aiff'],
+  caf: ['caf'],
 };
 
 // ── On-disk filename extension / output MIME per container ─────────────────────────────────────
@@ -119,6 +125,10 @@ export function containerExt(container: string): string {
       return 'ogg';
     case 'adts':
       return 'aac';
+    case 'aiff':
+      return 'aiff';
+    case 'caf':
+      return 'caf';
     default:
       return container;
   }
@@ -146,6 +156,10 @@ export function containerMime(container: string): string {
       return 'audio/ogg';
     case 'adts':
       return 'audio/aac';
+    case 'aiff':
+      return 'audio/aiff';
+    case 'caf':
+      return 'audio/x-caf';
     default:
       return 'application/octet-stream';
   }
@@ -184,6 +198,8 @@ export function canonicalCodec(name: string): string {
       return 'pcm-f32';
     case 'pcm_s16be':
       return 'pcm-s16be';
+    case 'pcm_s24be':
+      return 'pcm-s24be';
     default:
       return n;
   }

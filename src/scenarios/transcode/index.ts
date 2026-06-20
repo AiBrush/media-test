@@ -33,13 +33,6 @@ const TC_METRICS = ['wall', 'throughputRealtime', 'peakMemory', 'decodeFps', 'en
 const TC_EDGE_TIMEOUT_MS = 20_000;
 
 /**
- * Deterministic 60% tail-truncation (interrupted download → incomplete moov/mdat). Local copy so this
- * writer stays self-contained (it must not import the robustness family's mutate helpers).
- */
-const truncateTail60 = (bytes: Uint8Array): Uint8Array =>
-  bytes.slice(0, Math.max(0, Math.floor(bytes.length * 0.6)));
-
-/**
  * Transcode option payload. Some extended cases carry knobs beyond the core TranscodeOptions shape
  * (e.g. `invariant` for the property-invariant oracle, or a not-yet-supported transform like
  * `flip`/`crop`/`tonemap` that drives an honest NA). The runner forwards options opaquely and the
@@ -468,8 +461,9 @@ const fanoutScenarios: Scenario[] = [
 //    the case negotiates NA_ENGINE *honestly* (rule §0.1: a clean NA is correct; an over-claimed PASS
 //    on an unobserved knob is the sin). These slots exist so the spec's A.8/A.16 transform matrix is
 //    REPRESENTED and any future engine that gains the knob lights the cell up automatically — they are
-//    deliberately not faked green. The 10-bit/HDR rows ALSO have no source fixture in the corpus
-//    (manifest carries only 8-bit yuv420p), a second, documented reason they are NA today.
+//    deliberately not faked green. HDR rows still have no PQ/HDR source fixture; 10-bit rows remain
+//    NA on the undeclared depth-control feature even though the corpus now has a 10-bit H.264 decode
+//    fixture.
 //
 //  • The fps-change and rotate-dimension-swap reference oracles are known to mis-pair in the no-golden
 //    path (index-paired, not pts-/rotation-aware — see oracles.ssimVsReferenceSource). For those cases
@@ -767,12 +761,11 @@ const unsupportedTransformScenarios: Scenario[] = UNSUPPORTED_TRANSFORM_CASES.ma
   }),
 );
 
-// ── A.5 — 8↔10-bit & HDR10 ENCODE slots (NA on TWO grounds: no encoder feature + no source fixture) ─
+// ── A.5 — 8↔10-bit & HDR10 ENCODE slots (NA on undeclared transform features) ────────────────────
 //
-// The corpus carries only 8-bit yuv420p (manifest), so there is no 10-bit/HDR source to feed, AND no
-// adapter declares a depth/HDR encode knob. These slots tag an undeclared feature so they are honest
-// NA_ENGINE today; the note records that a 10-bit fixture (A.4) + an encoder feature are BOTH required
-// to make them run. Input is the closest existing asset purely so the scenario is well-formed.
+// No adapter declares a depth/HDR encode knob. These slots tag an undeclared feature so they are
+// honest NA_ENGINE today. The corpus now has a 10-bit H.264 decode fixture, but not the full set of
+// codec/HDR sources needed to make every depth/HDR transform live.
 interface DepthHdrCase {
   id: string;
   asset: string;
@@ -796,8 +789,8 @@ const DEPTH_HDR_CASES: DepthHdrCase[] = [
     feature: 'depth:10bit',
     extraOpts: { video: { codec: 'hevc', bitDepth: 10 } },
     notes:
-      '8-bit→10-bit HEVC encode (A.5/A.4 8↔10-bit). NA: no engine declares "depth:10bit" AND the corpus ' +
-      'has no 10-bit source — both a fixture and an encoder knob are needed before this runs.',
+      '8-bit→10-bit HEVC encode (A.5/A.4 8↔10-bit). NA: no engine declares the "depth:10bit" ' +
+      'transform knob yet; the source is real 8-bit H.264 media.',
   },
   {
     id: 'hevc_10bit_to_h264_8bit',
@@ -809,8 +802,8 @@ const DEPTH_HDR_CASES: DepthHdrCase[] = [
     feature: 'depth:10bit',
     extraOpts: { video: { codec: 'h264', bitDepth: 8 } },
     notes:
-      '10-bit→8-bit down-convert (A.4). NA today (no declared depth knob; the HEVC fixture is 8-bit, so ' +
-      'no real 10-bit source exists either).',
+      '10-bit→8-bit down-convert (A.4). NA today because no engine declares the depth-control knob; ' +
+      'the HEVC fixture used for this codec row is 8-bit, while the corpus 10-bit source is H.264.',
   },
   {
     id: 'hdr10_to_sdr_tonemap',
@@ -1377,10 +1370,9 @@ const roundTripScenarios: Scenario[] = [
 //
 // Extreme fps is gated by duration-preservation (property-invariant probe-duration; an interpolating/
 // decimating extreme rate makes index-paired SSIM unsound). Degenerate 0×0 / 1×1 resize MUST be
-// handled gracefully — modeled with a pass-through `mutate` so the runner takes the robustness path
-// where a clean throw/reject = PASS and a crash/hang = FAIL (graceful-failure); an engine that instead
-// emits a sane 1×1 frame also passes via the output path only if it does not crash. 0×0 is the harder
-// degenerate (no valid frame) and is expected to throw cleanly.
+// handled gracefully via the graceful-failure oracle; an engine that instead emits a sane 1×1 frame
+// also passes via the output path only if it does not crash. 0×0 is the harder degenerate (no valid
+// frame) and is expected to throw cleanly.
 const extremeFpsScenarios: Scenario[] = [
   buildVideoScenario({
     id: 'extreme_fps_1',
@@ -1429,9 +1421,7 @@ const extremeResizeScenarios: Scenario[] = [
     oracles: ['graceful-failure'],
     metrics: ['wall'],
     timeoutMs: TC_EDGE_TIMEOUT_MS,
-    // Pass-through mutate routes the runner to the robustness path (throw=PASS, crash/hang=FAIL).
     // 1x1 is valid-but-degenerate, so returned output is also an accepted non-crash path.
-    mutate: (b) => b,
     notes:
       '1×1 resize (A.16 "0×0 or 1×1 video"). Must handle gracefully or correctly — a clean throw or a ' +
       'sane minimal frame, never a crash/hang/OOM. graceful-failure allows returned output for this ' +
@@ -1453,7 +1443,6 @@ const extremeResizeScenarios: Scenario[] = [
     oracles: ['graceful-failure'],
     metrics: ['wall'],
     timeoutMs: TC_EDGE_TIMEOUT_MS,
-    mutate: (b) => b,
     notes:
       '0×0 resize (A.16 degenerate dimensions). Expected to throw cleanly (no valid frame); ' +
       'graceful-failure via the robustness path — output for 0×0 input is suspicious → FAIL.',
@@ -1465,11 +1454,10 @@ const extremeResizeScenarios: Scenario[] = [
 // (1) Image negatives: a still image fed to a VIDEO transcode. The image's pseudo-container (jpeg/png/
 //     webp) is declared by NO engine → clean NA_ENGINE at negotiation (the honest guard; the bytes are
 //     never decoded). If a future engine declares it, graceful-failure judges the throw.
-// (2) Truncated / zero-length sources: real malformed bytes via a `mutate` (truncate to 60% / empty) so
-//     the runner takes the robustness path and graceful-failure is sound (throw=PASS, output=FAIL).
-// (3) audio-only→video and video-only→audio mismatches: valid input, impossible target. Carried via a
-//     pass-through `mutate` so a clean throw = PASS (A.16 "audio-only/video-only/no-tracks must NA/throw
-//     cleanly"); an engine that silently emits a degenerate file is flagged (output=FAIL) for review.
+// (2) Truncated / zero-length sources: real malformed files so graceful-failure is sound
+//     (throw=PASS, output=FAIL).
+// (3) audio-only→video and video-only→audio mismatches: valid input, impossible target. A clean throw
+//     passes; an engine that silently emits a degenerate file is flagged (output=FAIL) for review.
 interface TranscodeNegativeCase {
   id: string;
   asset: string;
@@ -1478,7 +1466,6 @@ interface TranscodeNegativeCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   options: Record<string, unknown>;
-  mutate?: (b: Uint8Array) => Uint8Array;
   notes: string;
 }
 
@@ -1508,15 +1495,14 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
   },
   {
     id: 'malformed_truncated_h264_transcode',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'transcode_truncated_h264_60p.mp4',
     containersIn: ['mp4'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mp4', video: { codec: 'h264' }, gracefulAllowOutput: true },
-    mutate: truncateTail60,
     notes:
       'Truncated H.264 (moov/mdat incomplete) → transcode (A.16 header-truncated, §5.1). Robustness path: ' +
-      'must throw/reject within the timeout — no crash/hang/OOM. Deterministic 60%-truncation mutate.',
+      'must throw/reject within the timeout — no crash/hang/OOM. Uses a deterministic 60%-truncated fixture.',
   },
   {
     id: 'malformed_zero_length_transcode',
@@ -1525,7 +1511,6 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mp4', video: { codec: 'h264' } },
-    mutate: (b) => b, // asset is already 0 bytes; pass-through keeps the robustness path
     notes:
       'Zero-length file → transcode (A.16 zero-length). Robustness path: clean throw expected, no crash. ' +
       'Complements the robustness family with a transcode-specific degenerate-input entry.',
@@ -1537,7 +1522,6 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     audioCodecs: ['pcm-s16'],
     videoCodecs: ['h264'],
     options: { container: 'mp4', video: { codec: 'h264' } },
-    mutate: (b) => b,
     notes:
       'Audio-only input → VIDEO-targeting transcode (A.16 "audio-only/video-only"). Expect a clean throw ' +
       '(no video track to encode). Robustness path: throw=PASS; silently emitting a degenerate file=FAIL.',
@@ -1549,7 +1533,6 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mp4', audio: { codec: 'aac' } },
-    mutate: (b) => b,
     notes:
       'Video-only input (no audio track) → AUDIO-targeting transcode (A.16). Expect a clean throw (no ' +
       'audio to encode). Robustness path: throw=PASS.',
@@ -1561,7 +1544,6 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { container: 'mp4', video: { codec: 'h264' }, gracefulAllowOutput: true },
-    mutate: (b) => b,
     notes:
       'Mislabeled container: a TS payload declared as mp4 input (A.16 "h264 mislabeled / mismatched ' +
       'container/codec"). Robustness path: the engine must detect the mismatch and fail gracefully (or ' +
@@ -1584,7 +1566,6 @@ const negativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
     oracles: ['graceful-failure'],
     metrics: ['wall'],
     timeoutMs: TC_EDGE_TIMEOUT_MS,
-    ...(c.mutate ? { mutate: c.mutate } : {}),
     notes: c.notes,
   }),
 );
@@ -1636,7 +1617,7 @@ const gaplessScenarios: Scenario[] = [
 // audio-dsp covers stereo↔mono on audio-only WAV; this exercises a channel-layout change DURING a
 // video+audio re-encode (the muxed path), asserting the output audio layout via output metadata while
 // ssim-psnr gates the video. (Source is stereo; downmix-to-mono is the defined, assert-able change. A
-// true 5.1 source is not in the corpus, so 5.1 is documented as a fixture gap rather than faked.)
+// true muxed A/V 5.1 source is still not in the corpus; the audio-only 5.1 WAV is covered by audio-dsp.)
 const channelScenarios: Scenario[] = [
   defineScenario({
     id: 'transcode/av_downmix_stereo_to_mono',
@@ -1660,7 +1641,7 @@ const channelScenarios: Scenario[] = [
     notes:
       'Channel-layout change on a MUXED A/V transcode (A.16 variable channel count): stereo→mono during ' +
       'video+audio re-encode. Output metadata asserts the 1-channel output; ssim-psnr gates the video. ' +
-      '(5.1/variable-count sources are a corpus gap — not faked.)',
+      '(A muxed A/V 5.1 source is still a corpus gap; audio-only 5.1 is covered by audio-dsp.)',
   }),
 ];
 

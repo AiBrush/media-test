@@ -20,18 +20,15 @@
  *    over-claim (§0 honest-capabilities). We attach it only for what it truly checks and document the
  *    residual gap in `notes`.
  *
- * 2. The runner's `op:'remux'` dispatch (runner.ts executeOp, ~line 433) calls
- *    `engine.remux(input, { container })` and exposes the bytes as `ctx.output`. It forwards ONLY
- *    `{ container }` — `options.tags` is DROPPED — and it does NOT re-probe the output into
- *    `ctx.metadata`. Consequently for a remux op:
+ * 2. The runner's `op:'remux'` dispatch calls `engine.remux(input, { container, tags? })` and exposes
+ *    the bytes as `ctx.output`. It forwards `options.tags` to engines that support metadata writes,
+ *    but it does NOT re-probe the output into `ctx.metadata`. Consequently for a remux op:
  *      • `golden-metadata` reads `ctx.metadata` → ALWAYS "no probe metadata on ctx.metadata" → FAIL
  *        for a PLUMBING reason, masking whether any tag was written. So `golden-metadata` is NEVER a
  *        valid remux gate and is never attached to a write case.
- *      • The desired tags cannot reach the engine through the runner today, so a genuine
- *        write→readback of tag CONTENT is NOT realizable from a scenario file alone (it needs a
- *        runner that forwards options.tags + re-probes, and an oracle that compares the tag map —
- *        both outside the scenario writer's scope). We keep `options.tags` on the scenario (so a
- *        future runner/oracle reads it, and the intent is self-documenting) and gate the write with
+ *      • The desired tags do reach the engine, but a genuine write→readback of tag CONTENT is NOT
+ *        asserted until an oracle re-probes `ctx.output` and compares the tag map. We keep
+ *        `options.tags` on the scenario and gate the write with
  *        the oracles that DO observe a remux output: `reference-reimport` (the output is a real,
  *        parseable container) + `property-invariant` (the tag rewrite must NOT corrupt media —
  *        decode(remux(x))==decode(x) for video, probe(remux(x)).dur≈probe(x).dur for audio).
@@ -108,10 +105,9 @@ export interface TagWriteCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   /**
-   * Tags to set on the output. Carried in `options.tags` so a future runner that forwards them (and
-   * an oracle that re-probes + compares the tag map) activates a genuine write→readback. With the
-   * current runner these are not delivered (ORACLE §2); the case still gates that the rewrite is a
-   * valid container that did NOT corrupt media (via the oracles below).
+   * Tags to set on the output. The runner forwards these to remux implementations. The case gates
+   * that the tag-bearing rewrite is a valid container that did NOT corrupt media; tag-content
+   * readback still needs a dedicated oracle that re-probes ctx.output and compares tags.
    */
   tags: Record<string, string>;
   /**
@@ -245,13 +241,11 @@ export function buildDecodeRead(c: DecodeReadCase): Scenario {
 export interface MetaNegativeCase {
   /** unique id suffix (namespaced under metadata/) */
   id: string;
-  /** valid base asset to corrupt before probing */
+  /** malformed asset to probe */
   asset: string;
   container: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
-  /** byte mutation that garbles/truncates the tag/metadata region */
-  mutate: (bytes: Uint8Array) => Uint8Array;
   /**
    * Some parsers safely recover from malformed tag regions by ignoring the corrupt tag and returning
    * structural stream metadata. For those cases the robustness property is "no fault", not
@@ -263,10 +257,9 @@ export interface MetaNegativeCase {
 }
 
 /**
- * Build a negative metadata Scenario. A `mutate` fn classifies the case into the robustness PILLAR
- * and routes it through runner.runRobustness, which expects engine.probe to throw/reject within the
- * timeout. `graceful-failure` PASSes iff no output was produced (clean reject) — FAILs on hang/timeout
- * or on metadata emitted from a clearly-corrupt tag region.
+ * Build a negative metadata Scenario. `graceful-failure` routes through the robustness path and
+ * PASSes when the engine either rejects the malformed fixture cleanly or, for allowed cases, reports
+ * safe structural metadata.
  */
 export function buildNegative(c: MetaNegativeCase): Scenario {
   return defineScenario({
@@ -281,7 +274,6 @@ export function buildNegative(c: MetaNegativeCase): Scenario {
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,

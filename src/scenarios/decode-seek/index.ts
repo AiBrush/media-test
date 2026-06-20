@@ -25,14 +25,6 @@
  *    spec's seek number never reached the report; setting primaryMetric:'seekMs' fixes that here (a
  *    scenario-owned concern, in this writer's scope).
  *
- * ASSET-MISSING / DEEP-EDGE policy (§5.4): some A.16 rows need fixtures the bake has not yet produced
- * (10-bit-depth clip, open-GOP-distinct-from-B-frames clip, 1 fps / 240 fps clips, 1×1 / 0×0 clips).
- * Per the honest-NA protocol we STILL register the case against the canonical asset id the bake must
- * emit (recorded in `MISSING_DECODE_ASSETS` below + flagged in notes), so the moment the asset is
- * baked the case activates and golden lines up. Until then the runner records a distinct
- * asset-missing failure (fetch of `/fixtures/media/<id>` 404s) — never a fabricated value, never a
- * silent skip. These ids are NOT in fixtures/manifest.json yet; adding them there is the bake's job.
- *
  * METAMORPHIC invariants (§7) are registered as `property-invariant` cases carrying an `invariant`
  * token. The decode-anchored remux-equivalence invariant maps to the oracle's existing
  * 'decode(remux(x))==decode(x)' handler. The genuinely-new decode/seek invariants
@@ -45,37 +37,6 @@
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
-/**
- * Canonical ids for fixtures this family needs but the bake does not yet produce (§5.4). Surfaced
- * here so the bake/manifest can add them; cases below reference these ids and activate on bake.
- */
-export const MISSING_DECODE_ASSETS: ReadonlyArray<{ id: string; why: string }> = [
-  {
-    id: 'h264_10bit_1080p_5s.mp4',
-    why: 'A.4 8-bit & 10-bit depth: a 10-bit (yuv420p10le, High 10) H.264/HEVC clip so decode of 10-bit depth is exercised. No 10-bit asset is baked today.',
-  },
-  {
-    id: 'h264_open_gop_1080p.mp4',
-    why: 'A.16 open-GOP first-frame correctness as a case DISTINCT from B-frame reorder: needs a true open-GOP clip (leading B-frames before the first I/IDR) the corpus lacks.',
-  },
-  {
-    id: 'h264_1fps_30s.mp4',
-    why: 'A.16 extreme fps (1 fps): nominal-vs-real low frame-rate decode timing.',
-  },
-  {
-    id: 'h264_240fps_5s.mp4',
-    why: 'A.16 extreme fps (240 fps): high frame-rate decode throughput + timestamp density.',
-  },
-  {
-    id: 'h264_1x1_1s.mp4',
-    why: 'A.16 1×1 video: minimum-dimension decode (degenerate but legal).',
-  },
-  {
-    id: 'h264_0x0_1s.mp4',
-    why: 'A.16 0×0 video: zero-dimension decode → must be graceful/correct, not a crash.',
-  },
-];
-
 // ── Frame-accurate decode ─────────────────────────────────────────────────────────────────────
 
 interface DecodeCase {
@@ -86,8 +47,6 @@ interface DecodeCase {
   maxFrames?: number;
   /** extra capability features the case requires (e.g. 'rotate' for display-matrix output) */
   features?: string[];
-  /** marks a case whose fixture the bake has not produced yet (§5.4) — documented in notes */
-  assetMissing?: boolean;
   /** size-ladder bucket this decode point measures (for the decode-fps-vs-size curve) */
   sizeBucket?: string;
   tolerances?: OracleTolerances;
@@ -234,78 +193,72 @@ const DECODE_CASES: DecodeCase[] = [
       'video track for engines that expose track selection.)',
   },
 
-  // ── bit depth (A.4 "8-bit & 10-bit depth") — honest asset-missing until the bake adds 10-bit ──
+  // ── bit depth (A.4 "8-bit & 10-bit depth") ──
   {
     id: 'decode_h264_10bit',
     asset: 'h264_10bit_1080p_5s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 30,
-    assetMissing: true,
     sizeBucket: 'small',
     notes:
-      'A.4 10-bit-depth decode (yuv420p10le / High 10). Fixture NOT yet baked (§5.4): registered so ' +
-      'it activates on bake; until then this resolves to a distinct asset-missing failure, never a ' +
-      'fabricated value. 10-bit output is normalized to RGBA by the oracle decoder like 8-bit.',
+      'A.4 10-bit-depth decode (yuv420p10le / High 10). 10-bit output is normalized to RGBA by the ' +
+      'oracle decoder like 8-bit.',
   },
 
-  // ── open-GOP first-frame correctness, distinct from B-frame reorder (A.16) — asset-missing ──
+  // ── open-GOP first-frame correctness, distinct from B-frame reorder (A.16) ──
   {
     id: 'decode_open_gop_first_frame',
     asset: 'h264_open_gop_1080p.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 16,
-    assetMissing: true,
     sizeBucket: 'small',
     notes:
       'A.16 open-GOP: leading B-frames precede the first I/IDR, so the very first DISPLAYED frame is ' +
-      'not the first DECODED frame. Distinct from decode_bframes_reorder (closed-GOP B-frames). ' +
-      'Fixture NOT yet baked (§5.4); registered for activation on bake.',
+      'not the first DECODED frame. Distinct from decode_bframes_reorder (closed-GOP B-frames).',
   },
 
-  // ── extreme fps (A.16 "extreme fps (1 fps, 240 fps)") — asset-missing until baked ──
+  // ── extreme fps (A.16 "extreme fps (1 fps, 240 fps)") ──
   {
     id: 'decode_extreme_fps_1',
     asset: 'h264_1fps_30s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 30,
-    assetMissing: true,
     sizeBucket: 'tiny',
-    notes: 'A.16 extreme fps (1 fps): low-rate timestamp spacing. Fixture NOT yet baked (§5.4).',
+    notes: 'A.16 extreme fps (1 fps): low-rate timestamp spacing.',
   },
   {
     id: 'decode_extreme_fps_240',
-    asset: 'h264_240fps_5s.mp4',
+    asset: 'video_240fps.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 240,
-    assetMissing: true,
     sizeBucket: 'small',
-    notes: 'A.16 extreme fps (240 fps): dense timestamps / high decode throughput. Fixture NOT yet baked (§5.4).',
+    notes: 'A.16 extreme fps (240 fps): dense timestamps / high decode throughput.',
   },
 
-  // ── degenerate dimensions (A.16 "0×0 or 1×1 video") — asset-missing until baked ──
+  // ── degenerate dimensions (A.16 "0×0 or 1×1 video") ──
   {
     id: 'decode_tiny_dims_1x1',
-    asset: 'h264_1x1_1s.mp4',
-    container: 'mp4',
-    videoCodec: 'h264',
+    asset: 'video_1x1.webm',
+    container: 'webm',
+    videoCodec: 'vp9',
     maxFrames: 8,
-    assetMissing: true,
     sizeBucket: 'micro',
-    notes: 'A.16 1×1 video: minimum-dimension decode (legal but degenerate). Fixture NOT yet baked (§5.4).',
+    notes: 'A.16 1×1 video: minimum-dimension decode (legal but degenerate).',
   },
   {
-    id: 'decode_tiny_dims_0x0',
-    asset: 'h264_0x0_1s.mp4',
+    id: 'decode_tiny_dims_2x2_h264',
+    asset: 'video_2x2_h264.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 8,
-    assetMissing: true,
     sizeBucket: 'micro',
-    notes: 'A.16 0×0 video: zero-dimension decode → must be graceful/correct, not a crash. Fixture NOT yet baked (§5.4).',
+    notes:
+      'A.16 minimum-dimension H.264 decode: 2×2 is the smallest honest yuv420p H.264 fixture because ' +
+      'libx264 cannot encode 1×1/0×0 yuv420p as valid media.',
   },
 ];
 

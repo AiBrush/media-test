@@ -455,6 +455,7 @@
       table {
         border-collapse: collapse;
         font-size: 0.85rem;
+        table-layout: fixed;
         width: 100%;
       }
       th,
@@ -463,6 +464,11 @@
         padding: 0.3rem 0.5rem;
         text-align: left;
         vertical-align: top;
+        overflow-wrap: anywhere;
+      }
+      th:first-child,
+      td.scn {
+        width: min(24rem, 34%);
       }
       th {
         background: var(--bg-alt);
@@ -473,12 +479,11 @@
       td.scn {
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 0.78rem;
-        white-space: nowrap;
       }
       .status {
         font-weight: 600;
         font-size: 0.78rem;
-        white-space: nowrap;
+        overflow-wrap: anywhere;
       }
       .status.PASS {
         color: var(--pass);
@@ -796,6 +801,14 @@
         <button id="select-all-eng" type="button">All engines</button>
         <button id="select-all-scn" type="button">All scenarios</button>
         <button id="download" type="button" disabled>Download results JSON</button>
+        <button
+          id="export-cache"
+          type="button"
+          disabled
+          title="Download every test result currently stored in this browser's persistent cache, without starting a new run."
+        >
+          Export stored test data
+        </button>
         <span id="run-status" class="muted"></span>
       </div>
       <div id="progress-wrap"><div id="progress-bar"></div></div>

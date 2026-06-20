@@ -174,6 +174,14 @@ function wireControls(): void {
   getEl<HTMLButtonElement>('select-all-eng').addEventListener('click', () => setAllChecked('engines-list', true));
   getEl<HTMLButtonElement>('select-all-scn').addEventListener('click', () => setAllChecked('scenarios-list', true));
   getEl<HTMLButtonElement>('download').addEventListener('click', downloadResults);
+  const cacheExportBtn = getEl<HTMLButtonElement>('export-cache');
+  cacheExportBtn.disabled = !resultCache;
+  if (!resultCache) {
+    cacheExportBtn.title = 'Stored result export is unavailable because IndexedDB is not available.';
+  }
+  cacheExportBtn.addEventListener('click', () => {
+    void downloadCachedResults();
+  });
 }
 
 function shouldAutoStart(): boolean {
@@ -366,12 +374,58 @@ function downloadResults(): void {
     referenceEngineId: getReferenceEngineId(),
     results,
   };
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  downloadJson(payload, `results-${env.browser}-${stamp}.json`);
+}
+
+async function downloadCachedResults(): Promise<void> {
+  const cacheExportBtn = getEl<HTMLButtonElement>('export-cache');
+  if (!resultCache) {
+    setRunStatus('stored result export unavailable: IndexedDB is not available');
+    return;
+  }
+
+  const originalText = cacheExportBtn.textContent ?? 'Export stored test data';
+  cacheExportBtn.disabled = true;
+  cacheExportBtn.textContent = 'Preparing export...';
+  try {
+    const entries = await resultCache.list();
+    if (entries.length === 0) {
+      setRunStatus('no stored test data to export');
+      return;
+    }
+    const invalidatedCount = entries.filter((entry) => entry.invalidated).length;
+    const payload = {
+      schema: 'media-browser-test/browser-cache-export@1',
+      generatedAtIso: new Date().toISOString(),
+      env,
+      support,
+      referenceEngineId: getReferenceEngineId(),
+      cache: {
+        rowCount: entries.length,
+        invalidatedCount,
+      },
+      entries,
+      results: entries.map((entry) => entry.result),
+    };
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    downloadJson(payload, `stored-test-data-${env.browser}-${stamp}.json`);
+    setRunStatus(`exported ${entries.length} stored result${entries.length === 1 ? '' : 's'}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    setRunStatus(`stored result export failed: ${msg}`);
+  } finally {
+    cacheExportBtn.disabled = false;
+    cacheExportBtn.textContent = originalText;
+  }
+}
+
+function downloadJson(payload: unknown, filename: string): void {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  a.download = `results-${env.browser}-${stamp}.json`;
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
 }

@@ -36,7 +36,18 @@ export interface CodecSupport {
 const VIDEO_TOKENS = ['h264', 'hevc', 'vp8', 'vp9', 'av1'] as const;
 type VideoToken = (typeof VIDEO_TOKENS)[number];
 
-const AUDIO_TOKENS = ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'] as const;
+const AUDIO_TOKENS = [
+  'aac',
+  'opus',
+  'mp3',
+  'flac',
+  'vorbis',
+  'pcm-s16',
+  'pcm-s24',
+  'pcm-f32',
+  'pcm-s16be',
+  'pcm-s24be',
+] as const;
 type AudioToken = (typeof AUDIO_TOKENS)[number];
 
 /**
@@ -63,6 +74,7 @@ const AUDIO_STRING: Record<AudioToken, string | null> = {
   'pcm-s24': 'pcm-s24',
   'pcm-f32': 'pcm-f32',
   'pcm-s16be': 'pcm-s16be',
+  'pcm-s24be': 'pcm-s24be',
 };
 
 /**

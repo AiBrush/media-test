@@ -60,12 +60,10 @@
  *        already takes (wired now so the cell lines up the moment frames are baked). decode(mux(x)) must
  *        equal decode(x) because mux copies coded samples; this is the strongest mux video gate.
  *
- *  - `graceful-failure` (oracles.ts gracefulFailure): only meaningful when the runner routes the case
- *    through `runRobustness`, which gates on `family==='robustness' || typeof scenario.mutate ===
- *    'function'`. A mux-family negative case therefore carries a deterministic `mutate` (identity for an
- *    already-degenerate input, or a corruptor) so the engine is fed the bytes and must reject CLEANLY
- *    within the timeout — PASS on a throw/reject (no output), FAIL on a crash/hang/timeout or on output
- *    emitted from clearly-illegal input. Same mechanism the demux/remux negative files use.
+ *  - `graceful-failure` (oracles.ts gracefulFailure): negative mux cases point at concrete malformed
+ *    fixture files. The runner routes those cases through the robustness path via the oracle and the
+ *    engine must reject CLEANLY within the timeout, or safely return partial output only when the
+ *    case explicitly allows it.
  */
 
 import type { MetricId, OracleId, Scenario } from '../../core/scenario.ts';
@@ -142,8 +140,6 @@ export interface MuxCase {
   oracles?: OracleId[];
   /** hard wall-clock cap (ms); bounds large/long size-ladder muxes. */
   timeoutMs?: number;
-  /** robustness routing: a mutate makes the runner feed bytes through runRobustness (negative cases). */
-  mutate?: (bytes: Uint8Array) => Uint8Array;
   notes?: string;
 }
 
@@ -195,7 +191,6 @@ export function buildMux(c: MuxCase): Scenario {
     metrics: [...metrics],
     ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
-    ...(c.mutate ? { mutate: c.mutate } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
@@ -261,7 +256,7 @@ export function buildMuxPropertyAll(cases: MuxPropertyCase[]): Scenario[] {
 
 export interface MuxNegativeCase {
   id: string;
-  /** source asset whose demuxed tracks (or mutated bytes) feed the muxer */
+  /** source asset whose demuxed tracks feed the muxer */
   input: string | string[];
   containersIn: string[];
   /** target container (often an ILLEGAL one for the source codec — must be rejected) */
@@ -270,25 +265,8 @@ export interface MuxNegativeCase {
   audioCodecs?: string[];
   features?: string[];
   extraOptions?: Record<string, unknown>;
-  /**
-   * Required: a mutate routes the case through runRobustness so `graceful-failure` is meaningful.
-   * Use identityBytes() for an "illegal codec/container" or "zero-track" case where the INPUT is valid
-   * but the requested mux is impossible — the engine must still reject cleanly within the timeout.
-   */
-  mutate: (bytes: Uint8Array) => Uint8Array;
   timeoutMs?: number;
   notes: string;
-}
-
-/** Identity passthrough — makes `scenario.mutate` truthy (→ robustness/graceful path) without altering
- *  the bytes. Used for negatives where the INPUT is valid but the requested mux is illegal/impossible. */
-export function identityBytes(): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => bytes;
-}
-
-/** Zero the entire buffer — models an empty / all-zero source whose demux yields no codable tracks. */
-export function zeroOutAll(): (bytes: Uint8Array) => Uint8Array {
-  return (bytes) => new Uint8Array(bytes.length);
 }
 
 export function buildMuxNegative(c: MuxNegativeCase): Scenario {
@@ -307,7 +285,6 @@ export function buildMuxNegative(c: MuxNegativeCase): Scenario {
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    mutate: c.mutate,
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   });
