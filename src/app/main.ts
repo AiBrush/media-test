@@ -23,6 +23,7 @@ import { groupScenariosByFeature } from '../core/scenario.ts';
 import type { ScenarioFamily, ScenarioResult } from '../core/scenario.ts';
 import type { ResultStatus } from '../core/scenario.ts';
 import { installFrameBakeControl } from '../core/frame-bake.ts';
+import { createResultCache } from './result-cache.ts';
 import { registerAll } from './register.ts';
 import type { RegistrationReport } from './register.ts';
 import {
@@ -64,6 +65,7 @@ interface SuiteRunFilter {
   browser?: BrowserName;
   warmup?: number;
   iters?: number;
+  reuseSuccessful?: boolean;
 }
 
 declare global {
@@ -84,6 +86,7 @@ let getCheckedEngines: () => string[] = () => [];
 let getCheckedFeatures: () => string[] = () => [];
 let getCheckedScenarios: () => string[] = () => [];
 const matrix = new MatrixView('results');
+const resultCache = createResultCache();
 
 async function boot(): Promise<void> {
   // 1. Environment + codec support (defensive — never throws).
@@ -176,7 +179,8 @@ async function runFromUi(): Promise<ScenarioResult[]> {
   const scenarioIds = getCheckedScenarios();
   const warmup = Number(getEl<HTMLInputElement>('warmup').value) || 1;
   const iters = Number(getEl<HTMLInputElement>('iters').value) || 1;
-  return runFromFilter({ engineIds, featureIds, scenarioIds, pillar: 'all', warmup, iters });
+  const reuseSuccessful = getEl<HTMLInputElement>('reuse-successful').checked;
+  return runFromFilter({ engineIds, featureIds, scenarioIds, pillar: 'all', warmup, iters, reuseSuccessful });
 }
 
 /** Run driven by an explicit filter (the headless launcher path + the UI path funnel here). */
@@ -239,6 +243,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     },
     onProgress: (done, total, label) => setProgress(done, total, label),
   };
+  if (filter.reuseSuccessful !== false && resultCache) opts.resultReuse = resultCache;
   if (engineIds) opts.engineIds = engineIds;
   if (scenarioIds) opts.scenarioIds = scenarioIds;
   if (filter.featureIds?.length) opts.featureIds = filter.featureIds;
