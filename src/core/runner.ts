@@ -235,6 +235,11 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
 
 // ── Run options ──────────────────────────────────────────────────────────────────────────────
 
+export interface ResultReuseStore {
+  get(engineId: string, scenarioId: string, browser: BrowserName): Promise<ScenarioResult | undefined>;
+  put(result: ScenarioResult): Promise<void>;
+}
+
 export interface RunOptions {
   browser: BrowserName;
   engineIds?: string[]; // default: all registered
@@ -245,6 +250,8 @@ export interface RunOptions {
   benchOptions?: BenchOptions;
   onResult?: (r: ScenarioResult) => void;
   onProgress?: (done: number, total: number, label: string) => void;
+  /** Reuse cached PASS/NA cells and write every completed cell back to persistent storage. */
+  resultReuse?: ResultReuseStore;
   /** optional override of the browser-pure oracle hooks; default to the platform engine's helpers */
   decodeWithPlatform?: OracleContext['decodeWithPlatform'];
   playbackSmoke?: OracleContext['playbackSmoke'];
@@ -1073,6 +1080,26 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
+      const cached = await opts.resultReuse?.get(engine.id, scenario.id, opts.browser).catch(() => undefined);
+      if (cached && (cached.status === 'PASS' || cached.status === 'NA_ENGINE' || cached.status === 'NA_BROWSER' || cached.status === 'NA_ASSET')) {
+        result = {
+          ...cached,
+          reason: cached.reason ? `cached: ${cached.reason}` : 'cached previous PASS/N/A result',
+        };
+        if (engine.dispose) {
+          try {
+            await engine.dispose();
+          } catch {
+            /* swallow */
+          }
+        }
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${label} (cached)`);
+        continue;
+      }
+
       // Build the reference engine for oracles that re-import. When the candidate is the registered
       // reference, reuse that already-initialized instance for the oracle instead of omitting it.
       let referenceEngine: MediaEngine | undefined;
@@ -1140,6 +1167,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         result.env = { ...result.env, configUsed: engine.configUsed };
       }
 
+      await opts.resultReuse?.put(result).catch(() => undefined);
       results.push(result);
       opts.onResult?.(result);
       done += 1;

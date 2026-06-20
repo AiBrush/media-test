@@ -74,6 +74,13 @@ function streamStaticFile(req, res, filePath, st, type, corp) {
     return res.end();
   }
 
+  if (st.size === 0) {
+    res.statusCode = range ? 416 : 200;
+    if (range) res.setHeader('Content-Range', 'bytes */0');
+    res.setHeader('Content-Length', '0');
+    return res.end();
+  }
+
   const start = parsed ? parsed.start : 0;
   const end = parsed ? parsed.end : st.size - 1;
   if (parsed) {
