@@ -63,6 +63,7 @@ const ROTATION_DECODE_READ: DecodeReadCase[] = [
     asset: 'h264_rotated90.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
+    features: ['rotation:decode'],
     // The clip is short; a handful of frames is enough to catch a wrong/absent rotation since the
     // golden frames are baked rotation-applied. (Golden frames for this asset are produced by the
     // in-browser frame-bake; until then decoded-frames-bitexact reports a clean "golden frames
@@ -75,7 +76,9 @@ const ROTATION_DECODE_READ: DecodeReadCase[] = [
       'engine that drops the 90° display matrix, or bakes rotation into width/height and serves ' +
       'unrotated pixels, yields a different decoded image -> frame-digest mismatch. This is the only ' +
       'rotation gate expressible from a scenario file (golden-metadata.compareTrack never compares ' +
-      'track.rotation).',
+      'track.rotation). Requires feature rotation:decode so generic decodeFrames implementations that ' +
+      'do not explicitly claim display-matrix-applied output report NA(engine) instead of a misleading ' +
+      'pixel mismatch.',
   },
 ];
 

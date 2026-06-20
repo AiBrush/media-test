@@ -11,9 +11,8 @@
  *
  * ── WHAT IS HONESTLY GATED TODAY ────────────────────────────────────────────────────────────────
  *   - faststart_in_memory (moov-first progressive) and faststart_none (moov-last default) are both
- *     PROGRESSIVE mp4 → plain-<video> playable + inline-demuxable, so reference-reimport + playback-smoke
- *     gate them, and a probe-duration invariant gates that relocating/placing the moov did not change
- *     reported duration.
+ *     structurally gated by reference-reimport; a probe-duration invariant gates that relocating/placing
+ *     the moov did not change reported duration.
  *   - frag_vs_nonfrag_decode_equality uses 'decode(remux(x))==decode(x)' — BUT the platform inline mp4
  *     demux is progressive-only (cannot parse moof), so this metamorphic is authored against the
  *     NON-FRAGMENTED (buffer) shape so it actually runs today; it proves the lossless-sample-copy
@@ -50,7 +49,7 @@ import {
   type StreamPropertyCase,
 } from './_shared.ts';
 
-// ── Output-shape cases (progressive mp4 variants — plain-playable, honestly gated today) ──────────
+// ── Output-shape cases (progressive mp4 variants — structurally gated today) ─────────────────────
 const SHAPE_CASES: StreamCase[] = [
   {
     id: 'mp4_faststart_in_memory',
@@ -64,8 +63,8 @@ const SHAPE_CASES: StreamCase[] = [
     notes:
       'fastStart PROGRESSIVE (moov-first): mediabunny fastStart:"in-memory" relocates moov to the front ' +
       'after a buffered second pass (progressive-download friendly) — a DISTINCT mode from in-place ' +
-      '"reserve". reference-reimport + playback-smoke gate that the relocated-moov output re-imports + ' +
-      'plays. The moov-BEFORE-mdat position check needs a box-offset oracle (see file header).',
+      '"reserve". reference-reimport gates that the relocated-moov output re-imports. The moov-BEFORE-' +
+      'mdat position check needs a box-offset oracle (see file header).',
   },
   {
     id: 'mp4_faststart_none_control',
@@ -78,8 +77,8 @@ const SHAPE_CASES: StreamCase[] = [
     notes:
       'fastStart:false CONTROL (moov-LAST, mdat-first): the default placement. The negative contrast ' +
       'proving fastStart/reserve actually MOVED/reserved the moov — without this control there is no ' +
-      'baseline for the moov-first cases. reference-reimport + playback-smoke gate that the default ' +
-      'output is valid; the moov-AFTER-mdat position check needs a box-offset oracle (see file header).',
+      'baseline for the moov-first cases. reference-reimport gates that the default output is valid; ' +
+      'the moov-AFTER-mdat position check needs a box-offset oracle (see file header).',
   },
 ];
 

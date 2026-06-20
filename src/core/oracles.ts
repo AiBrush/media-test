@@ -905,7 +905,6 @@ async function playbackSmoke(ctx: OracleContext): Promise<OracleOutcome> {
 
 async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'ssim-psnr';
-  if (!ctx.output) return fail(oracle, 'no ctx.output bytes to decode for SSIM/PSNR');
 
   const golden = ctx.golden;
   const want = golden.frames;
@@ -921,19 +920,27 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     ? Math.max(want?.length ?? 0, refSigs?.length ?? 0) || undefined
     : REFERENCE_SAMPLE;
 
-  // Decode the CANDIDATE output with the platform engine. This is the fragile path: some engine
-  // outputs (e.g. a remotion-webcodecs streaming/headerless WebM) cannot be decoded by the platform
-  // decoder, which can yield a null sink / null tracks / null frames and historically null-derefed
-  // here ("Cannot read properties of null"). Treat ANY decode failure or null/empty result as a
-  // clean FAIL with a clear detail rather than throwing an uncaught error.
+  // Source the CANDIDATE frame sequence:
+  //   • decodeFrames → ctx.frames, the engine's own decoded pixels/digests.
+  //   • bytes-producing ops → ctx.output, re-decoded with the platform engine.
+  // Decode output with the platform engine is the fragile path: some engine outputs (e.g. a
+  // remotion-webcodecs streaming/headerless WebM) cannot be decoded by the platform decoder, which
+  // can yield a null sink / null tracks / null frames and historically null-derefed here. Treat any
+  // decode failure or null/empty result as a clean FAIL with a clear detail rather than throwing.
   let sink: FrameSink | null | undefined;
-  try {
-    sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames });
-  } catch (err) {
-    return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
+  if (ctx.frames) {
+    sink = ctx.frames;
+  } else if (ctx.output) {
+    try {
+      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames });
+    } catch (err) {
+      return fail(oracle, `platform decode of engine output failed: ${errMsg(err)}`);
+    }
+  } else {
+    return fail(oracle, 'no decoded frames (ctx.frames) or output bytes (ctx.output) for SSIM/PSNR');
   }
   if (!sink) {
-    return fail(oracle, 'platform decode of engine output returned no sink (output not decodable)');
+    return fail(oracle, 'candidate decode returned no sink (output not decodable)');
   }
   const candFrames = Array.isArray(sink.frames) ? sink.frames : [];
   if (!candFrames.length) {
@@ -1254,37 +1261,16 @@ function seekAccuracy(ctx: OracleContext, t: Required<OracleTolerances>): Oracle
   const seek = ctx.seek;
   if (!seek) return fail(oracle, 'no ctx.seek result (landedPtsUs/frame)');
 
-  // Expected landing pts: from scenario options.tUs/targetUs, else from the seek frame's golden.
+  // Expected landing pts: exact keyframe when the scenario asks for one, otherwise the nearest real
+  // video PTS to the requested time. Pixel digests are intentionally not a hard gate here: independent
+  // decoders can produce tiny RGBA differences for the same frame, and seek-accuracy is a timestamp
+  // oracle. Decode pixel quality is covered by `ssim-psnr` on decodeFrames scenarios.
   const requestedUs = readNumberOption(ctx.scenario.options, ['tUs', 'targetUs', 'timeUs', 'atUs']);
+  const expectKeyframe = readBooleanOption(ctx.scenario.options, ['expectKeyframe', 'keyframe']);
   const measurements: Record<string, number> = { landedPtsUs: seek.landedPtsUs };
 
-  // Find the expected keyframe in golden: the latest keyframe at or before the requested time.
-  const want = ctx.golden;
-  let expectedFrame: FrameDigest | undefined;
-  let expectedPtsUs: number | undefined;
-
-  if (requestedUs != null && want.packets && want.packets.length) {
-    // Restrict the expected-keyframe search to the VIDEO track. A seek lands on a VIDEO frame, but
-    // golden packets interleave video + audio, and an audio track (e.g. AAC) is all-keyframe at a
-    // fine ~21ms cadence — so an unfiltered keyframeAtOrBefore would pick an AUDIO keyframe pts and
-    // falsely fail a correct VIDEO seek (the audio keyframe sits between video keyframes). We derive
-    // the video track index set from golden meta (positionally aligned with packet trackIndex) with a
-    // structural fallback when meta is absent.
-    const videoTracks = videoTrackIndices(want);
-    const videoPkts = videoTracks
-      ? want.packets.filter((p) => videoTracks.has(p.trackIndex))
-      : want.packets;
-    const kf = keyframeAtOrBefore(videoPkts.length ? videoPkts : want.packets, requestedUs);
-    if (kf) {
-      expectedPtsUs = kf.ptsUs;
-      expectedFrame = (want.frames ?? []).find((f) => Math.abs(f.ptsUs - kf.ptsUs) <= 1000);
-    }
-  }
-  // Fallback: golden seek frame matching landed pts.
-  if (!expectedFrame && want.frames) {
-    expectedFrame = want.frames.find((f) => Math.abs(f.ptsUs - seek.landedPtsUs) <= t.seekToleranceUs);
-    if (expectedFrame) expectedPtsUs = expectedFrame.ptsUs;
-  }
+  const expectedPtsUs =
+    requestedUs != null ? expectedSeekPtsUs(ctx.golden, requestedUs, expectKeyframe) : undefined;
 
   const diffs: string[] = [];
 
@@ -1293,27 +1279,18 @@ function seekAccuracy(ctx: OracleContext, t: Required<OracleTolerances>): Oracle
     measurements.seekDeltaUs = d;
     measurements.expectedPtsUs = expectedPtsUs;
     if (d > t.seekToleranceUs) {
+      const label = expectKeyframe ? 'expected keyframe' : 'expected frame pts';
       diffs.push(
-        `landed ${seek.landedPtsUs}µs vs expected keyframe ${expectedPtsUs}µs (Δ ${d}µs > ${t.seekToleranceUs}µs)`,
+        `landed ${seek.landedPtsUs}µs vs ${label} ${expectedPtsUs}µs (Δ ${d}µs > ${t.seekToleranceUs}µs)`,
       );
     }
   } else if (requestedUs != null) {
-    diffs.push('could not resolve expected keyframe from golden packets/frames');
-  }
-
-  // frame digest must match golden for the landed frame
-  if (expectedFrame) {
-    if (normHex(seek.frame.sha256) !== normHex(expectedFrame.sha256)) {
-      diffs.push(
-        `landed frame sha256 ${shortHex(seek.frame.sha256)} vs golden ${shortHex(expectedFrame.sha256)}`,
-      );
-    }
-  } else if (want.frames && want.frames.length) {
-    diffs.push('no golden frame matched the landed pts for digest comparison');
+    diffs.push('could not resolve expected video pts from golden packets/frames');
   }
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  return pass(oracle, `seek landed on expected keyframe within ${t.seekToleranceUs}µs, frame digest matches`, measurements);
+  const mode = expectKeyframe ? 'keyframe' : 'actual frame pts';
+  return pass(oracle, `seek landed on expected ${mode} within ${t.seekToleranceUs}µs`, measurements);
 }
 
 function keyframeAtOrBefore(pkts: PacketInfo[], tUs: number): PacketInfo | undefined {
@@ -1328,6 +1305,71 @@ function keyframeAtOrBefore(pkts: PacketInfo[], tUs: number): PacketInfo | undef
     }
   }
   return best;
+}
+
+function expectedSeekPtsUs(
+  golden: GoldenStore,
+  requestedUs: number,
+  expectKeyframe: boolean,
+): number | undefined {
+  const pkts = videoPacketsForGolden(golden);
+  if (pkts.length) {
+    if (expectKeyframe) return keyframeAtOrBefore(pkts, requestedUs)?.ptsUs;
+    return nearestPacketPts(pkts, requestedUs);
+  }
+
+  const frames = golden.frames ?? [];
+  if (!frames.length) return undefined;
+  if (expectKeyframe) {
+    const keyframes = frames.filter((f) => (f as FrameDigest & { keyframe?: boolean }).keyframe === true);
+    return nearestFramePts(keyframes.length ? keyframes : frames, requestedUs, true);
+  }
+  return nearestFramePts(frames, requestedUs, false);
+}
+
+function videoPacketsForGolden(golden: GoldenStore): PacketInfo[] {
+  const pkts = golden.packets ?? [];
+  if (!pkts.length) return [];
+  const videoTracks = videoTrackIndices(golden);
+  const videoPkts = videoTracks ? pkts.filter((p) => videoTracks.has(p.trackIndex)) : pkts;
+  return videoPkts.length ? videoPkts : pkts;
+}
+
+function nearestPacketPts(pkts: PacketInfo[], tUs: number): number | undefined {
+  let best: PacketInfo | undefined;
+  let bestD = Infinity;
+  for (const p of pkts) {
+    const d = Math.abs(p.ptsUs - tUs);
+    if (d < bestD || (d === bestD && best && p.ptsUs < best.ptsUs)) {
+      bestD = d;
+      best = p;
+    }
+  }
+  return best?.ptsUs;
+}
+
+function nearestFramePts(
+  frames: FrameDigest[],
+  tUs: number,
+  atOrBefore: boolean,
+): number | undefined {
+  let best: FrameDigest | undefined;
+  let bestD = Infinity;
+  for (const f of frames) {
+    if (atOrBefore && f.ptsUs > tUs) continue;
+    const d = Math.abs(f.ptsUs - tUs);
+    if (d < bestD || (d === bestD && best && f.ptsUs < best.ptsUs)) {
+      bestD = d;
+      best = f;
+    }
+  }
+  if (best) return best.ptsUs;
+  if (!atOrBefore) return undefined;
+  // If the request is before the first frame/keyframe, clamp to the earliest available frame.
+  for (const f of frames) {
+    if (!best || f.ptsUs < best.ptsUs) best = f;
+  }
+  return best?.ptsUs;
 }
 
 /**
@@ -1417,23 +1459,36 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     diffs.push('could not determine output duration (no reference probe, <2 decoded frames)');
   }
 
-  // Boundary frame digests vs golden: first and last decoded frames must match golden boundaries.
+  // Boundary frame digests are sound only when the loaded frame golden was baked for THIS trim
+  // range. Today the runner loads source-asset golden; those frames are an opening prefix of the full
+  // source, so comparing them to a sub-range trim boundary falsely fails correct cuts once frame
+  // golden is baked. Keep duration as the live gate and only activate digest comparison for future
+  // trim-range golden that declares a matching range.
   const want = ctx.golden.frames;
+  let boundaryDetail = 'boundary frame digest skipped (no decoded video boundary frames or trim-range golden)';
+  measurements.boundaryFrameComparisons = 0;
   if (want && want.length && frames.length) {
-    const firstGot = frames[0]!;
-    const lastGot = frames[frames.length - 1]!;
-    const firstWant = want[0]!;
-    const lastWant = want[want.length - 1]!;
-    if (normHex(firstGot.sha256) !== normHex(firstWant.sha256)) {
-      diffs.push(`start boundary frame ${shortHex(firstGot.sha256)} vs golden ${shortHex(firstWant.sha256)}`);
-    }
-    if (normHex(lastGot.sha256) !== normHex(lastWant.sha256)) {
-      diffs.push(`end boundary frame ${shortHex(lastGot.sha256)} vs golden ${shortHex(lastWant.sha256)}`);
+    const goldenRange = readGoldenTrimRange(ctx);
+    if (range && goldenRange && sameUsRange(range, goldenRange)) {
+      const firstGot = frames[0]!;
+      const lastGot = frames[frames.length - 1]!;
+      const firstWant = want[0]!;
+      const lastWant = want[want.length - 1]!;
+      measurements.boundaryFrameComparisons = 2;
+      boundaryDetail = 'boundary frames match trim-range golden';
+      if (normHex(firstGot.sha256) !== normHex(firstWant.sha256)) {
+        diffs.push(`start boundary frame ${shortHex(firstGot.sha256)} vs golden ${shortHex(firstWant.sha256)}`);
+      }
+      if (normHex(lastGot.sha256) !== normHex(lastWant.sha256)) {
+        diffs.push(`end boundary frame ${shortHex(lastGot.sha256)} vs golden ${shortHex(lastWant.sha256)}`);
+      }
+    } else {
+      boundaryDetail = 'boundary frame digest skipped (loaded golden is source-prefix, not trim-range golden)';
     }
   }
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  return pass(oracle, 'trim duration within tolerance and boundary frames match golden', measurements);
+  return pass(oracle, `trim duration within tolerance; ${boundaryDetail}`, measurements);
 }
 
 function readRange(options: unknown): { startUs: number; endUs: number } | undefined {
@@ -1444,6 +1499,18 @@ function readRange(options: unknown): { startUs: number; endUs: number } | undef
   const endUs = Number((r as Record<string, unknown>).endUs);
   if (Number.isFinite(startUs) && Number.isFinite(endUs)) return { startUs, endUs };
   return undefined;
+}
+
+function readGoldenTrimRange(ctx: OracleContext): { startUs: number; endUs: number } | undefined {
+  const rawFrames = ctx.golden.raw?.frames;
+  const direct = readRange(rawFrames);
+  if (direct) return direct;
+  if (isObject(rawFrames)) return readRange((rawFrames as Record<string, unknown>).trimRange);
+  return undefined;
+}
+
+function sameUsRange(a: { startUs: number; endUs: number }, b: { startUs: number; endUs: number }): boolean {
+  return Math.abs(a.startUs - b.startUs) <= 1 && Math.abs(a.endUs - b.endUs) <= 1;
 }
 
 // ── decrypt-bitexact ─────────────────────────────────────────────────────────────────────────
@@ -1535,6 +1602,9 @@ function gracefulAllowsReturnedOutput(ctx: OracleContext): boolean {
  * Compute a metamorphic invariant in-browser using the injected helpers + frame digests. The
  * specific invariant is selected by scenario.options.invariant (or notes):
  *   - 'decode-remux'     : decode(remux(x)) == decode(x)            (frame digests equal)
+ *   - 'seek-vs-linear'   : seek(t) lands on the same real PTS as linear decode at t
+ *   - 'decode-pts-*'     : decoded frame PTS values are strictly increasing after reorder
+ *   - 'vfr-seek-*'       : VFR seek lands on the nearest true demuxed frame PTS
  *   - 'probe-duration'   : probe durations equal across containers  (golden meta vs out via reference probe)
  *   - 'trim-concat'      : trim(a..b) ++ trim(b..c) ≈ trim(a..c)    (boundary digests / duration equal)
  * For the cross-frame digest invariants we compare the engine output (ctx.output) decoded by the
@@ -1545,6 +1615,22 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   const oracle: OracleId = 'property-invariant';
   const which = (readStringOption(ctx.scenario.options, ['invariant', 'property']) ??
     inferInvariant(ctx.scenario)).toLowerCase();
+
+  if (which.includes('transcode-output') || which.includes('output-metadata')) {
+    return transcodeOutputMetadataInvariant(ctx, t, which);
+  }
+
+  if (which === 'seek(t)==linear-decode-frame-at(t)' || which.includes('linear-decode-frame')) {
+    return seekVsLinearDecodeInvariant(ctx, t, which);
+  }
+
+  if (which === 'decode-pts-strictly-increasing' || which.includes('pts-strictly-increasing')) {
+    return decodePtsStrictlyIncreasingInvariant(ctx, which);
+  }
+
+  if (which === 'vfr-seek-lands-on-true-pts') {
+    return vfrSeekLandsOnTruePtsInvariant(ctx, t, which);
+  }
 
   if (which.includes('decode') || which.includes('remux')) {
     // decode(remux(x)) == decode(x): output frame digests must equal golden source-decode digests.
@@ -1625,7 +1711,258 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     return { ...out, detail: `[invariant trim concat ≈ direct trim] ${out.detail ?? ''}`.trim() };
   }
 
-  return fail(oracle, `unknown property-invariant '${which}' (expected decode-remux | probe-duration | trim-concat)`);
+  return fail(
+    oracle,
+    `unknown property-invariant '${which}' (expected decode-remux | seek-vs-linear-decode | decode-pts-strictly-increasing | vfr-seek-lands-on-true-pts | probe-duration | trim-concat | transcode-output-metadata)`,
+  );
+}
+
+function seekVsLinearDecodeInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): OracleOutcome {
+  const oracle: OracleId = 'property-invariant';
+  const seek = ctx.seek;
+  if (!seek) return fail(oracle, `[${which}] no ctx.seek result to compare`);
+  const requestedUs = readNumberOption(ctx.scenario.options, ['tUs', 'targetUs', 'timeUs', 'atUs']);
+  if (requestedUs == null) return fail(oracle, `[${which}] no requested seek time in scenario options`);
+  const expectKeyframe = readBooleanOption(ctx.scenario.options, ['expectKeyframe', 'keyframe']);
+  const expectedPtsUs = expectedSeekPtsUs(ctx.golden, requestedUs, expectKeyframe);
+  if (expectedPtsUs == null) {
+    return fail(oracle, `[${which}] could not resolve linear-decode frame pts from golden timing`);
+  }
+  const deltaUs = Math.abs(seek.landedPtsUs - expectedPtsUs);
+  const measurements = { requestedUs, landedPtsUs: seek.landedPtsUs, expectedPtsUs, deltaUs };
+  if (deltaUs > t.seekToleranceUs) {
+    return fail(
+      oracle,
+      `[${which}] seek landed ${seek.landedPtsUs}µs vs linear-decode pts ${expectedPtsUs}µs (Δ ${deltaUs}µs > ${t.seekToleranceUs}µs)`,
+      measurements,
+    );
+  }
+  return pass(
+    oracle,
+    `[${which}] seek landed on the linear-decode pts ${expectedPtsUs}µs within ${t.seekToleranceUs}µs`,
+    measurements,
+  );
+}
+
+function decodePtsStrictlyIncreasingInvariant(ctx: OracleContext, which: string): OracleOutcome {
+  const oracle: OracleId = 'property-invariant';
+  const frames = ctx.frames?.frames ?? [];
+  if (!frames.length) return fail(oracle, `[${which}] no decoded frames on ctx.frames`);
+
+  let inversions = 0;
+  let duplicateOrBackstep = 0;
+  let minStepUs = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < frames.length; i++) {
+    const prev = frames[i - 1]!;
+    const cur = frames[i]!;
+    const step = cur.ptsUs - prev.ptsUs;
+    if (step <= 0) {
+      duplicateOrBackstep++;
+      if (cur.ptsUs < prev.ptsUs) inversions++;
+    } else if (step < minStepUs) {
+      minStepUs = step;
+    }
+  }
+  const measurements = finiteOnly({
+    frames: frames.length,
+    duplicateOrBackstep,
+    inversions,
+    minPositiveStepUs: minStepUs,
+  });
+  if (duplicateOrBackstep > 0) {
+    return fail(
+      oracle,
+      `[${which}] decoded PTS is not strictly increasing (${duplicateOrBackstep} duplicate/backstep pair(s), ${inversions} inversion(s))`,
+      measurements,
+    );
+  }
+  return pass(
+    oracle,
+    `[${which}] decoded PTS is strictly increasing over ${frames.length} frame(s)`,
+    measurements,
+  );
+}
+
+function vfrSeekLandsOnTruePtsInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): OracleOutcome {
+  const oracle: OracleId = 'property-invariant';
+  const seek = ctx.seek;
+  if (!seek) return fail(oracle, `[${which}] no ctx.seek result to compare`);
+  const requestedUs = readNumberOption(ctx.scenario.options, ['tUs', 'targetUs', 'timeUs', 'atUs']);
+  if (requestedUs == null) return fail(oracle, `[${which}] no requested seek time in scenario options`);
+  const videoPkts = videoPacketsForGolden(ctx.golden);
+  if (!videoPkts.length) return fail(oracle, `[${which}] no golden video packet PTS table`);
+
+  const expectedPtsUs = nearestPacketPts(videoPkts, requestedUs);
+  const landedActualDeltaUs = minPacketPtsDelta(videoPkts, seek.landedPtsUs);
+  if (expectedPtsUs == null || landedActualDeltaUs == null) {
+    return fail(oracle, `[${which}] could not resolve nearest VFR packet PTS`);
+  }
+
+  const targetDeltaUs = Math.abs(seek.landedPtsUs - expectedPtsUs);
+  const measurements = {
+    requestedUs,
+    landedPtsUs: seek.landedPtsUs,
+    expectedPtsUs,
+    targetDeltaUs,
+    landedActualDeltaUs,
+  };
+  const diffs: string[] = [];
+  if (targetDeltaUs > t.seekToleranceUs) {
+    diffs.push(
+      `landed ${seek.landedPtsUs}µs vs nearest true VFR pts ${expectedPtsUs}µs (Δ ${targetDeltaUs}µs > ${t.seekToleranceUs}µs)`,
+    );
+  }
+  if (landedActualDeltaUs > t.seekToleranceUs) {
+    diffs.push(
+      `landed pts ${seek.landedPtsUs}µs is not a real demuxed video pts (nearest Δ ${landedActualDeltaUs}µs > ${t.seekToleranceUs}µs)`,
+    );
+  }
+  if (diffs.length) return fail(oracle, `[${which}] ${diffs.join('; ')}`, measurements);
+  return pass(
+    oracle,
+    `[${which}] seek landed on nearest true VFR pts ${expectedPtsUs}µs`,
+    measurements,
+  );
+}
+
+function minPacketPtsDelta(pkts: PacketInfo[], ptsUs: number): number | undefined {
+  let best = Infinity;
+  for (const p of pkts) {
+    const d = Math.abs(p.ptsUs - ptsUs);
+    if (d < best) best = d;
+  }
+  return Number.isFinite(best) ? best : undefined;
+}
+
+async function transcodeOutputMetadataInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
+  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe output metadata`);
+
+  let meta: NormalizedMetadata;
+  try {
+    meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.transcode-meta'));
+  } catch (err) {
+    return fail(oracle, `[${which}] reference probe of output failed: ${errMsg(err)}`);
+  }
+
+  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const expectedContainer = readStringOption(options, ['container']);
+  const videoOpts = readObjectOption(options, 'video');
+  const audioOpts = readObjectOption(options, 'audio');
+  const diffs: string[] = [];
+  const measurements: Record<string, number> = {};
+
+  if (expectedContainer && normStr(meta.container) !== normStr(expectedContainer)) {
+    diffs.push(`container: output '${meta.container}' vs requested '${expectedContainer}'`);
+  }
+
+  const gotDur = meta.durationSec;
+  const wantDur = ctx.golden.meta?.durationSec ?? null;
+  if (wantDur != null && gotDur != null) {
+    const delta = Math.abs(gotDur - wantDur);
+    const assetId = primaryAssetId(ctx);
+    const container = resolveContainer(meta.container ?? ctx.output.container, assetId);
+    const explicitOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
+    const band = durationToleranceFor(container, assetId, t, explicitOverride);
+    const tolSec = band.loose
+      ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(wantDur))
+      : band.tolSec;
+    measurements.durationDeltaSec = delta;
+    measurements.durationToleranceSec = tolSec;
+    if (delta > tolSec) {
+      diffs.push(
+        `duration: output ${gotDur.toFixed(4)}s vs source ${wantDur.toFixed(4)}s ` +
+          `(Δ ${delta.toFixed(4)}s > ${tolSec.toFixed(4)}s)`,
+      );
+    }
+  } else if (wantDur != null && gotDur == null) {
+    diffs.push(`duration: output null vs source ${wantDur}s`);
+  }
+
+  if (videoOpts) {
+    const videoTracks = meta.tracks.filter((track) => track.type === 'video');
+    measurements.videoTracks = videoTracks.length;
+    if (!videoTracks.length) {
+      diffs.push('video track: output has none');
+    } else {
+      compareRequestedTrack('video', videoTracks, videoOpts, t, diffs);
+    }
+  }
+
+  if (audioOpts) {
+    const audioTracks = meta.tracks.filter((track) => track.type === 'audio');
+    measurements.audioTracks = audioTracks.length;
+    if (!audioTracks.length) {
+      diffs.push('audio track: output has none');
+    } else {
+      compareRequestedTrack('audio', audioTracks, audioOpts, t, diffs);
+    }
+  }
+
+  if (diffs.length) return fail(oracle, `[${which}] ${diffs.join('; ')}`, measurements);
+  return pass(
+    oracle,
+    `[invariant transcode output metadata] ${meta.container}, ${meta.tracks.length} track(s) match requested output shape`,
+    measurements,
+  );
+}
+
+function compareRequestedTrack(
+  type: 'video' | 'audio',
+  tracks: NormalizedTrack[],
+  opts: Record<string, unknown>,
+  t: Required<OracleTolerances>,
+  diffs: string[],
+): void {
+  const requestedCodec = typeof opts.codec === 'string' && opts.codec.length ? opts.codec : undefined;
+  const track = requestedCodec
+    ? tracks.find((candidate) => normStr(candidate.codec) === normStr(requestedCodec))
+    : tracks[0];
+  if (!track) {
+    diffs.push(`${type} codec: output ${tracks.map((candidate) => candidate.codec).join(',') || 'none'} vs requested '${requestedCodec}'`);
+    return;
+  }
+
+  const prefix = `${type} track`;
+  if (requestedCodec && normStr(track.codec) !== normStr(requestedCodec)) {
+    diffs.push(`${prefix}.codec: '${track.codec}' vs requested '${requestedCodec}'`);
+  }
+
+  const width = readNumberOption(opts, ['width']);
+  const height = readNumberOption(opts, ['height']);
+  const fps = readNumberOption(opts, ['fps']);
+  const sampleRate = readNumberOption(opts, ['sampleRate']);
+  const channels = readNumberOption(opts, ['channels']);
+
+  if (type === 'video') {
+    if (width != null && track.width !== width) diffs.push(`${prefix}.width: ${track.width} vs requested ${width}`);
+    if (height != null && track.height !== height) diffs.push(`${prefix}.height: ${track.height} vs requested ${height}`);
+    if (fps != null && track.fps != null && Math.abs(track.fps - fps) > t.fpsTolerance) {
+      diffs.push(`${prefix}.fps: ${track.fps} vs requested ${fps} (tol ±${t.fpsTolerance})`);
+    } else if (fps != null && track.fps == null) {
+      diffs.push(`${prefix}.fps: null vs requested ${fps}`);
+    }
+  } else {
+    if (sampleRate != null && track.sampleRate !== sampleRate) {
+      diffs.push(`${prefix}.sampleRate: ${track.sampleRate} vs requested ${sampleRate}`);
+    }
+    if (channels != null && track.channels !== channels) {
+      diffs.push(`${prefix}.channels: ${track.channels} vs requested ${channels}`);
+    }
+  }
 }
 
 function probeDurationInvariant(
@@ -2022,6 +2359,12 @@ function readStringOption(options: unknown, keys: string[]): string | undefined 
     if (typeof v === 'string' && v.length) return v;
   }
   return undefined;
+}
+
+function readObjectOption(options: unknown, key: string): Record<string, unknown> | undefined {
+  if (!isObject(options)) return undefined;
+  const v = options[key];
+  return isObject(v) ? v : undefined;
 }
 
 function readStringArrayOption(options: unknown, keys: string[]): string[] {

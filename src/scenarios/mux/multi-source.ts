@@ -20,14 +20,14 @@
  * The runner assembles EncodedTracks from ALL named inputs (it demuxes each and the engine packs them).
  * The track-selection / swap intent is carried in options (trackSelect / swapAudioFrom) for a runner
  * that honours it; correctness is gated by probe-duration (materialized duration of the assembled
- * output) + playback-smoke for <video>-friendly targets.
+ * output).
  *
  * ORACLE NOTE on multi-source + reference-reimport (the dossier's "multi-source half-unchecked" gap):
  * for a list input, the runner loads golden = loadGolden(input[0]) — the FIRST asset only. A
  * reference-reimport packet-count check would compare the COMBINED multi-track output against a
  * single-source golden and FALSE-FAIL (the second track inflates the count). So multi-source cases do
- * NOT attach reference-reimport; they gate on probe-duration (container-agnostic) + playback-smoke. A
- * true per-track count check needs a demux(mux(x)) oracle that does not yet exist in oracles.ts.
+ * NOT attach reference-reimport; they gate on probe-duration (container-agnostic). A true per-track
+ * count check needs a demux(mux(x)) oracle that does not yet exist in oracles.ts.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -42,11 +42,10 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    // probe-duration only (no playback dependence on a precise duration); mkv is <video>-friendly so
-    // playback-smoke is added by default. reference-reimport is correctly omitted (multi-source golden).
+    // probe-duration only; reference-reimport is correctly omitted (multi-source golden).
     notes:
       'MULTI-SOURCE → NON-mp4: H.264 video (asset A) + AAC audio (asset B, raw ADTS) assembled into ' +
-      'MKV. Legacy multi-source only ever wrote mp4. probe-duration + playback gate; no source-keyed ' +
+      'MKV. Legacy multi-source only ever wrote mp4. probe-duration gate; no source-keyed ' +
       'packet count (two sources, single-asset golden).',
   },
   {
@@ -87,7 +86,7 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     notes:
       'TRACK DROP / SUBSET: source has 1 video + 2 audio; mux only {video, audio#0} into mp4 (drop ' +
       'audio#1). Output must contain exactly the selected tracks. options.trackSelect carries the ' +
-      'subset; probe-duration + playback gate the result (reference-reimport omitted: subset ≠ source ' +
+      'subset; probe-duration gates the result (reference-reimport omitted: subset ≠ source ' +
       'golden packet count).',
   },
 

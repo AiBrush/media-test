@@ -446,6 +446,16 @@ function withTimeout<T>(p: Promise<T>, timeoutMs: number | undefined): Promise<T
   }) as Promise<T>;
 }
 
+function isNotApplicableError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'NotApplicableError';
+}
+
+function notApplicableError(message: string): Error {
+  const err = new Error(message);
+  err.name = 'NotApplicableError';
+  return err;
+}
+
 // ── Operation dispatch ──────────────────────────────────────────────────────────────────────────
 
 /** The shape of an executed functional op, fed into the OracleContext. */
@@ -543,7 +553,7 @@ async function executeOp(engine: MediaEngine, scenario: Scenario, inputs: MediaI
         (scenario.options as { tracks?: EncodedTracks } | undefined)?.tracks ??
         (engine.prepareMuxTracks ? await engine.prepareMuxTracks(inputs, options) : undefined);
       if (!tracks) {
-        throw new Error('mux scenario requires options.tracks or engine.prepareMuxTracks()');
+        throw notApplicableError('mux scenario requires options.tracks or engine.prepareMuxTracks()');
       }
       return { output: await engine.mux(tracks, { container: asContainerOpt(scenario.options) }) };
     }
@@ -675,6 +685,9 @@ export async function runOne(
       if (err instanceof TimeoutError) {
         return finalize('FAIL', [], `timeout: ${err.message}`);
       }
+      if (isNotApplicableError(err)) {
+        return finalize('NA_ENGINE', [], errMessage(err));
+      }
       throw err; // genuine error → caught by outer try as ERROR
     }
 
@@ -733,6 +746,9 @@ export async function runOne(
     }
     return finalize('PASS', oracleOutcomes, undefined, benchResult);
   } catch (err) {
+    if (isNotApplicableError(err)) {
+      return finalize('NA_ENGINE', [], errMessage(err));
+    }
     return finalize('ERROR', [], errMessage(err));
   } finally {
     if (engine.dispose) {
@@ -816,6 +832,9 @@ async function runRobustness(
     opResult = await withTimeout(executeOp(engine, scenario, [input]), scenario.timeoutMs);
     verdict = 'graceful'; // it returned without crashing/hanging; the engine did not blow up
   } catch (err) {
+    if (isNotApplicableError(err)) {
+      return finalize('NA_ENGINE', [], errMessage(err));
+    }
     if (err instanceof TimeoutError) {
       verdict = 'timeout';
     } else {

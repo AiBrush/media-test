@@ -27,7 +27,7 @@ export function canMediaRecorderTranscode(): boolean {
   );
 }
 
-/** Pick a MediaRecorder mimeType for a requested container + video codec, or null if none works. */
+/** Pick a MediaRecorder mimeType for the exact requested container + video codec, or null if none works. */
 export function recorderMimeFor(container: string, videoCodec?: string): string | null {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') return null;
   const c = container.toLowerCase();
@@ -37,10 +37,16 @@ export function recorderMimeFor(container: string, videoCodec?: string): string 
     else if (videoCodec === 'vp8') candidates.push('video/webm;codecs=vp8');
     else if (videoCodec === 'av1') candidates.push('video/webm;codecs=av01');
     else if (videoCodec === 'h264') candidates.push('video/webm;codecs=h264');
-    candidates.push('video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm');
-  } else if (c === 'mp4' || c === 'mov') {
-    // Safari supports MP4 recording; Chromium/Firefox generally do not.
-    candidates.push('video/mp4;codecs=avc1', 'video/mp4');
+    else if (!videoCodec) candidates.push('video/webm');
+    else return null;
+  } else if (c === 'mp4') {
+    // Safari may support MP4 recording; Chromium/Firefox generally do not. Keep this strict: a
+    // requested HEVC/AV1 MP4 transcode must not silently fall back to AVC and then be benchmarked.
+    if (videoCodec === 'h264') candidates.push('video/mp4;codecs=avc1', 'video/mp4');
+    else if (videoCodec === 'hevc') candidates.push('video/mp4;codecs=hvc1', 'video/mp4;codecs=hev1');
+    else if (videoCodec === 'av1') candidates.push('video/mp4;codecs=av01');
+    else if (!videoCodec) candidates.push('video/mp4');
+    else return null;
   } else {
     return null;
   }
@@ -73,6 +79,9 @@ export async function transcodeViaRecorder(input: MediaInput, opts: TranscodeOpt
   const blob = await input.blob();
   const srcUrl = URL.createObjectURL(blob);
   const video = document.createElement('video');
+  let stream: MediaStream | undefined;
+  let recorder: MediaRecorder | undefined;
+  let stopped: Promise<void> | undefined;
   video.muted = true;
   video.playsInline = true;
   video.preload = 'auto';
@@ -94,27 +103,28 @@ export async function transcodeViaRecorder(input: MediaInput, opts: TranscodeOpt
     // Capture at 0 fps so frames are pushed ONLY when we call track.requestFrame(): this decouples
     // capture from requestAnimationFrame (which a backgrounded/automated tab throttles), so the
     // recording is driven by decoded source frames instead of wall-clock rAF ticks.
-    const stream = canvas.captureStream(0);
+    stream = canvas.captureStream(0);
     const recorderOpts: MediaRecorderOptions = { mimeType: mime };
     if (opts.video?.bitrate) recorderOpts.videoBitsPerSecond = opts.video.bitrate;
-    const recorder = new MediaRecorder(stream, recorderOpts);
+    recorder = new MediaRecorder(stream, recorderOpts);
+    const activeRecorder = recorder;
     const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
+    activeRecorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
-    const stopped = new Promise<void>((resolve) => {
-      recorder.onstop = () => resolve();
+    stopped = new Promise<void>((resolve) => {
+      activeRecorder.onstop = () => resolve();
     });
 
     // Request the recorder emit a chunk every 250ms so we always get data even on short clips.
-    recorder.start(250);
+    activeRecorder.start(250);
 
     // Drive playback and paint frames onto the canvas. We stop at the source's end.
     const videoTrack = stream.getVideoTracks()[0] as (MediaStreamTrack & { requestFrame?: () => void }) | undefined;
     await playAndPaint(video, ctx, outW, outH, videoTrack);
 
-    if (recorder.state !== 'inactive') recorder.stop();
+    if (activeRecorder.state !== 'inactive') activeRecorder.stop();
     await stopped;
     // Drain any pending track frames.
     for (const track of stream.getTracks()) track.stop();
@@ -124,6 +134,21 @@ export async function transcodeViaRecorder(input: MediaInput, opts: TranscodeOpt
     const outBytes = new Uint8Array(await outBlob.arrayBuffer());
     return { bytes: outBytes, mime: outMime, container: containerFromRecorderMime(mime) };
   } finally {
+    try {
+      video.pause();
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      for (const track of stream?.getTracks() ?? []) track.stop();
+    } catch {
+      /* ignore */
+    }
     video.removeAttribute('src');
     try {
       video.load();

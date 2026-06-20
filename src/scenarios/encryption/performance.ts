@@ -31,6 +31,7 @@ const decryptThroughput: Scenario = defineScenario({
     encryption: ['cenc-ctr'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['encryption:cenc-ctr-clear-output'],
   },
   // decrypt-bitexact is the correctness gate; throughputRealtime is the ranked headline.
   oracles: ['decrypt-bitexact'],
@@ -41,7 +42,8 @@ const decryptThroughput: Scenario = defineScenario({
     'HEADLINE TIMED DECRYPT (§A.14/§8.2): CENC AES-CTR decrypt throughput. primaryMetric=' +
     'throughputRealtime (decrypt wall vs 5.021s media duration, higher-is-better); ranked per §9. ' +
     'Correctness (decrypt-bitexact vs offline cleartext golden) gates the bench — no green oracle, ' +
-    'no admissible number.',
+    'no admissible number. Requires feature encryption:cenc-ctr-clear-output so an engine must first ' +
+    'declare clear-sample export for CENC-CTR before this performance cell can run.',
 });
 
 export const encryptionPerformanceScenarios: Scenario[] = [decryptThroughput];

@@ -65,10 +65,14 @@ const DECRYPT_CASES: DecryptCase[] = [
     keyName: 'cenc_ctr',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['encryption:cenc-ctr-clear-output'],
     notes:
       'CENC AES-CTR full-sample encryption. Decrypted frames bit-exact vs the offline-decrypt golden; ' +
       'reference-reimport proves the output is a re-parseable de-protected container; playback-smoke ' +
-      'proves it plays. Key/KID from fixtures/golden/cenc_ctr.mp4.keys.json (the offline ground truth).',
+      'proves it plays. Requires feature encryption:cenc-ctr-clear-output because recognizing CENC ' +
+      'track metadata is not enough: the engine must export clear samples as bytes before correctness ' +
+      'or throughput is admissible. Key/KID from fixtures/golden/cenc_ctr.mp4.keys.json (the offline ' +
+      'ground truth).',
   },
   {
     id: 'cenc_cbcs_decrypt',

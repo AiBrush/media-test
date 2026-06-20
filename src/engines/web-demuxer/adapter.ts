@@ -593,8 +593,10 @@ export class WebDemuxerEngine implements MediaEngine {
         decodeFrames: true,
       },
       // Read side with the FULL prebuilt wasm. Only canonical tokens the suite recognizes are
-      // declared; the full build also parses avi/flv/asf/mpeg, which are not in CANONICAL_CONTAINERS.
-      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts'],
+      // declared; the full build also parses avi/flv/asf/mpeg/mpegts, but v4.0.0's packet-stream
+      // reader returns a null AVPacketReader for MPEG-TS in this browser/package combination. Because
+      // this suite's demux cells require packet tables, do not declare TS until that path is runnable.
+      containersIn: ['mp4', 'mov', 'mkv', 'webm'],
       // Demuxer writes nothing.
       containersOut: [],
       // Codecs web-demuxer can identify + packetize from these containers. Pixel decode (decodeFrames

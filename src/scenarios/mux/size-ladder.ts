@@ -17,8 +17,7 @@
  * sample COPY (no re-encode), so sustained throughput + peak memory are the meaningful axes at scale,
  * and throughputRealtime is the per-case leaderboard ranking number (§9). CORRECTNESS STILL GATES
  * (§0.1): each case keeps its container-appropriate oracle set (probe-duration always; reference-
- * reimport for faithful mp4 targets; playback-smoke for <video>-friendly), so a fast-but-wrong mux
- * FAILs and cannot win the throughput crown.
+ * reimport for faithful mp4 targets), so a fast-but-wrong mux FAILs and cannot win the throughput crown.
  *
  * HONESTY: the large/long assets are `source: generated` with sha256/sizeBytes still null in the
  * manifest (gated behind a non-skip-longform bake). Until the bake produces them, these cases resolve

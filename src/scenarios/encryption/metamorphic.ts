@@ -54,6 +54,7 @@ interface DecryptMetamorphicCase {
   rawKeyHex?: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
+  features?: string[];
   oracles?: OracleId[];
   notes: string;
 }
@@ -67,11 +68,14 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     keyName: 'cenc_ctr',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['encryption:cenc-ctr-clear-output'],
     notes:
       'METAMORPHIC: decrypt(cenc_ctr.mp4) decodes bit-exact to the offline CLEARTEXT (golden frames ' +
       'baked from the baseline). property-invariant[decode-cleartext-baseline] gates the pixels; ' +
       'reference-reimport gates that the output is a genuinely de-protected, re-parseable container ' +
-      '(no leftover sinf/senc breaking the track). Decrypt analogue of decode(remux(x))==decode(x).',
+      '(no leftover sinf/senc breaking the track). Requires feature encryption:cenc-ctr-clear-output ' +
+      'so engines that can only parse protected-track metadata do not post a false decrypt result. ' +
+      'Decrypt analogue of decode(remux(x))==decode(x).',
   },
   {
     id: 'hls_aes128_decrypt_eq_cleartext',
@@ -124,6 +128,7 @@ const metamorphicScenarios: Scenario[] = METAMORPHIC_CASES.map((c) => {
       encryption: [c.scheme],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles ?? ['property-invariant', 'reference-reimport', 'playback-smoke'],
     metrics: ['wall', 'peakMemory', 'longtasks'],

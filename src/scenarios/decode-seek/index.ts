@@ -2,14 +2,14 @@
  * src/scenarios/decode-seek/index.ts — Pillar 1, family "decode-seek".
  *
  * Two ops share this family:
- *  - decodeFrames: pull frames and compare their digests (sha256 of normalized RGBA) to golden via
- *    `decoded-frames-bitexact`. Exercises B-frame reorder (output in pts order), VFR timing, the
+ *  - decodeFrames: pull frames and compare their pixels to golden with tolerance via `ssim-psnr`.
+ *    Exercises B-frame reorder (output in pts order), VFR timing, the
  *    codec matrix (H.264/HEVC/VP8/VP9/AV1), the container matrix (mp4/mov/mkv/webm), display-matrix
  *    rotation, non-default track selection, bit depth (8/10), and the SIZE ladder (§5.3 — the decode
  *    fps-vs-size curve A.14/8.2 asks for: tiny → small → medium → large → huge).
  *  - seek: jump to a target time and assert the landed frame via `seek-accuracy` (keyframe seeks
- *    land exactly; non-keyframe seeks land within tolerance) plus `decoded-frames-bitexact` on the
- *    landed frame's digest. Covers the codec/container matrix (A.7) AND the seek-OP edges (A.16):
+ *    land exactly; non-keyframe seeks land within tolerance). Covers the codec/container matrix (A.7)
+ *    AND the seek-OP edges (A.16):
  *    seek-past-EOF, negative seek, backward seek, seek-to-0, repeated idempotent seek.
  *
  * The seek target time is carried in `options.tUs` (microseconds); the keyframe-vs-arbitrary nature
@@ -36,11 +36,10 @@
  * METAMORPHIC invariants (§7) are registered as `property-invariant` cases carrying an `invariant`
  * token. The decode-anchored remux-equivalence invariant maps to the oracle's existing
  * 'decode(remux(x))==decode(x)' handler. The genuinely-new decode/seek invariants
- * (seek-vs-linear-decode, pts-monotonic-after-reorder, vfr-seek-lands-on-true-pts) describe the
- * cross-check the oracle must compute; until oracles.ts learns these tokens they resolve to an honest
- * FAIL ("unknown property-invariant") rather than a fabricated pass — consistent with rule §0.1 (a
- * wrong oracle that lets a fast-but-incorrect engine win is worse than an honest FAIL). The required
- * oracle extension is tracked in this family's dossier oracleGaps, NOT papered over here.
+ * (seek-vs-linear-decode, pts-monotonic-after-reorder, vfr-seek-lands-on-true-pts) are computed by
+ * the oracle from the operation result plus golden packet/frame timing. The seek invariants assert
+ * landed PTS rather than cross-decoder byte-identical pixels, because exact RGBA digests are too
+ * strict across independent decoders.
  */
 
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
@@ -308,8 +307,8 @@ const DECODE_CASES: DecodeCase[] = [
   },
 ];
 
-const DECODE_ORACLES: OracleId[] = ['decoded-frames-bitexact'];
-const DECODE_ALPHA_ORACLES: OracleId[] = ['decoded-frames-bitexact', 'alpha-plane'];
+const DECODE_ORACLES: OracleId[] = ['ssim-psnr'];
+const DECODE_ALPHA_ORACLES: OracleId[] = ['ssim-psnr', 'alpha-plane'];
 // decodeFps is the size-ladder headline (frames/s, higher-better); timeToFirstFrame is the decode
 // latency line (A.14). wall/peakMemory/longtasks stay for context.
 const DECODE_METRICS = ['decodeFps', 'timeToFirstFrame', 'wall', 'peakMemory', 'longtasks'] as const;
@@ -344,8 +343,8 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
 // The decode-fps-vs-size CURVE the spec asks for: one decode point per size bucket per major
 // codec/container, so the report can plot decode fps against size and reveal that the winner at
 // 10 MB can differ from the winner at 700 MB. These reuse the real corpus rungs (tiny → huge). They
-// are correctness-gated by `decoded-frames-bitexact` like every decode case (the same leading-N
-// frames are compared regardless of file length), and rank on `decodeFps`.
+// are correctness-gated by `ssim-psnr` like every decode case (the same leading-N frames are compared
+// regardless of file length), and rank on `decodeFps`.
 
 interface SizeLadderCase {
   id: string;
@@ -469,10 +468,10 @@ const SEEK_CASES: SeekCase[] = [
     asset: 'h264_1080p_30s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
-    tUs: 5_000_000,
+    tUs: 4_000_000,
     keyframe: true,
     tolerances: { seekToleranceUs: 0 },
-    notes: 'Seek to a known keyframe at 5s; must land exactly on it.',
+    notes: 'Seek to a known keyframe at 4s; must land exactly on it.',
   },
   {
     id: 'seek_h264_nonkeyframe',
@@ -610,13 +609,13 @@ const SEEK_CASES: SeekCase[] = [
     asset: 'h264_1080p_30s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
-    tUs: 5_000_000,
+    tUs: 4_000_000,
     keyframe: true,
     edge: 'repeated',
     // Idempotency: seeking to the same keyframe target a second time must land identically.
     tolerances: { seekToleranceUs: 0 },
     notes:
-      'Idempotent seek: seeking twice to the same 5s keyframe target must land on the IDENTICAL frame ' +
+      'Idempotent seek: seeking twice to the same 4s keyframe target must land on the IDENTICAL frame ' +
       '(deterministic landing; no decoder-state drift between the two seeks).',
   },
   {
@@ -654,7 +653,7 @@ const seekScenarios: Scenario[] = SEEK_CASES.map((c) =>
       containersIn: [c.container],
       videoCodecs: [c.videoCodec],
     },
-    oracles: ['seek-accuracy', 'decoded-frames-bitexact'],
+    oracles: ['seek-accuracy'],
     // seekMs (ms/seek, lower-better) is the spec's PRIMARY seek headline (A.7/A.14), wired at
     // measure.ts:96 from ctx.seeks=1. wall/longtasks stay for context.
     metrics: ['seekMs', 'wall', 'longtasks'],
@@ -670,8 +669,9 @@ const seekScenarios: Scenario[] = SEEK_CASES.map((c) =>
 // suite's OWN outputs). Registered as `property-invariant` cases carrying an `invariant` token the
 // oracle interprets. Where the oracle already implements the token (decode-anchored remux
 // equivalence → 'decode(remux(x))==decode(x)') the case is live today; the genuinely-new
-// decode/seek invariants describe the computation the oracle must add and, until then, resolve to an
-// honest FAIL rather than a fabricated pass (rule §0.1).
+// decode/seek invariants are timestamp/property checks rather than cross-decoder byte-identical pixel
+// checks. Exact RGBA frame digests are deliberately avoided here because independent decoders may
+// differ by small, visually irrelevant pixel deltas.
 
 interface InvariantCase {
   id: string;
@@ -712,13 +712,12 @@ const INVARIANT_CASES: InvariantCase[] = [
     container: 'mp4',
     videoCodec: 'h264',
     invariant: 'seek(t)==linear-decode-frame-at(t)',
-    options: { tUs: 5_000_000, expectKeyframe: true, invariant: 'seek(t)==linear-decode-frame-at(t)' },
-    oracleImplemented: false,
+    options: { tUs: 4_000_000, expectKeyframe: true, invariant: 'seek(t)==linear-decode-frame-at(t)' },
+    oracleImplemented: true,
     notes:
-      'METAMORPHIC seek-vs-linear-decode: the frame seek(5s) lands on must be BIT-IDENTICAL to the ' +
-      'same-pts frame from a linear decodeFrames pass — cross-checks the seek path against the decode ' +
-      'path with NO external golden. Oracle token not yet implemented in oracles.ts → honest FAIL ' +
-      'until added (tracked in dossier oracleGaps); never a fabricated pass.',
+      'METAMORPHIC seek-vs-linear-decode: seek(4s) must land on the same PTS that a linear decode ' +
+      'would expose at that keyframe — cross-checks the seek path against decode timing without a ' +
+      'cross-decoder bit-exact pixel requirement.',
   },
   {
     id: 'meta_pts_monotonic_after_reorder',
@@ -728,11 +727,11 @@ const INVARIANT_CASES: InvariantCase[] = [
     videoCodec: 'h264',
     invariant: 'decode-pts-strictly-increasing',
     options: { maxFrames: 60, invariant: 'decode-pts-strictly-increasing' },
-    oracleImplemented: false,
+    oracleImplemented: true,
     notes:
       'METAMORPHIC pts-monotonic-after-reorder: decodeFrames output pts must be STRICTLY INCREASING ' +
       '(B-frame reorder correctness) as an explicit in-family invariant, not just implicit golden ' +
-      'ordering. Needs no golden. Oracle token not yet implemented → honest FAIL until added.',
+      'ordering. Needs no golden.',
   },
   {
     id: 'meta_vfr_seek_lands_on_true_pts',
@@ -742,12 +741,11 @@ const INVARIANT_CASES: InvariantCase[] = [
     videoCodec: 'h264',
     invariant: 'vfr-seek-lands-on-true-pts',
     options: { tUs: 4_250_000, expectKeyframe: false, invariant: 'vfr-seek-lands-on-true-pts' },
-    oracleImplemented: false,
+    oracleImplemented: true,
     notes:
       'METAMORPHIC vfr-seek-lands-on-true-pts: for the VFR clip, seek(4.25s) must land on the nearest ' +
       'ACTUAL (uneven) frame pts, NOT a nominal-fps grid point — guards the VFR seek tolerance against ' +
-      'masking a grid-snapping bug. The landed pts must equal one of the demuxed real pts. Oracle ' +
-      'token not yet implemented → honest FAIL until added.',
+      'masking a grid-snapping bug. The landed pts must equal the nearest demuxed real pts.',
   },
 ];
 

@@ -22,8 +22,8 @@
  *
  * ORACLES: these are mp4 targets of an ISO-BMFF source → reference-reimport is FAITHFUL (the fragmented
  * variant re-imports as a valid fMP4; the reserve variant as a moov-first mp4), so defaultOracles
- * attaches reference-reimport + playback-smoke + probe-duration. A muxer that writes a broken
- * fragment/reserve layout fails re-import or playback.
+ * attaches reference-reimport + probe-duration. A muxer that writes a broken fragment/reserve layout
+ * fails re-import or the duration invariant.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -41,7 +41,7 @@ const OUTPUT_MODE_CASES: MuxCase[] = [
     metrics: MUX_STREAM_METRICS,
     notes:
       'MUX WRITE SUB-MODE mp4 progressive (§A.3): pack EncodedTracks into a whole-blob mp4 (moov after ' +
-      'mdat). Baseline for the mux streaming comparison; reference-reimport + playback gate (faithful).',
+      'mdat). Baseline for the mux streaming comparison; reference-reimport + duration gates are faithful.',
   },
   {
     id: 'mp4_streaming_target',

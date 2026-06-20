@@ -22,8 +22,9 @@
  * flac_seektable.flac, mp3_xing.mp3, wav_s16/s24/f32 to source these tracks (manifest.json).
  *
  * ORACLES (see _shared.ts header for the full rationale):
- *   - <video>-friendly targets (mov/ogg/wav/webm/mkv/mp4) keep playback-smoke; ts/adts/mp3 do NOT
- *     (a bare <video> can't reliably play a raw elementary stream → would FALSE-FAIL).
+ *   - playback-smoke is not a default mux-family gate. The raw Brave run showed mux-authored outputs
+ *     that re-import and duration-probe correctly can still fail to advance in a plain `<video>`, and
+ *     audio-only outputs do not satisfy that oracle's premise.
  *   - reference-reimport is attached ONLY for faithful targets (mp4/mov of an ISO-BMFF source); a
  *     reframing target (mkv/webm/ts/ogg/wav/adts/mp3) is gated by probe-duration instead of a
  *     packet-count check keyed on a source golden that does not describe the reframed output.
@@ -57,7 +58,7 @@ const WRITE_TARGET_CASES: MuxCase[] = [
     audioCodecs: ['opus'],
     notes:
       'WRITE TARGET ogg (§A.3): demux Opus from OGG, re-mux into OGG (re-author pages + granulepos). ' +
-      'Reframing target → gated by playback-smoke + probe-duration, not a source-keyed packet count.',
+      'Reframing target → gated by probe-duration, not a source-keyed packet count.',
   },
   {
     id: 'vorbis_to_ogg',
@@ -135,7 +136,7 @@ const WRITE_TARGET_CASES: MuxCase[] = [
     audioCodecs: ['opus'],
     notes:
       'AUDIO WRITE matrix: Opus (from OGG) → WebM audio-only (Matroska/WebM audio track authoring). ' +
-      'Complements the video WebM writes; webm is <video>-playable so playback-smoke applies.',
+      'Complements the video WebM writes; probe-duration gates the authored audio-only WebM duration.',
   },
   {
     id: 'flac_to_mkv_audio',

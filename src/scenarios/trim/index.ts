@@ -3,35 +3,30 @@
  *
  * Cut a sub-range out of the input. Two modes:
  *  - keyframe-aligned (frameAccurate: false): fast, copy-only; the cut snaps to the enclosing
- *    keyframe boundaries. Oracle asserts output duration ≈ the (snapped) requested range and the
- *    boundary frames vs golden.
+ *    keyframe boundaries. Oracle asserts output duration ≈ the requested range within a GOP budget.
  *  - frame-accurate (frameAccurate: true): re-encodes the leading GOP so the cut is exact;
  *    requires the 'trim:frame-accurate' feature.
  *
- * The `trim-boundaries` oracle checks probe(out).dur ≈ requested AND the first/last frames match
- * golden. Range is carried in options.range {startUs, endUs}; mode in options.frameAccurate.
+ * The `trim-boundaries` oracle checks probe(out).dur ≈ requested. Boundary-frame digests are compared
+ * only when trim-range-specific golden declares the same {startUs,endUs}; source-prefix golden is not
+ * a valid boundary oracle for sub-range trims. Range is carried in options.range {startUs, endUs};
+ * mode in options.frameAccurate.
  *
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  * ORACLE-STRENGTH NOTE (correctness GATES every number, §0.1; honest capabilities, §0; cite dossier).
  *
- * The committed `trim-boundaries` oracle (oracles.ts:1050) gates a trim on TWO things: (1) output
- * duration ≈ requested range (±tolerance), and (2) the first/last DECODED frame digest vs
- * `ctx.golden.frames`. Golden is keyed STRICTLY off the SOURCE asset id (runner.ts:564
- * `loadGolden(primaryInput.id)`) — there is no trim-range-specific golden and no per-scenario golden
- * override. The only frames golden for a source is the FIRST handful of frames of the WHOLE source
- * (pts 0…), and at present those digests are `pending`/null placeholders, which `loadGolden` drops
- * (oracles.ts:82-90) → `ctx.golden.frames` is `undefined` → the boundary-frame block is SKIPPED.
+ * `trim-boundaries` must not compare a trimmed output to source-opening frame golden. Golden is keyed
+ * off the SOURCE asset id (`loadGolden(primaryInput.id)`), so the source `.frames.json` is only an
+ * opening prefix of the whole file. For a trim whose boundary is not inside that exact prefix, digest
+ * comparison is a wrong oracle. The trim oracle therefore keeps duration as the live gate and compares
+ * boundary digests only after a future bake/runner path provides trim-range-specific golden.
  *
- * Consequence the dossier flags: for any trim whose start≠0 the boundary-frame check can NEVER be
- * satisfied by the source-opening golden even once baked, AND while golden is pending the gate is
- * effectively DURATION-ONLY — a fast-but-WRONG copy-trim that returns the wrong GOP but the right
- * duration would pass. We cannot fix the runner/oracle/golden from scenario-land (writer scope), but
- * we DO make the gate materially stronger than duration-only WITHOUT introducing a wrong oracle, by
- * adding — on every real SUB-RANGE trim whose output container the browser can actually play — one
- * extra oracle that does NOT depend on the (broken) boundary-frame golden:
+ * We make video sub-range trims stronger than duration-only WITHOUT introducing a wrong oracle by
+ * adding — where the browser reliably plays the output container — one extra oracle that does not
+ * depend on source-keyed boundary golden:
  *
- *   • `playback-smoke` — the trimmed bytes must be a VALID, PLAYABLE container that a <video>/
- *                        <audio> element advances a few frames on (oracles.ts:652). Catches the
+ *   • `playback-smoke` — the trimmed bytes must be a VALID, PLAYABLE container that a <video>
+ *                        element advances a few frames on. Catches the
  *                        "structurally-broken-but-platform-decodable" output the dossier calls out
  *                        (bad moov / wrong edit list / negative ctts that decodeWithPlatform might
  *                        tolerate but a real player rejects). It has NO source-keyed dependency, so
@@ -44,23 +39,20 @@
  * (FAILing a correct engine). `reference-reimport` is therefore used ONLY on the full-range / no-op
  * idempotent trims (output packet count ≈ source), where it is sound.
  *
- * These are STRICTLY ADDITIONAL gates (all declared oracles must pass — runner.ts:569). They do not
- * loosen anything and they do not pretend to verify the cut LANDED at the right place (only a
- * trim-range-specific golden could, which the bake must add — see GOLDEN-TODO below). `playback-smoke`
- * is attached only where it is HONEST: containers a platform <video>/<audio> reliably plays
- * (mp4/mov/webm/mp3/wav/ogg). For raw elementary / non-<video> containers (MKV, MPEG-TS, ADTS .aac,
- * AIFF, FLAC) we attach NO extra oracle and rely on `trim-boundaries` alone — exactly as strong as
- * the original copy cases — rather than over-claim a playback the browser may not honor (over-claim
- * → spurious FAIL is the §0 anti-pattern we avoid). The ±duration tolerance per case is the same
- * ±1-GOP (copy) / ±1-frame (frame-accurate) budget the existing cases use.
+ * These are STRICTLY ADDITIONAL gates (all declared oracles must pass). They do not pretend to verify
+ * the cut LANDED at the right decoded frame; only trim-range-specific golden can do that. `playback-
+ * smoke` is attached only where it is HONEST for the current helper: video containers a platform
+ * <video> element reliably plays (mp4/mov/webm). Audio-only outputs (mp3/ogg/wav/adts/flac/aiff)
+ * rely on the audio-appropriate duration gate in `trim-boundaries` until the harness has an <audio>
+ * playback smoke or decoded-PCM oracle. For raw / non-<video> containers (MKV, MPEG-TS, ADTS .aac,
+ * AIFF, FLAC) we also attach NO extra oracle rather than over-claim a playback the browser may not
+ * honor (over-claim → spurious FAIL is the §0 anti-pattern we avoid). The ±duration tolerance per
+ * case is the same ±1-GOP (copy) / ±1-frame (frame-accurate) budget the existing cases use.
  *
  * GOLDEN-TODO (for the bake, NOT writable here): bake per-(asset,startUs,endUs) boundary golden at
  * `fixtures/golden/<asset>__<start>_<end>.trim.frames.json` and have the oracle/runner load it keyed
- * by scenario range. Until then the boundary-frame digest check is a no-op for start≠0 trims and the
- * playback gate above is the strongest honest correctness signal we can assert. The one trim that CAN
- * reuse source golden today is the idempotent 0..fullDuration cut (its first/last kept frame ARE the
- * source opening/closing frames) — that case additionally declares `decoded-frames-bitexact` so it
- * bit-exact-checks against source golden the moment it is baked.
+ * by scenario range. Until then, source-prefix frame golden is deliberately ignored for trim boundary
+ * digest checks.
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  */
 
@@ -121,22 +113,20 @@ interface TrimCase {
 // 2308 packets), so a CORRECT 6s sub-range trim (~462 packets) would FAIL the `withinRel(…,2%)`
 // packet-count check (oracles.ts:635) and the keyframe-count check — a wrong oracle that FAILs a
 // correct engine. We therefore reserve `reference-reimport` for ONLY the full-range / no-op trims,
-// where output packet count ≈ source packet count (the idempotent cases below). For SUB-RANGE trims
-// the strongest HONEST extra gate is `playback-smoke` (the output must be a valid, playable
-// container) — which has no source-keyed dependency and cannot mis-fire on a correct trim.
+// where output packet count ≈ source packet count (the idempotent cases below). For VIDEO sub-range
+// trims the strongest HONEST extra gate is `playback-smoke` (the output must be a valid, playable
+// <video> container) — which has no source-keyed dependency and cannot mis-fire on a correct trim.
 
-/** Extra gate for a sub-range trim whose output container a <video>/<audio> element plays. */
+/** Extra gate for a sub-range trim whose output container a <video> element plays. */
 const PLAYABLE_AV: OracleId[] = ['playback-smoke'];
-/** Sub-range audio whose container plays in <video>/<audio> (mp3/wav/ogg). */
-const PLAYABLE_AUDIO: OracleId[] = ['playback-smoke'];
+/** Audio-only trims currently have no decoded-PCM or <audio> smoke oracle; duration is the honest gate. */
+const PLAYABLE_AUDIO: OracleId[] = [];
 /**
- * Sub-range trim whose output container <video> cannot reliably play (mkv/ts/adts/aiff/flac) AND on
- * which `reference-reimport` would mis-fire (full-source packet golden). No safe ADDITIONAL gate
- * exists, so these rely on `trim-boundaries` alone — exactly as strong as the original copy cases.
+ * Sub-range trim whose output container <video> cannot reliably play and on which `reference-reimport`
+ * would mis-fire (full-source packet golden). No safe ADDITIONAL gate exists, so these rely on
+ * `trim-boundaries` alone — exactly as strong as the original copy cases.
  */
 const BOUNDARIES_ONLY: OracleId[] = [];
-/** Full-range / no-op output: packet count ≈ source, so `reference-reimport` is safe + add playback. */
-const PLAYABLE_AV_FULLRANGE: OracleId[] = ['playback-smoke', 'reference-reimport'];
 
 const TRIM_CASES: TrimCase[] = [
   // ══ EXISTING CASES — preserved verbatim (currently-working behavior) ════════════════════════════
@@ -439,8 +429,8 @@ const TRIM_CASES: TrimCase[] = [
     notes: 'MPEG-TS copy-trim; estimate-only PTS, must keep 188-byte TS packet alignment.',
   },
 
-  // start == 0 trim (range 0..N) — the only non-full trim that COULD match source-opening golden;
-  // also exercises the 'no leading GOP to re-encode' path (dossier missingCases #9).
+  // start == 0 trim (range 0..N) exercises the 'no leading GOP to re-encode' path (dossier
+  // missingCases #9). Boundary digest comparison still needs range-specific golden for the end frame.
   {
     id: 'h264_start_zero_copy',
     asset: 'h264_1080p_30s.mp4',
@@ -730,9 +720,8 @@ interface InvariantTrimCase {
 }
 
 const INVARIANT_CASES: InvariantTrimCase[] = [
-  // Idempotence / no-op edge: trim(0 .. fullDuration) ≈ identity. The ONE trim that legitimately
-  // reuses source golden frames (first/last kept frame == source opening/closing frame) AND whose
-  // probed duration must equal the source duration (dossier deepEdgeToAdd "Idempotence/no-op edge").
+  // Idempotence / no-op edge: trim(0 .. fullDuration) ≈ identity. The probed duration must equal the
+  // source duration (dossier deepEdgeToAdd "Idempotence/no-op edge").
   // Gated by: trim-boundaries (out.dur ≈ requested full range) + property-invariant probe-duration
   // (out.dur ≈ golden SOURCE dur — non-circular here) + reference-reimport (packet/keyframe table
   // ≈ source) + playback-smoke.
@@ -747,8 +736,8 @@ const INVARIANT_CASES: InvariantTrimCase[] = [
     frameAccurate: false,
     invariant: 'probe-duration',
     // Full-range no-op: output packet count ≈ source, so reference-reimport is SOUND here (unlike on
-    // sub-range trims). decoded-frames-bitexact is intentionally omitted while source frame golden is
-    // pending; declaring it would make this supported cell fail on a fixture-bake gap, not engine behavior.
+    // sub-range trims). decoded-frames-bitexact is intentionally omitted: source-prefix golden can
+    // validate only the opening frames, not the full identity trim.
     extraOracles: ['playback-smoke', 'reference-reimport'],
     // Full-range no-op: duration should match the source duration to within ~1 frame.
     tolerances: { durationToleranceSec: 0.05 },

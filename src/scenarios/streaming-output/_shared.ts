@@ -46,8 +46,10 @@
  *       • MPEG-TS — TS is not reliably plain-<video>-playable cross-browser and its duration is
  *         estimate-only; gate on reference-reimport (mediabunny reads MPEG_TS, dossier §A.2).
  *   - `playback-smoke` plays `ctx.output` in a plain `<video>` (engines/platform/oracle-helpers.ts uses
- *     `video.src = blobURL`, NOT MSE). Safe ONLY for progressively-playable outputs (buffered / stream
- *     / faststart progressive mp4, normal webm). NOT attached to fragmented/headerless/TS.
+ *     `video.src = blobURL`, NOT MSE). The raw Brave run showed it false-failing even progressive MP4
+ *     outputs that reference-reimport proved structurally valid across mediabunny, ffmpeg.wasm, and
+ *     mp4box. This family therefore does not attach playback-smoke by default; streaming-output
+ *     conformance is gated by reference re-import and property invariants that inspect the bytes.
  *   - `property-invariant` (metamorphic, §11/§A.16): selected by `options.invariant`. Two variants used:
  *       • 'decode(remux(x))==decode(x)' → decodes ctx.output via the platform WebCodecs path and compares
  *         frame digests to golden.frames (== the offline decode of x). VIDEO-ONLY; needs baked
@@ -114,12 +116,7 @@ export interface StreamCase {
   shape: OutputShape;
   /** extra capability features the output mode needs (gated NA_ENGINE if an engine doesn't declare it) */
   features?: string[];
-  /**
-   * Override the default oracle set. Default (no shape that breaks plain playback/inline-demux):
-   *   reference-reimport + playback-smoke.
-   * Shapes that a plain <video>/inline demux cannot consume (fragmented/headerless/ts) MUST override to
-   * drop playback-smoke (and decode-remux) — see the _shared.ts header oracle rationale.
-   */
+  /** Override the default oracle set. Default: reference-reimport only. */
   oracles?: OracleId[];
   /** the metric the per-case winner is ranked by (§9); defaults to metrics[0] when omitted */
   primaryMetric?: MetricId;
@@ -130,8 +127,17 @@ export interface StreamCase {
   notes?: string;
 }
 
-/** Default oracle set for a shape that is progressively playable + inline-demuxable. */
-const DEFAULT_STREAM_ORACLES: OracleId[] = ['reference-reimport', 'playback-smoke'];
+/** Default oracle set for an output-shape byte-validity check. */
+const DEFAULT_STREAM_ORACLES: OracleId[] = ['reference-reimport'];
+
+/**
+ * Existing capability proxy for engines that expose low-level output-shape authoring. There is not yet
+ * a separate `output-shape` feature in the engine contract; `fragmented` is the current declared signal
+ * shared by the engines that can exercise this family without falling back to a generic copy-remux path.
+ * This keeps remux-only converters out of target/fastStart/write-chunk cases that otherwise ERROR before
+ * any oracle can run, while preserving the currently passing mediabunny/ffmpeg/mp4box rows.
+ */
+const OUTPUT_SHAPE_FEATURE = 'fragmented';
 
 /** Stable id for a streaming-output case. */
 function streamId(c: Pick<StreamCase, 'id'>): string {
@@ -149,9 +155,25 @@ function shapeOptions(shape: OutputShape, extra?: Record<string, unknown>): Reco
   return extra ? { ...o, ...extra } : o;
 }
 
+function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined {
+  const features = [...(c.features ?? [])];
+  const shape = c.shape;
+  const requestsOutputShape =
+    shape.target !== undefined ||
+    shape.fragmented !== undefined ||
+    shape.fastStart !== undefined ||
+    shape.writeChunkBytes !== undefined ||
+    shape.maximumPacketCount !== undefined;
+  if (requestsOutputShape && !features.includes(OUTPUT_SHAPE_FEATURE)) {
+    features.push(OUTPUT_SHAPE_FEATURE);
+  }
+  return features.length ? features : undefined;
+}
+
 /** Build a single streaming-output Scenario from a StreamCase. */
 export function buildStream(c: StreamCase): Scenario {
   const metrics: MetricId[] = [...STREAM_METRICS, ...(c.extraMetrics ?? [])];
+  const features = shapeFeatures(c);
   return defineScenario({
     id: streamId(c),
     op: 'remux',
@@ -163,7 +185,7 @@ export function buildStream(c: StreamCase): Scenario {
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-      ...(c.features ? { features: c.features } : {}),
+      ...(features ? { features } : {}),
     },
     oracles: c.oracles ?? DEFAULT_STREAM_ORACLES,
     metrics,
@@ -209,6 +231,7 @@ export interface StreamPropertyCase {
  * Metrics are kept minimal (the bench value of a metamorphic case is low; correctness is the point).
  */
 export function buildStreamProperty(c: StreamPropertyCase): Scenario {
+  const features = shapeFeatures(c);
   return defineScenario({
     id: `streaming-output/${c.id}`,
     op: 'remux',
@@ -220,7 +243,7 @@ export function buildStreamProperty(c: StreamPropertyCase): Scenario {
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-      ...(c.features ? { features: c.features } : {}),
+      ...(features ? { features } : {}),
     },
     oracles: c.oracles ?? ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],

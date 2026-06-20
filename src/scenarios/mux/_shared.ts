@@ -33,18 +33,19 @@
  *    keyframe COUNT can shift, so the `withinRel(...,0.02,1)` count gate + EXACT keyframe-count gate can
  *    FALSE-FAIL a correct mux. We therefore attach `reference-reimport` ONLY where the source golden is
  *    a faithful packet reference for the target (no reframing): mp4/mov targets of an mp4/mov source,
- *    and same-container identity-ish writes. For reframing targets we rely on `playback-smoke` +
+ *    and same-container identity-ish writes. For reframing targets we rely on
  *    `property-invariant:probe-duration` (container-agnostic) instead of a packet-count gate keyed on a
  *    mismatched golden. This is the explicit fix for the dossier's "golden keyed on source, mismatched
  *    to a cross-container mux target" oracle gap — we do not let a count gate keyed on the wrong
  *    reference either FALSE-FAIL a correct engine or (worse) mask a real bug.
  *
- *  - `playback-smoke` (oracles.ts playbackSmoke): plays `ctx.output` in a `<video>`. Works for the
- *    <video>-friendly targets (mp4/mov/mkv/webm/ogg/wav). A raw MPEG-TS / elementary ADTS / MP3 stream
- *    is NOT reliably playable by a bare `<video>` (no moov/duration, demuxer-dependent), so playback
- *    can FALSE-FAIL a correct TS/ADTS/MP3 mux — for those targets we DROP playback-smoke and gate
- *    structurally via probe-duration (+ reference-reimport only when faithful). This addresses the
- *    dossier's "playback-smoke is the only structural gate for non-<video> targets" gap.
+ *  - `playback-smoke` (oracles.ts playbackSmoke): plays `ctx.output` in a plain `<video>`. The raw
+ *    Brave run showed this is not a reliable mux-family structural gate: outputs that reference-reimport
+ *    and duration-probe correctly still failed to advance in `<video>` after being authored by mux().
+ *    Audio-only outputs also fail the "advance a video element" premise outright. We therefore do NOT
+ *    attach playback-smoke by default for mux cases. Browser-playback coverage belongs to targeted
+ *    scenarios with a playback oracle designed for the output shape; mux conformance is gated here by
+ *    reference re-import where faithful and by probe-duration everywhere.
  *
  *  - `property-invariant` (oracles.ts propertyInvariant; `options.invariant` selects the branch):
  *      • PROBE_DUR ('probe…dur') reference-probes the output duration and compares to
@@ -100,9 +101,6 @@ export const MUX_STREAM_METRICS = [
 
 // ── Container classification (drives the default oracle set) ─────────────────────────────────────
 
-/** Targets a bare `<video>` element can reliably play (so playback-smoke is a valid gate). */
-const PLAYABLE_TARGETS = new Set(['mp4', 'mov', 'mkv', 'webm', 'ogg', 'wav']);
-
 /**
  * Targets that DO NOT reframe an mp4/mov source's coded samples, so the SOURCE golden packet table is a
  * faithful reference for `reference-reimport`. mp4 and mov share ISO-BMFF length-prefixed (AVCC) NAL
@@ -137,7 +135,6 @@ export interface MuxCase {
    * Override the default oracle set. Default is derived from the target container:
    *   - reference-reimport is included ONLY for FAITHFUL_REIMPORT_TARGETS of an ISO-BMFF source
    *     (source golden is a faithful packet reference); see _shared.ts header.
-   *   - playback-smoke is included ONLY for PLAYABLE_TARGETS (<video>-friendly).
    *   - every case keeps property-invariant:probe-duration (container-agnostic structural gate).
    */
   oracles?: OracleId[];
@@ -150,9 +147,9 @@ export interface MuxCase {
 
 /**
  * Default oracle set for a mux cell. We deliberately ALWAYS include the container-agnostic
- * probe-duration property-invariant (the faithful cross-container gate), add playback-smoke only for
- * <video>-friendly targets, and add reference-reimport only where the source golden is a faithful
- * packet reference (no reframing). This is the central correction for the dossier's oracle gaps.
+ * probe-duration property-invariant (the faithful cross-container gate), and add reference-reimport
+ * only where the source golden is a faithful packet reference (no reframing). We do not attach
+ * playback-smoke here; see the header for why plain `<video>` smoke is too brittle for mux outputs.
  */
 function defaultOracles(c: MuxCase): OracleId[] {
   const sourceIsIsoBmff = c.containersIn.every((cc) => cc === 'mp4' || cc === 'mov');
@@ -161,9 +158,6 @@ function defaultOracles(c: MuxCase): OracleId[] {
   const oracles: OracleId[] = [];
   if (isSingleSource && !hasTrackSelection && sourceIsIsoBmff && FAITHFUL_REIMPORT_TARGETS.has(c.to)) {
     oracles.push('reference-reimport');
-  }
-  if (PLAYABLE_TARGETS.has(c.to)) {
-    oracles.push('playback-smoke');
   }
   // probe-duration: works for video AND audio, and is invariant under the container change — the one
   // gate that is always faithful regardless of source/target reframing.
@@ -223,6 +217,7 @@ export interface MuxPropertyCase {
   extraOptions?: Record<string, unknown>;
   /** default: ['property-invariant']; pass extra (e.g. add reference-reimport for track survival) */
   oracles?: OracleId[];
+  tolerances?: Scenario['tolerances'];
   timeoutMs?: number;
   notes?: string;
 }
@@ -249,6 +244,7 @@ export function buildMuxProperty(c: MuxPropertyCase): Scenario {
     },
     oracles: c.oracles ?? ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });

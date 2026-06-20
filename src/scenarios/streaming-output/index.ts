@@ -10,7 +10,7 @@
  *
  * This index holds the BASE six output-shape cases and concatenates the sibling sub-batteries:
  *   - ./base.ts                 — the original six shapes (stable ids), with the honest oracle fix
- *                                 (fragmented/TS/headerless drop playback-smoke → false-FAIL risk).
+ *                                 (reference-reimport, not brittle plain-<video> smoke).
  *   - ./ttfb.ts                 — time-to-first-byte (§A.10) buffer vs stream, ranked on timeToFirstByte.
  *   - ./fragmented-faststart.ts — fastStart progressive (moov-first) + fastStart:false control + the
  *                                 fragmented lossless-copy premise; documents the moof/mdat structure,

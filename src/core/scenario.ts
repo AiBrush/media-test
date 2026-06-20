@@ -35,7 +35,7 @@ export type OracleId =
   | 'ssim-psnr' // decode output → SSIM+PSNR vs reference frames (lossy ops)
   | 'alpha-plane' // alpha channel compared separately
   | 'seek-accuracy' // seek lands on expected keyframe / within tolerance
-  | 'trim-boundaries' // out duration ≈ requested AND boundary frames vs golden
+  | 'trim-boundaries' // out duration ≈ requested; boundary frames only with trim-range golden
   | 'decrypt-bitexact' // decoded frames bit-exact vs golden (offline reference decrypt)
   | 'graceful-failure' // malformed input → throw/reject within timeout, no crash/hang/OOM
   | 'property-invariant'; // metamorphic invariant computed in-browser (§11)

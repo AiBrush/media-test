@@ -63,7 +63,7 @@
  * ════════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-import type { OracleId, Scenario } from '../../core/scenario.ts';
+import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
 // Property-invariant tokens (see ORACLE TRUTH §3 — bare, routing-safe tokens; human phrasing → notes).
@@ -120,6 +120,8 @@ export interface TagWriteCase {
    * duration materialized from the re-wrapped stream is the honest sample-fidelity proxy).
    */
   invariant: typeof DECODE_REMUX | typeof PROBE_DUR;
+  /** Optional per-case oracle tolerances for container-estimation edges. */
+  tolerances?: OracleTolerances;
   notes?: string;
 }
 
@@ -148,6 +150,7 @@ export function buildWrite(c: TagWriteCase): Scenario {
     },
     oracles: ['reference-reimport', 'property-invariant'],
     metrics: ['wall', 'targetWrites'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
 }
@@ -165,6 +168,8 @@ export interface MetaPropertyCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   features?: string[];
+  /** Optional per-case oracle tolerances for container-estimation edges. */
+  tolerances?: OracleTolerances;
   /** override the default ['property-invariant'] oracle set (e.g. add reference-reimport) */
   oracles?: OracleId[];
   timeoutMs?: number;
@@ -188,6 +193,7 @@ export function buildProperty(c: MetaPropertyCase): Scenario {
     },
     oracles: c.oracles ?? ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
@@ -201,6 +207,8 @@ export interface DecodeReadCase {
   asset: string;
   container: string;
   videoCodecs?: string[];
+  /** Optional feature tokens for decoded-presentation properties (for example rotation:decode). */
+  features?: string[];
   /** how many frames to decode + digest-compare against golden */
   maxFrames: number;
   timeoutMs?: number;
@@ -223,6 +231,7 @@ export function buildDecodeRead(c: DecodeReadCase): Scenario {
       operations: ['decodeFrames'],
       containersIn: [c.container],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: ['decoded-frames-bitexact'],
     metrics: ['wall'],
@@ -243,6 +252,12 @@ export interface MetaNegativeCase {
   audioCodecs?: string[];
   /** byte mutation that garbles/truncates the tag/metadata region */
   mutate: (bytes: Uint8Array) => Uint8Array;
+  /**
+   * Some parsers safely recover from malformed tag regions by ignoring the corrupt tag and returning
+   * structural stream metadata. For those cases the robustness property is "no fault", not
+   * "mandatory reject".
+   */
+  gracefulAllowOutput?: boolean;
   timeoutMs?: number;
   notes: string;
 }
@@ -267,6 +282,7 @@ export function buildNegative(c: MetaNegativeCase): Scenario {
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
     mutate: c.mutate,
+    ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   });

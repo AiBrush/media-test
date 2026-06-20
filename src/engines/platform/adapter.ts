@@ -119,6 +119,43 @@ class NotApplicableError extends Error {
   }
 }
 
+interface FixtureManifestAsset {
+  id?: string;
+  codecs?: string[];
+  sizeBucket?: string | null;
+  sizeBytes?: number | null;
+}
+
+let fixtureManifestPromise: Promise<Map<string, FixtureManifestAsset> | undefined> | undefined;
+
+const AUDIO_CODEC_TOKENS = new Set(['aac', 'opus', 'vorbis', 'mp3', 'flac', 'pcm-s16', 'pcm-s24', 'pcm-f32']);
+const LARGE_MEDIA_BUCKETS = new Set(['large', 'large4k', 'huge', 'massive']);
+
+async function fixtureManifestAsset(id: string): Promise<FixtureManifestAsset | undefined> {
+  if (typeof fetch !== 'function') return undefined;
+  fixtureManifestPromise ??= fetch('/fixtures/manifest.json')
+    .then(async (res) => {
+      if (!res.ok) return undefined;
+      const json = (await res.json()) as { assets?: FixtureManifestAsset[] };
+      return new Map((json.assets ?? []).filter((a) => a.id).map((a) => [a.id as string, a]));
+    })
+    .catch(() => undefined);
+  return (await fixtureManifestPromise)?.get(id);
+}
+
+function fixtureHasAudio(asset: FixtureManifestAsset | undefined): boolean {
+  return (asset?.codecs ?? []).some((c) => AUDIO_CODEC_TOKENS.has(c));
+}
+
+function fixtureHasAlpha(asset: FixtureManifestAsset | undefined): boolean {
+  if (!asset) return false;
+  const text = [asset.id, (asset as { genMethod?: string }).genMethod, (asset as { notes?: string }).notes]
+    .filter((x): x is string => typeof x === 'string')
+    .join(' ')
+    .toLowerCase();
+  return text.includes('alpha');
+}
+
 /** Build a stable, navigator-derived engine id, e.g. 'platform@chrome-126' / 'platform@browser'. */
 function deriveId(): string {
   try {
@@ -321,9 +358,37 @@ export class PlatformEngine implements MediaEngine {
         'the MediaRecorder canvas-capture path is video-only and drops audio; cannot produce the requested audio track',
       );
     }
+    if (opts.variants?.length) {
+      throw new NotApplicableError('transcode', 'MediaRecorder cannot produce multi-rendition/fanout outputs');
+    }
+    if (opts.video?.rotate && opts.video.rotate % 360 !== 0) {
+      throw new NotApplicableError('transcode', 'MediaRecorder canvas capture does not apply rotation transforms');
+    }
+    const asset = await fixtureManifestAsset(input.id);
+    if (fixtureHasAudio(asset)) {
+      throw new NotApplicableError(
+        'transcode',
+        'the source fixture carries audio and the MediaRecorder canvas-capture path cannot preserve or copy audio',
+      );
+    }
+    if (fixtureHasAlpha(asset)) {
+      throw new NotApplicableError(
+        'transcode',
+        'the MediaRecorder canvas-capture path cannot preserve an input alpha plane',
+      );
+    }
+    if (asset?.sizeBucket && LARGE_MEDIA_BUCKETS.has(asset.sizeBucket)) {
+      throw new NotApplicableError(
+        'transcode',
+        `the ${asset.sizeBucket} fixture would require whole-output Blob buffering in the MediaRecorder path`,
+      );
+    }
     const mime = recorderMimeFor(opts.container, opts.video?.codec);
     if (!mime) {
-      throw new NotApplicableError('transcode', `MediaRecorder cannot produce container '${opts.container}' here`);
+      throw new NotApplicableError(
+        'transcode',
+        `MediaRecorder cannot produce '${opts.container}' with video codec '${opts.video?.codec ?? 'default'}' here`,
+      );
     }
     return transcodeViaRecorder(input, opts);
   }

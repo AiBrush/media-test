@@ -5,9 +5,9 @@
  * obtains those tracks by demuxing the named source asset(s) (the source provides the coded chunks +
  * codec private data), then asks the engine to remux them into the target container via mux().
  * Because the coded samples are copied, the output must round-trip: `reference-reimport` re-parses the
- * muxed file with the reference engine and diffs the packet table, `playback-smoke` confirms a <video>
- * can play it, and `property-invariant:probe-duration` checks the materialized output duration ≈ the
- * source (the container-agnostic gate that survives cross-container reframing).
+ * muxed file with the reference engine and diffs the packet table where source-keyed packets are a
+ * faithful reference, and `property-invariant:probe-duration` checks the materialized output duration ≈
+ * the source (the container-agnostic gate that survives cross-container reframing).
  *
  * `input` is the source asset whose demuxed tracks feed the muxer. For multi-track muxing we name a
  * list so the runner can assemble tracks from more than one source.
@@ -25,7 +25,6 @@
  */
 
 import type { Scenario } from '../../core/scenario.ts';
-import { defineScenario } from '../../core/scenario.ts';
 
 import muxCodecEdgeScenarios from './codec-edges.ts';
 import muxMetamorphicScenarios from './metamorphic.ts';
@@ -34,25 +33,15 @@ import muxNegativeScenarios from './negative.ts';
 import muxOutputModeScenarios from './output-modes.ts';
 import muxSizeLadderScenarios from './size-ladder.ts';
 import muxWriteTargetScenarios from './write-targets.ts';
+import { buildMuxAll, type MuxCase } from './_shared.ts';
 
-const MUX_METRICS = ['wall', 'throughputRealtime', 'peakMemory', 'targetWrites', 'longtasks'] as const;
-
-interface LegacyMuxCase {
-  id: string;
-  /** source asset(s) the runner demuxes to obtain EncodedTracks */
-  input: string | string[];
-  /** source container(s) — for negotiation */
-  containersIn: string[];
-  /** target container to mux into */
-  to: string;
-  videoCodecs?: string[];
-  audioCodecs?: string[];
-  notes?: string;
-}
+type LegacyMuxCase = MuxCase;
 
 /**
- * The original 7 mux cases — preserved verbatim (ids, oracles, options, metrics) so existing behavior
- * is unchanged. New coverage lives in the sibling sub-batteries (see the file header).
+ * The original 7 mux cases — stable ids and inputs are preserved, but they now route through the shared
+ * mux builder so their oracle set matches the rest of the mux family: faithful reference re-import where
+ * source-keyed packet counts are valid, plus probe-duration everywhere, and no brittle plain-<video>
+ * smoke gate for mux-authored bytes.
  */
 const LEGACY_CASES: LegacyMuxCase[] = [
   {
@@ -119,25 +108,7 @@ const LEGACY_CASES: LegacyMuxCase[] = [
   },
 ];
 
-const legacyMuxScenarios: Scenario[] = LEGACY_CASES.map((c) =>
-  defineScenario({
-    id: `mux/${c.id}`,
-    op: 'mux',
-    input: c.input,
-    options: { container: c.to },
-    requires: {
-      // mux needs demux (to get the tracks) + mux (to pack them).
-      operations: ['demux', 'mux'],
-      containersIn: c.containersIn,
-      containersOut: [c.to],
-      ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
-      ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-    },
-    oracles: Array.isArray(c.input) ? ['playback-smoke'] : ['reference-reimport', 'playback-smoke'],
-    metrics: [...MUX_METRICS],
-    ...(c.notes ? { notes: c.notes } : {}),
-  }),
-);
+const legacyMuxScenarios: Scenario[] = buildMuxAll(LEGACY_CASES);
 
 export const muxScenarios: Scenario[] = [
   ...legacyMuxScenarios,

@@ -128,8 +128,8 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
 
 // ── Multitrack KEEP-ALL: gate that EVERY track survives via faithful reference-reimport (mp4 target) ──
 // This one is NOT a decode invariant (it is about track SURVIVAL, not pixels), and its mp4 target is
-// faithful, so the legacy oracle pair is correct here — we build it directly (not via the property
-// builder) so it carries reference-reimport + playback-smoke + probe-duration (via defaultOracles).
+// faithful, so we build it directly (not via the property builder) so it carries reference-reimport +
+// probe-duration (via defaultOracles).
 const MULTITRACK_KEEP_ALL: MuxCase = {
   id: 'edge_multitrack_keep_all_to_mp4',
   input: 'h264_multitrack.mp4',
@@ -138,8 +138,8 @@ const MULTITRACK_KEEP_ALL: MuxCase = {
   videoCodecs: ['h264'],
   audioCodecs: ['aac'],
   // mp4 target of an mp4 source is faithful → defaultOracles attaches reference-reimport (which checks
-  // track layout + per-track packet counts) + playback-smoke + probe-duration. A dropped audio track
-  // shows up as a packet-count / track-layout divergence vs the source golden.
+  // track layout + per-track packet counts) + probe-duration. A dropped audio track shows up as a
+  // packet-count / track-layout divergence vs the source golden.
   notes:
     'MULTITRACK KEEP-ALL mux → mp4 (§A.16): mux ALL tracks (1 video + 2 audio) of the multitrack source ' +
     'into a single mp4; every track must survive. reference-reimport (faithful mp4 target) checks track ' +

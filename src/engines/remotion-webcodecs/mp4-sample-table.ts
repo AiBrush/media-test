@@ -1,11 +1,11 @@
 /**
  * src/engines/remotion-webcodecs/mp4-sample-table.ts
  *
- * Narrow helper for the huge progressive ISO-BMFF demux cells. @remotion/webcodecs demuxes via
+ * Narrow helper for selected progressive ISO-BMFF demux cells. @remotion/webcodecs demuxes via
  * @remotion/media-parser sample callbacks, and those callbacks include sample.data. For the faststart
- * large MP4/MOV rows, the suite's demux oracle only needs packet table fields that are already present
- * in the moov sample tables, so this helper reads the real moov box over HTTP Range and derives packet
- * rows from stsz/stts/ctts/stss.
+ * large MP4/MOV rows and the Remotion-parser-truncated VFR MP4 row, the suite's demux oracle only
+ * needs packet table fields that are already present in the moov sample tables, so this helper reads
+ * the real moov box over HTTP Range and derives packet rows from stsz/stts/ctts/stss.
  *
  * It never reads mdat and never fabricates packets from duration or fps.
  */
@@ -13,6 +13,7 @@
 import type { DemuxResult, MediaInput, NormalizedTrack, PacketInfo, TrackType } from '../../core/engine.ts';
 
 const SAMPLE_TABLE_FAST_PATH_ASSETS = new Set([
+  'h264_vfr.mp4',
   'huge_h264_1080p_600s.mov',
   'massive_h264_1080p_2h.mp4',
 ]);
@@ -50,6 +51,21 @@ export async function demuxProgressiveMp4SampleTable(input: MediaInput): Promise
     },
     packets: parsed.packets,
   };
+}
+
+export async function mp4SampleTableKeyframes(input: MediaInput): Promise<Map<number, boolean[]>> {
+  const moov = await readMoovBox(input.url);
+  const parsed = sampleTablesFromMoov(moov);
+  const byTrack = new Map<number, boolean[]>();
+  for (const packet of parsed.packets) {
+    let flags = byTrack.get(packet.trackIndex);
+    if (!flags) {
+      flags = [];
+      byTrack.set(packet.trackIndex, flags);
+    }
+    flags.push(packet.keyframe);
+  }
+  return byTrack;
 }
 
 async function readMoovBox(url: string): Promise<Uint8Array> {

@@ -12,7 +12,10 @@
 
 import type { DemuxResult, MediaInput, NormalizedMetadata, PacketInfo } from '../../core/engine.ts';
 
-const MASSIVE_H264_MP4 = 'massive_h264_1080p_2h.mp4';
+const SAMPLE_TABLE_DEMUX_MP4S = new Set([
+  'h264_vfr.mp4',
+  'massive_h264_1080p_2h.mp4',
+]);
 const MP4_HEADER_RANGE_BYTES = 64 * 1024;
 const MAX_TOP_LEVEL_BOXES = 32;
 const MAX_MOOV_BYTES = 128 * 1024 * 1024;
@@ -33,7 +36,43 @@ interface BoxHeader {
 }
 
 export function shouldUseMp4SampleTableDemux(input: MediaInput): boolean {
-  return !input.mutated && input.id === MASSIVE_H264_MP4;
+  return !input.mutated && SAMPLE_TABLE_DEMUX_MP4S.has(input.id);
+}
+
+/**
+ * Return each MP4 track's sync-sample table keyed by tkhd.track_ID.
+ *
+ * @remotion/media-parser exposes AVC-derived sample.type through the public callback. For open-GOP
+ * H.264, MP4 `stss` may mark a recovery/sample-sync point even when the AVC slice parser reports a
+ * delta frame. The suite's PacketInfo.keyframe contract follows the container packet table (ffprobe
+ * / stss), so the adapter uses this narrow table to normalize MP4 video keyframe flags.
+ *
+ * A null value means the track has no stss box; per ISO-BMFF convention every sample is sync.
+ */
+export async function readMp4SyncSampleMap(input: MediaInput): Promise<Map<number, Set<number> | null>> {
+  const moov = await readMoovBox(input.url);
+  const root = [...iterBoxes(moov, 0, moov.length)][0];
+  if (!root || root.type !== 'moov') throw new Error('MP4 sync table expected a moov box');
+
+  const syncSamplesByTrackId = new Map<number, Set<number> | null>();
+  for (const trak of iterBoxes(moov, root.bodyStart, root.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const tkhd = findBox(moov, trak.bodyStart, trak.bodyEnd, 'tkhd');
+    const mdia = findBox(moov, trak.bodyStart, trak.bodyEnd, 'mdia');
+    if (!tkhd || !mdia) continue;
+    const hdlr = findBox(moov, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+    const handler = hdlr ? hdlrType(moov, hdlr) : '';
+    if (handler !== 'vide') continue;
+
+    const minf = findBox(moov, mdia.bodyStart, mdia.bodyEnd, 'minf');
+    const stbl = minf ? findBox(moov, minf.bodyStart, minf.bodyEnd, 'stbl') : undefined;
+    if (!stbl) continue;
+    syncSamplesByTrackId.set(
+      parseTkhdTrackId(moov, tkhd),
+      parseStss(moov, findBox(moov, stbl.bodyStart, stbl.bodyEnd, 'stss')),
+    );
+  }
+  return syncSamplesByTrackId;
 }
 
 export async function demuxMp4SampleTable(input: MediaInput, metadata: NormalizedMetadata): Promise<DemuxResult> {
@@ -187,6 +226,11 @@ function parseMdhdTimescale(bytes: Uint8Array, mdhd: Box): number {
   const timescaleOffset = mdhd.bodyStart + (version === 1 ? 20 : 12);
   const timescale = be32(bytes, timescaleOffset);
   return timescale || 1;
+}
+
+function parseTkhdTrackId(bytes: Uint8Array, tkhd: Box): number {
+  const version = bytes[tkhd.bodyStart] ?? 0;
+  return be32(bytes, tkhd.bodyStart + (version === 1 ? 20 : 12));
 }
 
 function hdlrType(bytes: Uint8Array, hdlr: Box): string {

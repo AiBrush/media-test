@@ -110,6 +110,11 @@ export interface DecryptCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   /**
+   * Extra feature gates for decrypt export paths that are narrower than scheme parsing. For example,
+   * CENC-CTR clear-sample export is distinct from merely recognizing protected tracks.
+   */
+  features?: string[];
+  /**
    * Override the oracle set. Default: decrypt-bitexact (frame-exact vs offline cleartext golden) +
    * reference-reimport (output re-parses as a real container) + playback-smoke (the de-protected
    * MP4 actually plays). The two structural oracles are the decrypt analogue of the remux secondary
@@ -143,6 +148,7 @@ export function buildDecrypt(c: DecryptCase): Scenario {
       encryption: [c.scheme],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles ?? defaultDecryptOracles(),
     metrics: c.metrics ? [...c.metrics] : [...DECRYPT_METRICS],

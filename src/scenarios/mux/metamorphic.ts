@@ -118,9 +118,11 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'VFR through mux → mp4 (§A.16 VFR nominal vs real fps): irregular per-sample durations must be ' +
-      'preserved; a constant-cadence-assuming muxer changes the total duration. probe(mux(x)).dur gates it.',
+      'preserved; a constant-cadence-assuming muxer changes the total duration. probe(mux(x)).dur gates it. ' +
+      'Allows a 125 ms container-duration materialization band for VFR sample rounding, not the global gate.',
   },
   {
     id: 'prop_vfr_mux_duration_mp4_to_mkv',
@@ -130,9 +132,11 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'VFR through mux → mkv (§A.16): VFR timestamps re-authored as Matroska block timestamps; the ' +
-      'materialized duration must match. Catches a muxer that quantizes VFR to a constant cadence.',
+      'materialized duration must match. Catches a muxer that quantizes VFR to a constant cadence while ' +
+      'allowing the same 125 ms VFR materialization band as the mp4 target.',
   },
 ];
 

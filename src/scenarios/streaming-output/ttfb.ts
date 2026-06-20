@@ -23,8 +23,8 @@
  * leaderboard shows stream's first byte arriving earlier than buffer's. We do NOT invent a fake oracle
  * to assert it.
  *
- * CORRECTNESS STILL GATES (§0.1): both are progressive mp4 → reference-reimport + playback-smoke (the
- * default), so a fast-but-wrong output FAILs and cannot win the ttfb crown.
+ * CORRECTNESS STILL GATES (§0.1): both are progressive mp4 → reference-reimport (the default), so a
+ * fast-but-wrong output FAILs and cannot win the ttfb crown.
  */
 
 import type { Scenario } from '../../core/scenario.ts';

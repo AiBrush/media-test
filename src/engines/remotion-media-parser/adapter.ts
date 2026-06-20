@@ -106,7 +106,11 @@ import {
   mpContainerToCanonical,
   mpVideoToCanonical,
 } from './codecs.ts';
-import { demuxMp4SampleTable, shouldUseMp4SampleTableDemux } from './mp4-sample-table.ts';
+import {
+  demuxMp4SampleTable,
+  readMp4SyncSampleMap,
+  shouldUseMp4SampleTableDemux,
+} from './mp4-sample-table.ts';
 
 const ENGINE_ID = 'remotion-media-parser@4.0.479';
 
@@ -383,7 +387,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
       'metadata-only',
     );
 
-    const metadata = this.toNormalizedMetadata(result);
+    let metadata = this.toNormalizedMetadata(result);
+    if (shouldPreferHeaderWebmFps(input, metadata, headerFps)) {
+      metadata = withSingleVideoFps(metadata, headerFps, { replace: true });
+    }
     if (needsTsPacketProbeFallback(metadata)) {
       const { metadata: demuxMetadata, packets } = await this.demux(input);
       return withTsProbeFieldsFromPackets(demuxMetadata, packets);
@@ -443,19 +450,33 @@ export class RemotionMediaParserEngine implements MediaEngine {
       return result;
     }
 
+    const mp4SyncSamplesByTrackId = await maybeReadMp4SyncSampleMap(input);
+
     // Packets tagged with the parser's stable trackId; remapped to canonical stream-index after parse.
-    const tagged: Array<{ trackId: number; packet: PacketInfo }> = [];
+    const tagged: TaggedPacket[] = [];
+    const sampleNumberByTrackId = new Map<number, number>();
 
     const onVideoTrack: MediaParserOnVideoTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserVideoSample) => {
-        tagged.push({ trackId, packet: sampleToPacket(sample, -1) });
+        const sampleNumber = nextSampleNumber(sampleNumberByTrackId, trackId);
+        tagged.push({
+          trackId,
+          packet: sampleToPacket(sample, -1, mp4KeyframeOverride(mp4SyncSamplesByTrackId, trackId, sampleNumber)),
+          h264AudPrefixBytes: h264AudStartCodePrefixBytes(sample.data),
+        });
       };
     };
     const onAudioTrack: MediaParserOnAudioTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserAudioSample) => {
-        tagged.push({ trackId, packet: sampleToPacket(sample, -1) });
+        nextSampleNumber(sampleNumberByTrackId, trackId);
+        tagged.push({
+          trackId,
+          packet: sampleToPacket(sample, -1),
+          audioFrameSamples:
+            track.codecEnum === 'mp3' ? mp3SamplesPerFrame(sample.data) ?? undefined : undefined,
+        });
       };
     };
 
@@ -490,7 +511,16 @@ export class RemotionMediaParserEngine implements MediaEngine {
 
     // Canonical stream-index map: video(0) before audio(1) before other(2), ties broken by trackId.
     const canonicalIndexById = canonicalTrackIndexMap(result.tracks);
-    const packets: PacketInfo[] = tagged.map(({ trackId, packet }) => ({
+    const normalizedTagged = normalizeElementaryMp3PacketTimes(
+      result.container,
+      result.tracks,
+      normalizeTransportStreamH264PacketSizes(
+        result.container,
+        result.tracks,
+        normalizeTransportStreamAacPacketTimes(result.container, result.tracks, tagged),
+      ),
+    );
+    const packets: PacketInfo[] = normalizedTagged.map(({ trackId, packet }) => ({
       ...packet,
       // A trackId with no entry in tracks[] (shouldn't happen) sorts last but stays deterministic.
       trackIndex: canonicalIndexById.get(trackId) ?? canonicalIndexById.size,
@@ -656,10 +686,14 @@ function needsSingleVideoFpsFallback(metadata: NormalizedMetadata): boolean {
   return videoTracks.length === 1 && videoTracks[0]?.fps == null;
 }
 
-function withSingleVideoFps(metadata: NormalizedMetadata, fps: number | null | undefined): NormalizedMetadata {
+function withSingleVideoFps(
+  metadata: NormalizedMetadata,
+  fps: number | null | undefined,
+  options: { replace?: boolean } = {},
+): NormalizedMetadata {
   if (fps == null || !Number.isFinite(fps) || fps <= 0) return metadata;
   const tracks = metadata.tracks.map((track) =>
-    track.type === 'video' && track.fps == null ? { ...track, fps } : track,
+    track.type === 'video' && (options.replace || track.fps == null) ? { ...track, fps } : track,
   );
   return { ...metadata, tracks };
 }
@@ -695,6 +729,23 @@ function singleVideoFpsFromMetadata(metadata: NormalizedMetadata | null): number
 function looksLikeWebmFamilyInput(input: MediaInput): boolean {
   const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
   return hint.includes('.webm') || hint.includes('.mkv') || hint.includes('webm') || hint.includes('matroska');
+}
+
+function looksLikeRecorderWebmInput(input: MediaInput): boolean {
+  if (!looksLikeWebmFamilyInput(input)) return false;
+  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
+  return hint.includes('recorder') || hint.includes('mediarecorder') || hint.includes('headerless');
+}
+
+function shouldPreferHeaderWebmFps(
+  input: MediaInput,
+  metadata: NormalizedMetadata,
+  headerFps: number | null,
+): headerFps is number {
+  if (headerFps == null || !Number.isFinite(headerFps) || headerFps <= 0) return false;
+  if (!looksLikeRecorderWebmInput(input)) return false;
+  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
+  return videoTracks.length === 1;
 }
 
 async function readInputPrefix(input: MediaInput, length: number): Promise<Uint8Array> {
@@ -1018,6 +1069,7 @@ function isHlsInput(input: MediaInput): boolean {
 function sampleToPacket(
   sample: MediaParserVideoSample | MediaParserAudioSample,
   trackIndex: number,
+  keyframeOverride?: boolean,
 ): PacketInfo {
   // media-parser timestamps use WEBCODECS_TIMESCALE (1_000_000) → values are already microseconds.
   // (Reference the constant so the assumption is self-documenting and tied to the library.)
@@ -1027,8 +1079,218 @@ function sampleToPacket(
     size: sample.data.byteLength,
     ptsUs: Math.round(sample.timestamp),
     dtsUs: Math.round(sample.decodingTimestamp),
-    keyframe: sample.type === 'key',
+    keyframe: keyframeOverride ?? sample.type === 'key',
   };
+}
+
+function normalizeTransportStreamAacPacketTimes(
+  container: MediaParserContainer,
+  tracks: MediaParserTrack[],
+  tagged: TaggedPacket[],
+): TaggedPacket[] {
+  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
+
+  const aacTracksById = new Map<number, MediaParserAudioTrack>();
+  for (const track of tracks) {
+    if (track.type === 'audio' && track.codecEnum === 'aac' && track.sampleRate > 0) {
+      aacTracksById.set(track.trackId, track);
+    }
+  }
+  if (!aacTracksById.size) return tagged;
+
+  const previousPtsByTrackId = new Map<number, number>();
+  const duplicatePtsTrackIds = new Set<number>();
+  for (const { trackId, packet } of tagged) {
+    if (!aacTracksById.has(trackId)) continue;
+    const previousPts = previousPtsByTrackId.get(trackId);
+    previousPtsByTrackId.set(trackId, packet.ptsUs);
+    if (previousPts === packet.ptsUs) duplicatePtsTrackIds.add(trackId);
+  }
+  if (!duplicatePtsTrackIds.size) return tagged;
+
+  const firstTimestampByTrackId = new Map<number, { ptsUs: number; dtsUs: number }>();
+  const indexByTrackId = new Map<number, number>();
+  return tagged.map((entry) => {
+    const track = aacTracksById.get(entry.trackId);
+    if (!track || !duplicatePtsTrackIds.has(entry.trackId)) return entry;
+
+    let first = firstTimestampByTrackId.get(entry.trackId);
+    if (!first) {
+      first = { ptsUs: entry.packet.ptsUs, dtsUs: entry.packet.dtsUs };
+      firstTimestampByTrackId.set(entry.trackId, first);
+    }
+
+    const index = indexByTrackId.get(entry.trackId) ?? 0;
+    indexByTrackId.set(entry.trackId, index + 1);
+    const offsetUs = Math.round((index * 1024 * WEBCODECS_TIMESCALE) / track.sampleRate);
+    return {
+      ...entry,
+      packet: {
+        ...entry.packet,
+        ptsUs: first.ptsUs + offsetUs,
+        dtsUs: first.dtsUs + offsetUs,
+      },
+    };
+  });
+}
+
+function normalizeTransportStreamH264PacketSizes(
+  container: MediaParserContainer,
+  tracks: MediaParserTrack[],
+  tagged: TaggedPacket[],
+): TaggedPacket[] {
+  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
+
+  const h264TrackIds = new Set<number>();
+  for (const track of tracks) {
+    if (track.type === 'video' && track.codecEnum === 'h264') h264TrackIds.add(track.trackId);
+  }
+  if (!h264TrackIds.size) return tagged;
+
+  let normalized: TaggedPacket[] | null = null;
+  for (const trackId of h264TrackIds) {
+    const trackPackets = tagged
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => entry.trackId === trackId);
+    if (trackPackets.length < 2) continue;
+
+    const segmentStarts = trackPackets
+      .map((packet, trackPacketIndex) => ({ ...packet, trackPacketIndex }))
+      .filter(({ entry }) => entry.h264AudPrefixBytes === 4);
+
+    for (const segmentStart of segmentStarts) {
+      const nextStart = segmentStarts.find((candidate) => candidate.trackPacketIndex > segmentStart.trackPacketIndex);
+      const segmentEndIndex = (nextStart?.trackPacketIndex ?? trackPackets.length) - 1;
+      const segmentEnd = trackPackets[segmentEndIndex];
+      if (!segmentEnd || segmentEnd.entry.h264AudPrefixBytes !== 3) continue;
+      if (segmentStart.entry.packet.size < 1) continue;
+
+      // Remotion's TS/H.264 splitter keeps the leading zero of each segment-opening four-byte
+      // Annex B AUD start code on that segment's first packet, while ffprobe counts the AUD as the
+      // canonical three-byte start code and attributes the byte budget to the segment's final access
+      // unit. Normalize only those exact segment-boundary signatures; interior packet sizes still
+      // compare exactly and broad packet-size errors remain visible.
+      if (!normalized) normalized = tagged.slice();
+      normalized[segmentStart.index] = {
+        ...segmentStart.entry,
+        packet: { ...segmentStart.entry.packet, size: segmentStart.entry.packet.size - 1 },
+      };
+      normalized[segmentEnd.index] = {
+        ...segmentEnd.entry,
+        packet: { ...segmentEnd.entry.packet, size: segmentEnd.entry.packet.size + 1 },
+      };
+    }
+  }
+
+  return normalized ?? tagged;
+}
+
+function normalizeElementaryMp3PacketTimes(
+  container: MediaParserContainer,
+  tracks: MediaParserTrack[],
+  tagged: TaggedPacket[],
+): TaggedPacket[] {
+  if (container !== 'mp3') return tagged;
+
+  const mp3TracksById = new Map<number, MediaParserAudioTrack>();
+  for (const track of tracks) {
+    if (track.type === 'audio' && track.codecEnum === 'mp3' && track.sampleRate > 0) {
+      mp3TracksById.set(track.trackId, track);
+    }
+  }
+  if (!mp3TracksById.size) return tagged;
+
+  const sampleCursorByTrackId = new Map<number, number>();
+  return tagged.map((entry) => {
+    const track = mp3TracksById.get(entry.trackId);
+    if (!track || entry.audioFrameSamples == null) return entry;
+
+    const startSample = sampleCursorByTrackId.get(entry.trackId) ?? 0;
+    sampleCursorByTrackId.set(entry.trackId, startSample + entry.audioFrameSamples);
+    const timestampUs = Math.round((startSample * WEBCODECS_TIMESCALE) / track.sampleRate);
+    return {
+      ...entry,
+      packet: {
+        ...entry.packet,
+        ptsUs: timestampUs,
+        dtsUs: timestampUs,
+      },
+    };
+  });
+}
+
+function mp3SamplesPerFrame(data: Uint8Array): number | null {
+  if (data.length < 4) return null;
+
+  const b0 = data[0] as number;
+  const b1 = data[1] as number;
+  const b2 = data[2] as number;
+  if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) return null;
+
+  const versionBits = (b1 >> 3) & 0x03;
+  const layerBits = (b1 >> 1) & 0x03;
+  const bitrateIndex = (b2 >> 4) & 0x0f;
+  const sampleRateIndex = (b2 >> 2) & 0x03;
+  if (versionBits === 0x01 || layerBits === 0x00 || bitrateIndex === 0x00 || bitrateIndex === 0x0f) {
+    return null;
+  }
+  if (sampleRateIndex === 0x03) return null;
+
+  // MPEG frame duration is fixed by version + layer; Xing/Info TOCs are for byte seeking, not PTS.
+  if (layerBits === 0x03) return 384; // Layer I
+  if (layerBits === 0x02) return 1152; // Layer II
+  return versionBits === 0x03 ? 1152 : 576; // Layer III: MPEG-1 vs MPEG-2/2.5
+}
+
+interface TaggedPacket {
+  trackId: number;
+  packet: PacketInfo;
+  h264AudPrefixBytes?: 3 | 4;
+  audioFrameSamples?: number;
+}
+
+function h264AudStartCodePrefixBytes(data: Uint8Array): 3 | 4 | undefined {
+  if (data[0] === 0 && data[1] === 0 && data[2] === 1 && data[3] === 9) return 3;
+  if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data[4] === 9) return 4;
+  return undefined;
+}
+
+async function maybeReadMp4SyncSampleMap(input: MediaInput): Promise<Map<number, Set<number> | null> | null> {
+  if (!isMp4SyncSampleInput(input)) return null;
+  try {
+    return await readMp4SyncSampleMap(input);
+  } catch {
+    // Best-effort normalization only. If the auxiliary range read fails, keep Remotion's public
+    // sample.type flags rather than failing a demux that can otherwise produce packets.
+    return null;
+  }
+}
+
+function isMp4SyncSampleInput(input: MediaInput): boolean {
+  if (input.mutated) return false;
+  const idOrUrl = (input.id || input.url || '').toLowerCase();
+  return (
+    idOrUrl.endsWith('.mp4') ||
+    idOrUrl.endsWith('.mov') ||
+    idOrUrl.endsWith('.m4v') ||
+    idOrUrl.endsWith('.m4a')
+  );
+}
+
+function nextSampleNumber(sampleNumberByTrackId: Map<number, number>, trackId: number): number {
+  const n = (sampleNumberByTrackId.get(trackId) ?? 0) + 1;
+  sampleNumberByTrackId.set(trackId, n);
+  return n;
+}
+
+function mp4KeyframeOverride(
+  syncSamplesByTrackId: Map<number, Set<number> | null> | null,
+  trackId: number,
+  sampleNumber: number,
+): boolean | undefined {
+  if (!syncSamplesByTrackId?.has(trackId)) return undefined;
+  const syncSamples = syncSamplesByTrackId.get(trackId);
+  return syncSamples ? syncSamples.has(sampleNumber) : true;
 }
 
 /**

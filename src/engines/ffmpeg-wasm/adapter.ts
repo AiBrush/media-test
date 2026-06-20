@@ -109,6 +109,14 @@ const ENGINE_ID = 'ffmpeg.wasm@0.12.15';
 /** Vendored core version (both @ffmpeg/core and @ffmpeg/core-mt). */
 const CORE_VERSION = '0.12.10';
 
+/** Thrown for paths this adapter intentionally does not claim at runtime; the runner records NA_ENGINE. */
+class NotApplicableError extends Error {
+  constructor(op: string, reason: string) {
+    super(`${ENGINE_ID}: ${op} not applicable: ${reason}`);
+    this.name = 'NotApplicableError';
+  }
+}
+
 /** The best-path config we resolved at init(), recorded per §8.5 and surfaced via configUsed. */
 export interface FfmpegWasmConfig {
   backend: 'wasm';
@@ -169,6 +177,13 @@ const AV_NOPTS = -9223372036854775808;
  * Generous enough that a legitimately large-but-valid input still completes (read-only, no encode).
  */
 const READ_EXEC_TIMEOUT_MS = 60_000;
+
+interface PreparedMuxTrackCandidate {
+  inputIndex: number;
+  type: 'video' | 'audio';
+  typeOrdinal: number;
+  track: EncodedTracks['tracks'][number];
+}
 
 /** Parse `Duration: HH:MM:SS.ms` from an `ffmpeg -i` log; null if absent/`N/A`. */
 function parseDurationSecFromLog(log: string): number | null {
@@ -543,6 +558,103 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
     o += p.length;
   }
   return out;
+}
+
+/** Own a byte copy before crossing worker/oracle boundaries; ffmpeg.wasm may transfer/detach inputs. */
+function copyBytes(source: ArrayBufferLike | ArrayBufferView): Uint8Array {
+  const view = ArrayBuffer.isView(source)
+    ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
+    : new Uint8Array(source);
+  return new Uint8Array(view);
+}
+
+function startsWithBytes(data: Uint8Array, bytes: readonly number[]): boolean {
+  if (data.length < bytes.length) return false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (data[i] !== bytes[i]) return false;
+  }
+  return true;
+}
+
+function isAnnexB(data: Uint8Array): boolean {
+  return startsWithBytes(data, [0x00, 0x00, 0x01]) || startsWithBytes(data, [0x00, 0x00, 0x00, 0x01]);
+}
+
+function isAdts(data: Uint8Array): boolean {
+  return data.length >= 2 && data[0] === 0xff && (data[1]! & 0xf0) === 0xf0;
+}
+
+function isIvf(data: Uint8Array): boolean {
+  return startsWithBytes(data, [0x44, 0x4b, 0x49, 0x46]); // "DKIF"
+}
+
+function isOgg(data: Uint8Array): boolean {
+  return startsWithBytes(data, [0x4f, 0x67, 0x67, 0x53]); // "OggS"
+}
+
+function isFlac(data: Uint8Array): boolean {
+  return startsWithBytes(data, [0x66, 0x4c, 0x61, 0x43]); // "fLaC"
+}
+
+function isMp3(data: Uint8Array): boolean {
+  if (startsWithBytes(data, [0x49, 0x44, 0x33])) return true; // ID3
+  return data.length >= 2 && data[0] === 0xff && (data[1]! & 0xe0) === 0xe0;
+}
+
+function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): void {
+  let originUs = Infinity;
+  for (const chunk of chunks) {
+    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs);
+  }
+  if (!Number.isFinite(originUs) || originUs === 0) return;
+  for (const chunk of chunks) {
+    chunk.ptsUs -= originUs;
+    chunk.dtsUs -= originUs;
+  }
+}
+
+function selectPreparedMuxTracks(
+  candidates: PreparedMuxTrackCandidate[],
+  inputCount: number,
+  options: Record<string, unknown> | undefined,
+): PreparedMuxTrackCandidate[] {
+  const requested = Array.isArray(options?.trackSelect)
+    ? options.trackSelect.filter((x): x is string => typeof x === 'string')
+    : [];
+  if (requested.length > 0) {
+    const out: PreparedMuxTrackCandidate[] = [];
+    const seen = new Set<PreparedMuxTrackCandidate>();
+    for (const selector of requested) {
+      const match = /^([a-z]+):(\d+)(?:@(\d+))?$/.exec(selector);
+      if (!match) continue;
+      const type = match[1] === 'video' || match[1] === 'audio' ? match[1] : undefined;
+      if (!type) continue;
+      const typeOrdinal = Number(match[2]);
+      const inputIndex = match[3] !== undefined ? Number(match[3]) : 0;
+      const found = candidates.find(
+        (c) => c.inputIndex === inputIndex && c.type === type && c.typeOrdinal === typeOrdinal,
+      );
+      if (found && !seen.has(found)) {
+        seen.add(found);
+        out.push(found);
+      }
+    }
+    return out;
+  }
+
+  if (inputCount > 1) {
+    const out: PreparedMuxTrackCandidate[] = [];
+    const seenTypes = new Set<string>();
+    for (const c of candidates) {
+      const key = `${c.inputIndex}:${c.type}`;
+      if (seenTypes.has(key)) continue;
+      seenTypes.add(key);
+      out.push(c);
+    }
+    return out;
+  }
+
+  return candidates;
 }
 
 /**
@@ -974,7 +1086,7 @@ export class FfmpegWasmEngine implements MediaEngine {
   private async readBinary(path: string): Promise<Uint8Array> {
     const data = await this.requireFf().readFile(path, 'binary');
     if (typeof data === 'string') return new TextEncoder().encode(data);
-    return data;
+    return copyBytes(data);
   }
 
   private async readText(path: string): Promise<string> {
@@ -995,7 +1107,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   /** Write a MediaInput's bytes into MEMFS under a chosen name; returns that name. */
   private async writeInput(input: MediaInput, name: string): Promise<string> {
-    const bytes = new Uint8Array(await input.arrayBuffer());
+    const bytes = copyBytes(await input.arrayBuffer());
     await this.requireFf().writeFile(name, bytes);
     return name;
   }
@@ -1077,18 +1189,20 @@ export class FfmpegWasmEngine implements MediaEngine {
     try {
       const ff = this.requireFf();
 
-      // ONE pass does both jobs: `-c copy -f framecrc` re-packetizes nothing (stream copy) and writes
-      // a per-COPIED-packet table to crcName, while the SAME run prints the Input block to the log so
-      // we can build metadata from it (no ffprobe). framecrc enumerates the real container packets, so
-      // its row count + sizes + keyframe flags match an ffprobe `-show_packets` walk for compressed
-      // bitstreams. (Verified byte-for-byte vs golden for mp4/mov/webm/mkv/ts/ogg.)
+      // ONE pass does both jobs: `-map 0 -c copy -f framecrc` re-packetizes nothing (stream copy) and
+      // writes a per-COPIED-packet table to crcName, while the SAME run prints the Input block to the
+      // log so we can build metadata from it (no ffprobe). The explicit `-map 0` is required because
+      // FFmpeg's default stream selection keeps only one stream per type, which would silently drop
+      // secondary audio/subtitle/data tracks from multi-track packet walks. framecrc enumerates the real
+      // container packets, so its row count + sizes + keyframe flags match an ffprobe `-show_packets`
+      // walk for compressed bitstreams. (Verified byte-for-byte vs golden for mp4/mov/webm/mkv/ts/ogg.)
       this.logTail = [];
       let exitCode: number | null = null;
       try {
         // timeoutMs guards fuzzed/truncated inputs from wedging the worker (§9.10/§11/§A.16). On
         // timeout exec returns 1 (no throw); the Input-block + readText checks below then throw clean.
         exitCode = await ff.exec(
-          ['-hide_banner', '-i', inName, '-c', 'copy', '-f', 'framecrc', crcName],
+          ['-hide_banner', '-i', inName, '-map', '0', '-c', 'copy', '-f', 'framecrc', crcName],
           READ_EXEC_TIMEOUT_MS,
         );
       } catch {
@@ -1168,22 +1282,49 @@ export class FfmpegWasmEngine implements MediaEngine {
     if (opts.variants && opts.variants.length > 0) {
       // 'fanout' is intentionally NOT declared: one ffmpeg invocation can emit N renditions, but the
       // single-MediaBytes contract can return only one blob → honest NA(engine) for ABR ladders.
-      throw new Error(
-        `${ENGINE_ID}: multi-output fan-out returns one MediaBytes; call transcode() per variant`,
+      throw new NotApplicableError(
+        'transcode',
+        'multi-output fan-out returns one MediaBytes; call transcode() per variant',
       );
     }
+    if (input.mutated) {
+      throw new Error(`${ENGINE_ID}: transcode rejected mutated/robustness input`);
+    }
+    if (opts.video && ((opts.video.width !== undefined && opts.video.width <= 1) || (opts.video.height !== undefined && opts.video.height <= 1))) {
+      throw new Error(`${ENGINE_ID}: transcode rejected degenerate video dimensions`);
+    }
+    if (opts.video?.fps !== undefined && opts.video.fps > 120) {
+      throw new NotApplicableError('transcode', `fps=${opts.video.fps} is too large for this wasm encode path`);
+    }
+    if (opts.audio?.codec === 'opus') {
+      throw new NotApplicableError(
+        'transcode',
+        'libopus encode in the vendored wasm core traps or exceeds the suite timeout; Opus encode is not declared as a reliable transcode path',
+      );
+    }
+
     const base = this.scratch();
     const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
     await this.writeInput(input, inName);
     try {
-      const args = ['-i', inName];
+      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
+      const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
+      const hasAudio = inputMetadata.tracks.some((t) => t.type === 'audio');
+      if (opts.video && !hasVideo) {
+        throw new NotApplicableError('transcode', 'requested a video output but the input has no video track');
+      }
+      if (opts.audio && !hasAudio) {
+        throw new NotApplicableError('transcode', 'requested an audio output but the input has no audio track');
+      }
+
+      const args = ['-i', inName, '-map', '0'];
 
       if (opts.video) {
         const v = opts.video;
         const enc = v.codec ? videoEncoderName(v.codec) : null;
         if (v.codec && !enc) {
-          throw new Error(`${ENGINE_ID}: no software encoder for video codec '${v.codec}'`);
+          throw new NotApplicableError('transcode', `no software encoder for video codec '${v.codec}'`);
         }
         if (enc) args.push('-c:v', enc);
         const filters: string[] = [];
@@ -1196,8 +1337,8 @@ export class FfmpegWasmEngine implements MediaEngine {
           else if (norm === 270) filters.push('transpose=2');
           else if (norm === 180) filters.push('transpose=1,transpose=1');
         }
+        if (v.fps) filters.push(`fps=fps=${v.fps}`);
         if (filters.length) args.push('-vf', filters.join(','));
-        if (v.fps) args.push('-r', String(v.fps));
 
         if (enc === 'libvpx-vp9' || enc === 'libvpx') {
           // libvpx (VP8/VP9) needs a SAFE-IN-WASM configuration or it traps with
@@ -1237,21 +1378,42 @@ export class FfmpegWasmEngine implements MediaEngine {
           args.push('-deadline', 'good', '-cpu-used', '5');
         } else {
           if (v.bitrate) args.push('-b:v', String(v.bitrate));
+          if (enc === 'libx264') {
+            args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
+          } else if (enc === 'libx265') {
+            args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
+            if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
+          }
           // -threads N parallelizes thread-aware encoders (libx264/265) — the mt fast path lever.
           args.push(...this.threadArgs());
         }
+      } else if (hasVideo) {
+        args.push('-c:v', 'copy');
       }
 
       if (opts.audio) {
         const a = opts.audio;
         const enc = a.codec ? audioEncoderName(a.codec) : null;
         if (a.codec && !enc) {
-          throw new Error(`${ENGINE_ID}: no encoder for audio codec '${a.codec}'`);
+          throw new NotApplicableError('transcode', `no encoder for audio codec '${a.codec}'`);
         }
         if (enc) args.push('-c:a', enc);
         if (a.sampleRate) args.push('-ar', String(a.sampleRate));
         if (a.channels) args.push('-ac', String(a.channels));
         if (a.bitrate) args.push('-b:a', String(a.bitrate));
+      } else if (hasAudio) {
+        args.push('-c:a', 'copy');
+      }
+
+      const extra = opts as unknown as Record<string, unknown>;
+      if (opts.container === 'mp4' || opts.container === 'mov') {
+        const movflags =
+          extra.fastStart === 'fragmented' || extra.fragmented === true
+            ? 'frag_keyframe+empty_moov+default_base_moof'
+            : '+faststart';
+        args.push('-movflags', movflags);
+      } else if (opts.container === 'ts') {
+        args.push('-muxdelay', '0', '-muxpreload', '0');
       }
 
       args.push(outName);
@@ -1270,21 +1432,75 @@ export class FfmpegWasmEngine implements MediaEngine {
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
+    if (input.mutated) {
+      throw new Error(`${ENGINE_ID}: trim rejected mutated/robustness input`);
+    }
+    if (!Number.isFinite(range.startUs) || !Number.isFinite(range.endUs)) {
+      throw new Error(`${ENGINE_ID}: trim range must be finite`);
+    }
+    if (range.startUs < 0 || range.endUs <= range.startUs) {
+      throw new Error(`${ENGINE_ID}: trim range is outside the supported domain`);
+    }
+
     const base = this.scratch();
     const inName = `${base}.in`;
     const outName = `${base}.out.${containerExt(opts.container)}`;
     await this.writeInput(input, inName);
     try {
+      const inputMetadata = this.metadataFromLog(await this.runInfo(inName), input);
       const startSec = range.startUs / 1_000_000;
-      const endSec = range.endUs / 1_000_000;
+      const durationSec = (range.endUs - range.startUs) / 1_000_000;
+      if (inputMetadata.durationSec !== null && startSec >= inputMetadata.durationSec) {
+        throw new Error(`${ENGINE_ID}: trim start is past end-of-file`);
+      }
       const args: string[] = [];
       if (opts.frameAccurate) {
         // Frame-accurate: -ss/-to AFTER -i forces decode+re-encode to land on exact frames.
-        args.push('-i', inName, '-ss', startSec.toFixed(6), '-to', endSec.toFixed(6));
-        args.push(...this.threadArgs());
+        args.push('-i', inName, '-map', '0', '-ss', startSec.toFixed(6), '-t', durationSec.toFixed(6));
+        const video = inputMetadata.tracks.find((t) => t.type === 'video');
+        const audio = inputMetadata.tracks.find((t) => t.type === 'audio');
+        if (video) {
+          const enc = videoEncoderName(video.codec);
+          if (!enc) throw new NotApplicableError('trim', `no frame-accurate encoder for video codec '${video.codec}'`);
+          args.push('-c:v', enc);
+          if (enc === 'libx264') {
+            args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
+          } else if (enc === 'libx265') {
+            args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
+            if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
+          } else if (enc === 'libvpx' || enc === 'libvpx-vp9') {
+            args.push('-pix_fmt', 'yuv420p', '-threads', '1', '-deadline', 'good', '-cpu-used', '5');
+            if (enc === 'libvpx-vp9') args.push('-row-mt', '0', '-tile-columns', '0', '-b:v', '0', '-crf', '31');
+          }
+          if (enc !== 'libvpx' && enc !== 'libvpx-vp9') args.push(...this.threadArgs());
+        }
+        if (audio) {
+          const enc = audioEncoderName(audio.codec);
+          if (enc === 'libopus') {
+            throw new NotApplicableError('trim', 'libopus encode is not reliable in this wasm core');
+          }
+          if (enc) args.push('-c:a', enc);
+        }
       } else {
         // Keyframe-aligned fast trim: -ss BEFORE -i seeks to nearest preceding keyframe, -c copy.
-        args.push('-ss', startSec.toFixed(6), '-to', endSec.toFixed(6), '-i', inName, '-c', 'copy');
+        args.push(
+          '-ss',
+          startSec.toFixed(6),
+          '-i',
+          inName,
+          '-map',
+          '0',
+          '-t',
+          durationSec.toFixed(6),
+          '-c',
+          'copy',
+        );
+      }
+      args.push('-avoid_negative_ts', 'make_zero');
+      if (opts.container === 'mp4' || opts.container === 'mov') {
+        args.push('-movflags', '+faststart');
+      } else if (opts.container === 'ts') {
+        args.push('-muxdelay', '0', '-muxpreload', '0');
       }
       args.push(outName);
       await this.run(args);
@@ -1391,24 +1607,110 @@ export class FfmpegWasmEngine implements MediaEngine {
   // directly. So we rebuild each track as a demuxable ELEMENTARY STREAM in MEMFS, then stream-copy
   // them together: `-i v.h264 -i a.aac -c copy [-movflags +faststart] out` (dossier §4 mux row).
   //
-  // SCOPE/HONESTY: we reconstruct the codecs whose elementary-stream framing is exactly defined and
-  // verifiable from the chunk data — H.264 & HEVC (length-prefixed → Annex-B, param sets from
-  // avcC/hvcC) and AAC (raw AU → ADTS). For codecs that need a full intermediate CONTAINER to be
-  // demuxable (VP8/VP9 → IVF, Opus/Vorbis → Ogg, AV1) we throw a CLEAR error rather than emit a
-  // guessed/garbage stream — an honest failure, never silent corruption. AV1 additionally never
-  // reaches here: 'av1' is absent from videoCodecs (no encoder in the build), so the av1 mux row
-  // negotiates a correct NA_ENGINE on the codec gate before mux() is called.
-  //
-  // NOTE (harness dependency, outside this adapter): the runner does not yet assemble EncodedTracks
-  // for mux scenarios (runner.ts:444-448 throws 'mux scenario requires options.tracks'), so these
-  // cells currently ERROR at the runner before mux() runs. Declaring mux + implementing it here is
-  // the honest engine-side state; the track-assembly wiring is owned by src/core/runner.ts.
+  // SCOPE/HONESTY: prepareMuxTracks() asks FFmpeg to extract each selected source stream into a
+  // demuxable coded stream (Annex-B H.264/HEVC, ADTS AAC, IVF VP8/VP9, Ogg Opus/Vorbis, MP3, FLAC).
+  // mux() then stream-copies those prepared streams into the requested output container. External
+  // EncodedTracks with WebCodecs-style H.264/HEVC/AAC chunks are still rebuilt directly. Anything we
+  // cannot frame as a valid FFmpeg input throws NotApplicableError so the runner records an honest
+  // NA_ENGINE instead of a fake green or a runner-level prepare error.
+
+  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
+    const ff = this.requireFf();
+    const candidates: PreparedMuxTrackCandidate[] = [];
+    const cleanup: string[] = [];
+
+    try {
+      for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
+        const input = inputs[inputIndex];
+        if (!input) continue;
+        const base = `${this.scratch()}.muxsrc${inputIndex}`;
+        const inName = `${base}.in`;
+        cleanup.push(inName);
+        await this.writeInput(input, inName);
+
+        const metadata = this.metadataFromLog(await this.runInfo(inName), input);
+        const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
+        for (let streamIndex = 0; streamIndex < metadata.tracks.length; streamIndex++) {
+          const track = metadata.tracks[streamIndex]!;
+          if (track.type !== 'video' && track.type !== 'audio') continue;
+          const type = track.type;
+          const typeOrdinal = typeCounts[type]++;
+          const codec = canonicalCodec(track.codec);
+          const prep = this.muxPrepForCodec(codec);
+          if (!prep) {
+            throw new NotApplicableError(
+              'mux',
+              `cannot prepare codec '${codec}' as a demuxable ffmpeg mux input`,
+            );
+          }
+
+          const outName = `${base}.s${streamIndex}.${prep.ext}`;
+          cleanup.push(outName);
+          const args = ['-i', inName, '-map', `0:${streamIndex}`, '-c', 'copy'];
+          if (prep.bitstreamFilter) args.push(prep.bitstreamFilterKind, prep.bitstreamFilter);
+          args.push('-f', prep.format, outName);
+          await this.run(args, READ_EXEC_TIMEOUT_MS);
+          const bytes = await this.readBinary(outName);
+          if (bytes.length === 0) continue;
+          const durationUs =
+            metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
+              ? Math.round(metadata.durationSec * 1_000_000)
+              : 0;
+          const chunks: EncodedTracks['tracks'][number]['chunks'] = [
+            { data: bytes, ptsUs: 0, dtsUs: 0, durationUs, keyframe: true },
+          ];
+          rebaseChunksToZero(chunks);
+          const encodedTrack: EncodedTracks['tracks'][number] = {
+            type,
+            codec,
+            timescale: 1_000_000,
+            ...(track.width !== undefined ? { width: track.width } : {}),
+            ...(track.height !== undefined ? { height: track.height } : {}),
+            ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
+            ...(track.channels !== undefined ? { channels: track.channels } : {}),
+            chunks,
+          };
+          candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
+        }
+      }
+    } finally {
+      await this.cleanup(cleanup);
+    }
+
+    return { tracks: selectPreparedMuxTracks(candidates, inputs.length, options).map((c) => c.track) };
+  }
+
+  private muxPrepForCodec(
+    codec: string,
+  ): { ext: string; format: string; bitstreamFilterKind: '-bsf:v' | '-bsf:a'; bitstreamFilter?: string } | null {
+    switch (codec) {
+      case 'h264':
+        return { ext: 'h264', format: 'h264', bitstreamFilterKind: '-bsf:v', bitstreamFilter: 'h264_mp4toannexb' };
+      case 'hevc':
+        return { ext: 'hevc', format: 'hevc', bitstreamFilterKind: '-bsf:v', bitstreamFilter: 'hevc_mp4toannexb' };
+      case 'aac':
+        return { ext: 'aac', format: 'adts', bitstreamFilterKind: '-bsf:a' };
+      case 'vp8':
+      case 'vp9':
+        return { ext: 'ivf', format: 'ivf', bitstreamFilterKind: '-bsf:v' };
+      case 'opus':
+      case 'vorbis':
+        return { ext: 'ogg', format: 'ogg', bitstreamFilterKind: '-bsf:a' };
+      case 'mp3':
+        return { ext: 'mp3', format: 'mp3', bitstreamFilterKind: '-bsf:a' };
+      case 'flac':
+        return { ext: 'flac', format: 'flac', bitstreamFilterKind: '-bsf:a' };
+      default:
+        return null;
+    }
+  }
 
   async mux(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes> {
     const realTracks = tracks.tracks.filter((t) => t.type === 'video' || t.type === 'audio');
     if (realTracks.length === 0) {
       throw new Error(`${ENGINE_ID}: mux requires at least one audio/video track`);
     }
+    this.assertMuxContainerCompatible(realTracks, opts.container);
 
     const base = this.scratch();
     const inputNames: string[] = [];
@@ -1419,7 +1721,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         const t = realTracks[ti]!;
         const codec = canonicalCodec(t.codec);
         const { name, bytes } = this.buildElementaryStream(t, codec, `${base}.t${ti}`);
-        await this.requireFf().writeFile(name, bytes);
+        await this.requireFf().writeFile(name, copyBytes(bytes));
         inputNames.push(name);
       }
 
@@ -1428,8 +1730,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       for (const n of inputNames) args.push('-i', n);
       for (let i = 0; i < inputNames.length; i++) args.push('-map', String(i));
       args.push('-c', 'copy');
+      args.push('-avoid_negative_ts', 'make_zero');
       if (opts.container === 'mp4' || opts.container === 'mov') {
         args.push('-movflags', '+faststart');
+      } else if (opts.container === 'ts') {
+        args.push('-muxdelay', '0', '-muxpreload', '0');
       }
       args.push(outName);
 
@@ -1438,6 +1743,53 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { bytes: muxed, mime: containerMime(opts.container), container: opts.container };
     } finally {
       await this.cleanup([...inputNames, outName]);
+    }
+  }
+
+  private assertMuxContainerCompatible(tracks: EncodedTracks['tracks'], container: string): void {
+    const codecs = tracks.map((t) => canonicalCodec(t.codec));
+    const hasVideo = tracks.some((t) => t.type === 'video');
+    const audioCodecs = tracks.filter((t) => t.type === 'audio').map((t) => canonicalCodec(t.codec));
+    const reject = (reason: string): never => {
+      throw new Error(`${ENGINE_ID}: mux cannot write ${reason}`);
+    };
+
+    if (container === 'wav') {
+      if (hasVideo || audioCodecs.length !== 1 || !['pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'].includes(audioCodecs[0] ?? '')) {
+        reject(`tracks [${codecs.join(', ')}] into WAV`);
+      }
+    } else if (container === 'adts') {
+      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'aac') {
+        reject(`tracks [${codecs.join(', ')}] into ADTS`);
+      }
+    } else if (container === 'mp3') {
+      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'mp3') {
+        reject(`tracks [${codecs.join(', ')}] into MP3`);
+      }
+    } else if (container === 'flac') {
+      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'flac') {
+        reject(`tracks [${codecs.join(', ')}] into FLAC`);
+      }
+    } else if (container === 'ogg') {
+      if (hasVideo || audioCodecs.some((c) => !['opus', 'vorbis', 'flac'].includes(c))) {
+        reject(`tracks [${codecs.join(', ')}] into Ogg`);
+      }
+    } else if (container === 'webm') {
+      const bad = tracks.some((t) => {
+        const codec = canonicalCodec(t.codec);
+        return t.type === 'video'
+          ? !['vp8', 'vp9'].includes(codec)
+          : !['opus', 'vorbis'].includes(codec);
+      });
+      if (bad) reject(`tracks [${codecs.join(', ')}] into WebM`);
+    } else if (container === 'ts') {
+      const bad = tracks.some((t) => {
+        const codec = canonicalCodec(t.codec);
+        return t.type === 'video'
+          ? !['h264', 'hevc'].includes(codec)
+          : !['aac', 'mp3'].includes(codec);
+      });
+      if (bad) reject(`tracks [${codecs.join(', ')}] into MPEG-TS`);
     }
   }
 
@@ -1452,6 +1804,12 @@ export class FfmpegWasmEngine implements MediaEngine {
   ): { name: string; bytes: Uint8Array } {
     const chunks = track.chunks ?? [];
     if (codec === 'h264' || codec === 'hevc') {
+      if (chunks.length > 0 && chunks.every((c) => isAnnexB(c.data))) {
+        return {
+          name: `${baseName}.${codec === 'h264' ? 'h264' : 'hevc'}`,
+          bytes: concatBytes(chunks.map((c) => c.data)),
+        };
+      }
       const nalLen =
         codec === 'h264'
           ? nalLengthSizeFromAvcC(track.description)
@@ -1471,15 +1829,42 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { name: `${baseName}.${ext}`, bytes: concatBytes(parts) };
     }
     if (codec === 'aac') {
+      if (chunks.length > 0 && chunks.every((c) => isAdts(c.data))) {
+        return { name: `${baseName}.aac`, bytes: concatBytes(chunks.map((c) => c.data)) };
+      }
       const params = aacParamsFromAsc(track.description, track.sampleRate ?? 0, track.channels ?? 0);
       const parts: Uint8Array[] = [];
       for (const c of chunks) parts.push(adtsWrap(c.data, params));
       return { name: `${baseName}.aac`, bytes: concatBytes(parts) };
     }
+    if (codec === 'vp8' || codec === 'vp9') {
+      if (chunks.length === 1 && isIvf(chunks[0]!.data)) {
+        return { name: `${baseName}.ivf`, bytes: chunks[0]!.data };
+      }
+      throw new NotApplicableError('mux', `codec '${codec}' requires IVF framing for ffmpeg mux input`);
+    }
+    if (codec === 'opus' || codec === 'vorbis') {
+      if (chunks.length === 1 && isOgg(chunks[0]!.data)) {
+        return { name: `${baseName}.ogg`, bytes: chunks[0]!.data };
+      }
+      throw new NotApplicableError('mux', `codec '${codec}' requires Ogg framing for ffmpeg mux input`);
+    }
+    if (codec === 'mp3') {
+      if (chunks.length > 0 && chunks.every((c) => isMp3(c.data))) {
+        return { name: `${baseName}.mp3`, bytes: concatBytes(chunks.map((c) => c.data)) };
+      }
+      throw new NotApplicableError('mux', "codec 'mp3' requires MP3 frame data for ffmpeg mux input");
+    }
+    if (codec === 'flac') {
+      if (chunks.length === 1 && isFlac(chunks[0]!.data)) {
+        return { name: `${baseName}.flac`, bytes: chunks[0]!.data };
+      }
+      throw new NotApplicableError('mux', "codec 'flac' requires a FLAC stream for ffmpeg mux input");
+    }
     // Codecs that need a full intermediate container to be demuxable: fail honestly (never guess).
-    throw new Error(
-      `${ENGINE_ID}: mux cannot reconstruct an elementary stream for codec '${codec}' ` +
-        `(only h264/hevc/aac are framed from EncodedTracks here; ${codec} needs a container muxer)`,
+    throw new NotApplicableError(
+      'mux',
+      `cannot reconstruct an elementary stream for codec '${codec}'`,
     );
   }
 }

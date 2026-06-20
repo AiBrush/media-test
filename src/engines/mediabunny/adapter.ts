@@ -117,6 +117,7 @@ import {
   mediabunnyToCanonicalAudio,
   mediabunnyToCanonicalVideo,
   mimeForContainer,
+  type OutputFormatOptions,
 } from './codecs.ts';
 import { digestImageData } from './digest.ts';
 
@@ -126,6 +127,10 @@ interface PreparedMuxTrackCandidate {
   typeOrdinal: number;
   track: EncodedTracks['tracks'][number];
 }
+
+type AlphaMode = 'discard' | 'keep';
+type HardwareAccelerationMode = NonNullable<ConversionVideoOptions['hardwareAcceleration']>;
+type DecodeHardwareAccelerationMode = NonNullable<VideoDecoderConfig['hardwareAcceleration']>;
 
 /**
  * The dossier best-path config (§6), recorded verbatim as `configUsed`. Static, deterministic, and
@@ -163,6 +168,42 @@ function isHlsAsset(input: MediaInput, container?: string): boolean {
 
 function isBlobUrl(url: string): boolean {
   return /^blob:/i.test(url);
+}
+
+function outputFormatOptionsFrom(opts?: Record<string, unknown>): OutputFormatOptions | undefined {
+  const rawFastStart = opts?.fastStart;
+  let fastStart: OutputFormatOptions['fastStart'] | undefined;
+  if (opts?.fragmented === true) {
+    fastStart = 'fragmented';
+  } else if (
+    rawFastStart === false ||
+    rawFastStart === 'in-memory' ||
+    rawFastStart === 'reserve' ||
+    rawFastStart === 'fragmented'
+  ) {
+    fastStart = rawFastStart;
+  }
+  return fastStart !== undefined ? { fastStart } : undefined;
+}
+
+function alphaModeFrom(opts?: Record<string, unknown>): AlphaMode | undefined {
+  const alpha = opts?.alpha;
+  return alpha === 'discard' || alpha === 'keep' ? alpha : undefined;
+}
+
+async function durationFromInput(input: Input): Promise<number | null> {
+  try {
+    const meta = await input.getDurationFromMetadata();
+    if (meta != null && Number.isFinite(meta) && meta > 0) return meta;
+  } catch {
+    // Fall through to the precise path.
+  }
+  try {
+    const d = await input.computeDuration();
+    return Number.isFinite(d) && d > 0 ? d : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Build a mediabunny Input from a corpus asset. Restricts formats to the asset's container when
@@ -446,10 +487,10 @@ function defaultVideoBitrate(codec: VideoCodec | undefined, width?: number, heig
   // Resolution-aware target (per-pixel coefficient × pixel count × codec efficiency) with an
   // absolute floor so even tiny frames clear WebCodecs encoder minimums. The floor (300 kbps) sits
   // far above the VP9 hardware-reject point (~120 kbps for 320×180) that caused the bug; the
-  // coefficient scales the rate cleanly upward for larger boxes (≈4.4 Mbps for VP9 720p, ≈10 Mbps
+  // coefficient scales the rate cleanly upward for larger boxes (≈7.4 Mbps for VP9 720p, ≈16.6 Mbps
   // for 1080p), and codec efficiency trims it for the more efficient codecs.
   const MIN_BITRATE = 300_000;
-  const PER_PIXEL = 6; // bits/sec per output pixel (≈ 30fps × 0.2 bpp reference)
+  const PER_PIXEL = 10; // bits/sec per output pixel (≈ 30fps × 0.33 bpp reference)
   const px = (width && width > 0 ? width : 1280) * (height && height > 0 ? height : 720);
   const efficiency: Record<string, number> = { avc: 1.0, hevc: 0.7, vp9: 0.8, av1: 0.6, vp8: 1.1 };
   const eff = (codec && efficiency[codec]) || 1.0;
@@ -473,7 +514,11 @@ function defaultVideoBitrate(codec: VideoCodec | undefined, width?: number, heig
  * `VideoEncoder.isConfigSupported` for the codec — fires first, so a genuinely unencodable codec is
  * reported as NA(browser), not ERROR.)
  */
-async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<ConversionVideoOptions> {
+async function buildVideoOptions(
+  mb: MB,
+  v: TranscodeVideoOptions,
+  extra?: { alpha?: AlphaMode },
+): Promise<ConversionVideoOptions> {
   const opts: ConversionVideoOptions = {};
   let codec: VideoCodec | undefined;
   if (v.codec) {
@@ -505,6 +550,7 @@ async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<Conv
     // Cite: conversion.d.ts ConversionVideoOptions.allowRotationMetadata; dossier §4.6.
     opts.allowRotationMetadata = false;
   }
+  if (extra?.alpha) opts.alpha = extra.alpha;
 
   // No codec requested → this may end up a lossless copy (no encode); keep the best-path hint and
   // return (the Conversion only applies hardwareAcceleration when it actually transcodes).
@@ -526,20 +572,25 @@ async function buildVideoOptions(mb: MB, v: TranscodeVideoOptions): Promise<Conv
   // try hardware first (best-path), then fall back so a missing hardware encoder still succeeds.
   const probeW = v.width && v.width > 0 ? v.width : undefined;
   const probeH = v.height && v.height > 0 ? v.height : undefined;
-  const modes: NonNullable<ConversionVideoOptions['hardwareAcceleration']>[] =
-    SOFTWARE_PREFERRED_ENCODE.has(codec)
-      ? ['prefer-software', 'no-preference']
+  const highFrameRate = typeof v.fps === 'number' && v.fps >= 120;
+  const modes: HardwareAccelerationMode[] = SOFTWARE_PREFERRED_ENCODE.has(codec)
+    ? ['prefer-software', 'no-preference']
+    : highFrameRate
+      ? ['no-preference', 'prefer-software', HW_ACCEL]
       : [HW_ACCEL, 'no-preference', 'prefer-software'];
 
-  let chosen: NonNullable<ConversionVideoOptions['hardwareAcceleration']> | null = null;
+  let chosen: HardwareAccelerationMode | null = null;
   for (const mode of modes) {
+    const probeOptions: Parameters<typeof mb.canEncodeVideo>[1] & { framerate?: number } = {
+      ...(probeW !== undefined ? { width: probeW } : {}),
+      ...(probeH !== undefined ? { height: probeH } : {}),
+      bitrate,
+      hardwareAcceleration: mode,
+    };
+    if (typeof v.fps === 'number') probeOptions.framerate = v.fps;
+    if (extra?.alpha) probeOptions.alpha = extra.alpha;
     const ok = await mb
-      .canEncodeVideo(codec, {
-        ...(probeW !== undefined ? { width: probeW } : {}),
-        ...(probeH !== undefined ? { height: probeH } : {}),
-        bitrate,
-        hardwareAcceleration: mode,
-      })
+      .canEncodeVideo(codec, probeOptions)
       .catch(() => false);
     if (ok) {
       chosen = mode;
@@ -621,6 +672,114 @@ class CapturedFrameSink implements FrameSink {
     const img = this.pixels[i];
     if (!img) throw new Error(`No pixels captured for frame ${i}`);
     return img;
+  };
+}
+
+async function videoDecoderOptionsForTrack(
+  mb: MB,
+  track: InputVideoTrack,
+): Promise<{ hardwareAcceleration: DecodeHardwareAccelerationMode }> {
+  const codec = await track.getCodec().catch(() => null);
+  if (!codec) return { hardwareAcceleration: HW_ACCEL };
+
+  const config = await track.getDecoderConfig().catch(() => undefined);
+  const softerFirst = codec === 'vp8' || codec === 'av1';
+  const modes: DecodeHardwareAccelerationMode[] = softerFirst
+    ? ['no-preference', 'prefer-software', HW_ACCEL]
+    : [HW_ACCEL, 'no-preference', 'prefer-software'];
+
+  for (const mode of modes) {
+    const ok = await mb.canDecodeVideo(codec, { ...(config ?? {}), hardwareAcceleration: mode }).catch(() => false);
+    if (ok) return { hardwareAcceleration: mode };
+  }
+
+  throw new Error(
+    `mediabunny decode: browser cannot decode ${codec} track with any acceleration mode ` +
+      '(WebCodecs VideoDecoder.isConfigSupported=false) - NA(browser)',
+  );
+}
+
+async function tryAudioOnlyPacketCopyTrim(
+  mb: MB,
+  input: Input,
+  meta: NormalizedMetadata,
+  range: { startUs: number; endUs: number },
+  opts: { container: string; frameAccurate: boolean },
+): Promise<MediaBytes | null> {
+  if (opts.frameAccurate) return null;
+  if (meta.container !== opts.container) return null;
+  if (meta.tracks.some((t) => t.type === 'video')) return null;
+
+  const tracks = await input.getTracks();
+  const audioTracks = tracks.filter((t): t is InputAudioTrack => t.isAudioTrack());
+  if (audioTracks.length !== 1) return null;
+
+  const audioTrack = audioTracks[0];
+  if (!audioTrack) return null;
+  const codec = await audioTrack.getCodec().catch(() => null);
+  if (!codec) return null;
+
+  const format = makeOutputFormat(opts.container);
+  if (!format) return null;
+
+  const output = new mb.Output({ format, target: new mb.BufferTarget() });
+  const source = new mb.EncodedAudioPacketSource(codec);
+  output.addAudioTrack(source);
+  await output.start();
+
+  const decoderConfig = await audioTrack.getDecoderConfig().catch(() => undefined);
+  const sampleRate = await audioTrack.getSampleRate().catch(() => 48000);
+  const channels = await audioTrack.getNumberOfChannels().catch(() => 2);
+  const description = decoderConfig?.description ? bufferOf(copyBytes(decoderConfig.description)) : undefined;
+  const codecString = decoderConfig?.codec ?? codecParamForAudioCodec(codec);
+  const sink = new mb.EncodedPacketSink(audioTrack);
+  const startSec = range.startUs / 1e6;
+  const endSec = range.endUs / 1e6;
+  let originSec: number | null = null;
+  let added = 0;
+
+  try {
+    for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+      const pktEnd = pkt.timestamp + pkt.duration;
+      if (pktEnd <= startSec) continue;
+      if (pkt.timestamp >= endSec) break;
+      originSec ??= pkt.timestamp;
+      const outPacket = new mb.EncodedPacket(
+        copyBytes(pkt.data),
+        pkt.type,
+        Math.max(0, pkt.timestamp - originSec),
+        pkt.duration,
+        added,
+      );
+      const packetMeta =
+        added === 0
+          ? ({
+              decoderConfig: {
+                codec: codecString,
+                sampleRate,
+                numberOfChannels: channels,
+                description,
+              },
+            } as EncodedAudioChunkMetadata)
+          : undefined;
+      await source.add(outPacket, packetMeta);
+      added++;
+    }
+  } finally {
+    source.close();
+  }
+
+  if (added === 0) {
+    throw new Error('mediabunny trim: no audio packets fell inside requested trim range');
+  }
+
+  await output.finalize();
+  const buffer = (output.target as BufferTarget).buffer;
+  if (!buffer) throw new Error('mediabunny trim packet-copy produced no output buffer');
+  return {
+    bytes: new Uint8Array(buffer),
+    mime: mimeForContainer(opts.container),
+    container: opts.container,
   };
 }
 
@@ -836,8 +995,8 @@ export class MediabunnyEngine implements MediaEngine {
 
   // ── remux ──────────────────────────────────────────────────────────────────────────────────
   /** Lossless container change: Conversion with no codec/transform options copies encoded samples. */
-  async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
-    const format = makeOutputFormat(opts.container);
+  async remux(input: MediaInput, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
     const mbInput = await openInput(this.lib, input);
     try {
@@ -860,7 +1019,8 @@ export class MediabunnyEngine implements MediaEngine {
    * number is claimed for the ladder because the capability is undeclared.
    */
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
-    const format = makeOutputFormat(opts.container);
+    const runtimeOpts = opts as TranscodeOptions & Record<string, unknown>;
+    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
     const mbInput = await openInput(this.lib, input);
@@ -869,8 +1029,12 @@ export class MediabunnyEngine implements MediaEngine {
       const convOpts: ConversionOptions = { input: mbInput, output };
 
       const videoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
-      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec);
+      const alpha = alphaModeFrom(runtimeOpts);
+      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, alpha ? { alpha } : undefined);
       if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio);
+
+      const inputDuration = await durationFromInput(mbInput);
+      if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
 
       return await runConversion(this.lib, convOpts, opts.container);
     } finally {
@@ -892,7 +1056,7 @@ export class MediabunnyEngine implements MediaEngine {
 
       // Best path (dossier §6): hardware-accelerated WebCodecs decode. Pull VideoSample objects so
       // ordinary frames can be copied directly to RGBA, avoiding canvas fingerprinting perturbations.
-      const sink = new this.lib.VideoSampleSink(videoTrack, { hardwareAcceleration: HW_ACCEL });
+      const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack));
       const out = new CapturedFrameSink();
       const max = opts?.maxFrames ?? Infinity;
 
@@ -926,7 +1090,7 @@ export class MediabunnyEngine implements MediaEngine {
       const videoTrack = await mbInput.getPrimaryVideoTrack();
       if (!videoTrack) throw new Error('mediabunny seek: no video track in input');
 
-      const sink = new this.lib.VideoSampleSink(videoTrack, { hardwareAcceleration: HW_ACCEL });
+      const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack));
       const sample = await sink.getSample(tUs / 1e6);
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
       try {
@@ -959,8 +1123,14 @@ export class MediabunnyEngine implements MediaEngine {
 
     const mbInput = await openInput(this.lib, input);
     try {
+      let cachedMeta: NormalizedMetadata | null = null;
+      const getMeta = async () => {
+        cachedMeta ??= await metadataFromInput(mbInput);
+        return cachedMeta;
+      };
+
       if (Math.abs(range.startUs) <= NOOP_TRIM_TOLERANCE_SEC * 1e6) {
-        const meta = await metadataFromInput(mbInput);
+        const meta = await getMeta();
         if (isNoopTrim(meta, range, opts.container)) {
           return {
             bytes: new Uint8Array(await input.arrayBuffer()),
@@ -968,6 +1138,11 @@ export class MediabunnyEngine implements MediaEngine {
             container: opts.container,
           };
         }
+      }
+
+      if (!opts.frameAccurate) {
+        const packetCopy = await tryAudioOnlyPacketCopyTrim(this.lib, mbInput, await getMeta(), range, opts);
+        if (packetCopy) return packetCopy;
       }
 
       const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
@@ -994,8 +1169,8 @@ export class MediabunnyEngine implements MediaEngine {
    * becomes an EncodedPacket (decode order; pts from ptsUs). The first packet of each track carries
    * a decoder config built from the track description so the muxer can write codec-private data.
    */
-  async mux(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes> {
-    const format = makeOutputFormat(opts.container);
+  async mux(tracks: EncodedTracks, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
     const mb = this.lib;
@@ -1003,6 +1178,7 @@ export class MediabunnyEngine implements MediaEngine {
 
     interface Pending {
       add: (pkt: EncodedPacket, meta?: EncodedVideoChunkMetadata | EncodedAudioChunkMetadata) => Promise<void>;
+      close: () => void;
       track: EncodedTracks['tracks'][number];
       isVideo: boolean;
     }
@@ -1013,14 +1189,24 @@ export class MediabunnyEngine implements MediaEngine {
         const mbCodec = canonicalToMediabunnyVideo(t.codec) as VideoCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported video codec '${t.codec}'`);
         const source = new mb.EncodedVideoPacketSource(mbCodec);
-        output.addVideoTrack(source);
-        pendings.push({ add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata), track: t, isVideo: true });
+        output.addVideoTrack(source, { maximumPacketCount: t.chunks.length });
+        pendings.push({
+          add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata),
+          close: () => source.close(),
+          track: t,
+          isVideo: true,
+        });
       } else if (t.type === 'audio') {
         const mbCodec = canonicalToMediabunnyAudio(t.codec) as AudioCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported audio codec '${t.codec}'`);
         const source = new mb.EncodedAudioPacketSource(mbCodec);
-        output.addAudioTrack(source);
-        pendings.push({ add: (p, m) => source.add(p, m as EncodedAudioChunkMetadata), track: t, isVideo: false });
+        output.addAudioTrack(source, { maximumPacketCount: t.chunks.length });
+        pendings.push({
+          add: (p, m) => source.add(p, m as EncodedAudioChunkMetadata),
+          close: () => source.close(),
+          track: t,
+          isVideo: false,
+        });
       } else {
         // subtitle/other not handled by the encoded-packet mux path.
         continue;
@@ -1032,39 +1218,43 @@ export class MediabunnyEngine implements MediaEngine {
     for (const p of pendings) {
       const { track, isVideo, add } = p;
       const description = track.description ? bufferOf(track.description) : undefined;
-      for (let i = 0; i < track.chunks.length; i++) {
-        const c = track.chunks[i];
-        if (!c) continue;
-        const pkt = new mb.EncodedPacket(
-          c.data,
-          c.keyframe ? 'key' : 'delta',
-          c.ptsUs / 1e6,
-          c.durationUs / 1e6,
-          // sequenceNumber: use decode index for stable ordering.
-          i,
-        );
-        // First packet carries the decoder config so the muxer can emit codec-private boxes.
-        const meta =
-          i === 0
-            ? isVideo
-              ? ({
-                  decoderConfig: {
-                    codec: codecParamForTrack(track, true),
-                    codedWidth: track.width ?? 0,
-                    codedHeight: track.height ?? 0,
-                    description,
-                  },
-                } as EncodedVideoChunkMetadata)
-              : ({
-                  decoderConfig: {
-                    codec: codecParamForTrack(track, false),
-                    sampleRate: track.sampleRate ?? 48000,
-                    numberOfChannels: track.channels ?? 2,
-                    description,
-                  },
-                } as EncodedAudioChunkMetadata)
-            : undefined;
-        await add(pkt, meta);
+      try {
+        for (let i = 0; i < track.chunks.length; i++) {
+          const c = track.chunks[i];
+          if (!c) continue;
+          const pkt = new mb.EncodedPacket(
+            c.data,
+            c.keyframe ? 'key' : 'delta',
+            c.ptsUs / 1e6,
+            c.durationUs / 1e6,
+            // sequenceNumber: use decode index for stable ordering.
+            i,
+          );
+          // First packet carries the decoder config so the muxer can emit codec-private boxes.
+          const meta =
+            i === 0
+              ? isVideo
+                ? ({
+                    decoderConfig: {
+                      codec: codecParamForTrack(track, true),
+                      codedWidth: track.width ?? 0,
+                      codedHeight: track.height ?? 0,
+                      description,
+                    },
+                  } as EncodedVideoChunkMetadata)
+                : ({
+                    decoderConfig: {
+                      codec: codecParamForTrack(track, false),
+                      sampleRate: track.sampleRate ?? 48000,
+                      numberOfChannels: track.channels ?? 2,
+                      description,
+                    },
+                  } as EncodedAudioChunkMetadata)
+              : undefined;
+          await add(pkt, meta);
+        }
+      } finally {
+        p.close();
       }
     }
 
@@ -1094,9 +1284,9 @@ export class MediabunnyEngine implements MediaEngine {
     }
     const mb = this.lib;
     const keyBytes = hexToBytes(key.keyHex);
-    const blob = await input.blob();
+    const buffer = await input.arrayBuffer();
     const mbInput = new mb.Input({
-      source: new mb.BlobSource(blob),
+      source: new mb.BufferSource(buffer),
       formats: mb.ALL_FORMATS,
       formatOptions: {
         isobmff: {
@@ -1157,6 +1347,21 @@ function codecParamForTrack(track: EncodedTracks['tracks'][number], isVideo: boo
       return 'flac';
     default:
       return track.codec;
+  }
+}
+
+function codecParamForAudioCodec(codec: AudioCodec): string {
+  switch (codec) {
+    case 'aac':
+      return 'mp4a.40.2';
+    case 'opus':
+      return 'opus';
+    case 'mp3':
+      return 'mp3';
+    case 'flac':
+      return 'flac';
+    default:
+      return codec;
   }
 }
 
