@@ -33,6 +33,8 @@ export interface WebmVideoConfig {
 
 export interface WebmSample {
   data: Uint8Array;
+  /** Matroska BlockAdditional payload for VPx alpha side data (BlockAddID=1), when present. */
+  alpha?: Uint8Array;
   ptsUs: number;
   dtsUs: number;
   durationUs: number;
@@ -129,6 +131,7 @@ const ID = {
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
+  AlphaMode: 0x53c0,
   Audio: 0xe1,
   SamplingFrequency: 0xb5, // EBML float (Hz)
   Channels: 0x9f,
@@ -137,6 +140,10 @@ const ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  BlockAdditions: 0x75a1,
+  BlockMore: 0xa6,
+  BlockAdditional: 0xa5,
+  BlockAddID: 0xee,
   BlockDuration: 0x9b,
   ReferenceBlock: 0xfb,
 } as const;
@@ -439,10 +446,19 @@ export function demuxWebmTracks(bytes: Uint8Array): WebmTrack[] {
   for (const d of descs) byTrackNumber.set(d.trackNumber, d);
 
   // Single pass over clusters → route each block's frames to its track by track number.
-  const push = (trackNum: number, frame: Uint8Array, ptsUs: number, durationUs: number, keyframe: boolean): void => {
+  const push = (
+    trackNum: number,
+    frame: Uint8Array,
+    ptsUs: number,
+    durationUs: number,
+    keyframe: boolean,
+    alpha?: Uint8Array,
+  ): void => {
     const d = byTrackNumber.get(trackNum);
     if (!d) return; // block for a track we didn't enumerate (e.g. unidentified codec) → ignore
-    d.track.samples.push({ data: frame, ptsUs, dtsUs: ptsUs, durationUs, keyframe });
+    const sample: WebmSample = { data: frame, ptsUs, dtsUs: ptsUs, durationUs, keyframe };
+    if (alpha) sample.alpha = alpha;
+    d.track.samples.push(sample);
   };
 
   for (const cluster of clusters) {
@@ -465,17 +481,20 @@ export function demuxWebmTracks(bytes: Uint8Array): WebmTrack[] {
         let blockEl: Element | undefined;
         let hasReference = false;
         let durationTicks = 0;
+        let mainAdditional: Uint8Array | undefined;
         for (const g of children(bytes, c.bodyStart, c.bodyEnd)) {
           if (g.id === ID.Block) blockEl = g;
           else if (g.id === ID.ReferenceBlock) hasReference = true;
           else if (g.id === ID.BlockDuration) durationTicks = readUint(bytes, g.bodyStart, g.bodyEnd - g.bodyStart);
+          else if (g.id === ID.BlockAdditions) mainAdditional = readMainBlockAdditional(bytes, g.bodyStart, g.bodyEnd);
         }
         if (!blockEl) continue;
         const block = parseBlock(bytes, blockEl.bodyStart, blockEl.bodyEnd);
         if (!block) continue;
         const ptsUs = tickToUs(clusterTs + block.relTs);
         const keyframe = !hasReference;
-        for (const frame of block.frames) push(block.track, frame, ptsUs, tickToUs(durationTicks), keyframe);
+        const alpha = block.frames.length === 1 ? mainAdditional : undefined;
+        for (const frame of block.frames) push(block.track, frame, ptsUs, tickToUs(durationTicks), keyframe, alpha);
       }
     }
   }
@@ -511,6 +530,23 @@ interface ParsedBlock {
   relTs: number; // signed int16 relative timestamp
   keyframe: boolean;
   frames: Uint8Array[];
+}
+
+function readMainBlockAdditional(buf: Uint8Array, start: number, end: number): Uint8Array | undefined {
+  for (const blockMore of children(buf, start, end)) {
+    if (blockMore.id !== ID.BlockMore) continue;
+    let addId = 1;
+    let data: Uint8Array | undefined;
+    for (const child of children(buf, blockMore.bodyStart, blockMore.bodyEnd)) {
+      if (child.id === ID.BlockAddID) {
+        addId = readUint(buf, child.bodyStart, child.bodyEnd - child.bodyStart);
+      } else if (child.id === ID.BlockAdditional) {
+        data = buf.subarray(child.bodyStart, child.bodyEnd).slice();
+      }
+    }
+    if (addId === 1 && data) return data;
+  }
+  return undefined;
 }
 
 /**

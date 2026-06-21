@@ -20,7 +20,7 @@ export interface DecodeInput {
   codedWidth: number;
   codedHeight: number;
   description?: Uint8Array;
-  samples: Array<{ data: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }>;
+  samples: Array<{ data: Uint8Array; alpha?: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }>;
 }
 
 /** A frame sink that also retains ImageData for getPixels (SSIM/PSNR oracles need raw pixels). */
@@ -114,12 +114,60 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
     config.description = input.description.slice().buffer;
   }
 
+  const hasAlphaSideData = input.samples.some((sample) => sample.alpha && sample.alpha.byteLength > 0);
+
   const support = await VideoDecoder.isConfigSupported(config).catch(() => null);
   if (!support || support.supported !== true) {
     throw new Error(`VideoDecoder config not supported: ${codec}`);
   }
 
   const sink = new RetainingFrameSink();
+  let colorFrames: Array<{ ptsUs: number; frame: VideoFrame }> = [];
+  let alphaFrames: Array<{ ptsUs: number; frame: VideoFrame }> = [];
+  try {
+    colorFrames = await collectDecodedFrames(config, input.samples, maxFrames, (sample) => sample.data);
+    if (hasAlphaSideData) {
+      const alphaSamples = input.samples.filter((sample): sample is typeof sample & { alpha: Uint8Array } =>
+        !!sample.alpha && sample.alpha.byteLength > 0,
+      );
+      alphaFrames = await collectDecodedFrames(config, alphaSamples, maxFrames, (sample) => sample.alpha);
+    }
+  } catch (e) {
+    closeCollectedFrames(colorFrames);
+    closeCollectedFrames(alphaFrames);
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+
+  const emit = colorFrames.slice(0, Number.isFinite(maxFrames) ? maxFrames : colorFrames.length);
+  const alphaByPts = new Map(alphaFrames.map((entry) => [entry.ptsUs, entry.frame]));
+
+  // Rasterize + digest the emitted frames; close ALL collected frames afterwards.
+  try {
+    for (let i = 0; i < emit.length; i++) {
+      const { ptsUs, frame } = emit[i]!;
+      let img = await imageDataFromVideoFrame(frame);
+      const alphaFrame = alphaByPts.get(ptsUs);
+      if (alphaFrame) {
+        const alphaImg = await imageDataFromVideoFrame(alphaFrame);
+        img = mergeAlphaPlane(img, alphaImg);
+      }
+      const digest = await digestImageData(img, i, ptsUs);
+      sink.add(digest, img);
+    }
+  } finally {
+    closeCollectedFrames(colorFrames);
+    closeCollectedFrames(alphaFrames);
+  }
+
+  return sink;
+}
+
+async function collectDecodedFrames<T extends { ptsUs: number; keyframe: boolean }>(
+  config: VideoDecoderConfig,
+  samples: T[],
+  maxFrames: number,
+  dataForSample: (sample: T) => Uint8Array,
+): Promise<Array<{ ptsUs: number; frame: VideoFrame }>> {
   // Collected (pts, VideoFrame) so we can emit in presentation order after flush.
   const collected: Array<{ ptsUs: number; frame: VideoFrame }> = [];
   let decodeError: Error | undefined;
@@ -143,21 +191,20 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
 
     // Feed chunks in decode order until we have submitted enough to yield maxFrames presentation
     // frames. We submit a bit extra past maxFrames to flush out-of-order (B-frame) reordering.
-    const submitCap = Number.isFinite(maxFrames) ? Math.min(input.samples.length, maxFrames + 16) : input.samples.length;
+    const submitCap = Number.isFinite(maxFrames) ? Math.min(samples.length, maxFrames + 16) : samples.length;
     for (let i = 0; i < submitCap; i++) {
       if (decodeError) break;
-      const s = input.samples[i]!;
+      const sample = samples[i]!;
       const chunk = new EncodedVideoChunk({
-        type: s.keyframe ? 'key' : 'delta',
-        timestamp: s.ptsUs,
-        data: s.data,
+        type: sample.keyframe ? 'key' : 'delta',
+        timestamp: sample.ptsUs,
+        data: dataForSample(sample),
       });
       decoder.decode(chunk);
     }
     await decoder.flush();
   } catch (e) {
-    // Clean up any frames already collected before rethrowing.
-    for (const c of collected) c.frame.close();
+    closeCollectedFrames(collected);
     throw e instanceof Error ? e : new Error(String(e));
   } finally {
     try {
@@ -167,31 +214,36 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
     }
   }
 
-  if (decodeError && collected.length === 0) throw decodeError;
-
-  // Emit in presentation (pts) order, capped at maxFrames.
-  collected.sort((a, b) => a.ptsUs - b.ptsUs);
-  const emit = collected.slice(0, Number.isFinite(maxFrames) ? maxFrames : collected.length);
-
-  // Rasterize + digest the emitted frames; close ALL collected frames afterwards.
-  try {
-    for (let i = 0; i < emit.length; i++) {
-      const { ptsUs, frame } = emit[i]!;
-      const img = await imageDataFromVideoFrame(frame);
-      const digest = await digestImageData(img, i, ptsUs);
-      sink.add(digest, img);
-    }
-  } finally {
-    for (const c of collected) {
-      try {
-        c.frame.close();
-      } catch {
-        /* ignore */
-      }
-    }
+  if (decodeError && collected.length === 0) {
+    closeCollectedFrames(collected);
+    throw decodeError;
   }
 
-  return sink;
+  collected.sort((a, b) => a.ptsUs - b.ptsUs);
+  return collected;
+}
+
+function mergeAlphaPlane(color: ImageData, alpha: ImageData): ImageData {
+  if (color.width !== alpha.width || color.height !== alpha.height) {
+    throw new Error(
+      `alpha plane dimensions ${alpha.width}x${alpha.height} do not match color frame ` +
+        `${color.width}x${color.height}`,
+    );
+  }
+  for (let i = 0; i < color.data.length; i += 4) {
+    color.data[i + 3] = alpha.data[i] as number;
+  }
+  return color;
+}
+
+function closeCollectedFrames(frames: Array<{ frame: VideoFrame }>): void {
+  for (const item of frames) {
+    try {
+      item.frame.close();
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /**

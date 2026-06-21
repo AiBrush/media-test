@@ -7,6 +7,10 @@ const INVALIDATED_PASS_KEYS = new Set([
   'ffmpeg.wasm@0.12.15\u0000transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
   'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_mkv',
   'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_ts',
+  'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_hevc_mp4',
+  'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_vp8_webm',
+  'ffmpeg.wasm@0.12.15\u0000transcode/vp9_alpha_to_vp9_keepalpha',
+  'ffmpeg.wasm@0.12.15\u0000trim/vp9_alpha_keyframe_aligned',
 ]);
 
 export interface CachedScenarioResult extends ScenarioResult {
@@ -41,7 +45,7 @@ function shouldInvalidateCachedResult(result: ScenarioResult): boolean {
 }
 
 export function isReusableResult(result: ScenarioResult | undefined): result is ScenarioResult {
-  return result?.status === 'PASS' || result?.status === 'NA_ENGINE' || result?.status === 'NA_BROWSER' || result?.status === 'NA_ASSET';
+  return result?.status === 'PASS';
 }
 
 function openDb(): Promise<IDBDatabase> {

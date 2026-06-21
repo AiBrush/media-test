@@ -73,8 +73,15 @@ import { registerEngine } from '../../core/registry.ts';
 import { decodeBytesToFrames, playbackSmoke } from './oracle-helpers.ts';
 import { decodeWithVideoElement, decodeWithWebCodecs, grabFrameAt } from './decode.ts';
 import type { DecodeInput } from './decode.ts';
-import { demuxMp4Tracks, demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import {
+  demuxMp4Tracks,
+  demuxMp4Video,
+  hasMp4DisplayMatrixTransform,
+  looksLikeMp4,
+  UnsupportedMp4Error,
+} from './demux-mp4.ts';
 import { demuxWebmTracks, demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+import { demuxWav, looksLikeWav, UnsupportedWavError } from './demux-wav.ts';
 import { probeInput } from './probe.ts';
 import { canMediaRecorderTranscode, recorderMimeFor, transcodeViaRecorder } from './transcode.ts';
 import { warmupPlatform } from './warmup.ts';
@@ -230,7 +237,7 @@ export class PlatformEngine implements MediaEngine {
       },
       // Inputs the inline demux + <video> can read. We can PROBE more than we can DEMUX, but the
       // common axis here is "containers the engine accepts as input for some op".
-      containersIn: ['mp4', 'mov', 'webm', 'mkv'],
+      containersIn: ['mp4', 'mov', 'webm', 'mkv', 'wav'],
       // Containers raw platform can WRITE via MediaRecorder: WebM broadly (Chromium/Firefox) and MP4
       // on Safari (OS encoder). Both are declared; the actual per-browser container is resolved at
       // runtime by recorderMimeFor() (returns null → NotApplicableError → honest NA), and the runner's
@@ -252,14 +259,25 @@ export class PlatformEngine implements MediaEngine {
       // as NA_BROWSER on browsers lacking it — distinct from NA_ENGINE, never collapsed. Matches the
       // mp4box / remotion-media-parser / web-demuxer convention (a demuxer declares the audio codecs
       // it can identify). (Dossier §2 probe/demux, §A.7, §A.11 'fps/codec ✓'.)
-      audioCodecs: ['aac', 'opus', 'vorbis'],
+      audioCodecs: ['aac', 'opus', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32'],
       encryption: [],
       // 'alpha' decode is possible via WebCodecs alpha:'keep' on VP8/VP9; 'resize' via canvas in the
       // transcode path; 'packets:dts' comes from MP4 sample-table decode timestamps.
       // 'metadata:protected-tracks' means the MP4 probe unwraps CENC `encv`/`enca` sample entries via
       // sinf/frma to identify the original H.264/AAC track metadata without decrypting samples.
-      // We do NOT claim fragmented/faststart/metadata:write/rotate/fanout/trim.
-      features: ['resize', 'alpha', 'packets:dts', 'metadata:protected-tracks', 'decode:golden-rgba'],
+      // 'rotate' / 'rotation:decode' are decode-side claims: display-matrix MP4s route through the
+      // browser <video> presenter so rotation is baked into the observed pixels. Transcode/remux/mux
+      // rotation write paths remain guarded/undeclared by operation-specific NA.
+      // We do NOT claim fragmented/faststart/metadata:write/fanout/trim.
+      features: [
+        'resize',
+        'alpha',
+        'rotate',
+        'rotation:decode',
+        'packets:dts',
+        'metadata:protected-tracks',
+        'decode:golden-rgba',
+      ],
     };
   }
 
@@ -321,8 +339,11 @@ export class PlatformEngine implements MediaEngine {
         });
         return { metadata: meta, packets };
       }
+      if (looksLikeWav(bytes)) {
+        return demuxWav(bytes);
+      }
     } catch (e) {
-      if (e instanceof UnsupportedMp4Error || e instanceof UnsupportedWebmError) {
+      if (e instanceof UnsupportedMp4Error || e instanceof UnsupportedWebmError || e instanceof UnsupportedWavError) {
         throw new NotApplicableError('demux', e.message);
       }
       throw e;
@@ -400,6 +421,16 @@ export class PlatformEngine implements MediaEngine {
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
     const ab = await input.arrayBuffer();
     const bytes = new Uint8Array(ab);
+
+    if (looksLikeMp4(bytes) && hasMp4DisplayMatrixTransform(bytes)) {
+      if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+        throw new NotApplicableError('decodeFrames', 'display-matrix decode requires DOM <video> presentation');
+      }
+      const blob = await input.blob();
+      const fallbackOpts: { maxFrames?: number } = {};
+      if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+      return decodeWithVideoElement(blob, fallbackOpts);
+    }
 
     const decodeInput = this.buildDecodeInput(bytes);
     if (decodeInput && decodeInput.samples.length > 0) {

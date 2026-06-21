@@ -17,6 +17,7 @@
 import type { MediaInput, NormalizedMetadata, NormalizedTrack } from '../../core/engine.ts';
 import { demuxMp4Tracks, looksLikeMp4, probeMp4Metadata, UnsupportedMp4Error } from './demux-mp4.ts';
 import { demuxWebmTracks, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+import { looksLikeWav, probeWavMetadata, UnsupportedWavError } from './demux-wav.ts';
 
 /** Map a MIME / asset id hint to a canonical container token. */
 function containerFromMime(mime: string, bytes: Uint8Array): string {
@@ -32,6 +33,7 @@ function containerFromMime(mime: string, bytes: Uint8Array): string {
   // Fall back to a sniff.
   if (looksLikeMp4(bytes)) return 'mp4';
   if (looksLikeWebm(bytes)) return 'webm';
+  if (looksLikeWav(bytes)) return 'wav';
   return 'unknown';
 }
 
@@ -225,6 +227,10 @@ export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number 
         if (d !== null) maxDuration = Math.max(maxDuration ?? 0, d);
       }
       demuxDuration = maxDuration;
+    } else if (container === 'wav' || looksLikeWav(bytes)) {
+      const wav = probeWavMetadata(bytes);
+      tracks.push(...wav.tracks);
+      demuxDuration = wav.durationSec;
     }
   } catch (e) {
     // Unsupported variants fall through to cheaper metadata-only probes or, finally, <video>.
@@ -260,6 +266,9 @@ export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number 
       } catch (fallbackErr) {
         if (!(fallbackErr instanceof UnsupportedMp4Error)) throw fallbackErr;
       }
+    }
+    if (e instanceof UnsupportedWavError && (container === 'wav' || looksLikeWav(bytes))) {
+      throw e;
     }
   }
 

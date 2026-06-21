@@ -170,7 +170,7 @@ try {
   const reusableResults = loadReusableResultsForSeed(opts.browser);
   const seeded = await seedReusableResults(page, reusableResults);
   if (seeded > 0) {
-    console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS/N/A result(s) into the page cache`);
+    console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS result(s) into the page cache`);
   }
 
   // Build the run filter from CLI flags. Empty arrays mean "all".
@@ -364,7 +364,7 @@ function resultFiles(rawDir) {
 }
 
 function isReusableStatus(status) {
-  return status === 'PASS' || status === 'NA_ENGINE' || status === 'NA_BROWSER' || status === 'NA_ASSET';
+  return status === 'PASS';
 }
 
 async function seedReusableResults(page, results) {

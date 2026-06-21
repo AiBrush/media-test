@@ -1199,10 +1199,14 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       }
 
       const cached = await opts.resultReuse?.get(engine.id, scenario.id, opts.browser).catch(() => undefined);
-      if (cached && (cached.status === 'PASS' || cached.status === 'NA_ENGINE' || cached.status === 'NA_BROWSER' || cached.status === 'NA_ASSET')) {
+      if (cached && cached.status === 'PASS') {
+        const cachedReason = cached.reason?.replace(/^(cached:\s*)+/i, '');
         result = {
           ...cached,
-          reason: cached.reason ? `cached: ${cached.reason}` : 'cached previous PASS/N/A result',
+          reason:
+            cachedReason && cachedReason !== 'cached previous PASS result'
+              ? `cached: ${cachedReason}`
+              : 'cached previous PASS result',
         };
         if (engine.dispose) {
           try {

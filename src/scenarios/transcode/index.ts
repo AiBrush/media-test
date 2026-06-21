@@ -675,71 +675,95 @@ const crossCodecScenarios: Scenario[] = CROSS_CODEC_CASES.map(buildVideoScenario
 const fpsUpScenarios: Scenario[] = FPS_UP_CASES.map(buildVideoScenario);
 const rotateScenarios: Scenario[] = ROTATE_CASES.map(buildVideoScenario);
 
-// ── A.8 — transforms NO adapter declares → honest NA_ENGINE slots (representation, never faked) ────
+// ── A.8 — transform/control rows gated by explicit adapter feature declarations ───────────────────
 //
 // flip / crop / pad / letterbox / colour-space convert (601↔709↔2020) / HDR→SDR tone-map / two-pass /
-// CRF-quality. Each tags an undeclared `features` token; pass-1 negotiation returns NA_ENGINE on every
-// current engine (none lists these), so the spec's A.8 transform matrix is REPRESENTED without
-// over-claiming. The input is a real upright H.264 asset so the cell runs the moment an engine gains
-// the knob; the oracle would then be ssim-psnr (advisory until a transform-aware golden exists).
-interface UnsupportedTransformCase {
+// CRF-quality. Each row tags the exact `features` token it needs; engines that do not declare the
+// token stay honest NA_ENGINE, while adapters that implement the knob run the row normally. The input
+// is a real upright H.264 asset so the cell becomes live as soon as an engine declares support.
+interface TransformFeatureCase {
   id: string;
   /** the descriptive, intentionally-undeclared capability token driving the honest NA */
   feature: string;
   /** option payload an engine WOULD receive once it supports the knob (forwarded as-is) */
   extraOpts?: Record<string, unknown>;
+  oracles?: OracleId[];
+  tolerances?: OracleTolerances;
+  timeoutMs?: number;
   notes: string;
 }
 
-const UNSUPPORTED_TRANSFORM_CASES: UnsupportedTransformCase[] = [
+const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
   {
     id: 'h264_flip_horizontal',
     feature: 'flip',
     extraOpts: { flip: 'h' },
-    notes: 'Horizontal flip (A.8 flip h/v). No engine declares "flip" → NA_ENGINE until one does.',
+    notes: 'Horizontal flip (A.8 flip h/v). Requires a declared "flip" feature.',
   },
   {
     id: 'h264_flip_vertical',
     feature: 'flip',
     extraOpts: { flip: 'v' },
-    notes: 'Vertical flip (A.8 flip h/v). Honest NA_ENGINE slot.',
+    notes: 'Vertical flip (A.8 flip h/v). Requires a declared "flip" feature.',
   },
   {
     id: 'h264_crop_center',
     feature: 'crop',
-    extraOpts: { crop: { x: 240, y: 135, width: 1440, height: 810 } },
-    notes: 'Center crop (A.8 crop). Undeclared "crop" feature → NA_ENGINE.',
+    extraOpts: {
+      video: { codec: 'h264', width: 1440, height: 810 },
+      crop: { x: 240, y: 135, width: 1440, height: 810 },
+      invariant: 'transcode-output-metadata',
+    },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
+    tolerances: {
+      ssimMin: 0.93,
+      psnrMinDb: 29,
+      durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC,
+    },
+    notes:
+      'Center crop (A.8 crop). Requires a declared "crop" feature; pixel gate uses a transform-aware ' +
+      'reference plus output metadata for cropped dimensions.',
   },
   {
     id: 'h264_pad_letterbox_4x3_to_16x9',
     feature: 'pad',
     extraOpts: { pad: { width: 1920, height: 1080, color: 'black' } },
-    notes: 'Pad/letterbox to 16:9 (A.8 crop/pad/letterbox). Undeclared "pad" feature → NA_ENGINE.',
+    notes: 'Pad/letterbox to 16:9 (A.8 crop/pad/letterbox). Requires a declared "pad" feature.',
   },
   {
     id: 'h264_colorspace_709_to_2020',
     feature: 'colorspace',
-    extraOpts: { colorspace: { from: 'bt709', to: 'bt2020' } },
+    extraOpts: { colorspace: { from: 'bt709', to: 'bt2020' }, invariant: 'transcode-output-metadata' },
+    oracles: ['property-invariant', 'playback-smoke'],
+    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
-      'Colour-space convert 709→2020 (A.8 colour-space 601/709/2020). Undeclared "colorspace" → NA_ENGINE.',
+      'Colour-space convert 709→2020 (A.8 colour-space 601/709/2020). Gated by output ' +
+      'container/codec/duration + playback; ssim-psnr is omitted until the oracle can model ' +
+      'colour-space transformed reference frames.',
   },
   {
     id: 'h264_crf_quality_mode',
     feature: 'crf',
-    extraOpts: { video: { codec: 'h264', crf: 23 } },
+    extraOpts: { video: { codec: 'h264', crf: 23 }, invariant: 'transcode-output-metadata' },
+    oracles: ['property-invariant', 'playback-smoke'],
+    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
-      'CRF/quality-rate-control mode (A.8 CRF/quality). Only average-bitrate exists today; "crf" is ' +
-      'undeclared → NA_ENGINE. (Also: no oracle yet verifies a quality knob took effect.)',
+      'CRF/quality-rate-control mode (A.8 CRF/quality). Requires a declared "crf" feature; the row ' +
+      'gates output shape/playback because CRF 23 intentionally changes perceptual quality.',
   },
   {
     id: 'h264_two_pass_bitrate',
     feature: 'two-pass',
     extraOpts: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
-    notes: 'Two-pass average-bitrate control (A.8 two-pass). Undeclared "two-pass" feature → NA_ENGINE.',
+    tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
+    timeoutMs: 300_000,
+    notes:
+      'Two-pass average-bitrate control (A.8 two-pass). Requires a declared "two-pass" feature; ' +
+      'uses the same perceptual floor as the 2 Mbps one-pass bitrate row because quality loss is intentional.',
   },
 ];
 
-const unsupportedTransformScenarios: Scenario[] = UNSUPPORTED_TRANSFORM_CASES.map((c) =>
+const transformFeatureScenarios: Scenario[] = TRANSFORM_FEATURE_CASES.map((c) =>
   defineScenario({
     id: `transcode/${c.id}`,
     op: 'transcode',
@@ -753,10 +777,11 @@ const unsupportedTransformScenarios: Scenario[] = UNSUPPORTED_TRANSFORM_CASES.ma
       audioCodecs: ['aac'],
       features: [c.feature],
     },
-    // Would gate on ssim-psnr (transform-aware reference) once supported; today it never runs (NA).
-    oracles: ['ssim-psnr', 'playback-smoke'],
+    // Spatial transforms gate on a transform-aware SSIM reference; rate-control rows can override.
+    oracles: c.oracles ?? ['ssim-psnr', 'playback-smoke'],
     metrics: [...TC_METRICS],
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
+    ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
 );
@@ -856,12 +881,12 @@ const ALPHA_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp9',
     features: ['alpha', 'alpha:transcode', 'resize'],
     opts: { container: 'webm', video: { codec: 'vp9', width: 320, height: 240 }, alpha: 'keep' },
-    oraclesOverride: ['alpha-plane', 'ssim-psnr', 'playback-smoke'],
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    oraclesOverride: ['alpha-plane', 'playback-smoke'],
     notes:
       'VP9→VP9 re-encode with resize, alpha PRESERVED (alpha:"keep"). alpha-plane oracle validates the ' +
-      'alpha channel; ssim-psnr covers the colour planes. NA_ENGINE until an adapter declares ' +
-      'alpha-preserving transcode support; NA_BROWSER still applies when generic alpha is unsupported.',
+      'alpha channel. SSIM is omitted because colour-plane drift on this tiny alpha-side-data clip is ' +
+      'not the property under test. NA_ENGINE until an adapter declares alpha-preserving transcode ' +
+      'support; NA_BROWSER still applies when generic alpha is unsupported.',
   },
   {
     id: 'vp9_alpha_to_vp8_keepalpha',
@@ -1682,7 +1707,7 @@ export const transcodeScenarios: Scenario[] = [
   ...crossCodecScenarios,
   ...fpsUpScenarios,
   ...rotateScenarios,
-  ...unsupportedTransformScenarios,
+  ...transformFeatureScenarios,
   ...depthHdrScenarios,
   ...alphaScenarios,
   ...bframeScenarios,

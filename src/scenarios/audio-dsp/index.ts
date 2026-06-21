@@ -13,21 +13,19 @@
  * choice below; they are documented here so a reviewer sees the choices are deliberate, not sloppy:
  *
  *   (1) `decoded-frames-bitexact` / `ssim-psnr` / `property-invariant(decode-remux)` all decode via
- *       `ctx.decodeWithPlatform`, which is a WebCodecs *VideoDecoder* → RGBA path. For an audio-only
- *       output it yields 0 frames → the oracle FAILS ("0 frames"). It is a PCM-blind oracle today.
- *       It is still attached to the bit-reproducible conversions because (a) the family header has
- *       always promised a decoded-PCM digest gate and this is the hook a future AudioDecoder/PCM
- *       digest path slots into without touching scenarios, and (b) it FAILS-CLOSED: it can never
- *       false-PASS a wrong engine. An honest FAIL here is strictly better than no gate.
+ *       `ctx.decodeWithPlatform`, which is a WebCodecs *VideoDecoder* → RGBA path. They are therefore
+ *       not attached to audio-only conversion outputs until the suite grows a PCM/AudioDecoder oracle.
+ *       Keeping those placeholders on live rows turned supported framework paths into guaranteed
+ *       NA_ASSET/FAIL cells, which hid real adapter support behind an oracle limitation.
  *   (2) `golden-metadata` reads `ctx.metadata`, which the runner only populates for `op:'probe'`.
- *       For a `transcode` it is undefined → FAIL ("no probe metadata"). Like (1) it fails-closed and
- *       is the natural slot for a post-op re-probe. It asserts the OUTPUT shape (rate/channels/codec).
+ *       For a `transcode` it is undefined → FAIL ("no probe metadata"). Audio conversions instead use
+ *       `property-invariant(transcode-output-metadata)`, which reference-probes the produced bytes and
+ *       asserts the OUTPUT container/codec/sample-rate/channel-count plus duration.
  *   (3) `loadGolden` keys golden to the INPUT asset id. The duration of a resample / ch-mix / PCM-
  *       reformat is INVARIANT (5s in → 5s out), so the metamorphic `property-invariant(probe-dur)`
  *       (which compares `referenceEngine.probe(output).dur` to the input golden duration) is a
- *       genuinely correct, harness-compatible correctness floor for those conversions — and it
- *       degrades to a clean FAIL ("no reference engine") rather than a false PASS when none is
- *       injected. It is the only oracle in this family that can PASS today, and only when it should.
+ *       genuinely correct, harness-compatible duration floor. The output-metadata invariant now
+ *       subsumes that duration check while adding the requested output shape.
  *
  * `graceful-failure` is fully functional today (it reads output-presence + notes tokens, no decode),
  * so the robustness/edge/negative cases below are real, gating coverage right now.
@@ -287,16 +285,14 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
   },
 ];
 
-// Oracle policy per conversion case. Bit-reproducible conversions lead with the PCM-digest oracle
-// (the format header has always promised it; it fails-closed today and is the AudioDecoder slot),
-// back it with the OUTPUT-shape metadata oracle, AND add the duration-invariant metamorphic oracle
-// that can actually PASS in the current harness via a reference probe. Resampling/lossy mixes are
-// not bit-reproducible across resamplers, so they drop the PCM-digest gate and rely on shape +
-// duration invariance. (`property-invariant` here means "probe(out).dur == probe(x).dur".)
+// Oracle policy per conversion case. The current suite has no decoded-PCM oracle, and
+// `golden-metadata` is probe-only. So every live audio conversion uses the output-metadata invariant:
+// reference-probe the produced bytes, assert requested output shape, and preserve duration. The
+// `bitReproducible` flag remains as documentation for the future PCM-digest oracle; it does not drive
+// a guaranteed-failing video-frame oracle today.
 function conversionOracles(c: AudioDspCase): OracleId[] {
-  return c.bitReproducible
-    ? ['decoded-frames-bitexact', 'golden-metadata', 'property-invariant']
-    : ['golden-metadata', 'property-invariant'];
+  void c;
+  return ['property-invariant'];
 }
 
 const conversionScenarios: Scenario[] = AUDIO_DSP_CASES.map((c) =>
@@ -306,7 +302,7 @@ const conversionScenarios: Scenario[] = AUDIO_DSP_CASES.map((c) =>
     input: c.asset,
     // Tag the metamorphic invariant the property-invariant oracle should evaluate (duration is
     // preserved by every conversion in this list). Carried alongside the transcode options.
-    options: { ...c.opts, invariant: 'probe-duration' },
+    options: { ...c.opts, invariant: 'transcode-output-metadata' },
     requires: {
       operations: ['transcode'],
       containersIn: [c.container],
@@ -499,7 +495,7 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 }, invariant: 'probe-duration' },
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 }, invariant: 'transcode-output-metadata' },
     oracles: ['property-invariant'],
     timeoutMs: LONG_AUDIO_TIMEOUT_MS,
     notes: 'A.16 size-ladder for audio: downsample a multi-hour file streaming; duration must survive.',
@@ -522,8 +518,8 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 2 }, invariant: 'probe-duration' },
-    oracles: ['golden-metadata', 'property-invariant'],
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 2 }, invariant: 'transcode-output-metadata' },
+    oracles: ['property-invariant'],
     notes: 'A.16 variable channel count: 5.1 (non-stereo layout) -> stereo; shape + duration assertion.',
   },
 ];

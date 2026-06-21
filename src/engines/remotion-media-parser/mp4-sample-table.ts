@@ -10,7 +10,13 @@
  * size/timestamp/keyframe rows from stsz/stts/ctts/stss. It never invents packets from duration or fps.
  */
 
-import type { DemuxResult, MediaInput, NormalizedMetadata, PacketInfo } from '../../core/engine.ts';
+import type {
+  DemuxResult,
+  MediaInput,
+  NormalizedMetadata,
+  NormalizedTrack,
+  PacketInfo,
+} from '../../core/engine.ts';
 
 const SAMPLE_TABLE_DEMUX_MP4S = new Set([
   'h264_1080p_30s.mp4',
@@ -21,6 +27,7 @@ const MP4_HEADER_RANGE_BYTES = 64 * 1024;
 const MAX_TOP_LEVEL_BOXES = 32;
 const MAX_MOOV_BYTES = 128 * 1024 * 1024;
 const MAX_SAMPLE_TABLE_PACKETS = 2_000_000;
+const MAX_PROTECTED_METADATA_BYTES = 32 * 1024 * 1024;
 
 interface Box {
   type: string;
@@ -34,6 +41,17 @@ interface BoxHeader {
   type: string;
   size: number;
   headerSize: number;
+}
+
+interface ProtectedTrack {
+  id: number;
+  timescale: number;
+  track: NormalizedTrack;
+}
+
+interface FragmentTrackStats {
+  sampleCount: number;
+  durationTicks: number;
 }
 
 export function shouldUseMp4SampleTableDemux(input: MediaInput): boolean {
@@ -82,6 +100,15 @@ export async function demuxMp4SampleTable(input: MediaInput, metadata: Normalize
   return { metadata, packets };
 }
 
+export async function readMp4ProtectedTrackMetadata(
+  input: MediaInput,
+): Promise<Pick<NormalizedMetadata, 'durationSec' | 'tracks'> | null> {
+  if (input.mutated) return null;
+  const bytes = await readFullMp4File(input.url);
+  const metadata = protectedTrackMetadataFromFile(bytes);
+  return metadata.tracks.length ? metadata : null;
+}
+
 async function readMoovBox(url: string): Promise<Uint8Array> {
   const prefix = await readRange(url, 0, MP4_HEADER_RANGE_BYTES - 1);
   let cursor = 0;
@@ -122,6 +149,21 @@ async function readRange(url: string, start: number, end: number): Promise<Uint8
   return new Uint8Array(await res.arrayBuffer());
 }
 
+async function readFullMp4File(url: string): Promise<Uint8Array> {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`MP4 protected metadata read failed: HTTP ${res.status}`);
+  const length = Number(res.headers.get('content-length') ?? '0');
+  if (Number.isFinite(length) && length > MAX_PROTECTED_METADATA_BYTES) {
+    await res.body?.cancel();
+    throw new Error(`MP4 protected metadata file too large: ${length} bytes`);
+  }
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length > MAX_PROTECTED_METADATA_BYTES) {
+    throw new Error(`MP4 protected metadata file too large: ${bytes.length} bytes`);
+  }
+  return bytes;
+}
+
 function packetsFromMoov(moovBytes: Uint8Array): PacketInfo[] {
   const moov = [...iterBoxes(moovBytes, 0, moovBytes.length)][0];
   if (!moov || moov.type !== 'moov') throw new Error('MP4 sample-table demux expected a moov box');
@@ -138,6 +180,231 @@ function packetsFromMoov(moovBytes: Uint8Array): PacketInfo[] {
 
   if (packets.length === 0) throw new Error('MP4 sample-table demux found no packetized tracks');
   return packets;
+}
+
+function protectedTrackMetadataFromFile(
+  bytes: Uint8Array,
+): Pick<NormalizedMetadata, 'durationSec' | 'tracks'> {
+  const moov = findBox(bytes, 0, bytes.length, 'moov');
+  if (!moov) throw new Error('MP4 protected metadata expected a moov box');
+
+  const protectedTracks: ProtectedTrack[] = [];
+  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const track = protectedTrackFromTrak(bytes, trak);
+    if (track) protectedTracks.push(track);
+  }
+
+  const fragmentStats = fragmentTrackStats(bytes, moov);
+  const tracks = protectedTracks.map(({ id, timescale, track }) => {
+    if (track.type !== 'video' || track.fps != null) return track;
+    const stats = fragmentStats.get(id);
+    if (!stats || stats.sampleCount <= 0 || stats.durationTicks <= 0 || timescale <= 0) return track;
+    return { ...track, fps: stats.sampleCount / (stats.durationTicks / timescale) };
+  });
+
+  const mvhd = findBox(bytes, moov.bodyStart, moov.bodyEnd, 'mvhd');
+  const movieDuration = mvhd ? parseMovieDurationSec(bytes, mvhd) : null;
+  const fragmentDuration = fragmentDurationSec(protectedTracks, fragmentStats);
+  return {
+    durationSec: movieDuration && movieDuration > 0 ? movieDuration : fragmentDuration,
+    tracks,
+  };
+}
+
+function protectedTrackFromTrak(bytes: Uint8Array, trak: Box): ProtectedTrack | null {
+  const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+  if (!mdia) return null;
+  const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
+  const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+  const handler = hdlr ? hdlrType(bytes, hdlr) : '';
+  if (handler !== 'vide' && handler !== 'soun') return null;
+
+  const mdhd = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'mdhd');
+  const minf = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'minf');
+  if (!mdhd || !minf) return null;
+  const stbl = findBox(bytes, minf.bodyStart, minf.bodyEnd, 'stbl');
+  if (!stbl) return null;
+  const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
+  if (!stsd) return null;
+  const entry = firstStsdEntry(bytes, stsd);
+  if (!entry) return null;
+
+  const format = protectedOriginalFormat(bytes, entry) ?? entry.type;
+  const id = tkhd ? parseTkhdTrackId(bytes, tkhd) : 0;
+  const timescale = parseMdhdTimescale(bytes, mdhd);
+  if (handler === 'vide') {
+    const width = be16(bytes, entry.start + 32) || undefined;
+    const height = be16(bytes, entry.start + 34) || undefined;
+    const fps = videoFpsFromStbl(bytes, stbl, mdhd);
+    const track: NormalizedTrack = {
+      type: 'video',
+      codec: mp4VideoCodec(format),
+      width,
+      height,
+      bitrate: null,
+      language: null,
+    };
+    if (fps != null) track.fps = fps;
+    return { id, timescale, track };
+  }
+
+  return {
+    id,
+    timescale,
+    track: {
+      type: 'audio',
+      codec: mp4AudioCodec(format),
+      sampleRate: be32(bytes, entry.start + 32) >>> 16 || undefined,
+      channels: be16(bytes, entry.start + 24) || undefined,
+      bitrate: null,
+      language: null,
+    },
+  };
+}
+
+function firstStsdEntry(bytes: Uint8Array, stsd: Box): Box | null {
+  const offset = stsd.bodyStart + 8;
+  const header = parseBoxHeader(bytes, offset, stsd.bodyEnd);
+  if (!header) return null;
+  const bodyStart = offset + header.headerSize;
+  const bodyEnd = offset + header.size;
+  if (bodyEnd > stsd.bodyEnd) return null;
+  return { type: header.type, start: offset, size: header.size, bodyStart, bodyEnd };
+}
+
+function protectedOriginalFormat(bytes: Uint8Array, entry: Box): string | null {
+  const childrenStart = entry.type === 'encv' ? entry.start + 86 : entry.type === 'enca' ? entry.start + 36 : entry.bodyStart;
+  const sinf = findBox(bytes, childrenStart, entry.bodyEnd, 'sinf');
+  const frma = sinf ? findBox(bytes, sinf.bodyStart, sinf.bodyEnd, 'frma') : undefined;
+  return frma ? fourcc(bytes, frma.bodyStart) : null;
+}
+
+function parseMovieDurationSec(bytes: Uint8Array, mvhd: Box): number | null {
+  const version = bytes[mvhd.bodyStart] ?? 0;
+  const timescale = be32(bytes, mvhd.bodyStart + (version === 1 ? 20 : 12));
+  const duration = version === 1 ? be64(bytes, mvhd.bodyStart + 24) : be32(bytes, mvhd.bodyStart + 16);
+  if (!timescale || !Number.isFinite(duration)) return null;
+  return duration / timescale;
+}
+
+function videoFpsFromStbl(bytes: Uint8Array, stbl: Box, mdhd: Box): number | null {
+  const stsz = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsz');
+  const stts = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stts');
+  if (!stsz || !stts) return null;
+  const sizes = parseStsz(bytes, stsz);
+  const durations = parseStts(bytes, stts, sizes.length);
+  const durationTicks = durations.reduce((sum, n) => sum + n, 0);
+  const timescale = parseMdhdTimescale(bytes, mdhd);
+  if (!sizes.length || !durationTicks || !timescale) return null;
+  return sizes.length / (durationTicks / timescale);
+}
+
+function fragmentDurationSec(
+  tracks: ProtectedTrack[],
+  statsByTrackId: Map<number, FragmentTrackStats>,
+): number | null {
+  const videoTrack = tracks.find((entry) => entry.track.type === 'video' && statsByTrackId.has(entry.id));
+  const preferred = videoTrack ? [videoTrack] : tracks;
+  for (const { id, timescale } of preferred) {
+    const stats = statsByTrackId.get(id);
+    if (stats && stats.durationTicks > 0 && timescale > 0) return stats.durationTicks / timescale;
+  }
+  return null;
+}
+
+function fragmentTrackStats(bytes: Uint8Array, moov: Box): Map<number, FragmentTrackStats> {
+  const defaults = trexDefaultDurations(bytes, moov);
+  const stats = new Map<number, FragmentTrackStats>();
+
+  for (const moof of iterBoxes(bytes, 0, bytes.length)) {
+    if (moof.type !== 'moof') continue;
+    for (const traf of iterBoxes(bytes, moof.bodyStart, moof.bodyEnd)) {
+      if (traf.type !== 'traf') continue;
+      const tfhd = findBox(bytes, traf.bodyStart, traf.bodyEnd, 'tfhd');
+      const trun = findBox(bytes, traf.bodyStart, traf.bodyEnd, 'trun');
+      if (!tfhd || !trun) continue;
+
+      const tfhdInfo = parseTfhd(bytes, tfhd);
+      if (!tfhdInfo.trackId) continue;
+      const defaultDuration = tfhdInfo.defaultSampleDuration ?? defaults.get(tfhdInfo.trackId) ?? 0;
+      const trunInfo = parseTrunStats(bytes, trun, defaultDuration);
+      const existing = stats.get(tfhdInfo.trackId) ?? { sampleCount: 0, durationTicks: 0 };
+      stats.set(tfhdInfo.trackId, {
+        sampleCount: existing.sampleCount + trunInfo.sampleCount,
+        durationTicks: existing.durationTicks + trunInfo.durationTicks,
+      });
+    }
+  }
+
+  return stats;
+}
+
+function trexDefaultDurations(bytes: Uint8Array, moov: Box): Map<number, number> {
+  const defaults = new Map<number, number>();
+  const mvex = findBox(bytes, moov.bodyStart, moov.bodyEnd, 'mvex');
+  if (!mvex) return defaults;
+  for (const trex of iterBoxes(bytes, mvex.bodyStart, mvex.bodyEnd)) {
+    if (trex.type !== 'trex') continue;
+    defaults.set(be32(bytes, trex.bodyStart + 4), be32(bytes, trex.bodyStart + 12));
+  }
+  return defaults;
+}
+
+function parseTfhd(bytes: Uint8Array, tfhd: Box): { trackId: number; defaultSampleDuration?: number } {
+  const flags = be32(bytes, tfhd.bodyStart) & 0xffffff;
+  const trackId = be32(bytes, tfhd.bodyStart + 4);
+  let offset = tfhd.bodyStart + 8;
+  if (flags & 0x000001) offset += 8; // base-data-offset-present
+  if (flags & 0x000002) offset += 4; // sample-description-index-present
+  let defaultSampleDuration: number | undefined;
+  if (flags & 0x000008) {
+    defaultSampleDuration = be32(bytes, offset);
+    offset += 4;
+  }
+  void offset;
+  return { trackId, defaultSampleDuration };
+}
+
+function parseTrunStats(
+  bytes: Uint8Array,
+  trun: Box,
+  defaultSampleDuration: number,
+): FragmentTrackStats {
+  const flags = be32(bytes, trun.bodyStart) & 0xffffff;
+  const sampleCount = be32(bytes, trun.bodyStart + 4);
+  let offset = trun.bodyStart + 8;
+  if (flags & 0x000001) offset += 4; // data-offset-present
+  if (flags & 0x000004) offset += 4; // first-sample-flags-present
+
+  let durationTicks = 0;
+  for (let i = 0; i < sampleCount && offset <= trun.bodyEnd; i++) {
+    const duration = flags & 0x000100 ? be32(bytes, offset) : defaultSampleDuration;
+    if (flags & 0x000100) offset += 4; // sample-duration-present
+    if (flags & 0x000200) offset += 4; // sample-size-present
+    if (flags & 0x000400) offset += 4; // sample-flags-present
+    if (flags & 0x000800) offset += 4; // sample-composition-time-offsets-present
+    durationTicks += duration;
+  }
+
+  return { sampleCount, durationTicks };
+}
+
+function mp4VideoCodec(format: string): string {
+  if (format === 'avc1' || format === 'avc2' || format === 'avc3' || format === 'avc4') return 'h264';
+  if (format === 'hvc1' || format === 'hev1') return 'hevc';
+  if (format === 'av01') return 'av1';
+  if (format === 'vp08') return 'vp8';
+  if (format === 'vp09') return 'vp9';
+  return format || 'unknown';
+}
+
+function mp4AudioCodec(format: string): string {
+  if (format === 'mp4a') return 'aac';
+  if (format === 'Opus') return 'opus';
+  if (format === '.mp3' || format === 'mp3 ') return 'mp3';
+  if (format === 'fLaC') return 'flac';
+  return format || 'unknown';
 }
 
 function packetsFromTrak(bytes: Uint8Array, trak: Box, trackIndex: number): PacketInfo[] | null {
@@ -317,6 +584,10 @@ function boundEntryCount(declared: number, entriesStart: number, entrySize: numb
 
 function ticksToUs(ticks: number, timescale: number): number {
   return Math.round((ticks * 1_000_000) / timescale);
+}
+
+function be16(bytes: Uint8Array, offset: number): number {
+  return (((bytes[offset] as number) << 8) | (bytes[offset + 1] as number)) >>> 0;
 }
 
 function be32(bytes: Uint8Array, offset: number): number {

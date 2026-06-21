@@ -939,9 +939,10 @@ export class MediabunnyEngine implements MediaEngine {
       containersOut: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'],
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'],
-      // CENC (ctr/cbcs) decryption at read time via resolveKeyId; HLS AES-128 not exposed as a
-      // decrypt primitive in 1.48.0 → not declared.
-      encryption: ['cenc-ctr', 'cenc-cbcs'],
+      // CENC (ctr/cbcs) decrypts at ISOBMFF read time via resolveKeyId. HLS AES-128 decrypts inside
+      // Mediabunny's HLS segmented reader by resolving #EXT-X-KEY URIs and decrypting segment bytes
+      // before demux/conversion, so both read and decrypt scenarios can honestly contest it.
+      encryption: ['cenc-ctr', 'cenc-cbcs', 'hls-aes128'],
       features: [
         'fragmented', // fastStart: 'fragmented' (fMP4 / CMAF)
         'fastStart:reserve', // fastStart: 'reserve'
@@ -962,7 +963,7 @@ export class MediabunnyEngine implements MediaEngine {
         'gain', // ConversionAudioOptions.process sample scaling
         'fade', // ConversionAudioOptions.process deterministic envelope
         'decode:golden-rgba', // VideoSample.copyTo(RGBA) matches the baked WebCodecs golden path
-        'hls:aes128', // read/probe AES-128 HLS playlists; decrypt() still does not expose hls-aes128
+        'hls:aes128', // read/probe/decrypt AES-128 HLS playlists via EXT-X-KEY segment decryption
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
@@ -1425,6 +1426,18 @@ export class MediabunnyEngine implements MediaEngine {
     key: DecryptKey,
     opts: { scheme: EncryptionScheme },
   ): Promise<MediaBytes> {
+    if (opts.scheme === 'hls-aes128') {
+      const mb = this.lib;
+      const mbInput = await openInput(mb, input, 'hls');
+      try {
+        const format = makeOutputFormat('mp4');
+        if (!format) throw new Error('mediabunny decrypt: mp4 output unavailable');
+        const output = new mb.Output({ format, target: new mb.BufferTarget() });
+        return await runConversion(mb, { input: mbInput, output }, 'mp4');
+      } finally {
+        mbInput.dispose();
+      }
+    }
     if (opts.scheme !== 'cenc-ctr' && opts.scheme !== 'cenc-cbcs') {
       throw new Error(`mediabunny decrypt: unsupported scheme '${opts.scheme}'`);
     }

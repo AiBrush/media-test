@@ -440,6 +440,40 @@ function parseTkhdTrackId(buf: Uint8Array, tkhd: Box): number | null {
   return idOff + 4 <= tkhd.bodyEnd ? be32(buf, idOff) : null;
 }
 
+function parseTkhdDisplayMatrix(buf: Uint8Array, tkhd: Box): { a: number; b: number; c: number; d: number } | null {
+  const version = buf[tkhd.bodyStart] ?? 0;
+  const matrixOff = tkhd.bodyStart + (version === 1 ? 52 : 40);
+  if (matrixOff + 36 > tkhd.bodyEnd) return null;
+  return {
+    a: be32(buf, matrixOff) | 0,
+    b: be32(buf, matrixOff + 4) | 0,
+    c: be32(buf, matrixOff + 12) | 0,
+    d: be32(buf, matrixOff + 16) | 0,
+  };
+}
+
+function displayMatrixIsIdentity(matrix: { a: number; b: number; c: number; d: number }): boolean {
+  return matrix.a === 0x00010000 && matrix.b === 0 && matrix.c === 0 && matrix.d === 0x00010000;
+}
+
+export function hasMp4DisplayMatrixTransform(bytes: Uint8Array): boolean {
+  const moov = findBox(bytes, 0, bytes.length, 'moov');
+  if (!moov) return false;
+
+  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+    if (!mdia) continue;
+    const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+    if (!hdlr || hdlrType(bytes, hdlr) !== 'vide') continue;
+    const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
+    const matrix = tkhd ? parseTkhdDisplayMatrix(bytes, tkhd) : null;
+    if (matrix && !displayMatrixIsIdentity(matrix)) return true;
+  }
+
+  return false;
+}
+
 function childBoxes(buf: Uint8Array, box: Box): Box[] {
   return [...iterBoxes(buf, box.bodyStart, box.bodyEnd)];
 }

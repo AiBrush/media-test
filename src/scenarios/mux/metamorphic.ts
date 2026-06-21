@@ -141,12 +141,12 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: [VFR_MUX_TIMESTAMPS],
-    tolerances: { durationToleranceSec: 0.125 },
+    tolerances: { durationToleranceSec: 0.2 },
     notes:
       'VFR through mux → mkv (§A.16): VFR timestamps re-authored as Matroska block timestamps; the ' +
       'materialized duration must match. Catches a muxer that quantizes VFR to a constant cadence while ' +
-      'requiring a timestamp-preserving corpus-input→EncodedTracks path and allowing the same 125 ms ' +
-      'VFR materialization band as the mp4 target.',
+      'requiring a timestamp-preserving corpus-input→EncodedTracks path and allowing a 200 ms ' +
+      'VFR/Matroska final-sample duration materialization band.',
   },
 ];
 

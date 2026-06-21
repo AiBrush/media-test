@@ -108,6 +108,7 @@ import {
 } from './codecs.ts';
 import {
   demuxMp4SampleTable,
+  readMp4ProtectedTrackMetadata,
   readMp4SyncSampleMap,
   shouldUseMp4SampleTableDemux,
 } from './mp4-sample-table.ts';
@@ -215,6 +216,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
         'streaming-read', // progressive parse, async-callback back-pressure
         'worker', // parseMediaOnWebWorker main-thread offload (when bundler allows)
         'packets:dts', // sample.decodingTimestamp is surfaced separately from timestamp
+        'metadata:protected-tracks', // encrypted MP4 track metadata can be parsed without decrypting
         'webcodecs:samples', // emits EncodedVideoChunk/EncodedAudioChunk-compatible samples
       ],
     };
@@ -381,7 +383,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
       'metadata-only',
     );
 
-    let metadata = this.toNormalizedMetadata(result, undefined, input);
+    let metadata = await withProtectedMp4TrackMetadata(
+      input,
+      this.toNormalizedMetadata(result, undefined, input),
+    );
     if (shouldPreferHeaderWebmFps(input, metadata, headerFps)) {
       metadata = withSingleVideoFps(metadata, headerFps, { replace: true });
     }
@@ -659,6 +664,28 @@ function withDurationFromPackets(
 ): NormalizedMetadata {
   const durationSec = metadata.durationSec ?? durationFromPacketPts(packets);
   return durationSec == null ? metadata : { ...metadata, durationSec };
+}
+
+async function withProtectedMp4TrackMetadata(
+  input: MediaInput,
+  metadata: NormalizedMetadata,
+): Promise<NormalizedMetadata> {
+  if (!needsProtectedMp4TrackMetadata(input, metadata)) return metadata;
+  const protectedMetadata = await readMp4ProtectedTrackMetadata(input);
+  if (!protectedMetadata) return metadata;
+  return {
+    ...metadata,
+    durationSec: metadata.durationSec ?? protectedMetadata.durationSec,
+    tracks: protectedMetadata.tracks,
+  };
+}
+
+function needsProtectedMp4TrackMetadata(input: MediaInput, metadata: NormalizedMetadata): boolean {
+  if (input.mutated || metadata.container !== 'mp4') return false;
+  const hasUnknownTracks = metadata.tracks.some((track) => track.type === 'other' || track.codec === 'unknown');
+  if (!hasUnknownTracks) return false;
+  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
+  return hint.includes('cenc');
 }
 
 function withTsProbeFieldsFromPackets(

@@ -909,7 +909,8 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   const golden = ctx.golden;
   const want = golden.frames;
   const refSigs = golden.ssimRef;
-  const haveGolden = (!!want && want.length > 0) || (!!refSigs && refSigs.length > 0);
+  const useReferenceSource = usesTransformReference(ctx);
+  const haveGolden = !useReferenceSource && ((!!want && want.length > 0) || (!!refSigs && refSigs.length > 0));
 
   // When there is NO committed golden (a resize/transcode case, or golden pending the in-browser
   // frame-bake), §5.2 says validate against REFERENCE frames, not golden: decode the SOURCE in-browser
@@ -1107,19 +1108,22 @@ async function ssimVsReferenceSource(
       continue;
     }
     if (!candPx || !srcPx) continue;
-    const ref = resizeImageData(srcPx, candPx.width, candPx.height);
+    const prepared = prepareReferenceImage(ctx, srcPx, candPx.width, candPx.height);
+    const ref = prepared.image;
     if (!ref) continue;
-    const s = ssim(candPx, ref);
+    const compareCand = usesAlphaVisualReference(ctx) ? compositeOverBackground(candPx, 0, 0, 0) : candPx;
+    const compareRef = usesAlphaVisualReference(ctx) ? compositeOverBackground(ref, 0, 0, 0) : ref;
+    const s = ssim(compareCand, compareRef);
     if (!Number.isFinite(s)) continue;
     ssimSum += s;
     if (s < minSsim) minSsim = s;
-    const p = psnrDb(candPx, ref);
+    const p = psnrDb(compareCand, compareRef);
     if (Number.isFinite(p)) {
       psnrSum += p;
       psnrCount++;
     }
     cnt++;
-    if (!dims) dims = `${candPx.width}x${candPx.height}`;
+    if (!dims) dims = `${prepared.detail} to ${candPx.width}x${candPx.height}`;
   }
   if (cnt === 0) return fail(oracle, 'could not compute SSIM on any frame (no comparable pixels)');
 
@@ -1133,10 +1137,67 @@ async function ssimVsReferenceSource(
   // scores ~0.84 — so the §8 SSIM floor (0.97 here) is a faithful correctness gate on its own.
   const ssimOk = ssimMean >= t.ssimMin;
   const detail =
-    `vs in-browser reference (source decoded + downscaled to ${dims}): SSIM mean ${ssimMean.toFixed(4)} ` +
+    `vs in-browser reference (${dims}): SSIM mean ${ssimMean.toFixed(4)} ` +
     `(min ${minSsim.toFixed(4)}); PSNR mean ${psnrMean.toFixed(1)} dB (advisory) over ${cnt} frame(s); ` +
     `gate SSIM≥${t.ssimMin}`;
   return ssimOk ? pass(oracle, detail, measurements) : fail(oracle, detail, measurements);
+}
+
+function prepareReferenceImage(
+  ctx: OracleContext,
+  img: ImageData,
+  targetW: number,
+  targetH: number,
+): { image: ImageData | null; detail: string } {
+  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  let ref: ImageData | null = img;
+  const steps: string[] = ['source decoded'];
+
+  const crop = readObjectOption(options, 'crop');
+  if (crop) {
+    const x = readNumberOption(crop, ['x', 'left']) ?? 0;
+    const y = readNumberOption(crop, ['y', 'top']) ?? 0;
+    const width = readNumberOption(crop, ['width']);
+    const height = readNumberOption(crop, ['height']);
+    if (width !== undefined && height !== undefined) {
+      ref = cropImageData(ref, x, y, width, height);
+      steps.push(`cropped ${Math.round(width)}x${Math.round(height)} at ${Math.round(x)},${Math.round(y)}`);
+    }
+  }
+
+  const flip = readStringOption(options, ['flip']);
+  if (ref && flip) {
+    ref = flipImageData(ref, flip);
+    if (ref) steps.push(`flipped ${flip}`);
+  }
+
+  const pad = readObjectOption(options, 'pad');
+  if (ref && pad) {
+    const width = readNumberOption(pad, ['width']) ?? targetW;
+    const height = readNumberOption(pad, ['height']) ?? targetH;
+    const color = readStringOption(pad, ['color']) ?? 'black';
+    ref = padContainImageData(ref, width, height, color);
+    steps.push(`contained in ${Math.round(width)}x${Math.round(height)}`);
+  }
+
+  if (ref && (ref.width !== targetW || ref.height !== targetH)) {
+    ref = resizeImageData(ref, targetW, targetH);
+    steps.push('resized');
+  }
+
+  return { image: ref, detail: steps.join(' + ') };
+}
+
+function usesTransformReference(ctx: OracleContext): boolean {
+  if (ctx.scenario.op !== 'transcode') return false;
+  const options: Record<string, unknown> = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  return isObject(options.crop) || isObject(options.pad) || typeof options.flip === 'string';
+}
+
+function usesAlphaVisualReference(ctx: OracleContext): boolean {
+  if (ctx.scenario.op !== 'transcode') return false;
+  const options: Record<string, unknown> = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  return readStringOption(options, ['alpha']) === 'keep';
 }
 
 /** Downscale (or passthrough) an ImageData to w×h via OffscreenCanvas high-quality smoothing. */
@@ -1158,6 +1219,88 @@ function resizeImageData(img: ImageData, w: number, h: number): ImageData | null
   } catch {
     return null;
   }
+}
+
+function cropImageData(img: ImageData | null, x: number, y: number, w: number, h: number): ImageData | null {
+  if (!img || typeof OffscreenCanvas !== 'function') return null;
+  const sx = Math.max(0, Math.min(img.width, Math.round(x)));
+  const sy = Math.max(0, Math.min(img.height, Math.round(y)));
+  const sw = Math.max(0, Math.min(img.width - sx, Math.round(w)));
+  const sh = Math.max(0, Math.min(img.height - sy, Math.round(h)));
+  if (sw <= 0 || sh <= 0) return null;
+  try {
+    const src = new OffscreenCanvas(img.width, img.height);
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    sctx.putImageData(img, 0, 0);
+    const dst = new OffscreenCanvas(sw, sh);
+    const dctx = dst.getContext('2d');
+    if (!dctx) return null;
+    dctx.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+    return dctx.getImageData(0, 0, sw, sh);
+  } catch {
+    return null;
+  }
+}
+
+function flipImageData(img: ImageData | null, mode: string): ImageData | null {
+  if (!img || typeof OffscreenCanvas !== 'function') return null;
+  const flipH = mode === 'h' || mode === 'horizontal' || mode === 'both' || mode === 'hv' || mode === 'vh';
+  const flipV = mode === 'v' || mode === 'vertical' || mode === 'both' || mode === 'hv' || mode === 'vh';
+  if (!flipH && !flipV) return img;
+  try {
+    const src = new OffscreenCanvas(img.width, img.height);
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    sctx.putImageData(img, 0, 0);
+    const dst = new OffscreenCanvas(img.width, img.height);
+    const dctx = dst.getContext('2d');
+    if (!dctx) return null;
+    dctx.translate(flipH ? img.width : 0, flipV ? img.height : 0);
+    dctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+    dctx.drawImage(src, 0, 0);
+    return dctx.getImageData(0, 0, img.width, img.height);
+  } catch {
+    return null;
+  }
+}
+
+function padContainImageData(img: ImageData | null, w: number, h: number, color: string): ImageData | null {
+  if (!img || typeof OffscreenCanvas !== 'function') return null;
+  const targetW = Math.max(1, Math.round(w));
+  const targetH = Math.max(1, Math.round(h));
+  try {
+    const src = new OffscreenCanvas(img.width, img.height);
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    sctx.putImageData(img, 0, 0);
+    const dst = new OffscreenCanvas(targetW, targetH);
+    const dctx = dst.getContext('2d');
+    if (!dctx) return null;
+    dctx.fillStyle = color;
+    dctx.fillRect(0, 0, targetW, targetH);
+    const scale = Math.min(targetW / img.width, targetH / img.height);
+    const drawW = img.width * scale;
+    const drawH = img.height * scale;
+    dctx.imageSmoothingEnabled = true;
+    dctx.imageSmoothingQuality = 'high';
+    dctx.drawImage(src, (targetW - drawW) / 2, (targetH - drawH) / 2, drawW, drawH);
+    return dctx.getImageData(0, 0, targetW, targetH);
+  } catch {
+    return null;
+  }
+}
+
+function compositeOverBackground(img: ImageData, r: number, g: number, b: number): ImageData {
+  const out = new ImageData(new Uint8ClampedArray(img.data), img.width, img.height);
+  for (let i = 0; i < out.data.length; i += 4) {
+    const alpha = out.data[i + 3]! / 255;
+    out.data[i] = Math.round(out.data[i]! * alpha + r * (1 - alpha));
+    out.data[i + 1] = Math.round(out.data[i + 1]! * alpha + g * (1 - alpha));
+    out.data[i + 2] = Math.round(out.data[i + 2]! * alpha + b * (1 - alpha));
+    out.data[i + 3] = 255;
+  }
+  return out;
 }
 
 // ── alpha-plane ──────────────────────────────────────────────────────────────────────────────

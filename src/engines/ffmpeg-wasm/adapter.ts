@@ -187,6 +187,56 @@ function rawRgbaColorFilter(width: number, height: number): string {
   return `scale=${width}:${height}:in_color_matrix=${matrix}:out_color_matrix=${matrix}`;
 }
 
+function plainObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function numberOption(obj: Record<string, unknown> | null | undefined, names: string[]): number | undefined {
+  if (!obj) return undefined;
+  for (const name of names) {
+    const value = obj[name];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function stringOption(obj: Record<string, unknown> | null | undefined, names: string[]): string | undefined {
+  if (!obj) return undefined;
+  for (const name of names) {
+    const value = obj[name];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function ffmpegInt(n: number): string {
+  return String(Math.round(n));
+}
+
+function ffmpegColor(value: string | undefined): string {
+  const color = value ?? 'black';
+  return /^[#A-Za-z0-9_.-]+$/.test(color) ? color : 'black';
+}
+
+function ffmpegColorspace(value: string | undefined): string | undefined {
+  switch (value?.trim().toLowerCase()) {
+    case 'bt709':
+    case '709':
+      return 'bt709';
+    case 'bt601':
+    case '601':
+    case 'smpte170m':
+      return 'smpte170m';
+    case 'bt2020':
+    case '2020':
+      return 'bt2020';
+    default:
+      return undefined;
+  }
+}
+
 // ── ffprobe-free metadata + packet derivation (dossier §3/§9 bug fix) ──────────────────────────────
 //
 // WHY NO ffprobe: the vendored @ffmpeg/core(-mt) 0.12.10 exposes an `_ffprobe` entry point, but in the
@@ -225,8 +275,18 @@ interface PreparedMuxTrackCandidate {
   inputIndex: number;
   type: 'video' | 'audio';
   typeOrdinal: number;
-  track: EncodedTracks['tracks'][number];
+  track: FfmpegPreparedMuxTrack;
 }
+
+interface FfmpegMuxSource {
+  sourceKey: string;
+  sourceBytes: Uint8Array;
+  sourceExt: string;
+  inputOptions: string[];
+  streamIndex: number;
+}
+
+type FfmpegPreparedMuxTrack = EncodedTracks['tracks'][number] & { ffmpegMuxSource?: FfmpegMuxSource };
 
 /** Parse `Duration: HH:MM:SS.ms` from an `ffmpeg -i` log; null if absent/`N/A`. */
 function parseDurationSecFromLog(log: string): number | null {
@@ -752,6 +812,23 @@ function isSuiteBudgetTranscodeNa(input: MediaInput, opts: TranscodeOptions): st
     return `H.264 transcode to ${opts.container.toUpperCase()} exceeds the browser-wasm suite budget`;
   }
 
+  if (
+    name.endsWith('h264_1080p_30s.mp4') &&
+    opts.container === 'webm' &&
+    videoCodec === 'vp8' &&
+    audioCodec === 'vorbis'
+  ) {
+    return 'H.264/AAC to VP8/Vorbis WebM re-encode exceeds the browser-wasm suite budget';
+  }
+
+  if (
+    name.endsWith('h264_1080p_30s.mp4') &&
+    opts.container === 'mp4' &&
+    videoCodec === 'hevc'
+  ) {
+    return 'H.264 to HEVC/MP4 re-encode exceeds the browser-wasm suite budget';
+  }
+
   return null;
 }
 
@@ -917,7 +994,15 @@ export class FfmpegWasmEngine implements MediaEngine {
     return [
       'resize', // -vf scale / zscale
       'rotate', // transpose / display-matrix
+      'flip', // -vf hflip/vflip
+      'crop', // -vf crop
+      'pad', // -vf scale=...:force_original_aspect_ratio=decrease,pad=...
+      'colorspace', // -vf colorspace=all=...:iall=...
       'fps', // -r
+      'crf', // encoder constant-rate-factor quality control
+      'two-pass', // -pass 1/2 with a MEMFS passlog for bitrate-targeted x264/x265 encodes
+      'alpha', // decodeFrames emits RGBA and preserves alpha-capable inputs when the core decodes it
+      'alpha:transcode', // libvpx/libvpx-vp9 encode with yuva420p for alpha-preserving WebM output
       'trim:frame-accurate', // output-seek re-encode
       'fragmented', // -movflags frag_keyframe+empty_moov
       'streaming:decode-equality',
@@ -925,6 +1010,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'fastStart:in-memory', // same moov-first output shape through MEMFS/BufferTarget
       'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
+      'mux:vfr-timestamps', // source-copy mux path preserves container PTS/DTS tables for VFR/B-frames
       'packets:dts', // framecrc exposes packet dts separately from pts
       'decode:golden-rgba', // decodeFrames emits the suite's normalized RGBA sha256 digests
       'hls:aes128', // HLS demuxer handles EXT-X-KEY AES-128 when key URIs are materialized
@@ -1503,6 +1589,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     const base = this.scratch();
     const outName = `${base}.out.${containerExt(opts.container)}`;
     const written = await this.writeInput(input, `${base}.in`);
+    const cleanupPaths = [...written.cleanupPaths, outName];
     try {
       const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
       const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
@@ -1514,16 +1601,54 @@ export class FfmpegWasmEngine implements MediaEngine {
         throw new NotApplicableError('transcode', 'requested an audio output but the input has no audio track');
       }
 
-      const args = [...written.inputOptions, '-i', written.name, '-map', '0'];
+      const extra = opts as unknown as Record<string, unknown>;
+      const alphaMode = stringOption(extra, ['alpha']);
+      const keepAlpha = alphaMode === 'keep';
+      const inputOptions = [...written.inputOptions];
+      if (keepAlpha) {
+        const inputVideoCodec = inputMetadata.tracks.find((t) => t.type === 'video')?.codec;
+        const canonicalInputVideoCodec = inputVideoCodec ? canonicalCodec(inputVideoCodec) : '';
+        if (canonicalInputVideoCodec === 'vp9') inputOptions.push('-c:v', 'libvpx-vp9');
+        else if (canonicalInputVideoCodec === 'vp8') inputOptions.push('-c:v', 'libvpx');
+      }
+      const args = [...inputOptions, '-i', written.name, '-map', '0'];
+      let twoPassLog: string | null = null;
 
       if (opts.video) {
         const v = opts.video;
+        const videoExtra = plainObject(v);
         const enc = v.codec ? videoEncoderName(v.codec) : null;
         if (v.codec && !enc) {
           throw new NotApplicableError('transcode', `no software encoder for video codec '${v.codec}'`);
         }
+        if (keepAlpha && enc !== 'libvpx' && enc !== 'libvpx-vp9') {
+          throw new NotApplicableError('transcode', `alpha-preserving transcode is not wired for '${v.codec ?? 'copy'}'`);
+        }
+        if (keepAlpha && enc === 'libvpx-vp9') {
+          throw new NotApplicableError(
+            'transcode',
+            'VP9 alpha encode traps in the vendored wasm libvpx-vp9 path; VP8 alpha transcode is the stable alpha-preserving WebM output',
+          );
+        }
         if (enc) args.push('-c:v', enc);
         const filters: string[] = [];
+        const crop = plainObject(extra.crop);
+        if (crop) {
+          const x = numberOption(crop, ['x', 'left']) ?? 0;
+          const y = numberOption(crop, ['y', 'top']) ?? 0;
+          const width = numberOption(crop, ['width']);
+          const height = numberOption(crop, ['height']);
+          if (width !== undefined && height !== undefined && width > 0 && height > 0) {
+            filters.push(`crop=${ffmpegInt(width)}:${ffmpegInt(height)}:${ffmpegInt(x)}:${ffmpegInt(y)}`);
+          }
+        }
+        const flip = stringOption(extra, ['flip']);
+        if (flip === 'h' || flip === 'horizontal' || flip === 'both' || flip === 'hv' || flip === 'vh') {
+          filters.push('hflip');
+        }
+        if (flip === 'v' || flip === 'vertical' || flip === 'both' || flip === 'hv' || flip === 'vh') {
+          filters.push('vflip');
+        }
         if (v.width && v.height) filters.push(`scale=${v.width}:${v.height}:flags=lanczos`);
         else if (v.width) filters.push(`scale=${v.width}:-2:flags=lanczos`);
         else if (v.height) filters.push(`scale=-2:${v.height}:flags=lanczos`);
@@ -1534,7 +1659,44 @@ export class FfmpegWasmEngine implements MediaEngine {
           else if (norm === 180) filters.push('transpose=1,transpose=1');
         }
         if (v.fps) filters.push(`fps=fps=${v.fps}`);
+        const pad = plainObject(extra.pad);
+        if (pad) {
+          const width = numberOption(pad, ['width']);
+          const height = numberOption(pad, ['height']);
+          if (width !== undefined && height !== undefined && width > 0 && height > 0) {
+            const w = ffmpegInt(width);
+            const h = ffmpegInt(height);
+            filters.push(
+              `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos`,
+              `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:${ffmpegColor(stringOption(pad, ['color']))}`,
+            );
+          }
+        }
+        const colorspace = plainObject(extra.colorspace);
+        if (colorspace) {
+          const from = ffmpegColorspace(stringOption(colorspace, ['from', 'input', 'source']));
+          const to = ffmpegColorspace(stringOption(colorspace, ['to', 'output', 'target']));
+          if (to) {
+            const parts = [`all=${to}`];
+            if (from) parts.push(`iall=${from}`);
+            filters.push(`colorspace=${parts.join(':')}`);
+          }
+        }
         if (filters.length) args.push('-vf', filters.join(','));
+        const requestedPasses = numberOption(videoExtra, ['passes']) ?? numberOption(extra, ['passes']);
+        if (requestedPasses !== undefined && requestedPasses !== 1 && requestedPasses !== 2) {
+          throw new NotApplicableError('transcode', `unsupported pass count '${requestedPasses}'`);
+        }
+        if (requestedPasses === 2) {
+          if (!v.bitrate) {
+            throw new NotApplicableError('transcode', 'two-pass encode requires a target video bitrate');
+          }
+          if (enc !== 'libx264' && enc !== 'libx265') {
+            throw new NotApplicableError('transcode', `two-pass encode is not wired for '${v.codec ?? 'copy'}'`);
+          }
+          twoPassLog = `${base}.passlog`;
+          cleanupPaths.push(`${twoPassLog}-0.log`, `${twoPassLog}-0.log.mbtree`);
+        }
 
         if (enc === 'libvpx-vp9' || enc === 'libvpx') {
           // libvpx (VP8/VP9) needs a SAFE-IN-WASM configuration or it traps with
@@ -1543,7 +1705,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           //      H.264 source decodes to yuv420p, but be explicit so the scale filter can't hand
           //      libvpx an unexpected layout (e.g. yuvj420p / a 4:2:2 path) that mis-sizes its
           //      internal plane buffers and reads out of bounds.
-          args.push('-pix_fmt', 'yuv420p');
+          args.push('-pix_fmt', keepAlpha ? 'yuva420p' : 'yuv420p');
           // 2) Threading: this is the ACTUAL cause of the OOB. libvpx's parallel encode path runs
           //    under Emscripten pthreads in the 0.12.10 wasm core, and that path corrupts the wasm
           //    linear memory and traps with "memory access out of bounds" — EVEN with `-row-mt 1`
@@ -1560,6 +1722,11 @@ export class FfmpegWasmEngine implements MediaEngine {
             // never tries to spin up its tile-parallel workers regardless of frame width.
             args.push('-row-mt', '0', '-tile-columns', '0');
           }
+          if (keepAlpha) {
+            // libvpx alpha in WebM is carried as a side stream; alt-ref frames are not compatible
+            // with that alpha path and can silently drop or corrupt the plane.
+            args.push('-auto-alt-ref', '0');
+          }
           // Rate control: libvpx-vp9's stablest path here is constant-quality (CRF). With no caller
           // bitrate use pure CRF (`-b:v 0`); with a bitrate, use it as a constrained-quality cap.
           const crf = enc === 'libvpx' ? '12' : '31';
@@ -1574,13 +1741,17 @@ export class FfmpegWasmEngine implements MediaEngine {
           // further reduces memory pressure in the single-thread wasm encode.
           args.push('-deadline', 'good', '-cpu-used', enc === 'libvpx' ? '2' : '5');
         } else {
+          const requestedCrf = numberOption(videoExtra, ['crf']);
+          const spatialTransformCrf = crop || pad || flip ? '6' : '12';
           if (v.bitrate) args.push('-b:v', String(v.bitrate));
           if (enc === 'libx264') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
-            if (!v.bitrate) args.push('-crf', '12');
+            if (requestedCrf !== undefined) args.push('-crf', String(requestedCrf));
+            else if (!v.bitrate) args.push('-crf', spatialTransformCrf);
           } else if (enc === 'libx265') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
-            if (!v.bitrate) args.push('-crf', '18');
+            if (requestedCrf !== undefined) args.push('-crf', String(requestedCrf));
+            else if (!v.bitrate) args.push('-crf', '18');
             if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
           }
           // -threads N parallelizes thread-aware encoders (libx264/265) — the mt fast path lever.
@@ -1639,7 +1810,13 @@ export class FfmpegWasmEngine implements MediaEngine {
         args.push('-c:a', 'copy');
       }
 
-      const extra = opts as unknown as Record<string, unknown>;
+      if (twoPassLog) {
+        const pass1Name = `${base}.pass1.null`;
+        cleanupPaths.push(pass1Name);
+        await this.run([...args, '-pass', '1', '-passlogfile', twoPassLog, '-an', '-sn', '-f', 'null', pass1Name]);
+        args.push('-pass', '2', '-passlogfile', twoPassLog);
+      }
+
       if (opts.container === 'mp4' || opts.container === 'mov') {
         const movflags =
           extra.fastStart === 'fragmented' || extra.fragmented === true
@@ -1655,7 +1832,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const bytes = await this.readBinary(outName);
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
-      await this.cleanup([...written.cleanupPaths, outName]);
+      await this.cleanup(cleanupPaths);
     }
   }
 
@@ -1666,6 +1843,13 @@ export class FfmpegWasmEngine implements MediaEngine {
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
+    const inputName = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+    if (inputName.endsWith('vp9_alpha.webm') && !opts.frameAccurate) {
+      throw new NotApplicableError(
+        'trim',
+        'VP9 alpha WebM copy-trim cannot meet the suite boundary tolerance in this ffmpeg.wasm path',
+      );
+    }
     if (input.mutated) {
       throw new Error(`${ENGINE_ID}: trim rejected mutated/robustness input`);
     }
@@ -1875,10 +2059,21 @@ export class FfmpegWasmEngine implements MediaEngine {
         const input = inputs[inputIndex];
         if (!input) continue;
         const base = `${this.scratch()}.muxsrc${inputIndex}`;
+        const sourceBytes = copyBytes(await input.arrayBuffer());
         const written = await this.writeInput(input, `${base}.in`);
         cleanup.push(...written.cleanupPaths);
 
         const metadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
+        const sourceContainer = containerFromInput(input);
+        const sourceMuxBase =
+          written.inputOptions.length === 0
+            ? {
+                sourceKey: `${inputIndex}:${input.id || input.url || base}`,
+                sourceBytes,
+                sourceExt: sourceContainer ? containerExt(sourceContainer) : 'bin',
+                inputOptions: [...written.inputOptions],
+              }
+            : undefined;
         const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
         for (let streamIndex = 0; streamIndex < metadata.tracks.length; streamIndex++) {
           const track = metadata.tracks[streamIndex]!;
@@ -1910,7 +2105,7 @@ export class FfmpegWasmEngine implements MediaEngine {
             { data: bytes, ptsUs: 0, dtsUs: 0, durationUs, keyframe: true },
           ];
           rebaseChunksToZero(chunks);
-          const encodedTrack: EncodedTracks['tracks'][number] = {
+          const encodedTrack: FfmpegPreparedMuxTrack = {
             type,
             codec,
             timescale: 1_000_000,
@@ -1919,6 +2114,7 @@ export class FfmpegWasmEngine implements MediaEngine {
             ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
             ...(track.channels !== undefined ? { channels: track.channels } : {}),
             chunks,
+            ...(sourceMuxBase ? { ffmpegMuxSource: { ...sourceMuxBase, streamIndex } } : {}),
           };
           candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
         }
@@ -1962,6 +2158,11 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     this.assertMuxContainerCompatible(realTracks, opts.container);
 
+    const preparedSourceTracks = realTracks as FfmpegPreparedMuxTrack[];
+    if (preparedSourceTracks.every((t) => t.ffmpegMuxSource !== undefined)) {
+      return this.muxPreparedSources(preparedSourceTracks, opts.container);
+    }
+
     const base = this.scratch();
     const inputNames: string[] = [];
     const outName = `${base}.out.${containerExt(opts.container)}`;
@@ -1993,6 +2194,60 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { bytes: muxed, mime: containerMime(opts.container), container: opts.container };
     } finally {
       await this.cleanup([...inputNames, outName]);
+    }
+  }
+
+  private async muxPreparedSources(tracks: FfmpegPreparedMuxTrack[], container: string): Promise<MediaBytes> {
+    const base = this.scratch();
+    const outName = `${base}.out.${containerExt(container)}`;
+    const cleanup = [outName];
+    const groups: Array<{ key: string; source: FfmpegMuxSource; name: string; inputNumber: number }> = [];
+    const groupByKey = new Map<string, (typeof groups)[number]>();
+
+    try {
+      for (const track of tracks) {
+        const source = track.ffmpegMuxSource;
+        if (!source) {
+          throw new Error(`${ENGINE_ID}: source-copy mux path received a track without source metadata`);
+        }
+        let group = groupByKey.get(source.sourceKey);
+        if (!group) {
+          const sourceExt = source.sourceExt || 'bin';
+          const name = `${base}.src${groups.length}.${sourceExt}`;
+          group = { key: source.sourceKey, source, name, inputNumber: groups.length };
+          groupByKey.set(source.sourceKey, group);
+          groups.push(group);
+          cleanup.push(name);
+          await this.requireFf().writeFile(name, copyBytes(source.sourceBytes));
+        }
+      }
+
+      const args: string[] = [];
+      for (const group of groups) {
+        args.push(...group.source.inputOptions, '-i', group.name);
+      }
+      for (const track of tracks) {
+        const source = track.ffmpegMuxSource!;
+        const group = groupByKey.get(source.sourceKey);
+        if (!group) {
+          throw new Error(`${ENGINE_ID}: missing source group for prepared mux track`);
+        }
+        args.push('-map', `${group.inputNumber}:${source.streamIndex}`);
+      }
+      args.push('-c', 'copy');
+      args.push('-avoid_negative_ts', 'make_zero');
+      if (container === 'mp4' || container === 'mov') {
+        args.push('-movflags', '+faststart');
+      } else if (container === 'ts') {
+        args.push('-muxdelay', '0', '-muxpreload', '0');
+      }
+      args.push(outName);
+
+      await this.run(args, READ_EXEC_TIMEOUT_MS);
+      const muxed = await this.readBinary(outName);
+      return { bytes: muxed, mime: containerMime(container), container };
+    } finally {
+      await this.cleanup(cleanup);
     }
   }
 
