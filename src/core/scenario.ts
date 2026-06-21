@@ -30,10 +30,13 @@ export type OracleId =
   | 'golden-metadata' // probe vs golden/<asset>.meta.json
   | 'golden-packets' // demux vs golden/<asset>.packets.json
   | 'decoded-frames-bitexact' // decode output in-browser vs golden frame digests
+  | 'decoded-audio-pcm' // audio decode output vs browser-decoded PCM sample digests
   | 'reference-reimport' // re-import engine output with the reference engine; compare packet tables
   | 'playback-smoke' // <video> can play the output
   | 'ssim-psnr' // decode output → SSIM+PSNR vs reference frames (lossy ops)
   | 'mp4-box-layout' // MP4/MOV top-level box order/fragment structure for output-shape rows
+  | 'webm-live-layout' // WebM/MKV live/append-only layout: unknown-size Segment, no SeekHead/Duration
+  | 'fanout-renditions' // multi-rendition transcode output: count, dimensions, playback, and SSIM
   | 'alpha-plane' // alpha channel compared separately
   | 'seek-accuracy' // seek lands on expected keyframe / within tolerance
   | 'trim-boundaries' // out duration ≈ requested; boundary frames only with trim-range golden

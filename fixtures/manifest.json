@@ -65,6 +65,20 @@
       "notes": "HEVC in MP4 (hvc1). Decode support is browser/platform dependent (NA(browser) expected on Firefox/WebKit-no-HW)."
     },
     {
+      "id": "hdr10_pq_micro_hevc.mp4",
+      "family": "video-mp4",
+      "container": "mp4",
+      "codecs": [
+        "hevc"
+      ],
+      "source": "generated",
+      "sizeBucket": "micro",
+      "genMethod": "ffmpeg testsrc2 128x72@5 2s, libx265 yuv420p10le Main10-style HEVC tagged hvc1 with BT.2020 primaries/matrix and SMPTE ST 2084 PQ transfer, +faststart",
+      "sha256": "ef939d3cf9c6ac01586ec1f039e0b349a3e289135912b0cf931d64dcfb1a4106",
+      "sizeBytes": 26435,
+      "notes": "Tiny real HDR/PQ HEVC source for HDR10-to-SDR tone-map coverage. Ten small frames keep browser-wasm decode/filter/re-encode inside suite budgets while giving playback smoke enough timestamps to advance."
+    },
+    {
       "id": "h264_bframes_1080p.mp4",
       "family": "video-mp4",
       "container": "mp4",
@@ -277,6 +291,36 @@
       "notes": "AES-128 encrypted HLS. ffmpeg 8 supports -hls_key_info_file natively (no Bento4 needed). If key generation unavailable in the bake env, recorded as SKIPPED with reason."
     },
     {
+      "id": "hls_aes128_clear.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "ffmpeg -allowed_extensions ALL -protocol_whitelist file,crypto -i hls_aes128.m3u8 -c copy -movflags +faststart hls_aes128_clear.mp4",
+      "sha256": "53c64d84ea484656dd01892701a3917d3b8cd1b28f8d87ff57813ce8ad80adcd",
+      "sizeBytes": 4459013,
+      "notes": "Plaintext MP4 reference remux of hls_aes128.m3u8 using the committed HLS AES-128 key. Browser frame goldens for this MP4 are the independent decrypt oracle baseline because Chromium cannot frame-bake HLS playlists directly."
+    },
+    {
+      "id": "cenc_ctr_clear.mp4",
+      "family": "encrypted-mp4",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "generated",
+      "sizeBucket": "small",
+      "genMethod": "Clear H.264/AAC MP4 baseline used as the plaintext source for cenc_ctr.mp4. Browser frame-bake digests for this asset are the independent decrypt oracle baseline.",
+      "sha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7",
+      "sizeBytes": 2200098,
+      "notes": "Plaintext twin of cenc_ctr.mp4. Keep this recipe byte-for-byte aligned with the clear source generated inside the cenc_ctr.mp4 encryption recipe."
+    },
+    {
       "id": "cenc_ctr.mp4",
       "family": "encrypted-mp4",
       "container": "mp4",
@@ -286,9 +330,9 @@
       ],
       "source": "generated",
       "sizeBucket": "small",
-      "genMethod": "ffmpeg -encryption_scheme cenc-aes-ctr -encryption_key <hex> -encryption_kid <hex> over the H.264/AAC baseline fragmented MP4. Key/KID/IV recorded in golden for decrypt oracle.",
-      "sha256": "442c34d54937b2fd52bc4aa6f089af059dab733c0abd617ea626ee4169050b54",
-      "sizeBytes": 2209644,
+      "genMethod": "ffmpeg -encryption_scheme cenc-aes-ctr -encryption_key <hex> -encryption_kid <hex> over the H.264/AAC clear baseline, emitted as faststart MP4. Key/KID recorded in golden for decrypt oracle.",
+      "sha256": "ff588222b7f22f5d92d23528e4c3b17cdcd6f775a2227a3773f6249d8b4ce095",
+      "sizeBytes": 2205784,
       "notes": "CENC AES-CTR (cenc) encrypted MP4. ffmpeg muxer supports -encryption_scheme cenc-aes-ctr. If unsupported in bake env, SKIPPED with reason; decrypt oracle then NA."
     },
     {
@@ -756,7 +800,7 @@
       "genMethod": "ffmpeg testsrc2 1280x720@30 4s + sine 48k stereo, libx264 yuv420p + AAC 128k, -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4. CMAF-style fragmented MP4: empty moov (init) + moof/mdat fragments (media), self-contained moofs.",
       "sha256": "60e1d30350b924b1d874d57aa66773fc6667f4bddbee9f7054a377090e130beb",
       "sizeBytes": 1458236,
-      "notes": "Deep edge (§A.16 'fragmented/CMAF init+media split'): unencrypted fragmented MP4 so the fragmentation edge is isolated from encryption (cenc_ctr.mp4 is fragmented AND encrypted). Probe/demux must handle empty-moov + moof fragments and init/media separation."
+      "notes": "Deep edge (§A.16 'fragmented/CMAF init+media split'): unencrypted fragmented MP4 so the fragmentation edge is isolated from encryption. Probe/demux must handle empty-moov + moof fragments and init/media separation."
     },
     {
       "id": "mislabeled_h264.webm",

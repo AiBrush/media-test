@@ -277,6 +277,9 @@ function resolveContainer(measured: string | undefined, assetId: string): string
 export interface OracleContext {
   scenario: Scenario;
   input: MediaInput;
+  inputs?: MediaInput[];
+  /** injected by runner: the candidate engine that produced the primary operation result */
+  engine?: MediaEngine;
   output?: MediaBytes; // bytes-producing ops
   metadata?: NormalizedMetadata; // probe
   probeMetadatas?: Array<{ input: MediaInput; metadata: NormalizedMetadata; golden: GoldenStore }>; // multi-input probe
@@ -313,6 +316,8 @@ export async function runOracle(
         return goldenPackets(ctx, t);
       case 'decoded-frames-bitexact':
         return decodedFramesBitexact(ctx);
+      case 'decoded-audio-pcm':
+        return decodedAudioPcm(ctx);
       case 'reference-reimport':
         return referenceReimport(ctx, t);
       case 'playback-smoke':
@@ -321,6 +326,10 @@ export async function runOracle(
         return ssimPsnr(ctx, t);
       case 'mp4-box-layout':
         return mp4BoxLayout(ctx);
+      case 'webm-live-layout':
+        return webmLiveLayout(ctx);
+      case 'fanout-renditions':
+        return fanoutRenditions(ctx, t);
       case 'alpha-plane':
         return alphaPlane(ctx);
       case 'seek-accuracy':
@@ -451,6 +460,134 @@ function asciiBoxType(bytes: Uint8Array, offset: number): string {
 
 function firstBoxOffset(boxes: TopLevelBox[], type: string): number | undefined {
   return boxes.find((box) => box.type === type)?.offset;
+}
+
+// ── webm-live-layout ─────────────────────────────────────────────────────────────────────────
+
+interface EbmlElement {
+  id: number;
+  size: number; // -1 means EBML unknown-size
+  offset: number;
+  bodyStart: number;
+  bodyEnd: number;
+  next: number;
+}
+
+const EBML_ID = {
+  Segment: 0x18538067,
+  Info: 0x1549a966,
+  Duration: 0x4489,
+  SeekHead: 0x114d9b74,
+  Cues: 0x1c53bb6b,
+  Cluster: 0x1f43b675,
+} as const;
+
+function webmLiveLayout(ctx: OracleContext): OracleOutcome {
+  const oracle: OracleId = 'webm-live-layout';
+  const out = ctx.output;
+  if (!out) return fail(oracle, 'no ctx.output to inspect');
+
+  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const outputContainer = normStr(readStringOption(options, ['container']) ?? out.container);
+  if (outputContainer !== 'webm' && outputContainer !== 'mkv') {
+    return fail(oracle, `output container '${outputContainer || out.container}' is not a WebM/Matroska layout target`);
+  }
+
+  const top = parseEbmlChildren(out.bytes, 0, out.bytes.byteLength);
+  const segment = top.find((el) => el.id === EBML_ID.Segment);
+  if (!segment) return fail(oracle, 'no Matroska Segment element found');
+
+  const segmentChildren = parseEbmlChildren(out.bytes, segment.bodyStart, segment.bodyEnd);
+  const info = segmentChildren.find((el) => el.id === EBML_ID.Info);
+  const infoChildren = info ? parseEbmlChildren(out.bytes, info.bodyStart, info.bodyEnd) : [];
+  const hasDuration = infoChildren.some((el) => el.id === EBML_ID.Duration);
+  const seekHeadCount = segmentChildren.filter((el) => el.id === EBML_ID.SeekHead).length;
+  const cuesCount = segmentChildren.filter((el) => el.id === EBML_ID.Cues).length;
+  const clusterCount = segmentChildren.filter((el) => el.id === EBML_ID.Cluster).length;
+  const measurements = finiteOnly({
+    segmentOffset: segment.offset,
+    segmentUnknownSize: segment.size === -1 ? 1 : 0,
+    segmentChildren: segmentChildren.length,
+    seekHeadCount,
+    cuesCount,
+    clusterCount,
+    segmentDurationPresent: hasDuration ? 1 : 0,
+  });
+
+  if (segment.size !== -1) {
+    return fail(oracle, 'live WebM expected an unknown-size Segment', measurements);
+  }
+  if (seekHeadCount > 0) {
+    return fail(oracle, `live WebM expected no SeekHead, found ${seekHeadCount}`, measurements);
+  }
+  if (hasDuration) {
+    return fail(oracle, 'live WebM expected no Segment Duration element', measurements);
+  }
+  if (clusterCount === 0) {
+    return fail(oracle, 'live WebM contains no Cluster elements', measurements);
+  }
+
+  return pass(
+    oracle,
+    `live WebM layout: unknown-size Segment, no SeekHead, no Segment Duration, ${clusterCount} Cluster(s), ${cuesCount} Cues element(s)`,
+    measurements,
+  );
+}
+
+function parseEbmlChildren(bytes: Uint8Array, start: number, end: number): EbmlElement[] {
+  const children: EbmlElement[] = [];
+  let pos = start;
+  const hardEnd = Math.min(end, bytes.byteLength);
+  while (pos + 2 <= hardEnd) {
+    const el = readEbmlElement(bytes, pos, hardEnd);
+    if (!el) break;
+    children.push(el);
+    if (el.next <= pos) break;
+    pos = el.next;
+  }
+  return children;
+}
+
+function readEbmlElement(bytes: Uint8Array, pos: number, parentEnd: number): EbmlElement | null {
+  const id = readEbmlVint(bytes, pos, true);
+  if (!id) return null;
+  const size = readEbmlVint(bytes, id.next, false);
+  if (!size) return null;
+  const bodyStart = size.next;
+  const bodyEnd = size.unknown ? parentEnd : Math.min(bodyStart + size.value, parentEnd);
+  if (bodyEnd < bodyStart) return null;
+  return {
+    id: id.value,
+    size: size.unknown ? -1 : size.value,
+    offset: pos,
+    bodyStart,
+    bodyEnd,
+    next: bodyEnd,
+  };
+}
+
+function readEbmlVint(
+  bytes: Uint8Array,
+  pos: number,
+  keepMarker: boolean,
+): { value: number; next: number; length: number; unknown: boolean } | null {
+  const first = bytes[pos];
+  if (first === undefined) return null;
+  let mask = 0x80;
+  let length = 1;
+  while (length <= 8 && (first & mask) === 0) {
+    mask >>= 1;
+    length++;
+  }
+  if (length > 8 || pos + length > bytes.byteLength) return null;
+
+  let value = keepMarker ? first : first & (mask - 1);
+  for (let i = 1; i < length; i++) {
+    value = value * 256 + (bytes[pos + i] ?? 0);
+  }
+
+  const allOnes = Math.pow(2, 7 * length) - 1;
+  return { value, next: pos + length, length, unknown: !keepMarker && value === allOnes };
 }
 
 // ── golden-metadata ──────────────────────────────────────────────────────────────────────────
@@ -749,6 +886,171 @@ function sameLayout(a: Record<number, number>, b: Record<number, number>): boole
   return true;
 }
 
+function compareMediaMetadata(
+  a: NormalizedMetadata,
+  b: NormalizedMetadata,
+  t: Required<OracleTolerances>,
+  assetId: string,
+): string[] {
+  const diffs: string[] = [];
+  const aTracks = (a.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
+  const bTracks = (b.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
+  if (aTracks.length !== bTracks.length) {
+    diffs.push(`media track count: second ${bTracks.length} vs first ${aTracks.length}`);
+  }
+  const n = Math.min(aTracks.length, bTracks.length);
+  for (let i = 0; i < n; i++) {
+    diffs.push(...compareTrack(i, bTracks[i]!, aTracks[i]!, t));
+  }
+
+  if (a.durationSec != null && b.durationSec != null) {
+    const delta = Math.abs(b.durationSec - a.durationSec);
+    const container = resolveContainer(b.container ?? a.container, assetId);
+    const band = durationToleranceFor(container, assetId, t, false);
+    const tolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(a.durationSec)) : band.tolSec;
+    if (delta > tolSec) {
+      diffs.push(
+        `duration: second ${b.durationSec.toFixed(4)}s vs first ${a.durationSec.toFixed(4)}s ` +
+          `(Δ ${delta.toFixed(4)}s > ${tolSec.toFixed(4)}s)`,
+      );
+    }
+  }
+
+  return diffs;
+}
+
+function comparePacketTables(
+  oracle: OracleId,
+  got: PacketInfo[],
+  want: PacketInfo[],
+  t: Required<OracleTolerances>,
+  label: string,
+): OracleOutcome {
+  const measurements: Record<string, number> = {
+    measuredCount: got.length,
+    expectedCount: want.length,
+  };
+  const diffs: string[] = [];
+
+  if (got.length !== want.length) {
+    diffs.push(`${label} packet count: measured ${got.length} vs expected ${want.length}`);
+  }
+
+  const gotLayout = trackLayout(got);
+  const wantLayout = trackLayout(want);
+  if (!sameLayout(gotLayout, wantLayout)) {
+    diffs.push(
+      `${label} trackIndex layout: measured ${JSON.stringify(gotLayout)} vs expected ${JSON.stringify(wantLayout)}`,
+    );
+  }
+
+  const byTrack = (ps: PacketInfo[]): Map<number, PacketInfo[]> => {
+    const m = new Map<number, PacketInfo[]>();
+    for (const p of ps) {
+      let group = m.get(p.trackIndex);
+      if (!group) {
+        group = [];
+        m.set(p.trackIndex, group);
+      }
+      group.push(p);
+    }
+    for (const group of m.values()) group.sort((x, y) => x.dtsUs - y.dtsUs || x.ptsUs - y.ptsUs);
+    return m;
+  };
+
+  const gotByTrack = byTrack(got);
+  const wantByTrack = byTrack(want);
+  const tsTolUs = t.seekToleranceUs;
+  let comparedTracks = 0;
+  let sizeMismatch = 0;
+  let kfMismatch = 0;
+  let ptsDrift = 0;
+  let dtsDrift = 0;
+  let maxPtsDriftUs = 0;
+
+  for (const [trackIndex, wantTrack] of wantByTrack) {
+    const gotTrack = gotByTrack.get(trackIndex) ?? [];
+    const n = Math.min(gotTrack.length, wantTrack.length);
+    if (n === 0) continue;
+    comparedTracks++;
+    const ptsOffset = gotTrack[0]!.ptsUs - wantTrack[0]!.ptsUs;
+    const dtsOffset = gotTrack[0]!.dtsUs - wantTrack[0]!.dtsUs;
+    for (let i = 0; i < n; i++) {
+      const a = gotTrack[i]!;
+      const b = wantTrack[i]!;
+      if (a.size !== b.size) sizeMismatch++;
+      if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
+      const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
+      const dtsResid = Math.abs(a.dtsUs - b.dtsUs - dtsOffset);
+      if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
+      if (ptsResid > tsTolUs) ptsDrift++;
+      if (dtsResid > tsTolUs) dtsDrift++;
+    }
+  }
+
+  measurements.comparedTracks = comparedTracks;
+  measurements.maxPtsDriftUs = maxPtsDriftUs;
+  if (sizeMismatch) diffs.push(`${label}: ${sizeMismatch} packets had a size mismatch`);
+  if (kfMismatch) diffs.push(`${label}: ${kfMismatch} packets had a keyframe-flag mismatch`);
+  if (ptsDrift) diffs.push(`${label}: ${ptsDrift} packets pts drift beyond ±${tsTolUs}µs`);
+  if (dtsDrift) diffs.push(`${label}: ${dtsDrift} packets dts drift beyond ±${tsTolUs}µs`);
+
+  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
+  return pass(oracle, `${label} packet table stable (${got.length} packets)`, measurements);
+}
+
+async function compareFrameSsim(
+  oracle: OracleId,
+  candidate: FrameSink,
+  reference: FrameSink,
+  t: Required<OracleTolerances>,
+  label: string,
+): Promise<OracleOutcome> {
+  const candidateFrames = Array.isArray(candidate.frames) ? candidate.frames : [];
+  const referenceFrames = Array.isArray(reference.frames) ? reference.frames : [];
+  const pairs = Math.min(candidateFrames.length, referenceFrames.length);
+  const measurements: Record<string, number> = {
+    candidateFrames: candidateFrames.length,
+    referenceFrames: referenceFrames.length,
+    framePairs: pairs,
+  };
+  const diffs: string[] = [];
+
+  if (pairs === 0) return fail(oracle, `${label}: no overlapping decoded frames`, measurements);
+  const frameDelta = Math.abs(candidateFrames.length - referenceFrames.length);
+  measurements.frameCountDelta = frameDelta;
+  if (frameDelta > 3) {
+    diffs.push(`${label}: frame count delta ${frameDelta} exceeds 3`);
+  }
+  if (!candidate.getPixels || !reference.getPixels) {
+    return fail(oracle, `${label}: decoded outputs do not expose pixels for SSIM`, measurements);
+  }
+
+  let minSsim = 1;
+  let sumSsim = 0;
+  let compared = 0;
+  for (let i = 0; i < pairs; i++) {
+    const a = await candidate.getPixels(i).catch(() => null);
+    const b = await reference.getPixels(i).catch(() => null);
+    if (!a || !b) continue;
+    const score = ssim(a, b);
+    minSsim = Math.min(minSsim, score);
+    sumSsim += score;
+    compared++;
+  }
+  measurements.ssimFrames = compared;
+  measurements.minSsim = compared ? minSsim : 0;
+  measurements.meanSsim = compared ? sumSsim / compared : 0;
+
+  if (compared === 0) return fail(oracle, `${label}: no pixel-bearing frames to compare`, measurements);
+  if (minSsim < t.ssimMin) {
+    diffs.push(`${label}: SSIM min ${minSsim.toFixed(4)} < ${t.ssimMin}`);
+  }
+
+  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
+  return pass(oracle, `${label}: SSIM min ${minSsim.toFixed(4)} over ${compared} frame(s)`, measurements);
+}
+
 // ── decoded-frames-bitexact ──────────────────────────────────────────────────────────────────
 
 async function decodedFramesBitexact(ctx: OracleContext): Promise<OracleOutcome> {
@@ -831,6 +1133,35 @@ function goldenFramesForDecodeCompare(ctx: OracleContext, frames: FrameDigest[])
   return frames.slice(0, n);
 }
 
+async function decodedAudioPcm(ctx: OracleContext): Promise<OracleOutcome> {
+  const oracle: OracleId = 'decoded-audio-pcm';
+  const got = ctx.frames?.frames ?? [];
+  if (!got.length) return fail(oracle, 'no decoded audio sample frames to compare');
+
+  const sourceContainer = resolveContainer(ctx.golden.meta?.container, primaryAssetId(ctx));
+  const sourceArray = new Uint8Array(await ctx.input.arrayBuffer());
+  const sourceCopy = new Uint8Array(sourceArray.byteLength);
+  sourceCopy.set(sourceArray);
+  const sourceBytes: MediaBytes = {
+    bytes: sourceCopy,
+    mime: ctx.input.mime,
+    container: sourceContainer,
+  };
+
+  let want: FrameDigest[];
+  try {
+    want = await decodeAudioPcmFrameDigests(sourceBytes, got.length);
+  } catch (err) {
+    return fail(oracle, `source audio PCM decode failed: ${errMsg(err)}`);
+  }
+
+  const out = compareDigests(oracle, got, want);
+  return {
+    ...out,
+    detail: `[audio PCM decode] ${out.detail ?? ''}`.trim(),
+  };
+}
+
 /** Compare a decoded sink's digests against golden digests, matched by index (then ptsUs fallback). */
 function compareDigests(
   oracle: OracleId,
@@ -909,11 +1240,14 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
     reimportPackets: pkts.length,
     reimportKeyframes,
   };
+  if (ctx.scenario.op === 'remux') {
+    if (pkts.length === 0 && !isExpectedOggFlacOutput(ctx, demux)) {
+      return fail(oracle, 'reference re-import produced an empty packet table', measurements);
+    }
+    return semanticRemuxReimport(ctx, demux, measurements, t);
+  }
   if (pkts.length === 0) {
     return fail(oracle, 'reference re-import produced an empty packet table', measurements);
-  }
-  if (ctx.scenario.op === 'remux') {
-    return semanticRemuxReimport(ctx, demux, measurements, t);
   }
   // Consistency check vs golden packet count/keyframes when available (otherwise just "round-trips").
   const want = ctx.golden.packets;
@@ -936,16 +1270,19 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
   );
 }
 
-function semanticRemuxReimport(
+async function semanticRemuxReimport(
   ctx: OracleContext,
   demux: DemuxResult,
   measurements: Record<string, number>,
   t: Required<OracleTolerances>,
-): OracleOutcome {
+): Promise<OracleOutcome> {
   const oracle: OracleId = 'reference-reimport';
   const expectedTracks = (ctx.golden.meta?.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  const actualTracks = (demux.metadata.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  measurements.reimportMediaTracks = actualTracks.length;
+  const rawActualTracks = (demux.metadata.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
+  const oggFlacFallback = ctx.output !== undefined && isExpectedOggFlacOutput(ctx, demux);
+  const actualTracks = rawActualTracks.length || !oggFlacFallback ? rawActualTracks : expectedTracks;
+  measurements.reimportMediaTracks = rawActualTracks.length;
+  if (oggFlacFallback && rawActualTracks.length === 0) measurements.oggFlacSemanticMediaTracks = actualTracks.length;
   measurements.goldenMediaTracks = expectedTracks.length;
   const diffs: string[] = [];
 
@@ -961,7 +1298,15 @@ function semanticRemuxReimport(
     if (a !== b) diffs.push(`track layout '${key}': reimport ${a} vs golden ${b}`);
   }
 
-  const gotDur = demux.metadata.durationSec;
+  let gotDur = demux.metadata.durationSec;
+  if ((gotDur == null || gotDur <= 0) && ctx.output && oggFlacFallback) {
+    const sampleRate = audioSampleRate(actualTracks) ?? audioSampleRate(expectedTracks);
+    const granuleDuration = durationFromOggGranules(ctx.output.bytes, sampleRate);
+    if (granuleDuration !== undefined) {
+      gotDur = granuleDuration;
+      measurements.durationFromOggGranulesSec = granuleDuration;
+    }
+  }
   const wantDur = ctx.golden.meta?.durationSec;
   if (gotDur != null && wantDur != null) {
     const delta = Math.abs(gotDur - wantDur);
@@ -978,6 +1323,41 @@ function semanticRemuxReimport(
     }
   }
 
+  if (ctx.output && oggFlacFallback) {
+    const sourceInfo = await nativeFlacStreamInfoFromInput(ctx.input);
+    const outputInfo = oggFlacStreamInfo(ctx.output.bytes);
+    if (!sourceInfo) {
+      diffs.push('Ogg-FLAC check: could not parse source FLAC STREAMINFO');
+    }
+    if (!outputInfo) {
+      diffs.push('Ogg-FLAC check: could not parse output Ogg-FLAC STREAMINFO');
+    }
+    if (sourceInfo && outputInfo) {
+      measurements.oggFlacPages = outputInfo.pages;
+      measurements.oggFlacPayloadBytes = outputInfo.payloadBytes;
+      measurements.flacSourceTotalSamples = Number(sourceInfo.totalSamples);
+      measurements.flacOutputTotalSamples = Number(outputInfo.info.totalSamples);
+      if (sourceInfo.sampleRate !== outputInfo.info.sampleRate) {
+        diffs.push(`Ogg-FLAC sampleRate: output ${outputInfo.info.sampleRate} vs source ${sourceInfo.sampleRate}`);
+      }
+      if (sourceInfo.channels !== outputInfo.info.channels) {
+        diffs.push(`Ogg-FLAC channels: output ${outputInfo.info.channels} vs source ${sourceInfo.channels}`);
+      }
+      if (sourceInfo.bitsPerSample !== outputInfo.info.bitsPerSample) {
+        diffs.push(`Ogg-FLAC bitsPerSample: output ${outputInfo.info.bitsPerSample} vs source ${sourceInfo.bitsPerSample}`);
+      }
+      if (sourceInfo.totalSamples !== outputInfo.info.totalSamples) {
+        diffs.push(`Ogg-FLAC totalSamples: output ${outputInfo.info.totalSamples} vs source ${sourceInfo.totalSamples}`);
+      }
+      if (sourceInfo.md5 !== outputInfo.info.md5) {
+        diffs.push('Ogg-FLAC STREAMINFO MD5 changed across remux');
+      }
+      if (outputInfo.pages <= 0 || outputInfo.payloadBytes <= 0) {
+        diffs.push('Ogg-FLAC output has no Ogg page payload');
+      }
+    }
+  }
+
   const expectedVideoKeyframes = (ctx.golden.packets ?? []).filter((p) => p.keyframe).length;
   const actualVideoKeyframes = demux.packets.filter((p) => p.keyframe).length;
   if (expectedTracks.some((t) => t.type === 'video') && expectedVideoKeyframes > 0 && actualVideoKeyframes === 0) {
@@ -985,9 +1365,13 @@ function semanticRemuxReimport(
   }
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
+  const detail =
+    oggFlacFallback && rawActualTracks.length === 0
+      ? `Ogg-FLAC STREAMINFO/granule proof: ${actualTracks.length} media track(s)`
+      : `reference re-imported remux output semantically: ${demux.packets.length} packets, ${actualTracks.length} media track(s)`;
   return pass(
     oracle,
-    `reference re-imported remux output semantically: ${demux.packets.length} packets, ${actualTracks.length} media track(s)`,
+    detail,
     measurements,
   );
 }
@@ -1001,6 +1385,190 @@ function mediaTrackLayout(tracks: NormalizedTrack[]): Record<string, number> {
   return out;
 }
 
+function isExpectedOggFlacOutput(ctx: OracleContext, demux: DemuxResult): boolean {
+  const container = normStr(ctx.output?.container ?? demux.metadata.container);
+  if (container !== 'ogg') return false;
+  return [...(demux.metadata.tracks ?? []), ...(ctx.golden.meta?.tracks ?? [])].some(
+    (track) => track.type === 'audio' && normStr(track.codec) === 'flac',
+  );
+}
+
+function audioSampleRate(tracks: NormalizedTrack[]): number | undefined {
+  const sampleRate = tracks.find((track) => track.type === 'audio' && typeof track.sampleRate === 'number')?.sampleRate;
+  return sampleRate !== undefined && Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : undefined;
+}
+
+function durationFromOggGranules(bytes: Uint8Array, sampleRate: number | undefined): number | undefined {
+  if (sampleRate === undefined || sampleRate <= 0) return undefined;
+  let pos = 0;
+  let maxGranule = -1n;
+
+  while (pos + 27 <= bytes.byteLength) {
+    if (
+      bytes[pos] !== 0x4f ||
+      bytes[pos + 1] !== 0x67 ||
+      bytes[pos + 2] !== 0x67 ||
+      bytes[pos + 3] !== 0x53
+    ) {
+      return undefined;
+    }
+
+    const segmentCount = bytes[pos + 26]!;
+    const segmentTable = pos + 27;
+    const payloadStart = segmentTable + segmentCount;
+    if (payloadStart > bytes.byteLength) return undefined;
+
+    let payloadLength = 0;
+    for (let i = 0; i < segmentCount; i++) payloadLength += bytes[segmentTable + i]!;
+    const next = payloadStart + payloadLength;
+    if (next > bytes.byteLength) return undefined;
+
+    let granule = 0n;
+    for (let i = 7; i >= 0; i--) granule = (granule << 8n) | BigInt(bytes[pos + 6 + i]!);
+    const isUnset = granule === 0xffffffffffffffffn;
+    const isNegative = (granule & 0x8000000000000000n) !== 0n;
+    if (!isUnset && !isNegative && granule > maxGranule) maxGranule = granule;
+
+    pos = next;
+  }
+
+  return maxGranule >= 0n ? Number(maxGranule) / sampleRate : undefined;
+}
+
+interface FlacStreamInfo {
+  sampleRate: number;
+  channels: number;
+  bitsPerSample: number;
+  totalSamples: bigint;
+  md5: string;
+}
+
+interface OggFlacInfo {
+  info: FlacStreamInfo;
+  pages: number;
+  payloadBytes: number;
+}
+
+async function nativeFlacStreamInfoFromInput(input: MediaInput): Promise<FlacStreamInfo | undefined> {
+  try {
+    return nativeFlacStreamInfo(new Uint8Array(await input.arrayBuffer()));
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeFlacStreamInfo(bytes: Uint8Array): FlacStreamInfo | undefined {
+  if (!bytesStartWith(bytes, 0, [0x66, 0x4c, 0x61, 0x43])) return undefined;
+  return flacStreamInfoFromMetadataBlocks(bytes, 4);
+}
+
+function oggFlacStreamInfo(bytes: Uint8Array): OggFlacInfo | undefined {
+  let pos = 0;
+  let pages = 0;
+  let payloadBytes = 0;
+  const packetParts: Uint8Array[] = [];
+
+  while (pos + 27 <= bytes.byteLength) {
+    if (!bytesStartWith(bytes, pos, [0x4f, 0x67, 0x67, 0x53])) return undefined;
+    pages++;
+
+    const segmentCount = bytes[pos + 26]!;
+    const segmentTable = pos + 27;
+    const payloadStart = segmentTable + segmentCount;
+    if (payloadStart > bytes.byteLength) return undefined;
+
+    let pagePayload = 0;
+    for (let i = 0; i < segmentCount; i++) pagePayload += bytes[segmentTable + i]!;
+    const next = payloadStart + pagePayload;
+    if (next > bytes.byteLength) return undefined;
+    payloadBytes += pagePayload;
+
+    let payloadOffset = payloadStart;
+    for (let i = 0; i < segmentCount; i++) {
+      const len = bytes[segmentTable + i]!;
+      if (len > 0) packetParts.push(bytes.subarray(payloadOffset, payloadOffset + len));
+      payloadOffset += len;
+      if (len < 255) {
+        const packet = concatBytes(packetParts);
+        const info = flacStreamInfoFromOggPacket(packet);
+        return info ? { info, pages, payloadBytes } : undefined;
+      }
+    }
+
+    pos = next;
+  }
+
+  return undefined;
+}
+
+function flacStreamInfoFromOggPacket(packet: Uint8Array): FlacStreamInfo | undefined {
+  if (!bytesStartWith(packet, 0, [0x7f, 0x46, 0x4c, 0x41, 0x43])) return undefined;
+  const nativeMarker = indexOfBytes(packet, [0x66, 0x4c, 0x61, 0x43], 5);
+  if (nativeMarker < 0) return undefined;
+  return flacStreamInfoFromMetadataBlocks(packet, nativeMarker + 4);
+}
+
+function flacStreamInfoFromMetadataBlocks(bytes: Uint8Array, pos: number): FlacStreamInfo | undefined {
+  while (pos + 4 <= bytes.byteLength) {
+    const header = bytes[pos]!;
+    const last = (header & 0x80) !== 0;
+    const type = header & 0x7f;
+    const len = (bytes[pos + 1]! << 16) | (bytes[pos + 2]! << 8) | bytes[pos + 3]!;
+    const data = pos + 4;
+    if (data + len > bytes.byteLength) return undefined;
+    if (type === 0 && len >= 34) return parseFlacStreamInfoBlock(bytes.subarray(data, data + 34));
+    pos = data + len;
+    if (last) break;
+  }
+  return undefined;
+}
+
+function parseFlacStreamInfoBlock(block: Uint8Array): FlacStreamInfo | undefined {
+  if (block.byteLength < 34) return undefined;
+  const sampleRate = (block[10]! << 12) | (block[11]! << 4) | (block[12]! >> 4);
+  const channels = ((block[12]! & 0x0e) >> 1) + 1;
+  const bitsPerSample = (((block[12]! & 0x01) << 4) | (block[13]! >> 4)) + 1;
+  let totalSamples = BigInt(block[13]! & 0x0f);
+  for (let i = 14; i <= 17; i++) totalSamples = (totalSamples << 8n) | BigInt(block[i]!);
+  return {
+    sampleRate,
+    channels,
+    bitsPerSample,
+    totalSamples,
+    md5: hexBytes(block.subarray(18, 34)),
+  };
+}
+
+function bytesStartWith(bytes: Uint8Array, offset: number, prefix: number[]): boolean {
+  if (offset < 0 || offset + prefix.length > bytes.byteLength) return false;
+  for (let i = 0; i < prefix.length; i++) {
+    if (bytes[offset + i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
+function indexOfBytes(bytes: Uint8Array, needle: number[], from: number): number {
+  for (let i = Math.max(0, from); i <= bytes.byteLength - needle.length; i++) {
+    if (bytesStartWith(bytes, i, needle)) return i;
+  }
+  return -1;
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function hexBytes(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ── playback-smoke ───────────────────────────────────────────────────────────────────────────
 
 async function playbackSmoke(ctx: OracleContext): Promise<OracleOutcome> {
@@ -1009,6 +1577,110 @@ async function playbackSmoke(ctx: OracleContext): Promise<OracleOutcome> {
   const ok = await ctx.playbackSmoke(ctx.output);
   if (ok) return pass(oracle, '<video> played a few frames of the output');
   return fail(oracle, '<video> playback did not advance / failed to play the output');
+}
+
+// ── fanout-renditions ───────────────────────────────────────────────────────────────────────
+
+async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
+  const oracle: OracleId = 'fanout-renditions';
+  const output = ctx.output;
+  if (!output) return fail(oracle, 'no ctx.output bytes for fanout verification');
+  const variants = output.variants;
+  if (!Array.isArray(variants) || variants.length === 0) {
+    return fail(oracle, 'output did not expose a variants[] array');
+  }
+
+  const expected = fanoutVariantSpecs(ctx.scenario.options);
+  if (expected.length === 0) {
+    return fail(oracle, 'scenario options do not declare variants[]');
+  }
+  if (variants.length !== expected.length) {
+    return fail(oracle, `variant count ${variants.length} vs expected ${expected.length}`, {
+      variants: variants.length,
+      expectedVariants: expected.length,
+    });
+  }
+  if (!ctx.referenceEngine) return fail(oracle, 'no reference engine injected for fanout metadata checks');
+
+  const measurements: Record<string, number> = {
+    variants: variants.length,
+    totalBytes: variants.reduce((sum, v) => sum + v.bytes.byteLength, 0),
+  };
+  const details: string[] = [];
+
+  for (let i = 0; i < variants.length; i++) {
+    const variant = variants[i]!;
+    const spec = expected[i]!;
+    if (!(variant.bytes instanceof Uint8Array) || variant.bytes.byteLength === 0) {
+      return fail(oracle, `variant ${i} produced no bytes`, finiteOnly(measurements));
+    }
+
+    let meta: NormalizedMetadata;
+    try {
+      meta = await ctx.referenceEngine.probe(bytesToInput(variant, `${primaryAssetId(ctx)}.fanout${i}`));
+    } catch (err) {
+      return fail(oracle, `variant ${i} reference probe failed: ${errMsg(err)}`, finiteOnly(measurements));
+    }
+
+    const video = meta.tracks.find((track) => track.type === 'video');
+    if (!video) return fail(oracle, `variant ${i} has no video track`, finiteOnly(measurements));
+    measurements[`variant${i}Bytes`] = variant.bytes.byteLength;
+    if (typeof video.width === 'number') measurements[`variant${i}Width`] = video.width;
+    if (typeof video.height === 'number') measurements[`variant${i}Height`] = video.height;
+
+    if (typeof spec.width === 'number' && video.width !== spec.width) {
+      return fail(oracle, `variant ${i} width ${video.width ?? 'null'} vs expected ${spec.width}`, finiteOnly(measurements));
+    }
+    if (typeof spec.height === 'number' && video.height !== spec.height) {
+      return fail(oracle, `variant ${i} height ${video.height ?? 'null'} vs expected ${spec.height}`, finiteOnly(measurements));
+    }
+    if (typeof spec.codec === 'string' && video.codec !== spec.codec) {
+      return fail(oracle, `variant ${i} video codec '${video.codec}' vs expected '${spec.codec}'`, finiteOnly(measurements));
+    }
+
+    const played = await ctx.playbackSmoke(variant);
+    if (!played) return fail(oracle, `variant ${i} playback did not advance`, finiteOnly(measurements));
+
+    const ssim = await ssimPsnr({ ...ctx, output: variant }, t);
+    if (!ssim.pass) {
+      return fail(oracle, `variant ${i} failed SSIM/PSNR: ${ssim.detail}`, {
+        ...finiteOnly(measurements),
+        ...prefixMeasurements(`variant${i}Ssim`, ssim.measurements),
+      });
+    }
+    Object.assign(measurements, prefixMeasurements(`variant${i}Ssim`, ssim.measurements));
+    details.push(`${i}:${video.width}x${video.height}/${video.codec}`);
+  }
+
+  return pass(
+    oracle,
+    `fanout produced ${variants.length} verified rendition(s): ${details.join(', ')}`,
+    finiteOnly(measurements),
+  );
+}
+
+function fanoutVariantSpecs(options: unknown): Array<{ width?: number; height?: number; codec?: string }> {
+  if (!isObject(options) || !Array.isArray(options.variants)) return [];
+  return options.variants
+    .filter(isObject)
+    .map((variant) => ({
+      ...(typeof variant.width === 'number' ? { width: variant.width } : {}),
+      ...(typeof variant.height === 'number' ? { height: variant.height } : {}),
+      ...(typeof variant.codec === 'string' ? { codec: variant.codec } : {}),
+    }));
+}
+
+function prefixMeasurements(prefix: string, measurements: OracleOutcome['measurements']): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!measurements) return out;
+  for (const [key, value] of Object.entries(measurements)) {
+    if (typeof value === 'number' && Number.isFinite(value)) out[`${prefix}${upperFirst(key)}`] = value;
+  }
+  return out;
+}
+
+function upperFirst(value: string): string {
+  return value ? value[0]!.toUpperCase() + value.slice(1) : value;
 }
 
 // ── ssim-psnr ────────────────────────────────────────────────────────────────────────────────
@@ -1453,6 +2125,7 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   let maxMeanAbsDiff = 0;
   let framesWithAlpha = 0;
   let pixelFrames = 0;
+  let comparedAlphaDigests = 0;
   const pairs = Math.min(sink.frames.length, want?.length ?? sink.frames.length);
   const measurements: Record<string, number> = { pairs };
 
@@ -1469,10 +2142,13 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
     if (alpha.nonOpaque) framesWithAlpha++;
 
     // If golden ships a per-frame alpha digest (sha256 of the alpha-as-grayscale RGBA), compare it.
+    // Do not compare against frames[i].sha256: that digest is for the full RGBA frame, not alpha.
     const w = want?.[i];
-    if (w) {
+    const wantAlpha = alphaDigestFromGoldenFrame(w);
+    if (wantAlpha) {
+      comparedAlphaDigests++;
       const alphaDigest = await sha256Hex(alpha.asRgbaBuffer);
-      if (normHex(alphaDigest) === normHex(w.sha256)) {
+      if (normHex(alphaDigest) === normHex(wantAlpha)) {
         // exact alpha match → meanAbsDiff 0 for this frame
         continue;
       }
@@ -1485,6 +2161,7 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   measurements.framesWithAlpha = framesWithAlpha;
   measurements.pixelFrames = pixelFrames;
   measurements.maxAlphaMeanAbsDiff = maxMeanAbsDiff;
+  measurements.comparedAlphaDigests = comparedAlphaDigests;
 
   if (pixelFrames === 0) {
     return fail(oracle, `could not read pixels for any of ${pairs} frame(s); cannot inspect alpha plane`, measurements);
@@ -1492,7 +2169,7 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   if (framesWithAlpha === 0) {
     return fail(oracle, `no frame exposed a non-opaque alpha channel over ${pixelFrames} readable frame(s)`, measurements);
   }
-  if (want && maxMeanAbsDiff > 0) {
+  if (comparedAlphaDigests > 0 && maxMeanAbsDiff > 0) {
     return fail(
       oracle,
       `alpha plane diverged from golden on at least one frame (digest mismatch)`,
@@ -1502,9 +2179,19 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
   return pass(
     oracle,
     `alpha plane present on ${framesWithAlpha}/${pairs} frame(s)` +
-      (want ? ' and bit-exact vs golden' : ' (no golden alpha to compare; presence verified)'),
+      (comparedAlphaDigests > 0 ? ' and bit-exact vs golden alpha digest' : ' (no golden alpha digest to compare; presence verified)'),
     measurements,
   );
+}
+
+function alphaDigestFromGoldenFrame(frame: FrameDigest | undefined): string | undefined {
+  if (!frame) return undefined;
+  const rec = frame as unknown as Record<string, unknown>;
+  for (const key of ['alphaSha256', 'alphaDigest', 'alphaPlaneSha256']) {
+    const value = rec[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
 }
 
 // ── seek-accuracy ────────────────────────────────────────────────────────────────────────────
@@ -1850,11 +2537,13 @@ function sameUsRange(a: { startUs: number; endUs: number }, b: { startUs: number
 async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   const oracle: OracleId = 'decrypt-bitexact';
   if (!ctx.output) return fail(oracle, 'no ctx.output (decrypted) bytes to decode');
-  const want = ctx.golden.frames;
+  const golden = await frameComparisonGolden(ctx);
+  const want = golden.frames;
   if (!want || !want.length) {
+    const asset = frameComparisonAssetId(ctx) ?? primaryAssetId(ctx);
     return fail(
       oracle,
-      'no golden frame digests for decrypt comparison (fixtures/golden/<id>.frames.json absent or ' +
+      `no golden frame digests for decrypt comparison (${asset}.frames.json absent or ` +
         'pending; frame-bake must run — not an engine defect)',
     );
   }
@@ -1868,6 +2557,16 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   const out = compareDigests(oracle, got, want);
   // Re-label the detail to the decrypt context while preserving pass/fail + measurements.
   return { ...out, oracle };
+}
+
+function frameComparisonAssetId(ctx: OracleContext): string | undefined {
+  return readStringOption(ctx.scenario.options, ['cleartextAsset', 'cleartextAssetId', 'goldenAsset', 'goldenAssetId']);
+}
+
+async function frameComparisonGolden(ctx: OracleContext): Promise<GoldenStore> {
+  const assetId = frameComparisonAssetId(ctx);
+  if (!assetId || assetId === primaryAssetId(ctx)) return ctx.golden;
+  return loadGolden(assetId);
 }
 
 // ── graceful-failure ─────────────────────────────────────────────────────────────────────────
@@ -1964,12 +2663,34 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     return vfrSeekLandsOnTruePtsInvariant(ctx, t, which);
   }
 
+  if (which === 'demux(mux(x))==x' || which.includes('demux(mux')) {
+    return demuxMuxRoundtripInvariant(ctx, t, which);
+  }
+
+  if (which === 'remux(remux(x))==remux(x)' || which.includes('remux(remux')) {
+    return doubleRemuxStableInvariant(ctx, t, which);
+  }
+
+  if (which === 'flac-seek-lands-identical-with-without-seektable' || which.includes('flac-seek')) {
+    return flacSeektableSeekEquivalenceInvariant(ctx, which);
+  }
+
+  if (which === 'gapless-decoded-sample-count-priming-removed' || which.includes('gapless')) {
+    return gaplessDecodedSampleCountInvariant(ctx, which);
+  }
+
+  if (which === 'audio-pcm-digest' || which.includes('audio-pcm')) {
+    return audioPcmDigestInvariant(ctx, which);
+  }
+
   if (which.includes('decode') || which.includes('remux')) {
     // decode(remux(x)) == decode(x): output frame digests must equal golden source-decode digests.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
-    const want = ctx.golden.frames;
+    const golden = await frameComparisonGolden(ctx);
+    const want = golden.frames;
     if (!want || !want.length) {
-      return fail(oracle, `[${which}] no golden frames = decode(x) to compare against (frame-bake pending)`);
+      const asset = frameComparisonAssetId(ctx) ?? primaryAssetId(ctx);
+      return fail(oracle, `[${which}] no golden frames for ${asset} = decode(x) to compare against (frame-bake pending)`);
     }
     let sink: FrameSink | null | undefined;
     try {
@@ -2028,24 +2749,742 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   if (which.includes('trim') || which.includes('concat')) {
-    // trim(a..b)++trim(b..c) ≈ trim(a..c): compare output decode to golden (the baked a..c decode).
-    if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
-    const want = ctx.golden.frames;
-    if (!want || !want.length) return fail(oracle, `[${which}] no golden frames for trim-concat (frame-bake pending)`);
-    let sink: FrameSink | null | undefined;
-    try {
-      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
-    } catch (err) {
-      return fail(oracle, `[${which}] platform decode of output failed: ${errMsg(err)}`);
-    }
-    const got = sink && Array.isArray(sink.frames) ? sink.frames : [];
-    const out = compareDigests(oracle, got, want);
-    return { ...out, detail: `[invariant trim concat ≈ direct trim] ${out.detail ?? ''}`.trim() };
+    return trimComposeInvariant(ctx, t, which);
   }
 
   return fail(
     oracle,
-    `unknown property-invariant '${which}' (expected decode-remux | seek-vs-linear-decode | decode-pts-strictly-increasing | vfr-seek-lands-on-true-pts | probe-duration | trim-concat | transcode-output-metadata)`,
+    `unknown property-invariant '${which}' (expected decode-remux | seek-vs-linear-decode | decode-pts-strictly-increasing | vfr-seek-lands-on-true-pts | flac-seektable-equivalence | probe-duration | trim-concat | transcode-output-metadata)`,
+  );
+}
+
+async function flacSeektableSeekEquivalenceInvariant(ctx: OracleContext, which: string): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.engine) return fail(oracle, `[${which}] no candidate engine to perform FLAC trims`);
+
+  const inputs = ctx.inputs ?? [ctx.input];
+  if (inputs.length < 2) return fail(oracle, `[${which}] expected two FLAC inputs, got ${inputs.length}`);
+
+  const withSeektable = inputs.find((input) => input.id.includes('flac_seektable')) ?? inputs[0]!;
+  const withoutSeektable = inputs.find((input) => input.id.includes('flac_noseektable')) ?? inputs[1]!;
+  if (withSeektable.id === withoutSeektable.id) {
+    return fail(oracle, `[${which}] could not identify distinct seektable and no-seektable FLAC inputs`);
+  }
+
+  const targetUs = readNumberOption(ctx.scenario.options, ['targetUs', 'tUs', 'startUs']) ?? 2_880_000;
+  const durationUs = readNumberOption(ctx.scenario.options, ['durationUs', 'segmentUs', 'windowUs']) ?? 960_000;
+  if (!Number.isFinite(targetUs) || !Number.isFinite(durationUs) || durationUs <= 0) {
+    return fail(oracle, `[${which}] expected finite targetUs and positive durationUs`);
+  }
+
+  const container = readStringOption(ctx.scenario.options, ['container']) ?? 'flac';
+  const range = { startUs: targetUs, endUs: targetUs + durationUs };
+
+  let sourceWithInfo: FlacStreamInfo | undefined;
+  let sourceWithoutInfo: FlacStreamInfo | undefined;
+  try {
+    [sourceWithInfo, sourceWithoutInfo] = await Promise.all([
+      nativeFlacStreamInfoFromInput(withSeektable),
+      nativeFlacStreamInfoFromInput(withoutSeektable),
+    ]);
+  } catch {
+    // Source STREAMINFO is diagnostic; the trimmed-output checks below are the conformance gate.
+  }
+
+  let trimmedWithSeektable: MediaBytes;
+  let trimmedWithoutSeektable: MediaBytes;
+  try {
+    trimmedWithSeektable = await ctx.engine.trim(withSeektable, range, { container, frameAccurate: false });
+    trimmedWithoutSeektable = await ctx.engine.trim(withoutSeektable, range, { container, frameAccurate: false });
+  } catch (err) {
+    return fail(oracle, `[${which}] FLAC trim at ${targetUs}µs failed: ${errMsg(err)}`);
+  }
+
+  const infoWithSeektable = nativeFlacStreamInfo(trimmedWithSeektable.bytes);
+  const infoWithoutSeektable = nativeFlacStreamInfo(trimmedWithoutSeektable.bytes);
+  if (!infoWithSeektable || !infoWithoutSeektable) {
+    return fail(oracle, `[${which}] trimmed output missing native FLAC STREAMINFO`);
+  }
+
+  let pcmWithSeektable: AudioPcmDigest;
+  let pcmWithoutSeektable: AudioPcmDigest;
+  try {
+    [pcmWithSeektable, pcmWithoutSeektable] = await Promise.all([
+      decodeAudioPcmDigest(trimmedWithSeektable),
+      decodeAudioPcmDigest(trimmedWithoutSeektable),
+    ]);
+  } catch (err) {
+    return fail(oracle, `[${which}] browser audio decode of trimmed FLAC failed: ${errMsg(err)}`);
+  }
+
+  const measurements: Record<string, number> = {
+    targetUs,
+    durationUs,
+    withSeektableBytes: trimmedWithSeektable.bytes.byteLength,
+    withoutSeektableBytes: trimmedWithoutSeektable.bytes.byteLength,
+    withSeektableTotalSamples: Number(infoWithSeektable.totalSamples),
+    withoutSeektableTotalSamples: Number(infoWithoutSeektable.totalSamples),
+    withSeektableSampleRate: infoWithSeektable.sampleRate,
+    withoutSeektableSampleRate: infoWithoutSeektable.sampleRate,
+    withSeektableChannels: infoWithSeektable.channels,
+    withoutSeektableChannels: infoWithoutSeektable.channels,
+    withSeektableBitsPerSample: infoWithSeektable.bitsPerSample,
+    withoutSeektableBitsPerSample: infoWithoutSeektable.bitsPerSample,
+    withSeektableDecodedSamples: pcmWithSeektable.samples,
+    withoutSeektableDecodedSamples: pcmWithoutSeektable.samples,
+    decodedSampleRate: pcmWithSeektable.sampleRate,
+    decodedChannels: pcmWithSeektable.channels,
+    ...(sourceWithInfo ? { sourceWithSeektableTotalSamples: Number(sourceWithInfo.totalSamples) } : {}),
+    ...(sourceWithoutInfo ? { sourceWithoutSeektableTotalSamples: Number(sourceWithoutInfo.totalSamples) } : {}),
+  };
+
+  const diffs: string[] = [];
+  if (sourceWithInfo && sourceWithoutInfo && sourceWithInfo.md5 !== sourceWithoutInfo.md5) {
+    diffs.push('source FLAC STREAMINFO MD5 differs between seektable and no-seektable fixtures');
+  }
+  if (infoWithSeektable.sampleRate !== infoWithoutSeektable.sampleRate) {
+    diffs.push(`STREAMINFO sample rate ${infoWithSeektable.sampleRate} vs ${infoWithoutSeektable.sampleRate}`);
+  }
+  if (infoWithSeektable.channels !== infoWithoutSeektable.channels) {
+    diffs.push(`STREAMINFO channels ${infoWithSeektable.channels} vs ${infoWithoutSeektable.channels}`);
+  }
+  if (infoWithSeektable.bitsPerSample !== infoWithoutSeektable.bitsPerSample) {
+    diffs.push(`STREAMINFO bits/sample ${infoWithSeektable.bitsPerSample} vs ${infoWithoutSeektable.bitsPerSample}`);
+  }
+  if (infoWithSeektable.totalSamples !== infoWithoutSeektable.totalSamples) {
+    diffs.push(`STREAMINFO total samples ${infoWithSeektable.totalSamples} vs ${infoWithoutSeektable.totalSamples}`);
+  }
+  if (pcmWithSeektable.sampleRate !== pcmWithoutSeektable.sampleRate) {
+    diffs.push(`decoded sample rate ${pcmWithSeektable.sampleRate} vs ${pcmWithoutSeektable.sampleRate}`);
+  }
+  if (pcmWithSeektable.channels !== pcmWithoutSeektable.channels) {
+    diffs.push(`decoded channels ${pcmWithSeektable.channels} vs ${pcmWithoutSeektable.channels}`);
+  }
+  if (pcmWithSeektable.samples !== pcmWithoutSeektable.samples) {
+    diffs.push(`decoded samples ${pcmWithSeektable.samples} vs ${pcmWithoutSeektable.samples}`);
+  }
+  if (pcmWithSeektable.sha256 !== pcmWithoutSeektable.sha256) {
+    diffs.push(`decoded PCM digest ${shortHex(pcmWithSeektable.sha256)} vs ${shortHex(pcmWithoutSeektable.sha256)}`);
+  }
+
+  if (diffs.length) {
+    return fail(
+      oracle,
+      `[invariant FLAC ±SEEKTABLE seek equivalence] ${diffs.join('; ')}`,
+      measurements,
+    );
+  }
+
+  return pass(
+    oracle,
+    `[invariant FLAC ±SEEKTABLE seek equivalence] trim at ${targetUs}µs produced identical decoded PCM (${pcmWithSeektable.samples} sample(s))`,
+    measurements,
+  );
+}
+
+interface AudioPcmDigest {
+  samples: number;
+  sampleRate: number;
+  channels: number;
+  sha256: string;
+}
+
+async function gaplessDecodedSampleCountInvariant(ctx: OracleContext, which: string): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) return fail(oracle, `[${which}] no trimmed output to decode`);
+
+  const audioTrack = ctx.golden.meta?.tracks?.find((track) => track.type === 'audio');
+  const sampleRate = audioTrack?.sampleRate;
+  const durationSec = ctx.golden.meta?.durationSec;
+  if (!sampleRate || sampleRate <= 0 || durationSec == null || durationSec <= 0) {
+    return fail(oracle, `[${which}] no golden sample rate/duration to derive priming-removed sample count`);
+  }
+
+  const expectedSourceRateSamples = Math.round(durationSec * sampleRate);
+  const packetCount = ctx.golden.packets?.filter((packet) => packet.trackIndex === 0).length ?? 0;
+  const rawAacFrameSamples = packetCount > 0 ? packetCount * 1024 : undefined;
+  const firstPtsUs = ctx.golden.packets?.find((packet) => packet.trackIndex === 0)?.ptsUs;
+  const primingSamples =
+    firstPtsUs !== undefined && firstPtsUs < 0 ? Math.round((-firstPtsUs * sampleRate) / 1_000_000) : undefined;
+
+  let decodedSamples: number;
+  let decodedSampleRate: number;
+  let decodedChannels: number;
+  try {
+    const decoded = await decodeAudioSampleCount(ctx.output);
+    decodedSamples = decoded.samples;
+    decodedSampleRate = decoded.sampleRate;
+    decodedChannels = decoded.channels;
+  } catch (err) {
+    return fail(oracle, `[${which}] browser audio decode of output failed: ${errMsg(err)}`);
+  }
+
+  const expectedDecodedRateSamples = Math.round(durationSec * decodedSampleRate);
+  const sampleDelta = Math.abs(decodedSamples - expectedDecodedRateSamples);
+  const decodedDurationSec = decodedSamples / decodedSampleRate;
+  const durationDeltaSec = Math.abs(decodedDurationSec - durationSec);
+  const measurements: Record<string, number> = {
+    decodedSamples,
+    expectedDecodedRateSamples,
+    expectedSourceRatePrimingRemovedSamples: expectedSourceRateSamples,
+    sampleDelta,
+    decodedSampleRate,
+    expectedSampleRate: sampleRate,
+    decodedChannels,
+    expectedChannels: audioTrack.channels ?? decodedChannels,
+    goldenDurationSec: durationSec,
+    decodedDurationSec,
+    durationDeltaSec,
+    ...(rawAacFrameSamples !== undefined ? { rawAacFrameSamples } : {}),
+    ...(primingSamples !== undefined ? { primingSamples } : {}),
+  };
+  if (rawAacFrameSamples !== undefined) {
+    measurements.rawMinusExpectedSourceRateSamples = rawAacFrameSamples - expectedSourceRateSamples;
+  }
+
+  const diffs: string[] = [];
+  if (audioTrack.channels !== undefined && decodedChannels !== audioTrack.channels) {
+    diffs.push(`channels: decoded ${decodedChannels} vs golden ${audioTrack.channels}`);
+  }
+  if (sampleDelta > 1) {
+    diffs.push(`decoded samples ${decodedSamples} vs priming-removed expected ${expectedDecodedRateSamples} at ${decodedSampleRate}Hz (delta ${sampleDelta} > 1)`);
+  }
+  if (durationDeltaSec > 1 / sampleRate) {
+    diffs.push(`decoded duration ${decodedDurationSec.toFixed(6)}s vs golden ${durationSec.toFixed(6)}s`);
+  }
+  if (rawAacFrameSamples !== undefined && decodedSampleRate === sampleRate && rawAacFrameSamples === decodedSamples) {
+    diffs.push(`decoded sample count still equals raw AAC frame samples (${rawAacFrameSamples}); priming/padding was not stripped`);
+  }
+
+  if (diffs.length) return fail(oracle, `[invariant gapless sample count] ${diffs.join('; ')}`, measurements);
+  return pass(
+    oracle,
+    `[invariant gapless sample count] decoded ${decodedSamples} sample(s), within tolerance of priming-removed expected count`,
+    measurements,
+  );
+}
+
+async function audioPcmDigestInvariant(ctx: OracleContext, which: string): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) return fail(oracle, `[${which}] no output bytes to decode`);
+
+  const sourceContainer = resolveContainer(ctx.golden.meta?.container, primaryAssetId(ctx));
+  const sourceArray = new Uint8Array(await ctx.input.arrayBuffer());
+  const sourceCopy = new Uint8Array(sourceArray.byteLength);
+  sourceCopy.set(sourceArray);
+  const sourceBytes: MediaBytes = {
+    bytes: sourceCopy,
+    mime: ctx.input.mime,
+    container: sourceContainer,
+  };
+
+  let source: AudioPcmDigest;
+  let output: AudioPcmDigest;
+  try {
+    [source, output] = await Promise.all([decodeAudioPcmDigest(sourceBytes), decodeAudioPcmDigest(ctx.output)]);
+  } catch (err) {
+    return fail(oracle, `[${which}] browser audio decode failed: ${errMsg(err)}`);
+  }
+
+  const measurements: Record<string, number> = {
+    sourceSamples: source.samples,
+    outputSamples: output.samples,
+    sourceSampleRate: source.sampleRate,
+    outputSampleRate: output.sampleRate,
+    sourceChannels: source.channels,
+    outputChannels: output.channels,
+  };
+
+  const diffs: string[] = [];
+  if (source.samples !== output.samples) diffs.push(`samples ${output.samples} vs source ${source.samples}`);
+  if (source.sampleRate !== output.sampleRate) {
+    diffs.push(`sampleRate ${output.sampleRate} vs source ${source.sampleRate}`);
+  }
+  if (source.channels !== output.channels) diffs.push(`channels ${output.channels} vs source ${source.channels}`);
+  if (source.sha256 !== output.sha256) {
+    diffs.push(`PCM digest ${shortHex(output.sha256)} vs source ${shortHex(source.sha256)}`);
+  }
+  if (diffs.length) return fail(oracle, `[invariant audio PCM digest] ${diffs.join('; ')}`, measurements);
+
+  return pass(
+    oracle,
+    `[invariant audio PCM digest] output decodes bit-identical to source (${output.samples} sample(s))`,
+    measurements,
+  );
+}
+
+async function decodeAudioPcmDigest(out: MediaBytes): Promise<AudioPcmDigest> {
+  const audio = await decodeAudioBuffer(out);
+  const channels = audio.numberOfChannels;
+  const samples = audio.length;
+  const pcm = new Uint8Array(samples * channels * Float32Array.BYTES_PER_ELEMENT);
+  const floats = new Float32Array(pcm.buffer);
+  for (let channelIndex = 0; channelIndex < channels; channelIndex++) {
+    const channel = new Float32Array(samples);
+    audio.copyFromChannel(channel, channelIndex);
+    for (let sampleIndex = 0; sampleIndex < samples; sampleIndex++) {
+      floats[sampleIndex * channels + channelIndex] = channel[sampleIndex] ?? 0;
+    }
+  }
+  return {
+    samples,
+    sampleRate: audio.sampleRate,
+    channels,
+    sha256: await sha256Hex(pcm),
+  };
+}
+
+async function decodeAudioPcmFrameDigests(out: MediaBytes, maxSamples: number): Promise<FrameDigest[]> {
+  const native = await decodeNativeAudioPcmFrameDigests(out, maxSamples);
+  if (native) return native;
+  return decodeBrowserAudioPcmFrameDigests(out, maxSamples);
+}
+
+async function decodeBrowserAudioPcmFrameDigests(out: MediaBytes, maxSamples: number): Promise<FrameDigest[]> {
+  const audio = await decodeAudioBuffer(out);
+  const channels = audio.numberOfChannels;
+  const samples = Math.max(0, Math.min(audio.length, Math.floor(maxSamples)));
+  const channelData: Float32Array[] = [];
+  for (let channelIndex = 0; channelIndex < channels; channelIndex++) {
+    const channel = new Float32Array(samples);
+    audio.copyFromChannel(channel, channelIndex);
+    channelData.push(channel);
+  }
+
+  const frames: FrameDigest[] = [];
+  const sampleBytes = new Uint8Array(channels * Float32Array.BYTES_PER_ELEMENT);
+  const sampleFloats = new Float32Array(sampleBytes.buffer);
+  for (let sampleIndex = 0; sampleIndex < samples; sampleIndex++) {
+    for (let channelIndex = 0; channelIndex < channels; channelIndex++) {
+      sampleFloats[channelIndex] = channelData[channelIndex]?.[sampleIndex] ?? 0;
+    }
+    frames.push({
+      index: sampleIndex,
+      ptsUs: Math.round((sampleIndex / audio.sampleRate) * 1_000_000),
+      sha256: await sha256Hex(sampleBytes),
+      width: channels,
+      height: 1,
+    });
+  }
+  return frames;
+}
+
+type NativeAudioSampleFormat = 's16le' | 's24le' | 's32le' | 'f32le' | 's16be' | 's24be' | 's32be' | 'f32be';
+
+interface NativeAudioPcm {
+  data: Uint8Array;
+  sampleRate: number;
+  channels: number;
+  blockAlign: number;
+  bytesPerSample: number;
+  samples: number;
+  format: NativeAudioSampleFormat;
+}
+
+async function decodeNativeAudioPcmFrameDigests(
+  out: MediaBytes,
+  maxSamples: number,
+): Promise<FrameDigest[] | null> {
+  const source = parseNativeAudioPcm(out);
+  if (!source) return null;
+
+  const samples = Math.max(0, Math.min(source.samples, Math.floor(maxSamples)));
+  const frames: FrameDigest[] = [];
+  const sampleBytes = new Uint8Array(source.channels * Float32Array.BYTES_PER_ELEMENT);
+  const sampleFloats = new Float32Array(sampleBytes.buffer);
+
+  for (let sampleIndex = 0; sampleIndex < samples; sampleIndex++) {
+    const frameOffset = sampleIndex * source.blockAlign;
+    for (let channelIndex = 0; channelIndex < source.channels; channelIndex++) {
+      const offset = frameOffset + channelIndex * source.bytesPerSample;
+      sampleFloats[channelIndex] = readNativePcmSample(source.data, offset, source.format);
+    }
+    frames.push({
+      index: sampleIndex,
+      ptsUs: Math.round((sampleIndex / source.sampleRate) * 1_000_000),
+      sha256: await sha256Hex(sampleBytes),
+      width: source.channels,
+      height: 1,
+    });
+  }
+
+  return frames;
+}
+
+function parseNativeAudioPcm(out: MediaBytes): NativeAudioPcm | null {
+  if (ascii4(out.bytes, 0) === 'RIFF' && ascii4(out.bytes, 8) === 'WAVE') {
+    return parseNativeWavPcm(out.bytes);
+  }
+  if (ascii4(out.bytes, 0) === 'FORM' && (ascii4(out.bytes, 8) === 'AIFF' || ascii4(out.bytes, 8) === 'AIFC')) {
+    return parseNativeAiffPcm(out.bytes);
+  }
+  return null;
+}
+
+function parseNativeWavPcm(bytes: Uint8Array): NativeAudioPcm | null {
+  if (bytes.byteLength < 44) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let pos = 12;
+  let formatTag: number | undefined;
+  let channels: number | undefined;
+  let sampleRate: number | undefined;
+  let blockAlign: number | undefined;
+  let bitsPerSample: number | undefined;
+  let data: Uint8Array | undefined;
+
+  while (pos + 8 <= bytes.byteLength) {
+    const id = ascii4(bytes, pos);
+    const size = view.getUint32(pos + 4, true);
+    const body = pos + 8;
+    if (body + size > bytes.byteLength) break;
+
+    if (id === 'fmt ' && size >= 16) {
+      formatTag = view.getUint16(body, true);
+      channels = view.getUint16(body + 2, true);
+      sampleRate = view.getUint32(body + 4, true);
+      blockAlign = view.getUint16(body + 12, true);
+      bitsPerSample = view.getUint16(body + 14, true);
+      if (formatTag === 0xfffe && size >= 40) {
+        const subFormatTag = view.getUint32(body + 24, true);
+        if (subFormatTag === 1 || subFormatTag === 3) formatTag = subFormatTag;
+      }
+    } else if (id === 'data') {
+      data = bytes.subarray(body, body + size);
+    }
+
+    pos = body + size + (size % 2);
+  }
+
+  if (!data || !formatTag || !channels || !sampleRate || !blockAlign || !bitsPerSample) return null;
+  const bytesPerSample = bitsPerSample / 8;
+  if (!Number.isInteger(bytesPerSample) || bytesPerSample <= 0) return null;
+
+  let format: NativeAudioSampleFormat | null = null;
+  if (formatTag === 1) {
+    if (bitsPerSample === 16) format = 's16le';
+    else if (bitsPerSample === 24) format = 's24le';
+    else if (bitsPerSample === 32) format = 's32le';
+  } else if (formatTag === 3 && bitsPerSample === 32) {
+    format = 'f32le';
+  }
+  if (!format) return null;
+
+  return {
+    data,
+    sampleRate,
+    channels,
+    blockAlign,
+    bytesPerSample,
+    samples: Math.floor(data.byteLength / blockAlign),
+    format,
+  };
+}
+
+function parseNativeAiffPcm(bytes: Uint8Array): NativeAudioPcm | null {
+  if (bytes.byteLength < 54) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const formType = ascii4(bytes, 8);
+  let pos = 12;
+  let channels: number | undefined;
+  let samples: number | undefined;
+  let bitsPerSample: number | undefined;
+  let sampleRate: number | undefined;
+  let compression = 'NONE';
+  let soundData: Uint8Array | undefined;
+
+  while (pos + 8 <= bytes.byteLength) {
+    const id = ascii4(bytes, pos);
+    const size = view.getUint32(pos + 4, false);
+    const body = pos + 8;
+    if (body + size > bytes.byteLength) break;
+
+    if (id === 'COMM' && size >= 18) {
+      channels = view.getUint16(body, false);
+      samples = view.getUint32(body + 2, false);
+      bitsPerSample = view.getUint16(body + 6, false);
+      sampleRate = readExtended80(view, body + 8);
+      if (formType === 'AIFC' && size >= 22) compression = ascii4(bytes, body + 18);
+    } else if (id === 'SSND' && size >= 8) {
+      const offset = view.getUint32(body, false);
+      const blockSize = view.getUint32(body + 4, false);
+      if (blockSize !== 0) return null;
+      const dataStart = body + 8 + offset;
+      if (dataStart <= body + size) soundData = bytes.subarray(dataStart, body + size);
+    }
+
+    pos = body + size + (size % 2);
+  }
+
+  if (!soundData || !channels || samples === undefined || !bitsPerSample || !sampleRate) return null;
+  const bytesPerSample = bitsPerSample / 8;
+  if (!Number.isInteger(bytesPerSample) || bytesPerSample <= 0) return null;
+
+  let format: NativeAudioSampleFormat | null = null;
+  const normalizedCompression = compression.trim();
+  const littleEndian = normalizedCompression === 'sowt';
+  if (bitsPerSample === 16) format = littleEndian ? 's16le' : 's16be';
+  else if (bitsPerSample === 24) format = littleEndian ? 's24le' : 's24be';
+  else if (bitsPerSample === 32 && normalizedCompression === 'fl32') format = 'f32be';
+  else if (bitsPerSample === 32 && normalizedCompression === 'sowt') format = 's32le';
+  else if (bitsPerSample === 32) format = 's32be';
+  if (!format) return null;
+
+  const blockAlign = channels * bytesPerSample;
+  return {
+    data: soundData,
+    sampleRate,
+    channels,
+    blockAlign,
+    bytesPerSample,
+    samples: Math.min(samples, Math.floor(soundData.byteLength / blockAlign)),
+    format,
+  };
+}
+
+function readNativePcmSample(data: Uint8Array, offset: number, format: NativeAudioSampleFormat): number {
+  const view = new DataView(data.buffer, data.byteOffset + offset, data.byteLength - offset);
+  switch (format) {
+    case 's16le':
+      return view.getInt16(0, true) / 32768;
+    case 's16be':
+      return view.getInt16(0, false) / 32768;
+    case 's24le':
+      return signExtend24(data[offset]! | (data[offset + 1]! << 8) | (data[offset + 2]! << 16)) / 8388608;
+    case 's24be':
+      return signExtend24((data[offset]! << 16) | (data[offset + 1]! << 8) | data[offset + 2]!) / 8388608;
+    case 's32le':
+      return view.getInt32(0, true) / 2147483648;
+    case 's32be':
+      return view.getInt32(0, false) / 2147483648;
+    case 'f32le':
+      return view.getFloat32(0, true);
+    case 'f32be':
+      return view.getFloat32(0, false);
+  }
+}
+
+function signExtend24(value: number): number {
+  return value & 0x800000 ? value | 0xff000000 : value;
+}
+
+async function decodeAudioSampleCount(out: MediaBytes): Promise<{ samples: number; sampleRate: number; channels: number }> {
+  const audio = await decodeAudioBuffer(out);
+  return { samples: audio.length, sampleRate: audio.sampleRate, channels: audio.numberOfChannels };
+}
+
+async function decodeAudioBuffer(out: MediaBytes): Promise<AudioBuffer> {
+  const global = globalThis as typeof globalThis & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+  const AudioContextCtor = typeof AudioContext !== 'undefined' ? AudioContext : global.webkitAudioContext;
+  let ctx: BaseAudioContext | undefined;
+  try {
+    if (AudioContextCtor) {
+      ctx = new AudioContextCtor();
+    } else if (typeof OfflineAudioContext !== 'undefined') {
+      ctx = new OfflineAudioContext(1, 1, 44100);
+    } else {
+      throw new Error('AudioContext/OfflineAudioContext unavailable');
+    }
+    const exact = copyToArrayBuffer(out.bytes);
+    return await ctx.decodeAudioData(exact);
+  } finally {
+    if (ctx && 'close' in ctx && typeof (ctx as AudioContext).close === 'function') {
+      await (ctx as AudioContext).close().catch(() => undefined);
+    }
+  }
+}
+
+function copyToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer as ArrayBuffer;
+}
+
+async function trimComposeInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.engine) return fail(oracle, `[${which}] no candidate engine to perform trims`);
+  if (!ctx.engine.concat) return fail(oracle, `[${which}] candidate engine does not implement concat()`);
+  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe trim outputs`);
+
+  const options = ctx.scenario.options;
+  const a = readNumberOption(options, ['a']);
+  const b = readNumberOption(options, ['b']);
+  const c = readNumberOption(options, ['c']);
+  if (a == null || b == null || c == null || !(a < b && b < c)) {
+    return fail(oracle, `[${which}] expected finite options a < b < c`);
+  }
+  const container = readStringOption(options, ['container']) ?? 'mp4';
+  const frameAccurate = readBooleanOption(options, ['frameAccurate']);
+  const trimOpts = { container, frameAccurate };
+
+  let left: MediaBytes;
+  let right: MediaBytes;
+  let direct: MediaBytes;
+  let concatenated: MediaBytes;
+  try {
+    left = await ctx.engine.trim(ctx.input, { startUs: a, endUs: b }, trimOpts);
+    right = await ctx.engine.trim(ctx.input, { startUs: b, endUs: c }, trimOpts);
+    direct = await ctx.engine.trim(ctx.input, { startUs: a, endUs: c }, trimOpts);
+    concatenated = await ctx.engine.concat([left, right], { container });
+  } catch (err) {
+    return fail(oracle, `[${which}] trim/concat step failed: ${errMsg(err)}`);
+  }
+
+  let concatMeta: NormalizedMetadata;
+  let directMeta: NormalizedMetadata;
+  try {
+    concatMeta = await ctx.referenceEngine.probe(bytesToInput(concatenated, `${ctx.input.id}.trim-concat`));
+    directMeta = await ctx.referenceEngine.probe(bytesToInput(direct, `${ctx.input.id}.trim-direct`));
+  } catch (err) {
+    return fail(oracle, `[${which}] reference probe of trim outputs failed: ${errMsg(err)}`);
+  }
+
+  const expectedDurationSec = (c - a) / 1_000_000;
+  const durationTolSec = Math.max(t.durationToleranceSec, 0.15);
+  const concatDur = concatMeta.durationSec;
+  const directDur = directMeta.durationSec;
+  const durationDiffs: string[] = [];
+  if (concatDur == null) durationDiffs.push('concat output duration is null');
+  if (directDur == null) durationDiffs.push('direct output duration is null');
+  if (concatDur != null && Math.abs(concatDur - expectedDurationSec) > durationTolSec) {
+    durationDiffs.push(
+      `concat duration ${concatDur.toFixed(4)}s vs expected ${expectedDurationSec.toFixed(4)}s`,
+    );
+  }
+  if (directDur != null && Math.abs(directDur - expectedDurationSec) > durationTolSec) {
+    durationDiffs.push(
+      `direct duration ${directDur.toFixed(4)}s vs expected ${expectedDurationSec.toFixed(4)}s`,
+    );
+  }
+  if (concatDur != null && directDur != null && Math.abs(concatDur - directDur) > durationTolSec) {
+    durationDiffs.push(
+      `concat duration ${concatDur.toFixed(4)}s vs direct ${directDur.toFixed(4)}s`,
+    );
+  }
+
+  let concatSink: FrameSink;
+  let directSink: FrameSink;
+  try {
+    concatSink = await ctx.decodeWithPlatform(concatenated, { maxFrames: 240 });
+    directSink = await ctx.decodeWithPlatform(direct, { maxFrames: 240 });
+  } catch (err) {
+    return fail(oracle, `[${which}] platform decode of trim outputs failed: ${errMsg(err)}`);
+  }
+
+  const cmp = await compareFrameSsim(oracle, concatSink, directSink, t, 'concat trim vs direct trim');
+  const measurements: Record<string, number> = {
+    expectedDurationSec,
+    durationToleranceSec: durationTolSec,
+    ...(concatDur != null ? { concatDurationSec: concatDur } : {}),
+    ...(directDur != null ? { directDurationSec: directDur } : {}),
+    ...(cmp.measurements ?? {}),
+  };
+
+  if (durationDiffs.length || !cmp.pass) {
+    return fail(
+      oracle,
+      `[invariant trim(a..b)+trim(b..c)==trim(a..c)] ${[...durationDiffs, cmp.detail ?? ''].filter(Boolean).join('; ')}`,
+      measurements,
+    );
+  }
+
+  return pass(
+    oracle,
+    `[invariant trim(a..b)+trim(b..c)==trim(a..c)] durations match and ${cmp.detail ?? 'frames compare'}`,
+    measurements,
+  );
+}
+
+async function demuxMuxRoundtripInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) return fail(oracle, `[${which}] no mux output to demux`);
+  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to demux mux output`);
+  if (!ctx.golden.packets?.length) return fail(oracle, `[${which}] no golden packets for source comparison`);
+
+  let demux: DemuxResult;
+  try {
+    demux = await ctx.referenceEngine.demux(bytesToInput(ctx.output, `${ctx.input.id}.mux-roundtrip`));
+  } catch (err) {
+    return fail(oracle, `[${which}] reference demux of mux output failed: ${errMsg(err)}`);
+  }
+
+  const out = goldenPackets({ ...ctx, demux }, t);
+  return {
+    ...out,
+    oracle,
+    detail: `[invariant demux(mux(x))==x] ${out.detail ?? ''}`.trim(),
+  };
+}
+
+async function doubleRemuxStableInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  which: string,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) return fail(oracle, `[${which}] no first remux output`);
+  if (!ctx.engine) return fail(oracle, `[${which}] no candidate engine to perform second remux`);
+  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to inspect remux outputs`);
+
+  const container = readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
+  const firstInput = bytesToInput(ctx.output, `${ctx.input.id}.remux1`);
+  let secondOutput: MediaBytes;
+  try {
+    secondOutput = await ctx.engine.remux(firstInput, { container });
+  } catch (err) {
+    return fail(oracle, `[${which}] second remux failed: ${errMsg(err)}`);
+  }
+
+  let firstDemux: DemuxResult;
+  let secondDemux: DemuxResult;
+  try {
+    firstDemux = await ctx.referenceEngine.demux(bytesToInput(ctx.output, `${ctx.input.id}.remux1.inspect`));
+    secondDemux = await ctx.referenceEngine.demux(bytesToInput(secondOutput, `${ctx.input.id}.remux2.inspect`));
+  } catch (err) {
+    return fail(oracle, `[${which}] reference demux of remux output failed: ${errMsg(err)}`);
+  }
+
+  const metadataDiffs = compareMediaMetadata(
+    firstDemux.metadata,
+    secondDemux.metadata,
+    t,
+    primaryAssetId(ctx),
+  );
+  const packetOutcome = comparePacketTables(
+    oracle,
+    secondDemux.packets,
+    firstDemux.packets,
+    t,
+    'second remux vs first remux',
+  );
+
+  const measurements: Record<string, number> = {
+    firstPackets: firstDemux.packets.length,
+    secondPackets: secondDemux.packets.length,
+    ...(packetOutcome.measurements ?? {}),
+  };
+  const packetDetail = packetOutcome.detail ?? '';
+  if (metadataDiffs.length || !packetOutcome.pass) {
+    return fail(
+      oracle,
+      `[invariant remux(remux(x))==remux(x)] ${[...metadataDiffs, packetDetail].filter(Boolean).join('; ')}`,
+      measurements,
+    );
+  }
+
+  return pass(
+    oracle,
+    `[invariant remux(remux(x))==remux(x)] metadata and packet table stable (${secondDemux.packets.length} packets)`,
+    measurements,
   );
 }
 

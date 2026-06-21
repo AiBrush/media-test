@@ -1,0 +1,72 @@
+[
+  {
+    "trackIndex": 0,
+    "size": 4874,
+    "ptsUs": 0,
+    "dtsUs": 0,
+    "keyframe": true
+  },
+  {
+    "trackIndex": 0,
+    "size": 1498,
+    "ptsUs": 200000,
+    "dtsUs": 200000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1473,
+    "ptsUs": 400000,
+    "dtsUs": 400000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1351,
+    "ptsUs": 600000,
+    "dtsUs": 600000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1472,
+    "ptsUs": 800000,
+    "dtsUs": 800000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 5946,
+    "ptsUs": 1000000,
+    "dtsUs": 1000000,
+    "keyframe": true
+  },
+  {
+    "trackIndex": 0,
+    "size": 1617,
+    "ptsUs": 1200000,
+    "dtsUs": 1200000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1896,
+    "ptsUs": 1400000,
+    "dtsUs": 1400000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1795,
+    "ptsUs": 1600000,
+    "dtsUs": 1600000,
+    "keyframe": false
+  },
+  {
+    "trackIndex": 0,
+    "size": 1264,
+    "ptsUs": 1800000,
+    "dtsUs": 1800000,
+    "keyframe": false
+  }
+]

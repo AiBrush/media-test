@@ -107,7 +107,12 @@ type RobustnessVerdict = 'graceful' | 'timeout' | 'crash';
  *           requires, the browser's WebCodecs decode/encode support must confirm it. If WebCodecs
  *           itself is missing, or a required codec is unconfigurable, ⇒ NA_BROWSER.
  */
-export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: Requires): Negotiation {
+export function negotiate(
+  caps: CapabilitySet,
+  support: CodecSupport,
+  requires: Requires,
+  options?: Scenario['options'],
+): Negotiation {
   // ── Pass 1: engine declaration (NA_ENGINE wins) ──
   for (const op of requires.operations) {
     if (!caps.operations[op]) {
@@ -164,6 +169,8 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
 
   const requiredVideo = requires.videoCodecs ?? [];
   const requiredAudio = requires.audioCodecs ?? [];
+  const isTranscode = requires.operations.includes('transcode');
+  const transcodeTargets = isTranscode ? transcodeTargetCodecs(options) : undefined;
 
   // Determine whether this scenario asks the browser to configure codecs. Parser-only operations
   // (probe/demux/remux copy) do not need WebCodecs decode support just to read packets/metadata; the
@@ -190,7 +197,13 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
   for (const vc of requiredVideo) {
     const canDecode = support.videoDecode[vc] === true;
     const canEncode = support.videoEncode[vc] === true;
-    if (producesEncodedOutput) {
+    const needsEncode = isTranscode
+      ? transcodeTargets?.video.has(vc) === true
+      : producesEncodedOutput;
+    const needsDecode = isTranscode
+      ? needsTranscodeDecode(vc, requiredVideo, transcodeTargets?.video ?? new Set())
+      : needsDecodeConfig && !producesEncodedOutput;
+    if (needsEncode) {
       if (!canEncode) {
         return {
           ok: false,
@@ -198,7 +211,8 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
           reason: `browser cannot encode video codec '${vc}' (WebCodecs VideoEncoder.isConfigSupported=false)`,
         };
       }
-    } else if (needsDecodeConfig && !canDecode) {
+    }
+    if (needsDecode && !canDecode) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -210,7 +224,13 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
   for (const ac of requiredAudio) {
     const canDecode = support.audioDecode[ac] === true;
     const canEncode = support.audioEncode[ac] === true;
-    if (producesEncodedOutput) {
+    const needsEncode = isTranscode
+      ? transcodeTargets?.audio.has(ac) === true
+      : producesEncodedOutput;
+    const needsDecode = isTranscode
+      ? needsTranscodeDecode(ac, requiredAudio, transcodeTargets?.audio ?? new Set())
+      : needsDecodeConfig && !producesEncodedOutput;
+    if (needsEncode) {
       if (!canEncode) {
         return {
           ok: false,
@@ -218,7 +238,8 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
           reason: `browser cannot encode audio codec '${ac}' (WebCodecs AudioEncoder.isConfigSupported=false)`,
         };
       }
-    } else if (needsDecodeConfig && !canDecode) {
+    }
+    if (needsDecode && !canDecode) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -234,6 +255,45 @@ export function negotiate(caps: CapabilitySet, support: CodecSupport, requires: 
   }
 
   return { ok: true };
+}
+
+function transcodeTargetCodecs(options: Scenario['options'] | undefined): {
+  video: Set<string>;
+  audio: Set<string>;
+} {
+  const video = new Set<string>();
+  const audio = new Set<string>();
+  const opts = recordOption(options);
+  if (!opts) return { video, audio };
+
+  const videoCodec = codecOption(opts.video);
+  if (videoCodec) video.add(videoCodec);
+  const audioCodec = codecOption(opts.audio);
+  if (audioCodec) audio.add(audioCodec);
+
+  if (Array.isArray(opts.variants)) {
+    for (const variant of opts.variants) {
+      const codec = codecOption(variant);
+      if (codec) video.add(codec);
+    }
+  }
+
+  return { video, audio };
+}
+
+function needsTranscodeDecode(codec: string, required: string[], targets: Set<string>): boolean {
+  if (targets.size === 0 || !targets.has(codec)) return true;
+  return required.every((c) => targets.has(c));
+}
+
+function recordOption(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+}
+
+function codecOption(value: unknown): string | undefined {
+  const rec = recordOption(value);
+  const codec = rec?.codec;
+  return typeof codec === 'string' && codec.trim() ? codec.trim().toLowerCase() : undefined;
 }
 
 // ── Run options ──────────────────────────────────────────────────────────────────────────────
@@ -572,7 +632,16 @@ function asDecryptKey(options: Scenario['options']): DecryptKey {
 }
 function asEncryptionScheme(options: Scenario['options']): EncryptionScheme {
   const s = (options as Record<string, unknown> | undefined)?.['scheme'];
-  return s === 'cenc-cbcs' || s === 'hls-aes128' ? s : 'cenc-ctr';
+  switch (s) {
+    case 'cenc-cbcs':
+    case 'hls-aes128':
+    case 'clearkey':
+    case 'cenc-cens':
+    case 'hls-sample-aes':
+      return s;
+    default:
+      return 'cenc-ctr';
+  }
 }
 
 /**
@@ -729,7 +798,7 @@ export async function runOne(
 
     // 1) Negotiate (declared ∧ runtime) — NA short-circuits, never benched.
     const caps = engine.capabilities();
-    const neg = negotiate(caps, support, scenario.requires);
+    const neg = negotiate(caps, support, scenario.requires, scenario.options);
     if (!neg.ok) {
       return finalize(neg.status, [], neg.reason);
     }
@@ -751,7 +820,7 @@ export async function runOne(
 
     // 4) Graceful-failure path: malformed/degenerate inputs expect clean reject/return within timeout.
     if (usesGracefulFailurePath) {
-      return await runRobustness(engine, scenario, primaryInput, finalize, opts);
+      return await runRobustness(engine, scenario, inputs, finalize, opts);
     }
 
     // 5) FUNCTIONAL PASS FIRST — execute the op (timeout-guarded), then run all oracles.
@@ -781,7 +850,7 @@ export async function runOne(
         ),
       };
     }
-    const ctx = buildOracleContext(scenario, primaryInput, opResult, golden, opts);
+    const ctx = buildOracleContext(scenario, primaryInput, inputs, opResult, golden, engine, opts);
 
     // 7) Run every declared oracle; PASS iff all green, else FAIL with first failure's detail.
     const oracleOutcomes: OracleOutcome[] = [];
@@ -842,8 +911,10 @@ export async function runOne(
 function buildOracleContext(
   scenario: Scenario,
   input: MediaInput,
+  inputs: MediaInput[],
   opResult: OpResult,
   golden: GoldenStore,
+  engine: MediaEngine,
   opts: RunOneOptions | undefined,
 ): OracleContext {
   const missingHook =
@@ -861,6 +932,8 @@ function buildOracleContext(
   return {
     scenario,
     input,
+    inputs,
+    engine,
     golden,
     decodeWithPlatform,
     playbackSmoke,
@@ -892,7 +965,7 @@ function buildOracleContext(
 async function runRobustness(
   engine: MediaEngine,
   scenario: Scenario,
-  input: MediaInput,
+  inputs: MediaInput[],
   finalize: (
     status: ScenarioResult['status'],
     oracleOutcomes: OracleOutcome[],
@@ -901,12 +974,13 @@ async function runRobustness(
   ) => ScenarioResult,
   opts: RunOneOptions | undefined,
 ): Promise<ScenarioResult> {
+  const input = inputs[0]!;
   let verdict: RobustnessVerdict;
   let opResult: OpResult | undefined;
   let opError: unknown;
 
   try {
-    opResult = await withTimeout(executeOp(engine, scenario, [input]), scenario.timeoutMs);
+    opResult = await withTimeout(executeOp(engine, scenario, inputs), scenario.timeoutMs);
     verdict = 'graceful'; // it returned without crashing/hanging; the engine did not blow up
   } catch (err) {
     if (isNotApplicableError(err)) {
@@ -929,7 +1003,7 @@ async function runRobustness(
   // When the op threw, opResult is undefined → empty output fields → graceful-failure infers PASS.
   // When it returned output, we pass it through → graceful-failure FAILs it as suspicious.
   const golden: GoldenStore = await loadGolden(input.id).catch(() => ({}) as GoldenStore);
-  const ctx = buildOracleContext(scenario, input, opResult ?? {}, golden, opts);
+  const ctx = buildOracleContext(scenario, input, inputs, opResult ?? {}, golden, engine, opts);
 
   const oracleOutcomes: OracleOutcome[] = [];
   for (const oracle of scenario.oracles) {
@@ -994,7 +1068,11 @@ async function runBench(
     // numerator and opsPerSec/packetsPerSec/framesPerSec collapse to 0.
     // Every single op execution is one operation -> opsPerSec = 1/wall (e.g. probes/sec).
     ctx.ops = 1;
-    if (opResult.output) ctx.bytesOut = opResult.output.bytes.byteLength;
+    if (opResult.output) {
+      ctx.bytesOut = opResult.output.variants?.length
+        ? opResult.output.variants.reduce((sum, variant) => sum + variant.bytes.byteLength, 0)
+        : opResult.output.bytes.byteLength;
+    }
     if (opResult.demux) ctx.packets = opResult.demux.packets.length;
     if (opResult.seek) ctx.seeks = 1;
     if (opResult.frames) {
@@ -1181,7 +1259,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      const preNeg = negotiate(engine.capabilities(), support, scenario.requires);
+      const preNeg = negotiate(engine.capabilities(), support, scenario.requires, scenario.options);
       if (!preNeg.ok) {
         result = {
           engineId: engine.id,

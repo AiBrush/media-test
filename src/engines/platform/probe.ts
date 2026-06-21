@@ -19,6 +19,13 @@ import { demuxMp4Tracks, looksLikeMp4, probeMp4Metadata, UnsupportedMp4Error } f
 import { demuxWebmTracks, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 import { looksLikeWav, probeWavMetadata, UnsupportedWavError } from './demux-wav.ts';
 
+function isStillImageInput(input: MediaInput): boolean {
+  const mime = input.mime.toLowerCase();
+  if (mime.startsWith('image/')) return true;
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  return /\.(?:jpe?g|png|webp|gif|bmp|avif)$/.test(name);
+}
+
 /** Map a MIME / asset id hint to a canonical container token. */
 function containerFromMime(mime: string, bytes: Uint8Array): string {
   const m = mime.toLowerCase();
@@ -158,6 +165,9 @@ function fpsFromSampleCount(sampleCount: number, durationUs: number | null): num
  */
 export async function probeInput(input: MediaInput, opts?: { timeoutMs?: number }): Promise<NormalizedMetadata> {
   const timeoutMs = opts?.timeoutMs ?? 5000;
+  if (isStillImageInput(input)) {
+    throw new Error('raw platform probe rejected still-image input; this suite probes media containers only');
+  }
   const ab = await input.arrayBuffer();
   const bytes = new Uint8Array(ab);
   const container = containerFromMime(input.mime, bytes);

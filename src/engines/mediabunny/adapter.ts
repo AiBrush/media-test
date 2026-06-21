@@ -27,12 +27,10 @@
  *     mediabunny's lossless audio COPY fast-path (conversion.js requires `!trackOptions.bitrate`).
  *     mediabunny supplies QUALITY_HIGH itself only inside its re-encode branch, so leaving bitrate
  *     unset is the dossier's "copy whenever possible" path and lossless for unchanged audio.
- *   - 'fanout' removed from capabilities().features: the suite's single-blob MediaBytes contract
- *     can carry only ONE rendition, so transcode() emits variants[0] and cannot deliver a true
- *     1→N ABR ladder. Declaring it let the ladder scenario score green on a single 1080p rung
- *     (over-claim). Removing it makes that scenario negotiate NA_ENGINE honestly. (mediabunny CAN
- *     fan out natively via ConversionVideoOptions[] — conversion.d.ts:45 — but the contract can't
- *     surface N outputs, so the honest move is to drop the claim, not fake the green.)
+ *   - fanout is declared only after the shared MediaBytes contract grew `variants[]`, allowing the
+ *     adapter to surface every ABR rendition instead of scoring one green primary blob. The current
+ *     path emits separate verified rendition files (primary === variants[0]); it does NOT claim a
+ *     single native one-decode multi-output pipeline.
  *   - metadataFromInput reads duration via the cheap getDurationFromMetadata() FIRST and only falls
  *     back to computeDuration() when metadata yields null (dossier §4.1 cheap path; longform/edge
  *     probes require duration without a full sample scan / OOM). computeDuration walks all fragments
@@ -190,7 +188,12 @@ function outputFormatOptionsFrom(opts?: Record<string, unknown>): OutputFormatOp
   ) {
     fastStart = rawFastStart;
   }
-  return fastStart !== undefined ? { fastStart } : undefined;
+  const appendOnly = opts?.appendOnly === true ? true : undefined;
+  if (fastStart === undefined && appendOnly === undefined) return undefined;
+  return {
+    ...(fastStart !== undefined ? { fastStart } : {}),
+    ...(appendOnly !== undefined ? { appendOnly } : {}),
+  };
 }
 
 function alphaModeFrom(opts?: Record<string, unknown>): AlphaMode | undefined {
@@ -950,6 +953,7 @@ export class MediabunnyEngine implements MediaEngine {
         'fastStart:none', // fastStart: false (explicit moov-last control)
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'trim:frame-accurate-hevc', // HEVC re-encode trim is supported via WebCodecs where available
+        'trim:massive-lazy-read', // normal corpus inputs use UrlSource, preserving lazy reads for massive trims
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
         'resize', // Conversion video width/height
@@ -965,20 +969,19 @@ export class MediabunnyEngine implements MediaEngine {
         'gain', // ConversionAudioOptions.process sample scaling
         'fade', // ConversionAudioOptions.process deterministic envelope
         'decode:golden-rgba', // VideoSample.copyTo(RGBA) matches the baked WebCodecs golden path
+        'audio-samples:gapless-priming', // full-range AAC trims preserve priming/padding-stripped decode length
         'hls:aes128', // read/probe/decrypt AES-128 HLS playlists via EXT-X-KEY segment decryption
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
         'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
+        'remux:compose', // remux(remux(x)) is validated by the property-invariant oracle
         'mux:vfr-timestamps', // prepareMuxTracks preserves per-packet PTS/duration from the source
         'mux:browser-decode-equality', // muxed outputs satisfy the platform decode invariant
+        'mux:roundtrip-compare', // demux->mux->demux packet stability is validated by the property oracle
         'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
-        // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
-        // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
-        // returns a SINGLE blob, so transcode() can only deliver variants[0] — it cannot surface the
-        // N separate renditions an ABR ladder needs. Declaring 'fanout' would let the ladder scenario
-        // score green on one rung (over-claim); dropping it makes that scenario negotiate NA_ENGINE
-        // honestly until the contract can carry multiple outputs.
+        'headerless', // WebM/Matroska appendOnly live layout: unknown Segment size, no SeekHead/duration
+        'fanout', // transcode() returns every requested ABR rendition in MediaBytes.variants[]
       ],
     };
   }
@@ -1143,50 +1146,61 @@ export class MediabunnyEngine implements MediaEngine {
   /**
    * Codec / resolution / fps / bitrate / rotate transcode via Conversion.
    *
-   * NOTE on `opts.variants` (ABR ladder): mediabunny natively fans out (ConversionVideoOptions[]),
-   * but the suite's MediaBytes contract returns a SINGLE blob, so we cannot deliver N separate
-   * renditions. We therefore DO NOT declare the 'fanout' feature (capabilities()), which makes the
-   * ladder scenario negotiate NA_ENGINE rather than scoring on one rung. If a caller still passes
-   * `variants` we transcode the FIRST rung only (a defined, non-crashing fallback) — but no green
-   * number is claimed for the ladder because the capability is undeclared.
+   * NOTE on `opts.variants` (ABR ladder): the suite needs independently inspectable rendition
+   * files, so this adapter returns every requested rung in `MediaBytes.variants[]` and uses the
+   * first as the primary output. Each rung is produced with the same audio settings and its own
+   * fresh Input/Output pair to avoid reusing a consumed media source.
    */
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     const runtimeOpts = opts as TranscodeOptions & Record<string, unknown>;
-    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
-    if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
-    const requestedVideoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
-    if (
-      requestedVideoSpec &&
-      ((requestedVideoSpec.width !== undefined && requestedVideoSpec.width <= 0) ||
-        (requestedVideoSpec.height !== undefined && requestedVideoSpec.height <= 0))
-    ) {
-      throw new Error('mediabunny transcode rejected invalid video dimensions');
+    const variants = opts.variants?.length ? opts.variants : undefined;
+    const videoSpecs = variants ?? (opts.video ? [opts.video] : []);
+    for (const spec of videoSpecs) {
+      if (
+        (spec.width !== undefined && spec.width <= 0) ||
+        (spec.height !== undefined && spec.height <= 0)
+      ) {
+        throw new Error('mediabunny transcode rejected invalid video dimensions');
+      }
     }
 
-    const mbInput = await openInput(this.lib, input);
-    try {
+    const runSingle = async (videoSpec?: TranscodeVideoOptions): Promise<MediaBytes> => {
+      const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
+      if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
+      const mbInput = await openInput(this.lib, input);
       const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
       const convOpts: ConversionOptions = { input: mbInput, output };
 
-      const videoSpec = requestedVideoSpec;
-      const tracks = await mbInput.getTracks();
-      if (videoSpec && !tracks.some((track) => track.isVideoTrack())) {
-        throw new Error('mediabunny transcode: requested video output but input has no video track');
-      }
-      if (opts.audio && !tracks.some((track) => track.isAudioTrack())) {
-        throw new Error('mediabunny transcode: requested audio output but input has no audio track');
-      }
-      const inputDuration = await durationFromInput(mbInput);
-      const videoExtras = videoTransformExtrasFrom(runtimeOpts);
-      if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, videoExtras);
-      if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio, inputDuration ?? undefined);
+      try {
+        const tracks = await mbInput.getTracks();
+        if (videoSpec && !tracks.some((track) => track.isVideoTrack())) {
+          throw new Error('mediabunny transcode: requested video output but input has no video track');
+        }
+        if (opts.audio && !tracks.some((track) => track.isAudioTrack())) {
+          throw new Error('mediabunny transcode: requested audio output but input has no audio track');
+        }
+        const inputDuration = await durationFromInput(mbInput);
+        const videoExtras = videoTransformExtrasFrom(runtimeOpts);
+        if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, videoExtras);
+        if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio, inputDuration ?? undefined);
 
-      if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
+        if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
 
-      return await runConversion(this.lib, convOpts, opts.container);
-    } finally {
-      mbInput.dispose();
+        return await runConversion(this.lib, convOpts, opts.container);
+      } finally {
+        mbInput.dispose();
+      }
+    };
+
+    if (variants) {
+      const outputs: MediaBytes[] = [];
+      for (const variant of variants) outputs.push(await runSingle(variant));
+      const primary = outputs[0];
+      if (!primary) throw new Error('mediabunny fanout produced no variants');
+      return { ...primary, variants: outputs };
     }
+
+    return await runSingle(opts.video);
   }
 
   // ── decodeFrames ───────────────────────────────────────────────────────────────────────────

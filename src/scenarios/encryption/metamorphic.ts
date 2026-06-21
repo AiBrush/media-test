@@ -2,9 +2,8 @@
  * src/scenarios/encryption/metamorphic.ts — property-invariant (metamorphic, §11) decrypt cases.
  *
  * The decrypt analogue of remux's decode(remux(x))==decode(x): a correct decrypt must reproduce the
- * OFFLINE CLEARTEXT. The committed golden `<asset>.frames.json` for each encrypted asset was baked
- * from the cleartext (manifest: cenc_ctr.mp4 = "ffmpeg -encryption_* over the H.264/AAC baseline";
- * its golden frames ARE the baseline decode). So:
+ * OFFLINE CLEARTEXT. Encrypted assets may name `options.cleartextAsset`, whose committed
+ * `<cleartextAsset>.frames.json` was browser-baked from the independent plaintext corpus twin. So:
  *
  *   decrypt(x) frame digests  ==  golden.frames (the offline cleartext decode)
  *
@@ -55,6 +54,7 @@ interface DecryptMetamorphicCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   features?: string[];
+  cleartextAsset?: string;
   oracles?: OracleId[];
   notes: string;
 }
@@ -66,12 +66,13 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     container: 'mp4',
     scheme: 'cenc-ctr',
     keyName: 'cenc_ctr',
+    cleartextAsset: 'cenc_ctr_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['encryption:cenc-ctr-clear-output'],
     notes:
       'METAMORPHIC: decrypt(cenc_ctr.mp4) decodes bit-exact to the offline CLEARTEXT (golden frames ' +
-      'baked from the baseline). property-invariant[decode-cleartext-baseline] gates the pixels; ' +
+      'baked from cenc_ctr_clear.mp4). property-invariant[decode-cleartext-baseline] gates the pixels; ' +
       'reference-reimport gates that the output is a genuinely de-protected, re-parseable container ' +
       '(no leftover sinf/senc breaking the track). Requires feature encryption:cenc-ctr-clear-output ' +
       'so engines that can only parse protected-track metadata do not post a false decrypt result. ' +
@@ -83,6 +84,7 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     container: 'hls',
     scheme: 'hls-aes128',
     keyName: 'hls_aes128',
+    cleartextAsset: 'hls_aes128_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     // HLS output re-import as an MP4/TS via the reference engine is engine-dependent; keep the frame
@@ -91,8 +93,9 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     oracles: ['property-invariant', 'playback-smoke'],
     notes:
       'METAMORPHIC: decrypt(hls_aes128) full-segment AES-128 decodes bit-exact to the cleartext ' +
-      'golden. property-invariant[decode-cleartext-baseline] + playback-smoke. The HLS golden carries ' +
-      'an explicit ivHex (from #EXT-X-KEY) so the explicit-IV path is what is exercised here.',
+      'MP4 reference hls_aes128_clear.mp4. property-invariant[decode-cleartext-baseline] + playback-smoke. ' +
+      'The HLS golden carries an explicit ivHex (from #EXT-X-KEY) so the explicit-IV path is what is ' +
+      'exercised here.',
   },
   {
     id: 'unencrypted_left_untouched_noop',
@@ -121,7 +124,12 @@ const metamorphicScenarios: Scenario[] = METAMORPHIC_CASES.map((c) => {
     id: `encryption/${c.id}`,
     op: 'decrypt',
     input: c.asset,
-    options: { scheme: c.scheme, key, invariant: DECODE_CLEARTEXT },
+    options: {
+      scheme: c.scheme,
+      key,
+      invariant: DECODE_CLEARTEXT,
+      ...(c.cleartextAsset ? { cleartextAsset: c.cleartextAsset } : {}),
+    },
     requires: {
       operations: ['decrypt'],
       containersIn: [c.container],

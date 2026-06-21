@@ -24,6 +24,7 @@ import { defineScenario } from '../../core/scenario.ts';
 
 const FUZZ_TIMEOUT_MS = 15_000;
 const TRANSCODE_PROPERTY_TIMEOUT_MS = 120_000;
+const COMPOSE_TIMEOUT_MS = 60_000;
 
 // ── (a) EDGE cases ──────────────────────────────────────────────────────────────────────────────
 
@@ -127,13 +128,16 @@ const EDGE_CASES: EdgeCase[] = [
   },
   {
     id: 'edge_pcm_s24_decode',
-    op: 'decodeFrames',
+    op: 'transcode',
     asset: 'wav_s24.wav',
     containersIn: ['wav'],
+    containersOut: ['wav'],
     audioCodecs: ['pcm-s24'],
-    options: { maxFrames: 1 },
-    oracles: ['decoded-frames-bitexact'],
-    notes: '24-bit PCM decode to canonical samples.',
+    options: { container: 'wav', audio: { codec: 'pcm-s24' }, invariant: 'audio-pcm-digest' },
+    oracles: ['property-invariant'],
+    notes:
+      '24-bit PCM sample-format edge: materialize an identity WAV transcode and browser-decode source ' +
+      'plus output to the same PCM digest. This uses the audio PCM oracle because decoded-frames-bitexact is RGBA-video-only.',
   },
   {
     id: 'edge_cbcs_boundary_decrypt',
@@ -369,6 +373,8 @@ interface PropertyCase {
   audioCodecs?: string[];
   features?: string[];
   options?: Record<string, unknown>;
+  tolerances?: Scenario['tolerances'];
+  timeoutMs?: number;
   notes?: string;
 }
 
@@ -427,11 +433,15 @@ const PROPERTY_CASES: PropertyCase[] = [
       a: 2_000_000,
       b: 5_000_000,
       c: 9_000_000,
+      range: { startUs: 2_000_000, endUs: 9_000_000 },
     },
+    tolerances: { ssimMin: 0.985 },
+    timeoutMs: COMPOSE_TIMEOUT_MS,
     notes:
       'Concatenating adjacent frame-accurate trims reproduces the single combined trim. Requires ' +
-      'trim:compose because the current runner cannot execute the three-trim + concat workflow in a ' +
-      'single-op scenario.',
+      'trim:compose because the property oracle performs three trims plus a concat before comparing ' +
+      'against the direct trim; SSIM is perceptual because separately re-encoded adjacent trims can ' +
+      'round slightly differently from one direct trim.',
   },
   {
     id: 'prop_duration_consistent_across_containers',
@@ -463,7 +473,8 @@ const propertyScenarios: Scenario[] = PROPERTY_CASES.map((c) =>
     },
     oracles: ['property-invariant'],
     metrics: ['wall', 'peakMemory'],
-    timeoutMs: FUZZ_TIMEOUT_MS,
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
+    timeoutMs: c.timeoutMs ?? FUZZ_TIMEOUT_MS,
     ...(c.notes ? { notes: c.notes } : {}),
   }),
 );
@@ -473,15 +484,15 @@ const propertyScenarios: Scenario[] = PROPERTY_CASES.map((c) =>
 interface ImageNegativeCase {
   id: string;
   asset: string;
-  /** the still-image "container" tag (not a canonical media container — drives honest NA) */
-  pseudoContainer: string;
+  /** still-image format label used only in notes; it is not a media-container capability gate */
+  format: string;
   notes?: string;
 }
 
 const IMAGE_NEGATIVE_CASES: ImageNegativeCase[] = [
-  { id: 'image_jpeg_probe_na', asset: 'image.jpg', pseudoContainer: 'jpeg' },
-  { id: 'image_png_probe_na', asset: 'image.png', pseudoContainer: 'png' },
-  { id: 'image_webp_probe_na', asset: 'image.webp', pseudoContainer: 'webp' },
+  { id: 'image_jpeg_probe_na', asset: 'image.jpg', format: 'JPEG' },
+  { id: 'image_png_probe_na', asset: 'image.png', format: 'PNG' },
+  { id: 'image_webp_probe_na', asset: 'image.webp', format: 'WebP' },
 ];
 
 const imageNegativeScenarios: Scenario[] = IMAGE_NEGATIVE_CASES.map((c) =>
@@ -491,19 +502,15 @@ const imageNegativeScenarios: Scenario[] = IMAGE_NEGATIVE_CASES.map((c) =>
     input: c.asset,
     requires: {
       operations: ['probe'],
-      // Declare the still-image pseudo-container so no media engine claims support → clean NA;
-      // an engine that DOES try is judged by the graceful-failure oracle (output-absence), never by
-      // the note prose.
-      containersIn: [c.pseudoContainer],
     },
     oracles: ['graceful-failure'],
     metrics: ['wall'],
     timeoutMs: FUZZ_TIMEOUT_MS,
-    // Note avoids the graceful-failure good-token set (graceful/threw/rejected/…) so the verdict
-    // cannot be won by the prose; it rests on NA (no engine declares the still-image container) or
-    // the runner's output-absence inference.
+    // Note avoids the graceful-failure explicit `signal:` marker so the verdict rests on the runner's
+    // output-absence inference, not on prose.
     notes:
-      c.notes ?? 'Still image fed to a media probe: expect a clean NA (no engine declares it) or a clean reject.',
+      c.notes ??
+      `${c.format} still image fed to a media probe: engines with probe support must reject it cleanly.`,
   }),
 );
 
@@ -680,10 +687,12 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     containersIn: ['webm'],
     videoCodecs: ['vp9'],
     options: { maxFrames: 1 },
-    oracles: ['decoded-frames-bitexact'],
+    oracles: ['ssim-psnr'],
+    tolerances: { ssimMin: 0.96 },
     notes:
       '§A.16 1×1 decode: decode one 1×1 frame — exercises the SSIM/luma divide-by-zero guard in the ' +
-      'oracle pixel math on a degenerate dimension.',
+      'oracle pixel math on a degenerate dimension. The row is perceptual rather than bitexact because ' +
+      'a one-pixel VP9 decode can round differently across otherwise correct decoders.',
   },
   {
     id: 'edge_dims_2x2_h264_probe',
@@ -909,14 +918,14 @@ const extraFuzzScenarios: Scenario[] = EXTRA_FUZZ_CASES.map((c) =>
 //       is ever baked — that oracle would be a guaranteed-FAIL here. The true cross-asset "seek lands
 //       identically with vs without SEEKTABLE" property is an oracle extension, tracked as honest-FAIL.)
 //
-//   HONEST-FAIL (oracle token NOT implemented → resolves to "unknown property-invariant", never a
-//   fabricated pass; the required oracle extension is tracked in the dossier oracleGaps):
+//   LIVE through property-invariant multi-step oracles:
 //     - demux(mux(x)) ≈ x : re-demux a muxed stream and compare packets to source.
-//     - remux(remux(x)) bit-stable / decode-equal : double-remux round-trip stability.
+//     - remux(remux(x)) bit-stable : run a second remux and compare metadata plus packet tables.
+//     - trim additivity (proper compose) : trim(a..b)++trim(b..c) decode-compares to trim(a..c).
+//
+//   HONEST-FAIL / HONEST-N/A until dedicated audio/cross-asset oracle support exists:
 //     - FLAC seek ±SEEKTABLE land-identical : two-asset seek-equality.
-//     - trim additivity (proper compose) : trim(a..b)++trim(b..c) decode-equals trim(a..c) — needs a
-//       runner compose path the single-op executor lacks (the existing prop_trim_concatenation only
-//       runs ONE trim; this records the proper invariant for when compose exists).
+//     - gapless AAC decoded sample count : audio sample-count oracle, not RGBA frame digesting.
 
 // (h1) LIVE — transcode resize-to-same is perceptually identical (ssim-psnr reference path).
 const transcodeIdempotentScenarios: Scenario[] = [
@@ -1011,6 +1020,8 @@ interface MetamorphicTodoCase {
   audioCodecs?: string[];
   features?: string[];
   options: Record<string, unknown>;
+  tolerances?: Scenario['tolerances'];
+  timeoutMs?: number;
   notes: string;
 }
 
@@ -1027,10 +1038,9 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     options: { container: 'mp4', invariant: 'demux(mux(x))==x' },
     notes:
       '§A.16 metamorphic demux(mux(x)) ≈ x: mux the source coded tracks, then re-demux and compare ' +
-      'packet count/sizes/keyframe layout to the source packets. Oracle token NOT implemented in ' +
-      'oracles.ts and no single-op runner path exists for the re-demux compare. The undeclared ' +
-      'mux:roundtrip-compare feature keeps this honest NA(engine) until both are added; never a ' +
-      'fabricated pass.',
+      'packet count/sizes/keyframe layout to the source packets. The property-invariant oracle now ' +
+      'performs the re-demux comparison; engines must declare mux:roundtrip-compare only after that ' +
+      'path passes.',
   },
   {
     id: 'prop_double_remux_stable',
@@ -1044,10 +1054,9 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     options: { container: 'mp4', invariant: 'remux(remux(x))==remux(x)' },
     notes:
       '§A.16 metamorphic double-remux stability: remux(remux(x)) must be bit-stable / decode-equal to ' +
-      'remux(x) — catches engines that drift metadata or re-order packets on each wrap. Needs a runner ' +
-      'compose path (two sequential remuxes) the single-op executor lacks AND an oracle token. The ' +
-      'undeclared remux:compose feature keeps this honest NA(engine) until both exist, never a ' +
-      'fabricated pass.',
+      'remux(x) — catches engines that drift metadata or re-order packets on each wrap. The property ' +
+      'oracle now runs the second remux and compares metadata plus packet tables; engines must declare ' +
+      'remux:compose only after that path passes.',
   },
   {
     id: 'prop_flac_seek_seektable_equiv',
@@ -1057,14 +1066,19 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersOut: ['flac'],
     audioCodecs: ['flac'],
     features: ['flac:seektable-seek-equivalence'],
-    options: { container: 'flac', invariant: 'flac-seek-lands-identical-with-without-seektable' },
+    options: {
+      container: 'flac',
+      invariant: 'flac-seek-lands-identical-with-without-seektable',
+      targetUs: 2_880_000,
+      durationUs: 960_000,
+    },
     notes:
       '§A.16 metamorphic FLAC ±SEEKTABLE seek equivalence: seeking to the same tUs in ' +
       'flac_seektable.flac vs flac_noseektable.flac must land on an IDENTICAL frame digest (the ' +
-      'SEEKTABLE is an index, not a content change). This is a TWO-ASSET cross-check the current ' +
-      'single-input runner + oracle cannot compute. The undeclared flac:seektable-seek-equivalence ' +
-      'feature keeps this honest NA(engine) until the oracle/runner learn it. The per-asset decode ' +
-      'equality is covered live above.',
+      'SEEKTABLE is an index, not a content change). The property oracle trims the same 960 ms ' +
+      'frame-aligned window from both assets with the candidate engine, then compares native FLAC ' +
+      'STREAMINFO and browser-decoded PCM digests. Engines must declare ' +
+      'flac:seektable-seek-equivalence only after both FLAC trim paths are implemented.',
   },
   {
     id: 'prop_gapless_sample_count_priming',
@@ -1081,14 +1095,13 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
       // Trim the whole clip; the gapless property is that the decoded sample count equals the
       // priming/padding-removed total, not the raw frame×1024 count.
       startUs: 0,
-      endUs: 0,
+      endUs: 1_012_993,
     },
     notes:
       '§A.16 gapless audio exact-sample-count: the decoded/trimmed sample count must equal the ' +
       'priming(encoder-delay)+padding-removed total (AAC priming stripped), not raw frameCount×1024. ' +
-      'No audio-SAMPLE oracle exists (decoded-frames-bitexact is RGBA-video-only) → honest FAIL ' +
-      '("unknown property-invariant") until an audio-sample oracle is added (dossier oracleGaps); never ' +
-      'a fabricated pass.',
+      'The property oracle browser-decodes the trimmed AAC output and compares the priming-removed ' +
+      'sample count; decoded-frames-bitexact remains RGBA-video-only and is deliberately not used here.',
   },
   {
     id: 'prop_trim_additivity_compose',
@@ -1106,14 +1119,16 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
       a: 2_000_000,
       b: 5_000_000,
       c: 9_000_000,
+      range: { startUs: 2_000_000, endUs: 9_000_000 },
     },
+    tolerances: { ssimMin: 0.985 },
+    timeoutMs: COMPOSE_TIMEOUT_MS,
     notes:
       '§A.16 metamorphic trim ADDITIVITY (proper compose): trim(a..b)++trim(b..c) decode-equals ' +
-      'trim(a..c). This is the REAL additivity invariant the existing prop_trim_concatenation only ' +
-      'claims — that case runs a SINGLE trim (runner has no concat path) so it degenerates to ' +
-      '"one trim ≈ golden". This case records the proper compose invariant; it needs a runner compose ' +
-      'path (trim a..b, trim b..c, concat, trim a..c, compare) AND an oracle token. The undeclared ' +
-      'trim:compose feature keeps this honest NA(engine) until both exist, never a fabricated pass.',
+      'trim(a..c). The property oracle performs the runner compose path (trim a..b, trim b..c, concat, ' +
+      'trim a..c, compare); engines must declare trim:compose only after that path passes. The compare ' +
+      'uses a tight perceptual SSIM floor because adjacent separately re-encoded trims are not expected ' +
+      'to be byte-identical to one direct re-encode.',
   },
 ];
 
@@ -1133,7 +1148,8 @@ const metamorphicTodoScenarios: Scenario[] = METAMORPHIC_TODO_CASES.map((c) =>
     },
     oracles: ['property-invariant'],
     metrics: ['wall', 'peakMemory'],
-    timeoutMs: FUZZ_TIMEOUT_MS,
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
+    timeoutMs: c.timeoutMs ?? FUZZ_TIMEOUT_MS,
     notes: c.notes,
   }),
 );

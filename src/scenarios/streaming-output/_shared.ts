@@ -95,6 +95,8 @@ export interface OutputShape {
   writeChunkBytes?: number;
   /** fastStart:'reserve' bound — per-track packet ceiling the reserved moov is sized for */
   maximumPacketCount?: number;
+  /** Matroska/WebM append-only live profile: unknown-size Segment, no SeekHead, no Segment Duration. */
+  appendOnly?: boolean;
 }
 
 export interface StreamCase {
@@ -146,6 +148,16 @@ function withMp4LayoutOracle(oracles: OracleId[], shape: OutputShape): OracleId[
   return [...oracles, 'mp4-box-layout'];
 }
 
+function webmLiveLayoutOracleApplies(shape: OutputShape): boolean {
+  const container = shape.container.trim().toLowerCase();
+  return (container === 'webm' || container === 'mkv') && shape.appendOnly === true;
+}
+
+function withWebmLiveLayoutOracle(oracles: OracleId[], shape: OutputShape): OracleId[] {
+  if (!webmLiveLayoutOracleApplies(shape) || oracles.includes('webm-live-layout')) return oracles;
+  return [...oracles, 'webm-live-layout'];
+}
+
 /** Stable id for a streaming-output case. */
 function streamId(c: Pick<StreamCase, 'id'>): string {
   return `streaming-output/${c.id}`;
@@ -159,6 +171,7 @@ function shapeOptions(shape: OutputShape, extra?: Record<string, unknown>): Reco
   if (shape.fastStart !== undefined) o.fastStart = shape.fastStart;
   if (shape.writeChunkBytes !== undefined) o.writeChunkBytes = shape.writeChunkBytes;
   if (shape.maximumPacketCount !== undefined) o.maximumPacketCount = shape.maximumPacketCount;
+  if (shape.appendOnly !== undefined) o.appendOnly = shape.appendOnly;
   return extra ? { ...o, ...extra } : o;
 }
 
@@ -170,7 +183,8 @@ function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined
     shape.fragmented !== undefined ||
     shape.fastStart !== undefined ||
     shape.writeChunkBytes !== undefined ||
-    shape.maximumPacketCount !== undefined;
+    shape.maximumPacketCount !== undefined ||
+    shape.appendOnly !== undefined;
   if (requestsOutputShape && !features.includes(OUTPUT_SHAPE_FEATURE)) {
     features.push(OUTPUT_SHAPE_FEATURE);
   }
@@ -184,7 +198,7 @@ function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined
 export function buildStream(c: StreamCase): Scenario {
   const metrics: MetricId[] = [...STREAM_METRICS, ...(c.extraMetrics ?? [])];
   const features = shapeFeatures(c);
-  const oracles = withMp4LayoutOracle(c.oracles ?? DEFAULT_STREAM_ORACLES, c.shape);
+  const oracles = withWebmLiveLayoutOracle(withMp4LayoutOracle(c.oracles ?? DEFAULT_STREAM_ORACLES, c.shape), c.shape);
   return defineScenario({
     id: streamId(c),
     op: 'remux',
@@ -244,7 +258,7 @@ export interface StreamPropertyCase {
  */
 export function buildStreamProperty(c: StreamPropertyCase): Scenario {
   const features = shapeFeatures(c);
-  const oracles = withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.shape);
+  const oracles = withWebmLiveLayoutOracle(withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.shape), c.shape);
   return defineScenario({
     id: `streaming-output/${c.id}`,
     op: 'remux',

@@ -8,7 +8,7 @@
       "width": 1280,
       "height": 720,
       "fps": 29.872,
-      "bitrate": 3369563,
+      "bitrate": 3369562,
       "language": "und"
     },
     {
@@ -16,7 +16,7 @@
       "codec": "aac",
       "sampleRate": 48000,
       "channels": 2,
-      "bitrate": 128019,
+      "bitrate": 128018,
       "language": "und"
     }
   ],

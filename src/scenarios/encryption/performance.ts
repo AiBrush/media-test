@@ -24,7 +24,7 @@ const decryptThroughput: Scenario = defineScenario({
   id: 'encryption/perf_cenc_ctr_decrypt_throughput',
   op: 'decrypt',
   input: 'cenc_ctr.mp4',
-  options: { scheme: 'cenc-ctr', key: decryptKeyFor('cenc_ctr') },
+  options: { scheme: 'cenc-ctr', key: decryptKeyFor('cenc_ctr'), cleartextAsset: 'cenc_ctr_clear.mp4' },
   requires: {
     operations: ['decrypt'],
     containersIn: ['mp4'],

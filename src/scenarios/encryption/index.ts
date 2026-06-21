@@ -63,6 +63,7 @@ const DECRYPT_CASES: DecryptCase[] = [
     container: 'mp4',
     scheme: 'cenc-ctr',
     keyName: 'cenc_ctr',
+    cleartextAsset: 'cenc_ctr_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['encryption:cenc-ctr-clear-output'],
@@ -72,7 +73,7 @@ const DECRYPT_CASES: DecryptCase[] = [
       'proves it plays. Requires feature encryption:cenc-ctr-clear-output because recognizing CENC ' +
       'track metadata is not enough: the engine must export clear samples as bytes before correctness ' +
       'or throughput is admissible. Key/KID from fixtures/golden/cenc_ctr.mp4.keys.json (the offline ' +
-      'ground truth).',
+      'ground truth); frame goldens come from the independent plaintext fixture cenc_ctr_clear.mp4.',
   },
   {
     id: 'cenc_cbcs_decrypt',
@@ -97,6 +98,7 @@ const DECRYPT_CASES: DecryptCase[] = [
     container: 'hls',
     scheme: 'hls-aes128',
     keyName: 'hls_aes128',
+    cleartextAsset: 'hls_aes128_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     // HLS is segmented; reference-reimport of a playlist-as-one-blob is not well-defined for every
@@ -106,7 +108,8 @@ const DECRYPT_CASES: DecryptCase[] = [
       'HLS AES-128 full-segment CBC decrypt. Key + explicit IV from fixtures/golden/hls_aes128.m3u8.' +
       'keys.json (the playlist #EXT-X-KEY carried an explicit IV, so the EXPLICIT-IV path is exercised; ' +
       'the media-sequence-derived-IV default path is a separate variant a future golden without ivHex ' +
-      'would cover). decrypt-bitexact vs cleartext golden + playback-smoke. Routes NA(engine) for any ' +
+      'would cover). decrypt-bitexact vs the offline MP4 cleartext reference hls_aes128_clear.mp4 + ' +
+      'playback-smoke. Routes NA(engine) for any ' +
       'engine that does not declare hls-aes128 (see index header: mediabunny adapter-vs-dossier note).',
   },
 ];

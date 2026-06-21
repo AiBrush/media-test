@@ -6,7 +6,8 @@
  * CONTINUITY-COUNTER correctness across many tiny writes, nor PAT/PMT repetition for a mid-stream join.
  * And webm_streaming_target covered only the NORMAL (Segment-Duration) WebM — there was no headerless
  * unknown-duration cluster-streaming profile (the §A.16 headerless-MediaRecorder neighbor) whose
- * streamed output must still be playable/parseable without a SeekHead/Cues.
+ * streamed output must still be parseable as an append-only WebM without a SeekHead or Segment
+ * Duration.
  *
  * ── HONEST GATES TODAY ──────────────────────────────────────────────────────────────────────────
  *   - TS cases: reference-reimport (mediabunny reads MPEG_TS, dossier §A.2). If the continuity_counter
@@ -16,10 +17,11 @@
  *     gates that the streamed TS yields a sane duration (TS is estimate-only → loose band in oracles.ts).
  *     NOT gated by playback-smoke (raw TS is not reliably plain-<video>-playable cross-browser).
  *   - Headerless/live WebM: reference-reimport (mediabunny computeDuration reads headerless WebM,
- *     dossier §A.16) + a probe-duration invariant (loose recorder-webm band). NOT playback-smoke (a
- *     headerless/live WebM with no SeekHead/Cues may not play in a plain <video src=blob> → false-FAIL
- *     risk). The genuine MSE-appendability proof (feed the segments through SourceBuffer.appendBuffer)
- *     needs an MSE playback oracle that does not exist in oracles.ts (out of this writer's scope).
+ *     dossier §A.16), a WebM-live layout oracle (unknown-size Segment, no SeekHead, no Segment
+ *     Duration), and a probe-duration invariant (loose recorder-webm band). NOT playback-smoke (a
+ *     live-style WebM may not play in a plain <video src=blob> → false-FAIL risk). The genuine MSE
+ *     appendability proof (feed the segments through SourceBuffer.appendBuffer) needs an MSE playback
+ *     oracle that does not exist in oracles.ts (out of this writer's scope).
  *
  * ── NEEDS NEW MACHINERY (documented, not faked) ─────────────────────────────────────────────────
  *   - 188-byte WRITE-GRANULARITY invariant (§A.16): assert targetWrites is MANY (≈ bytesOut/188) and
@@ -64,16 +66,15 @@ const SHAPE_CASES: StreamCase[] = [
     to: 'webm',
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
-    shape: { container: 'webm', target: 'stream' },
+    shape: { container: 'webm', target: 'stream', appendOnly: true },
     features: ['headerless'],
     // reference-reimport ONLY (a headerless/live WebM may not plain-<video>-play; MSE-appendability
     // proof needs an MSE oracle that does not exist — see file header).
     oracles: ['reference-reimport'],
     notes:
-      'Headerless / "live" Matroska(WebM) streaming output (unknown-duration cluster streaming, no ' +
-      'SeekHead/Cues): the streamed output must still be parseable without seek structures. ' +
-      'reference-reimport (mediabunny computeDuration reads headerless WebM) gates it. (manifest: ' +
-      'recorder_headerless.webm is source:captured, golden pending → clean NA until baked.)',
+      'Headerless / "live" Matroska(WebM) streaming output (append-only unknown-size Segment, no ' +
+      'SeekHead or Segment Duration): the streamed output must still be parseable. reference-reimport ' +
+      'and webm-live-layout gate it.',
   },
 ];
 
@@ -101,12 +102,12 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'webm',
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
-    shape: { container: 'webm', target: 'stream' },
+    shape: { container: 'webm', target: 'stream', appendOnly: true },
     features: ['headerless'],
     notes:
       'probe(remux_headerless_stream(x)).dur≈probe(x).dur: a headerless/live WebM streamed output must ' +
-      'materialize a sane, seekable duration despite no Segment Duration in the source (loose ' +
-      'recorder-webm band in oracles.ts). The duration-side gate for the live profile.',
+      'probe to a sane duration despite having no Segment Duration (loose recorder-webm band in ' +
+      'oracles.ts). The duration-side gate for the live profile.',
   },
 ];
 

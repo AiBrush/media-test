@@ -24,7 +24,13 @@ export interface MediaInput {
 }
 
 /** Bytes produced by an operation (remux/transcode/trim/mux/decrypt). */
-export type MediaBytes = { bytes: Uint8Array; mime: string; container: string };
+export type MediaBytes = {
+  bytes: Uint8Array;
+  mime: string;
+  container: string;
+  /** Multi-rendition operations such as ABR fanout. Includes the primary rendition as variants[0]. */
+  variants?: MediaBytes[];
+};
 
 export type TrackType = 'video' | 'audio' | 'subtitle' | 'other';
 
@@ -92,7 +98,13 @@ export type Operation =
   | 'mux'
   | 'decrypt';
 
-export type EncryptionScheme = 'cenc-ctr' | 'cenc-cbcs' | 'hls-aes128';
+export type EncryptionScheme =
+  | 'cenc-ctr'
+  | 'cenc-cbcs'
+  | 'hls-aes128'
+  | 'clearkey'
+  | 'cenc-cens'
+  | 'hls-sample-aes';
 
 /**
  * What an engine DECLARES it can do. The runner additionally runtime-feature-detects per browser
@@ -204,6 +216,8 @@ export interface MediaEngine {
    */
   prepareMuxTracks?(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks>;
   mux?(tracks: EncodedTracks, opts: MuxOptions): Promise<MediaBytes>;
+  /** Optional composition hook for scenarios that must concatenate already-produced media segments. */
+  concat?(segments: MediaBytes[], opts: MuxOptions): Promise<MediaBytes>;
   decrypt?(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes>;
 }
 

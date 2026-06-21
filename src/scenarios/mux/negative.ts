@@ -68,7 +68,6 @@ const NEGATIVE_CASES: MuxNegativeCase[] = [
     input: 'empty_audio.wav',
     containersIn: ['wav'],
     to: 'mp4',
-    audioCodecs: ['pcm-s16'],
     notes:
       'ZERO-TRACK / EMPTY mux (§A.16 no-tracks / zero-length): empty_audio.wav is a valid WAV with an ' +
       'EMPTY data chunk → its demux yields a track with no samples. Muxing zero/empty EncodedTracks must ' +

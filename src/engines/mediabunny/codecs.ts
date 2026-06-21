@@ -34,6 +34,7 @@ import {
   type InputFormat,
   type OutputFormat,
   type IsobmffOutputFormatOptions,
+  type MkvOutputFormatOptions,
   type VideoCodec,
   type AudioCodec,
 } from 'mediabunny';
@@ -145,6 +146,8 @@ export function inputFormatForContainer(token: string): InputFormat | null {
 export interface OutputFormatOptions {
   /** ISOBMFF fastStart mode (false | 'in-memory' | 'reserve' | 'fragmented'). */
   fastStart?: IsobmffOutputFormatOptions['fastStart'];
+  /** Matroska/WebM append-only live output. */
+  appendOnly?: MkvOutputFormatOptions['appendOnly'];
 }
 
 /**
@@ -155,15 +158,17 @@ export interface OutputFormatOptions {
 export function makeOutputFormat(token: string, opts?: OutputFormatOptions): OutputFormat | null {
   const isobmff: IsobmffOutputFormatOptions | undefined =
     opts?.fastStart !== undefined ? { fastStart: opts.fastStart } : undefined;
+  const matroska: MkvOutputFormatOptions | undefined =
+    opts?.appendOnly !== undefined ? { appendOnly: opts.appendOnly } : undefined;
   switch (token) {
     case 'mp4':
       return new Mp4OutputFormat(isobmff);
     case 'mov':
       return new MovOutputFormat(isobmff);
     case 'mkv':
-      return new MkvOutputFormat();
+      return new MkvOutputFormat(matroska);
     case 'webm':
-      return new WebMOutputFormat();
+      return new WebMOutputFormat(matroska);
     case 'ts':
       return new MpegTsOutputFormat();
     case 'wav':

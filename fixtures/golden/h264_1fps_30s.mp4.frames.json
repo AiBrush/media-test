@@ -1,79 +1,105 @@
 {
   "$todo": "BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer (src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.",
-  "pending": true,
+  "pending": false,
   "assetId": "h264_1fps_30s.mp4",
   "frames": [
     {
       "index": 0,
       "ptsUs": 0,
+      "sha256": "c8619678be9cc878c487d0e1d98d2d797641718ba3a9e0dd49c50708545c76b4",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 1,
       "ptsUs": 1000000,
+      "sha256": "03568a08f305da7ec152fccdca4acdb42506d2502d69281babfc8b39f4df4e62",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 2,
       "ptsUs": 2000000,
+      "sha256": "ed2f495eb93afe30ea00966d2321259ee89fd56e410396b352aab3e4788df88a",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 3,
       "ptsUs": 3000000,
+      "sha256": "010ed1a5b75897577673b871bff9d0fafb7a6c380d3a7e127ef061b496789880",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 4,
       "ptsUs": 4000000,
+      "sha256": "5bec0b7cfd063c1c2bfeecb75cd606780ae0b0b4d87c78b052bbc1855362526c",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 5,
       "ptsUs": 5000000,
+      "sha256": "832a85a088be30183bb2a67bba614f5651bd610843a59a8ce0d8f1a35cb3844c",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 6,
       "ptsUs": 6000000,
+      "sha256": "0be1df95b709fd642d096c08468061168519afdf6feec333499a0bee5fdae93d",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 7,
       "ptsUs": 7000000,
+      "sha256": "455f579890075f4c59226d4c35a5174dd5d827b769829ccbc40584a8f26c231f",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 8,
       "ptsUs": 8000000,
+      "sha256": "24f564eb38c6c1368ba09069bc2dd6d2f506fa7e04b8815a1398bef2c01b7e1f",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 9,
       "ptsUs": 9000000,
+      "sha256": "d3c6a74fef00882062b28d1f6892a6452d7de56dd9d8dbc2de904de9d56393dd",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 10,
       "ptsUs": 10000000,
+      "sha256": "1baf306f79ccabe6318f6de705b112c643ac510fb2c2c975c323334778165c74",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     },
     {
       "index": 11,
       "ptsUs": 11000000,
+      "sha256": "7441e8f2a40f8765b614d1134d82a97f2bda365ab616c1a0926398380e11093d",
       "keyframe": true,
-      "sha256": null
+      "width": 320,
+      "height": 240
     }
-  ]
+  ],
+  "bakedBy": "frame-bake (platform engine) · Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+  "bakedAtIso": "2026-06-21T13:19:29.285Z"
 }

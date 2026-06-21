@@ -331,6 +331,7 @@ interface ThroughputCase {
   /** 'decode' => decodeFrames throughput; 'encode' => transcode-to-PCM throughput */
   kind: 'decode' | 'encode';
   outContainer?: string;
+  features?: string[];
   opts?: Record<string, unknown>;
   oracles: OracleId[];
   primaryMetric: MetricId;
@@ -344,8 +345,9 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s24'],
     kind: 'decode',
+    features: ['decode:audio-pcm'],
     opts: { maxFrames: 4096 },
-    oracles: ['decoded-frames-bitexact'],
+    oracles: ['decoded-audio-pcm'],
     primaryMetric: 'framesPerSec',
     notes: 'A.6 standalone DECODE throughput for 24-bit PCM (samples/s); gated by PCM digest.',
   },
@@ -355,8 +357,9 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     container: 'aiff',
     audioCodecs: ['pcm-s16be'],
     kind: 'decode',
+    features: ['decode:audio-pcm'],
     opts: { maxFrames: 4096 },
-    oracles: ['decoded-frames-bitexact'],
+    oracles: ['decoded-audio-pcm'],
     primaryMetric: 'framesPerSec',
     notes: 'A.6 standalone DECODE throughput for big-endian PCM (samples/s); gated by PCM digest.',
   },
@@ -400,6 +403,7 @@ const throughputScenarios: Scenario[] = THROUGHPUT_CASES.map((c) =>
       containersIn: [c.container],
       ...(c.outContainer ? { containersOut: [c.outContainer] } : {}),
       audioCodecs: [...new Set(c.audioCodecs)],
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles,
     // framesPerSec/decodeFps as the headline; wall+memory for context.
@@ -464,11 +468,12 @@ const containerReadScenarios: Scenario[] = CONTAINER_READ_CASES.map((c) =>
 
 interface EdgeAudioCase {
   id: string;
-  op: 'probe' | 'transcode' | 'decodeFrames';
+  op: 'probe' | 'transcode' | 'decodeFrames' | 'trim';
   asset: string;
   container: string;
   audioCodecs: string[];
   outContainer?: string;
+  features?: string[];
   opts?: Record<string, unknown>;
   oracles: OracleId[];
   timeoutMs?: number;
@@ -502,14 +507,24 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
   },
   {
     id: 'edge_gapless_aac_decode',
-    op: 'decodeFrames',
+    op: 'trim',
     asset: 'gapless_aac.m4a',
     container: 'mp4',
     audioCodecs: ['aac'],
-    opts: { maxFrames: 4096 },
-    oracles: ['decoded-frames-bitexact'],
+    outContainer: 'mp4',
+    features: ['trim:frame-accurate', 'audio-samples:gapless-priming'],
+    opts: {
+      container: 'mp4',
+      frameAccurate: true,
+      invariant: 'gapless-decoded-sample-count-priming-removed',
+      startUs: 0,
+      endUs: 1_012_993,
+    },
+    oracles: ['property-invariant'],
     timeoutMs: LONG_AUDIO_TIMEOUT_MS,
-    notes: 'A.16 gapless: AAC with encoder delay/padding; decoded sample count after priming trim.',
+    notes:
+      'A.16 gapless: AAC with encoder delay/padding; full-range trim is browser-audio-decoded and ' +
+      'the decoded sample count must equal the priming/padding-removed duration.',
   },
   {
     id: 'edge_variable_channel_count_downmix',
@@ -535,6 +550,7 @@ const edgeAudioScenarios: Scenario[] = EDGE_AUDIO_CASES.map((c) =>
       containersIn: [c.container],
       ...(c.outContainer ? { containersOut: [c.outContainer] } : {}),
       audioCodecs: [...new Set(c.audioCodecs)],
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],
@@ -642,9 +658,9 @@ const robustnessAudioScenarios: Scenario[] = ROBUSTNESS_AUDIO_CASES.map((c) =>
 );
 
 // IMAGE NEGATIVE into an audio op (A.16/§7): the corpus has image negatives but no AUDIO op consumed
-// one. Feeding a JPEG into an audio transcode must produce a clean NA (no engine declares 'jpeg' as a
-// container) or a graceful error — never a crash. The pseudo-container 'jpeg' drives the NA; an
-// engine that nonetheless tries must fail gracefully.
+// one. Feeding a JPEG into an audio transcode must reject cleanly. Do not gate this on a fake 'jpeg'
+// container or on WAV/PCM output support: the intent is graceful invalid-input handling, not claiming
+// image/audio conversion capability.
 const imageIntoAudioScenario: Scenario = defineScenario({
   id: 'audio-dsp/negative_image_into_audio_transcode',
   op: 'transcode',
@@ -652,9 +668,6 @@ const imageIntoAudioScenario: Scenario = defineScenario({
   options: { container: 'wav', audio: { codec: 'pcm-s16', channels: 1 } },
   requires: {
     operations: ['transcode'],
-    containersIn: ['jpeg'],
-    containersOut: ['wav'],
-    audioCodecs: ['pcm-s16'],
   },
   oracles: ['graceful-failure'],
   metrics: ['wall'],
@@ -694,8 +707,8 @@ const METAMORPHIC_CASES: MetamorphicCase[] = [
     audioCodecs: ['pcm-s16'],
     // Convert to the SAME 48000Hz/stereo/s16 the source already is: a no-op-ish round-trip whose
     // decoded PCM must equal the source decode (golden is the input-keyed source decode).
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 48000, channels: 2 }, invariant: 'decode-remux' },
-    oracles: ['decoded-frames-bitexact', 'property-invariant'],
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 48000, channels: 2 }, invariant: 'audio-pcm-digest' },
+    oracles: ['property-invariant'],
     notes:
       'A.16 metamorphic: transcode to the identical rate/channels/format is idempotent — decoded PCM == source decode (and duration preserved).',
   },
@@ -708,8 +721,8 @@ const METAMORPHIC_CASES: MetamorphicCase[] = [
     audioCodecs: ['pcm-s16', 'pcm-s16be'],
     // s16le -> s16be -> s16le must reproduce the original bytes exactly. The roundtrip flag asks a
     // capable engine to apply both legs; the decoded PCM of the result must equal the source decode.
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', roundtrip: 'pcm-s16be' }, invariant: 'decode-remux' },
-    oracles: ['decoded-frames-bitexact'],
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', roundtrip: 'pcm-s16be' }, invariant: 'audio-pcm-digest' },
+    oracles: ['property-invariant'],
     notes:
       'A.16 metamorphic: endianness round-trip s16le->s16be->s16le is PCM-bit-exact to the original.',
   },

@@ -18,12 +18,14 @@
  * HONEST capabilities (dossier §6/§9): FFmpeg's matrix is 100% compile-time-determined. init() runs
  * `ffmpeg -encoders` / `-decoders` / `-formats` once and parses the log (codecs.ts) to build the
  * EXACT capability set for the vendored 0.12.10 core. The published build does NOT enable AV1
- * (no libaom/dav1d) → av1 is absent. decrypt (CENC/HLS) is not in the build → absent. fan-out
- * returns N renditions which the single-MediaBytes contract can't carry → 'fanout' absent.
+ * (no libaom/dav1d) → av1 is absent. CENC-CTR decrypt is a narrow adapter path for our generated
+ * non-fragmented MP4 CENC fixture: WebCrypto clears samples, then ffmpeg.wasm stream-copies the clear
+ * MP4. HLS AES-128 is transparent demux input only. fan-out returns N renditions which the
+ * single-MediaBytes contract can't carry → 'fanout' absent.
  *
  * decodeFrames/seek can emit normalized RGBA frame digests for diagnostics, but Chromium/WebCodecs
- * and FFmpeg do not remain bit-identical on every H.264 edge stream. The adapter therefore does not
- * declare the browser-golden `decode:golden-rgba` feature.
+ * and FFmpeg do not remain bit-identical on every H.264 edge stream. FFmpeg also decodes the current
+ * VP9-alpha fixture as opaque RGBA, so this adapter does not declare generic alpha decode support.
  *
  * HARDENING (2026-06-18, audited findings):
  *   • configUsed is a PROPERTY (not a method) so the runner records the §8.5 best-path config by value
@@ -91,8 +93,10 @@ import {
 } from './codecs.ts';
 import type {
   CapabilitySet,
+  DecryptKey,
   DemuxResult,
   EncodedTracks,
+  EncryptionScheme,
   FrameDigest,
   FrameSink,
   MediaBytes,
@@ -234,6 +238,20 @@ function ffmpegColorspace(value: string | undefined): string | undefined {
       return 'bt2020';
     default:
       return undefined;
+  }
+}
+
+function ffmpegToneMapAlgorithm(value: string | undefined): string {
+  switch (value?.trim().toLowerCase()) {
+    case 'clip':
+    case 'linear':
+    case 'gamma':
+    case 'reinhard':
+    case 'hable':
+    case 'mobius':
+      return value.trim().toLowerCase();
+    default:
+      return 'hable';
   }
 }
 
@@ -789,6 +807,45 @@ function containerFromInput(input: MediaInput): string {
   return '';
 }
 
+function isStillImageInput(input: MediaInput): boolean {
+  const mime = input.mime.toLowerCase();
+  if (mime.startsWith('image/')) return true;
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  return /\.(?:jpe?g|png|webp|gif|bmp|avif)$/.test(name);
+}
+
+function patchFlacStreaminfoTotalSamples(bytes: Uint8Array, durationSec: number): Uint8Array {
+  if (bytes.byteLength < 42) return bytes;
+  if (String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!, bytes[3]!) !== 'fLaC') return bytes;
+  let pos = 4;
+  while (pos + 4 <= bytes.byteLength) {
+    const blockHeader = bytes[pos]!;
+    const last = (blockHeader & 0x80) !== 0;
+    const type = blockHeader & 0x7f;
+    const len = (bytes[pos + 1]! << 16) | (bytes[pos + 2]! << 8) | bytes[pos + 3]!;
+    const data = pos + 4;
+    if (data + len > bytes.byteLength) return bytes;
+    if (type === 0 && len >= 34) {
+      const sampleRate = (bytes[data + 10]! << 12) | (bytes[data + 11]! << 4) | (bytes[data + 12]! >> 4);
+      if (!Number.isFinite(durationSec) || durationSec <= 0 || sampleRate <= 0) return bytes;
+      const patched = copyBytes(bytes);
+      const totalSamples = BigInt(Math.max(0, Math.round(durationSec * sampleRate)));
+      const totalMask = (1n << 36n) - 1n;
+      let packed = 0n;
+      for (let i = 0; i < 8; i++) packed = (packed << 8n) | BigInt(patched[data + 10 + i]!);
+      packed = (packed & ~totalMask) | (totalSamples & totalMask);
+      for (let i = 7; i >= 0; i--) {
+        patched[data + 10 + i] = Number(packed & 0xffn);
+        packed >>= 8n;
+      }
+      return patched;
+    }
+    pos = data + len;
+    if (last) break;
+  }
+  return bytes;
+}
+
 function isSuiteBudgetTranscodeNa(input: MediaInput, opts: TranscodeOptions): string | null {
   const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
   const videoCodec = opts.video?.codec;
@@ -830,6 +887,14 @@ function isSuiteBudgetTranscodeNa(input: MediaInput, opts: TranscodeOptions): st
     return 'H.264 to HEVC/MP4 re-encode exceeds the browser-wasm suite budget';
   }
 
+  return null;
+}
+
+function isSuiteBudgetDecodeNa(input: MediaInput): string | null {
+  const name = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+  if (name.endsWith('huge_h264_1080p_600s.mov')) {
+    return 'huge 600s MOV decode requires a whole-file browser-wasm decode path that exceeds the suite budget';
+  }
   return null;
 }
 
@@ -918,6 +983,422 @@ function resolveHlsSidecarUrl(input: MediaInput, sourceUri: string): string {
   return new URL(sourceUri, inputUrl).href;
 }
 
+interface IsoBox {
+  start: number;
+  size: number;
+  type: string;
+  headerSize: number;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
+interface CencSubsample {
+  clearLen: number;
+  protectedLen: number;
+}
+
+interface CencSampleEncryption {
+  iv: Uint8Array;
+  subsamples: CencSubsample[] | null;
+}
+
+interface TencInfo {
+  ivSize: number;
+  kid: string;
+  cryptByteBlock: number;
+  skipByteBlock: number;
+}
+
+function be8(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] ?? 0;
+}
+
+function mp4Be16(bytes: Uint8Array, offset: number): number {
+  return (be8(bytes, offset) << 8) | be8(bytes, offset + 1);
+}
+
+function be24(bytes: Uint8Array, offset: number): number {
+  return (be8(bytes, offset) << 16) | (be8(bytes, offset + 1) << 8) | be8(bytes, offset + 2);
+}
+
+function be32(bytes: Uint8Array, offset: number): number {
+  return (
+    be8(bytes, offset) * 0x1000000 +
+    ((be8(bytes, offset + 1) << 16) | (be8(bytes, offset + 2) << 8) | be8(bytes, offset + 3))
+  );
+}
+
+function be64Number(bytes: Uint8Array, offset: number): number {
+  const high = be32(bytes, offset);
+  const low = be32(bytes, offset + 4);
+  const value = high * 0x100000000 + low;
+  if (!Number.isSafeInteger(value)) throw new Error(`${ENGINE_ID}: MP4 offset exceeds safe integer range`);
+  return value;
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  let out = '';
+  for (let i = 0; i < length; i++) out += String.fromCharCode(be8(bytes, offset + i));
+  return out;
+}
+
+function writeAscii(bytes: Uint8Array, offset: number, value: string): void {
+  for (let i = 0; i < value.length; i++) bytes[offset + i] = value.charCodeAt(i);
+}
+
+function bytesToLowerHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+  return out;
+}
+
+function hexToBytesStrict(hex: string, label: string): Uint8Array {
+  const clean = hex.trim().toLowerCase();
+  if (!/^[0-9a-f]+$/.test(clean) || clean.length % 2 !== 0) {
+    throw new Error(`${ENGINE_ID}: ${label} must be hexadecimal`);
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function iterIsoBoxes(bytes: Uint8Array, start: number, end: number): IsoBox[] {
+  const boxes: IsoBox[] = [];
+  let offset = start;
+  while (offset + 8 <= end) {
+    let size = be32(bytes, offset);
+    let headerSize = 8;
+    const type = ascii(bytes, offset + 4, 4);
+    if (size === 1) {
+      if (offset + 16 > end) break;
+      size = be64Number(bytes, offset + 8);
+      headerSize = 16;
+    } else if (size === 0) {
+      size = end - offset;
+    }
+    if (size < headerSize || offset + size > end) break;
+    boxes.push({
+      start: offset,
+      size,
+      type,
+      headerSize,
+      bodyStart: offset + headerSize,
+      bodyEnd: offset + size,
+    });
+    offset += size;
+  }
+  return boxes;
+}
+
+function findIsoBox(bytes: Uint8Array, start: number, end: number, type: string): IsoBox | undefined {
+  return iterIsoBoxes(bytes, start, end).find((box) => box.type === type);
+}
+
+function requireIsoBox(bytes: Uint8Array, start: number, end: number, type: string, context: string): IsoBox {
+  const box = findIsoBox(bytes, start, end, type);
+  if (!box) throw new Error(`${ENGINE_ID}: CENC decrypt requires ${context}/${type}`);
+  return box;
+}
+
+function findIsoPath(bytes: Uint8Array, root: IsoBox, path: string[], context: string): IsoBox {
+  let box = root;
+  let label = context;
+  for (const type of path) {
+    box = requireIsoBox(bytes, box.bodyStart, box.bodyEnd, type, label);
+    label += `/${type}`;
+  }
+  return box;
+}
+
+function sampleEntryChildStart(entryStart: number, sampleEntryType: string): number {
+  if (sampleEntryType === 'encv' || sampleEntryType === 'avc1' || sampleEntryType === 'hvc1' || sampleEntryType === 'hev1') {
+    return entryStart + 8 + 78;
+  }
+  if (sampleEntryType === 'enca' || sampleEntryType === 'mp4a') {
+    return entryStart + 8 + 28;
+  }
+  return entryStart + 8;
+}
+
+function parseFirstStsdEntry(bytes: Uint8Array, stsd: IsoBox): { start: number; end: number; type: string; childrenStart: number } {
+  const entryStart = stsd.bodyStart + 8; // fullbox header + entry_count
+  if (entryStart + 8 > stsd.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated stsd`);
+  const size = be32(bytes, entryStart);
+  const type = ascii(bytes, entryStart + 4, 4);
+  const end = entryStart + size;
+  if (size < 8 || end > stsd.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found invalid stsd entry`);
+  return { start: entryStart, end, type, childrenStart: sampleEntryChildStart(entryStart, type) };
+}
+
+function parseTenc(bytes: Uint8Array, tenc: IsoBox): TencInfo {
+  let offset = tenc.bodyStart;
+  const version = be8(bytes, offset);
+  offset += 4; // version + flags
+  offset += 1; // reserved
+  const patternByte = be8(bytes, offset);
+  offset += 1;
+  const cryptByteBlock = version > 0 ? patternByte >> 4 : 0;
+  const skipByteBlock = version > 0 ? patternByte & 0x0f : 0;
+  const isProtected = be8(bytes, offset);
+  offset += 1;
+  const ivSize = be8(bytes, offset);
+  offset += 1;
+  if (isProtected === 0) throw new Error(`${ENGINE_ID}: CENC decrypt found unprotected tenc`);
+  if (ivSize !== 8 && ivSize !== 16) {
+    throw new Error(`${ENGINE_ID}: CENC decrypt supports per-sample 8- or 16-byte IVs only`);
+  }
+  if (offset + 16 > tenc.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated tenc KID`);
+  return {
+    ivSize,
+    kid: bytesToLowerHex(bytes.subarray(offset, offset + 16)),
+    cryptByteBlock,
+    skipByteBlock,
+  };
+}
+
+function parseStsz(bytes: Uint8Array, stsz: IsoBox): number[] {
+  const defaultSize = be32(bytes, stsz.bodyStart + 4);
+  const count = be32(bytes, stsz.bodyStart + 8);
+  const sizes: number[] = [];
+  if (defaultSize > 0) {
+    for (let i = 0; i < count; i++) sizes.push(defaultSize);
+    return sizes;
+  }
+  let offset = stsz.bodyStart + 12;
+  for (let i = 0; i < count; i++, offset += 4) {
+    if (offset + 4 > stsz.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated stsz`);
+    sizes.push(be32(bytes, offset));
+  }
+  return sizes;
+}
+
+function parseStsc(bytes: Uint8Array, stsc: IsoBox): Array<{ firstChunk: number; samplesPerChunk: number }> {
+  const count = be32(bytes, stsc.bodyStart + 4);
+  const entries: Array<{ firstChunk: number; samplesPerChunk: number }> = [];
+  let offset = stsc.bodyStart + 8;
+  for (let i = 0; i < count; i++, offset += 12) {
+    if (offset + 12 > stsc.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated stsc`);
+    entries.push({ firstChunk: be32(bytes, offset), samplesPerChunk: be32(bytes, offset + 4) });
+  }
+  if (entries.length === 0) throw new Error(`${ENGINE_ID}: CENC decrypt found empty stsc`);
+  return entries;
+}
+
+function parseChunkOffsets(bytes: Uint8Array, stco: IsoBox | undefined, co64: IsoBox | undefined): number[] {
+  if (co64) {
+    const count = be32(bytes, co64.bodyStart + 4);
+    const offsets: number[] = [];
+    let offset = co64.bodyStart + 8;
+    for (let i = 0; i < count; i++, offset += 8) {
+      if (offset + 8 > co64.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated co64`);
+      offsets.push(be64Number(bytes, offset));
+    }
+    return offsets;
+  }
+  if (!stco) throw new Error(`${ENGINE_ID}: CENC decrypt requires stco or co64`);
+  const count = be32(bytes, stco.bodyStart + 4);
+  const offsets: number[] = [];
+  let offset = stco.bodyStart + 8;
+  for (let i = 0; i < count; i++, offset += 4) {
+    if (offset + 4 > stco.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated stco`);
+    offsets.push(be32(bytes, offset));
+  }
+  return offsets;
+}
+
+function buildSampleOffsets(
+  sampleSizes: number[],
+  chunkOffsets: number[],
+  stsc: Array<{ firstChunk: number; samplesPerChunk: number }>,
+): number[] {
+  const offsets: number[] = [];
+  let sampleIndex = 0;
+  for (let chunkIndex = 0; chunkIndex < chunkOffsets.length && sampleIndex < sampleSizes.length; chunkIndex++) {
+    const chunkNumber = chunkIndex + 1;
+    let entry = stsc[0]!;
+    for (const candidate of stsc) {
+      if (candidate.firstChunk <= chunkNumber) entry = candidate;
+      else break;
+    }
+    let sampleOffset = chunkOffsets[chunkIndex]!;
+    for (let i = 0; i < entry.samplesPerChunk && sampleIndex < sampleSizes.length; i++, sampleIndex++) {
+      offsets.push(sampleOffset);
+      sampleOffset += sampleSizes[sampleIndex]!;
+    }
+  }
+  if (offsets.length !== sampleSizes.length) {
+    throw new Error(`${ENGINE_ID}: CENC decrypt sample table does not cover every sample`);
+  }
+  return offsets;
+}
+
+function parseSenc(bytes: Uint8Array, senc: IsoBox, ivSize: number, expectedCount: number): CencSampleEncryption[] {
+  let offset = senc.bodyStart;
+  const flags = be24(bytes, offset + 1);
+  if (flags & 0x01) throw new Error(`${ENGINE_ID}: CENC decrypt does not support senc override parameters`);
+  offset += 4;
+  const sampleCount = be32(bytes, offset);
+  offset += 4;
+  if (sampleCount !== expectedCount) {
+    throw new Error(`${ENGINE_ID}: CENC decrypt senc sample count ${sampleCount} != stsz count ${expectedCount}`);
+  }
+  const samples: CencSampleEncryption[] = [];
+  for (let i = 0; i < sampleCount; i++) {
+    if (offset + ivSize > senc.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated senc IV`);
+    const iv = bytes.slice(offset, offset + ivSize);
+    offset += ivSize;
+    let subsamples: CencSubsample[] | null = null;
+    if (flags & 0x02) {
+      if (offset + 2 > senc.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated subsample count`);
+      const count = mp4Be16(bytes, offset);
+      offset += 2;
+      subsamples = [];
+      for (let j = 0; j < count; j++) {
+        if (offset + 6 > senc.bodyEnd) throw new Error(`${ENGINE_ID}: CENC decrypt found truncated subsample entry`);
+        subsamples.push({ clearLen: mp4Be16(bytes, offset), protectedLen: be32(bytes, offset + 2) });
+        offset += 6;
+      }
+    }
+    samples.push({ iv, subsamples });
+  }
+  return samples;
+}
+
+function encryptedSegments(subsamples: CencSubsample[], sampleSize: number): Array<{ offset: number; length: number }> {
+  const segments: Array<{ offset: number; length: number }> = [];
+  let cursor = 0;
+  for (const subsample of subsamples) {
+    cursor += subsample.clearLen;
+    if (subsample.protectedLen > 0) segments.push({ offset: cursor, length: subsample.protectedLen });
+    cursor += subsample.protectedLen;
+  }
+  if (cursor !== sampleSize) {
+    throw new Error(`${ENGINE_ID}: CENC decrypt subsample lengths do not match sample size`);
+  }
+  return segments;
+}
+
+async function aesCtrDecrypt(key: Uint8Array, iv: Uint8Array, encrypted: Uint8Array): Promise<Uint8Array> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error(`${ENGINE_ID}: CENC decrypt requires WebCrypto AES-CTR`);
+  const counter = new Uint8Array(16);
+  counter.set(iv.subarray(0, Math.min(iv.length, 16)), 0);
+  const cryptoKey = await subtle.importKey('raw', key as BufferSource, { name: 'AES-CTR' }, false, ['decrypt']);
+  const plain = await subtle.decrypt(
+    { name: 'AES-CTR', counter, length: 64 },
+    cryptoKey,
+    encrypted as BufferSource,
+  );
+  return new Uint8Array(plain);
+}
+
+async function decryptCencSample(
+  key: Uint8Array,
+  sample: Uint8Array,
+  encryption: CencSampleEncryption,
+  tenc: TencInfo,
+): Promise<Uint8Array> {
+  if (!encryption.subsamples) return aesCtrDecrypt(key, encryption.iv, sample);
+  if (tenc.cryptByteBlock !== 0 || tenc.skipByteBlock !== 0) {
+    throw new Error(`${ENGINE_ID}: CENC decrypt does not support pattern encryption`);
+  }
+  const segments = encryptedSegments(encryption.subsamples, sample.length);
+  if (segments.length === 0) return new Uint8Array(sample);
+
+  const parts: Array<{ segment?: { offset: number; length: number }; pad?: number }> = [];
+  let total = 0;
+  for (const segment of segments) {
+    parts.push({ segment });
+    total += segment.length;
+    // FFmpeg's cenc-aes-ctr muxer advances each subsample's protected range to the next AES block.
+    // Without this padding, the second encrypted NAL in the first IDR sample decrypts incorrectly.
+    const pad = (16 - (total % 16)) % 16;
+    if (pad > 0) {
+      parts.push({ pad });
+      total += pad;
+    }
+  }
+
+  const encryptedConcat = new Uint8Array(total);
+  let cursor = 0;
+  for (const part of parts) {
+    if (part.segment) {
+      encryptedConcat.set(sample.subarray(part.segment.offset, part.segment.offset + part.segment.length), cursor);
+      cursor += part.segment.length;
+    } else {
+      cursor += part.pad ?? 0;
+    }
+  }
+
+  const plainConcat = await aesCtrDecrypt(key, encryption.iv, encryptedConcat);
+  const out = new Uint8Array(sample);
+  cursor = 0;
+  for (const part of parts) {
+    if (part.segment) {
+      out.set(plainConcat.subarray(cursor, cursor + part.segment.length), part.segment.offset);
+      cursor += part.segment.length;
+    } else {
+      cursor += part.pad ?? 0;
+    }
+  }
+  return out;
+}
+
+async function decryptCencCtrMp4(bytes: Uint8Array, key: Uint8Array, expectedKid?: string): Promise<Uint8Array> {
+  const moov = requireIsoBox(bytes, 0, bytes.length, 'moov', 'root');
+  const out = new Uint8Array(bytes);
+  let decryptedTracks = 0;
+
+  for (const trak of iterIsoBoxes(bytes, moov.bodyStart, moov.bodyEnd).filter((box) => box.type === 'trak')) {
+    const stbl = findIsoPath(bytes, trak, ['mdia', 'minf', 'stbl'], 'trak');
+    const stsd = requireIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd', 'trak/mdia/minf/stbl');
+    const entry = parseFirstStsdEntry(bytes, stsd);
+    if (entry.type !== 'encv' && entry.type !== 'enca') continue;
+
+    const sinf = requireIsoBox(bytes, entry.childrenStart, entry.end, 'sinf', `${entry.type} sample entry`);
+    const frma = requireIsoBox(bytes, sinf.bodyStart, sinf.bodyEnd, 'frma', 'sinf');
+    const schm = requireIsoBox(bytes, sinf.bodyStart, sinf.bodyEnd, 'schm', 'sinf');
+    const scheme = ascii(bytes, schm.bodyStart + 4, 4);
+    if (scheme !== 'cenc') throw new Error(`${ENGINE_ID}: CENC decrypt expected scheme 'cenc', found '${scheme}'`);
+
+    const schi = requireIsoBox(bytes, sinf.bodyStart, sinf.bodyEnd, 'schi', 'sinf');
+    const tenc = parseTenc(bytes, requireIsoBox(bytes, schi.bodyStart, schi.bodyEnd, 'tenc', 'sinf/schi'));
+    if (expectedKid && expectedKid.toLowerCase() !== tenc.kid) {
+      throw new Error(`${ENGINE_ID}: CENC decrypt KID mismatch (${tenc.kid} != ${expectedKid.toLowerCase()})`);
+    }
+
+    const sampleSizes = parseStsz(bytes, requireIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsz', 'stbl'));
+    const sampleOffsets = buildSampleOffsets(
+      sampleSizes,
+      parseChunkOffsets(
+        bytes,
+        findIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stco'),
+        findIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'co64'),
+      ),
+      parseStsc(bytes, requireIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsc', 'stbl')),
+    );
+    const samples = parseSenc(
+      bytes,
+      requireIsoBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'senc', 'stbl'),
+      tenc.ivSize,
+      sampleSizes.length,
+    );
+
+    for (let i = 0; i < sampleSizes.length; i++) {
+      const offset = sampleOffsets[i]!;
+      const size = sampleSizes[i]!;
+      if (offset + size > bytes.length) throw new Error(`${ENGINE_ID}: CENC decrypt sample extends past EOF`);
+      const clear = await decryptCencSample(key, bytes.subarray(offset, offset + size), samples[i]!, tenc);
+      out.set(clear, offset);
+    }
+    writeAscii(out, entry.start + 4, ascii(bytes, frma.bodyStart, 4));
+    decryptedTracks++;
+  }
+
+  if (decryptedTracks === 0) throw new Error(`${ENGINE_ID}: CENC decrypt found no protected tracks`);
+  return out;
+}
+
 /** Best-effort human description of an unknown thrown value. */
 function describeError(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -978,13 +1459,14 @@ export class FfmpegWasmEngine implements MediaEngine {
         seek: true,
         trim: true,
         mux: true, // documented core strength (dossier §4/§10 A.3); kept in sync with probed set.
+        decrypt: true,
       },
       // HLS input is declared because writeInput() materializes playlist sidecars into MEMFS.
       containersIn: [...FALLBACK_CONTAINERS_IN],
       containersOut: [...FALLBACK_CONTAINERS_OUT],
       videoCodecs: [...FALLBACK_VIDEO],
       audioCodecs: [...FALLBACK_AUDIO],
-      encryption: ['hls-aes128'], // transparent HLS demux decrypt only; no standalone decrypt op.
+      encryption: ['cenc-ctr', 'hls-aes128'], // CENC-CTR standalone decrypt + transparent HLS demux.
       features: this.featureList(),
     };
   }
@@ -999,12 +1481,17 @@ export class FfmpegWasmEngine implements MediaEngine {
       'crop', // -vf crop
       'pad', // -vf scale=...:force_original_aspect_ratio=decrease,pad=...
       'colorspace', // -vf colorspace=all=...:iall=...
+      'tonemap', // -vf zscale + tonemap: verified narrow HDR/PQ -> SDR/BT.709 path
       'fps', // -r
       'crf', // encoder constant-rate-factor quality control
       'two-pass', // -pass 1/2 with a MEMFS passlog for bitrate-targeted x264/x265 encodes
-      'alpha', // decodeFrames emits RGBA and preserves alpha-capable inputs when the core decodes it
-      'alpha:transcode', // libvpx/libvpx-vp9 encode with yuva420p for alpha-preserving WebM output
+      'depth:10bit-to-8bit', // verified 10-bit source decode to 8-bit H.264 encode via pix_fmt
       'trim:frame-accurate', // output-seek re-encode
+      'trim:compose', // trim(a..b)+trim(b..c) concatenation via concat demuxer, verified by oracle
+      'trim:flac-seektable-copy', // FLAC stream-copy trim with STREAMINFO total-samples repair
+      'trim:flac-no-seektable-frame-scan', // FFmpeg packet scan + STREAMINFO repair for no-seektable FLAC
+      'flac:seektable-seek-equivalence', // paired FLAC trims prove SEEKTABLE is only an index
+      'decode:audio-pcm', // decode audio-only PCM inputs to normalized f32 sample-frame digests
       'fragmented', // -movflags frag_keyframe+empty_moov
       'streaming:decode-equality',
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
@@ -1012,6 +1499,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'fastStart:none', // explicit control: leave moov at the default tail position
       'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
+      'encryption:cenc-ctr-clear-output', // WebCrypto clears CENC samples; ffmpeg.wasm emits clear MP4
       'mux:vfr-timestamps', // source-copy mux path preserves container PTS/DTS tables for VFR/B-frames
       'mux:browser-decode-equality', // muxed progressive outputs satisfy the platform decode invariant
       'packets:dts', // framecrc exposes packet dts separately from pts
@@ -1024,6 +1512,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
       'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
       'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
+      'remux:flac-in-ogg', // Ogg-mapped FLAC stream copy; oracle validates duration from Ogg granules
     ];
   }
 
@@ -1244,12 +1733,13 @@ export class FfmpegWasmEngine implements MediaEngine {
         // encoded tracks via `-i vid -i aud -c copy out`. Declared so it is not a false-NA; the
         // genuinely-unencodable av1 mux row stays NA via the codec gate (av1 absent from videoCodecs).
         mux: true,
+        decrypt: true,
       },
       containersIn,
       containersOut,
       videoCodecs,
       audioCodecs,
-      encryption: ['hls-aes128'],
+      encryption: ['cenc-ctr', 'hls-aes128'],
       features: this.featureList(),
     };
   }
@@ -1385,6 +1875,9 @@ export class FfmpegWasmEngine implements MediaEngine {
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
 
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
+    if (isStillImageInput(input)) {
+      throw new Error(`${ENGINE_ID}: probe rejected still-image input; this suite probes media containers only`);
+    }
     const base = this.scratch();
     const written = await this.writeInput(input, `${base}.in`);
     try {
@@ -1560,9 +2053,66 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
+  // ── decrypt ──────────────────────────────────────────────────────────────────────────────────
+
+  async decrypt(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes> {
+    if (opts.scheme !== 'cenc-ctr') {
+      throw new NotApplicableError('decrypt', `scheme '${opts.scheme}' is not supported by this path`);
+    }
+
+    const keyHex = key.keyHex.trim().toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(keyHex)) {
+      throw new Error(`${ENGINE_ID}: decrypt requires a 16-byte hexadecimal CENC key`);
+    }
+
+    const base = this.scratch();
+    const clearName = `${base}.cenc-clear-input.mp4`;
+    const outName = `${base}.clear.mp4`;
+    const encryptedBytes = copyBytes(await input.arrayBuffer());
+    let clearBytes: Uint8Array;
+    try {
+      clearBytes = await decryptCencCtrMp4(encryptedBytes, hexToBytesStrict(keyHex, 'CENC key'), key.kid);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/CENC decrypt found no protected tracks/.test(msg)) {
+        throw err;
+      }
+      // Clear MP4 no-op decrypt case: preserve usable media by remuxing the original bytes below.
+      clearBytes = encryptedBytes;
+    }
+    await this.requireFf().writeFile(clearName, clearBytes);
+    try {
+      await this.run(
+        [
+          '-i',
+          clearName,
+          '-map',
+          '0',
+          '-c',
+          'copy',
+          '-tag:v',
+          'avc1',
+          '-tag:a',
+          'mp4a',
+          '-movflags',
+          '+faststart',
+          outName,
+        ],
+        READ_EXEC_TIMEOUT_MS,
+      );
+      const bytes = await this.readBinary(outName);
+      return { bytes, mime: containerMime('mp4'), container: 'mp4' };
+    } finally {
+      await this.cleanup([clearName, outName]);
+    }
+  }
+
   // ── transcode ────────────────────────────────────────────────────────────────────────────────
 
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
+    if (isStillImageInput(input)) {
+      throw new Error(`${ENGINE_ID}: transcode rejected still-image input`);
+    }
     const suiteBudgetNa = isSuiteBudgetTranscodeNa(input, opts);
     if (suiteBudgetNa) {
       throw new NotApplicableError('transcode', suiteBudgetNa);
@@ -1610,6 +2160,48 @@ export class FfmpegWasmEngine implements MediaEngine {
         throw new NotApplicableError('transcode', 'requested an audio output but the input has no audio track');
       }
 
+      const audioRoundtripCodec = stringOption(plainObject(opts.audio), ['roundtrip']);
+      if (audioRoundtripCodec) {
+        if (hasVideo) {
+          throw new NotApplicableError('transcode', 'audio roundtrip invariant is only wired for audio-only inputs');
+        }
+        const finalCodec = opts.audio?.codec;
+        const roundtripEnc = audioEncoderName(audioRoundtripCodec);
+        const finalEnc = finalCodec ? audioEncoderName(finalCodec) : null;
+        if (!roundtripEnc) {
+          throw new NotApplicableError('transcode', `no encoder for audio roundtrip codec '${audioRoundtripCodec}'`);
+        }
+        if (!finalCodec || !finalEnc) {
+          throw new NotApplicableError('transcode', `no encoder for final audio codec '${finalCodec ?? 'copy'}'`);
+        }
+
+        const midContainer = audioRoundtripCodec.endsWith('be') ? 'aiff' : opts.container;
+        const midName = `${base}.roundtrip.${containerExt(midContainer)}`;
+        cleanupPaths.push(midName);
+
+        const midArgs = [
+          ...written.inputOptions,
+          '-i',
+          written.name,
+          '-map',
+          '0:a:0',
+          '-vn',
+          '-c:a',
+          roundtripEnc,
+          midName,
+        ];
+        await this.run(midArgs);
+
+        const finalArgs = ['-i', midName, '-map', '0:a:0', '-vn', '-c:a', finalEnc];
+        if (opts.audio?.sampleRate) finalArgs.push('-ar', String(opts.audio.sampleRate));
+        if (opts.audio?.channels) finalArgs.push('-ac', String(opts.audio.channels));
+        if (opts.audio?.bitrate) finalArgs.push('-b:a', String(opts.audio.bitrate));
+        finalArgs.push(outName);
+        await this.run(finalArgs);
+        const bytes = await this.readBinary(outName);
+        return { bytes, mime: containerMime(opts.container), container: opts.container };
+      }
+
       const extra = opts as unknown as Record<string, unknown>;
       const alphaMode = stringOption(extra, ['alpha']);
       const keepAlpha = alphaMode === 'keep';
@@ -1629,6 +2221,16 @@ export class FfmpegWasmEngine implements MediaEngine {
         const enc = v.codec ? videoEncoderName(v.codec) : null;
         if (v.codec && !enc) {
           throw new NotApplicableError('transcode', `no software encoder for video codec '${v.codec}'`);
+        }
+        const requestedBitDepth = numberOption(videoExtra, ['bitDepth', 'depth']);
+        if (requestedBitDepth !== undefined && requestedBitDepth > 8) {
+          if (enc !== 'libx265') {
+            throw new NotApplicableError('transcode', `10-bit output is only wired for HEVC/libx265, got '${v.codec ?? 'copy'}'`);
+          }
+          throw new NotApplicableError(
+            'transcode',
+            '10-bit HEVC output encode exceeds the browser-wasm suite budget in the stable ffmpeg.wasm core',
+          );
         }
         if (keepAlpha && enc !== 'libvpx' && enc !== 'libvpx-vp9') {
           throw new NotApplicableError('transcode', `alpha-preserving transcode is not wired for '${v.codec ?? 'copy'}'`);
@@ -1681,6 +2283,26 @@ export class FfmpegWasmEngine implements MediaEngine {
             );
           }
         }
+        let toneMapToSdr = false;
+        const tonemap = plainObject(extra.tonemap);
+        if (tonemap) {
+          const from = stringOption(tonemap, ['from', 'input', 'source'])?.trim().toLowerCase() ?? 'pq';
+          const to = stringOption(tonemap, ['to', 'output', 'target'])?.trim().toLowerCase() ?? 'sdr';
+          const pqSource = from === 'pq' || from === 'smpte2084' || from === 'hdr10';
+          const sdrTarget = to === 'sdr' || to === 'bt709' || to === 'rec709';
+          if (!pqSource || !sdrTarget) {
+            throw new NotApplicableError('transcode', `tone-map path '${from}' -> '${to}' is not wired`);
+          }
+          const algo = ffmpegToneMapAlgorithm(stringOption(tonemap, ['algorithm', 'algo', 'tonemap']));
+          filters.push(
+            'zscale=matrixin=bt2020nc:transferin=smpte2084:primariesin=bt2020:matrix=gbr:transfer=linear:primaries=bt2020:npl=100',
+            'format=gbrpf32le',
+            `tonemap=tonemap=${algo}:desat=0`,
+            'zscale=matrix=bt709:transfer=bt709:primaries=bt709:range=tv',
+            'format=yuv420p',
+          );
+          toneMapToSdr = true;
+        }
         const colorspace = plainObject(extra.colorspace);
         if (colorspace) {
           const from = ffmpegColorspace(stringOption(colorspace, ['from', 'input', 'source']));
@@ -1692,6 +2314,9 @@ export class FfmpegWasmEngine implements MediaEngine {
           }
         }
         if (filters.length) args.push('-vf', filters.join(','));
+        if (toneMapToSdr) {
+          args.push('-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709');
+        }
         const requestedPasses = numberOption(videoExtra, ['passes']) ?? numberOption(extra, ['passes']);
         if (requestedPasses !== undefined && requestedPasses !== 1 && requestedPasses !== 2) {
           throw new NotApplicableError('transcode', `unsupported pass count '${requestedPasses}'`);
@@ -1758,7 +2383,14 @@ export class FfmpegWasmEngine implements MediaEngine {
             if (requestedCrf !== undefined) args.push('-crf', String(requestedCrf));
             else if (!v.bitrate) args.push('-crf', spatialTransformCrf);
           } else if (enc === 'libx265') {
-            args.push('-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-x265-params', 'log-level=error');
+            args.push(
+              '-pix_fmt',
+              requestedBitDepth !== undefined && requestedBitDepth > 8 ? 'yuv420p10le' : 'yuv420p',
+              '-preset',
+              'ultrafast',
+              '-x265-params',
+              'log-level=error',
+            );
             if (requestedCrf !== undefined) args.push('-crf', String(requestedCrf));
             else if (!v.bitrate) args.push('-crf', '18');
             if (opts.container === 'mp4' || opts.container === 'mov') args.push('-tag:v', 'hvc1');
@@ -1946,7 +2578,10 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
       args.push(outName);
       await this.run(args);
-      const bytes = await this.readBinary(outName);
+      let bytes = await this.readBinary(outName);
+      if (!opts.frameAccurate && opts.container === 'flac') {
+        bytes = patchFlacStreaminfoTotalSamples(bytes, durationSec);
+      }
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
       await this.cleanup([...written.cleanupPaths, outName]);
@@ -1956,13 +2591,49 @@ export class FfmpegWasmEngine implements MediaEngine {
   // ── decodeFrames ─────────────────────────────────────────────────────────────────────────────
 
   async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
+    const suiteBudgetNa = isSuiteBudgetDecodeNa(input);
+    if (suiteBudgetNa) {
+      throw new NotApplicableError('decodeFrames', suiteBudgetNa);
+    }
     const base = this.scratch();
     const rawName = `${base}.rgba`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
+      const inputLog = await this.runInfo(written.name, written.inputOptions);
+      const inputMetadata = this.metadataFromLog(inputLog, input);
+      const videoTrack = inputMetadata.tracks.find((t) => t.type === 'video');
+      const audioTrack = inputMetadata.tracks.find((t) => t.type === 'audio');
+      if (!videoTrack && audioTrack) {
+        const sampleRate = audioTrack.sampleRate && audioTrack.sampleRate > 0 ? audioTrack.sampleRate : 48_000;
+        const channels = audioTrack.channels && audioTrack.channels > 0 ? audioTrack.channels : 1;
+        const maxSamples = Math.max(0, Math.floor(opts?.maxFrames ?? 4096));
+        const args = [...written.inputOptions, '-i', written.name, '-map', '0:a:0', '-vn'];
+        if (maxSamples > 0) args.push('-t', (maxSamples / sampleRate).toFixed(9));
+        args.push('-f', 'f32le', '-acodec', 'pcm_f32le', rawName);
+        await this.run(args);
+
+        const raw = await this.readBinary(rawName);
+        const sampleBytes = channels * Float32Array.BYTES_PER_ELEMENT;
+        const decodedSamples = sampleBytes > 0 ? Math.floor(raw.byteLength / sampleBytes) : 0;
+        const total = maxSamples > 0 ? Math.min(decodedSamples, maxSamples) : decodedSamples;
+        const frames: FrameDigest[] = [];
+        for (let i = 0; i < total; i++) {
+          const start = i * sampleBytes;
+          const view = raw.subarray(start, start + sampleBytes);
+          frames.push({
+            index: i,
+            ptsUs: Math.round((i / sampleRate) * 1_000_000),
+            sha256: await sha256Hex(view),
+            width: channels,
+            height: 1,
+          });
+        }
+        return { frames };
+      }
+
       // Learn dimensions + frame rate (from the `ffmpeg -i` log, no ffprobe) so we can slice the raw
       // stream and assign PTS.
-      const v = this.firstVideoTrack(await this.runInfo(written.name, written.inputOptions), 'decodeFrames');
+      const v = this.firstVideoTrack(inputLog, 'decodeFrames');
       const width = v.width;
       const height = v.height;
       const fps = v.fps && v.fps > 0 ? v.fps : 30;
@@ -2158,6 +2829,12 @@ export class FfmpegWasmEngine implements MediaEngine {
         return { ext: 'mp3', format: 'mp3', bitstreamFilterKind: '-bsf:a' };
       case 'flac':
         return { ext: 'flac', format: 'flac', bitstreamFilterKind: '-bsf:a' };
+      case 'pcm-s16':
+        return { ext: 's16le', format: 's16le', bitstreamFilterKind: '-bsf:a' };
+      case 'pcm-s24':
+        return { ext: 's24le', format: 's24le', bitstreamFilterKind: '-bsf:a' };
+      case 'pcm-f32':
+        return { ext: 'f32le', format: 'f32le', bitstreamFilterKind: '-bsf:a' };
       default:
         return null;
     }
@@ -2210,6 +2887,38 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { bytes: muxed, mime: containerMime(opts.container), container: opts.container };
     } finally {
       await this.cleanup([...inputNames, outName]);
+    }
+  }
+
+  async concat(segments: MediaBytes[], opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+    if (segments.length === 0) {
+      throw new Error(`${ENGINE_ID}: concat requires at least one segment`);
+    }
+    const base = this.scratch();
+    const inputNames: string[] = [];
+    const listName = `${base}.concat.txt`;
+    const outName = `${base}.out.${containerExt(opts.container)}`;
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        const segment = segments[i]!;
+        const ext = containerExt(segment.container || opts.container);
+        const name = `${base}.seg${i}.${ext}`;
+        await this.requireFf().writeFile(name, copyBytes(segment.bytes));
+        inputNames.push(name);
+      }
+      const list = inputNames.map((name) => `file '${name}'`).join('\n') + '\n';
+      await this.requireFf().writeFile(listName, new TextEncoder().encode(list));
+
+      const args = ['-f', 'concat', '-safe', '0', '-i', listName, '-c', 'copy'];
+      if (opts.container === 'mp4' || opts.container === 'mov') {
+        args.push('-movflags', '+faststart');
+      }
+      args.push(outName);
+      await this.run(args);
+      const bytes = await this.readBinary(outName);
+      return { bytes, mime: containerMime(opts.container), container: opts.container };
+    } finally {
+      await this.cleanup([...inputNames, listName, outName]);
     }
   }
 

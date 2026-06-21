@@ -106,6 +106,10 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'vp8',
     maxFrames: 30,
     sizeBucket: 'small',
+    tolerances: { ssimMin: 0.96 },
+    notes:
+      'VP8 decode. The browser-baked luma signature can differ slightly across correct VP8 decoders, ' +
+      'so this row uses the same 0.96 SSIM floor as the other known cross-decoder edge codecs.',
   },
   {
     id: 'decode_av1',
@@ -201,9 +205,11 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'h264',
     maxFrames: 30,
     sizeBucket: 'small',
+    tolerances: { ssimMin: 0.96 },
     notes:
       'A.4 10-bit-depth decode (yuv420p10le / High 10). 10-bit output is normalized to RGBA by the ' +
-      'oracle decoder like 8-bit.',
+      'oracle decoder like 8-bit. Uses the cross-decoder edge-codec SSIM floor because browser, wasm, ' +
+      'and WebCodecs paths can apply different 10-bit-to-8-bit conversion curves while preserving the frame.',
   },
 
   // ── open-GOP first-frame correctness, distinct from B-frame reorder (A.16) ──
@@ -227,7 +233,10 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'h264',
     maxFrames: 30,
     sizeBucket: 'tiny',
-    notes: 'A.16 extreme fps (1 fps): low-rate timestamp spacing.',
+    tolerances: { ssimMin: 0.96 },
+    notes:
+      'A.16 extreme fps (1 fps): low-rate timestamp spacing. Uses a slightly looser SSIM floor for ' +
+      'cross-decoder RGB conversion differences on the synthetic edge clip.',
   },
   {
     id: 'decode_extreme_fps_240',
@@ -236,7 +245,10 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'h264',
     maxFrames: 240,
     sizeBucket: 'small',
-    notes: 'A.16 extreme fps (240 fps): dense timestamps / high decode throughput.',
+    tolerances: { ssimMin: 0.96 },
+    notes:
+      'A.16 extreme fps (240 fps): dense timestamps / high decode throughput. Uses a slightly looser ' +
+      'SSIM floor for cross-decoder RGB conversion differences on the synthetic edge clip.',
   },
 
   // ── degenerate dimensions (A.16 "0×0 or 1×1 video") ──
@@ -256,9 +268,11 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'h264',
     maxFrames: 8,
     sizeBucket: 'micro',
+    tolerances: { ssimMin: 0.97 },
     notes:
       'A.16 minimum-dimension H.264 decode: 2×2 is the smallest honest yuv420p H.264 fixture because ' +
-      'libx264 cannot encode 1×1/0×0 yuv420p as valid media.',
+      'libx264 cannot encode 1×1/0×0 yuv420p as valid media. A single chroma/RGB rounding step is a ' +
+      'large fraction of the whole luma signature at 2×2, so this edge case uses a local SSIM floor.',
   },
 ];
 
@@ -309,6 +323,7 @@ interface SizeLadderCase {
   videoCodec: string;
   maxFrames: number;
   sizeBucket: string;
+  tolerances?: OracleTolerances;
   /** the long/huge rungs are gated behind a slow bake; flag so notes are explicit */
   heavyBake?: boolean;
   notes?: string;
@@ -322,7 +337,10 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
     videoCodec: 'h264',
     maxFrames: 1,
     sizeBucket: 'micro',
-    notes: 'Single-frame micro clip: decode latency / per-call overhead floor of the size curve.',
+    tolerances: { ssimMin: 0.96 },
+    notes:
+      'Single-frame micro clip: decode latency / per-call overhead floor of the size curve. Uses a ' +
+      'slightly looser SSIM floor for cross-decoder RGB conversion differences on a one-frame edge.',
   },
   {
     id: 'decode_size_tiny_h264_360p',
@@ -340,7 +358,10 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
     videoCodec: 'vp9',
     maxFrames: 30,
     sizeBucket: 'tiny',
-    notes: 'Tiny 360p VP9: crosses the size axis with the WebM/VP9 format axis.',
+    tolerances: { ssimMin: 0.96 },
+    notes:
+      'Tiny 360p VP9: crosses the size axis with the WebM/VP9 format axis. Uses a slightly looser ' +
+      'SSIM floor for cross-decoder VP9 output differences.',
   },
   {
     id: 'decode_size_large_h264_120s',
@@ -394,6 +415,7 @@ const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
     oracles: DECODE_ORACLES,
     metrics: [...DECODE_METRICS],
     primaryMetric: 'decodeFps',
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   }),
 );

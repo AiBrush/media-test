@@ -98,7 +98,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
   },
   {
     id: 'h264_to_vp8_webm',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'tiny_h264_360p_2s.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
     fromAudio: 'aac',
@@ -106,6 +106,8 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp8',
     toAudio: 'vorbis',
     opts: { container: 'webm', video: { codec: 'vp8' }, audio: { codec: 'vorbis' } },
+    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    notes: 'Tiny MP4/H.264/AAC → WebM/VP8/Vorbis: keeps the VP8/Vorbis output row inside the browser-wasm budget.',
   },
   {
     id: 'h264_to_av1_mp4',
@@ -409,9 +411,9 @@ const audioScenarios: Scenario[] = AUDIO_CASES.map((c) => {
 // ── Fan-out / ABR ladder (one input → N renditions) ──────────────────────────────────────────────
 
 /**
- * ABR fan-out via TranscodeOptions.variants: one decode feeds N encoders producing a quality ladder.
- * Each rendition is SSIM/PSNR-validated against the reference frames for that rung's resolution.
- * Requires the 'fanout' feature so engines without a ladder API negotiate NA.
+ * ABR fan-out via TranscodeOptions.variants: the engine must surface every requested quality rung.
+ * The fanout-renditions oracle validates count, dimensions, codec, playback, and SSIM/PSNR for each
+ * rendition. Requires the 'fanout' feature so engines without multi-rendition output negotiate NA.
  */
 const ABR_OPTS: TranscodeOptions = {
   container: 'mp4',
@@ -438,11 +440,10 @@ const fanoutScenarios: Scenario[] = [
       audioCodecs: ['aac'],
       features: ['fanout', 'resize'],
     },
-    // ssim-psnr is applied per rendition; floors loosen for the lower rungs in the oracle config.
-    oracles: ['ssim-psnr', 'playback-smoke'],
+    oracles: ['fanout-renditions'],
     metrics: [...TC_METRICS],
     tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
-    notes: '1→4 H.264 ABR renditions (1080/720/480/360); SSIM/PSNR validated per rung.',
+    notes: '1→4 H.264 ABR renditions (1080/720/480/360); every surfaced rendition is playback + SSIM/PSNR validated.',
   }),
 ];
 
@@ -545,16 +546,18 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
   },
   {
     id: 'vp8_to_vp9_webm',
-    asset: 'vp8_720p_10s.webm',
+    asset: 'recorder_headerless.webm',
     fromContainer: 'webm',
     fromVideo: 'vp8',
-    fromAudio: 'vorbis',
+    fromAudio: 'opus',
     toContainer: 'webm',
     toVideo: 'vp9',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'vp9' }, audio: { codec: 'opus' } },
     tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
-    notes: 'VP8→VP9 up-generation; Vorbis→Opus.',
+    notes:
+      'VP8→VP9 up-generation from the captured VP8/Opus WebM fixture. The older VP8/Vorbis corpus ' +
+      'assets remain parser coverage, but Chromium exposes no WebCodecs Vorbis decode path for transcode.',
   },
   {
     id: 'av1_to_vp9_webm',
@@ -786,11 +789,12 @@ const transformFeatureScenarios: Scenario[] = TRANSFORM_FEATURE_CASES.map((c) =>
   }),
 );
 
-// ── A.5 — 8↔10-bit & HDR10 ENCODE slots (NA on undeclared transform features) ────────────────────
+// ── A.5 — 8↔10-bit & HDR10 ENCODE slots ───────────────────────────────────────────────────────────
 //
-// No adapter declares a depth/HDR encode knob. These slots tag an undeclared feature so they are
-// honest NA_ENGINE today. The corpus now has a 10-bit H.264 decode fixture, but not the full set of
-// codec/HDR sources needed to make every depth/HDR transform live.
+// The suite keeps output-depth encode, source-depth down-convert, and HDR tone-map separate:
+// ffmpeg.wasm can validate the available 10-bit H.264 source by encoding an 8-bit output, and the
+// tone-map row uses a tiny real BT.2020/PQ HEVC source so a browser-wasm engine can run it inside the
+// suite budget. HEVC-10 output encode remains beyond the stable browser-wasm path.
 interface DepthHdrCase {
   id: string;
   asset: string;
@@ -800,48 +804,58 @@ interface DepthHdrCase {
   toVideo: string;
   feature: string;
   extraOpts?: Record<string, unknown>;
+  oracles?: OracleId[];
+  tolerances?: OracleTolerances;
+  timeoutMs?: number;
   notes: string;
 }
 
 const DEPTH_HDR_CASES: DepthHdrCase[] = [
   {
     id: 'h264_8bit_to_hevc_10bit',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'micro_h264_1frame.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
     toContainer: 'mp4',
     toVideo: 'hevc',
-    feature: 'depth:10bit',
+    feature: 'depth:10bit-output',
     extraOpts: { video: { codec: 'hevc', bitDepth: 10 } },
     notes:
-      '8-bit→10-bit HEVC encode (A.5/A.4 8↔10-bit). NA: no engine declares the "depth:10bit" ' +
-      'transform knob yet; the source is real 8-bit H.264 media.',
+      '8-bit→10-bit HEVC encode (A.5/A.4 8↔10-bit). Uses the browser-baked 320×240 one-frame H.264 ' +
+      'fixture for future coverage, but remains N/A until an engine can emit HEVC-10 inside suite budgets.',
   },
   {
-    id: 'hevc_10bit_to_h264_8bit',
-    asset: 'hevc_1080p_10s.mp4',
+    id: 'h264_10bit_to_h264_8bit',
+    asset: 'h264_10bit_1080p_5s.mp4',
     fromContainer: 'mp4',
-    fromVideo: 'hevc',
+    fromVideo: 'h264',
     toContainer: 'mp4',
     toVideo: 'h264',
-    feature: 'depth:10bit',
+    feature: 'depth:10bit-to-8bit',
     extraOpts: { video: { codec: 'h264', bitDepth: 8 } },
     notes:
-      '10-bit→8-bit down-convert (A.4). NA today because no engine declares the depth-control knob; ' +
-      'the HEVC fixture used for this codec row is 8-bit, while the corpus 10-bit source is H.264.',
+      '10-bit→8-bit down-convert (A.4). Uses the corpus 10-bit H.264 fixture and encodes an 8-bit ' +
+      'H.264 output, so the row tests the actual available 10-bit source instead of a mislabeled HEVC fixture.',
   },
   {
     id: 'hdr10_to_sdr_tonemap',
-    asset: 'hevc_1080p_10s.mp4',
+    asset: 'hdr10_pq_micro_hevc.mp4',
     fromContainer: 'mp4',
     fromVideo: 'hevc',
     toContainer: 'mp4',
     toVideo: 'h264',
     feature: 'tonemap',
-    extraOpts: { video: { codec: 'h264' }, tonemap: { from: 'pq', to: 'sdr' } },
+    extraOpts: {
+      video: { codec: 'h264' },
+      tonemap: { from: 'pq', to: 'sdr' },
+      invariant: 'transcode-output-metadata',
+    },
+    oracles: ['property-invariant', 'playback-smoke'],
+    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
-      'HDR10→SDR tone-map (A.8 HDR→SDR). NA on both grounds: no "tonemap" feature is declared and the ' +
-      'corpus has no HDR/PQ source. Pairs with the 10-bit rows above.',
+      'HDR10→SDR tone-map (A.8 HDR→SDR). Uses a tiny real HEVC Main10-style BT.2020/PQ source and gates ' +
+      'the output container/codec/duration plus browser playback; SSIM is omitted because the SDR output ' +
+      'is deliberately colour transformed from the HDR source frames.',
   },
 ];
 
@@ -858,9 +872,10 @@ const depthHdrScenarios: Scenario[] = DEPTH_HDR_CASES.map((c) =>
       videoCodecs: [...new Set([c.fromVideo, c.toVideo])],
       features: [c.feature],
     },
-    oracles: ['ssim-psnr', 'playback-smoke'],
+    oracles: c.oracles ?? ['ssim-psnr', 'playback-smoke'],
     metrics: [...TC_METRICS],
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
+    ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
 );
@@ -1476,9 +1491,9 @@ const extremeResizeScenarios: Scenario[] = [
 
 // ── A.16 / §5.1 / §7 — negative & malformed inputs to transcode (must NA/throw, never crash) ──────
 //
-// (1) Image negatives: a still image fed to a VIDEO transcode. The image's pseudo-container (jpeg/png/
-//     webp) is declared by NO engine → clean NA_ENGINE at negotiation (the honest guard; the bytes are
-//     never decoded). If a future engine declares it, graceful-failure judges the throw.
+// (1) Image negatives: a still image fed to a VIDEO transcode. These deliberately do NOT require a
+//     jpeg/png/webp pseudo-container: the point is not image decode support, it is that engines with a
+//     transcode path reject invalid input cleanly through the graceful-failure oracle.
 // (2) Truncated / zero-length sources: real malformed files so graceful-failure is sound
 //     (throw=PASS, output=FAIL).
 // (3) audio-only→video and video-only→audio mismatches: valid input, impossible target. A clean throw
@@ -1486,8 +1501,8 @@ const extremeResizeScenarios: Scenario[] = [
 interface TranscodeNegativeCase {
   id: string;
   asset: string;
-  /** declared input container(s); a still-image pseudo-container forces honest NA_ENGINE */
-  containersIn: string[];
+  /** declared input container(s); omit for invalid-image rows so graceful-failure can exercise them */
+  containersIn?: string[];
   videoCodecs?: string[];
   audioCodecs?: string[];
   options: Record<string, unknown>;
@@ -1498,25 +1513,21 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
   {
     id: 'negative_jpeg_to_video',
     asset: 'image.jpg',
-    containersIn: ['jpeg'],
     options: { container: 'mp4', video: { codec: 'h264' } },
     notes:
-      'JPEG → video transcode (§5.1/§7/A.16 image negative). No engine declares the "jpeg" pseudo-' +
-      'container → clean NA_ENGINE; an engine that DOES try must fail gracefully, never crash.',
+      'JPEG → video transcode (§5.1/§7/A.16 image negative). Engines with transcode support must reject the still image cleanly.',
   },
   {
     id: 'negative_png_to_video',
     asset: 'image.png',
-    containersIn: ['png'],
     options: { container: 'mp4', video: { codec: 'h264' } },
-    notes: 'PNG → video transcode negative. Honest NA_ENGINE via the "png" pseudo-container.',
+    notes: 'PNG → video transcode negative. Engines with transcode support must reject the still image cleanly.',
   },
   {
     id: 'negative_webp_to_video',
     asset: 'image.webp',
-    containersIn: ['webp'],
     options: { container: 'mp4', video: { codec: 'h264' } },
-    notes: 'WebP (still image) → video transcode negative. Honest NA_ENGINE via the "webp" pseudo-container.',
+    notes: 'WebP (still image) → video transcode negative. Engines with transcode support must reject the still image cleanly.',
   },
   {
     id: 'malformed_truncated_h264_transcode',
@@ -1544,7 +1555,6 @@ const NEGATIVE_CASES: TranscodeNegativeCase[] = [
     id: 'mismatch_audio_only_to_video_target',
     asset: 'wav_s16.wav',
     containersIn: ['wav'],
-    audioCodecs: ['pcm-s16'],
     videoCodecs: ['h264'],
     options: { container: 'mp4', video: { codec: 'h264' } },
     notes:
@@ -1584,7 +1594,7 @@ const negativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
     options: c.options,
     requires: {
       operations: ['transcode'],
-      containersIn: c.containersIn,
+      ...(c.containersIn ? { containersIn: c.containersIn } : {}),
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },

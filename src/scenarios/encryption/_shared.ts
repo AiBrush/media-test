@@ -114,6 +114,8 @@ export interface DecryptCase {
    * CENC-CTR clear-sample export is distinct from merely recognizing protected tracks.
    */
   features?: string[];
+  /** Optional plaintext corpus asset whose browser-baked frame golden is the decrypt comparison target. */
+  cleartextAsset?: string;
   /**
    * Override the oracle set. Default: decrypt-bitexact (frame-exact vs offline cleartext golden) +
    * reference-reimport (output re-parses as a real container) + playback-smoke (the de-protected
@@ -141,7 +143,7 @@ export function buildDecrypt(c: DecryptCase): Scenario {
     id: `encryption/${c.id}`,
     op: 'decrypt',
     input: c.asset,
-    options: { scheme: c.scheme, key },
+    options: { scheme: c.scheme, key, ...(c.cleartextAsset ? { cleartextAsset: c.cleartextAsset } : {}) },
     requires: {
       operations: ['decrypt'],
       containersIn: [c.container],
