@@ -1773,18 +1773,31 @@ async function main() {
         summary.reused.push(id);
         log(`  = ${id} (reuse existing)`);
       } else if (!recipe) {
-        // No generator. For a `provided`/`captured` asset this is EXPECTED (the bake can't make it).
-        // Record it as MISSING (drop-in needed) rather than a hard error.
-        entry.sha256 = null;
-        entry.sizeBytes = null;
-        if (entry.source === 'provided' || entry.source === 'captured') {
-          summary.missing.push({ id, entry, reason: `source:'${entry.source}' and not present on disk (no generator).` });
-          log(`  ◌ ${id}: MISSING (${entry.source}; drop into fixtures/media/ — see MISSING ASSETS)`);
+        if (entry.source === 'fetched') {
+          mkdirSync(dirname(out), { recursive: true });
+          const expectedSha256 = typeof entry.sha256 === 'string' ? entry.sha256 : null;
+          const res = await fetchPinned(entry.sourceUrl, out, expectedSha256, id);
+          if (res && typeof res === 'object' && res.skipped) {
+            summary.missing.push({ id, entry, reason: res.reason });
+            log(`  ◌ ${id}: MISSING (fetched) — ${res.reason}`);
+            continue;
+          }
+          summary.generated.push(id);
+          log(`  + ${id} (fetched, sha256-verified)`);
         } else {
-          summary.errors.push({ id, reason: 'no recipe defined in bake.mjs' });
-          log(`  ! ${id}: NO RECIPE — skipped (add one to RECIPES)`);
+          // No generator. For a `provided`/`captured` asset this is EXPECTED (the bake can't make it).
+          // Record it as MISSING (drop-in needed) rather than a hard error.
+          entry.sha256 = null;
+          entry.sizeBytes = null;
+          if (entry.source === 'provided' || entry.source === 'captured') {
+            summary.missing.push({ id, entry, reason: `source:'${entry.source}' and not present on disk (no generator).` });
+            log(`  ◌ ${id}: MISSING (${entry.source}; drop into fixtures/media/ — see MISSING ASSETS)`);
+          } else {
+            summary.errors.push({ id, reason: 'no recipe defined in bake.mjs' });
+            log(`  ! ${id}: NO RECIPE — skipped (add one to RECIPES)`);
+          }
+          continue;
         }
-        continue;
       } else {
         try {
           mkdirSync(dirname(out), { recursive: true });

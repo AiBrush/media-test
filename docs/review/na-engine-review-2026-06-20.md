@@ -232,12 +232,21 @@ Progress made in the current worktree after this report was written:
 
 False-positive guard added after the explicit FFmpeg runtime/suite-budget N/A decisions: cached PASS rows are now invalidated for `transcode/h264_to_hevc_mp4`, `transcode/h264_to_vp8_webm`, `transcode/vp9_alpha_to_vp9_keepalpha`, and `trim/vp9_alpha_keyframe_aligned`. This does not change the recovered-row count; it prevents a stale browser cache from reporting success without rerunning the validation path.
 
+Additional false-positive guard added for the broader rerun: cached PASS rows now carry validation epoch `2026-06-21-real-validation-v1`; old PASS rows without that epoch are not reused. This forces genuine execution for the refreshed validation pass instead of silently accepting previous green cells. The local server launcher also now uses Vite `--strictPort` so a browser run cannot drift to a different port and accidentally validate against a foreign or stale server.
+
+Output-shape false-positive guard added for streaming/mux MP4 rows: the runner now forwards the full `remux`/`mux` option bag, not just `container`, so `fastStart`, `fragmented`, `target`, `maximumPacketCount`, `trackSelect`, and similar scenario knobs reach adapters. A new `mp4-box-layout` oracle parses top-level MP4/MOV boxes and is attached automatically to MP4 fastStart/fragmented streaming-output and mux scenarios; it fails if `fastStart:'in-memory'`/`'reserve'` does not put `moov` before `mdat`, if `fastStart:false` does not keep the control `mdat` before `moov`, or if fragmented output lacks top-level `moov` plus `moof`/`mdat` media fragments. This does not change the recovered-row count; it prevents valid-but-wrong plain MP4 output from satisfying output-shape cases.
+
+MP4Box MP4 mux rows are no longer a harness-contract false NA. `mp4box@2.3.0` now declares `mux`, implements `prepareMuxTracks()` from MP4/MOV inputs, preserves MP4 sample-entry boxes (`avcC`/`hvcC`/`esds`/etc.) plus exact per-sample tick timing, and writes MP4 via `addTrack`/`addSample`/`getBuffer`. A focused Brave run passed `mux/h264_aac_to_mp4` in `results/raw/brave-2026-06-21T01-39-43-291Z.json`; reference re-import saw 2,308 packets / 1,423 keyframes and the probe-duration invariant passed with Δ 0.0213s ≤ 0.0417s.
+
+Updated corpus audit for the expanded real-world-media goal: `fixtures/manifest.json` now declares 100 assets, all with non-null `sha256` and `sizeBytes`; source distribution is 94 generated, 3 fetched, 2 provided, and 1 captured. The new pinned fetched assets are `realworld_mdn_flower.mp4` (H.264/AAC), `realworld_mdn_flower.webm` (VP8/Vorbis), and `realworld_mdn_trex.mp3` (MP3), all from MDN CC0 interactive-example media with recorded `sourceUrl`, `sha256`, and `sizeBytes`. `fixtures/bake.mjs` now has generic `source:"fetched"` handling that refuses unpinned downloads and verifies the manifest checksum before writing media/goldens.
+
 Total current progress: **99 stored-run `NA_ENGINE` rows are no longer classified as engine-declaration skips** by current code. This is not a blanket PASS claim; the four HLS rows, seven FFmpeg transform/control rows, one FFmpeg alpha-transcode row, four FFmpeg VFR/B-frame mux timestamp rows, two Remotion protected-track probe rows, eight platform WAV read rows, and two platform rotation decode/read rows now have focused Chromium PASS evidence, while the rest still require a fresh browser matrix run to separate PASS, FAIL, NA_BROWSER, `NA_ASSET`, and runtime `NotApplicableError`.
 
 Verification performed:
 
 - `bun run typecheck` passes.
 - `bun run build` passes.
+- Static scenario-catalog check confirms `mp4-box-layout` is attached only to MP4 fastStart/fragmented streaming-output rows and MP4 fastStart/fragmented mux rows. Direct oracle smoke tests passed a real `fragmented_cmaf.mp4` fixture, passed a moov-first MP4 when requested as `fastStart:'in-memory'`, and failed closed when the same moov-first MP4 was intentionally checked as a `fastStart:false` moov-last control.
 - Targeted static negotiation checks pass for the listed stored-run rows.
 - Focused Chromium runtime run passed all four FFmpeg HLS rows: `probe/hls_vod`, `probe/hls_aes128`, `demux/hls_vod`, `demux/hls_aes128`.
 - Focused Chromium runtime runs passed the seven newly live FFmpeg transform/control rows: `transcode/h264_flip_horizontal`, `transcode/h264_flip_vertical`, `transcode/h264_crop_center`, `transcode/h264_pad_letterbox_4x3_to_16x9`, `transcode/h264_colorspace_709_to_2020`, `transcode/h264_crf_quality_mode`, and `transcode/h264_two_pass_bitrate`.
@@ -249,20 +258,23 @@ Verification performed:
 - Focused Chromium runtime run passed the eight platform WAV read rows: three PCM probe rows, three PCM demux rows, plus empty-WAV probe/demux coverage.
 - Focused Chromium runtime run passed the two platform rotation decode/read rows: `decode-seek/decode_rotated_display_matrix` and `metadata/rotation_decode_read_h264_rotated90`.
 - Focused Chromium runtime run confirmed the four platform rotate-transcode rows are explicit runtime `NA_ENGINE` in Chromium, not declaration skips: `transcode/h264_rotate_normalize`, `transcode/h264_rotate_180`, `transcode/h264_rotate_90_dimswap`, and `transcode/h264_rotate_270_dimswap`.
+- Focused Brave runtime run passed MP4Box MP4 mux: `mux/h264_aac_to_mp4` in `results/raw/brave-2026-06-21T01-39-43-291Z.json`.
+- Focused Brave runtime run passed fetched-media probe/demux coverage in `results/raw/brave-2026-06-21T01-46-05-274Z.json`: Mediabunny passed `probe/realworld_mdn_flower_mp4`, `probe/realworld_mdn_flower_webm`, `demux/realworld_mdn_flower_webm`, and `demux/realworld_mdn_trex_mp3`; MP4Box passed `probe/realworld_mdn_flower_mp4` and `demux/realworld_mdn_flower_mp4`; incompatible containers were clean `NA_ENGINE`. After a targeted 50ms MP3 metadata tolerance was added for encoder-delay/padding estimation, `probe/realworld_mdn_trex_mp3` passed in `results/raw/brave-2026-06-21T01-46-44-396Z.json`.
 - Direct Web-Demuxer smoke tests for WAV and MP3/FLAC/Ogg read containers still fail with `Cannot open input file` / `get_media_info failed`, so those remain undeclared in the current worktree.
+- A final full Brave matrix rerun after the MP3 tolerance and MP4 box-layout guard is still pending; the last escalation request for that browser rerun was rejected by the approval usage limit, so no workaround run was attempted.
 
 Remaining high-confidence work:
 
-- Mediabunny: HLS AES-128 decrypt primitive, fanout contract, and browser alpha policy/runtime validation.
+- Mediabunny: HLS AES-128 decrypt primitive, fanout contract, browser alpha policy/runtime validation, and fresh browser evidence for the already-declared audio DSP / fastStart / transform rows under the new option-forwarding guard.
 - FFmpeg.wasm: remaining video/filter features (alpha trim boundary support, 10-bit/depth, tonemap) and Opus reliability.
-- MP4Box/WebCodecs/parser engines: mux contract and decode/seek policy decisions remain open.
+- MP4Box/WebCodecs/parser engines: MP4Box MP4 mux is now implemented; decode/seek policy decisions remain open, and non-MP4 mux targets remain outside MP4Box's declared scope.
 - Web-Demuxer read under-declaration remains unproven after direct smoke tests; remaining platform video-transform under-declaration (`fps`, `flip`, `crop`, `pad`, `alpha:transcode`, `fragmented`, and unsupported rotate write paths) still needs focused validation before changing capabilities.
 
 ## Priority Backlog
 
-1. Fix the reference engine first: Mediabunny audio DSP, HLS AES-128, CENC clear output implementation, `fastStart:in-memory`, and alpha transcode. This removes false N/A from the baseline engine and improves oracle coverage.
+1. Fix and verify the reference engine first: Mediabunny HLS AES-128, CENC clear output implementation, browser alpha policy, and focused runtime evidence for the already-wired audio DSP / `fastStart:in-memory` / transform rows. This removes false N/A from the baseline engine and improves oracle coverage.
 2. Fix FFmpeg.wasm feature mapping: AIFF/CAF, audio/video filters, metadata tag forwarding, `decode:golden-rgba`, and Opus reliability.
-3. Add a real mux contract path: feed `EncodedTracks` into mux scenarios so MP4Box.js and other mux-capable engines can contest MP4 mux rows.
+3. Extend mux validation beyond the now-implemented MP4Box MP4 path: broaden compatible engines and add more output-container implementations without over-claiming non-ISOBMFF writers.
 4. Decide whether parser engines are allowed to pair with WebCodecs for decode/seek. If yes, implement MP4Box, Remotion Media Parser, and Web-Demuxer decode/seek paths. If no, document those rows as intentionally parser-only.
 5. Audit under-declared read containers for Web-Demuxer and Remotion Media Parser with direct smoke tests per container.
 6. Separate fixture/corpus work from engine work: bake missing frames and restore/fetch missing media assets before interpreting the 1,019 `NA_ASSET` rows as support gaps.
@@ -280,6 +292,7 @@ Remaining high-confidence work:
 - FFmpeg formats: <https://ffmpeg.org/ffmpeg-formats.html>
 - MP4Box.js repo/docs: <https://github.com/gpac/mp4box.js/>
 - MP4Box.js TypeScript rewrite post: <https://gpac.io/2025/06/19/announcing-mp4box-js-1-0-0-with-typescript-support/>
+- MDN CC0 sample video/audio assets used for fetched corpus coverage: <https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4>, <https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm>, <https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3>
 - Remotion WebCodecs docs: <https://www.remotion.dev/docs/webcodecs/>
 - Remotion `convertMedia()` docs: <https://www.remotion.dev/docs/webcodecs/convert-media>
 - Remotion Media Parser docs: <https://www.remotion.dev/docs/media-parser/>

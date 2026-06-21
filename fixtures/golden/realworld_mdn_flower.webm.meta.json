@@ -1,0 +1,26 @@
+{
+  "container": "webm",
+  "durationSec": 5.059,
+  "tracks": [
+    {
+      "type": "video",
+      "codec": "vp8",
+      "width": 960,
+      "height": 540,
+      "fps": 29.97,
+      "bitrate": 876154,
+      "language": null
+    },
+    {
+      "type": "audio",
+      "codec": "vorbis",
+      "sampleRate": 44100,
+      "channels": 2,
+      "bitrate": 876154,
+      "language": null
+    }
+  ],
+  "tags": {
+    "encoder": "Lavf57.71.100"
+  }
+}

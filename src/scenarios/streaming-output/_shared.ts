@@ -14,21 +14,15 @@
  *
  * ── CONTRACT-LEVEL CAVEAT (read before adding oracles) ──────────────────────────────────────────
  * The output-shape knobs (`target`, `fragmented`, `fastStart`, `writeChunkBytes`, `maximumPacketCount`)
- * are carried in `options` HERE, but the current core contract `MediaEngine.remux(input,{container})`
- * (engine.ts) and the runner's `executeOp` (runner.ts → `engine.remux(input,{container})`) pass ONLY
- * `container` to the adapter and DROP the rest. Until the contract carries an output-shape arg AND the
- * adapters implement StreamTarget / fastStart / fragmented, the bytes produced by the buffer / stream /
- * fragmented / faststart / ts variants are the SAME plain buffered remux differentiated only by
- * container. These cases are written so that:
- *   (a) the options are already in place the moment the contract grows the arg (zero re-authoring), and
- *   (b) their oracles are chosen to be HONEST UNDER TODAY'S behavior — they never fake-pass a no-op and
- *       never false-FAIL a correct output (see the per-case oracle rationale below). The
- *       distinguishing SHAPE assertions (moof/mdat structure, reserved-moov forward-seek, 188-byte
- *       write granularity, time-to-first-byte plumbing, buffer-vs-stream peak-memory at GB scale) need
- *       NEW runner/oracle machinery (CountingTarget threading, a streaming-shape oracle, a firstByte
- *       callback) that lives OUTSIDE this writer's scope (src/core/*). Where a SHAPE property cannot yet
- *       be observed, the case is documented with the exact missing hook rather than gated by a
- *       placeholder that would silently pass.
+ * are carried in `options` HERE and the runner forwards the full remux option bag to adapters. That
+ * makes declared `fastStart:*` / `fragmented` rows execute the requested mode instead of accidentally
+ * validating a plain buffered remux. The remaining caveat is OBSERVABILITY: `reference-reimport` and
+ * duration invariants prove the output is valid and duration-preserving, but they do not distinguish
+ * moov position, moof/mdat split structure, reserved forward seeks, TS write granularity, first-byte
+ * timing, or buffer-vs-stream peak memory. Those need NEW runner/oracle machinery (CountingTarget
+ * threading, a streaming-shape oracle, a firstByte callback) that lives OUTSIDE this file. Where a
+ * SHAPE property cannot yet be observed, the case is documented with the exact missing hook rather
+ * than gated by a placeholder that would silently pass.
  *
  * ── ORACLE TRUTH for an `op:'remux'` scenario (mirrors remux/_shared.ts) ─────────────────────────
  *   - The runner runs ONLY `engine.remux(...)` and exposes the result as `ctx.output`. It never
@@ -40,8 +34,9 @@
  *       • fragmented/CMAF mp4 (moof/mdat) — mediabunny reads fMP4/CMAF (dossier mediabunny.md §A.2),
  *         but the platform inline mp4 demux is progressive-only (engines/platform/demux-mp4.ts: "does
  *         not handle moof/traf") AND a plain <video src=blob> may not play a bare fMP4. So fragmented
- *         cases gate on reference-reimport ONLY — attaching decode-remux or playback-smoke would risk a
- *         FALSE FAIL on a CORRECT fragmented output (the §0.1 anti-pattern, inverted).
+ *         cases gate byte validity with reference-reimport and top-level structure with mp4-box-layout;
+ *         attaching decode-remux or playback-smoke would risk a FALSE FAIL on a CORRECT fragmented
+ *         output (the §0.1 anti-pattern, inverted).
  *       • headerless/live WebM — same reasoning: reference-reimport (+ a probe-duration invariant).
  *       • MPEG-TS — TS is not reliably plain-<video>-playable cross-browser and its duration is
  *         estimate-only; gate on reference-reimport (mediabunny reads MPEG_TS, dossier §A.2).
@@ -58,7 +53,8 @@
  *       • 'probe-duration' (token deliberately contains neither "decode" nor "remux" so it routes to the
  *         probe branch — see remux/metamorphic.ts header) → reference-probes ctx.output's duration vs
  *         golden.meta.durationSec. Works for video AND audio AND every output shape; the honest gate
- *         that fastStart/fragmented/stream did not corrupt the reported duration.
+ *         that fastStart/fragmented/stream did not corrupt the reported duration. MP4 fastStart and
+ *         fragmented cases also receive mp4-box-layout so the shape itself is checked.
  */
 
 import type { MetricId, OracleId, Scenario } from '../../core/scenario.ts';
@@ -80,9 +76,9 @@ export const STREAM_METRICS = [
   'longtasks',
 ] as const;
 
-/** Output-shape knobs carried in `options` (forwarded to the engine once the contract grows the arg). */
+/** Output-shape knobs carried in `options` and forwarded to adapters by the runner. */
 export interface OutputShape {
-  /** canonical target container (the one option the runner forwards today) */
+  /** canonical target container */
   container: string;
   /** 'buffer' (whole-blob, BufferTarget) vs 'stream' (incremental StreamTarget) */
   target?: 'buffer' | 'stream';
@@ -139,6 +135,17 @@ const DEFAULT_STREAM_ORACLES: OracleId[] = ['reference-reimport'];
  */
 const OUTPUT_SHAPE_FEATURE = 'fragmented';
 
+function mp4LayoutOracleApplies(shape: OutputShape): boolean {
+  const container = shape.container.trim().toLowerCase();
+  const isIsoBmff = container === 'mp4' || container === 'mov';
+  return isIsoBmff && (shape.fragmented === true || shape.fastStart !== undefined);
+}
+
+function withMp4LayoutOracle(oracles: OracleId[], shape: OutputShape): OracleId[] {
+  if (!mp4LayoutOracleApplies(shape) || oracles.includes('mp4-box-layout')) return oracles;
+  return [...oracles, 'mp4-box-layout'];
+}
+
 /** Stable id for a streaming-output case. */
 function streamId(c: Pick<StreamCase, 'id'>): string {
   return `streaming-output/${c.id}`;
@@ -174,6 +181,7 @@ function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined
 export function buildStream(c: StreamCase): Scenario {
   const metrics: MetricId[] = [...STREAM_METRICS, ...(c.extraMetrics ?? [])];
   const features = shapeFeatures(c);
+  const oracles = withMp4LayoutOracle(c.oracles ?? DEFAULT_STREAM_ORACLES, c.shape);
   return defineScenario({
     id: streamId(c),
     op: 'remux',
@@ -187,7 +195,7 @@ export function buildStream(c: StreamCase): Scenario {
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(features ? { features } : {}),
     },
-    oracles: c.oracles ?? DEFAULT_STREAM_ORACLES,
+    oracles,
     metrics,
     ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
@@ -233,6 +241,7 @@ export interface StreamPropertyCase {
  */
 export function buildStreamProperty(c: StreamPropertyCase): Scenario {
   const features = shapeFeatures(c);
+  const oracles = withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.shape);
   return defineScenario({
     id: `streaming-output/${c.id}`,
     op: 'remux',
@@ -246,7 +255,7 @@ export function buildStreamProperty(c: StreamPropertyCase): Scenario {
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(features ? { features } : {}),
     },
-    oracles: c.oracles ?? ['property-invariant'],
+    oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),

@@ -9,11 +9,10 @@
  * ORACLE FIX vs the legacy index (which attached reference-reimport + playback-smoke to ALL six):
  * every base case now gates byte validity with reference-reimport only. The raw Brave run showed
  * playback-smoke false-failing progressive MP4 outputs that re-imported correctly, and fragmented/TS
- * outputs were never safe plain-<video> inputs. Shape-specific structure assertions still need new
- * oracles (see sibling files); these rows do not fake them with a brittle playback gate.
+ * outputs were never safe plain-<video> inputs. MP4 fastStart/fragmented rows also get the
+ * mp4-box-layout oracle from the shared builder so the requested shape cannot pass as a plain remux.
  *
- * See ./_shared.ts for the full oracle rationale and the contract-level caveat that the shape knobs in
- * `options` are not yet forwarded by the runner.
+ * See ./_shared.ts for the full oracle rationale and remaining observability caveats.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -51,13 +50,13 @@ const BASE_CASES: StreamCase[] = [
     audioCodecs: ['aac'],
     shape: { container: 'mp4', fragmented: true, target: 'stream' },
     features: ['fragmented'],
-    // reference-reimport ONLY: a bare fMP4 is not reliably plain-<video>-playable and the platform
-    // inline demux is progressive-only — playback-smoke/decode-remux would risk a false FAIL.
+    // reference-reimport + mp4-box-layout: a bare fMP4 is not reliably plain-<video>-playable and the
+    // platform inline demux is progressive-only — playback-smoke/decode-remux would risk a false FAIL.
     oracles: ['reference-reimport'],
     notes:
       'Fragmented MP4 (CMAF): moof/mdat fragments, MSE-appendable. reference-reimport proves the ' +
-      'fragments re-parse to the same packet table; the moof/mdat init+media-split STRUCTURE check ' +
-      'is a separate case needing a new structural oracle (see ./fragmented-faststart.ts).',
+      'fragments re-parse to the same packet table; mp4-box-layout checks top-level moov/moof/mdat ' +
+      'structure. Deeper MSE appendability remains a separate oracle gap.',
   },
   {
     id: 'mp4_faststart_reserve',
@@ -66,7 +65,7 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: 'reserve', target: 'stream' },
+    shape: { container: 'mp4', fastStart: 'reserve', target: 'stream', maximumPacketCount: 4096 },
     features: ['fastStart:reserve'],
     notes:
       'fastStart with reserved forward moov (mediabunny fastStart:"reserve", needs maximumPacketCount). ' +

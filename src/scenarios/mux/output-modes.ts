@@ -22,8 +22,8 @@
  *
  * ORACLES: these are mp4 targets of an ISO-BMFF source → reference-reimport is FAITHFUL (the fragmented
  * variant re-imports as a valid fMP4; the reserve variant as a moov-first mp4), so defaultOracles
- * attaches reference-reimport + probe-duration. A muxer that writes a broken fragment/reserve layout
- * fails re-import or the duration invariant.
+ * attaches reference-reimport + probe-duration. The shared mux builder also adds mp4-box-layout for
+ * fastStart/fragmented options, so a muxer cannot pass a shape row by writing a valid plain MP4.
  */
 
 import type { Scenario } from '../../core/scenario.ts';

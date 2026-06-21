@@ -108,6 +108,20 @@ export const MUX_STREAM_METRICS = [
  */
 const FAITHFUL_REIMPORT_TARGETS = new Set(['mp4', 'mov']);
 
+function mp4LayoutOracleApplies(container: string, options?: Record<string, unknown>): boolean {
+  const target = container.trim().toLowerCase();
+  const isIsoBmff = target === 'mp4' || target === 'mov';
+  return (
+    isIsoBmff &&
+    (options?.fragmented === true || options?.fastStart === false || typeof options?.fastStart === 'string')
+  );
+}
+
+function withMp4LayoutOracle(oracles: OracleId[], container: string, options?: Record<string, unknown>): OracleId[] {
+  if (!mp4LayoutOracleApplies(container, options) || oracles.includes('mp4-box-layout')) return oracles;
+  return [...oracles, 'mp4-box-layout'];
+}
+
 // ── Mux case model + builder ─────────────────────────────────────────────────────────────────────
 
 export interface MuxCase {
@@ -171,7 +185,7 @@ function muxOptions(c: MuxCase): Record<string, unknown> {
 
 /** Build a single mux Scenario from a MuxCase. */
 export function buildMux(c: MuxCase): Scenario {
-  const oracles = c.oracles ?? defaultOracles(c);
+  const oracles = withMp4LayoutOracle(c.oracles ?? defaultOracles(c), c.to, c.extraOptions);
   const metrics = (c.metrics ?? MUX_METRICS) as readonly MetricId[];
   return defineScenario({
     id: `mux/${c.id}`,
@@ -227,6 +241,7 @@ export interface MuxPropertyCase {
  *   - PROBE_DUR   → reference-probed output duration ≈ golden source duration (VIDEO+AUDIO).
  */
 export function buildMuxProperty(c: MuxPropertyCase): Scenario {
+  const oracles = withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.to, c.extraOptions);
   return defineScenario({
     id: `mux/${c.id}`,
     op: 'mux',
@@ -240,7 +255,7 @@ export function buildMuxProperty(c: MuxPropertyCase): Scenario {
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.features ? { features: c.features } : {}),
     },
-    oracles: c.oracles ?? ['property-invariant'],
+    oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),

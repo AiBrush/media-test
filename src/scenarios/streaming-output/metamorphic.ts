@@ -4,10 +4,9 @@
  *
  * THE BUG THIS WOULD HAVE CAUGHT: every streaming-output shape (buffer / stream / fragmented / faststart)
  * is a lossless sample COPY, so all must decode to BIT-IDENTICAL frames and probe to the SAME duration —
- * only their CONTAINER STRUCTURE may differ. Because the runner currently drops the shape knobs, all
- * shapes presently produce the SAME bytes; these invariants assert the decode/duration equality that
- * holds regardless, and become the gate that catches a shape variant that silently corrupts samples or
- * duration once the shapes truly diverge.
+ * only their CONTAINER STRUCTURE may differ. The runner forwards the shape knobs, so these invariants
+ * assert the decode/duration equality across genuinely requested output modes and catch a shape variant
+ * that silently corrupts samples or duration.
  *
  * ORACLE ROUTING (substring match in oracles.ts `propertyInvariant`, see remux/metamorphic.ts header):
  *   - DECODE token must contain "decode"/"remux" → routes to the decode-frames branch (VIDEO-only,
@@ -59,7 +58,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
       'decode(remux_stream(x))==decode(x): the StreamTarget output must decode IDENTICALLY to the buffer ' +
       'output and the source — proving the streaming write path is the same lossless sample copy, only the ' +
       'bytes leave incrementally. Directly gates §A.16 decode-equality across output shapes; would flag a ' +
-      'stream path that drops/reorders samples once the shape knobs are actually honored.',
+      'stream path that drops/reorders samples while honoring the requested shape knobs.',
   },
 
   // ── probe(remux_SHAPE(x)).dur ≈ probe(x).dur across buffer / stream / faststart shapes ────────────
@@ -103,9 +102,8 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     notes:
       'probe(remux_fragmented(x)).dur≈probe(x).dur: a fragmented/CMAF (moof/mdat) output legitimately ' +
       'grows (per-fragment moof overhead) but must report the SAME duration as the source. The duration ' +
-      'invariant is the part of the fragmented contract observable WITHOUT a moof-structure oracle ' +
-      '(reference engine probes fMP4, dossier §A.2); the structural init+media split is in ' +
-      './fragmented-faststart.ts.',
+      'invariant is paired with mp4-box-layout for top-level moov/moof/mdat structure. Deeper MSE ' +
+      'appendability remains a separate oracle gap (reference engine probes fMP4, dossier §A.2).',
   },
 ];
 

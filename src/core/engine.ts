@@ -157,9 +157,13 @@ export interface DecryptKey {
   ivHex?: string;
 }
 
-export interface RemuxOptions {
+export interface RemuxOptions extends Record<string, unknown> {
   container: string;
   tags?: Record<string, string>;
+}
+
+export interface MuxOptions extends Record<string, unknown> {
+  container: string;
 }
 
 /**
@@ -199,7 +203,7 @@ export interface MediaEngine {
    * capabilities().operations.mux and negotiated before this hook is called.
    */
   prepareMuxTracks?(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks>;
-  mux?(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes>;
+  mux?(tracks: EncodedTracks, opts: MuxOptions): Promise<MediaBytes>;
   decrypt?(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes>;
 }
 

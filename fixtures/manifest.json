@@ -18,6 +18,23 @@
       "notes": "Baseline H.264/AAC progressive MP4. Workhorse for probe/demux/remux/transcode/decode/trim. medium bucket (~10-30 MB) default workhorse."
     },
     {
+      "id": "realworld_mdn_flower.mp4",
+      "family": "real-world-video",
+      "container": "mp4",
+      "codecs": [
+        "h264",
+        "aac"
+      ],
+      "source": "fetched",
+      "sizeBucket": "small",
+      "genMethod": "Pinned fetch from MDN interactive examples CC0 media: flower.mp4 (H.264/AAC 960x540).",
+      "sourceUrl": "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
+      "acquire": "bake.mjs downloads this pinned public sample from sourceUrl, verifies sha256=0cd83d944a6ca7822b4a8306cecc60a36e859b041f6702c6a1ad9ead78924451, and stores it at fixtures/media/realworld_mdn_flower.mp4.",
+      "sha256": "0cd83d944a6ca7822b4a8306cecc60a36e859b041f6702c6a1ad9ead78924451",
+      "sizeBytes": 1128375,
+      "notes": "Authentic internet-downloaded MP4 smoke asset for real-world corpus coverage; complements synthetic H.264/AAC workhorse files."
+    },
+    {
       "id": "h264_4k_10s.mp4",
       "family": "video-mp4",
       "container": "mp4",
@@ -137,6 +154,23 @@
       "sha256": "2fc7d368edd6fa2ac1ce7c538c5b643ec7d46867fb1026cf1f6daa76de9fa8dc",
       "sizeBytes": 9293670,
       "notes": "VP9/Opus WebM. Reference WebM video path."
+    },
+    {
+      "id": "realworld_mdn_flower.webm",
+      "family": "real-world-video",
+      "container": "webm",
+      "codecs": [
+        "vp8",
+        "vorbis"
+      ],
+      "source": "fetched",
+      "sizeBucket": "tiny",
+      "genMethod": "Pinned fetch from MDN interactive examples CC0 media: flower.webm (VP8/Vorbis 960x540).",
+      "sourceUrl": "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm",
+      "acquire": "bake.mjs downloads this pinned public sample from sourceUrl, verifies sha256=c6f8a348953395598a9a73b9bab1676436410797bce9f398f4be1531d6e76dda, and stores it at fixtures/media/realworld_mdn_flower.webm.",
+      "sha256": "c6f8a348953395598a9a73b9bab1676436410797bce9f398f4be1531d6e76dda",
+      "sizeBytes": 554058,
+      "notes": "Authentic internet-downloaded WebM smoke asset for real-world corpus coverage; exercises VP8/Vorbis from a browser documentation sample instead of generated testsrc media."
     },
     {
       "id": "vp8_720p_10s.webm",
@@ -343,6 +377,22 @@
       "sha256": "f27e1f381399657f845fa3c4edf197418f72cedb9ccf457583fb54f2bc85caa9",
       "sizeBytes": 64166,
       "notes": "VBR MP3 with Xing header (seek TOC present)."
+    },
+    {
+      "id": "realworld_mdn_trex.mp3",
+      "family": "real-world-audio",
+      "container": "mp3",
+      "codecs": [
+        "mp3"
+      ],
+      "source": "fetched",
+      "sizeBucket": "tiny",
+      "genMethod": "Pinned fetch from MDN interactive examples CC0 media: t-rex-roar.mp3 (stereo MP3 44.1 kHz).",
+      "sourceUrl": "https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3",
+      "acquire": "bake.mjs downloads this pinned public sample from sourceUrl, verifies sha256=41191d0727073bf848bcc8f0bd851d71a0b0058e901abb1c1b236ad327bda52e, and stores it at fixtures/media/realworld_mdn_trex.mp3.",
+      "sha256": "41191d0727073bf848bcc8f0bd851d71a0b0058e901abb1c1b236ad327bda52e",
+      "sizeBytes": 39868,
+      "notes": "Authentic internet-downloaded MP3 smoke asset for real-world corpus coverage; complements deterministic sine-wave MP3 fixtures."
     },
     {
       "id": "mp3_cbr_notoc.mp3",

@@ -50,6 +50,7 @@ import { defineScenario } from '../../core/scenario.ts';
 // ── (1) CORE format-axis cases (each backed by golden/<asset>.packets.json) ──────────────────────
 
 interface DemuxCase {
+  id?: string;
   asset: string;
   container: string;
   videoCodecs?: string[];
@@ -62,6 +63,17 @@ interface DemuxCase {
 const DEMUX_CASES: DemuxCase[] = [
   // ── MP4 / MOV ──
   { asset: 'h264_1080p_30s.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'] },
+  {
+    id: 'realworld_mdn_flower_mp4',
+    asset: 'realworld_mdn_flower.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    features: ['packets:dts'],
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 flower.mp4. Golden-packets ensures the downloaded MP4 ' +
+      'actually demuxes into the expected H.264/AAC packet table.',
+  },
   {
     asset: 'h264_bframes_1080p.mp4',
     container: 'mp4',
@@ -89,6 +101,16 @@ const DEMUX_CASES: DemuxCase[] = [
 
   // ── WebM / MKV ──
   { asset: 'vp9_1080p_10s.webm', container: 'webm', videoCodecs: ['vp9'], audioCodecs: ['opus'] },
+  {
+    id: 'realworld_mdn_flower_webm',
+    asset: 'realworld_mdn_flower.webm',
+    container: 'webm',
+    videoCodecs: ['vp8'],
+    audioCodecs: ['vorbis'],
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 flower.webm. Golden-packets validates VP8/Vorbis packet ' +
+      'enumeration from a browser-documentation sample.',
+  },
   { asset: 'vp8_720p_10s.webm', container: 'webm', videoCodecs: ['vp8'], audioCodecs: ['vorbis'] },
   { asset: 'av1_720p_5s.webm', container: 'webm', videoCodecs: ['av1'], audioCodecs: ['opus'] },
   { asset: 'h264_in_mkv.mkv', container: 'mkv', videoCodecs: ['h264'], audioCodecs: ['aac'] },
@@ -181,6 +203,15 @@ const DEMUX_CASES: DemuxCase[] = [
     notes: 'MP3 elementary demux with a Xing/Info TOC header: the TOC frame must not be emitted as audio data.',
   },
   {
+    id: 'realworld_mdn_trex_mp3',
+    asset: 'realworld_mdn_trex.mp3',
+    container: 'mp3',
+    audioCodecs: ['mp3'],
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 t-rex-roar.mp3. Golden-packets validates frame walking ' +
+      'against an authentic downloaded MP3, not only generated sine-wave fixtures.',
+  },
+  {
     asset: 'mp3_cbr_notoc.mp3',
     container: 'mp3',
     audioCodecs: ['mp3'],
@@ -216,7 +247,7 @@ const DEMUX_CASES: DemuxCase[] = [
 
 const coreScenarios: Scenario[] = DEMUX_CASES.map((c) =>
   defineScenario({
-    id: `demux/${c.asset.replace(/\.[^.]+$/, '')}`,
+    id: `demux/${c.id ?? c.asset.replace(/\.[^.]+$/, '')}`,
     op: 'demux',
     input: c.asset,
     requires: {

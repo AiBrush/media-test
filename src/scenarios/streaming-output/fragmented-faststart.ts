@@ -11,23 +11,19 @@
  *
  * ── WHAT IS HONESTLY GATED TODAY ────────────────────────────────────────────────────────────────
  *   - faststart_in_memory (moov-first progressive) and faststart_none (moov-last default) are both
- *     structurally gated by reference-reimport; a probe-duration invariant gates that relocating/placing
- *     the moov did not change reported duration.
+ *     structurally gated by mp4-box-layout plus reference-reimport; a probe-duration invariant gates
+ *     that relocating/placing the moov did not change reported duration.
  *   - frag_vs_nonfrag_decode_equality uses 'decode(remux(x))==decode(x)' — BUT the platform inline mp4
  *     demux is progressive-only (cannot parse moof), so this metamorphic is authored against the
  *     NON-FRAGMENTED (buffer) shape so it actually runs today; it proves the lossless-sample-copy
  *     premise the fragmented case shares. (When a fragmented-aware decode path exists, flip its shape.)
  *
- * ── WHAT NEEDS A NEW ORACLE (OUT OF THIS WRITER'S SCOPE: src/core/oracles.ts + runner.ts) ────────
+ * ── WHAT STILL NEEDS DEEPER ORACLE WORK (OUT OF THIS WRITER'S SCOPE) ────────────────────────────
  * These are documented here, NOT emitted as fake-passing cases (§0.1: a placeholder that silently
  * passes is worse than an honest gap):
- *   - moof/mdat INIT+MEDIA SPLIT (fragmented/CMAF, §A.16): assert the output decomposes into a
- *     standalone init segment (ftyp+moov, no samples) + N media fragments (moof+mdat), each parseable,
- *     and that init++any-fragment is MSE-appendable. Needs a box-structure oracle (parse moof/mdat) +
- *     an MSE SourceBuffer.appendBuffer playback path. None exists in oracles.ts.
- *   - moov-FIRST vs moov-LAST POSITION (fastStart progressive vs control, §A.3/§A.10): assert
- *     'in-memory'/'reserve' put moov BEFORE mdat while the default puts it AFTER. Needs a box-offset
- *     oracle. reference-reimport checks the packet table, not box order, so it cannot tell them apart.
+ *   - FULL fragmented/CMAF split semantics (§A.16): mp4-box-layout now asserts top-level moov +
+ *     moof/mdat presence/order, but does not yet prove each fragment is independently parseable or
+ *     MSE SourceBuffer.appendBuffer-playable. That needs an MSE append oracle.
  *   - fastStart:'reserve' LARGE FORWARD SEEK (§A.16, the promised-but-unimplemented one): drive the
  *     remux through a positioned/sparse target so the engine reserves a forward moov, writes mdat, then
  *     seeks BACK to patch the reserved region; assert the reserved region was written exactly once at a
@@ -36,9 +32,9 @@
  *   - reserve OVERFLOW / UNDERFLOW (§A.16): overflow (maximumPacketCount < actual) must fail GRACEFULLY
  *     (graceful-failure) or transparently fall back, never produce a truncated moov; underflow (huge
  *     reservation) must still re-import + play with no orphaned bytes. Both require the runner to
- *     FORWARD fastStart/maximumPacketCount to the adapter (today executeOp passes only {container}); a
- *     graceful-failure case authored now would FALSE-FAIL because the engine is never actually asked to
- *     overflow. Deferred with this exact dependency rather than faked.
+ *     FORWARD a deliberately too-small maximumPacketCount to the adapter and assert the outcome. The
+ *     runner now forwards the option bag; the missing piece is the targeted overflow/underflow oracle
+ *     and fixture case rather than a placeholder that would silently pass.
  */
 
 import type { Scenario } from '../../core/scenario.ts';

@@ -319,6 +319,8 @@ export async function runOracle(
         return playbackSmoke(ctx);
       case 'ssim-psnr':
         return ssimPsnr(ctx, t);
+      case 'mp4-box-layout':
+        return mp4BoxLayout(ctx);
       case 'alpha-plane':
         return alphaPlane(ctx);
       case 'seek-accuracy':
@@ -341,6 +343,114 @@ export async function runOracle(
     }
     return fail(oracle, `oracle threw: ${errMsg(err)}`);
   }
+}
+
+// ── mp4-box-layout ───────────────────────────────────────────────────────────────────────────
+
+interface TopLevelBox {
+  type: string;
+  offset: number;
+  size: number;
+}
+
+function mp4BoxLayout(ctx: OracleContext): OracleOutcome {
+  const oracle: OracleId = 'mp4-box-layout';
+  const out = ctx.output;
+  if (!out) return fail(oracle, 'no ctx.output to inspect');
+  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const outputContainer = normStr(readStringOption(options, ['container']) ?? out.container);
+  if (outputContainer !== 'mp4' && outputContainer !== 'mov') {
+    return fail(oracle, `output container '${outputContainer || out.container}' is not an ISOBMFF layout target`);
+  }
+
+  const boxes = parseTopLevelBoxes(out.bytes);
+  if (!boxes.length) return fail(oracle, 'no parseable top-level MP4 boxes found');
+
+  const firstMoov = firstBoxOffset(boxes, 'moov');
+  const firstMdat = firstBoxOffset(boxes, 'mdat');
+  const firstMoof = firstBoxOffset(boxes, 'moof');
+  const measurements = finiteOnly({
+    topLevelBoxes: boxes.length,
+    moovOffset: firstMoov ?? Number.NaN,
+    mdatOffset: firstMdat ?? Number.NaN,
+    moofOffset: firstMoof ?? Number.NaN,
+  });
+  const layout = boxes.map((box) => `${box.type}@${box.offset}`).slice(0, 12).join(', ');
+
+  const fastStart = readStringOrFalseOption(options, ['fastStart']);
+  const fragmented = readBooleanOption(options, ['fragmented']) || fastStart === 'fragmented';
+
+  if (fragmented) {
+    if (firstMoov == null) return fail(oracle, `fragmented MP4 missing moov box; layout: ${layout}`, measurements);
+    if (firstMoof == null) return fail(oracle, `fragmented MP4 missing moof box; layout: ${layout}`, measurements);
+    const firstMdatAfterMoof = boxes.find((box) => box.type === 'mdat' && box.offset > firstMoof)?.offset;
+    if (firstMdatAfterMoof == null) {
+      return fail(oracle, `fragmented MP4 missing mdat after moof; layout: ${layout}`, measurements);
+    }
+    if (firstMoof < firstMoov) {
+      return fail(oracle, `fragment moof appears before moov init segment; layout: ${layout}`, measurements);
+    }
+    return pass(oracle, `fragmented MP4 has moov init plus moof/mdat media fragments; layout: ${layout}`, measurements);
+  }
+
+  if (fastStart === 'in-memory' || fastStart === 'reserve') {
+    if (firstMoov == null || firstMdat == null) {
+      return fail(oracle, `fastStart MP4 needs moov and mdat boxes; layout: ${layout}`, measurements);
+    }
+    if (firstMoov > firstMdat) {
+      return fail(oracle, `fastStart:${fastStart} expected moov before mdat; layout: ${layout}`, measurements);
+    }
+    return pass(oracle, `fastStart:${fastStart} placed moov before mdat; layout: ${layout}`, measurements);
+  }
+
+  if (fastStart === false) {
+    if (firstMoov == null || firstMdat == null) {
+      return fail(oracle, `fastStart:false control needs moov and mdat boxes; layout: ${layout}`, measurements);
+    }
+    if (firstMdat > firstMoov) {
+      return fail(oracle, `fastStart:false expected mdat before moov; layout: ${layout}`, measurements);
+    }
+    return pass(oracle, `fastStart:false control placed mdat before moov; layout: ${layout}`, measurements);
+  }
+
+  return fail(oracle, 'scenario did not request fastStart or fragmented output shape');
+}
+
+function parseTopLevelBoxes(bytes: Uint8Array): TopLevelBox[] {
+  const boxes: TopLevelBox[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const start = offset;
+    let size = view.getUint32(offset);
+    offset += 4;
+    const type = asciiBoxType(bytes, offset);
+    offset += 4;
+
+    if (!/^[A-Za-z0-9 ]{4}$/.test(type)) break;
+    if (size === 1) {
+      if (offset + 8 > bytes.byteLength) break;
+      const hi = view.getUint32(offset);
+      const lo = view.getUint32(offset + 4);
+      offset += 8;
+      size = hi * 2 ** 32 + lo;
+    } else if (size === 0) {
+      size = bytes.byteLength - start;
+    }
+
+    if (!Number.isFinite(size) || size < offset - start || start + size > bytes.byteLength) break;
+    boxes.push({ type, offset: start, size });
+    offset = start + size;
+  }
+  return boxes;
+}
+
+function asciiBoxType(bytes: Uint8Array, offset: number): string {
+  return String.fromCharCode(bytes[offset] ?? 0, bytes[offset + 1] ?? 0, bytes[offset + 2] ?? 0, bytes[offset + 3] ?? 0);
+}
+
+function firstBoxOffset(boxes: TopLevelBox[], type: string): number | undefined {
+  return boxes.find((box) => box.type === type)?.offset;
 }
 
 // ── golden-metadata ──────────────────────────────────────────────────────────────────────────
@@ -2578,6 +2688,15 @@ function readStringOption(options: unknown, keys: string[]): string | undefined 
   if (!isObject(options)) return undefined;
   for (const k of keys) {
     const v = options[k];
+    if (typeof v === 'string' && v.length) return v;
+  }
+  return undefined;
+}
+function readStringOrFalseOption(options: unknown, keys: string[]): string | false | undefined {
+  if (!isObject(options)) return undefined;
+  for (const k of keys) {
+    const v = options[k];
+    if (v === false) return false;
     if (typeof v === 'string' && v.length) return v;
   }
   return undefined;

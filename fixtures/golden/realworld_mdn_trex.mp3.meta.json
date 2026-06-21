@@ -1,0 +1,14 @@
+{
+  "container": "mp3",
+  "durationSec": 2.074,
+  "tracks": [
+    {
+      "type": "audio",
+      "codec": "mp3",
+      "sampleRate": 44100,
+      "channels": 2,
+      "bitrate": 150735,
+      "language": null
+    }
+  ]
+}

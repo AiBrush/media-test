@@ -38,6 +38,7 @@ import type {
   NormalizedMetadata,
   Operation,
   RemuxOptions,
+  MuxOptions,
   TranscodeOptions,
 } from './engine.ts';
 import type {
@@ -518,10 +519,19 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 function asRemuxOpts(options: Scenario['options']): RemuxOptions {
   const raw = (options ?? {}) as Record<string, unknown>;
   const tags = raw['tags'];
-  return {
-    container: asContainerOpt(options),
-    ...(isStringRecord(tags) ? { tags } : {}),
-  };
+  const opts: RemuxOptions = { ...raw, container: asContainerOpt(options) };
+  if (isStringRecord(tags)) {
+    opts.tags = tags;
+  } else {
+    delete opts.tags;
+  }
+  return opts;
+}
+function asMuxOpts(options: Scenario['options']): MuxOptions {
+  const raw = (options ?? {}) as Record<string, unknown>;
+  const opts: MuxOptions = { ...raw, container: asContainerOpt(options) };
+  delete opts.tracks;
+  return opts;
 }
 function asTranscodeOpts(options: Scenario['options']): TranscodeOptions {
   const o = (options ?? {}) as Partial<TranscodeOptions>;
@@ -605,7 +615,7 @@ async function executeOp(engine: MediaEngine, scenario: Scenario, inputs: MediaI
       if (!tracks) {
         throw notApplicableError('mux scenario requires options.tracks or engine.prepareMuxTracks()');
       }
-      return { output: await engine.mux(tracks, { container: asContainerOpt(scenario.options) }) };
+      return { output: await engine.mux(tracks, asMuxOpts(scenario.options)) };
     }
     case 'decrypt': {
       if (!engine.decrypt) throw new Error("engine.decrypt is not implemented (capability declared but method missing)");

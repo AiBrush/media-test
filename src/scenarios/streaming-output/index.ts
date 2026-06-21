@@ -5,17 +5,16 @@
  * streaming target, fragmented/CMAF (moof/mdat), fastStart (moov-first / reserve / none), MPEG-TS tiny
  * writes, headerless/live WebM, and the bounded-peak-memory promise of a stream target at GB scale.
  * Every case is a lossless `remux` (coded samples copied), so the SHAPE — not the codec — is what
- * differs. See ./_shared.ts for the oracle rationale and the contract-level caveat that the shape
- * knobs in `options` are not yet forwarded by the runner (a core change outside this writer's scope).
+ * differs. See ./_shared.ts for the oracle rationale, forwarded shape options, and remaining
+ * observability caveats.
  *
  * This index holds the BASE six output-shape cases and concatenates the sibling sub-batteries:
  *   - ./base.ts                 — the original six shapes (stable ids), with the honest oracle fix
  *                                 (reference-reimport, not brittle plain-<video> smoke).
  *   - ./ttfb.ts                 — time-to-first-byte (§A.10) buffer vs stream, ranked on timeToFirstByte.
  *   - ./fragmented-faststart.ts — fastStart progressive (moov-first) + fastStart:false control + the
- *                                 fragmented lossless-copy premise; documents the moof/mdat structure,
- *                                 moov-position, forward-seek, and reserve overflow/underflow gaps that
- *                                 need a new structural oracle (out of scope) rather than faking them.
+ *                                 fragmented lossless-copy premise; checks top-level MP4 box layout
+ *                                 and documents deeper MSE / reserve overflow gaps rather than faking them.
  *   - ./ts-webm-live.ts         — MPEG-TS continuity across tiny writes + headerless/"live" WebM.
  *   - ./size-ladder.ts          — buffer-vs-stream PEAK-MEMORY contrast at large/huge/massive scale
  *                                 (§A.10 reason-to-exist + §5.3), ranked on peakMemory.

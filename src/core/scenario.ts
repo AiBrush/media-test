@@ -33,6 +33,7 @@ export type OracleId =
   | 'reference-reimport' // re-import engine output with the reference engine; compare packet tables
   | 'playback-smoke' // <video> can play the output
   | 'ssim-psnr' // decode output → SSIM+PSNR vs reference frames (lossy ops)
+  | 'mp4-box-layout' // MP4/MOV top-level box order/fragment structure for output-shape rows
   | 'alpha-plane' // alpha channel compared separately
   | 'seek-accuracy' // seek lands on expected keyframe / within tolerance
   | 'trim-boundaries' // out duration ≈ requested; boundary frames only with trim-range golden

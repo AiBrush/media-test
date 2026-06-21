@@ -3,6 +3,7 @@ import type { ScenarioResult } from '../core/scenario.ts';
 const DB_NAME = 'media-browser-test-results';
 const DB_VERSION = 1;
 const STORE = 'results';
+const CACHE_VALIDATION_EPOCH = '2026-06-21-real-validation-v1';
 const INVALIDATED_PASS_KEYS = new Set([
   'ffmpeg.wasm@0.12.15\u0000transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
   'ffmpeg.wasm@0.12.15\u0000transcode/h264_to_mkv',
@@ -33,6 +34,7 @@ export interface ResultCache {
 interface StoredResultRow {
   key?: unknown;
   updatedAtIso?: string;
+  validationEpoch?: string;
   result?: ScenarioResult;
 }
 
@@ -40,8 +42,10 @@ function cacheKey(engineId: string, scenarioId: string, browser: string): string
   return `${browser}\u0000${engineId}\u0000${scenarioId}`;
 }
 
-function shouldInvalidateCachedResult(result: ScenarioResult): boolean {
-  return result.status === 'PASS' && INVALIDATED_PASS_KEYS.has(`${result.engineId}\u0000${result.scenarioId}`);
+function shouldInvalidateCachedResult(result: ScenarioResult, validationEpoch?: string): boolean {
+  if (result.status !== 'PASS') return false;
+  if (validationEpoch !== CACHE_VALIDATION_EPOCH) return true;
+  return INVALIDATED_PASS_KEYS.has(`${result.engineId}\u0000${result.scenarioId}`);
 }
 
 export function isReusableResult(result: ScenarioResult | undefined): result is ScenarioResult {
@@ -73,8 +77,8 @@ export function createResultCache(): ResultCache | undefined {
         const tx = database.transaction(STORE, 'readonly');
         const req = tx.objectStore(STORE).get(key);
         req.onsuccess = () => {
-          const row = req.result as { result?: ScenarioResult } | undefined;
-          if (!row?.result || shouldInvalidateCachedResult(row.result)) {
+          const row = req.result as StoredResultRow | undefined;
+          if (!row?.result || shouldInvalidateCachedResult(row.result, row.validationEpoch)) {
             resolve(undefined);
             return;
           }
@@ -90,6 +94,7 @@ export function createResultCache(): ResultCache | undefined {
         tx.objectStore(STORE).put({
           key: cacheKey(result.engineId, result.scenarioId, result.browser),
           updatedAtIso: new Date().toISOString(),
+          validationEpoch: CACHE_VALIDATION_EPOCH,
           result,
         });
         tx.oncomplete = () => resolve();
@@ -111,7 +116,7 @@ export function createResultCache(): ResultCache | undefined {
               key: typeof row.key === 'string' ? row.key : String(cursor.key),
               updatedAtIso: row.updatedAtIso,
               result: row.result,
-              invalidated: shouldInvalidateCachedResult(row.result),
+              invalidated: shouldInvalidateCachedResult(row.result, row.validationEpoch),
             });
           }
           cursor.continue();

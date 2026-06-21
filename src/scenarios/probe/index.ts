@@ -37,6 +37,7 @@ import { defineScenario } from '../../core/scenario.ts';
 
 /** One probe scenario per asset. `containersIn` + codec hints make NA-negotiation honest. */
 interface ProbeCase {
+  id?: string;
   asset: string;
   container: string;
   videoCodecs?: string[];
@@ -50,6 +51,16 @@ interface ProbeCase {
 const PROBE_CASES: ProbeCase[] = [
   // ── Video MP4 / MOV ──
   { asset: 'h264_1080p_30s.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'] },
+  {
+    id: 'realworld_mdn_flower_mp4',
+    asset: 'realworld_mdn_flower.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 flower.mp4 from sourceUrl in manifest. Prevents the ' +
+      'MP4 probe axis from relying only on ffmpeg-generated test patterns.',
+  },
   { asset: 'h264_4k_10s.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'] },
   { asset: 'hevc_1080p_10s.mp4', container: 'mp4', videoCodecs: ['hevc'], audioCodecs: ['aac'] },
   {
@@ -87,6 +98,16 @@ const PROBE_CASES: ProbeCase[] = [
 
   // ── WebM / MKV ──
   { asset: 'vp9_1080p_10s.webm', container: 'webm', videoCodecs: ['vp9'], audioCodecs: ['opus'] },
+  {
+    id: 'realworld_mdn_flower_webm',
+    asset: 'realworld_mdn_flower.webm',
+    container: 'webm',
+    videoCodecs: ['vp8'],
+    audioCodecs: ['vorbis'],
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 flower.webm from sourceUrl in manifest. Exercises a ' +
+      'browser-documentation WebM instead of generated testsrc media.',
+  },
   { asset: 'vp8_720p_10s.webm', container: 'webm', videoCodecs: ['vp8'], audioCodecs: ['vorbis'] },
   { asset: 'av1_720p_5s.webm', container: 'webm', videoCodecs: ['av1'], audioCodecs: ['opus'] },
   {
@@ -162,6 +183,17 @@ const PROBE_CASES: ProbeCase[] = [
       "token's endianness ('pcm-s16be'). Engines without AIFF support negotiate NA honestly.",
   },
   { asset: 'mp3_xing.mp3', container: 'mp3', audioCodecs: ['mp3'], notes: 'Xing/Info header → accurate duration.' },
+  {
+    id: 'realworld_mdn_trex_mp3',
+    asset: 'realworld_mdn_trex.mp3',
+    container: 'mp3',
+    audioCodecs: ['mp3'],
+    tolerances: { durationToleranceSec: 0.05 },
+    notes:
+      'Real-world fetched corpus smoke: MDN CC0 t-rex-roar.mp3 from sourceUrl in manifest. Complements ' +
+      'the synthetic sine-wave MP3 fixtures. Uses a narrow 50ms duration band for MP3 encoder-delay/' +
+      'padding estimation differences; packet walking is separately gated by demux/realworld_mdn_trex_mp3.',
+  },
   {
     asset: 'mp3_cbr_notoc.mp3',
     container: 'mp3',
@@ -293,7 +325,7 @@ const PROBE_CASES: ProbeCase[] = [
 
 const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
   defineScenario({
-    id: `probe/${c.asset.replace(/\.[^.]+$/, '')}`,
+    id: `probe/${c.id ?? c.asset.replace(/\.[^.]+$/, '')}`,
     op: 'probe',
     input: c.asset,
     requires: {
