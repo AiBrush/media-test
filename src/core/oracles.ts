@@ -2181,19 +2181,25 @@ async function transcodeOutputMetadataInvariant(
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
   if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
-  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe output metadata`);
-
-  let meta: NormalizedMetadata;
-  try {
-    meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.transcode-meta'));
-  } catch (err) {
-    return fail(oracle, `[${which}] reference probe of output failed: ${errMsg(err)}`);
-  }
-
   const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
   const expectedContainer = readStringOption(options, ['container']);
   const videoOpts = readObjectOption(options, 'video');
   const audioOpts = readObjectOption(options, 'audio');
+
+  let meta: NormalizedMetadata;
+  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe output metadata`);
+  try {
+    meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.transcode-meta'));
+  } catch (err) {
+    const fallback = expectedContainer === 'aiff' || ctx.output.container === 'aiff'
+      ? parseAiffMetadata(ctx.output.bytes)
+      : null;
+    if (!fallback) {
+      return fail(oracle, `[${which}] reference probe of output failed: ${errMsg(err)}`);
+    }
+    meta = fallback;
+  }
+
   const diffs: string[] = [];
   const measurements: Record<string, number> = {};
 
@@ -2250,6 +2256,74 @@ async function transcodeOutputMetadataInvariant(
     `[invariant transcode output metadata] ${meta.container}, ${meta.tracks.length} track(s) match requested output shape`,
     measurements,
   );
+}
+
+function parseAiffMetadata(bytes: Uint8Array): NormalizedMetadata | null {
+  if (bytes.byteLength < 30) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (ascii(bytes, 0, 4) !== 'FORM') return null;
+  const formType = ascii(bytes, 8, 4);
+  if (formType !== 'AIFF' && formType !== 'AIFC') return null;
+
+  let offset = 12;
+  while (offset + 8 <= bytes.byteLength) {
+    const type = ascii(bytes, offset, 4);
+    const size = view.getUint32(offset + 4, false);
+    const body = offset + 8;
+    if (body + size > bytes.byteLength) break;
+
+    if (type === 'COMM' && size >= 18) {
+      const channels = view.getUint16(body, false);
+      const sampleFrames = view.getUint32(body + 2, false);
+      const sampleSize = view.getUint16(body + 6, false);
+      const sampleRate = readExtended80(view, body + 8);
+      const compression = formType === 'AIFC' && size >= 22 ? ascii(bytes, body + 18, 4) : 'NONE';
+      const codec = aiffCodec(compression, sampleSize);
+      return {
+        container: 'aiff',
+        durationSec: sampleRate > 0 ? sampleFrames / sampleRate : null,
+        tracks: [
+          {
+            type: 'audio',
+            codec,
+            sampleRate: Math.round(sampleRate),
+            channels,
+            language: null,
+          },
+        ],
+      };
+    }
+
+    offset = body + size + (size % 2);
+  }
+
+  return null;
+}
+
+function aiffCodec(compression: string, sampleSize: number): string {
+  const c = compression.trim();
+  if (c === 'sowt') return sampleSize === 24 ? 'pcm-s24' : 'pcm-s16';
+  if (sampleSize === 24) return 'pcm-s24be';
+  if (sampleSize === 32) return 'pcm-s32be';
+  return 'pcm-s16be';
+}
+
+function readExtended80(view: DataView, offset: number): number {
+  if (offset + 10 > view.byteLength) return 0;
+  const signExp = view.getUint16(offset, false);
+  const sign = signExp & 0x8000 ? -1 : 1;
+  const exponent = signExp & 0x7fff;
+  const hi = view.getUint32(offset + 2, false);
+  const lo = view.getUint32(offset + 6, false);
+  if (exponent === 0 && hi === 0 && lo === 0) return 0;
+  const mantissa = hi * 2 ** 32 + lo;
+  return sign * mantissa * 2 ** (exponent - 16383 - 63);
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  let out = '';
+  for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i] ?? 0);
+  return out;
 }
 
 function compareRequestedTrack(

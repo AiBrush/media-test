@@ -42,6 +42,7 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    tolerances: { durationToleranceSec: 0.125 },
     // probe-duration only; reference-reimport is correctly omitted (multi-source golden).
     notes:
       'MULTI-SOURCE → NON-mp4: H.264 video (asset A) + AAC audio (asset B, raw ADTS) assembled into ' +

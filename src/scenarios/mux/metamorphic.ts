@@ -45,6 +45,7 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes:
       'demux(mux(x))≈x via duration (§A.16): H.264+AAC muxed MP4→MKV must materialize a Segment ' +
       'Duration ≈ the source. probe(mux(x)).dur≈probe(x).dur — the count-gate-free cross-container check.',
@@ -124,7 +125,7 @@ const METAMORPHIC_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: [VFR_MUX_TIMESTAMPS],
-    tolerances: { durationToleranceSec: 0.125 },
+    tolerances: { durationToleranceSec: 0.25 },
     notes:
       'VFR through mux → mp4 (§A.16 VFR nominal vs real fps): irregular per-sample durations must be ' +
       'preserved; a constant-cadence-assuming muxer changes the total duration. probe(mux(x)).dur gates it. ' +

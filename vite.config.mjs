@@ -95,7 +95,11 @@ function streamStaticFile(req, res, filePath, st, type, corp) {
   if (req.method === 'HEAD') return res.end();
 
   const stream = createReadStream(filePath, { start, end });
+  req.on('close', () => {
+    if (!res.writableEnded) stream.destroy();
+  });
   stream.on('error', (err) => {
+    if (res.destroyed || err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return;
     if (!res.headersSent) res.statusCode = 500;
     res.end(`static stream error: ${err?.message || err}`);
   });
@@ -128,6 +132,26 @@ function fixturesStatic() {
 
         const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
         // Under COEP: require-corp, every subresource needs a CORP header to be loadable.
+        return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
+      });
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0];
+        if (!url.startsWith('/fixtures/')) return next();
+
+        const filePath = normalize(join(process.cwd(), decodeURIComponent(url)));
+        if (!filePath.startsWith(fixturesRoot) || !existsSync(filePath)) {
+          res.statusCode = 404;
+          return res.end('fixtures: not found');
+        }
+        const st = statSync(filePath);
+        if (st.isDirectory()) {
+          res.statusCode = 404;
+          return res.end('fixtures: is a directory');
+        }
+
+        const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
         return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
       });
     },
@@ -184,6 +208,13 @@ function crossOriginIsolation() {
   return {
     name: 'cross-origin-isolation',
     configureServer(server) {
+      server.middlewares.use((_req, res, next) => {
+        res.setHeader('Cross-Origin-Opener-Policy', coop);
+        res.setHeader('Cross-Origin-Embedder-Policy', coep);
+        next();
+      });
+    },
+    configurePreviewServer(server) {
       server.middlewares.use((_req, res, next) => {
         res.setHeader('Cross-Origin-Opener-Policy', coop);
         res.setHeader('Cross-Origin-Embedder-Policy', coep);

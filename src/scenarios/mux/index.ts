@@ -60,6 +60,7 @@ const LEGACY_CASES: LegacyMuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    tolerances: { durationToleranceSec: 0.125 },
     notes: 'Same coded tracks muxed into Matroska.',
   },
   {

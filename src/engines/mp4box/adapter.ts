@@ -979,7 +979,10 @@ export class Mp4boxEngine implements MediaEngine {
     const MP4Box = this.lib();
     const out = MP4Box.createFile(true);
     const movieTimescale = 1_000;
-    const movieDuration = Math.max(...realTracks.map((t) => usToTrackTicks(trackDurationUs(t), movieTimescale)));
+    let movieDuration = 0;
+    for (const track of realTracks) {
+      movieDuration = Math.max(movieDuration, usToTrackTicks(trackDurationUs(track), movieTimescale));
+    }
     out.init({ brands: ['isom', 'iso6', 'mp41'], timescale: movieTimescale, duration: movieDuration });
 
     const hasVideo = realTracks.some((t) => t.type === 'video');
@@ -987,12 +990,11 @@ export class Mp4boxEngine implements MediaEngine {
       const track = realTracks[i]!;
       const info = track.mp4boxMux!;
       const timescale = Number.isFinite(track.timescale) && track.timescale > 0 ? track.timescale : 1_000_000;
-      const mediaDuration = Math.max(
-        ...track.chunks.map((chunk) => {
-          const timing = sampleTimingForChunk(chunk, timescale);
-          return Math.max(timing.dts + timing.duration, timing.cts + timing.duration);
-        }),
-      );
+      let mediaDuration = 0;
+      for (const chunk of track.chunks) {
+        const timing = sampleTimingForChunk(chunk, timescale);
+        mediaDuration = Math.max(mediaDuration, timing.dts + timing.duration, timing.cts + timing.duration);
+      }
       const trackDuration = usToTrackTicks(trackDurationUs(track), movieTimescale);
       const addTrackOptions: Mp4boxIsoFileOptions = {
         id: i + 1,

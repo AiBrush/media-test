@@ -174,6 +174,9 @@ function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined
   if (requestsOutputShape && !features.includes(OUTPUT_SHAPE_FEATURE)) {
     features.push(OUTPUT_SHAPE_FEATURE);
   }
+  if (shape.fastStart === false && !features.includes('fastStart:none')) {
+    features.push('fastStart:none');
+  }
   return features.length ? features : undefined;
 }
 

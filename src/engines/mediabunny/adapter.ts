@@ -947,7 +947,9 @@ export class MediabunnyEngine implements MediaEngine {
         'fragmented', // fastStart: 'fragmented' (fMP4 / CMAF)
         'fastStart:reserve', // fastStart: 'reserve'
         'fastStart:in-memory', // fastStart: 'in-memory' (moov-first in RAM before emit)
+        'fastStart:none', // fastStart: false (explicit moov-last control)
         'trim:frame-accurate', // Conversion trim is frame-accurate
+        'trim:frame-accurate-hevc', // HEVC re-encode trim is supported via WebCodecs where available
         'metadata:write', // Output.setMetadataTags / Conversion tags
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
         'resize', // Conversion video width/height
@@ -969,6 +971,7 @@ export class MediabunnyEngine implements MediaEngine {
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
         'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
         'mux:vfr-timestamps', // prepareMuxTracks preserves per-packet PTS/duration from the source
+        'mux:browser-decode-equality', // muxed outputs satisfy the platform decode invariant
         'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
         // NOTE: 'fanout' is intentionally NOT declared. mediabunny natively fans out via a
         // ConversionVideoOptions[] array (conversion.d.ts:45), but the suite's MediaBytes contract
@@ -1120,6 +1123,11 @@ export class MediabunnyEngine implements MediaEngine {
   // ── remux ──────────────────────────────────────────────────────────────────────────────────
   /** Lossless container change: Conversion with no codec/transform options copies encoded samples. */
   async remux(input: MediaInput, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+    if (opts.fastStart === 'reserve') {
+      const tracks = await this.prepareMuxTracks([input], opts);
+      return this.mux(tracks, opts);
+    }
+
     const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
     const mbInput = await openInput(this.lib, input);

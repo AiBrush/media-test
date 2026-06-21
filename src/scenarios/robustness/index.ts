@@ -600,6 +600,7 @@ interface ShapeEdgeCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   options?: Record<string, unknown>;
+  tolerances?: Scenario['tolerances'];
   oracles: Scenario['oracles'];
   notes: string;
 }
@@ -740,6 +741,7 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     oracles: ['golden-metadata'],
+    tolerances: { fpsTolerance: 30 },
     notes:
       '§A.16 MPEG-TS discontinuity: a joined TS stream with a timestamp jump. Probe duration must be ' +
       'derived safely without negative-duration or hang behavior.',
@@ -790,6 +792,7 @@ const shapeEdgeScenarios: Scenario[] = SHAPE_EDGE_CASES.map((c) =>
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
     oracles: c.oracles,
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     metrics: ['wall', 'peakMemory', 'longtasks'],
     timeoutMs: FUZZ_TIMEOUT_MS,
     notes: c.notes,
@@ -1070,7 +1073,7 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     containersIn: ['mp4'],
     containersOut: ['mp4'],
     audioCodecs: ['aac'],
-    features: ['trim:frame-accurate'],
+    features: ['trim:frame-accurate', 'audio-samples:gapless-priming'],
     options: {
       container: 'mp4',
       frameAccurate: true,

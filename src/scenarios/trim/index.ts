@@ -257,6 +257,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_500_000,
     endUs: 6_500_000,
     frameAccurate: true,
+    features: ['trim:frame-accurate-hevc'],
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'HEVC frame-accurate trim (leading GOP re-encode requires an HEVC encoder); NA where unsupported.',

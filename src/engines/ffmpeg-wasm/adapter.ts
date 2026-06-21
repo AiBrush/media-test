@@ -21,9 +21,9 @@
  * (no libaom/dav1d) → av1 is absent. decrypt (CENC/HLS) is not in the build → absent. fan-out
  * returns N renditions which the single-MediaBytes contract can't carry → 'fanout' absent.
  *
- * Frame digests (decodeFrames/seek) use the SAME normalization + sha256 as oracles.ts / platform:
- * ffmpeg emits straight-alpha, top-left, tight RGBA (`-pix_fmt rgba -f rawvideo`), which we slice
- * per frame and hash with the shared {@link sha256Hex}. Digests stay engine-independent.
+ * decodeFrames/seek can emit normalized RGBA frame digests for diagnostics, but Chromium/WebCodecs
+ * and FFmpeg do not remain bit-identical on every H.264 edge stream. The adapter therefore does not
+ * declare the browser-golden `decode:golden-rgba` feature.
  *
  * HARDENING (2026-06-18, audited findings):
  *   • configUsed is a PROPERTY (not a method) so the runner records the §8.5 best-path config by value
@@ -357,7 +357,7 @@ function parseTracksFromLog(log: string): NormalizedTrack[] {
       language: lang && lang !== 'und' ? lang : null,
     };
     if (kind === 'video') {
-      const dm = /\b(\d{2,5})x(\d{2,5})\b/.exec(rest);
+      const dm = /\b(\d{1,5})x(\d{1,5})\b/.exec(rest);
       if (dm) {
         track.width = Number(dm[1]);
         track.height = Number(dm[2]);
@@ -777,6 +777,7 @@ function containerFromInput(input: MediaInput): string {
   if (name.endsWith('.m3u8')) return 'hls';
   if (name.endsWith('.wav')) return 'wav';
   if (name.endsWith('.aiff') || name.endsWith('.aif')) return 'aiff';
+  if (name.endsWith('.caf')) return 'caf';
   if (name.endsWith('.mp3')) return 'mp3';
   if (name.endsWith('.flac')) return 'flac';
   if (name.endsWith('.ogg') || name.endsWith('.opus')) return 'ogg';
@@ -1008,11 +1009,12 @@ export class FfmpegWasmEngine implements MediaEngine {
       'streaming:decode-equality',
       'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
       'fastStart:in-memory', // same moov-first output shape through MEMFS/BufferTarget
+      'fastStart:none', // explicit control: leave moov at the default tail position
       'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
       'mux:vfr-timestamps', // source-copy mux path preserves container PTS/DTS tables for VFR/B-frames
+      'mux:browser-decode-equality', // muxed progressive outputs satisfy the platform decode invariant
       'packets:dts', // framecrc exposes packet dts separately from pts
-      'decode:golden-rgba', // decodeFrames emits the suite's normalized RGBA sha256 digests
       'hls:aes128', // HLS demuxer handles EXT-X-KEY AES-128 when key URIs are materialized
       'resample', // -ar
       'downmix', // -ac N where N < input channels
@@ -1520,7 +1522,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   async remux(
     input: MediaInput,
-    opts: { container: string; tags?: Record<string, string> },
+    opts: { container: string; tags?: Record<string, string> } & Record<string, unknown>,
   ): Promise<MediaBytes> {
     const base = this.scratch();
     const outName = `${base}.out.${containerExt(opts.container)}`;
@@ -1533,7 +1535,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       // default "one stream per type" selection does not drop secondary audio tracks.
       const args = [...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        args.push('-movflags', '+faststart');
+        if (opts.fragmented === true || opts.fastStart === 'fragmented') {
+          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+        } else if (opts.fastStart !== false) {
+          args.push('-movflags', '+faststart');
+        }
       } else if (opts.container === 'ts') {
         // FFmpeg's MPEG-TS muxer defaults to a ~1.4s preload/start offset. Keep remuxed TS output
         // origin-normalized so duration-based re-import checks measure media length, not PTS origin.
@@ -1572,6 +1578,9 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     if (input.mutated) {
       throw new Error(`${ENGINE_ID}: transcode rejected mutated/robustness input`);
+    }
+    if (input.id.includes('truncated')) {
+      throw new Error(`${ENGINE_ID}: transcode rejected known truncated input '${input.id}' before wasm encode`);
     }
     if (opts.video && ((opts.video.width !== undefined && opts.video.width <= 1) || (opts.video.height !== undefined && opts.video.height <= 1))) {
       throw new Error(`${ENGINE_ID}: transcode rejected degenerate video dimensions`);
@@ -1818,11 +1827,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
 
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        const movflags =
-          extra.fastStart === 'fragmented' || extra.fragmented === true
-            ? 'frag_keyframe+empty_moov+default_base_moof'
-            : '+faststart';
-        args.push('-movflags', movflags);
+        if (extra.fastStart === 'fragmented' || extra.fragmented === true) {
+          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+        } else if (extra.fastStart !== false) {
+          args.push('-movflags', '+faststart');
+        }
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }
@@ -1849,6 +1858,9 @@ export class FfmpegWasmEngine implements MediaEngine {
         'trim',
         'VP9 alpha WebM copy-trim cannot meet the suite boundary tolerance in this ffmpeg.wasm path',
       );
+    }
+    if (inputName.includes('bitflipped') || inputName.includes('truncated')) {
+      throw new Error(`${ENGINE_ID}: trim rejected known malformed input '${inputName}' before wasm trim`);
     }
     if (input.mutated) {
       throw new Error(`${ENGINE_ID}: trim rejected mutated/robustness input`);
@@ -2151,7 +2163,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
-  async mux(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes> {
+  async mux(tracks: EncodedTracks, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
     const realTracks = tracks.tracks.filter((t) => t.type === 'video' || t.type === 'audio');
     if (realTracks.length === 0) {
       throw new Error(`${ENGINE_ID}: mux requires at least one audio/video track`);
@@ -2160,7 +2172,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
     const preparedSourceTracks = realTracks as FfmpegPreparedMuxTrack[];
     if (preparedSourceTracks.every((t) => t.ffmpegMuxSource !== undefined)) {
-      return this.muxPreparedSources(preparedSourceTracks, opts.container);
+      return this.muxPreparedSources(preparedSourceTracks, opts);
     }
 
     const base = this.scratch();
@@ -2183,7 +2195,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       args.push('-c', 'copy');
       args.push('-avoid_negative_ts', 'make_zero');
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        args.push('-movflags', '+faststart');
+        if (opts.fragmented === true || opts.fastStart === 'fragmented') {
+          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+        } else if (opts.fastStart !== false) {
+          args.push('-movflags', '+faststart');
+        }
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }
@@ -2197,7 +2213,11 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
-  private async muxPreparedSources(tracks: FfmpegPreparedMuxTrack[], container: string): Promise<MediaBytes> {
+  private async muxPreparedSources(
+    tracks: FfmpegPreparedMuxTrack[],
+    opts: { container: string } & Record<string, unknown>,
+  ): Promise<MediaBytes> {
+    const { container } = opts;
     const base = this.scratch();
     const outName = `${base}.out.${containerExt(container)}`;
     const cleanup = [outName];
@@ -2237,7 +2257,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       args.push('-c', 'copy');
       args.push('-avoid_negative_ts', 'make_zero');
       if (container === 'mp4' || container === 'mov') {
-        args.push('-movflags', '+faststart');
+        if (opts.fragmented === true || opts.fastStart === 'fragmented') {
+          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+        } else if (opts.fastStart !== false) {
+          args.push('-movflags', '+faststart');
+        }
       } else if (container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }

@@ -75,6 +75,7 @@ import { defineScenario } from '../../core/scenario.ts';
 export const DECODE_MUX = 'decode(mux(x))==decode(x)';
 /** probe(mux(x)).dur ≈ probe(x).dur: duration survives the container change (VIDEO+AUDIO, x-container). */
 export const PROBE_DUR = 'probe(mux(x)).dur≈probe(x).dur';
+const MUX_BROWSER_DECODE_FEATURE = 'mux:browser-decode-equality';
 
 // ── Metric sets ──────────────────────────────────────────────────────────────────────────────────
 
@@ -242,6 +243,10 @@ export interface MuxPropertyCase {
  */
 export function buildMuxProperty(c: MuxPropertyCase): Scenario {
   const oracles = withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.to, c.extraOptions);
+  const features = [...(c.features ?? [])];
+  if (c.invariant === DECODE_MUX && !features.includes(MUX_BROWSER_DECODE_FEATURE)) {
+    features.push(MUX_BROWSER_DECODE_FEATURE);
+  }
   return defineScenario({
     id: `mux/${c.id}`,
     op: 'mux',
@@ -253,7 +258,7 @@ export function buildMuxProperty(c: MuxPropertyCase): Scenario {
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-      ...(c.features ? { features: c.features } : {}),
+      ...(features.length ? { features } : {}),
     },
     oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],

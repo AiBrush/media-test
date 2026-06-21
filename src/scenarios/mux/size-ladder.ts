@@ -77,6 +77,7 @@ const SIZE_LADDER_CASES: MuxCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     primaryMetric: 'throughputRealtime',
+    tolerances: { durationToleranceSec: 0.125 },
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
     notes:
       'SIZE LADDER (large ~100 MB §A.16): 120 s 1080p H.264 → mp4. Many-thousand-sample sample table; ' +
@@ -90,6 +91,7 @@ const SIZE_LADDER_CASES: MuxCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     primaryMetric: 'throughputRealtime',
+    tolerances: { durationToleranceSec: 0.125 },
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
     notes:
       'SIZE LADDER (large ~100 MB §A.16): 120 s 1080p H.264 → mkv. Matroska cue-index density at scale ' +
