@@ -2728,8 +2728,18 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     }
     if (outDur == null) return fail(oracle, `[${which}] output probe returned null duration`);
     const d = Math.abs(outDur - goldenDur);
+    const explicitDurOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
     const container = resolveContainer(ctx.golden.meta?.container ?? ctx.output.container, primaryAssetId(ctx));
-    const band = durationToleranceFor(container, primaryAssetId(ctx), t, ctx.scenario.tolerances?.durationToleranceSec != null);
+    // This invariant probes an AUTHORED output. An mp3 elementary stream produced by mux/transcode
+    // has no guaranteed Xing/Info TOC, so its probed duration is frame-estimate-only (≈±2 mp3 frames
+    // of encoder-delay/partial-final-frame) EVEN WHEN the source was a Xing mp3 whose golden stays
+    // strict for probe/demux. Key the band off the authored OUTPUT container so an mp3 write target is
+    // judged with the same estimate-only band as ts/adts (precise inputs still keep the ±1-frame gate).
+    const authoredMp3Out =
+      !explicitDurOverride && resolveContainer(ctx.output.container, '').trim().toLowerCase() === 'mp3';
+    const band = authoredMp3Out
+      ? { tolSec: LOOSE_DURATION_ABS_SEC, loose: true }
+      : durationToleranceFor(container, primaryAssetId(ctx), t, explicitDurOverride);
     const tolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(goldenDur)) : band.tolSec;
     const measurements = { outDurationSec: outDur, goldenDurationSec: goldenDur, deltaSec: d, durationToleranceSec: tolSec };
     if (d > tolSec) {
@@ -3830,8 +3840,8 @@ function probeDurationInvariant(
   const explicitOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
 
   entries.forEach((entry, index) => {
-    const gotDur = entry.metadata.durationSec;
-    const wantDur = entry.golden.meta?.durationSec ?? null;
+    const gotDur = entry.metadata?.durationSec ?? null;
+    const wantDur = entry.golden?.meta?.durationSec ?? null;
     const label = entry.input.id;
     if (wantDur == null) {
       diffs.push(`${label}: no golden/source duration to compare`);
@@ -3842,7 +3852,7 @@ function probeDurationInvariant(
       return;
     }
 
-    const container = resolveContainer(entry.golden.meta?.container ?? entry.metadata.container, label);
+    const container = resolveContainer(entry.golden?.meta?.container ?? entry.metadata?.container, label);
     const band = durationToleranceFor(container, label, t, explicitOverride);
     const tolSec = band.loose
       ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(wantDur))

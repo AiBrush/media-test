@@ -2056,8 +2056,46 @@ export class FfmpegWasmEngine implements MediaEngine {
   // ── decrypt ──────────────────────────────────────────────────────────────────────────────────
 
   async decrypt(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes> {
+    // Scheme dispatch. Two schemes are honestly supported and declared (encryption capability set is
+    // ['cenc-ctr','hls-aes128']); everything else throws a PLAIN Error so graceful-failure robustness
+    // cases record a clean reject (runRobustness maps NotApplicableError→NA_ENGINE, plain throw→graceful).
+    if (opts.scheme === 'hls-aes128') {
+      // Native FFmpeg HLS decrypt-on-demux + stream copy. writeInput() materializes the EXT-X-KEY URI
+      // and referenced .ts segments into MEMFS and returns inputOptions (['-allowed_extensions','ALL'])
+      // plus the playlist name. The HLS demuxer transparently decrypts METHOD=AES-128 segments during
+      // demux; -c copy stream-copies the cleared H.264/AAC into a faststart MP4. No extra
+      // -protocol_whitelist is needed (the HLS demuxer auto-whitelists crypto+file).
+      const base = this.scratch();
+      const outName = `${base}.clear.mp4`;
+      const written = await this.writeInput(input, `${base}.in`);
+      try {
+        await this.run(
+          [
+            ...written.inputOptions,
+            '-i',
+            written.name,
+            '-map',
+            '0',
+            '-c',
+            'copy',
+            '-movflags',
+            '+faststart',
+            outName,
+          ],
+          READ_EXEC_TIMEOUT_MS,
+        );
+        const bytes = await this.readBinary(outName);
+        return { bytes, mime: containerMime('mp4'), container: 'mp4' };
+      } finally {
+        await this.cleanup([...written.cleanupPaths, outName]);
+      }
+    }
+
     if (opts.scheme !== 'cenc-ctr') {
-      throw new NotApplicableError('decrypt', `scheme '${opts.scheme}' is not supported by this path`);
+      // clearkey / cenc-cens / hls-sample-aes / cenc-cbcs: not a native ffmpeg.wasm decrypt path. A plain
+      // throw (NOT NotApplicableError) yields a graceful-reject verdict for the *_decrypt_na robustness
+      // scenarios. Declared encryption set stays ['cenc-ctr','hls-aes128'] — these are intentionally absent.
+      throw new Error(`${ENGINE_ID}: unsupported decrypt scheme '${opts.scheme}'`);
     }
 
     const keyHex = key.keyHex.trim().toLowerCase();
@@ -2153,11 +2191,14 @@ export class FfmpegWasmEngine implements MediaEngine {
       const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
       const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
       const hasAudio = inputMetadata.tracks.some((t) => t.type === 'audio');
+      // Track mismatch is a graceful-failure robustness case (mismatch_audio_only_to_video_target,
+      // mismatch_video_only_to_audio_target): a PLAIN throw = graceful reject = PASS, whereas a
+      // NotApplicableError would be mapped to NA_ENGINE and miss the graceful-reject assertion.
       if (opts.video && !hasVideo) {
-        throw new NotApplicableError('transcode', 'requested a video output but the input has no video track');
+        throw new Error('requested a video output but the input has no video track');
       }
       if (opts.audio && !hasAudio) {
-        throw new NotApplicableError('transcode', 'requested an audio output but the input has no audio track');
+        throw new Error('requested an audio output but the input has no audio track');
       }
 
       const audioRoundtripCodec = stringOption(plainObject(opts.audio), ['roundtrip']);

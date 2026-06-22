@@ -175,9 +175,15 @@ export function negotiate(
   // Determine whether this scenario asks the browser to configure codecs. Parser-only operations
   // (probe/demux/remux copy) do not need WebCodecs decode support just to read packets/metadata; the
   // old flat gate incorrectly blocked cases like FLAC demux in Chromium. Decode/seek/decrypt need
-  // decode support, while transcode/mux additionally need encode support for target codecs.
+  // decode support. Only transcode additionally needs ENCODE support, because it constructs a real
+  // WebCodecs encoder for the target codecs. mux() is a packet COPY: it writes already-encoded
+  // packets verbatim into the output container and never constructs a WebCodecs encoder OR decoder,
+  // so it needs neither browser decode nor encode support for the packet codecs (the old gate wrongly
+  // produced NA_BROWSER for mediabunny flac/vorbis/mp3/pcm mux cases). mux therefore negotiates on the
+  // engine-declared containers/codecs from Pass 1 alone; any container/codec incompatibility still
+  // surfaces honestly at mux() runtime (FAIL/ERROR, never a false PASS).
   const producesEncodedOutput =
-    requires.operations.includes('transcode') || requires.operations.includes('mux');
+    requires.operations.includes('transcode');
   const needsDecodeConfig =
     requires.operations.includes('decodeFrames') ||
     requires.operations.includes('seek') ||
@@ -222,6 +228,22 @@ export function negotiate(
   }
 
   for (const ac of requiredAudio) {
+    // PCM is uncompressed: some engines encode/decode it in software (a trivial byte
+    // pack/unpack/endian-swap) entirely independent of WebCodecs. Those engines declare the honest
+    // per-codec feature 'audio:pcm-native' (mediabunny, remotion-webcodecs). When set, the browser's
+    // WebCodecs AudioEncoder/AudioDecoder table is irrelevant for pcm-* codecs, so we skip the
+    // NA_BROWSER gate for them only — non-PCM audio (aac/opus/mp3/flac/vorbis) is still gated exactly
+    // as before, and so is PCM on engines that do NOT declare this feature. Correctness remains
+    // enforced by the scenario oracles, so skipping the gate here cannot post a false green.
+    const pcmNative = caps.features.includes('audio:pcm-native') && ac.startsWith('pcm-');
+    // pcm-s16 is the canonical WAV sample format: any engine that declares 'wav' output writes it
+    // with its own muxer (a trivial little-endian sample pack), independent of the WebCodecs
+    // AudioEncoder table (which exposes no PCM encoder). So the browser ENCODE gate must not apply to
+    // a pcm-s16 target when the engine outputs WAV. This is the honest, NARROW counterpart to
+    // 'audio:pcm-native' for engines (e.g. remotion-webcodecs) that ship a WAV writer for pcm-s16 but
+    // legitimately route other PCM widths (pcm-s24/pcm-f32) through WebCodecs and so cannot claim the
+    // blanket token. It suppresses ONLY the encode gate (decode is unaffected) and ONLY for pcm-s16.
+    const pcmWavEncode = ac === 'pcm-s16' && caps.containersOut.includes('wav');
     const canDecode = support.audioDecode[ac] === true;
     const canEncode = support.audioEncode[ac] === true;
     const needsEncode = isTranscode
@@ -230,7 +252,7 @@ export function negotiate(
     const needsDecode = isTranscode
       ? needsTranscodeDecode(ac, requiredAudio, transcodeTargets?.audio ?? new Set())
       : needsDecodeConfig && !producesEncodedOutput;
-    if (needsEncode) {
+    if (needsEncode && !pcmNative && !pcmWavEncode) {
       if (!canEncode) {
         return {
           ok: false,
@@ -239,7 +261,7 @@ export function negotiate(
         };
       }
     }
-    if (needsDecode && !canDecode) {
+    if (needsDecode && !canDecode && !pcmNative) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -1003,7 +1025,23 @@ async function runRobustness(
   // When the op threw, opResult is undefined → empty output fields → graceful-failure infers PASS.
   // When it returned output, we pass it through → graceful-failure FAILs it as suspicious.
   const golden: GoldenStore = await loadGolden(input.id).catch(() => ({}) as GoldenStore);
-  const ctx = buildOracleContext(scenario, input, inputs, opResult ?? {}, golden, engine, opts);
+  // Multi-input probe scenarios (e.g. robustness/prop_duration_consistent_across_containers) carry a
+  // per-entry `golden` that the oracle dereferences; mirror runOne so each probeMetadatas entry has its
+  // own golden loaded. Without this the robustness path left `entry.golden` undefined and the
+  // probe-duration invariant threw "Cannot read properties of undefined (reading 'meta')".
+  let robustnessOpResult = opResult ?? {};
+  if (robustnessOpResult.probeMetadatas?.length) {
+    robustnessOpResult = {
+      ...robustnessOpResult,
+      probeMetadatas: await Promise.all(
+        robustnessOpResult.probeMetadatas.map(async (entry) => ({
+          ...entry,
+          golden: await loadGolden(entry.input.id).catch(() => ({}) as GoldenStore),
+        })),
+      ),
+    };
+  }
+  const ctx = buildOracleContext(scenario, input, inputs, robustnessOpResult, golden, engine, opts);
 
   const oracleOutcomes: OracleOutcome[] = [];
   for (const oracle of scenario.oracles) {
@@ -1197,24 +1235,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
     const scenario = scenarioById.get(cell.scenarioId);
     if (!scenario) continue;
     const engineId = cell.engineId;
-    const disabledReason = disabledCellReason(engineId, scenario.id);
-    if (disabledReason) {
-      const r: ScenarioResult = {
-        engineId,
-        browser: opts.browser,
-        scenarioId: scenario.id,
-        family: scenario.family,
-        status: 'SKIPPED',
-        oracleOutcomes: [],
-        reason: disabledReason,
-        env: { ...runEnvBase, engineId },
-      };
-      results.push(r);
-      opts.onResult?.(r);
-      done += 1;
-      opts.onProgress?.(done, total, `${scenario.id} / ${engineId} (skipped)`);
-      continue;
-    }
     const reg = getEngine(engineId);
     if (!reg) {
       // Unknown engine id: surface as ERROR cells rather than throwing the whole matrix.
@@ -1256,6 +1276,38 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         opts.onResult?.(result);
         done += 1;
         opts.onProgress?.(done, total, label);
+        continue;
+      }
+
+      // Disabled cell? Check AFTER construction so we can match (and label with) the engine's CANONICAL
+      // id (engine.id). The registry key (cell.engineId) may be a bare alias — e.g. mediabunny registers
+      // under 'mediabunny' while the instance reports 'mediabunny@1.48.0' — so we match disabled-cells.ts
+      // entries against EITHER id form, and always label the result with engine.id so a disabled cell
+      // never splits the engine's column in the report.
+      const disabledReason =
+        disabledCellReason(engine.id, scenario.id) ?? disabledCellReason(engineId, scenario.id);
+      if (disabledReason) {
+        if (engine.dispose) {
+          try {
+            await engine.dispose();
+          } catch {
+            // dispose failures must not mask the skip; swallow.
+          }
+        }
+        result = {
+          engineId: engine.id,
+          browser: opts.browser,
+          scenarioId: scenario.id,
+          family: scenario.family,
+          status: 'SKIPPED',
+          oracleOutcomes: [],
+          reason: disabledReason,
+          env: { ...runEnvBase, engineId: engine.id },
+        };
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${scenario.id} / ${engine.id} (skipped)`);
         continue;
       }
 

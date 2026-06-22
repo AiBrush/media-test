@@ -124,7 +124,7 @@ import {
   mimeForContainer,
   type OutputFormatOptions,
 } from './codecs.ts';
-import { digestImageData } from './digest.ts';
+import { digestImageData, sha256Hex } from './digest.ts';
 
 interface PreparedMuxTrackCandidate {
   inputIndex: number;
@@ -982,6 +982,24 @@ export class MediabunnyEngine implements MediaEngine {
         'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
         'headerless', // WebM/Matroska appendOnly live layout: unknown Segment size, no SeekHead/duration
         'fanout', // transcode() returns every requested ABR rendition in MediaBytes.variants[]
+        // mediabunny encodes AND decodes all PCM codecs in PURE TS, independent of WebCodecs:
+        // encode.js canEncodeAudio / decode.js canDecodeAudio return true for PCM_AUDIO_CODECS BEFORE
+        // any WebCodecs probe (initPcmEncoder / PcmAudioDecoderWrapper handle pcm-* natively). The
+        // runner's negotiate() reads this token to SKIP the browser encode/decode gate for pcm-*
+        // codecs (those gates would otherwise NA a codec mediabunny genuinely handles with no browser).
+        'audio:pcm-native',
+        // NOTE: 'encryption:cenc-ctr-clear-output' is deliberately NOT declared. The NA audit proposed
+        // it (decrypt() structurally builds a clear-sample MP4 via resolveKeyId + no-transform
+        // Conversion), but a real browser run proved mediabunny@1.48.0 WASM-ABORTS ("Assertion failed.")
+        // when reading THIS CENC-CTR fixture (cenc_ctr.mp4) — both on decrypt and on plain probe — while
+        // it handles cenc_cbcs.mp4 fine and ffmpeg.wasm decrypts cenc_ctr.mp4 correctly. The clear-output
+        // decrypt path is therefore NOT a real, working capability for this engine/build, so it stays
+        // undeclared (honest NA_ENGINE) rather than surfacing as ERROR. See disabled-cells.ts for the
+        // matching probe/cenc_ctr entry.
+        // decodeFrames() decodes the primary AUDIO track (AudioSampleSink) to interleaved-f32
+        // per-sample-frame digests when the input has no video track, mirroring the decoded-audio-pcm
+        // oracle. Unblocks audio-dsp/throughput_decode_s24 and throughput_decode_s16be.
+        'decode:audio-pcm',
       ],
     };
   }
@@ -1213,7 +1231,56 @@ export class MediabunnyEngine implements MediaEngine {
     const mbInput = await openInput(this.lib, input);
     try {
       const videoTrack = await mbInput.getPrimaryVideoTrack();
-      if (!videoTrack) throw new Error('mediabunny decodeFrames: no video track in input');
+      if (!videoTrack) {
+        // No video track: decode the primary AUDIO track to per-sample-frame digests. This mirrors
+        // the decoded-audio-pcm oracle (src/engines/ffmpeg-wasm/adapter.ts:2606-2631), which decodes
+        // audio to INTERLEAVED little-endian f32 (pcm_f32le) and hashes each sample-frame (one f32
+        // per channel) with a GLOBAL running index used for BOTH index and ptsUs. We must bit-match
+        // that contract exactly, so we use the global index (NOT AudioSample.timestamp), extract
+        // interleaved f32 (planeIndex 0, format 'f32' — non-planar), and sha256 over exactly
+        // channels*4 raw little-endian f32 bytes per sample-frame (width=channels, height=1).
+        const audioTrack = await mbInput.getPrimaryAudioTrack();
+        if (!audioTrack) throw new Error('mediabunny decodeFrames: no decodable track in input');
+
+        const sink = new this.lib.AudioSampleSink(audioTrack);
+        const sampleRate = await audioTrack.getSampleRate().catch(() => 0);
+        const channels = await audioTrack.getNumberOfChannels().catch(() => 0);
+        const max = opts?.maxFrames ?? Infinity;
+        const frames: FrameDigest[] = [];
+        const bytesPerSampleFrame = channels * Float32Array.BYTES_PER_ELEMENT;
+
+        // GLOBAL running sample-frame index across all decoded AudioSample chunks (NOT per-chunk).
+        let globalIndex = 0;
+        for await (const sample of sink.samples()) {
+          try {
+            if (globalIndex >= max) {
+              sample.close();
+              break;
+            }
+            // Interleaved (non-planar) f32: one plane (planeIndex 0) holds frame0[ch0..chN], frame1...
+            const size = sample.allocationSize({ planeIndex: 0, format: 'f32' });
+            const buffer = new ArrayBuffer(size);
+            sample.copyTo(buffer, { planeIndex: 0, format: 'f32' });
+            const raw = new Uint8Array(buffer);
+            // Walk the interleaved buffer one sample-frame (channels*4 bytes) at a time.
+            for (let offset = 0; offset + bytesPerSampleFrame <= raw.byteLength; offset += bytesPerSampleFrame) {
+              if (globalIndex >= max) break;
+              const slice = raw.subarray(offset, offset + bytesPerSampleFrame);
+              frames.push({
+                index: globalIndex,
+                ptsUs: Math.round((globalIndex / sampleRate) * 1e6),
+                sha256: await sha256Hex(slice),
+                width: channels,
+                height: 1,
+              });
+              globalIndex++;
+            }
+          } finally {
+            sample.close();
+          }
+        }
+        return { frames };
+      }
 
       // Best path (dossier §6): hardware-accelerated WebCodecs decode. Pull VideoSample objects so
       // ordinary frames can be copied directly to RGBA, avoiding canvas fingerprinting perturbations.

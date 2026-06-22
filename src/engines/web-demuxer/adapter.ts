@@ -121,6 +121,39 @@ const AAC_CHANNELS_BY_CONFIG = [undefined, 1, 2, 3, 4, 5, 6, 8];
 type PacketizedTrackType = Extract<TrackType, 'video' | 'audio' | 'subtitle'>;
 type AacAudioConfig = { sampleRate: number; channels: number };
 
+/**
+ * Thrown for a path this adapter declares at the capability level but CANNOT run for a specific input
+ * at runtime, due to a confirmed library limitation (not a corpus/asset problem and not a bug here).
+ * The runner keys off `err.name === 'NotApplicableError'` (see src/core/runner.ts isNotApplicableError)
+ * and records NA_ENGINE — an honest "not applicable", never a fabricated pass and never an ERROR.
+ * Mirrors the identical helper in the mp4box / ffmpeg-wasm adapters.
+ */
+class NotApplicableError extends Error {
+  constructor(op: string, reason: string) {
+    super(`${ENGINE_ID}: ${op} not applicable: ${reason}`);
+    this.name = 'NotApplicableError';
+  }
+}
+
+/**
+ * Recognize the v4.0.0 MPEG-TS packet-reader failure. web-demuxer's readAVPacket() returns a
+ * ReadableStream whose start() asks the bundled worker to construct an AVPacketReader; for MPEG-TS
+ * the worker fails to build one and surfaces the error via the stream's controller.error(errMsg)
+ * (web-demuxer.js v4 readAVPacket → `W.error(I.errMsg)`), so it is thrown from the consumer's
+ * reader.read() rather than synchronously from readAVPacket(). The worker's errMsg text is not a
+ * stable public contract, so we match the reader-construction signature loosely (reader/AVPacketReader
+ * + a null/create/failed token). This is only ever consulted for 'ts' input (see demux()), keeping the
+ * self-NA narrow: any other failure on a TS read still propagates as a genuine ERROR.
+ */
+function isTsAvPacketReaderConstructionFailure(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  if (!msg) return false;
+  const mentionsReader = msg.includes('avpacketreader') || msg.includes('reader');
+  const mentionsConstructFailure =
+    msg.includes('null') || msg.includes('create') || msg.includes('failed') || msg.includes('nullptr');
+  return mentionsReader && mentionsConstructFailure;
+}
+
 /** seconds → integer microseconds (web-demuxer's raw packet/stream times are in seconds). */
 function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
@@ -595,10 +628,15 @@ export class WebDemuxerEngine implements MediaEngine {
         decodeFrames: true,
       },
       // Read side with the FULL prebuilt wasm. Only canonical tokens the suite recognizes are
-      // declared; the full build also parses avi/flv/asf/mpeg/mpegts, but v4.0.0's packet-stream
-      // reader returns a null AVPacketReader for MPEG-TS in this browser/package combination. Because
-      // this suite's demux cells require packet tables, do not declare TS until that path is runnable.
-      containersIn: ['mp4', 'mov', 'mkv', 'webm'],
+      // declared; the full build also parses avi/flv/asf/mpeg. 'ts' (MPEG-TS) IS declared because
+      // PROBE is fully runnable for it: getMediaInfo()/getAVStreams() parse the container + streams,
+      // and this adapter's own MPEG-TS AAC byte parser (aacAudioConfigFromMpegTs) fills in sampleRate/
+      // channels — all reader-independent, no AVPacketReader involved. The DEMUX packet path is a
+      // DIFFERENT story: v4.0.0's packet-stream reader returns a null AVPacketReader for MPEG-TS in
+      // this browser/package combination, so demux() SELF-NAs at runtime for 'ts' (see the narrow
+      // catch in demux()) — recorded as a clean NA, never a fabricated pass. Declaring 'ts' here lets
+      // the reader-independent probe cells run honestly without claiming TS packet demux works.
+      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts'],
       // Demuxer writes nothing.
       containersOut: [],
       // Codecs web-demuxer can identify + packetize from these containers. Pixel decode (decodeFrames
@@ -736,6 +774,14 @@ export class WebDemuxerEngine implements MediaEngine {
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;
 
+    // MPEG-TS guard (capabilities() declares 'ts' for PROBE only): in vendored web-demuxer v4.0.0 the
+    // worker cannot construct an AVPacketReader for MPEG-TS packet streams, so the readAVPacket
+    // ReadableStream errors at the first reader.read() below. That is a confirmed LIBRARY limitation,
+    // not a bug here — so for 'ts' input we translate ONLY that reader-construction failure into a
+    // runtime NotApplicableError (clean NA_ENGINE), never a fabricated pass and never an ERROR. Any
+    // other failure on a TS read still propagates unchanged as a genuine ERROR.
+    const isTsInput = metadata.container === 'ts';
+
     const packets: PacketInfo[] = [];
     for (const stream of streams) {
       const type = trackTypeOf(stream);
@@ -758,6 +804,16 @@ export class WebDemuxerEngine implements MediaEngine {
             keyframe: pkt.keyframe === 1,
           });
         }
+      } catch (err) {
+        // Narrow self-NA: only the TS-input + AVPacketReader-construction-failure case. Honest about
+        // the limitation — do NOT represent TS packet demux as working.
+        if (isTsInput && isTsAvPacketReaderConstructionFailure(err)) {
+          throw new NotApplicableError(
+            'demux',
+            'web-demuxer v4.0.0 cannot construct an AVPacketReader for MPEG-TS packet streams',
+          );
+        }
+        throw err; // any other failure → genuine ERROR
       } finally {
         try {
           reader.releaseLock();

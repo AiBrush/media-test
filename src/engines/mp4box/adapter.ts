@@ -665,6 +665,16 @@ export class Mp4boxEngine implements MediaEngine {
         'metadata:protected-tracks',
         'mux:vfr-timestamps',
         'packets:dts',
+        // 'mux:roundtrip-compare' enables robustness/prop_demux_mux_roundtrip_eq (demux(mux(x))==x):
+        // mux copies coded sample bytes verbatim while preserving cts/dts ticks, so a re-demux of the
+        // muxed MP4 reproduces the source packet table. Browser-verified PASS.
+        //
+        // NOTE: 'remux:compose' is deliberately NOT declared. The NA audit proposed it for
+        // prop_double_remux_stable (remux(remux(mp4))==remux(mp4)), but a real-browser run FAILED: the
+        // SECOND remux of mp4box's own fragmented output throws "Cannot read properties of undefined
+        // (reading 'fragment_duration')" — mp4box cannot re-fragment a file it already fragmented. So
+        // double-remux stability is a GENUINE NA for this engine and stays undeclared.
+        'mux:roundtrip-compare',
         'webcodecs:demux-feed',
         'webcodecs:independent',
       ],

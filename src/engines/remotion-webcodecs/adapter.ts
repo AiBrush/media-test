@@ -262,7 +262,12 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       // No decrypt API.
       encryption: [],
       // Pixel transforms are limited to resize + rotate (90° multiples) on OffscreenCanvas 2D.
-      features: ['resize', 'rotate', 'packets:dts', PROTECTED_TRACK_METADATA_FEATURE, 'decode:golden-rgba'],
+      // 'resample' is HONEST for WAV output only: getDefaultAudioCodec({container:'wav'}) === 'wav',
+      // whose getWaveAudioEncoder runs convertAudioData({ newSampleRate: config.sampleRate, format:'s16' })
+      // and writes the requested rate into the output fmt chunk (verified in 4.0.479 ESM). For mp4/opus
+      // Chrome's AudioEncoder overrides the requested rate, so non-WAV sampleRate still throws NA in
+      // ensureSupportedTranscodeRequest (~line 2190) and channel remap stays NA there too.
+      features: ['resize', 'rotate', 'resample', 'packets:dts', PROTECTED_TRACK_METADATA_FEATURE, 'decode:golden-rgba'],
     };
   }
 
@@ -542,7 +547,29 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       audioCodec = mapped;
     }
 
-    return this.convert(input, { container, videoCodec, audioCodec, resize, rotate });
+    // Audio resample (sampleRate only; channel remap stays NA and is rejected upstream by
+    // ensureSupportedTranscodeRequest). When a target rate is requested without a channel change we
+    // forward it to convertMedia via an onAudioTrack resolver. The resolver MUST return 'reencode'
+    // UNCONDITIONALLY: a 'copy' (which canCopyTrack would allow for an already-pcm-s16 WAV source)
+    // bypasses the encoder entirely and would emit the SOURCE rate, silently ignoring the resample.
+    // Re-encoding routes every AudioData through getWaveAudioEncoder ->
+    // convertAudioData({ newSampleRate, format:'s16' }), which resamples and writes the requested rate
+    // into the WAV fmt chunk. Only reachable for WAV here: ensureSupportedTranscodeRequest still throws
+    // NA for non-WAV sampleRate (Chrome's AudioEncoder overrides the rate for aac/opus).
+    let onAudioTrack: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler | undefined;
+    if (opts.audio?.sampleRate != null && opts.audio.channels == null) {
+      const requestedSampleRate = opts.audio.sampleRate;
+      // getDefaultAudioCodec({container:'wav'}) === 'wav' (its getWaveAudioEncoder honors sampleRate).
+      const resampleAudioCodec = getDefaultAudioCodecForContainer(this.mustLib().wc, container);
+      onAudioTrack = () => ({
+        type: 'reencode',
+        audioCodec: resampleAudioCodec,
+        bitrate: 128000,
+        sampleRate: requestedSampleRate,
+      });
+    }
+
+    return this.convert(input, { container, videoCodec, audioCodec, resize, rotate, onAudioTrack });
   }
 
   /** Shared convertMedia driver: buffer writer + license ack + probe-derived expected metadata. */
@@ -554,6 +581,9 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       audioCodec?: RemotionAudioCodec;
       resize?: import('@remotion/webcodecs').ResizeOperation;
       rotate?: number;
+      // Optional per-audio-track resolver (used only for the resample path). When provided it OVERRIDES
+      // the lib's default copy/reencode decision so the requested output sampleRate is honored.
+      onAudioTrack?: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler;
     },
   ): Promise<MediaBytes> {
     const { wc, bufferWriter, mp } = this.mustLib();
@@ -585,6 +615,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       audioCodec: opts.audioCodec,
       resize: opts.resize,
       rotate: opts.rotate,
+      onAudioTrack: opts.onAudioTrack, // undefined for every non-resample call (preserves prior behavior)
       controller,
       writer: bufferWriter, // in-memory output -> save() returns the bytes
       expectedDurationInSeconds,
@@ -2153,12 +2184,32 @@ function withSingleVideoFps(
   return applied ? { ...metadata, tracks } : metadata;
 }
 
+/**
+ * Resolve the lib's default audio codec for an output container via the lib's own getDefaultAudioCodec
+ * (the same helper convertMedia uses internally), so the resample resolver re-encodes with the codec
+ * the container would have chosen anyway. For 'wav' this returns 'wav' — the only path whose encoder
+ * (getWaveAudioEncoder) honors the requested sampleRate exactly.
+ */
+function getDefaultAudioCodecForContainer(
+  wc: WebcodecsModule,
+  container: RemotionContainer,
+): RemotionAudioCodec {
+  return wc.getDefaultAudioCodec({ container });
+}
+
 function ensureSupportedTranscodeRequest(
   input: MediaInput,
   opts: TranscodeOptions,
   container: RemotionContainer,
   videoSpec: TranscodeVideoOptions | undefined,
 ): void {
+  // Channel remap (downmix/upmix) has NO native path in @remotion/webcodecs on ANY container,
+  // including WAV: the onAudioTrack resolver can change the sample rate but not numberOfChannels.
+  // Check this BEFORE the WAV early-return so a channel-count request (e.g. 5.1 -> stereo) is an
+  // honest NA_ENGINE rather than silently emitting the source layout and failing the metadata oracle.
+  if (opts.audio?.channels != null) {
+    throw new NotApplicableError('transcode', 'the adapter cannot remap audio channel count (downmix/upmix)');
+  }
   if (container === 'wav') return;
 
   if (
@@ -2187,6 +2238,11 @@ function ensureSupportedTranscodeRequest(
     );
   }
 
+  // Reached for NON-WAV containers only (container==='wav' returned early above). WAV resample is now
+  // honored natively via the onAudioTrack resolver in transcode() (getWaveAudioEncoder writes the
+  // requested rate). For mp4/webm, Chrome's AudioEncoder overrides the requested sampleRate for
+  // aac/opus, so non-WAV resample is NOT exact -> still NA. Channel remap has no native path on ANY
+  // container (the resolver cannot change numberOfChannels) -> still NA everywhere.
   if (opts.audio?.channels != null || opts.audio?.sampleRate != null) {
     throw new NotApplicableError('transcode', 'the adapter cannot request audio resampling or channel remapping');
   }
