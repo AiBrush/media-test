@@ -136,9 +136,29 @@ export function negotiate(
       return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare video codec '${vc}'` };
     }
   }
+  for (const vc of requires.videoCodecsIn ?? []) {
+    if (!codecSet(caps.videoCodecsIn, caps.videoCodecs).includes(vc)) {
+      return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare input video codec '${vc}'` };
+    }
+  }
+  for (const vc of requires.videoCodecsOut ?? []) {
+    if (!codecSet(caps.videoCodecsOut, caps.videoCodecs).includes(vc)) {
+      return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare output video codec '${vc}'` };
+    }
+  }
   for (const ac of requires.audioCodecs ?? []) {
     if (!caps.audioCodecs.includes(ac)) {
       return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare audio codec '${ac}'` };
+    }
+  }
+  for (const ac of requires.audioCodecsIn ?? []) {
+    if (!codecSet(caps.audioCodecsIn, caps.audioCodecs).includes(ac)) {
+      return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare input audio codec '${ac}'` };
+    }
+  }
+  for (const ac of requires.audioCodecsOut ?? []) {
+    if (!codecSet(caps.audioCodecsOut, caps.audioCodecs).includes(ac)) {
+      return { ok: false, status: 'NA_ENGINE', reason: `engine does not declare output audio codec '${ac}'` };
     }
   }
 
@@ -167,8 +187,8 @@ export function negotiate(
     return { ok: true };
   }
 
-  const requiredVideo = requires.videoCodecs ?? [];
-  const requiredAudio = requires.audioCodecs ?? [];
+  const requiredVideo = [...(requires.videoCodecs ?? []), ...(requires.videoCodecsIn ?? []), ...(requires.videoCodecsOut ?? [])];
+  const requiredAudio = [...(requires.audioCodecs ?? []), ...(requires.audioCodecsIn ?? []), ...(requires.audioCodecsOut ?? [])];
   const isTranscode = requires.operations.includes('transcode');
   const transcodeTargets = isTranscode ? transcodeTargetCodecs(options) : undefined;
 
@@ -277,6 +297,10 @@ export function negotiate(
   }
 
   return { ok: true };
+}
+
+function codecSet(specific: string[] | undefined, fallback: string[]): string[] {
+  return specific ?? fallback;
 }
 
 function transcodeTargetCodecs(options: Scenario['options'] | undefined): {

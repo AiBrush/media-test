@@ -37,7 +37,7 @@ const OUTPUT_MODE_CASES: MuxCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    extraOptions: { target: 'buffer' },
+    extraOptions: { fastStart: false, target: 'buffer' },
     metrics: MUX_STREAM_METRICS,
     notes:
       'MUX WRITE SUB-MODE mp4 progressive (§A.3): pack EncodedTracks into a whole-blob mp4 (moov after ' +
@@ -82,13 +82,13 @@ const OUTPUT_MODE_CASES: MuxCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['fragmented'],
-    extraOptions: { fragmented: true, target: 'stream' },
+    extraOptions: { fragmented: true },
     metrics: MUX_STREAM_METRICS,
-    primaryMetric: 'targetWrites',
     notes:
       'MUX WRITE SUB-MODE mp4 fragmented/CMAF (§A.3): author moof/mdat fragments from the EncodedTracks ' +
       '(MSE-appendable). re-import must see segments; the mux fragment-boundary logic differs from a ' +
-      'remux that copies an existing fragmentation.',
+      'remux that copies an existing fragmentation. True streaming target writes are gated separately ' +
+      'by target:writes and are not implied by returning valid fragmented bytes.',
   },
 ];
 

@@ -271,6 +271,7 @@ export class PlatformEngine implements MediaEngine {
       // We do NOT claim fragmented/faststart/metadata:write/fanout/trim.
       features: [
         'resize',
+        'mediarecorder:video-only',
         'alpha',
         'rotate',
         'rotation:decode',

@@ -38,11 +38,12 @@ const TTFB_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'buffer' },
+    shape: { container: 'mp4', fastStart: false, target: 'buffer' },
+    features: ['target:writes'],
     extraMetrics: ['timeToFirstByte'],
     primaryMetric: 'timeToFirstByte',
     notes:
-      'TIME-TO-FIRST-BYTE control (buffer target): a BufferTarget emits its first byte only at ' +
+      'TIME-TO-FIRST-BYTE control (progressive buffer target): a BufferTarget emits its first byte only at ' +
       'finalize(), so ttfb ≈ whole-op wall. The high-water baseline the streaming target is measured ' +
       'against (stream.ttfb should be markedly lower). Ranked on timeToFirstByte (lower-is-better).',
   },

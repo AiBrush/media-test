@@ -41,6 +41,7 @@ interface ProbeCase {
   asset: string;
   container: string;
   videoCodecs?: string[];
+  videoCodecsIn?: string[];
   audioCodecs?: string[];
   features?: string[];
   options?: Record<string, unknown>;
@@ -109,7 +110,15 @@ const PROBE_CASES: ProbeCase[] = [
       'browser-documentation WebM instead of generated testsrc media.',
   },
   { asset: 'vp8_720p_10s.webm', container: 'webm', videoCodecs: ['vp8'], audioCodecs: ['vorbis'] },
-  { asset: 'av1_720p_5s.webm', container: 'webm', videoCodecs: ['av1'], audioCodecs: ['opus'] },
+  {
+    asset: 'av1_720p_5s.webm',
+    container: 'webm',
+    videoCodecsIn: ['av1'],
+    audioCodecs: ['opus'],
+    notes:
+      'AV1 read-side probe: uses videoCodecsIn so software engines that can parse/decode/copy AV1 but ' +
+      'cannot encode AV1 are not falsely hidden behind an encode-capability gate.',
+  },
   {
     asset: 'vp9_alpha.webm',
     container: 'webm',
@@ -332,6 +341,7 @@ const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
       operations: ['probe'],
       containersIn: [c.container],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
+      ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.features ? { features: c.features } : {}),
     },

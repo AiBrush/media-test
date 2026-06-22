@@ -14,8 +14,9 @@
 - **Kind (orientation only, per `test-instructions.md` §1):** "future candidate — placeholder
   adapter today; no capabilities until built."
 - **Adapter file in the repo:** `src/engines/aibrush-media/adapter.ts` (already present as a stub;
-  `capabilities()` returns all-empty, every operation method throws `NOT_IMPLEMENTED`,
-  `registerAibrushMedia()` exists but is **not** auto-called so it never pollutes a comparison).
+  `capabilities()` returns all-empty, every operation method throws `NOT_IMPLEMENTED`, and
+  `registerAibrushMedia()` is called by app wiring so the placeholder appears in the matrix as
+  explicit `NA_ENGINE` coverage instead of being silently omitted).
 - **Researched on:** 2026-06-17.
 
 ---
@@ -187,9 +188,9 @@ Verified that no public browser media library by this name exists (June 2026):
 
 Reference doc URLs (for context only; none describe a usable browser engine API):
 
-- AiBrush Studio docs (product, not a library): https://docs.aibrush.co/
-- MDN WebCodecs (the API a future real engine would build on): https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
-- Mediabunny (the suite's reference engine, for comparison of what a real dossier contains): https://mediabunny.dev/
+- AiBrush Studio docs (product, not a library): <https://docs.aibrush.co/>
+- MDN WebCodecs (the API a future real engine would build on): <https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API>
+- Mediabunny (the suite's reference engine, for comparison of what a real dossier contains): <https://mediabunny.dev/>
 
 Internal references in this repo (authoritative for the placeholder's intended shape):
 

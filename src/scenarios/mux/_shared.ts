@@ -76,6 +76,7 @@ export const DECODE_MUX = 'decode(mux(x))==decode(x)';
 /** probe(mux(x)).dur ≈ probe(x).dur: duration survives the container change (VIDEO+AUDIO, x-container). */
 export const PROBE_DUR = 'probe(mux(x)).dur≈probe(x).dur';
 const MUX_BROWSER_DECODE_FEATURE = 'mux:browser-decode-equality';
+const MUX_TARGET_WRITE_FEATURE = 'target:writes';
 
 // ── Metric sets ──────────────────────────────────────────────────────────────────────────────────
 
@@ -121,6 +122,21 @@ function mp4LayoutOracleApplies(container: string, options?: Record<string, unkn
 function withMp4LayoutOracle(oracles: OracleId[], container: string, options?: Record<string, unknown>): OracleId[] {
   if (!mp4LayoutOracleApplies(container, options) || oracles.includes('mp4-box-layout')) return oracles;
   return [...oracles, 'mp4-box-layout'];
+}
+
+function muxFeatures(c: Pick<MuxCase, 'features' | 'extraOptions'>): string[] | undefined {
+  const features = [...(c.features ?? [])];
+  const opts = c.extraOptions ?? {};
+  if (opts.target === 'stream' || opts.writeChunkBytes !== undefined) pushUnique(features, MUX_TARGET_WRITE_FEATURE);
+  if (opts.fragmented === true) pushUnique(features, 'fragmented');
+  if (opts.fastStart === false) pushUnique(features, 'fastStart:none');
+  if (opts.fastStart === 'in-memory') pushUnique(features, 'fastStart:in-memory');
+  if (opts.fastStart === 'reserve') pushUnique(features, 'fastStart:reserve');
+  return features.length ? features : undefined;
+}
+
+function pushUnique(list: string[], value: string): void {
+  if (!list.includes(value)) list.push(value);
 }
 
 // ── Mux case model + builder ─────────────────────────────────────────────────────────────────────
@@ -188,6 +204,7 @@ function muxOptions(c: MuxCase): Record<string, unknown> {
 export function buildMux(c: MuxCase): Scenario {
   const oracles = withMp4LayoutOracle(c.oracles ?? defaultOracles(c), c.to, c.extraOptions);
   const metrics = (c.metrics ?? MUX_METRICS) as readonly MetricId[];
+  const features = muxFeatures(c);
   return defineScenario({
     id: `mux/${c.id}`,
     op: 'mux',
@@ -200,7 +217,7 @@ export function buildMux(c: MuxCase): Scenario {
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
-      ...(c.features ? { features: c.features } : {}),
+      ...(features ? { features } : {}),
     },
     oracles,
     metrics: [...metrics],

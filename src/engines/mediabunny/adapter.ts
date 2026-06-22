@@ -988,7 +988,7 @@ export class MediabunnyEngine implements MediaEngine {
         // runner's negotiate() reads this token to SKIP the browser encode/decode gate for pcm-*
         // codecs (those gates would otherwise NA a codec mediabunny genuinely handles with no browser).
         'audio:pcm-native',
-        // NOTE: 'encryption:cenc-ctr-clear-output' is deliberately NOT declared. The NA audit proposed
+        // NOTE: 'webcrypto:cenc-ctr-clear-output' is deliberately NOT declared. The NA audit proposed
         // it (decrypt() structurally builds a clear-sample MP4 via resolveKeyId + no-transform
         // Conversion), but a real browser run proved mediabunny@1.48.0 WASM-ABORTS ("Assertion failed.")
         // when reading THIS CENC-CTR fixture (cenc_ctr.mp4) — both on decrypt and on plain probe — while

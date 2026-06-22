@@ -54,6 +54,7 @@ interface DemuxCase {
   asset: string;
   container: string;
   videoCodecs?: string[];
+  videoCodecsIn?: string[];
   audioCodecs?: string[];
   encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
   features?: string[];
@@ -112,7 +113,14 @@ const DEMUX_CASES: DemuxCase[] = [
       'enumeration from a browser-documentation sample.',
   },
   { asset: 'vp8_720p_10s.webm', container: 'webm', videoCodecs: ['vp8'], audioCodecs: ['vorbis'] },
-  { asset: 'av1_720p_5s.webm', container: 'webm', videoCodecs: ['av1'], audioCodecs: ['opus'] },
+  {
+    asset: 'av1_720p_5s.webm',
+    container: 'webm',
+    videoCodecsIn: ['av1'],
+    audioCodecs: ['opus'],
+    notes:
+      'AV1 read-side demux: requires input AV1 parsing/packet walking, not AV1 encode capability.',
+  },
   { asset: 'h264_in_mkv.mkv', container: 'mkv', videoCodecs: ['h264'], audioCodecs: ['aac'] },
 
   // ── TS ──
@@ -254,6 +262,7 @@ const coreScenarios: Scenario[] = DEMUX_CASES.map((c) =>
       operations: ['demux'],
       containersIn: [c.container],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
+      ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.encryption ? { encryption: c.encryption } : {}),
       ...(c.features ? { features: c.features } : {}),

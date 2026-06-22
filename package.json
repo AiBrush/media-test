@@ -29,7 +29,7 @@
     "@ffmpeg/ffmpeg": "^0.12.10",
     "@ffmpeg/util": "^0.12.1",
     "@remotion/webcodecs": "4.0.479",
-    "mediabunny": "^1.0.0",
+    "mediabunny": "1.48.0",
     "mp4box": "2.3.0",
     "web-demuxer": "4.0.0"
   }

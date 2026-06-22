@@ -69,12 +69,12 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     cleartextAsset: 'cenc_ctr_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['encryption:cenc-ctr-clear-output'],
+    features: ['webcrypto:cenc-ctr-clear-output'],
     notes:
       'METAMORPHIC: decrypt(cenc_ctr.mp4) decodes bit-exact to the offline CLEARTEXT (golden frames ' +
       'baked from cenc_ctr_clear.mp4). property-invariant[decode-cleartext-baseline] gates the pixels; ' +
       'reference-reimport gates that the output is a genuinely de-protected, re-parseable container ' +
-      '(no leftover sinf/senc breaking the track). Requires feature encryption:cenc-ctr-clear-output ' +
+      '(no leftover sinf/senc breaking the track). Requires feature webcrypto:cenc-ctr-clear-output ' +
       'so engines that can only parse protected-track metadata do not post a false decrypt result. ' +
       'Decrypt analogue of decode(remux(x))==decode(x).',
   },

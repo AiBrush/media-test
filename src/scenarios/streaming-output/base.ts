@@ -26,8 +26,10 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'buffer' },
-    notes: 'Whole-blob (in-memory BufferTarget) output; baseline for the streaming comparison.',
+    shape: { container: 'mp4', fastStart: false, target: 'buffer' },
+    notes:
+      'Whole-blob progressive BufferTarget output with moov after mdat; baseline for the streaming ' +
+      'comparison. Fragmented full-buffer bytes are covered by the CMAF row, not this baseline.',
   },
   {
     id: 'mp4_streaming_target',
@@ -48,7 +50,7 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fragmented: true, target: 'stream' },
+    shape: { container: 'mp4', fragmented: true },
     features: ['fragmented'],
     // reference-reimport + mp4-box-layout: a bare fMP4 is not reliably plain-<video>-playable and the
     // platform inline demux is progressive-only — playback-smoke/decode-remux would risk a false FAIL.
@@ -56,7 +58,7 @@ const BASE_CASES: StreamCase[] = [
     notes:
       'Fragmented MP4 (CMAF): moof/mdat fragments, MSE-appendable. reference-reimport proves the ' +
       'fragments re-parse to the same packet table; mp4-box-layout checks top-level moov/moof/mdat ' +
-      'structure. Deeper MSE appendability remains a separate oracle gap.',
+      'structure. Deeper MSE appendability and true StreamTarget write metrics remain separate oracle gaps.',
   },
   {
     id: 'mp4_faststart_reserve',
@@ -65,12 +67,12 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: 'reserve', target: 'stream', maximumPacketCount: 4096 },
+    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096 },
     features: ['fastStart:reserve'],
     notes:
       'fastStart with reserved forward moov (mediabunny fastStart:"reserve", needs maximumPacketCount). ' +
-      'reference-reimport verifies the reserved-moov output still re-imports; the ' +
-      'forward-seek/patch STRUCTURE assertion is a separate case (see ./fragmented-faststart.ts).',
+      'reference-reimport verifies the reserved-moov output still re-imports; true streaming-target ' +
+      'forward-seek/write metrics remain a separate target:writes case.',
   },
   {
     id: 'ts_tiny_writes',

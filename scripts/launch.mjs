@@ -15,7 +15,7 @@
  *   bun scripts/launch.mjs --base-url http://localhost:5173 --browser chromium \
  *        [--engine <id>] [--pillar functional|performance|robustness|all] \
  *        [--feature <id>] [--operation <op>] [--scenario <id>] \
- *        [--out results/raw] [--warmup N] [--iters N] [--timeout-ms MS] [--headed]
+ *        [--out results/raw] [--warmup N] [--iters N] [--timeout-ms MS] [--headed] [--no-reuse]
  *
  * --engine/--scenario/--pillar are forwarded as a run filter. --engine/--scenario may repeat or be
  * comma-separated. Output: results/raw/<browser>-<timestamp>.json (the same payload the in-page
@@ -44,6 +44,7 @@ const opts = {
   iters: undefined,
   timeoutMs: 30 * 60 * 1000, // 30 min default cap for a whole matrix run
   headed: false,
+  reuseSuccessful: true,
 };
 
 const argv = process.argv.slice(2);
@@ -64,8 +65,9 @@ for (let i = 0; i < argv.length; i++) {
     case '--iters': opts.iters = Number(next()); break;
     case '--timeout-ms': opts.timeoutMs = Number(next()); break;
     case '--headed': opts.headed = true; break;
+    case '--no-reuse': opts.reuseSuccessful = false; break;
     case '-h': case '--help':
-      console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--feature id] [--operation op] [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS]');
+      console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--feature id] [--operation op] [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS] [--no-reuse]');
       process.exit(0);
     default:
       console.error(`launch.mjs: unknown arg '${a}'`);
@@ -167,17 +169,21 @@ try {
       `${suiteInfo.scenarioIds.length} scenarios; ref=${suiteInfo.referenceEngineId}`,
   );
 
-  const reusableResults = loadReusableResultsForSeed(opts.browser);
-  const seeded = await seedReusableResults(page, reusableResults);
-  if (seeded > 0) {
-    console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS result(s) into the page cache`);
+  if (opts.reuseSuccessful) {
+    const reusableResults = loadReusableResultsForSeed(opts.browser);
+    const seeded = await seedReusableResults(page, reusableResults);
+    if (seeded > 0) {
+      console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS result(s) into the page cache`);
+    }
+  } else {
+    console.log(`[launch] ${opts.browser} result reuse disabled; every selected executable cell will run fresh`);
   }
 
   // Build the run filter from CLI flags. Empty arrays mean "all".
   const filter = {
     browser: opts.browser,
     pillar: opts.pillar,
-    reuseSuccessful: true,
+    reuseSuccessful: opts.reuseSuccessful,
     ...(opts.engines.length ? { engineIds: opts.engines } : {}),
     ...(opts.features.length ? { featureIds: opts.features } : {}),
     ...(opts.operations.length ? { operations: opts.operations } : {}),

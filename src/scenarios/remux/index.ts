@@ -86,12 +86,19 @@ const REMUX_CASES: RemuxCase[] = [
   // ── VP9 / VP8 / AV1 with Opus/Vorbis are portable across webm / mkv ──
   { asset: 'vp9_1080p_10s.webm', from: 'webm', to: 'mkv', videoCodecs: ['vp9'], audioCodecs: ['opus'] },
   { asset: 'vp8_720p_10s.webm', from: 'webm', to: 'mkv', videoCodecs: ['vp8'], audioCodecs: ['vorbis'] },
-  { asset: 'av1_720p_5s.webm', from: 'webm', to: 'mkv', videoCodecs: ['av1'], audioCodecs: ['opus'] },
+  {
+    asset: 'av1_720p_5s.webm',
+    from: 'webm',
+    to: 'mkv',
+    videoCodecsIn: ['av1'],
+    audioCodecs: ['opus'],
+    notes: 'AV1/Opus WebM->MKV copy: requires AV1 read/copy support, not AV1 encode support.',
+  },
   {
     asset: 'av1_720p_5s.webm',
     from: 'webm',
     to: 'mp4',
-    videoCodecs: ['av1'],
+    videoCodecsIn: ['av1'],
     audioCodecs: ['opus'],
     features: ['remux:av1-opus-in-mp4'],
     notes: 'AV1 + Opus are both legal in mp4 — lossless remux out of webm.',

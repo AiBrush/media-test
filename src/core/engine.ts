@@ -117,6 +117,15 @@ export interface CapabilitySet {
   containersOut: string[];
   videoCodecs: string[]; // ['h264','hevc','vp8','vp9','av1', ...]
   audioCodecs: string[]; // ['aac','opus','mp3','flac','vorbis','pcm-s16','pcm-s24','pcm-f32', ...]
+  /**
+   * Optional operation-specific codec declarations. When absent, negotiation falls back to the flat
+   * `videoCodecs` / `audioCodecs` sets for backwards compatibility. Use these only when a framework
+   * can honestly read/copy/decode a codec but cannot encode it, or vice versa.
+   */
+  videoCodecsIn?: string[];
+  audioCodecsIn?: string[];
+  videoCodecsOut?: string[];
+  audioCodecsOut?: string[];
   encryption: EncryptionScheme[];
   features: string[]; // 'fragmented','fastStart:reserve','trim:frame-accurate','metadata:write','packets:dts','alpha','resize','rotate', ...
 }

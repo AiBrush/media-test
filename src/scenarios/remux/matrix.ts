@@ -102,7 +102,7 @@ const MATRIX_CASES: RemuxCase[] = [
     asset: 'av1_720p_5s.webm',
     from: 'webm',
     to: 'webm',
-    videoCodecs: ['av1'],
+    videoCodecsIn: ['av1'],
     audioCodecs: ['opus'],
     features: ['remux:av1-opus-in-webm'],
     notes: 'AV1/Opus WebM->WebM identity re-mux: AV1 video through the WebM writer (av1C in Matroska).',

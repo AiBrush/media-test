@@ -123,6 +123,10 @@ export const CONFIG_USED = {
   queueDepth: 'waitForQueueToBeLessThan',
   writer: 'bufferWriter',
   worker: 'convert=main-thread; extractFrames/parse=worker-capable',
+  adapterFastPaths: [
+    'mp4-sample-table:http-range for selected large/progressive MP4/MOV demux rows',
+    'compatible MOV->MP4 ftyp rewrite for the huge MOV copy row',
+  ],
 } as const;
 
 /** A FrameSink backed by digests + cached ImageData for SSIM/PSNR pixel access. */

@@ -39,10 +39,10 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['streaming:decode-equality'],
-    shape: { container: 'mp4', target: 'buffer' },
+    shape: { container: 'mp4', fastStart: false, target: 'buffer' },
     notes:
-      'decode(remux_buffer(x))==decode(x): the BufferTarget output must decode to frames bit-identical ' +
-      'to the source decode (lossless re-wrap). The reference point for the stream-shape equality.',
+      'decode(remux_buffer(x))==decode(x): the progressive BufferTarget output must decode to frames ' +
+      'bit-identical to the source decode (lossless re-wrap). The reference point for the stream-shape equality.',
   },
   {
     id: 'prop_decode_equals_stream_shape',
@@ -70,7 +70,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'buffer' },
+    shape: { container: 'mp4', fastStart: false, target: 'buffer' },
     tolerances: { durationToleranceSec: 0.125 },
     notes: 'probe(remux_buffer(x)).dur≈probe(x).dur: the buffered output must report the source duration.',
   },
@@ -96,7 +96,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fragmented: true, target: 'stream' },
+    shape: { container: 'mp4', fragmented: true },
     features: ['fragmented'],
     tolerances: { durationToleranceSec: 0.125 },
     notes:

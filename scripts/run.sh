@@ -19,6 +19,8 @@
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 1800000 = 30 min).
 #   --headed             show the browser window (debugging).
+#   --no-reuse           force every selected PASS-capable cell to execute instead of reusing stored
+#                        successful results from prior runs.
 #   --no-serve           do not start a server; assume one is already up at --base-url.
 #   --base-url <url>     use this base url instead of starting a server (implies --no-serve).
 #   --keep-serving       leave the server running after the run (for manual inspection).
@@ -47,6 +49,7 @@ HEADED=0
 NO_SERVE=0
 KEEP_SERVING=0
 BASE_URL=""
+NO_REUSE=0
 
 # bash 3.2-compatible CSV-append into a named array (macOS ships bash 3.2 — no `local -n` namerefs).
 append_csv() { local _name="$1" _val="$2" _p; IFS=',' read -ra _parts <<< "$_val"; for _p in "${_parts[@]}"; do [[ -n "$_p" ]] && eval "${_name}+=(\"\$_p\")"; done; }
@@ -64,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --iters) ITERS="$2"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
     --headed) HEADED=1; shift ;;
+    --no-reuse) NO_REUSE=1; shift ;;
     --no-serve) NO_SERVE=1; shift ;;
     --keep-serving) KEEP_SERVING=1; shift ;;
     --base-url) BASE_URL="$2"; NO_SERVE=1; shift 2 ;;
@@ -213,6 +217,7 @@ mkdir -p results/raw
 
 LAUNCH_COMMON=(--base-url "${BASE_URL}" --pillar "${PILLAR}" --out "results/raw" --timeout-ms "${TIMEOUT_MS}")
 [[ "${HEADED}" -eq 1 ]] && LAUNCH_COMMON+=(--headed)
+[[ "${NO_REUSE}" -eq 1 ]] && LAUNCH_COMMON+=(--no-reuse)
 [[ -n "${WARMUP}" ]] && LAUNCH_COMMON+=(--warmup "${WARMUP}")
 [[ -n "${ITERS}" ]] && LAUNCH_COMMON+=(--iters "${ITERS}")
 # bash 3.2 + set -u: expanding an EMPTY array as "${arr[@]}" raises 'unbound variable', so guard on

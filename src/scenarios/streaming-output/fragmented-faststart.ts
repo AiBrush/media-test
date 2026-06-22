@@ -125,14 +125,14 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: 'reserve', target: 'stream', maximumPacketCount: 4096 },
+    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096 },
     features: ['fastStart:reserve'],
     tolerances: { durationToleranceSec: 0.125 },
     notes:
-      'probe(remux_reserve(x)).dur≈probe(x).dur: a reserved-forward-moov output (fastStart:"reserve", ' +
+      'probe(remux_reserve(x)).dur≈probe(x).dur: a reserved-moov output (fastStart:"reserve", ' +
       'maximumPacketCount per track) must report the same duration as the source. The duration-side gate ' +
-      'for reserve; the forward-seek/patch STRUCTURE and overflow/underflow edges need new machinery ' +
-      '(see file header).',
+      'for reserve; true streaming-target forward-seek/patch and overflow/underflow edges need new ' +
+      'machinery (see file header).',
   },
 ];
 

@@ -87,6 +87,7 @@ import {
   deriveContainersIn,
   deriveContainersOut,
   deriveVideoCodecs,
+  deriveVideoDecodeCodecs,
   parseCodecNames,
   parseFormats,
   videoEncoderName,
@@ -144,6 +145,7 @@ export interface FfmpegWasmConfig {
 
 /** Documented-build fallback used ONLY if the runtime probe parses to an empty set (defensive). */
 const FALLBACK_VIDEO = ['h264', 'hevc', 'vp8', 'vp9'];
+const FALLBACK_VIDEO_IN = ['h264', 'hevc', 'vp8', 'vp9', 'av1'];
 const FALLBACK_AUDIO = [
   'aac',
   'opus',
@@ -1466,6 +1468,10 @@ export class FfmpegWasmEngine implements MediaEngine {
       containersOut: [...FALLBACK_CONTAINERS_OUT],
       videoCodecs: [...FALLBACK_VIDEO],
       audioCodecs: [...FALLBACK_AUDIO],
+      videoCodecsIn: [...FALLBACK_VIDEO_IN],
+      audioCodecsIn: [...FALLBACK_AUDIO],
+      videoCodecsOut: [...FALLBACK_VIDEO],
+      audioCodecsOut: [...FALLBACK_AUDIO],
       encryption: ['cenc-ctr', 'hls-aes128'], // CENC-CTR standalone decrypt + transparent HLS demux.
       features: this.featureList(),
     };
@@ -1499,7 +1505,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'fastStart:none', // explicit control: leave moov at the default tail position
       'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
-      'encryption:cenc-ctr-clear-output', // WebCrypto clears CENC samples; ffmpeg.wasm emits clear MP4
+      'webcrypto:cenc-ctr-clear-output', // WebCrypto clears CENC samples; ffmpeg.wasm emits clear MP4
       'mux:vfr-timestamps', // source-copy mux path preserves container PTS/DTS tables for VFR/B-frames
       'mux:browser-decode-equality', // muxed progressive outputs satisfy the platform decode invariant
       'packets:dts', // framecrc exposes packet dts separately from pts
@@ -1683,6 +1689,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     };
 
     let videoCodecs: string[];
+    let videoCodecsIn: string[];
     let audioCodecs: string[];
     let containersIn: string[];
     let containersOut: string[];
@@ -1696,6 +1703,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       const { demux, mux } = parseFormats(formatsLog);
 
       videoCodecs = deriveVideoCodecs(encoders, decoders);
+      videoCodecsIn = deriveVideoDecodeCodecs(decoders);
       audioCodecs = deriveAudioCodecs(encoders, decoders);
       containersIn = deriveContainersIn(demux);
       containersOut = deriveContainersOut(mux);
@@ -1704,12 +1712,15 @@ export class FfmpegWasmEngine implements MediaEngine {
       // rather than wrongly declaring zero capability.
       if (videoCodecs.length === 0 && audioCodecs.length === 0) {
         videoCodecs = [...FALLBACK_VIDEO];
+        videoCodecsIn = [...FALLBACK_VIDEO_IN];
         audioCodecs = [...FALLBACK_AUDIO];
       }
+      if (videoCodecsIn.length === 0) videoCodecsIn = Array.from(new Set([...videoCodecs, ...FALLBACK_VIDEO_IN]));
       if (containersIn.length === 0) containersIn = [...FALLBACK_CONTAINERS_IN];
       if (containersOut.length === 0) containersOut = [...FALLBACK_CONTAINERS_OUT];
     } catch {
       videoCodecs = [...FALLBACK_VIDEO];
+      videoCodecsIn = [...FALLBACK_VIDEO_IN];
       audioCodecs = [...FALLBACK_AUDIO];
       containersIn = [...FALLBACK_CONTAINERS_IN];
       containersOut = [...FALLBACK_CONTAINERS_OUT];
@@ -1739,6 +1750,10 @@ export class FfmpegWasmEngine implements MediaEngine {
       containersOut,
       videoCodecs,
       audioCodecs,
+      videoCodecsIn,
+      audioCodecsIn: audioCodecs,
+      videoCodecsOut: videoCodecs,
+      audioCodecsOut: audioCodecs,
       encryption: ['cenc-ctr', 'hls-aes128'],
       features: this.featureList(),
     };

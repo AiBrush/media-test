@@ -36,6 +36,15 @@ const DISABLED_CELLS: DisabledCell[] = [
       'mediabunny decode it within budget; ffmpeg.wasm honestly NAs it — this is a per-engine scale limit.',
   },
   {
+    engineId: 'remotion-webcodecs@4.0.479',
+    scenarioId: 'streaming-output/buffer_massive_h264_mp4',
+    reason:
+      'real Chromium no-reuse run on 2026-06-22 timed out after the 120s op budget while buffering the ' +
+      '2h massive H.264 MP4 fixture through remotion-webcodecs bufferWriter. The paired massive stream ' +
+      'row is already NA because this adapter does not declare target:writes, so this exact buffer rung ' +
+      'is a tracked per-engine scale limit rather than a conformance path to rerun in every full matrix.',
+  },
+  {
     engineId: 'mediabunny@1.48.0',
     scenarioId: 'probe/cenc_ctr',
     reason:

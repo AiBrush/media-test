@@ -20,6 +20,12 @@ export interface Requires {
   containersOut?: string[];
   videoCodecs?: string[];
   audioCodecs?: string[];
+  /** Input/read-side codec requirements. Falls back to videoCodecs/audioCodecs unless specified. */
+  videoCodecsIn?: string[];
+  audioCodecsIn?: string[];
+  /** Output/write-side codec requirements. Falls back to videoCodecs/audioCodecs unless specified. */
+  videoCodecsOut?: string[];
+  audioCodecsOut?: string[];
   encryption?: EncryptionScheme[];
   features?: string[];
 }

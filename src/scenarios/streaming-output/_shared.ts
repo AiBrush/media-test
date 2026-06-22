@@ -16,13 +16,13 @@
  * The output-shape knobs (`target`, `fragmented`, `fastStart`, `writeChunkBytes`, `maximumPacketCount`)
  * are carried in `options` HERE and the runner forwards the full remux option bag to adapters. That
  * makes declared `fastStart:*` / `fragmented` rows execute the requested mode instead of accidentally
- * validating a plain buffered remux. The remaining caveat is OBSERVABILITY: `reference-reimport` and
- * duration invariants prove the output is valid and duration-preserving, but they do not distinguish
- * moov position, moof/mdat split structure, reserved forward seeks, TS write granularity, first-byte
- * timing, or buffer-vs-stream peak memory. Those need NEW runner/oracle machinery (CountingTarget
- * threading, a streaming-shape oracle, a firstByte callback) that lives OUTSIDE this file. Where a
- * SHAPE property cannot yet be observed, the case is documented with the exact missing hook rather
- * than gated by a placeholder that would silently pass.
+ * validating a plain buffered remux. Streaming target rows are stricter: any case that requests
+ * `target:'stream'` or write granularity now requires the explicit `target:writes` feature, so a
+ * BufferTarget/MEMFS/full-buffer implementation cannot pass a streaming-output row by merely returning
+ * valid bytes. The remaining caveat is OBSERVABILITY: target-write counts, first-byte timing, and
+ * bounded stream memory still need CountingTarget/StreamTarget plumbing in adapters and runner metrics.
+ * Where a SHAPE property cannot yet be observed, the case is documented with the exact missing hook
+ * rather than gated by a placeholder that would silently pass.
  *
  * ── ORACLE TRUTH for an `op:'remux'` scenario (mirrors remux/_shared.ts) ─────────────────────────
  *   - The runner runs ONLY `engine.remux(...)` and exposes the result as `ctx.output`. It never
@@ -128,14 +128,7 @@ export interface StreamCase {
 /** Default oracle set for an output-shape byte-validity check. */
 const DEFAULT_STREAM_ORACLES: OracleId[] = ['reference-reimport'];
 
-/**
- * Existing capability proxy for engines that expose low-level output-shape authoring. There is not yet
- * a separate `output-shape` feature in the engine contract; `fragmented` is the current declared signal
- * shared by the engines that can exercise this family without falling back to a generic copy-remux path.
- * This keeps remux-only converters out of target/fastStart/write-chunk cases that otherwise ERROR before
- * any oracle can run, while preserving the currently passing mediabunny/ffmpeg/mp4box rows.
- */
-const OUTPUT_SHAPE_FEATURE = 'fragmented';
+const TARGET_WRITE_FEATURE = 'target:writes';
 
 function mp4LayoutOracleApplies(shape: OutputShape): boolean {
   const container = shape.container.trim().toLowerCase();
@@ -178,20 +171,29 @@ function shapeOptions(shape: OutputShape, extra?: Record<string, unknown>): Reco
 function shapeFeatures(c: StreamCase | StreamPropertyCase): string[] | undefined {
   const features = [...(c.features ?? [])];
   const shape = c.shape;
-  const requestsOutputShape =
-    shape.target !== undefined ||
-    shape.fragmented !== undefined ||
-    shape.fastStart !== undefined ||
-    shape.writeChunkBytes !== undefined ||
-    shape.maximumPacketCount !== undefined ||
-    shape.appendOnly !== undefined;
-  if (requestsOutputShape && !features.includes(OUTPUT_SHAPE_FEATURE)) {
-    features.push(OUTPUT_SHAPE_FEATURE);
+  if (shape.target === 'stream' || shape.writeChunkBytes !== undefined) {
+    pushUnique(features, TARGET_WRITE_FEATURE);
+  }
+  if (shape.fragmented === true) {
+    pushUnique(features, 'fragmented');
   }
   if (shape.fastStart === false && !features.includes('fastStart:none')) {
     features.push('fastStart:none');
   }
+  if (shape.fastStart === 'in-memory') {
+    pushUnique(features, 'fastStart:in-memory');
+  }
+  if (shape.fastStart === 'reserve') {
+    pushUnique(features, 'fastStart:reserve');
+  }
+  if (shape.appendOnly === true) {
+    pushUnique(features, 'headerless');
+  }
   return features.length ? features : undefined;
+}
+
+function pushUnique(list: string[], value: string): void {
+  if (!list.includes(value)) list.push(value);
 }
 
 /** Build a single streaming-output Scenario from a StreamCase. */

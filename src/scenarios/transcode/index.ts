@@ -199,6 +199,20 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
     notes: '4K→1080p downscale.',
   },
+  {
+    id: 'video_only_h264_resize_360p_to_vp9_webm',
+    asset: 'h264_video_only.mp4',
+    fromContainer: 'mp4',
+    fromVideo: 'h264',
+    toContainer: 'webm',
+    toVideo: 'vp9',
+    features: ['resize', 'mediarecorder:video-only'],
+    opts: { container: 'webm', video: { codec: 'vp9', width: 640, height: 360, bitrate: 4_000_000 } },
+    tolerances: { ssimMin: 0.93, psnrMinDb: 30 },
+    notes:
+      'Video-only browser-native transcode coverage: uses the corpus h264_video_only.mp4 fixture so ' +
+      'platform can exercise its real canvas→MediaRecorder path without falsely claiming audio preservation.',
+  },
 
   // ── FPS change (temporal resample) ──
   {

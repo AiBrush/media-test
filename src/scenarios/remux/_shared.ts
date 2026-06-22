@@ -55,6 +55,7 @@ export interface RemuxCase {
   /** target container token (canonical) */
   to: string;
   videoCodecs?: string[];
+  videoCodecsIn?: string[];
   audioCodecs?: string[];
   features?: string[];
   /**
@@ -91,6 +92,7 @@ export function buildRemux(c: RemuxCase): Scenario {
       containersIn: [c.from],
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
+      ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.features ? { features: c.features } : {}),
     },
@@ -116,6 +118,7 @@ export interface RemuxPropertyCase {
   from: string;
   to: string;
   videoCodecs?: string[];
+  videoCodecsIn?: string[];
   audioCodecs?: string[];
   features?: string[];
   /** extra option keys merged into options (e.g. round-trip via container, second remux target) */
@@ -143,6 +146,7 @@ export function buildRemuxProperty(c: RemuxPropertyCase): Scenario {
       containersIn: [c.from],
       containersOut: [c.to],
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
+      ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
       ...(c.features ? { features: c.features } : {}),
     },

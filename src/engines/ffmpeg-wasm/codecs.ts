@@ -284,11 +284,9 @@ export function parseFormats(log: string): { demux: Set<string>; mux: Set<string
  * cannot be expressed through this one flat list while `webcodecs:independent` is declared.
  *
  * Therefore we keep the conservative round-trip gate here (AV1 fails the encode test → absent). The
- * honest cure for the read-side false-NA on av1 (demux/remux of av1-in-webm, which this engine truly
- * performs via stream copy) is OUTSIDE this adapter's scope: either drop the videoCodecs requirement
- * from the read-only scenarios (src/scenarios/{demux,remux}) so they gate on the container alone, or
- * split a decode-only set into core (src/core/engine.ts CapabilitySet + runner.ts negotiate()). The
- * golden-packets / reference-reimport oracles remain the full correctness gate either way.
+ * read-side AV1 cases use CapabilitySet.videoCodecsIn, derived separately below, so demux/remux-copy
+ * can exercise FFmpeg's decoder/demuxer support without falsely declaring AV1 encode capability.
+ * The golden-packets / reference-reimport oracles remain the full correctness gate.
  */
 export function deriveVideoCodecs(
   encoders: Set<string>,
@@ -302,6 +300,15 @@ export function deriveVideoCodecs(
     // Declare a codec only when BOTH decode and encode are present (the suite treats a videoCodec
     // token as round-trippable; see the round-trip-gate rationale above). AV1 fails encode → absent.
     if (decodes && encodes) out.push(canonical);
+  }
+  return out;
+}
+
+/** Video codecs the runtime decoder can read/decode, regardless of whether an encoder exists. */
+export function deriveVideoDecodeCodecs(decoders: Set<string>): CanonicalVideoCodec[] {
+  const out: CanonicalVideoCodec[] = [];
+  for (const canonical of Object.keys(VIDEO_DECODER_ALIASES) as CanonicalVideoCodec[]) {
+    if (VIDEO_DECODER_ALIASES[canonical].some((d) => decoders.has(d))) out.push(canonical);
   }
   return out;
 }
