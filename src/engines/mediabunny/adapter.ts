@@ -84,6 +84,8 @@ import type {
   AudioCodec,
   Rotation,
   BufferTarget,
+  Target,
+  StreamTargetChunk,
 } from 'mediabunny';
 
 /** The mediabunny module namespace, loaded lazily in init() (rule §0.7 — untimed). */
@@ -751,8 +753,98 @@ function buildAudioProcess(
   };
 }
 
+interface OutputTargetTelemetry {
+  target: Target;
+  mediaBytes: (container: string) => Promise<MediaBytes>;
+}
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+function instrumentedOutputTarget(mb: MB, opts?: Record<string, unknown>): OutputTargetTelemetry {
+  const startMs = nowMs();
+  let targetWrites = 0;
+  let firstByteMs: number | undefined;
+  const markWrite = () => {
+    targetWrites++;
+    firstByteMs ??= Math.max(0, nowMs() - startMs);
+  };
+
+  if (opts?.target === 'stream') {
+    const chunks: Array<{ position: number; data: Uint8Array }> = [];
+    let maxEnd = 0;
+    let resolveClosed!: () => void;
+    let rejectClosed!: (err: unknown) => void;
+    const closed = new Promise<void>((resolve, reject) => {
+      resolveClosed = resolve;
+      rejectClosed = reject;
+    });
+
+    const writable = new WritableStream<StreamTargetChunk>({
+      write(chunk) {
+        markWrite();
+        const data = new Uint8Array(chunk.data);
+        chunks.push({ position: chunk.position, data });
+        maxEnd = Math.max(maxEnd, chunk.position + data.byteLength);
+      },
+      close() {
+        resolveClosed();
+      },
+      abort(reason) {
+        rejectClosed(reason);
+      },
+    });
+
+    const target = new mb.StreamTarget(writable);
+    return {
+      target,
+      async mediaBytes(container) {
+        await closed;
+        const bytes = new Uint8Array(maxEnd);
+        for (const chunk of chunks) bytes.set(chunk.data, chunk.position);
+        return {
+          bytes,
+          mime: mimeForContainer(container),
+          container,
+          targetWrites,
+          ...(firstByteMs !== undefined ? { firstByteMs } : {}),
+        };
+      },
+    };
+  }
+
+  const target = new mb.BufferTarget();
+  target.on('write', () => {
+    targetWrites++;
+  });
+
+  return {
+    target,
+    async mediaBytes(container) {
+      const buffer = target.buffer;
+      if (!buffer) throw new Error('mediabunny output target produced no output buffer');
+      firstByteMs ??= Math.max(0, nowMs() - startMs);
+      return {
+        bytes: new Uint8Array(buffer),
+        mime: mimeForContainer(container),
+        container,
+        targetWrites,
+        firstByteMs,
+      };
+    },
+  };
+}
+
 /** Run a Conversion to completion and return the resulting bytes. */
-async function runConversion(mb: MB, opts: ConversionOptions, container: string): Promise<MediaBytes> {
+async function runConversion(
+  mb: MB,
+  opts: ConversionOptions,
+  container: string,
+  targetInfo?: OutputTargetTelemetry,
+): Promise<MediaBytes> {
   const conversion = await mb.Conversion.init(opts);
   if (!conversion.isValid) {
     const reasons = conversion.discardedTracks.map((d) => d.reason).join(', ');
@@ -761,14 +853,19 @@ async function runConversion(mb: MB, opts: ConversionOptions, container: string)
     );
   }
   await conversion.execute();
-  const target = opts.output.target as BufferTarget;
-  const buffer = target.buffer;
-  if (!buffer) throw new Error('mediabunny Conversion produced no output buffer');
-  return {
-    bytes: new Uint8Array(buffer),
-    mime: mimeForContainer(container),
-    container,
-  };
+  return (targetInfo ?? {
+    target: opts.output.target as Target,
+    async mediaBytes(fallbackContainer: string): Promise<MediaBytes> {
+      const target = opts.output.target as BufferTarget;
+      const buffer = target.buffer;
+      if (!buffer) throw new Error('mediabunny Conversion produced no output buffer');
+      return {
+        bytes: new Uint8Array(buffer),
+        mime: mimeForContainer(fallbackContainer),
+        container: fallbackContainer,
+      };
+    },
+  }).mediaBytes(container);
 }
 
 /** A FrameSink backed by digests + cached ImageData for SSIM/PSNR pixel access. */
@@ -980,6 +1077,7 @@ export class MediabunnyEngine implements MediaEngine {
         'mux:browser-decode-equality', // muxed outputs satisfy the platform decode invariant
         'mux:roundtrip-compare', // demux->mux->demux packet stability is validated by the property oracle
         'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
+        'target:writes', // Output can write through native StreamTarget and reports target write telemetry
         'headerless', // WebM/Matroska appendOnly live layout: unknown Segment size, no SeekHead/duration
         'fanout', // transcode() returns every requested ABR rendition in MediaBytes.variants[]
         // mediabunny encodes AND decodes all PCM codecs in PURE TS, independent of WebCodecs:
@@ -1153,8 +1251,9 @@ export class MediabunnyEngine implements MediaEngine {
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
     const mbInput = await openInput(this.lib, input);
     try {
-      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
-      return await runConversion(this.lib, { input: mbInput, output }, opts.container);
+      const targetInfo = instrumentedOutputTarget(this.lib, opts);
+      const output = new this.lib.Output({ format, target: targetInfo.target });
+      return await runConversion(this.lib, { input: mbInput, output }, opts.container, targetInfo);
     } finally {
       mbInput.dispose();
     }
@@ -1186,7 +1285,8 @@ export class MediabunnyEngine implements MediaEngine {
       const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
       if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
       const mbInput = await openInput(this.lib, input);
-      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
+      const targetInfo = instrumentedOutputTarget(this.lib, runtimeOpts);
+      const output = new this.lib.Output({ format, target: targetInfo.target });
       const convOpts: ConversionOptions = { input: mbInput, output };
 
       try {
@@ -1204,7 +1304,7 @@ export class MediabunnyEngine implements MediaEngine {
 
         if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
 
-        return await runConversion(this.lib, convOpts, opts.container);
+        return await runConversion(this.lib, convOpts, opts.container, targetInfo);
       } finally {
         mbInput.dispose();
       }
@@ -1410,7 +1510,8 @@ export class MediabunnyEngine implements MediaEngine {
     if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
 
     const mb = this.lib;
-    const output = new mb.Output({ format, target: new mb.BufferTarget() });
+    const targetInfo = instrumentedOutputTarget(mb, opts);
+    const output = new mb.Output({ format, target: targetInfo.target });
 
     interface Pending {
       add: (pkt: EncodedPacket, meta?: EncodedVideoChunkMetadata | EncodedAudioChunkMetadata) => Promise<void>;
@@ -1495,13 +1596,7 @@ export class MediabunnyEngine implements MediaEngine {
     }
 
     await output.finalize();
-    const buffer = (output.target as BufferTarget).buffer;
-    if (!buffer) throw new Error('mediabunny mux produced no output buffer');
-    return {
-      bytes: new Uint8Array(buffer),
-      mime: mimeForContainer(opts.container),
-      container: opts.container,
-    };
+    return targetInfo.mediaBytes(opts.container);
   }
 
   // ── decrypt ────────────────────────────────────────────────────────────────────────────────

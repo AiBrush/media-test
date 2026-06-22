@@ -1134,6 +1134,8 @@ async function runBench(
       ctx.bytesOut = opResult.output.variants?.length
         ? opResult.output.variants.reduce((sum, variant) => sum + variant.bytes.byteLength, 0)
         : opResult.output.bytes.byteLength;
+      if (opResult.output.targetWrites !== undefined) ctx.targetWrites = opResult.output.targetWrites;
+      if (opResult.output.firstByteMs !== undefined) ctx.firstByteMs = opResult.output.firstByteMs;
     }
     if (opResult.demux) ctx.packets = opResult.demux.packets.length;
     if (opResult.seek) ctx.seeks = 1;

@@ -28,6 +28,10 @@ export type MediaBytes = {
   bytes: Uint8Array;
   mime: string;
   container: string;
+  /** Observable output-target write count, when the adapter can instrument a real target. */
+  targetWrites?: number;
+  /** Milliseconds from operation entry to the first observable output-target byte. */
+  firstByteMs?: number;
   /** Multi-rendition operations such as ABR fanout. Includes the primary rendition as variants[0]. */
   variants?: MediaBytes[];
 };
