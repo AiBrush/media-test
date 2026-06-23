@@ -1,0 +1,57 @@
+# audio-dsp/edge_longform_audio_resample_16k
+
+family: audio-dsp | fixture asset: `longform_1h_audio_pcm.wav` (≈318 MB, ~1h PCM-S16 WAV) | primaryMetric: wall | passCount: 3/7
+
+## Verdict
+
+- Best framework: **ffmpeg.wasm@0.12.15** (engineId `ffmpeg-wasm`).
+- Contested: YES — 3 engines PASS (ffmpeg-wasm, mediabunny, remotion-webcodecs), all satisfying the identical gating oracle `property-invariant` (`transcode-output-metadata`).
+- Decisive factor: PERFORMANCE. Correctness is comparable across all three winners (same single metadata-exact oracle, all within the duration tolerance and matching the requested `wav / pcm-s16 / 16000 Hz` output shape), so the tie breaks on wall-clock. ffmpeg-wasm is fastest.
+- Margin over runner-up (mediabunny): **2.39× faster wall** (4117.01 ms vs 9850.38 ms) and **3.23× fewer long-task ms** (315 ms vs 1017 ms). Over the 3rd-place remotion-webcodecs it is **5.80× faster wall** (4117.01 ms vs 23873.35 ms) and **10.27× fewer long-task ms** (315 vs 3234 ms). Caveat: n=1 sample per engine (mad=0, p95=median), so the margins are single-shot, not distributions.
+
+## Per-engine results
+
+| engine | status | oracles passed (name:pass) | wall median (ms) | throughputRealtime | peakMemory | longtasks (ms) | reason |
+|---|---|---|---|---|---|---|---|
+| ffmpeg.wasm@0.12.15 | PASS | property-invariant:pass | 4117.01 | n/a (not measured) | 0 (n=0) | 315 | cached previous PASS result |
+| mediabunny@1.48.0 | PASS | property-invariant:pass | 9850.38 | n/a (not measured) | 0 (n=0) | 1017 | cached previous PASS result |
+| remotion-webcodecs@4.0.479 | PASS | property-invariant:pass | 23873.35 | n/a (not measured) | 0 (n=0) | 3234 | cached previous PASS result |
+| mp4box@2.3.0 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+| remotion-media-parser@4.0.479 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+| web-demuxer@4.0.0 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+| platform@chrome-149 | NA_ENGINE | — | — | — | — | — | engine does not declare output container 'wav' |
+
+Note: `throughputRealtime` and `peakMemory` were not captured for this scenario (peakMemory bench has n=0 samples for all three winners; no throughput metric in the shard). The only measured benches are `wall` and `longtasks`.
+
+## Why the winner wins (deep technical)
+
+The operation is a pure-audio **DSP resample**: take a ~1-hour mono/stereo PCM-S16 WAV (`longform_1h_audio_pcm.wav`, ~318 MB on disk) and produce a WAV whose audio is re-sampled to 16000 Hz, still PCM-S16 (`opts.audio = { codec: 'pcm-s16', sampleRate: 16000 }`, `outContainer: 'wav'`). There is no video track, no compressed codec to decode/encode — the entire cost is (1) reading a multi-hundred-MB linear PCM stream and (2) running a sample-rate-conversion filter, then writing a RIFF/WAVE container. The scenario `notes` (src/scenarios/audio-dsp/index.ts:506) make the intent explicit: "size-ladder for audio: downsample a multi-hour file streaming; duration must survive." So the property that matters is throughput on a huge linear buffer plus duration preservation across the rate change.
+
+ffmpeg.wasm maps this directly onto its native command pipeline. In the audio branch of `transcode` (src/engines/ffmpeg-wasm/adapter.ts:2461–2508), with `opts.audio.codec='pcm-s16'` it resolves the PCM encoder and pushes `-c:a <enc>` (line 2472), then on line 2503 pushes `-ar 16000` (the literal resample request) — this is the real libswresample `aresample` path inside the vendored ffmpeg core. The WAV target is handled by the container/extension plumbing (`-f wav` via `outName = <base>.out.wav`, adapter.ts:2202/2527), and the bytes are read back with `readBinary(outName)`. The engine declares `resample` (the `-ar` capability) and `transcode` in its registration (adapter.ts:1513 `'resample', // -ar`, and the `transcode: true` operation flag), so the runner routes the op to it instead of NA-gating. Mechanistically, ffmpeg.wasm streams the PCM through libswresample in C-compiled WASM with a tight inner loop; no JS-side per-sample marshalling, no WebCodecs round-trip, no canvas. That is why it finishes in 4117 ms with only 315 ms of long-task time.
+
+The oracle that gates the PASS is `transcodeOutputMetadataInvariant` (src/core/oracles.ts:3626–3708, reached via `propertyInvariant` → the `output-metadata` branch at oracles.ts:2650–2651). It re-probes the produced bytes with the reference engine and asserts three things: container == `wav` (oracles.ts:3655), output duration within a per-container tolerance of the source golden duration (oracles.ts:3659–3677), and the audio track matches the requested shape via `compareRequestedTrack` (oracles.ts:3692–3699 → 3778–3821), which for audio checks `track.sampleRate === 16000` (oracles.ts:3814) and `track.codec === 'pcm-s16'` (oracles.ts:3795). ffmpeg-wasm's recorded measurements are `durationDeltaSec: 0`, `durationToleranceSec: 0.041666…` (= 1/24 s) and `audioTracks: 1` — i.e. it preserved the ~1h duration EXACTLY (Δ=0) after dropping the sample rate to 16 kHz, which is the hardest part of the invariant: a naive resample that mis-counts trailing samples would drift the duration. ffmpeg's swr keeps the time base intact, so Δ=0.
+
+Why ffmpeg beats the two WebCodecs-backed engines here specifically: this is PCM↔PCM with a rate change, which is exactly the workload where WebCodecs adds overhead rather than removing it. mediabunny (env.configUsed.backend `webcodecs`, `pipeline: streaming-lockstep`, `pure-ts-esm` core, `sharedArrayBuffer:false`) and remotion-webcodecs (backend `webcodecs`, `pipeline: streaming-backpressure`, `worker: convert=main-thread`) both PASS the same oracle (mediabunny durationDelta 0.0000625 s ≪ tol 0.04167 s; remotion-webcodecs durationDelta 0) but pay for the abstraction. There is no hardware audio codec to accelerate a PCM resample, so the WebCodecs route degenerates to JS/TS-driven sample handling: mediabunny's pure-TS streaming-lockstep loop moves the 1-hour buffer through TS frames (9850 ms, 1017 ms long tasks), and remotion-webcodecs runs its convert step on the **main thread** ("convert=main-thread", env.configUsed) with a backpressure queue, which serializes a huge PCM stream through main-thread tasks — 23873 ms wall and 3234 ms of long tasks, the worst responsiveness of the three. ffmpeg's monolithic WASM swr loop has none of that per-frame JS overhead, hence the 2.39×/5.80× wins.
+
+## What each other framework did wrong
+
+- **mediabunny@1.48.0** — PASS but lost on speed. Same oracle, durationDelta 0.0000625 s within tol. 9850.38 ms wall is 2.39× slower than ffmpeg and 1017 ms of long tasks is 3.23× worse. Cause: pure-TS (`coreBuild: pure-ts-esm`) `streaming-lockstep` WebCodecs pipeline with no SharedArrayBuffer — a PCM resample gets no HW acceleration, so it is TS-bound on a ~1h buffer.
+- **remotion-webcodecs@4.0.479** — PASS but slowest. Same oracle, durationDelta 0. 23873.35 ms wall (5.80× slower than ffmpeg) and 3234 ms long tasks (10.27× worse). Cause: env.configUsed shows `worker: convert=main-thread`; the conversion runs on the main thread with a `waitForQueueToBeLessthan` backpressure loop, serializing a multi-hundred-MB PCM stream through main-thread long tasks.
+- **mp4box@2.3.0** — NA_ENGINE: "engine does not declare operation 'transcode'." Honest NA — MP4Box is an MP4 demuxer/box parser, not an encoder/resampler; it has no audio DSP path, and a WAV (RIFF) output container is outside its MP4-only scope.
+- **remotion-media-parser@4.0.479** — NA_ENGINE: "engine does not declare operation 'transcode'." Honest NA — it is a parser/probe library, no encode/resample capability.
+- **web-demuxer@4.0.0** — NA_ENGINE: "engine does not declare operation 'transcode'." Honest NA — demux-only; no encoder or sample-rate-conversion path.
+- **platform@chrome-149** — NA_ENGINE: "engine does not declare output container 'wav'." Honest NA at the container level — the Chrome platform path (MediaRecorder/WebCodecs muxing) cannot author a RIFF/WAVE file, so it is correctly gated out of a `outContainer: 'wav'` request rather than faking it.
+
+## Anti-cheat validation
+
+- Scenario definition: src/scenarios/audio-dsp/index.ts:496–507 (`id: 'edge_longform_audio_resample_16k'`, `op: 'transcode'`, `asset: 'longform_1h_audio_pcm.wav'`, `opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 }, invariant: 'transcode-output-metadata' }`, oracle `property-invariant`, notes at line 506).
+- Fixture: `fixtures/media/longform_1h_audio_pcm.wav` EXISTS — `stat` shows ~318 MB, last modified ~1 day ago. This is a real, large, multi-hour PCM WAV, not synthetic/empty/mock. The size is physically consistent with ~1h of PCM-S16 audio.
+- Gating oracle: src/core/oracles.ts:3626 `transcodeOutputMetadataInvariant` (entered via oracles.ts:2650). It performs a REAL re-probe of the produced bytes (`ctx.referenceEngine.probe`, oracles.ts:3641) and asserts container=wav (3655), duration within 1/24 s of golden (3659–3677), and audio track sampleRate=16000 (3814) + codec=pcm-s16 (3795) via `compareRequestedTrack` (3778). This is metadata-exact, not a smoke gate and not an ssim/exactFrames==0 proxy; the sampleRate equality check is strict (`!==`), so a no-op copy that left 48 kHz/44.1 kHz in place would FAIL. Tolerance is tight (Δ must be ≤ 0.04167 s over a ~3600 s file).
+- Winner adapter: src/engines/ffmpeg-wasm/adapter.ts:2461–2508 (audio encode branch), specifically `-ar 16000` at adapter.ts:2503 and PCM encoder selection at 2468–2472; output read at 2527/`readBinary`. The transcode is genuinely implemented against the vendored ffmpeg WASM core — it shells real `-c:a`/`-ar` args, does not return canned bytes, does not copy input→output (it forces a re-encode/resample), and does not short-circuit to a golden file. Measurements (`durationDeltaSec: 0`, `audioTracks: 1`) are physically plausible for an exact-time-base PCM resample.
+- Verdict: **REAL** — real large fixture, real libswresample resample path, strict metadata-exact oracle that verifies the actual 16 kHz / pcm-s16 / wav output shape and duration preservation.
+- Cached note: ffmpeg-wasm result has `cached: true` ("cached previous PASS result"); so do mediabunny and remotion-webcodecs. The PASS and benches are reused from a prior run, not freshly executed in this report. Per the launcher seeding caveat, single-shot (n=1) cached benches carry mild staleness risk, but the win margins (2.39×/5.80×) are large enough that ordering is robust.
+
+## Confidence & caveats
+
+- Confidence: HIGH on the winner identity and ordering. ffmpeg-wasm is fastest by a wide margin, the oracle is a genuine strict metadata check, the fixture is real, and the adapter path is a true resample.
+- Caveats: (1) all three winning results are `cached: true` (reused, not re-run). (2) Each bench is n=1 (mad=0, p95=median) — margins are single-shot, not distributions, so absolute timings could shift on a fresh run though the 2.4×–5.8× gaps make a re-ordering unlikely. (3) `peakMemory` (n=0) and `throughputRealtime` were not measured, so the win rests on `wall` + `longtasks` only. (4) The gate is metadata-exact, not bit-exact PCM: it does not compare resampled sample values against a golden, so it verifies shape/duration correctness, not filter fidelity (a wrong-but-plausible resample filter would still PASS) — this caps oracle strength at "structural/metadata-exact," below bit-exact.

@@ -1,0 +1,59 @@
+# robustness/prop_transcode_idempotent_dims_h264
+
+family: robustness | fixture asset: `h264_1080p_30s.mp4` (31 MB, H.264 1080p30 + AAC stereo 48kHz, MP4) | primaryMetric: wall (metrics: wall, peakMemory) | passCount: 3 / 7
+
+Metamorphic idempotence: transcode with target dims == source dims (1920x1080), same codec (h264) and container (mp4) must be perceptually a no-op. Gated by `ssim-psnr` + `playback-smoke`.
+
+## Verdict
+
+**Best framework: remotion-webcodecs@4.0.479** — CONTESTED (3 engines PASS: remotion-webcodecs, mediabunny, ffmpeg-wasm).
+
+Decisive factor: **correctness strength, not performance.** remotion-webcodecs is the only PASS that achieved a *bit-exact* result — all 12 paired frames were digest-identical (`exactFrames: 12/12`, SSIM=1.000000, PSNR=infinity). The other two PASS engines satisfied only the *perceptual luma-signature proxy* rung of the SSIM ladder (`exactFrames: 0/12`, SSIM ~ 0.9999998). Per the decision ladder, bit-exact / digest-identical beats a perceptual proxy regardless of timing, so remotion-webcodecs wins on the strongest oracle outcome even though it is not the fastest engine.
+
+Margin over runner-up (correctness): 12/12 digest-exact frames vs 0/12 for both mediabunny and ffmpeg-wasm — a categorical gap (exact reconstruction vs near-1.0 perceptual match), not a numeric tolerance margin. On wall time remotion-webcodecs (durationMs 6832) is ~1.53x slower than mediabunny (4454) but ~10.9x faster than ffmpeg-wasm (74558); timing is not the tiebreaker here because correctness already separated them.
+
+## Per-engine results
+
+| engine | status | oracles passed (name:pass) | wall (durationMs) | throughputRealtime | peakMemory | longtasks | reason |
+|---|---|---|---|---|---|---|---|
+| remotion-webcodecs@4.0.479 | PASS | ssim-psnr:true (12/12 exact, SSIM=1, PSNR=inf); playback-smoke:true | 6832 | n/a (not in shard) | n/a | n/a | cached previous PASS result |
+| mediabunny@1.48.0 | PASS | ssim-psnr:true (0/12 exact, SSIMmin 0.99999960); playback-smoke:true | 4454 | n/a | n/a | n/a | cached previous PASS result |
+| ffmpeg.wasm@0.12.15 | PASS | ssim-psnr:true (0/12 exact, SSIMmin 0.99999978); playback-smoke:true | 74558 | n/a | n/a | n/a | cached previous PASS result |
+| platform@chrome-149 | NA_ENGINE | — | 22 | — | — | — | transcode is NA: source carries audio and the MediaRecorder canvas-capture path cannot preserve/copy audio |
+| web-demuxer@4.0.0 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+| mp4box@2.3.0 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+| remotion-media-parser@4.0.479 | NA_ENGINE | — | — | — | — | — | engine does not declare operation 'transcode' |
+
+Note: the shard entries carry no `bench{}` blocks — only `durationMs` and `cached:true`. throughputRealtime / peakMemory / longtasks were not recorded for these cached entries, so wall (durationMs) is the only timing signal available.
+
+## Why the winner wins (deep technical)
+
+The asset is `h264_1080p_30s.mp4`: AVC/H.264 video at 1920x1080@30 (bitrate ~8.2 Mb/s per the committed `fixtures/golden/h264_1080p_30s.mp4.meta.json`) muxed with AAC-LC stereo at 48 kHz in a faststart MP4. The scenario (`src/scenarios/robustness/index.ts:931-963`) requests `op: 'transcode'` with `options.video = { codec: 'h264', width: 1920, height: 1080 }` and `container: 'mp4'` — i.e. the *same* codec, the *same* dimensions, the *same* container as the source. This is the classic resize-to-same / re-encode-idempotence property.
+
+remotion-webcodecs drives this through `wc.convertMedia(...)` in its real adapter (`src/engines/remotion-webcodecs/adapter.ts:521` `transcode()` -> `:580` `convert()` -> `:615` `wc.convertMedia({ container, videoCodec, resize, rotate, writer: bufferWriter, ... })`). `buildResize(videoSpec)` (`adapter.ts:541`) is fed width=1920/height=1080. Because the requested dimensions equal the source dimensions and the codec equals the source codec, Remotion's convertMedia takes the lossless track-copy fast path for the video track rather than re-encoding it — the encoded H.264 NAL units are remuxed verbatim into a fresh MP4 via the in-memory `bufferWriter`. When the `ssim-psnr` oracle re-decodes that output with the platform decoder, every decoded RGBA frame is byte-for-byte identical to the committed golden frame digests, so the oracle's branch-A digest-equality test fires for all 12 sampled frames: `normHex(cand.sha256) === normHex(want[i].sha256)` (`src/core/oracles.ts:1766`), driving `exactCount` to 12, and at `:1803` `exactCount === pairs` returns `pass` with `psnrDb = +Infinity`. That is exactly what the shard records: `"all 12 paired frames digest-identical (SSIM=1, PSNR=∞)"`, `measurements {pairs:12, exactFrames:12, ssimMean:1, ssimMin:1}`. This is the top rung of the correctness ladder (decoded-frames bit-exact), and no other engine reached it.
+
+By contrast, mediabunny and ffmpeg-wasm re-*encoded* the H.264 video. mediabunny runs the source through its `Conversion` API (`src/engines/mediabunny/adapter.ts`, `Conversion.init/.execute` with `ConversionVideoOptions` built around an H.264 encoder and a `fit` algorithm — note `adapter.ts:579` "Conversion requires a fit algorithm whenever BOTH width and height are set"). Even though dims match, supplying both width and height forces a decode->scale(fit)->re-encode pipeline through WebCodecs (`backend: webcodecs`, `prefer-hardware`, `pixelBackend: VideoSample.copyTo(RGBA)>canvas`), which produces a NEW H.264 bitstream. Lossy re-encode means the decoded RGBA pixels differ from the golden at the bit level, so none of the 12 digests match (`exactFrames:0`) and the oracle falls to branch-B downsampled-luma-signature SSIM (`oracles.ts:1782-1786`), scoring `ssimMin 0.99999960` / `ssimMean 0.99999976` — visually a perfect no-op, but only a *perceptual proxy*, not bit-exact. ffmpeg-wasm does the same via its libx264 exec path (single-thread wasm core; `src/engines/ffmpeg-wasm/adapter.ts` transcode exec), landing `ssimMin 0.99999978` / `exactFrames:0`. Both pass the gate (floor `ssimMin: 0.97`, scenario `tolerances`), but both sit one rung below remotion-webcodecs.
+
+The oracle selection is honest here: `usesTransformReference(ctx)` (`oracles.ts:1973`) returns false for this scenario because `options` has no `crop`/`pad`/`flip` — so the committed-golden branch is used (golden `frames.json` has `pending:false` and `ssim.json` ships real 256-value luma sigs). That means a wrong-size or garbled output would have failed digest AND luma SSIM. remotion-webcodecs winning by digest-exactness is therefore a real, strong signal.
+
+## What each other framework did wrong
+
+- **mediabunny@1.48.0** (PASS, lost on correctness): re-encoded the H.264 stream through its WebCodecs `Conversion` pipeline (decode->fit-scale->H.264 re-encode), yielding a lossy new bitstream. Result `exactFrames: 0/12`, SSIMmin 0.99999960 — passes the perceptual gate but is one ladder rung below remotion-webcodecs's 12/12 digest-exact. It was actually the fastest engine (durationMs 4454, ~1.53x faster than the winner), but performance is the secondary criterion and correctness already decided it.
+- **ffmpeg.wasm@0.12.15** (PASS, lost on correctness AND perf): libx264 re-encode in a single-thread wasm core. `exactFrames: 0/12`, SSIMmin 0.99999978 — passes perceptually but not bit-exact, and at durationMs 74558 it is ~10.9x slower than the winner and ~16.7x slower than mediabunny. Loses on every comparison axis.
+- **platform@chrome-149** (NA_ENGINE, honest): reason "transcode is NA — the source fixture carries audio and the MediaRecorder canvas-capture path cannot preserve or copy audio." This is a genuine capability limitation: the platform engine's only encode route is `<video>->canvas->MediaRecorder`, which captures video frames but cannot mux the source AAC track. Honest NA, not under-declared.
+- **web-demuxer@4.0.0** (NA_ENGINE, honest): "engine does not declare operation 'transcode'" — web-demuxer is a demux-only library with no encoder; correctly not declared.
+- **mp4box@2.3.0** (NA_ENGINE, honest): "engine does not declare operation 'transcode'" — mp4box is a box-level (de)muxer with no codec, correctly not declared.
+- **remotion-media-parser@4.0.479** (NA_ENGINE, honest): "engine does not declare operation 'transcode'" — media-parser is a parser/probe-only library (its sibling remotion-webcodecs is the encode-capable package), correctly not declared.
+
+## Anti-cheat validation
+
+- **Scenario**: `src/scenarios/robustness/index.ts:931-963` (id `robustness/prop_transcode_idempotent_dims_h264`). Input `h264_1080p_30s.mp4`, options same-codec/same-dims/same-container. Notes explicitly justify the gate. **Caveat found:** the scenario's inline notes (lines 948-951) claim the asset "ships no `.ssim.json` and its `.frames.json` is `pending`" so the §5.2 reference-source path runs. On disk this is now STALE: `fixtures/golden/h264_1080p_30s.mp4.frames.json` has `"pending": false` and `fixtures/golden/h264_1080p_30s.mp4.ssim.json` (76 KB) ships real luma sigs. So the *committed-golden* branch actually ran (consistent with the shard details mentioning "PSNR via golden pixels unavailable (digest proxy ...)"). The comment is out of date but the resulting gate is STRONGER than the comment describes, not weaker — not a cheat.
+- **Fixture exists**: `fixtures/media/h264_1080p_30s.mp4`, 31 MB, real H.264+AAC MP4 (confirmed via stat; golden meta reports 1920x1080@30, AAC 48kHz stereo, 30s). Not synthetic/empty/mock.
+- **Oracle**: `src/core/oracles.ts:1688` `ssimPsnr`. Real comparison: branch-A digest equality vs committed golden frame sha256 (`:1766`), branch-B downsampled-luma-signature SSIM with `ssimMin` gate at floor 0.97 (`:1823`); a wrong-size/garbled/empty output FAILs (`:1729-1734`, `:1830-1832`). Not trivially satisfiable. Second gate `playback-smoke` (output must actually play). Measurements are physically plausible: 12 frame pairs, SSIM ~ 0.9999998 for lossy re-encode of a clean source, SSIM=1 for a lossless copy.
+- **Winner adapter**: `src/engines/remotion-webcodecs/adapter.ts:521` `transcode()` -> `:615` `wc.convertMedia({...writer: bufferWriter})` -> `:629` `result.save()` returns real bytes. Genuinely calls the Remotion WebCodecs library; does not copy input->output by hand, does not short-circuit to the golden, does not swallow errors (throws on unsupported codec/container at `:523`,`:537`). The bit-exactness comes from convertMedia's legitimate lossless track-copy when codec+dims match, not from faking.
+- **Verdict: REAL.** Real 31 MB fixture, real convertMedia transcode, meaningful digest+SSIM+smoke gate. The winner's bit-exact result is the correct mechanistic outcome of a same-codec/same-dims copy.
+- **Cached note**: ALL three PASS entries (and the NA entries) have `cached: true` ("cached previous PASS result"). Evidence is reused, not freshly re-run, so there is mild staleness risk; per MEMORY launcher caveat, a fully honest fresh run would require clearing the raw + `.browser-cache`. The relative ranking (digest-exact vs proxy) is intrinsic to the codec-copy-vs-reencode behavior and unlikely to flip on re-run.
+
+## Confidence & caveats
+
+Confidence: high on the winner. The correctness gap (12/12 digest-exact vs 0/12) is categorical and follows directly from convertMedia taking a lossless H.264 track-copy when codec+dims are unchanged, versus mediabunny/ffmpeg re-encoding. Caveats: (1) all entries are cached, so timing numbers (durationMs) are from a prior run and no `bench{}`/peakMemory/throughput was captured; (2) the scenario's inline golden-status comment is stale relative to the committed golden files (gate is stronger than commented, not weaker); (3) timing margins (1.53x slower than mediabunny) are real but irrelevant to the verdict since correctness decided it.
