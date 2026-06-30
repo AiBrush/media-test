@@ -264,6 +264,15 @@ export function negotiate(
     // legitimately route other PCM widths (pcm-s24/pcm-f32) through WebCodecs and so cannot claim the
     // blanket token. It suppresses ONLY the encode gate (decode is unaffected) and ONLY for pcm-s16.
     const pcmWavEncode = ac === 'pcm-s16' && caps.containersOut.includes('wav');
+    // FLAC is likewise software-native for engines that explicitly declare this narrow feature:
+    // aibrush-media parses/decodes FLAC in pure TS and authors FLAC via its pure-TS encoder, so the
+    // browser's AudioDecoder/AudioEncoder FLAC table is irrelevant for FLAC only.
+    const flacNative = caps.features.includes('audio:flac-native') && ac === 'flac';
+    // Vorbis has no Chromium WebCodecs AudioDecoder/AudioEncoder, but engines may ship their own vetted
+    // native/wasm Vorbis tails. Keep decode and encode tokens separate so a decode-only tail never
+    // suppresses the encode gate by accident.
+    const vorbisNativeDecode = caps.features.includes('audio:vorbis-native') && ac === 'vorbis';
+    const vorbisNativeEncode = caps.features.includes('audio:vorbis-encode-native') && ac === 'vorbis';
     const canDecode = support.audioDecode[ac] === true;
     const canEncode = support.audioEncode[ac] === true;
     const needsEncode = isTranscode
@@ -272,7 +281,7 @@ export function negotiate(
     const needsDecode = isTranscode
       ? needsTranscodeDecode(ac, requiredAudio, transcodeTargets?.audio ?? new Set())
       : needsDecodeConfig && !producesEncodedOutput;
-    if (needsEncode && !pcmNative && !pcmWavEncode) {
+    if (needsEncode && !pcmNative && !pcmWavEncode && !flacNative && !vorbisNativeEncode) {
       if (!canEncode) {
         return {
           ok: false,
@@ -281,7 +290,7 @@ export function negotiate(
         };
       }
     }
-    if (needsDecode && !canDecode && !pcmNative) {
+    if (needsDecode && !canDecode && !pcmNative && !flacNative && !vorbisNativeDecode) {
       return {
         ok: false,
         status: 'NA_BROWSER',
@@ -294,6 +303,18 @@ export function negotiate(
   // can't honour it, that's NA_BROWSER (the engine already declared it in pass 1).
   if ((requires.features ?? []).includes('alpha') && !support.alpha) {
     return { ok: false, status: 'NA_BROWSER', reason: "browser cannot configure 'alpha' frames" };
+  }
+
+  // Strict golden-RGBA decode comparability is also browser-gated: it depends on the current browser's
+  // native decode+raster path matching the committed golden frame signatures closely enough for the
+  // decode/SSIM oracles. If the platform engine itself cannot satisfy that gate in this browser, any
+  // engine that requires the feature must negotiate NA_BROWSER instead of posting misleading pixel FAILs.
+  if ((requires.features ?? []).includes('decode:golden-rgba') && !support.strictGoldenRgba) {
+    return {
+      ok: false,
+      status: 'NA_BROWSER',
+      reason: "browser cannot provide strict committed-golden RGBA decode comparability",
+    };
   }
 
   return { ok: true };
@@ -780,6 +801,154 @@ function decodeFrameGoldenGap(scenario: Scenario, golden: GoldenStore): string |
   return 'decodeFrames oracle unavailable: no golden frame digests/signatures to compare (frame-bake pending)';
 }
 
+function decodeFrameStrictRgbaGap(scenario: Scenario, support: CodecSupport): string | null {
+  if (support.strictGoldenRgba) return null;
+  if (scenario.op !== 'decodeFrames') return null;
+  if (!scenario.oracles.some((oracle) => oracle === 'ssim-psnr' || oracle === 'decoded-frames-bitexact')) {
+    return null;
+  }
+  return 'browser cannot provide strict committed-golden RGBA decode comparability';
+}
+
+async function strictPixelBrowserGap(
+  scenario: Scenario,
+  support: CodecSupport,
+  primaryAssetId: string,
+  primaryGolden: GoldenStore,
+  browser: BrowserName,
+): Promise<string | null> {
+  if (
+    scenarioUsesReferencePixels(scenario) &&
+    (scenario.oracles.includes('ssim-psnr') || scenario.oracles.includes('fanout-renditions'))
+  ) {
+    if (!support.strictSourceRgba) {
+      return 'browser cannot provide strict source-reference RGBA pixel comparability';
+    }
+  }
+
+  if (support.strictGoldenRgba) return null;
+
+  const primaryHasSsim = (primaryGolden.ssimRef?.length ?? 0) > 0;
+  const primaryHasFrames = (primaryGolden.frames?.length ?? 0) > 0;
+  const usesGoldenSsim =
+    scenario.oracles.includes('ssim-psnr') || scenario.oracles.includes('fanout-renditions');
+  if (usesGoldenSsim && (primaryHasSsim || primaryHasFrames)) {
+    return 'browser cannot provide strict committed-golden RGBA decode comparability';
+  }
+
+  if (scenario.oracles.includes('decoded-frames-bitexact') && primaryHasFrames) {
+    return 'browser cannot provide strict committed-golden RGBA decode comparability';
+  }
+
+  if (scenario.oracles.includes('decrypt-bitexact')) {
+    const golden = await loadFrameComparisonGoldenForScenario(scenario, primaryAssetId, primaryGolden, browser);
+    if ((golden.frames?.length ?? 0) > 0) {
+      return 'browser cannot provide strict committed-golden RGBA decode comparability';
+    }
+  }
+
+  if (scenario.oracles.includes('property-invariant') && propertyInvariantUsesDecodeFrames(scenario)) {
+    const golden = await loadFrameComparisonGoldenForScenario(scenario, primaryAssetId, primaryGolden, browser);
+    if ((golden.frames?.length ?? 0) > 0) {
+      return 'browser cannot provide strict committed-golden RGBA decode comparability';
+    }
+  }
+
+  return null;
+}
+
+function scenarioMayUseStrictPixelOracle(scenario: Scenario): boolean {
+  return scenario.oracles.some(
+    (oracle) =>
+      oracle === 'ssim-psnr' ||
+      oracle === 'fanout-renditions' ||
+      oracle === 'decoded-frames-bitexact' ||
+      oracle === 'decrypt-bitexact' ||
+      oracle === 'property-invariant',
+  );
+}
+
+function playbackSmokeBrowserGap(scenario: Scenario, browser: BrowserName): string | null {
+  if (browser !== 'webkit') return null;
+  if (!scenario.oracles.includes('playback-smoke')) return null;
+  if ((scenario.requires.containersOut ?? []).includes('mkv')) {
+    return "browser cannot playback-smoke Matroska/MKV output with a plain <video> element";
+  }
+  return null;
+}
+
+function gaplessSampleCountBrowserGap(scenario: Scenario, browser: BrowserName): string | null {
+  if (browser !== 'webkit') return null;
+  if (!scenario.oracles.includes('property-invariant')) return null;
+  if (!(scenario.requires.features ?? []).includes('audio-samples:gapless-priming')) return null;
+  return 'browser cannot provide exact AAC priming/padding decoded sample-count evidence';
+}
+
+function scenarioUsesReferencePixels(scenario: Scenario): boolean {
+  if (scenario.op !== 'transcode') return false;
+  const options = objectOptionRoot(scenario.options);
+  return isRecord(options.crop) || isRecord(options.pad) || typeof options.flip === 'string';
+}
+
+function propertyInvariantUsesDecodeFrames(scenario: Scenario): boolean {
+  const explicit = readStringOption(scenario.options, ['invariant', 'property']);
+  const which = (explicit ?? inferInvariantForPreflight(scenario)).toLowerCase();
+  if (which.includes('transcode-output') || which.includes('output-metadata')) return false;
+  if (which.includes('linear-decode-frame')) return false;
+  if (which.includes('pts-strictly-increasing')) return false;
+  if (which.includes('vfr-seek-lands-on-true-pts')) return false;
+  if (which.includes('demux(mux')) return false;
+  if (which.includes('remux(remux')) return false;
+  if (which.includes('flac-seek')) return false;
+  if (which.includes('gapless')) return false;
+  if (which.includes('audio-pcm')) return false;
+  return which.includes('decode') || which.includes('remux');
+}
+
+function inferInvariantForPreflight(scenario: Scenario): string {
+  if (scenario.op === 'remux') return 'decode-remux';
+  if (scenario.op === 'trim') return 'trim-concat';
+  if (scenario.op === 'probe') return 'probe-duration';
+  return 'decode-remux';
+}
+
+async function loadFrameComparisonGoldenForScenario(
+  scenario: Scenario,
+  primaryAssetId: string,
+  primaryGolden: GoldenStore,
+  browser: BrowserName,
+): Promise<GoldenStore> {
+  const assetId = readStringOption(scenario.options, [
+    'cleartextAsset',
+    'cleartextAssetId',
+    'goldenAsset',
+    'goldenAssetId',
+  ]) ?? primaryAssetId;
+  if (browser !== 'chromium' && browser !== 'brave') {
+    const browserGolden = await loadGolden(`${assetId}.${browser}`);
+    if ((browserGolden.frames?.length ?? 0) > 0) return browserGolden;
+  }
+  if (assetId === primaryAssetId) return primaryGolden;
+  return loadGolden(assetId);
+}
+
+function readStringOption(options: unknown, keys: string[]): string | undefined {
+  const root = objectOptionRoot(options);
+  for (const key of keys) {
+    const value = root[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function objectOptionRoot(options: unknown): Record<string, unknown> {
+  return isRecord(options) ? options : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 // ── runOne ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -848,6 +1017,26 @@ export async function runOne(
     if (!neg.ok) {
       return finalize(neg.status, [], neg.reason);
     }
+    const strictRgbaGap = decodeFrameStrictRgbaGap(scenario, support);
+    if (strictRgbaGap) return finalize('NA_BROWSER', [], strictRgbaGap);
+    if (
+      (!support.strictGoldenRgba || !support.strictSourceRgba) &&
+      scenarioMayUseStrictPixelOracle(scenario)
+    ) {
+      golden ??= await loadGolden(assetIds[0]!);
+      const pixelGap = await strictPixelBrowserGap(
+        scenario,
+        support,
+        assetIds[0]!,
+        golden,
+        browser,
+      );
+      if (pixelGap) return finalize('NA_BROWSER', [], pixelGap);
+    }
+    const playbackGap = playbackSmokeBrowserGap(scenario, browser);
+    if (playbackGap) return finalize('NA_BROWSER', [], playbackGap);
+    const gaplessGap = gaplessSampleCountBrowserGap(scenario, browser);
+    if (gaplessGap) return finalize('NA_BROWSER', [], gaplessGap);
 
     // 2) init() brackets expensive setup (excluded from measured timing). Timeout-guarded so a
     //    hanging WASM compile/instantiate (e.g. ffmpeg-wasm) becomes a clean ERROR, not a matrix stall.
@@ -981,6 +1170,7 @@ function buildOracleContext(
     inputs,
     engine,
     golden,
+    ...(opts?.browser !== undefined ? { browser: opts.browser } : {}),
     decodeWithPlatform,
     playbackSmoke,
     ...(opResult.output ? { output: opResult.output } : {}),

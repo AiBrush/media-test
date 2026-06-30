@@ -61,12 +61,26 @@ export const GOLDEN_KEYS: Record<string, GoldenKeyRow> = {
     keyHex: '00112233445566778899aabbccddeeff',
     kid: '11223344556677889900aabbccddeeff',
   },
+  // fixtures/golden/cenc_cens.mp4.keys.json → { keyHex, kid, scheme:'cenc-cens' }
+  cenc_cens: {
+    assetId: 'cenc_cens.mp4',
+    $source: 'cenc_cens.mp4.keys.json',
+    keyHex: '000102030405060708090a0b0c0d0e0f',
+    kid: '00112233445566778899aabbccddeeff',
+  },
   // fixtures/golden/hls_aes128.m3u8.keys.json → { keyHex, ivHex, scheme:'hls-aes128' }
   hls_aes128: {
     assetId: 'hls_aes128.m3u8',
     $source: 'hls_aes128.m3u8.keys.json',
     keyHex: '366a63833fcc99941516c6239b0d3f11',
     ivHex: '953e5e232e1585e615d9164ece153cf2',
+  },
+  // fixtures/golden/hls_sample_aes.m3u8.keys.json → { keyHex, ivHex, scheme:'hls-sample-aes' }
+  hls_sample_aes: {
+    assetId: 'hls_sample_aes.m3u8',
+    $source: 'hls_sample_aes.m3u8.keys.json',
+    keyHex: '000102030405060708090a0b0c0d0e0f',
+    ivHex: '101112131415161718191a1b1c1d1e1f',
   },
   // fixtures/golden/cenc_cbcs.mp4.keys.json — the asset is manifest source:'provided' (needs
   // Bento4/shaka) and ships NO committed .keys.json yet. The manifest `acquire` note documents the
@@ -94,11 +108,9 @@ export function decryptKeyFor(name: keyof typeof GOLDEN_KEYS): DecryptKey {
 }
 
 /**
- * A positive decrypt case. `scheme` is restricted to the closed `EncryptionScheme` union (engine.ts):
- * 'cenc-ctr' | 'cenc-cbcs' | 'hls-aes128'. Schemes OUTSIDE that union (ClearKey, CENC 'cens',
- * SAMPLE-AES) are NOT decrypt cases — they are capability-findings expressed via a required FEATURE
- * token (see capability-findings.ts), because the runner's negotiate() types requires.encryption as
- * EncryptionScheme[] and would not compile with an out-of-union token.
+ * A positive decrypt case. `scheme` is restricted to the closed `EncryptionScheme` union (engine.ts).
+ * ClearKey stays a capability-finding because it is live EME/key-system acquisition, not this suite's
+ * key-provided raw decrypt primitive. Built raw schemes (`cenc-cens`, `hls-sample-aes`) belong here.
  */
 export interface DecryptCase {
   id: string;

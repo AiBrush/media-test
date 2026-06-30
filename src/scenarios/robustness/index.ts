@@ -147,9 +147,10 @@ const EDGE_CASES: EdgeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     encryption: ['cenc-cbcs'],
-    options: { scheme: 'cenc-cbcs', key: { kid: '00112233445566778899aabbccddeeff', keyHex: '000102030405060708090a0b0c0d0e0f' } },
+    options: { scheme: 'cenc-cbcs', key: { kid: 'abcdef00112233445566778899aabbcc', keyHex: '0123456789abcdef0123456789abcdef' } },
     oracles: ['decrypt-bitexact'],
-    notes: 'cbcs crypt/skip pattern-block boundaries — the classic off-by-one decrypt edge.',
+    notes:
+      'cbcs crypt/skip pattern-block boundaries — the classic off-by-one decrypt edge. Key/KID mirror fixtures/golden/cenc_cbcs.mp4.keys.json.',
   },
   {
     id: 'edge_faststart_reserve_remux',
@@ -479,38 +480,38 @@ const propertyScenarios: Scenario[] = PROPERTY_CASES.map((c) =>
   }),
 );
 
-// ── (d) IMAGE NEGATIVES ─────────────────────────────────────────────────────────────────────────
+// ── (d) IMAGE PROBES ────────────────────────────────────────────────────────────────────────────
 
-interface ImageNegativeCase {
+interface ImageProbeCase {
   id: string;
   asset: string;
-  /** still-image format label used only in notes; it is not a media-container capability gate */
+  container: 'jpeg' | 'png' | 'webp';
+  /** still-image format label used only in notes */
   format: string;
   notes?: string;
 }
 
-const IMAGE_NEGATIVE_CASES: ImageNegativeCase[] = [
-  { id: 'image_jpeg_probe_na', asset: 'image.jpg', format: 'JPEG' },
-  { id: 'image_png_probe_na', asset: 'image.png', format: 'PNG' },
-  { id: 'image_webp_probe_na', asset: 'image.webp', format: 'WebP' },
+const IMAGE_PROBE_CASES: ImageProbeCase[] = [
+  { id: 'image_jpeg_probe', asset: 'image.jpg', container: 'jpeg', format: 'JPEG' },
+  { id: 'image_png_probe', asset: 'image.png', container: 'png', format: 'PNG' },
+  { id: 'image_webp_probe', asset: 'image.webp', container: 'webp', format: 'WebP' },
 ];
 
-const imageNegativeScenarios: Scenario[] = IMAGE_NEGATIVE_CASES.map((c) =>
+const imageProbeScenarios: Scenario[] = IMAGE_PROBE_CASES.map((c) =>
   defineScenario({
     id: `robustness/${c.id}`,
     op: 'probe',
     input: c.asset,
     requires: {
       operations: ['probe'],
+      containersIn: [c.container],
     },
-    oracles: ['graceful-failure'],
+    oracles: ['golden-metadata'],
     metrics: ['wall'],
     timeoutMs: FUZZ_TIMEOUT_MS,
-    // Note avoids the graceful-failure explicit `signal:` marker so the verdict rests on the runner's
-    // output-absence inference, not on prose.
     notes:
       c.notes ??
-      `${c.format} still image fed to a media probe: engines with probe support must reject it cleanly.`,
+      `${c.format} still image probe: engines that declare the image container must report the committed golden metadata.`,
   }),
 );
 
@@ -1158,7 +1159,7 @@ export const robustnessScenarios: Scenario[] = [
   ...edgeScenarios,
   ...fuzzScenarios,
   ...propertyScenarios,
-  ...imageNegativeScenarios,
+  ...imageProbeScenarios,
   // ── new (this extension) ──
   ...seekEdgeScenarios,
   ...shapeEdgeScenarios,

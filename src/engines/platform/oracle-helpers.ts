@@ -22,18 +22,24 @@ function toBytes(input: MediaBytes | Uint8Array): Uint8Array {
   return input instanceof Uint8Array ? input : input.bytes;
 }
 
+function explicitMimeFor(input: MediaBytes | Uint8Array): string | undefined {
+  if (input instanceof Uint8Array) return undefined;
+  const mime = input.mime.trim();
+  return mime.length > 0 ? mime : undefined;
+}
+
 /** Best-effort MIME for blob construction, used by the <video> fallback + playback smoke. */
 function mimeFor(input: MediaBytes | Uint8Array): string {
   const bytes = toBytes(input);
+  const explicit = explicitMimeFor(input);
+  if (explicit?.startsWith('audio/')) return explicit;
   // Prefer a sniffed container type — it is more reliable for the <video> element than a possibly
   // missing/wrong `mime` on the MediaBytes (e.g. an engine that emits a WebM blob with a null/blank
   // mime). A correct top-level type ('video/webm' / 'video/mp4') is what makes Chrome pick the right
   // demuxer for the playback fallback.
   if (looksLikeWebm(bytes)) return 'video/webm';
   if (looksLikeMp4(bytes)) return 'video/mp4';
-  if (!(input instanceof Uint8Array) && typeof input.mime === 'string' && input.mime.trim().length > 0) {
-    return input.mime;
-  }
+  if (explicit) return explicit;
   return 'application/octet-stream';
 }
 
@@ -159,26 +165,27 @@ export async function decodeBytesToFrames(input: MediaBytes | Uint8Array, opts?:
 }
 
 /**
- * Playback smoke test: attach the bytes to a <video> via a blob URL and return true iff it reaches
+ * Playback smoke test: attach the bytes to a media element via a blob URL and return true iff it reaches
  * readyState>=2 (HAVE_CURRENT_DATA) AND advances at least a couple of frames within a timeout.
  * Returns false (never throws) on any failure so an oracle can record a clean negative.
  *
- * Injected by the runner as `ctx.playbackSmoke`. Page main thread only (a <video> needs the DOM);
- * resolves false in a Worker where <video> is unavailable.
+ * Injected by the runner as `ctx.playbackSmoke`. Page main thread only (media elements need the DOM);
+ * resolves false in a Worker where media elements are unavailable.
  */
 export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { timeoutMs?: number }): Promise<boolean> {
   if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-    return false; // <video> unavailable (Worker) — cannot smoke-test; honest false.
+    return false; // Media elements unavailable (Worker) — cannot smoke-test; honest false.
   }
   const timeoutMs = opts?.timeoutMs ?? 5000;
   const bytes = toBytes(input);
-  const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
+  const mime = mimeFor(input);
+  const blob = new Blob([bytes.slice().buffer], { type: mime });
   const url = URL.createObjectURL(blob);
-  const video = document.createElement('video');
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = 'auto';
-  video.src = url;
+  const media = mime.startsWith('audio/') ? document.createElement('audio') : document.createElement('video');
+  media.muted = true;
+  if (media instanceof HTMLVideoElement) media.playsInline = true;
+  media.preload = 'auto';
+  media.src = url;
 
   try {
     return await new Promise<boolean>((resolve) => {
@@ -191,7 +198,7 @@ export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { tim
         settled = true;
         clearTimeout(timer);
         try {
-          video.pause();
+          media.pause();
         } catch {
           /* ignore */
         }
@@ -200,8 +207,8 @@ export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { tim
       };
 
       const onTimeUpdate = () => {
-        if (video.readyState >= 2 && video.currentTime > lastTime) {
-          lastTime = video.currentTime;
+        if (media.readyState >= 2 && media.currentTime > lastTime) {
+          lastTime = media.currentTime;
           advancedFrames++;
           // readyState>=2 AND advanced a couple of frames ⇒ it plays.
           if (advancedFrames >= 2) finish(true);
@@ -210,7 +217,7 @@ export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { tim
       const onError = () => finish(false);
       const onLoadedData = () => {
         // We have at least one frame; try to play to advance the clock.
-        void video.play().catch(() => {
+        void media.play().catch(() => {
           // Autoplay may be blocked; fall back to manually stepping currentTime.
           stepManually();
         });
@@ -219,10 +226,10 @@ export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { tim
       // Some engines/containers won't autoplay; nudge currentTime to force frame advance.
       const stepManually = () => {
         if (settled) return;
-        if (video.readyState >= 2) {
-          const next = Math.min((video.duration || 1) - 0.001, video.currentTime + 1 / 15);
+        if (media.readyState >= 2) {
+          const next = Math.min((media.duration || 1) - 0.001, media.currentTime + 1 / 15);
           try {
-            video.currentTime = Number.isFinite(next) && next > video.currentTime ? next : video.currentTime + 0.05;
+            media.currentTime = Number.isFinite(next) && next > media.currentTime ? next : media.currentTime + 0.05;
           } catch {
             /* ignore */
           }
@@ -230,33 +237,33 @@ export async function playbackSmoke(input: MediaBytes | Uint8Array, opts?: { tim
       };
 
       const onSeeked = () => {
-        if (video.readyState >= 2) {
+        if (media.readyState >= 2) {
           advancedFrames++;
           if (advancedFrames >= 2) finish(true);
           else stepManually();
         }
       };
 
-      const timer = setTimeout(() => finish(advancedFrames >= 2 && video.readyState >= 2), timeoutMs);
+      const timer = setTimeout(() => finish(advancedFrames >= 2 && media.readyState >= 2), timeoutMs);
 
       const cleanup = () => {
-        video.removeEventListener('timeupdate', onTimeUpdate);
-        video.removeEventListener('error', onError);
-        video.removeEventListener('loadeddata', onLoadedData);
-        video.removeEventListener('seeked', onSeeked);
-        video.removeAttribute('src');
+        media.removeEventListener('timeupdate', onTimeUpdate);
+        media.removeEventListener('error', onError);
+        media.removeEventListener('loadeddata', onLoadedData);
+        media.removeEventListener('seeked', onSeeked);
+        media.removeAttribute('src');
         try {
-          video.load();
+          media.load();
         } catch {
           /* ignore */
         }
         URL.revokeObjectURL(url);
       };
 
-      video.addEventListener('timeupdate', onTimeUpdate);
-      video.addEventListener('error', onError);
-      video.addEventListener('loadeddata', onLoadedData);
-      video.addEventListener('seeked', onSeeked);
+      media.addEventListener('timeupdate', onTimeUpdate);
+      media.addEventListener('error', onError);
+      media.addEventListener('loadeddata', onLoadedData);
+      media.addEventListener('seeked', onSeeked);
     });
   } catch {
     URL.revokeObjectURL(url);

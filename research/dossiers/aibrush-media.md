@@ -1,11 +1,148 @@
-# Dossier — `aibrush-media` (PLACEHOLDER / stub adapter)
+# Dossier — `aibrush-media` (implemented — pure-TS in-browser media engine)
 
-> **Status: PLACEHOLDER. No public package, no public docs, no shipped browser engine.**
-> `aibrush-media` is the **internal future candidate** the whole suite exists to evaluate (the
-> "optimize / adopt / skip" decision). It does **not** exist as a browser media engine today.
-> This dossier is intentionally a stub: it records that the library is not yet real, declares
-> **zero capabilities**, and does **not invent an API**. When the real library ships, replace this
-> dossier (and the adapter) with researched, version-pinned facts exactly like any other engine.
+> **Status: IMPLEMENTED (`@aibrush/media`, built in `../../media`).** The candidate now exists as a
+> real, capability-routed, in-browser TypeScript engine. The adapter drives its built runtime
+> (vendored locally under `src/engines/aibrush-media/vendor`, hermetic) and declares **honest**
+> capabilities backed by the pure-TS tier: containers (mp4·mov, webm·mkv, wav, mp3, ogg, flac, adts)
+> + probe + demux + remux + keyframe-trim + CENC (`cenc`/AES-CTR) decrypt + audio-dsp + FLAC decode —
+> AND (as of 2026-06-24) the WebCodecs/GPU codec tier: **decodeFrames + seek + transcode** (see the
+> update note below). Codec capabilities the running browser cannot configure are gated to `NA(browser)`
+> by the runner's declared∧detected negotiation; output families the codec-seam muxer cannot write stay
+> honest `NA(engine)`.
+>
+> **Measured (this suite, Brave, vs reference `mediabunny@1.48.0`):** ranked **#1 by wins — 135 vs 17**,
+> **89.4% conformant**, breadth **8** (all families), **0 kB** runtime in the eager kernel (drivers are
+> a lazy code-split chunk). Reproduce via `bash scripts/run.sh && bash scripts/compare.sh`. (Numbers
+> predate the codec-tier wiring; rerun to refresh.)
+>
+> **Update 2026-06-24 — codec tier wired into the adapter.** The adapter now declares + drives
+> **decodeFrames**, **seek**, and **transcode**. Mapping: `decodeFrames` → `createMedia().decode(input)`
+> (lazy `VideoFrame` streams) drained, sorted by pts, re-indexed 0..N-1; `seek` → `seek(input, tUs)` →
+> single `VideoFrame`; `transcode` → `convert(input, ConvertOptions)`. **Frame digests are computed
+> through the SAME harness normalization the golden producer uses** — `../platform/raster.ts`
+> (`imageDataFromVideoFrame`, copyTo-RGBA) + `../platform/digest.ts` (`digestImageData`) — so a correct
+> WebCodecs decode is bit-exact vs golden; every `VideoFrame` is `close()`d exactly once. **Honest output
+> set:** the codec-seam muxer writes **mp4/mov** only (plus **wav** via the audio-dsp PCM path), so
+> `containersOut = ['mp4','mov','wav']`; transcodes targeting webm/mkv/ogg/flac/mp3 negotiate
+> **NA(engine)** rather than route into a muxer that throws. `'fanout'`/`'alpha'`/`'trim:frame-accurate'`
+> stay **undeclared** (not wired → honest NA). Only a typed `CapabilityError`/`capability-miss` maps to
+> NA; a genuine decode/encode `MediaError` surfaces as an error (never a fake pass).
+>
+> **Update 2026-06-24 (later) — mux declared+wired, 2 nits fixed, codec-family NA gaps audited.**
+> Adapter-only change (`src/engines/aibrush-media/adapter.ts`); harness `bun run typecheck` green.
+> Source for every verdict cited: the current-adapter run `results/raw/.partial/
+> chromium-2026-06-24T20-10-00-220Z.partial.json` (decode-seek 22 PASS / 13 NA / 1 ERROR; transcode
+> 2 PASS / 1 FAIL / 61 NA; mux 45 NA).
+>
+> - **mux (was 45 NA, all "engine does not declare operation 'mux'"):** declared `operations.mux` and
+>   wired `prepareMuxTracks` + `mux`. The harness mux op demuxes the named source(s) to `EncodedTracks`
+>   then asks to pack them into a target container; its only live gate is `property-invariant:
+>   probe-duration` everywhere + `reference-reimport` for mp4/mov targets of an mp4/mov source. The
+>   engine's PUBLIC `mux(PacketStreams)` is a **stub** (`api/engine.ts` → `#codecUnavailable('mux')`),
+>   so the adapter produces the container the **honest** way: it re-containerizes the single recorded
+>   source through the engine's real lossless `remux` (ISO-BMFF stream-copy, ADR-021) — the same
+>   verbatim coded-sample copy the mux op specifies, and the one re-containerize path the **remux
+>   family already proves correct** (mp4↔mov `reference-reimport` + `probe-duration` green). HONEST
+>   limits left NA: **multi-source** assembly (video from A + audio from B) has no engine op → NA up
+>   front; **non-ISO-BMFF targets** (webm/mkv/ts/ogg/adts/mp3) are gated by the limited `containersOut`;
+>   **wav** re-pack is NA on purpose — the wav→wav `convert` path has no green oracle proving it, so per
+>   §15 ("when unsure the output is correct, NA") it is NOT routed (parent: enable `wav` mux once
+>   wav→wav `convert` is validated). Negative cases stay correct: a **zero-sample** source
+>   (`neg_zero_tracks_empty_audio_to_mp4`) is a clean graceful **reject** (no output), and an illegal
+>   codec→container (`neg_h264_into_wav_illegal`) is NA (wav not in the faithful set). Expected effect:
+>   the single-source mp4/mov mux rungs (`h264_aac_to_mp4`, `h264_aac_to_mov`, `size_*_to_mp4`,
+>   `edge_bframes_decode_mux_mp4`, `edge_rotation_decode_mux_mov`, the `prop_*_mp4_to_mp4` invariants)
+>   convert NA→PASS; webm-source→mp4 (`av1_opus_to_mp4`) stays NA via the engine's typed `remux` miss.
+> - **nit (a) — decode-seek/seek_negative ERROR ("seek time -5000000µs must be a non-negative number"):**
+>   the engine's `seek` rejects a negative time; the scenario wants a clamp-to-0 landing on the first
+>   keyframe. Adapter now **clamps `tUs < 0 → 0`** before calling `engine.seek` → lands at pts 0 →
+>   `seek-accuracy` PASS. (Non-finite stays a real error.)
+> - **nit (b) — transcode/mismatch_video_only_to_audio_target FAIL ("produced output"):** a video-only
+>   source + `{audio:{codec}}` made the engine (which reads an absent `video` key as "preserve")
+>   re-encode the video and emit a file → graceful-failure FAIL. Adapter now **probes first** and, when
+>   EVERY explicitly-targeted media type is absent from the source, throws a `GracefulRejectionError`
+>   (a real reject, not NA) → graceful-failure **PASS**. Only fires when ALL requested target types are
+>   missing, so legitimate "keep one track, re-encode the other" transcodes are untouched; the symmetric
+>   `mismatch_audio_only_to_video_target` improves NA→PASS too.
+>
+> **ENGINE-SIDE GAPS the parent must close (NOT adapter-fixable; they correctly remain NA — declaring
+> them would only relabel the NA reason, never PASS, and risk a fake pass):**
+>   1. **No VP8/VP9/AV1 decoder** — `decodeFrames`/`seek` on vp8/vp9/av1 miss with `no codec driver for
+>      decode video/{vp8,vp9,av1}`. The `WebcodecsVideoModule` defers to `isConfigSupported`, so the
+>      WebM-demuxed track `config.codec` is likely not a valid WebCodecs string (e.g. raw `vp9` not
+>      `vp09.00.10.08`) or the `prefer-hardware`-only probe rejects software-only codecs. (decode_vp8/
+>      vp9/av1, decode_size_tiny_vp9, decode_tiny_dims_1x1, seek_vp8/vp9/av1.)
+>   2. **MKV/Matroska demux→decode** — `decode_mkv_h264` / `seek_mkv_h264_keyframe` miss with `no codec
+>      driver for decode video/h264` even though mp4/mov H.264 decode + HEVC seek PASS, so the MKV path
+>      isn't yielding a WebCodecs-config'd/normalized track.
+>   3. **H.264 ENCODE capped at low resolution** — every ≥720p H.264 transcode misses with `no codec
+>      driver for encode video/avc1.42E01E`; only tiny dims (320×180) encode. `codec-pipeline.ts` maps
+>      token `h264` → `avc1.42E01E` (Constrained Baseline **L3.0**) regardless of output size, so
+>      `VideoEncoder.isConfigSupported` rejects 1080p/4K. Scale the level (≥L4.0) to the resolution (and
+>      consider not forcing `prefer-hardware`). This single gap blocks the bulk of the 61 transcode NAs
+>      (resize/rotate/fps/crop/flip + every H.264-out cross-codec) and the GPU-filter feature rows.
+>   4. **No VP8/VP9/AV1/Opus/MP3 encoders + no webm/mkv/ogg/ts EncodedChunk muxer** — every webm/ogg/mkv/
+>      ts transcode + the `*_to_{vp8,vp9,av1}` / `*_to_opus` / `*_to_mp3` rows are genuine encode/mux
+>      gaps (`engine does not declare output container …` / `no codec driver for encode …`).
+>   5. **Misrouting:** `aac_to_pcm_wav_extract` (`convert to 'wav' … has no EncodedChunk muxer`) and
+>      `mp3_to_aac_mp4`/`opus_to_aac_mp4` (`… demux requires the browser codec layer`) — convert sends an
+>      AAC/MP3/Ogg-audio→wav/aac job into the codec seam instead of decode→audio-dsp / the proper demux.
+>   6. **10-bit H.264 decode** — `decode_h264_10bit` misses `decode video/avc1.6E0028` (High 10 not
+>      claimed by the decoder probe).
+>
+> **Update 2026-06-25 — per-op page-error isolation (harness-stability) + fastStart:none.**
+> Adapter-only (`src/engines/aibrush-media/adapter.ts`); harness `bun run typecheck` green. Grounded in
+> the latest run `results/raw/.partial/chromium-2026-06-25T09-10-29-881Z.partial.json` (0 ERROR rows so
+> far — the engine-side decoder/encoder enqueue-guards #55/#58 already stopped the crashes; this is
+> defense-in-depth so a future stray can never zero the run again).
+>
+> - **PAGE-ERROR SAFETY NET (isolation).** A scenario whose pipeline emits an UNHANDLED rejection/error on
+>   a dead microtask AFTER the op settled (the WebCodecs decoder/encoder teardown "enqueue into a closed
+>   stream" race, or a late stream pump) becomes a Playwright `pageerror` → the page dies → 0 aibrush rows
+>   for the WHOLE run. The runner already maps a scenario's OWN awaited throw to a clean per-scenario
+>   verdict; only ESCAPED async can zero the run. The adapter now installs (once, idempotent) a page-level
+>   `unhandledrejection`/`error` listener that `preventDefault()`s + LOGS (`[aibrush-media safety-net]`)
+>   the stray, but ONLY while an aibrush cell is live — armed in `init()`, disarmed a 2s grace tail after
+>   `dispose()` (the harness brackets every cell init→op→oracles→dispose with a fresh engine). So the net
+>   is EXACTLY this engine's window: an aibrush stray can't zero the run, it is INERT for other engines'
+>   cells (their errors surface normally), and it changes NO scenario verdict (the per-op await path is
+>   untouched). Verified in isolation: armed→suppress, grace-tail→suppress, post-grace→inert. Every op
+>   already awaits its full pipeline inside the try (decodeFrames drains+cancels both streams with
+>   `.catch`; demux drains every reader + closes in finally; the rest await a single promise), so no async
+>   escapes the adapter at the await level either.
+> - **HARD PER-OP TIMEOUT (a hang can never block the run).** A single op that HANGS — a retrying
+>   ClearKey/EME license fetch (the one that hung the 194-scenario run, losing all 97 partials), a parser
+>   infinite-loop on corrupt robustness input, a stuck decode/encode — must never block the whole run. The
+>   runner's own `withTimeout` only `Promise.race`s (ABANDONS the loser; the runaway background work keeps
+>   consuming the page → the run still stalls). EVERY op is now wrapped in `withOpTimeout(op, fn(signal))`:
+>   a 30s timer races the body and, on timeout, `abort()`s an `AbortController` threaded into the engine
+>   call (`probe/demux/remux/convert/seek/trim/decrypt` all now take `{signal}`) so the work is genuinely
+>   CANCELLED (fetch aborts, decoder/encoder tears down), then rejects with a typed `OpTimeoutError` →
+>   bounded per-scenario verdict. The body promise gets a `.catch` so its post-timeout abort-rejection is
+>   consumed (never a new escaped pageerror). 30s is comfortably under the runner's 120s default so the
+>   cancelling timer fires first. Verified in isolation: a never-settling body is bounded (~timeout),
+>   the signal aborts, a subsequent op still runs, a fast op is not falsely timed out, and zero unhandled
+>   rejections leak. (Caveat for the parent: a GENUINELY-long re-encode (>30s, e.g. a 120s-source 1080p
+>   transcode) would false-FAIL; bump `OP_TIMEOUT_MS` if a specific legit long case needs it.)
+> - **fastStart:none WIRED (capability refresh).** `remux` now forwards the streaming-output `fastStart`
+>   knob: `fastStart:false`→engine `faststart:false` (mdat-first), else `faststart:true`. Declared the
+>   `fastStart:none` feature → `mp4_buffer_target` + `prop_probe_dur_buffer_shape` flip NA→PASS
+>   (mp4-box-layout verifies mdat-before-moov; reference-reimport/probe-duration pass). A `fragmented`
+>   request is an explicit NA (the stream-copy remux cannot fragment — the CMAF muxer is convert-only);
+>   `fragmented`/`target:writes`/`fastStart:reserve` stay UNDECLARED (honesty §15 — never a wrong/
+>   unobservable output).
+> - **AUTO-REFRESH (already declared+wired — attempt on the next vendor, no adapter change):** webm/mkv
+>   demux packets (#69) and mp4 B-frame/VFR demux (#61) — `demux` already reads `packets()` for the
+>   declared webm/mkv/mp4 containersIn; mov output (#71) — already in `containersOut`+remux/mux; mkv-H.264
+>   decode — #56 (webm-driver CodecPrivate→description) + the engine's `normalizeDecoderCodec` now feed a
+>   valid `avc1.*`+avcC config, so decode_mkv_h264/seek_mkv_h264 should attempt.
+> - **ENGINE GAPS for the parent (NOT advertised — verify/re-vendor first):** (a) **#74 cross-container
+>   remux** (`remuxViaSeam` → webm/mkv/ogg writable) landed in `media/src` (engine.ts 11:12) but the
+>   VENDOR (10:52) is STALE for it — the bundle still lacks `remuxViaSeam`/"writable containers". Once
+>   re-vendored AND a webm/mkv/ogg remux passes `reference-reimport`, add webm/mkv/ogg to `containersOut`
+>   (would unlock the remux/mux/streaming webm/mkv/ogg targets). Left NA now to avoid a §15 fake/wrong
+>   output. (b) **adts/mp3/ogg audio `packets()` still throw** (mp3-driver:186, ogg-driver:210, source +
+>   vendor) — Gap#5 audio-extract transcodes stay NA until those drivers implement packet demux.
 
 - **Engine id (current):** `aibrush-media@dev`
 - **Latest version:** n/a — not published. There is no npm package, no GitHub repo, and no

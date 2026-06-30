@@ -43,7 +43,7 @@ interface DecodeCase {
   id: string;
   asset: string;
   container: string;
-  videoCodec: string;
+  videoCodec?: string;
   maxFrames?: number;
   /** extra capability features the case requires (e.g. 'rotate' for display-matrix output) */
   features?: string[];
@@ -128,6 +128,35 @@ const DECODE_CASES: DecodeCase[] = [
     videoCodec: 'vp9',
     maxFrames: 30,
     notes: 'Alpha track decode; alpha plane compared separately via the alpha-plane oracle.',
+  },
+
+  // ── still-image decode via the ImageDecoder side capability (ADR-049) ──
+  {
+    id: 'decode_image_jpeg',
+    asset: 'image.jpg',
+    container: 'jpeg',
+    maxFrames: 1,
+    sizeBucket: 'micro',
+    notes:
+      'JPEG still image decode: one ImageDecoder-backed frame must match the browser-baked image golden.',
+  },
+  {
+    id: 'decode_image_png',
+    asset: 'image.png',
+    container: 'png',
+    maxFrames: 1,
+    sizeBucket: 'micro',
+    notes:
+      'PNG still image decode: one ImageDecoder-backed frame must match the browser-baked image golden.',
+  },
+  {
+    id: 'decode_image_webp',
+    asset: 'image.webp',
+    container: 'webp',
+    maxFrames: 1,
+    sizeBucket: 'micro',
+    notes:
+      'WebP still image decode: one ImageDecoder-backed frame must match the browser-baked image golden.',
   },
 
   // ── container matrix gaps (A.2/A.7): the mov/mkv decode paths were exercised nowhere ──
@@ -297,7 +326,7 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
     requires: {
       operations: ['decodeFrames'],
       containersIn: [c.container],
-      videoCodecs: [c.videoCodec],
+      ...(c.videoCodec ? { videoCodecs: [c.videoCodec] } : {}),
       ...(c.features ? { features: isAlpha ? [...c.features, 'alpha'] : c.features } : isAlpha ? { features: ['alpha'] } : {}),
     },
     oracles: isAlpha ? DECODE_ALPHA_ORACLES : DECODE_ORACLES,

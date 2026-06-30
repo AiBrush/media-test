@@ -8,14 +8,13 @@
  * eagerly and the runner reads scenario.options synchronously).
  *
  * SUB-BATTERIES:
- *   - this file                : positive decrypt (cenc-ctr · cenc-cbcs · hls-aes128), frame-exact +
- *                                structural re-import + playback smoke.
+ *   - this file                : positive decrypt (cenc-ctr · cenc-cens · cenc-cbcs · hls-aes128 ·
+ *                                hls-sample-aes), frame-exact + structural re-import + playback smoke.
  *   - ./metamorphic.ts         : decrypt(x)==offline-cleartext (property-invariant) + no-op idempotence.
  *   - ./robustness.ts          : malformed-protection fuzz → graceful-failure (§A.16).
  *   - ./performance.ts         : headline TIMED decrypt-throughput (primaryMetric, §A.14/§8.2).
- *   - ./capability-findings.ts : Appendix-B NA rows for schemes OUTSIDE the EncryptionScheme union
- *                                (ClearKey · CENC cens · SAMPLE-AES) — registered + attributed, never
- *                                silently omitted.
+ *   - ./capability-findings.ts : Appendix-B NA rows for live EME/key acquisition (ClearKey) —
+ *                                registered + attributed, never silently omitted.
  *
  * ──────────────────────────────────────────────────────────────────────────────────────────────
  * ORACLE-SOUNDNESS FIXES vs the previous version (all within scenario scope):
@@ -76,6 +75,21 @@ const DECRYPT_CASES: DecryptCase[] = [
       'ground truth); frame goldens come from the independent plaintext fixture cenc_ctr_clear.mp4.',
   },
   {
+    id: 'cenc_cens_decrypt',
+    asset: 'cenc_cens.mp4',
+    container: 'mp4',
+    scheme: 'cenc-cens',
+    keyName: 'cenc_cens',
+    cleartextAsset: 'cenc_ctr_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'CENC cens patterned AES-CTR encryption (crypt:skip 1:9) over the H.264 video samples. ' +
+      'Decrypt output must decode bit-exact to the independent clear MP4 twin cenc_ctr_clear.mp4; ' +
+      'reference-reimport and playback-smoke prove the result is a normal de-protected MP4, not just ' +
+      'clear frames inside a protected wrapper. Key/KID from fixtures/golden/cenc_cens.mp4.keys.json.',
+  },
+  {
     id: 'cenc_cbcs_decrypt',
     asset: 'cenc_cbcs.mp4',
     container: 'mp4',
@@ -111,6 +125,23 @@ const DECRYPT_CASES: DecryptCase[] = [
       'would cover). decrypt-bitexact vs the offline MP4 cleartext reference hls_aes128_clear.mp4 + ' +
       'playback-smoke. Routes NA(engine) for any ' +
       'engine that does not declare hls-aes128 (see index header: mediabunny adapter-vs-dossier note).',
+  },
+  {
+    id: 'hls_sample_aes_decrypt',
+    asset: 'hls_sample_aes.m3u8',
+    container: 'hls',
+    scheme: 'hls-sample-aes',
+    keyName: 'hls_sample_aes',
+    cleartextAsset: 'hls_aes128_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    oracles: ['decrypt-bitexact', 'playback-smoke'],
+    notes:
+      'HLS SAMPLE-AES key-provided decrypt over five real MPEG-TS VOD segments. The segments are ' +
+      'partial-sample encrypted (H.264/AAC sample blocks), not full-segment AES-128; decrypt-bitexact ' +
+      'compares decoded frames to the clear MP4 reference hls_aes128_clear.mp4 and playback-smoke ' +
+      'proves the adapter returns browser-playable MP4 bytes. Key/IV from ' +
+      'fixtures/golden/hls_sample_aes.m3u8.keys.json.',
   },
 ];
 

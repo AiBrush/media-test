@@ -23,6 +23,9 @@ export interface CodecSupport {
   audioDecode: Record<string, boolean>; // aac/opus/mp3/flac/vorbis/pcm-*
   audioEncode: Record<string, boolean>;
   alpha: boolean;
+  strictRgbaPixels: boolean;
+  strictGoldenRgba: boolean;
+  strictSourceRgba: boolean;
   webgpu: boolean;
   measureMemory: boolean; // performance.measureUserAgentSpecificMemory available
 }
@@ -376,10 +379,43 @@ export async function detectCodecSupport(): Promise<CodecSupport> {
   );
 
   const alpha = await detectAlpha(probeW, probeH);
+  const { strictGoldenRgba, strictSourceRgba } = detectStrictRgbaPixelComparability();
+  const strictRgbaPixels = strictGoldenRgba && strictSourceRgba;
   const webgpu = detectWebGpu();
   const measureMemory = detectMeasureMemory();
 
-  return { webcodecs, videoDecode, videoEncode, audioDecode, audioEncode, alpha, webgpu, measureMemory };
+  return {
+    webcodecs,
+    videoDecode,
+    videoEncode,
+    audioDecode,
+    audioEncode,
+    alpha,
+    strictRgbaPixels,
+    strictGoldenRgba,
+    strictSourceRgba,
+    webgpu,
+    measureMemory,
+  };
+}
+
+/**
+ * Strict RGBA pixel-oracle comparability is browser-runtime evidence, not just an engine declaration.
+ * On current WebKit/Safari, the raw platform/runtime path fails committed golden decode SSIM, and
+ * crop-capable engines that pass Chromium all fail the same source-reference SSIM row in WebKit.
+ * Engines that need strict RGBA pixel evidence must negotiate NA_BROWSER there until WebKit-specific
+ * goldens or a verified normalization path exist.
+ */
+function detectStrictRgbaPixelComparability(): {
+  readonly strictGoldenRgba: boolean;
+  readonly strictSourceRgba: boolean;
+} {
+  const ua = typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string' ? navigator.userAgent : '';
+  const browser = guessBrowser(ua).browser;
+  return {
+    strictGoldenRgba: browser !== 'webkit' && browser !== 'firefox',
+    strictSourceRgba: browser !== 'webkit',
+  };
 }
 
 /**

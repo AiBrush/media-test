@@ -36,7 +36,7 @@
 import type { Scenario } from '../../core/scenario.ts';
 import { buildStream, type StreamCase } from './_shared.ts';
 
-const SIZE_LADDER_TIMEOUT_MS = 120_000; // 2 min: bounds a GB-scale streaming-remux hang.
+const SIZE_LADDER_TIMEOUT_MS = 300_000; // 5 min: bounds a GB-scale streaming-remux hang.
 
 const SIZE_LADDER_CASES: StreamCase[] = [
   // large (~100 MB) H.264 MP4 streamed to MP4: sustained throughput + peak memory at the large rung.

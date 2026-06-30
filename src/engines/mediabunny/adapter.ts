@@ -276,13 +276,22 @@ async function openInput(mb: MB, input: MediaInput, container?: string): Promise
   });
 }
 
+function siblingContainerHint(input: MediaInput): 'mov' | 'mkv' | undefined {
+  const mime = input.mime.toLowerCase();
+  const id = input.id.toLowerCase();
+  if (mime.includes('quicktime') || id.endsWith('.mov')) return 'mov';
+  if (mime.includes('matroska') || id.endsWith('.mkv')) return 'mkv';
+  return undefined;
+}
+
 /** Map a mediabunny InputFormat name to a canonical container token for NormalizedMetadata. */
-function canonicalContainerFromFormat(name: string): string {
+function canonicalContainerFromFormat(name: string, source?: MediaInput): string {
   const n = name.toLowerCase();
+  const hint = source === undefined ? undefined : siblingContainerHint(source);
   if (n.includes('quicktime') || n === 'qtff' || n.includes('mov')) return 'mov';
-  if (n.includes('webm')) return 'webm';
+  if (n.includes('webm')) return hint === 'mkv' ? 'mkv' : 'webm';
   if (n.includes('matroska') || n.includes('mkv')) return 'mkv';
-  if (n.includes('mp4') || n.includes('isobmff')) return 'mp4';
+  if (n.includes('mp4') || n.includes('isobmff')) return hint === 'mov' ? 'mov' : 'mp4';
   if (n.includes('mpeg-ts') || n.includes('transport')) return 'ts';
   if (n.includes('wave') || n === 'wav') return 'wav';
   if (n.includes('mp3')) return 'mp3';
@@ -414,9 +423,9 @@ function selectPreparedMuxTracks(
 }
 
 /** Probe an already-opened Input into NormalizedMetadata. */
-async function metadataFromInput(input: Input): Promise<NormalizedMetadata> {
+async function metadataFromInput(input: Input, source?: MediaInput): Promise<NormalizedMetadata> {
   const format = await input.getFormat();
-  const container = canonicalContainerFromFormat(format.name);
+  const container = canonicalContainerFromFormat(format.name, source);
 
   // Duration via the CHEAP metadata path first (dossier §4.1): getDurationFromMetadata() reads the
   // container's declared duration (mvhd/Segment-duration/etc.) WITHOUT scanning samples, so longform
@@ -1134,7 +1143,7 @@ export class MediabunnyEngine implements MediaEngine {
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
     const mbInput = await openInput(this.lib, input);
     try {
-      return await metadataFromInput(mbInput);
+      return await metadataFromInput(mbInput, input);
     } finally {
       mbInput.dispose();
     }

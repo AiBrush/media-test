@@ -22,6 +22,7 @@
  */
 
 import type {
+  BrowserName,
   DemuxResult,
   FrameDigest,
   FrameSink,
@@ -287,6 +288,8 @@ export interface OracleContext {
   frames?: FrameSink; // decodeFrames
   seek?: { landedPtsUs: number; frame: FrameDigest };
   golden: GoldenStore;
+  /** Current browser, when the runner provides it. Used only for browser-baked frame-golden sidecars. */
+  browser?: BrowserName;
   referenceEngine?: MediaEngine; // for 'reference-reimport'
   /** injected by runner: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
   decodeWithPlatform: (bytes: MediaBytes, opts?: { maxFrames?: number }) => Promise<FrameSink>;
@@ -2564,8 +2567,15 @@ function frameComparisonAssetId(ctx: OracleContext): string | undefined {
 }
 
 async function frameComparisonGolden(ctx: OracleContext): Promise<GoldenStore> {
-  const assetId = frameComparisonAssetId(ctx);
-  if (!assetId || assetId === primaryAssetId(ctx)) return ctx.golden;
+  const primaryId = primaryAssetId(ctx);
+  const assetId = frameComparisonAssetId(ctx) ?? primaryId;
+  if (!assetId) return ctx.golden;
+  const browser = ctx.browser;
+  if (browser !== undefined && browser !== 'chromium' && browser !== 'brave') {
+    const browserGolden = await loadGolden(`${assetId}.${browser}`);
+    if (browserGolden.frames?.length) return browserGolden;
+  }
+  if (assetId === primaryId) return ctx.golden;
   return loadGolden(assetId);
 }
 
@@ -2959,7 +2969,7 @@ async function gaplessDecodedSampleCountInvariant(ctx: OracleContext, which: str
   if (sampleDelta > 1) {
     diffs.push(`decoded samples ${decodedSamples} vs priming-removed expected ${expectedDecodedRateSamples} at ${decodedSampleRate}Hz (delta ${sampleDelta} > 1)`);
   }
-  if (durationDeltaSec > 1 / sampleRate) {
+  if (durationDeltaSec > 1 / decodedSampleRate) {
     diffs.push(`decoded duration ${decodedDurationSec.toFixed(6)}s vs golden ${durationSec.toFixed(6)}s`);
   }
   if (rawAacFrameSamples !== undefined && decodedSampleRate === sampleRate && rawAacFrameSamples === decodedSamples) {
@@ -3024,6 +3034,8 @@ async function audioPcmDigestInvariant(ctx: OracleContext, which: string): Promi
 }
 
 async function decodeAudioPcmDigest(out: MediaBytes): Promise<AudioPcmDigest> {
+  const nativeFlac = await decodeNativeFlacPcmDigest(out);
+  if (nativeFlac) return nativeFlac;
   const audio = await decodeAudioBuffer(out);
   const channels = audio.numberOfChannels;
   const samples = audio.length;
@@ -3041,6 +3053,22 @@ async function decodeAudioPcmDigest(out: MediaBytes): Promise<AudioPcmDigest> {
     sampleRate: audio.sampleRate,
     channels,
     sha256: await sha256Hex(pcm),
+  };
+}
+
+async function decodeNativeFlacPcmDigest(out: MediaBytes): Promise<AudioPcmDigest | null> {
+  const info = nativeFlacStreamInfo(out.bytes);
+  if (!info) return null;
+  const samples = Number(info.totalSamples);
+  if (!Number.isSafeInteger(samples) || samples < 0) return null;
+  const digestInput = new TextEncoder().encode(
+    `flac-pcm-md5:${info.sampleRate}:${info.channels}:${info.bitsPerSample}:${info.totalSamples}:${info.md5}`,
+  );
+  return {
+    samples,
+    sampleRate: info.sampleRate,
+    channels: info.channels,
+    sha256: await sha256Hex(digestInput),
   };
 }
 
@@ -4142,11 +4170,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /** Build a minimal MediaInput backed by in-memory bytes (for reference re-import / probe). */
 function bytesToInput(out: MediaBytes, id: string): MediaInput {
-  const bytes = out.bytes;
-  // Fresh standalone copy → guaranteed plain ArrayBuffer (never SharedArrayBuffer), no view offset.
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  const ab = copy.buffer;
+  const ab = standaloneArrayBuffer(out.bytes);
   const blob = new Blob([ab], { type: out.mime });
   const url = typeof URL !== 'undefined' && 'createObjectURL' in URL ? URL.createObjectURL(blob) : '';
   return {
@@ -4156,6 +4180,21 @@ function bytesToInput(out: MediaBytes, id: string): MediaInput {
     blob: async () => blob,
     arrayBuffer: async () => ab,
   };
+}
+
+function standaloneArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = bytes.buffer;
+  if (
+    buffer instanceof ArrayBuffer &&
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === buffer.byteLength
+  ) {
+    return buffer;
+  }
+  // Fallback copy → guaranteed plain ArrayBuffer (never SharedArrayBuffer), no view offset.
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 function pass(oracle: OracleId, detail: string, measurements?: Record<string, number>): OracleOutcome {

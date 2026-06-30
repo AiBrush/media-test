@@ -1,0 +1,105 @@
+{
+  "$todo": "BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer (src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.",
+  "pending": false,
+  "assetId": "hevc_1080p_10s.mp4",
+  "frames": [
+    {
+      "index": 0,
+      "ptsUs": 0,
+      "sha256": "68045fc5d37ef19a444d4253499ec4bb612a8f0d6ce5f765b09c2fcbdb40c3e0",
+      "keyframe": true,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 1,
+      "ptsUs": 33333,
+      "sha256": "28a6472dc993f0ac0701256c406b6f6e39acd6b8d3ec9a8ad1bf91198b4df4bb",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 2,
+      "ptsUs": 66667,
+      "sha256": "96c9d115c821342dfab31b899e9a4208ca21c16f12516c3c92bda105f7c92614",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 3,
+      "ptsUs": 100000,
+      "sha256": "fd7dc069170d023d2867c40424298e4a5c6c6c20228e9758e277f67300bceb51",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 4,
+      "ptsUs": 133333,
+      "sha256": "c8f040f0902da3281701b7fd0a65cd4299f4f4e1dbf767c0a8889d15f8ac1f23",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 5,
+      "ptsUs": 166667,
+      "sha256": "13f29c014e93f02f10b48f19ad5f5375962a01d3f1764c9319e3242781aa7e44",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 6,
+      "ptsUs": 200000,
+      "sha256": "b9dce3e41a9e913596fefc2f5a49f69b8537f8163d3f6e4b1ef045eb1facd4fd",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 7,
+      "ptsUs": 233333,
+      "sha256": "79fac43b804f4f42ab220ef7c548aa047d634add99931a5783ea3037da178121",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 8,
+      "ptsUs": 266667,
+      "sha256": "c4e5db4fcdf2f9cd5e49179519771629c5ba5881173751cebfff96d75835b402",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 9,
+      "ptsUs": 300000,
+      "sha256": "4d96bd63f14c44e031d5ed806490e5d351b0db8abf232282d04205b4d1f062e3",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 10,
+      "ptsUs": 333333,
+      "sha256": "feb3d1390690a715d36a7ad00b7c9fd9fcf066cc62654cbd11532c485b1e1354",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    },
+    {
+      "index": 11,
+      "ptsUs": 366667,
+      "sha256": "f601e38e0905523874ecbbdbff8748bd2b9822b41b65b0b4b5a15f674730fac9",
+      "keyframe": false,
+      "width": 1920,
+      "height": 1080
+    }
+  ],
+  "bakedBy": "frame-bake (platform engine) · Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
+  "bakedAtIso": "2026-06-27T03:51:31.014Z"
+}

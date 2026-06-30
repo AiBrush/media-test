@@ -95,6 +95,22 @@ bun run typecheck
 bun run build
 ```
 
+Full multi-engine bake, per browser (no --engine = ALL engines; full perf iters, not --iters 1)
+
+```bash
+cd ../media-test/media-browser-test
+bash scripts/run.sh --browser chromium --no-reuse
+bash scripts/run.sh --browser webkit   --no-reuse
+bash scripts/run.sh --browser firefox  --no-reuse
+```
+
+Rank + leaderboard + comparison
+
+```
+bun scripts/aggregate.mjs
+bash scripts/compare.sh
+```
+
 ## Feature-First Flow
 
 The default execution model is:

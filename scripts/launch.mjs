@@ -274,9 +274,11 @@ async function saveResultsPayload(page, partialReason, options = {}) {
   const payload = await page.evaluate((reason) => ({
     schema: 'media-browser-test/results@1',
     generatedAtIso: new Date().toISOString(),
-    env: window.__SUITE__.env,
-    support: window.__SUITE__.support,
-    referenceEngineId: window.__SUITE__.referenceEngineId,
+    // Guard __SUITE__: a crashed/navigated page (e.g. another engine faulting) can clear it; the
+    // partial save must still persist whatever results exist rather than abort the whole run.
+    env: window.__SUITE__?.env,
+    support: window.__SUITE__?.support,
+    referenceEngineId: window.__SUITE__?.referenceEngineId,
     results: window.__RESULTS__ ?? [],
     ...(reason ? { partialReason: reason } : {}),
   }), partialReason ?? null);

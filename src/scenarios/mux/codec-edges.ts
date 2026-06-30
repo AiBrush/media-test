@@ -19,11 +19,12 @@
  *     — the survival counterpart to multi-source/drop. reference-reimport (mp4 target, faithful) checks
  *     track layout + per-track packets so a dropped track shows as a count/layout divergence.
  *
- * DECODE_MUX cases need a baked <asset>.frames.json (= decode(x)). Those source frame goldens are
- * `$todo` placeholders today, so these resolve to a clean "no golden frames" FAIL until the bake fills
- * them — the same honest, wired-now posture the remux metamorphic file takes. PROBE_DUR is added as a
- * second, immediately-active invariant where it adds signal (so the cell is not entirely dark
- * pre-bake). reference-reimport is attached ONLY for faithful (mp4/mov) targets per _shared.ts.
+ * DECODE_MUX cases compare decode(mux(x)) against a baked <asset>.frames.json (= decode(x)). Those source
+ * frame goldens are BAKED (in-browser frame-bake, 2026-06-18/21 — `pending:false`, real RGBA sha256 per
+ * frame; ffmpeg cannot produce them, see frame-bake.ts), so a red DECODE_MUX cell means an engine-decode
+ * divergence or a stale harness run, NOT a missing golden — re-bake via `window.__FRAME_BAKE__` only if the
+ * asset changes. PROBE_DUR is added as a second, immediately-active invariant where it adds signal.
+ * reference-reimport is attached ONLY for faithful (mp4/mov) targets per _shared.ts.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -108,6 +109,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['hevc'],
     audioCodecs: ['aac'],
+    features: ['mux:hevc-browser-decode-equality'],
     oracles: ['property-invariant', 'reference-reimport'],
     notes:
       'HEVC mux → mp4 (§A.3/§A.16): the hvcC codec-private must be authored into the output hev1/hvc1 ' +
@@ -122,6 +124,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     to: 'mkv',
     videoCodecs: ['hevc'],
     audioCodecs: ['aac'],
+    features: ['mux:hevc-browser-decode-equality'],
     notes:
       'HEVC mux → mkv (§A.3): HEVC into Matroska (CodecPrivate = hvcC). decode(mux(x))==decode(x) gates ' +
       'pixels through the Matroska writer; reframing target → no source-keyed packet count.',
