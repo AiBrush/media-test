@@ -328,6 +328,48 @@ interface AibrushPacketMetadata {
   durationUs: number;
   keyframe: boolean;
 }
+type AibrushPacketInfoRow = AibrushPacketMetadata & {
+  trackIndex?: number;
+  size?: number;
+};
+type IndexedAibrushPacketInfoRow = AibrushPacketMetadata & {
+  trackIndex: number;
+  size: number;
+};
+interface AibrushPacketInfoMetadata {
+  trackIndex: number;
+  size: number;
+  ptsUs: number;
+  dtsUs: number;
+  keyframe: boolean;
+}
+interface AibrushPacketInfoTable {
+  tracks: ReadonlyArray<AibrushTrackInfo>;
+  packets: ReadonlyArray<AibrushPacketInfoMetadata>;
+}
+
+function hasHarnessPacketAliases(
+  row: AibrushPacketInfoRow | undefined,
+  trackCount: number,
+): row is IndexedAibrushPacketInfoRow {
+  const trackIndex = row?.trackIndex;
+  const size = row?.size;
+  if (typeof trackIndex !== 'number' || typeof size !== 'number') return false;
+  return (
+    Number.isInteger(trackIndex) &&
+    trackIndex >= 0 &&
+    trackIndex < trackCount &&
+    Number.isSafeInteger(size) &&
+    size >= 0
+  );
+}
+
+function packetRowsArePreindexed(packetRows: readonly AibrushPacketInfoRow[], trackCount: number): boolean {
+  if (packetRows.length === 0) return true;
+  const first = packetRows[0];
+  const last = packetRows[packetRows.length - 1];
+  return hasHarnessPacketAliases(first, trackCount) && (last === first || hasHarnessPacketAliases(last, trackCount));
+}
 /** The demux `TrackInfo` fields the mux track-assembly reads (WebCodecs DecoderConfig subset). */
 interface AibrushTrackInfo {
   id: number;
@@ -345,6 +387,7 @@ interface AibrushTrackInfo {
 }
 interface AibrushDemuxed {
   tracks: ReadonlyArray<AibrushTrackInfo>;
+  packetInfoTable?(): ReadonlyArray<AibrushPacketInfoMetadata>;
   packetTable?(): ReadonlyArray<AibrushPacketMetadata>;
   packets(trackId: number): ReadableStream<AibrushPacket>;
   close(): Promise<void>;
@@ -406,7 +449,7 @@ async function concatenateChunks(chunks: readonly Uint8Array[], total: number): 
   }
   return bytes;
 }
-type AibrushOutput = Blob | ReadableStream<Uint8Array> | undefined;
+type AibrushOutput = Blob | ReadableStream<Uint8Array> | Uint8Array | undefined;
 interface AibrushConvertOptions {
   to?: string;
   video?: false | AibrushVideoTarget;
@@ -431,6 +474,8 @@ interface AibrushFromOptions {
 interface AibrushEngine {
   from(input: unknown, opts?: AibrushFromOptions): unknown;
   probe(input: unknown, o?: AibrushCallOptions): Promise<AibrushInfo>;
+  probeContainer?(input: unknown, container: string, o?: AibrushCallOptions): Promise<AibrushInfo>;
+  packetInfo?(input: unknown, o?: AibrushCallOptions): Promise<AibrushPacketInfoTable>;
   demux(input: unknown, o?: AibrushCallOptions): Promise<AibrushDemuxed>;
   remux(
     input: unknown,
@@ -457,6 +502,12 @@ interface AibrushEngine {
   // Codec tier. `decode` returns synchronously (lazy streams); the rest are Cancellable promises.
   decode(input: unknown, o?: AibrushCallOptions): AibrushMediaStreams;
   convert(input: unknown, opts: AibrushConvertOptions, o?: AibrushCallOptions): Promise<AibrushOutput>;
+  pcm?(
+    input: unknown,
+    sourceContainer: string,
+    opts: AibrushConvertOptions,
+    o?: AibrushCallOptions,
+  ): Promise<AibrushOutput>;
   seek(input: unknown, timeUs: number, o?: AibrushCallOptions): Promise<VideoFrame>;
   // Public packet-seam mux (engine `mux`): pack caller-supplied coded packet streams — from one OR several
   // demuxed sources (`tracks[]`) — into a target container. The TrackInfo travels with each stream so the
@@ -549,6 +600,66 @@ function canonicalCodec(codec: string): string {
   if (codec.toLowerCase().startsWith('mp4a.6')) return 'mp3'; // mp3-in-mp4 (check before the AAC family)
   if (codec === 'mp4a' || codec.startsWith('mp4a')) return 'aac'; // incl. bare 'mp4a' (esds-less AAC entry)
   return codec; // 'opus' | 'vorbis' | 'flac' | 'pcm-s16' | … already canonical
+}
+
+function containerFromInput(input: MediaInput): string {
+  if (isHlsAsset(input)) return 'hls';
+  const mime = input.mime.toLowerCase();
+  const id = input.id.toLowerCase();
+  if (mime.includes('quicktime') || id.endsWith('.mov')) return 'mov';
+  if (mime.includes('matroska') || id.endsWith('.mkv')) return 'mkv';
+  if (mime.includes('mp4') || /\.(mp4|m4a|m4v)$/i.test(id)) return 'mp4';
+  if (mime.includes('webm') || id.endsWith('.webm')) return 'webm';
+  if (mime.includes('mpegurl') || id.endsWith('.m3u8') || id.endsWith('.m3u')) return 'hls';
+  if (mime.includes('mpegts') || id.endsWith('.ts')) return 'ts';
+  if (mime.includes('wav') || id.endsWith('.wav')) return 'wav';
+  if (mime.includes('aiff') || id.endsWith('.aiff') || id.endsWith('.aif')) return 'aiff';
+  if (mime.includes('caf') || id.endsWith('.caf')) return 'caf';
+  if (mime.includes('flac') || id.endsWith('.flac')) return 'flac';
+  if (mime.includes('ogg') || /\.(oga|ogg|opus)$/i.test(id)) return 'ogg';
+  if (mime.includes('mpeg') || id.endsWith('.mp3')) return 'mp3';
+  if (mime.includes('aac') || id.endsWith('.aac') || id.endsWith('.adts')) return 'adts';
+  if (mime.includes('avi') || id.endsWith('.avi')) return 'avi';
+  return id.includes('.') ? id.slice(id.lastIndexOf('.') + 1) : mime || 'unknown';
+}
+
+function isPcmAggregateInput(input: MediaInput): boolean {
+  const container = containerFromInput(input);
+  return container === 'wav' || container === 'aiff' || container === 'caf';
+}
+
+function knownContainerProbeToken(input: MediaInput): 'webm' | 'mkv' | undefined {
+  const container = containerFromInput(input);
+  if (
+    (container === 'webm' || container === 'mkv') &&
+    !isMalformedHarnessInput(input) &&
+    !isStillImageInput(input)
+  ) {
+    return container;
+  }
+  return undefined;
+}
+
+function metadataFromDemuxed(input: MediaInput, demuxed: AibrushDemuxed): NormalizedMetadata {
+  let durationSec: number | null = null;
+  const tracks: NormalizedTrack[] = demuxed.tracks.map((t) => {
+    const trackDuration = t.durationSec;
+    if (trackDuration !== undefined && trackDuration > 0) {
+      durationSec = durationSec === null ? trackDuration : Math.max(durationSec, trackDuration);
+    }
+    const codec = canonicalCodec(t.codec ?? t.config?.codec ?? 'unknown');
+    return {
+      type: t.mediaType,
+      codec,
+      ...(t.config?.codedWidth !== undefined ? { width: t.config.codedWidth } : {}),
+      ...(t.config?.codedHeight !== undefined ? { height: t.config.codedHeight } : {}),
+      ...(t.config?.sampleRate !== undefined ? { sampleRate: t.config.sampleRate } : {}),
+      ...(t.config?.numberOfChannels !== undefined ? { channels: t.config.numberOfChannels } : {}),
+      bitrate: null,
+      language: null,
+    };
+  });
+  return { container: containerFromInput(input), durationSec, tracks };
 }
 
 async function inputBytes(input: MediaInput): Promise<Uint8Array> {
@@ -671,6 +782,10 @@ function u32le(bytes: Uint8Array, offset: number): number {
   );
 }
 
+function u16le(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8);
+}
+
 function u32be(bytes: Uint8Array, offset: number): number {
   return (
     (((bytes[offset] ?? 0) << 24) |
@@ -712,6 +827,43 @@ function pcmBytesPerSample(codec: string): number | undefined {
 
 function pcmTrack(metadata: NormalizedMetadata): NormalizedTrack | undefined {
   return metadata.tracks.find((track) => track.type === 'audio' && pcmBytesPerSample(track.codec) !== undefined);
+}
+
+function wavCodecFromFmt(formatTag: number, bitsPerSample: number): string | undefined {
+  if (formatTag === 3) return bitsPerSample === 64 ? 'pcm-f64' : 'pcm-f32';
+  if (formatTag !== 1 && formatTag !== 0xfffe) return undefined;
+  return bitsPerSample === 8 ? 'pcm-u8' : `pcm-s${bitsPerSample}`;
+}
+
+function pcmMetadataFromBytes(input: MediaInput, bytes: Uint8Array): NormalizedMetadata | undefined {
+  const container = containerFromInput(input);
+  if (container !== 'wav' || !tagEquals(bytes, 0, 'RIFF') || !tagEquals(bytes, 8, 'WAVE')) return undefined;
+  let channels = 0;
+  let sampleRate = 0;
+  let blockAlign = 0;
+  let codec: string | undefined;
+  let dataBytes = 0;
+  for (let offset = 12; offset + 8 <= bytes.byteLength; ) {
+    const size = u32le(bytes, offset + 4);
+    const body = offset + 8;
+    if (tagEquals(bytes, offset, 'fmt ') && size >= 16 && body + 16 <= bytes.byteLength) {
+      const formatTag = u16le(bytes, body);
+      channels = u16le(bytes, body + 2);
+      sampleRate = u32le(bytes, body + 4);
+      blockAlign = u16le(bytes, body + 12);
+      codec = wavCodecFromFmt(formatTag, u16le(bytes, body + 14));
+    } else if (tagEquals(bytes, offset, 'data')) {
+      dataBytes = Math.min(size, Math.max(0, bytes.byteLength - body));
+    }
+    offset = body + size + (size & 1);
+  }
+  if (codec === undefined || channels <= 0 || sampleRate <= 0 || blockAlign <= 0) return undefined;
+  const durationSec = dataBytes > 0 ? dataBytes / (sampleRate * blockAlign) : null;
+  return {
+    container,
+    durationSec,
+    tracks: [{ type: 'audio', codec, sampleRate, channels, bitrate: null, language: null }],
+  };
 }
 
 function riffDataBytes(bytes: Uint8Array): number {
@@ -809,22 +961,23 @@ async function pcmPacketTable(input: MediaInput, metadata: NormalizedMetadata): 
   return packets;
 }
 
-function pcmEncodedTrackFrom(metadata: NormalizedMetadata, packets: PacketInfo[]): EncodedTrack | undefined {
+function pcmEncodedTrackFrom(metadata: NormalizedMetadata): EncodedTrack | undefined {
   const track = pcmTrack(metadata);
   if (!track || track.sampleRate === undefined || track.channels === undefined) return undefined;
+  const durationUs =
+    metadata.durationSec !== null && metadata.durationSec > 0
+      ? Math.max(1, Math.round(metadata.durationSec * 1_000_000))
+      : 0;
   return {
     type: 'audio',
     codec: track.codec,
     timescale: 1_000_000,
     sampleRate: track.sampleRate,
     channels: track.channels,
-    chunks: packets.map((packet) => ({
-      data: new Uint8Array(0),
-      ptsUs: packet.ptsUs,
-      dtsUs: packet.dtsUs,
-      durationUs: 0,
-      keyframe: true,
-    })),
+    chunks:
+      durationUs > 0
+        ? [{ data: new Uint8Array(0), ptsUs: 0, dtsUs: 0, durationUs, keyframe: true }]
+        : [],
   };
 }
 async function rejectOversizedBufferTarget(input: MediaInput, opts: RemuxOptions): Promise<void> {
@@ -981,6 +1134,9 @@ async function toMediaBytes(output: AibrushOutput, container: string): Promise<M
   }
   if (output instanceof Blob) {
     return { bytes: new Uint8Array(await output.arrayBuffer()), mime: outputMime(container), container };
+  }
+  if (output instanceof Uint8Array) {
+    return { bytes: output, mime: outputMime(container), container };
   }
   return { bytes: await streamBytes(output), mime: outputMime(container), container };
 }
@@ -1607,6 +1763,12 @@ interface ConcatTrackPackets {
   packets: AibrushPacket[];
 }
 
+interface PreparedPcmMuxSource {
+  readonly input: MediaInput;
+  readonly target: string;
+  readonly bytes: Uint8Array;
+}
+
 class AibrushMediaEngine implements MediaEngine {
   readonly id = ENGINE_ID;
   readonly configUsed = {
@@ -1617,8 +1779,10 @@ class AibrushMediaEngine implements MediaEngine {
     backend: 'webcodecs+pure-ts-containers',
   };
   #lib: AibrushMedia | undefined;
+  #engineInstance: AibrushEngine | undefined;
   /** Source(s) recorded by prepareMuxTracks for the immediately-following mux() (same instance, serial). */
   #muxSource: MediaInput[] | undefined;
+  #preparedPcmMuxSource: PreparedPcmMuxSource | undefined;
 
   async init(): Promise<void> {
     // Arm the page-error safety net for this cell BEFORE any work, so an init/op teardown race cannot
@@ -1629,12 +1793,15 @@ class AibrushMediaEngine implements MediaEngine {
 
   async dispose(): Promise<void> {
     this.#muxSource = undefined;
+    this.#preparedPcmMuxSource = undefined;
+    this.#engineInstance = undefined;
     disarmSafetyNet();
   }
 
   #engine(): AibrushEngine {
     if (!this.#lib) throw new Error('aibrush-media not initialized');
-    return this.#lib.createMedia();
+    this.#engineInstance ??= this.#lib.createMedia();
+    return this.#engineInstance;
   }
   #streamSink(): AibrushStreamSink {
     if (!this.#lib) throw new Error('aibrush-media not initialized');
@@ -1836,7 +2003,12 @@ class AibrushMediaEngine implements MediaEngine {
       let info: AibrushInfo;
       try {
         const engine = this.#engine();
-        info = await engine.probe(await this.#src(engine, input), { signal });
+        const src = await this.#src(engine, input);
+        const knownContainer = knownContainerProbeToken(input);
+        info =
+          knownContainer !== undefined && engine.probeContainer !== undefined
+            ? await engine.probeContainer(src, knownContainer, { signal })
+            : await engine.probe(src, { signal });
       } catch (e) {
         return naIfMiss('probe', e, input);
       }
@@ -1865,57 +2037,90 @@ class AibrushMediaEngine implements MediaEngine {
     return withOpTimeout('demux', async (signal) => {
       try {
         const engine = this.#engine();
-        const metadata = await this.probe(input);
-        if (pcmTrack(metadata) !== undefined) {
+        if (isPcmAggregateInput(input)) {
+          const metadata = await this.probe(input);
+          if (pcmTrack(metadata) === undefined) {
+            throw new Error(`aibrush PCM aggregate input ${input.id} has no PCM track`);
+          }
           return { metadata, packets: await pcmPacketTable(input, metadata) };
         }
+        if ((containerFromInput(input) === 'mp4' || containerFromInput(input) === 'mov') && !isMalformedHarnessInput(input)) {
+          const packetInfo = await engine.packetInfo?.(await this.#src(engine, input), { signal });
+          if (packetInfo !== undefined && packetInfo.packets.length > 0) {
+            const demuxedView: AibrushDemuxed = {
+              tracks: packetInfo.tracks,
+              packetInfoTable: () => packetInfo.packets,
+              packets: () => {
+                throw new Error('aibrush packet-info fast path has no payload streams');
+              },
+              close: () => Promise.resolve(),
+            };
+            return { metadata: metadataFromDemuxed(input, demuxedView), packets: packetInfo.packets as PacketInfo[] };
+          }
+        }
         const demuxed = await engine.demux(await this.#src(engine, input), { signal });
-        const packets: PacketInfo[] = [];
+        const metadata = metadataFromDemuxed(input, demuxed);
+        let packets: PacketInfo[] = [];
+        let packetTableFastPath = false;
         try {
-          const packetTable = demuxed.packetTable?.();
-          if (packetTable !== undefined) {
-            const trackIndexById = new Map<number, number>();
-            for (let i = 0; i < demuxed.tracks.length; i++) {
-              const track = demuxed.tracks[i];
-              if (track) trackIndexById.set(track.id, i);
-            }
-            for (const p of packetTable) {
-              const trackIndex = trackIndexById.get(p.trackId);
-              if (trackIndex === undefined) {
-                throw new Error(`aibrush packetTable referenced unknown track ${p.trackId}`);
-              }
-              packets.push({
-                trackIndex,
-                size: p.sizeBytes,
-                ptsUs: Math.round(p.ptsUs),
-                dtsUs: Math.round(p.dtsUs),
-                keyframe: p.keyframe,
-              });
-            }
+          const packetInfoTable = demuxed.packetInfoTable?.();
+          if (packetInfoTable !== undefined) {
+            packetTableFastPath = true;
+            packets = packetInfoTable as PacketInfo[];
           } else {
-            for (let i = 0; i < demuxed.tracks.length; i++) {
-              const track = demuxed.tracks[i];
-              if (!track) continue;
-              const reader = demuxed.packets(track.id).getReader(); // may throw a capability-miss → NA
-              for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = value.chunk;
-                // Real DTS from the seam packet (decode order on B-frame streams), else PTS (ADR-045).
-                packets.push({
-                  trackIndex: i,
-                  size: value.sizeBytes ?? chunk.byteLength,
-                  ptsUs: Math.round(chunk.timestamp),
-                  dtsUs: Math.round(value.dtsUs ?? chunk.timestamp),
-                  keyframe: chunk.type === 'key',
-                });
+            const packetTable = demuxed.packetTable?.();
+            if (packetTable !== undefined) {
+              packetTableFastPath = true;
+              let maxTrackId = 0;
+              for (let i = 0; i < demuxed.tracks.length; i++) {
+                const track = demuxed.tracks[i];
+                if (track && track.id > maxTrackId) maxTrackId = track.id;
+              }
+              const trackIndexById = new Int32Array(maxTrackId + 1);
+              trackIndexById.fill(-1);
+              for (let i = 0; i < demuxed.tracks.length; i++) {
+                const track = demuxed.tracks[i];
+                if (track) trackIndexById[track.id] = i;
+              }
+              const packetRows = packetTable as AibrushPacketInfoRow[];
+              if (!packetRowsArePreindexed(packetRows, demuxed.tracks.length)) {
+                for (let i = 0; i < packetTable.length; i++) {
+                  const p = packetRows[i];
+                  if (p === undefined) continue;
+                  const trackIndex = p.trackId < trackIndexById.length ? (trackIndexById[p.trackId] ?? -1) : -1;
+                  if (trackIndex < 0) {
+                    throw new Error(`aibrush packetTable referenced unknown track ${p.trackId}`);
+                  }
+                  p.trackIndex = trackIndex;
+                  p.size = p.sizeBytes;
+                }
+              }
+              packets = packetRows as PacketInfo[];
+            } else {
+              for (let i = 0; i < demuxed.tracks.length; i++) {
+                const track = demuxed.tracks[i];
+                if (!track) continue;
+                const reader = demuxed.packets(track.id).getReader(); // may throw a capability-miss → NA
+                for (;;) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const chunk = value.chunk;
+                  // Real DTS from the seam packet (decode order on B-frame streams), else PTS (ADR-045).
+                  packets.push({
+                    trackIndex: i,
+                    size: value.sizeBytes ?? chunk.byteLength,
+                    ptsUs: Math.round(chunk.timestamp),
+                    dtsUs: Math.round(value.dtsUs ?? chunk.timestamp),
+                    keyframe: chunk.type === 'key',
+                  });
+                }
               }
             }
           }
         } finally {
           await demuxed.close();
         }
-        packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
+        if (!packetTableFastPath) packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
         return { metadata, packets };
       } catch (e) {
         return naIfMiss('demux', e, input);
@@ -2143,20 +2348,41 @@ class AibrushMediaEngine implements MediaEngine {
    * capability miss maps to NA. Multi-source assembly (tracks from >1 asset) is NA up front — the engine
    * has no public multi-source packer, so we never pretend to assemble across sources (honesty §15).
    */
-  async prepareMuxTracks(inputs: MediaInput[], _options?: Record<string, unknown>): Promise<EncodedTracks> {
+  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
     if (inputs.length === 0) throw new NotApplicableError('mux', 'no source inputs to assemble');
     // Multi-source assembly (tracks from >1 asset) is now a real engine op: mux() re-demuxes every recorded
     // source and feeds all tracks to `engine.mux({ tracks })`. Here we just materialize the demuxed tracks
     // for the harness contract (and to detect an empty/zero-sample source in mux()).
     return withOpTimeout('mux', async (signal) => {
       try {
+        this.#preparedPcmMuxSource = undefined;
+        const requestedTarget = typeof options?.container === 'string' ? options.container.toLowerCase() : undefined;
+        const canCachePcmSource =
+          inputs.length === 1 && requestedTarget !== undefined && PCM_MUX_TARGETS.has(requestedTarget);
         const tracks: EncodedTrack[] = [];
         for (const input of inputs) {
-          const metadata = await this.probe(input);
-          if (pcmTrack(metadata) !== undefined) {
-            const pcmTrackForMux = pcmEncodedTrackFrom(metadata, await pcmPacketTable(input, metadata));
+          if (canCachePcmSource && requestedTarget !== undefined) {
+            const bytes = await inputBytes(input);
+            const metadata = pcmMetadataFromBytes(input, bytes);
+            const pcmTrackForMux = metadata === undefined ? undefined : pcmEncodedTrackFrom(metadata);
             if (pcmTrackForMux !== undefined) {
               tracks.push(pcmTrackForMux);
+              this.#preparedPcmMuxSource = { input, target: requestedTarget, bytes };
+              continue;
+            }
+          }
+          const metadata = await this.probe(input);
+          if (pcmTrack(metadata) !== undefined) {
+            const pcmTrackForMux = pcmEncodedTrackFrom(metadata);
+            if (pcmTrackForMux !== undefined) {
+              tracks.push(pcmTrackForMux);
+              if (canCachePcmSource && requestedTarget !== undefined) {
+                this.#preparedPcmMuxSource = {
+                  input,
+                  target: requestedTarget,
+                  bytes: await inputBytes(input),
+                };
+              }
               continue;
             }
           }
@@ -2174,6 +2400,7 @@ class AibrushMediaEngine implements MediaEngine {
         return { tracks };
       } catch (e) {
         this.#muxSource = undefined;
+        this.#preparedPcmMuxSource = undefined;
         return naIfMiss('mux', e, inputs[0]);
       }
     });
@@ -2195,7 +2422,9 @@ class AibrushMediaEngine implements MediaEngine {
    */
   async mux(tracks: EncodedTracks, opts: MuxOptions): Promise<MediaBytes> {
     const recorded = this.#muxSource;
+    const preparedPcmSource = this.#preparedPcmMuxSource;
     this.#muxSource = undefined; // consume once; never leak state into an unrelated later mux
+    this.#preparedPcmMuxSource = undefined;
     const target = String(opts.container).toLowerCase();
     if (!recorded || recorded.length === 0)
       throw new NotApplicableError('mux', 'no recorded source (prepareMuxTracks not run)');
@@ -2218,12 +2447,36 @@ class AibrushMediaEngine implements MediaEngine {
       return withOpTimeout('mux', async (signal) => {
         try {
           const engine = this.#engine();
+          const preparedBytes =
+            preparedPcmSource?.input === input && preparedPcmSource.target === target
+              ? preparedPcmSource.bytes
+              : undefined;
+          const sourceContainer = containerFromInput(input);
+          const canUseByteRewrite =
+            preparedBytes !== undefined &&
+            sourceContainer === 'wav' &&
+            target === 'wav' &&
+            (opts as { target?: unknown }).target !== 'stream';
+          if (canUseByteRewrite && engine.pcm !== undefined) {
+            const startMs = nowMs();
+            const out = await engine.pcm(preparedBytes, sourceContainer, { to: target }, { signal });
+            const media = await toMediaBytes(out, target);
+            if ((opts as { target?: unknown }).target !== 'buffer') return media;
+            return {
+              ...media,
+              targetWrites: media.bytes.byteLength > 0 ? 1 : 0,
+              firstByteMs: Math.max(0, nowMs() - startMs),
+            };
+          }
           const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>);
-          const out = await engine.convert(
-            await this.#src(engine, input),
-            { to: target, sink: telemetry.sink },
-            { signal },
-          );
+          const src =
+            preparedBytes !== undefined
+              ? engine.from(preparedBytes, { mime: input.mime, size: preparedBytes.byteLength })
+              : await this.#src(engine, input);
+          const out =
+            engine.pcm !== undefined
+              ? await engine.pcm(src, sourceContainer, { to: target, sink: telemetry.sink }, { signal })
+              : await engine.convert(src, { to: target, sink: telemetry.sink }, { signal });
           return telemetry.mediaBytes(out, target);
         } catch (e) {
           return naIfMiss('mux', e, input);
