@@ -88,6 +88,7 @@ interface FixtureManifestAsset {
 }
 
 let fixtureManifestPromise: Promise<Map<string, FixtureManifestAsset> | undefined> | undefined;
+let fixtureManifestCache: Map<string, FixtureManifestAsset> | undefined;
 
 /**
  * Map a robustness `mutate` outcome (graceful failure expected) — the runner records `graceful`
@@ -467,6 +468,7 @@ async function fixtureManifestById(): Promise<Map<string, FixtureManifestAsset> 
         for (const asset of manifest.assets ?? []) {
           if (typeof asset.id === 'string' && asset.id) byId.set(asset.id, asset);
         }
+        fixtureManifestCache = byId;
         return byId;
       } catch {
         return undefined;
@@ -518,6 +520,11 @@ async function missingAssetReason(assetId: string): Promise<string | undefined> 
 function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8Array): MediaInput {
   const url = mediaAssetUrl(assetId);
   const mime = mimeForAssetId(assetId);
+  const manifestSize = fixtureManifestCache?.get(assetId)?.sizeBytes;
+  const sizeBytes =
+    typeof manifestSize === 'number' && Number.isSafeInteger(manifestSize) && manifestSize >= 0
+      ? manifestSize
+      : undefined;
 
   let cached: Promise<ArrayBuffer> | undefined;
   const fetchBytes = (): Promise<ArrayBuffer> => {
@@ -543,6 +550,7 @@ function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8A
     id: assetId,
     url,
     mime,
+    ...(sizeBytes !== undefined && mutate === undefined ? { sizeBytes } : {}),
     mutated: typeof mutate === 'function',
     async arrayBuffer(): Promise<ArrayBuffer> {
       return applyMutate(await fetchBytes());
