@@ -1918,12 +1918,23 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // §10 STALE-PASS guard: fold the selection tag into the reuse key so a run that picked a DIFFERENT
-      // file for this scenario can never reuse a prior PASS validated against other bytes. `selectionCacheTag`
-      // is 'baked' for the baked fixture, else the picked file's sha prefix. The store keys `put` off
-      // result.scenarioId, so we stamp the composite key onto the STORED copy only (via withCacheKey) and
-      // restore the true scenarioId on the cache-hit read path — live results always carry the real id.
-      const cacheTag = selection ? selectionCacheTag(selection) : undefined;
+      // §10 STALE-PASS guard: fold the selected input(s) into the reuse key so a run that picked a
+      // DIFFERENT file — or, in exhaustive mode, a different candidate SET — can never reuse a prior PASS
+      // validated against other bytes. Non-exhaustive → the single pick's `selectionCacheTag` ('baked' or
+      // the sha prefix). Exhaustive → `exhaustive:<n>:<tag,tag,…>` over the FULL ordered candidate list, so
+      // the aggregate PASS is reused ONLY when EVERY file in the set is unchanged (honest: a single-file
+      // PASS is never enough to satisfy an all-files audit). The store keys `put` off result.scenarioId, so
+      // we stamp the composite key onto the STORED copy only (via withCacheKey) and restore the true
+      // scenarioId on the cache-hit read path — live results always carry the real id.
+      const exhaustiveList = exhaustive
+        ? (exhaustiveCandidates.get(scenario.id) ?? (selection ? [selection] : []))
+        : undefined;
+      const cacheTag =
+        exhaustiveList && exhaustiveList.length > 0
+          ? `exhaustive:${exhaustiveList.length}:${exhaustiveList.map(selectionCacheTag).join(',')}`
+          : selection
+            ? selectionCacheTag(selection)
+            : undefined;
       const cacheScenarioKey = cacheTag ? `${scenario.id}#${cacheTag}` : scenario.id;
       const withCacheKey = (r: ScenarioResult): ScenarioResult =>
         cacheScenarioKey === scenario.id ? r : { ...r, scenarioId: cacheScenarioKey };
@@ -1955,10 +1966,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // Exhaustive mode runs every file fresh (a thorough audit) — never serve a single-file cached PASS.
-      const cached = exhaustive
-        ? undefined
-        : await opts.resultReuse?.get(engine.id, cacheScenarioKey, opts.browser).catch(() => undefined);
+      // Reuse a prior PASS keyed by the EXACT input(s): the single picked file (normal) OR the full
+      // candidate SET (exhaustive — cacheScenarioKey encodes every file via the `exhaustive:<n>:…` tag, so
+      // the aggregate PASS is only served when the whole set is unchanged). A changed pick/set produces a
+      // different key → an honest re-run. Only PASS is served (below); NA/FAIL always re-run.
+      const cached = await opts.resultReuse?.get(engine.id, cacheScenarioKey, opts.browser).catch(() => undefined);
       if (cached && cached.status === 'PASS') {
         const cachedReason = cached.reason?.replace(/^(cached:\s*)+/i, '');
         result = {
@@ -1990,12 +2002,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       // median per metric). `engine` (constructed + negotiated OK) is reused for file 0; fresh engines
       // for the rest (runOne inits+disposes each). Bypasses the single-file path.
       if (exhaustive) {
-        const list = exhaustiveCandidates.get(scenario.id) ?? (selection ? [selection] : []);
+        const list = exhaustiveList ?? [];
         if (list.length > 0) {
           result = await runExhaustiveCell(engine, engineId, reg, list, scenario, opts, support, runEnvBase, pillar);
           if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
             result.primaryMetric = scenario.primaryMetric;
           }
+          // Persist the aggregate under the SET-encoded key so a later run with the identical candidate
+          // set reuses this PASS instead of re-running every file. Only a PASS is ever served back (above).
+          await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
           results.push(result);
           opts.onResult?.(result);
           done += 1;
