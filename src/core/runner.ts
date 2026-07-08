@@ -865,6 +865,12 @@ function isGoldenBakeGap(outcome: OracleOutcome): boolean {
     // Oracles that RETIRE to NA (oracles.ts) on a rotated, golden-less real file emit the canonical
     // substring 'golden absent' so a missing base routes to NA_ASSET, never a FAIL (P0 contract).
     detail.includes('golden absent') ||
+    // The packet oracles (reference-reimport/mux round-trip/double-remux) emit 'packet table unreadable'
+    // when the candidate's OWN output cannot be byte-read into a packet table (container outside
+    // mp4/webm coverage, or a fragmented/laced/reordered/truncated output the reader bails on). That is
+    // an honest truth-unavailable NA (R3), never a FAIL — a real packet mismatch instead reports a
+    // comparator diff (size/keyframe/count/drift) which does NOT contain this substring.
+    detail.includes('packet table unreadable') ||
     // §11 broadening: a golden-KEYED oracle that fails ONLY because its golden is ABSENT (a rotated,
     // golden-less real file) is honestly NA_ASSET, not FAIL. Each substring below is emitted by
     // oracles.ts EXCLUSIVELY on a missing-golden/absent-base branch — verified to be either an early

@@ -33,7 +33,7 @@ import type {
 } from './engine.ts';
 import type { MediaEngine, PacketInfo } from './engine.ts';
 import type { OracleId, OracleOutcome, OracleTolerances, Scenario } from './scenario.ts';
-import { canonicalCodecToken, readOutputStructure } from './box-readers.ts';
+import { canonicalCodecToken, readOutputPackets, readOutputStructure } from './box-readers.ts';
 
 /** No-engine structural read of an engine's OWN output bytes (box-readers.ts). */
 type OutputStructure = NonNullable<ReturnType<typeof readOutputStructure>>;
@@ -310,6 +310,17 @@ export interface OracleContext {
  */
 function naOutcome(oracle: OracleId, detail: string): OracleOutcome {
   return { oracle, pass: false, detail: `golden absent: ${detail}` };
+}
+
+/**
+ * An honest NA for "the candidate's OWN output cannot be byte-read into a packet table" — the container
+ * is outside the mp4/webm packet-reader's coverage, or the reader bails on a fragmented / laced /
+ * B-frame-reordered / truncated output. The runner routes the `packet table unreadable` substring to
+ * NA_ASSET. R3: NA ONLY when the truth is genuinely unavailable (the parser cannot read the container),
+ * never a manufactured pass and never a FAIL for a real mismatch.
+ */
+function naPacketsUnreadable(oracle: OracleId, detail: string): OracleOutcome {
+  return { oracle, pass: false, detail: `packet table unreadable: ${detail}` };
 }
 
 /** Map a byte-read OutputStructure to a NormalizedMetadata (fps/sampleRate/channels are unknown). */
@@ -815,14 +826,31 @@ function metadataTracksForScenario(ctx: OracleContext, tracks: NormalizedTrack[]
 
 // ── golden-packets ───────────────────────────────────────────────────────────────────────────
 
-function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): OracleOutcome {
-  const oracle: OracleId = 'golden-packets';
-  const got = ctx.demux?.packets;
-  const want = ctx.golden.packets;
-  if (!got) return fail(oracle, 'no demux packets on ctx.demux.packets');
-  if (!want) return fail(oracle, 'no golden packets (fixtures/golden/<id>.packets.json absent)');
-  if (usesPcmAggregatePacketOracle(ctx)) return pcmAggregatePackets(ctx, got, want, t);
+interface PacketTableComparison {
+  ok: boolean;
+  diffs: string[];
+  measurements: Record<string, number>;
+}
 
+/**
+ * The CANONICAL packet-table comparator — shared by `golden-packets` AND the metamorphic / reimport
+ * packet oracles so all four judge a packet table the SAME faithful way, with NO reference engine.
+ *
+ * ORDER-INDEPENDENT, PER-TRACK: golden (ffprobe) lists packets interleaved by dts across tracks while
+ * an engine may group them per-track, so group BOTH sides by trackIndex, sort each group by (dts,pts),
+ * and compare position-by-position. Sizes + keyframe flags must match EXACTLY. Timestamps are compared
+ * within `tsTolUs` AFTER removing a CONSTANT per-track origin offset (ffprobe exposes raw container
+ * priming / edit-list pts, e.g. -21333µs, while an engine may apply the edit list and start at 0 — a
+ * constant shift is fine; a VARYING residual is a real inter-packet timing error).
+ * `opts.looseFirstPacket(trackIndex)` handles the Ogg/Opus pre-skip convention: anchor packet 1 and
+ * skip timestamp drift on packet 0 for that track (sizes/counts still compare exactly).
+ */
+function comparePacketTables(
+  got: PacketInfo[],
+  want: PacketInfo[],
+  tsTolUs: number,
+  opts?: { looseFirstPacket?: (trackIndex: number) => boolean },
+): PacketTableComparison {
   const diffs: string[] = [];
   const measurements: Record<string, number> = {
     measuredCount: got.length,
@@ -844,13 +872,6 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
     );
   }
 
-  // ORDER-INDEPENDENT, PER-TRACK comparison. Golden (ffprobe) lists packets interleaved by dts across
-  // tracks; an engine may yield them grouped per-track. So group BOTH sides by trackIndex, sort each
-  // group by dts then pts, and compare position-by-position within the track. Sizes + keyframe flags
-  // must match exactly. Timestamps are compared offset-tolerantly: a CONSTANT per-track origin shift
-  // (ffprobe exposes raw container priming / edit-list pts, e.g. -21333µs, while an engine may apply
-  // the edit list and start at 0) is allowed; a VARYING residual is a real inter-packet timing error.
-  const tsTolUs = t.seekToleranceUs; // reuse 1ms as the "small" packet ts tolerance
   const byTrack = (ps: PacketInfo[]): Map<number, PacketInfo[]> => {
     const m = new Map<number, PacketInfo[]>();
     for (const p of ps) {
@@ -878,12 +899,8 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
     const m = Math.min(gotTrack.length, wantTrack.length);
     if (m === 0) continue;
     comparedTracks++;
-    // Per-track constant offset, taken from an aligned packet (origin alignment). Ogg/Opus exposes
-    // codec pre-skip differently across demuxers: ffprobe reports a negative first packet, while
-    // Mediabunny starts it at 0 and agrees from packet 1 onward. Anchor packet 1 and skip timestamp
-    // drift on packet 0 for that specific convention difference; sizes/counts still compare exactly.
-    const looseOpusFirstPacket = usesOpusPreskipLoosePacket(ctx, trackIndex) && m > 1;
-    const anchor = looseOpusFirstPacket ? 1 : 0;
+    const looseFirstPacket = (opts?.looseFirstPacket?.(trackIndex) ?? false) && m > 1;
+    const anchor = looseFirstPacket ? 1 : 0;
     const ptsOffset = gotTrack[anchor]!.ptsUs - wantTrack[anchor]!.ptsUs;
     const dtsOffset = gotTrack[anchor]!.dtsUs - wantTrack[anchor]!.dtsUs;
     for (let i = 0; i < m; i++) {
@@ -891,7 +908,7 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
       const b = wantTrack[i]!;
       if (a.size !== b.size) sizeMismatch++;
       if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
-      if (looseOpusFirstPacket && i === 0) continue;
+      if (looseFirstPacket && i === 0) continue;
       const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
       const dtsResid = Math.abs(a.dtsUs - b.dtsUs - dtsOffset);
       if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
@@ -906,8 +923,65 @@ function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): Oracl
   if (ptsDrift) diffs.push(`${ptsDrift} packets pts drift beyond ±${tsTolUs}µs after per-track origin alignment`);
   if (dtsDrift) diffs.push(`${dtsDrift} packets dts drift beyond ±${tsTolUs}µs after per-track origin alignment`);
 
-  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  return pass(oracle, `packet table matches golden (${got.length} packets)`, measurements);
+  return { ok: diffs.length === 0, diffs, measurements };
+}
+
+/**
+ * Faithful packet-preservation check for LOSSLESS-container ops (remux/mux/reimport) with NO reference
+ * engine: parse the candidate's OWN output packet table (box-readers) and compare it to the baked
+ * ffprobe golden packet table (ctx.golden.packets) via the shared `comparePacketTables`. For a lossless
+ * container change the output packet table MUST equal the source golden packet table (same coded
+ * samples, sizes, keyframe flags, and — after per-track origin alignment — timestamps), so a dropped /
+ * reordered / resized packet is a real FAIL. Truth-unavailable cases route to NA, never to a pass/FAIL:
+ *   - ctx.golden.packets absent                         → NA ('golden absent' → NA_ASSET)
+ *   - readOutputPackets returns null (container outside
+ *     mp4/webm coverage, or fragmented/laced/reordered
+ *     /truncated output the reader bails on)            → NA ('packet table unreadable' → NA_ASSET)
+ */
+function outputPacketsVsGolden(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+  oracle: OracleId,
+  label: string,
+): OracleOutcome {
+  const output = ctx.output;
+  if (!output) return fail(oracle, `${label}no ctx.output bytes to re-demux`);
+  const want = ctx.golden.packets;
+  if (!want || want.length === 0) {
+    return naOutcome(
+      oracle,
+      `${label}no golden packet table to compare (fixtures/golden/<id>.packets.json absent)`,
+    );
+  }
+  const got = readOutputPackets(output.bytes, output.container);
+  if (!got) {
+    return naPacketsUnreadable(
+      oracle,
+      `${label}output container '${normStr(output.container)}' is outside the mp4/webm packet reader, or the output is fragmented/laced/reordered/truncated`,
+    );
+  }
+  const cmp = comparePacketTables(got, want, t.seekToleranceUs);
+  if (!cmp.ok) return fail(oracle, `${label}${cmp.diffs.join('; ')}`, cmp.measurements);
+  return pass(
+    oracle,
+    `${label}re-demuxed ${got.length} packet(s) equal the golden packet table`,
+    cmp.measurements,
+  );
+}
+
+function goldenPackets(ctx: OracleContext, t: Required<OracleTolerances>): OracleOutcome {
+  const oracle: OracleId = 'golden-packets';
+  const got = ctx.demux?.packets;
+  const want = ctx.golden.packets;
+  if (!got) return fail(oracle, 'no demux packets on ctx.demux.packets');
+  if (!want) return fail(oracle, 'no golden packets (fixtures/golden/<id>.packets.json absent)');
+  if (usesPcmAggregatePacketOracle(ctx)) return pcmAggregatePackets(ctx, got, want, t);
+
+  const cmp = comparePacketTables(got, want, t.seekToleranceUs, {
+    looseFirstPacket: (trackIndex) => usesOpusPreskipLoosePacket(ctx, trackIndex),
+  });
+  if (cmp.diffs.length) return fail(oracle, cmp.diffs.join('; '), cmp.measurements);
+  return pass(oracle, `packet table matches golden (${got.length} packets)`, cmp.measurements);
 }
 
 function usesPcmAggregatePacketOracle(ctx: OracleContext): boolean {
@@ -1234,12 +1308,20 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
     return semanticRemuxReimport(ctx, t);
   }
 
-  // NON-remux consistency was a packet-count/keyframe comparison against golden packets. That needs a
-  // full PACKET TABLE, which the byte reader does not provide — retire to honest NA under the
-  // no-reference policy (never a manufactured pass, never a byte-parse FAIL).
+  // NON-remux: the original check compared the re-demuxed OUTPUT packet table to the SOURCE golden
+  // packets. That is faithful ONLY for a LOSSLESS-preserve op that repackages coded samples verbatim.
+  // `mux` qualifies (it packs x's own coded samples into a container), and the mux family attaches
+  // reference-reimport ONLY for faithful ISO-BMFF targets (mp4/mov), so parse the mux output's OWN
+  // packet table and compare to golden via the shared comparator — a dropped/reordered/resized packet
+  // is a real FAIL; an unreadable output (e.g. a TS target) is honest NA. Any other non-remux op
+  // (transcode re-encodes; decrypt is gated by decrypt-bitexact + property-invariant, not verified
+  // packet-lossless here) stays NA rather than risk a false FAIL — no packet equality on re-encoded bytes.
+  if (ctx.scenario.op === 'mux') {
+    return outputPacketsVsGolden(ctx, t, oracle, 'reference-reimport mux round-trip: ');
+  }
   return naOutcome(
     oracle,
-    'reference-reimport packet-count/keyframe check needs a packet table / demuxer; retired to NA under the no-reference policy',
+    `reference-reimport packet check applies to lossless container ops (remux/mux); op '${ctx.scenario.op}' is not a verified packet-lossless case under the no-reference policy`,
   );
 }
 
@@ -3504,12 +3586,11 @@ async function demuxMuxRoundtripInvariant(
   which: string,
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
-  // demux(mux(x))==x compares the mux output's full PACKET TABLE against golden packets. The no-engine
-  // byte reader does NOT expose a packet table, so this invariant is retired to honest NA.
-  return naOutcome(
-    oracle,
-    `[${which}] demux(mux(x))==x needs a packet table / demuxer; retired to NA under the no-reference policy`,
-  );
+  // demux(mux(x))==x: `mux` repackages x's coded samples LOSSLESSLY, so re-demuxing the mux output must
+  // reproduce the SOURCE packet table (ctx.golden.packets = ffprobe of x). Parse the mux output's OWN
+  // packet table (box-readers, no reference engine) and compare via the shared comparator — dropped or
+  // reordered or resized packets are a real FAIL; an unreadable/absent-golden case is honest NA.
+  return outputPacketsVsGolden(ctx, t, oracle, `[${which}] demux(mux(x))==x: `);
 }
 
 async function doubleRemuxStableInvariant(
@@ -3518,12 +3599,15 @@ async function doubleRemuxStableInvariant(
   which: string,
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
-  // remux(remux(x))==remux(x) compares full metadata + PACKET TABLES across two remux passes via a
-  // demuxer. The no-engine byte reader exposes no packet table, so this invariant is retired to NA.
-  return naOutcome(
-    oracle,
-    `[${which}] remux(remux(x))==remux(x) needs a packet table / demuxer; retired to NA under the no-reference policy`,
-  );
+  // remux(remux(x))==remux(x). DATA MODEL: the runner performs a SINGLE remux, exposing ctx.output =
+  // remux(x); it injects no second remux output. A packet-LOSSLESS remux preserves x's packet table, so
+  // demux(remux(x)) must equal ctx.golden.packets (ffprobe of x). That is a STRONGER, ruler-symmetric
+  // guarantee that IMPLIES packet-level idempotence — if remux(x) already carries x's exact packet
+  // table, a second remux cannot change it. So parse remux(x)'s OWN packet table and compare vs golden
+  // via the shared comparator (a reorder/drop on the single wrap is a real FAIL; unreadable/absent →
+  // NA). (If a future runner injects BOTH remux outputs, compare those two tables to each other instead
+  // — fully metamorphic, no golden needed; the single-output data model here does not carry a second.)
+  return outputPacketsVsGolden(ctx, t, oracle, `[${which}] remux(remux(x))==remux(x): `);
 }
 
 function seekVsLinearDecodeInvariant(

@@ -19,19 +19,31 @@
  * byte-for-byte the same shape the baked-fixture goldens use (and `golden-metadata` expects). If you
  * change canonicalization in bake.mjs, mirror it here.
  *
- * Frame/SSIM goldens (decode-seek/decrypt) are NOT produced here — those require the in-browser
- * WebCodecs decoder (scripts/frame-bake.mjs), a heavier separate pass.
+ * FRAME/SSIM DIGESTS are the browser's normalized-RGBA sha256 — ffmpeg CANNOT produce them, so the
+ * `--frames` mode here only emits the ffprobe-derived PLACEHOLDER (`<id>.frames.json` with sha256:null,
+ * pending:true) that the in-browser WebCodecs pass (scripts/frame-bake.mjs → src/core/frame-bake.ts)
+ * later fills. The placeholder shape is COPIED VERBATIM from fixtures/bake.mjs `frameHookFor` (the flat
+ * corpus's producer) so the browser pass + the decoded-frames-bitexact / ssim-psnr / seek-accuracy
+ * oracles read a nested real-file golden byte-identically to a flat one. The final digest is still
+ * baked ONLY by the platform instrument, never by a scored candidate engine.
  *
  * Usage:
- *   bun fixtures/bake-scenario-goldens.mjs [--force] [--packets] [--family <fam>] [<id-substring> ...]
+ *   bun fixtures/bake-scenario-goldens.mjs [--force] [--packets] [--frames] [--family <fam>] [<id-substring> ...]
  *     --force            overwrite existing scenario goldens (default: skip present)
  *     --packets          also bake packets.json for EVERY selected file (default: demux family only)
- *     --family <fam>     restrict to one family (e.g. probe, demux, metadata)
+ *     --frames           FRAMES MODE: emit ffprobe-derived <id>.frames.json PLACEHOLDERS (sha256:null,
+ *                        pending:true) for real video-bearing files whose family consumes frame goldens
+ *                        (decode-seek/transcode/remux/mux/metadata/performance; encryption is metamorphic
+ *                        and needs NO frame golden). Does not write meta/packets. Never clobbers a golden
+ *                        the browser pass already filled. The digests themselves are baked by
+ *                        scripts/frame-bake.mjs --scenario-frames, not here.
+ *     --family <fam>     restrict to one family (e.g. probe, demux, metadata); in --frames mode an
+ *                        explicit family overrides the frame-family allowlist (honors operator intent)
  *     <id-substring>     positional filters: only scenarios whose id contains a term
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(dirname(new URL(import.meta.url).pathname), '..');
@@ -41,13 +53,14 @@ const GOLDEN_DIR = join(ROOT, 'fixtures/golden');
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
-const opts = { force: false, packets: false, family: /** @type {string|null} */ (null), terms: /** @type {string[]} */ ([]) };
+const opts = { force: false, packets: false, frames: false, family: /** @type {string|null} */ (null), terms: /** @type {string[]} */ ([]) };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--force') opts.force = true;
   else if (a === '--packets') opts.packets = true;
+  else if (a === '--frames') opts.frames = true;
   else if (a === '--family') opts.family = argv[++i] ?? null;
-  else if (a === '--help' || a === '-h') { console.log('bun fixtures/bake-scenario-goldens.mjs [--force] [--packets] [--family <fam>] [<id-substring> ...]'); process.exit(0); }
+  else if (a === '--help' || a === '-h') { console.log('bun fixtures/bake-scenario-goldens.mjs [--force] [--packets] [--frames] [--family <fam>] [<id-substring> ...]'); process.exit(0); }
   else if (a.startsWith('--')) { console.error(`unknown flag ${a}`); process.exit(1); }
   else opts.terms.push(a.trim());
 }
@@ -166,6 +179,98 @@ function packetsFor(assetId, mediaPath) {
   });
 }
 
+// ── Frame-digest PLACEHOLDER (browser-filled) ─────────────────────────────────────────────────────
+//
+// Families whose ROTATED real files are scored by a frame-digest golden (decoded-frames-bitexact /
+// ssim-psnr) or by seek-accuracy (which resolves its expected PTS from golden frames when no packet
+// golden is present). Only these get a `--frames` placeholder by default. Determined by inspecting the
+// built battery (src/scenarios/*) for video scenarios using those oracles AND cross-checking that the
+// family actually rotates onto real files (has REAL/DERIVED rows in _sources.ndjson):
+//   INCLUDED : decode-seek, transcode, remux, mux, metadata, performance
+//   EXCLUDED : encryption   → rotates to a METAMORPHIC oracle (media-selection.ts deriveEffective sets
+//                             invariant='decrypt-eq-cleartext-decode' + cleartextBaseAsset and DROPS
+//                             decrypt-bitexact); it decodes decrypt(x) vs the live cleartext BASE media,
+//                             consuming NO frame golden — a placeholder here would be fabricated noise.
+//   EXCLUDED : robustness (no REAL rows), streaming-output (baked-only, never rotates), and the
+//              audio-only / probe / demux families (no frame-digest oracle on a video track).
+// An explicit `--family <fam>` overrides this allowlist (honors operator intent).
+const FRAME_ORACLE_FAMILIES = new Set(['decode-seek', 'transcode', 'remux', 'mux', 'metadata', 'performance']);
+
+/** True iff the file carries a decodable video (or still-image) stream — mirrors frameHookFor's hasVideo. */
+function hasVideoStream(assetId, mediaPath) {
+  const inOpts = goldenInputOpts(assetId);
+  const probe = ffprobeJson([...inOpts, '-select_streams', 'v', '-show_entries', 'stream=codec_type', mediaPath], `${assetId} video-probe`);
+  return (probe.streams || []).some((s) => s.codec_type === 'video');
+}
+
+/** Resolve a frame's presentation time in seconds: best_effort_timestamp_time, else pts_time; null if neither. */
+function frameTimeSec(f) {
+  for (const k of ['best_effort_timestamp_time', 'pts_time']) {
+    const v = f[k];
+    if (v != null && v !== 'N/A') {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+/** How many presentation frames the golden lists (matches the flat corpus's 12-frame convention). */
+const FRAME_COUNT = 12;
+/**
+ * How many DECODE-order frames to read before selecting. `-read_intervals %+#N` reads the first N frames
+ * in DECODE (coded) order; for B-frame content the first FRAME_COUNT *presentation* frames can be spread
+ * across MORE than FRAME_COUNT decoded frames (a later-decoded B-frame carries an earlier PTS). Reading a
+ * generous multiple (past any realistic reorder depth), sorting by PTS, and taking the first FRAME_COUNT
+ * yields the true CONTIGUOUS first-FRAME_COUNT presentation frames — so golden[i].ptsUs === presentation
+ * frame i, which is REQUIRED: the browser pass fills golden[i] from the decoded frame AT golden[i].ptsUs
+ * and the oracle matches by that index. (The old `%+#12` grabbed 12 DECODE frames and, after sorting,
+ * DROPPED the reordered B-frame at the tail while KEEPING a later P-frame — a non-contiguous gap, e.g.
+ * [0…166667,200000] missing 183333 — which mislabels the tail golden entry.)
+ */
+const FRAME_READ_COUNT = 60;
+
+/**
+ * Build the `<id>.frames.json` PLACEHOLDER for a video-bearing real file — the SAME $todo/pending shape
+ * fixtures/bake.mjs `frameHookFor` emits for the flat corpus (so the browser pass + oracles read it
+ * byte-identically), with robustness refinements the nested corpus needs: (1) resolve each frame's time
+ * from best_effort_timestamp_time (falling back to pts_time) so VFR/edge frames that carry only a
+ * best-effort stamp are not dropped; (2) read FRAME_READ_COUNT decoded frames, sort into presentation
+ * (PTS) order, and take the first CONTIGUOUS FRAME_COUNT — never a decode-order gap (see FRAME_READ_COUNT).
+ * Never invents a digest: every sha256 is null and pending stays true until the platform pass.
+ */
+function framePlaceholderFor(assetId, mediaPath) {
+  let entries = [];
+  try {
+    const inOpts = goldenInputOpts(assetId);
+    const probe = ffprobeJson(
+      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${FRAME_READ_COUNT}`, mediaPath],
+      `${assetId} frames-hook`,
+    );
+    entries = (probe.frames || [])
+      .map((f) => {
+        const t = frameTimeSec(f);
+        return t == null ? null : { ptsUs: Math.round(t * 1e6), keyframe: f.key_frame === 1 || f.key_frame === '1' };
+      })
+      .filter((e) => e !== null)
+      .sort((a, b) => a.ptsUs - b.ptsUs)
+      .slice(0, FRAME_COUNT); // first CONTIGUOUS presentation frames (0..FRAME_COUNT-1)
+  } catch {
+    entries = [];
+  }
+  return {
+    $todo:
+      'BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer ' +
+      '(src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. ' +
+      'Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each ' +
+      'listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is ' +
+      'a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.',
+    pending: true,
+    assetId,
+    frames: entries.map((p, index) => ({ index, ptsUs: p.ptsUs, keyframe: p.keyframe, sha256: null })),
+  };
+}
+
 function writeJson(path, obj) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(obj, null, 2) + '\n');
@@ -192,8 +297,80 @@ function selected(row) {
   return true;
 }
 
+/** Is this family eligible for a --frames placeholder? An explicit --family always wins over the allowlist. */
+function frameFamilyEligible(fam) {
+  return opts.family ? true : FRAME_ORACLE_FAMILIES.has(fam);
+}
+
+// ── --frames mode: emit ffprobe frame PLACEHOLDERS (browser pass fills the digests) ─────────────────
+function bakeFramesMode(rows) {
+  let framesWritten = 0, skippedPresent = 0, skippedFilled = 0, audioSkipped = 0, familySkipped = 0, missing = 0, failed = 0;
+  const perFamily = {};
+  const failures = [];
+
+  for (const row of rows) {
+    const fam = row.scenarioId.split('/')[0];
+    if (!frameFamilyEligible(fam)) { familySkipped++; continue; }
+    for (const file of row.files) {
+      const assetId = `scenarios/${row.scenarioId}/${file.file}`;
+      const mediaPath = join(MEDIA_SCENARIOS, row.scenarioId, file.file);
+      if (!existsSync(mediaPath)) { missing++; continue; }
+
+      const framesPath = join(GOLDEN_DIR, `${assetId}.frames.json`);
+      const ssimPath = join(GOLDEN_DIR, `${assetId}.ssim.json`);
+      // Without --force, keep what's on disk (don't clobber browser digests, don't rewrite a pending
+      // placeholder). WITH --force, RESET: overwrite whatever is there (filled OR pending) — a forced
+      // re-placeholder is an explicit correctness reset (e.g. a golden baked from an unfaithful decode).
+      if (existsSync(framesPath) && !opts.force) {
+        let prevFilled = false;
+        try {
+          const prev = JSON.parse(readFileSync(framesPath, 'utf8'));
+          prevFilled = Array.isArray(prev.frames) && prev.frames.some((f) => f && f.sha256);
+        } catch { /* unparseable → treat as a stale placeholder we may rewrite under --force */ }
+        if (prevFilled) { skippedFilled++; continue; }
+        skippedPresent++; continue;
+      }
+
+      // Audio-only (no video/image stream) → no frame golden, exactly like frameHookFor returning null.
+      let hasVideo;
+      try {
+        hasVideo = hasVideoStream(assetId, mediaPath);
+      } catch (e) { failed++; failures.push(`${assetId} video-probe: ${e.message}`); continue; }
+      if (!hasVideo) { audioSkipped++; continue; }
+
+      try {
+        writeJson(framesPath, framePlaceholderFor(assetId, mediaPath));
+        // A fresh PENDING placeholder means "not yet baked" → any prior luma-signature side-file is now
+        // stale and MUST go: loadGolden reads ssim.json independently of the frames `pending` flag, so a
+        // lingering ssim.json would keep ssim-psnr scoring (a FAIL) instead of the honest NA the pending
+        // frames golden intends. Removing it makes decodeFrameGoldenGap (runner.ts) resolve to NA_ASSET.
+        rmSync(ssimPath, { force: true });
+        framesWritten++;
+        perFamily[fam] = (perFamily[fam] ?? 0) + 1;
+      } catch (e) { failed++; failures.push(`${assetId} frames: ${e.message}`); }
+    }
+  }
+
+  console.log(`\n═══ scenario real-file FRAME placeholders (browser pass fills digests) ═══`);
+  console.log(`  scenarios selected  : ${rows.length}${opts.family ? ` (family=${opts.family})` : ''}${opts.terms.length ? ` (terms=${opts.terms.join(',')})` : ''}`);
+  console.log(`  frames.json written : ${framesWritten}`);
+  for (const fam of Object.keys(perFamily).sort()) console.log(`      ${fam.padEnd(16)}: ${perFamily[fam]}`);
+  console.log(`  skipped (placeholder present): ${skippedPresent}`);
+  console.log(`  skipped (browser-filled kept): ${skippedFilled}`);
+  console.log(`  skipped (audio-only/no video): ${audioSkipped}`);
+  console.log(`  skipped (family not frame-oracle): ${familySkipped}`);
+  console.log(`  media missing/skip  : ${missing}`);
+  console.log(`  ffprobe failures    : ${failed}`);
+  for (const f of failures.slice(0, 20)) console.log(`    ✗ ${f}`);
+  if (failures.length > 20) console.log(`    … and ${failures.length - 20} more`);
+  console.log(`  NEXT: bun scripts/frame-bake.mjs --scenario-frames --browser chromium --headless --base-url http://localhost:5173`);
+  console.log(`═══════════════════════════════════`);
+}
+
 function main() {
   const rows = loadRows().filter(selected);
+  if (opts.frames) { bakeFramesMode(rows); return; }
+
   let metaWritten = 0, packetsWritten = 0, skipped = 0, missing = 0, failed = 0;
   const failures = [];
 

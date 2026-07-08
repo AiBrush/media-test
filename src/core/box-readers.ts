@@ -444,6 +444,8 @@ interface Element {
   bodyStart: number;
   /** exclusive end (clamped to parentEnd; unknown-size ⇒ parentEnd). */
   bodyEnd: number;
+  /** true when the size vint was Matroska "unknown size" (all data bits set). */
+  unknown: boolean;
 }
 
 function readElement(bytes: Uint8Array, pos: number, parentEnd: number): Element | null {
@@ -455,15 +457,19 @@ function readElement(bytes: Uint8Array, pos: number, parentEnd: number): Element
   if (bodyStart > parentEnd) return null;
   const bodyEnd = size.unknown ? parentEnd : Math.min(bodyStart + size.value, parentEnd);
   if (bodyEnd < bodyStart) return null;
-  return { id: id.value, bodyStart, bodyEnd };
+  return { id: id.value, bodyStart, bodyEnd, unknown: size.unknown };
 }
 
-/** Iterate the child elements of [start,end). Bounded; stops on malformed/non-advancing elements. */
-function ebmlChildren(bytes: Uint8Array, start: number, end: number): Element[] {
+/**
+ * Iterate the child elements of [start,end). Bounded; stops on malformed/non-advancing elements.
+ * `limit` caps the iteration count (default 8192, ample for structure elements); packet parsing over
+ * huge clusters passes a larger, byte-derived bound so a many-thousand-block cluster is not truncated.
+ */
+function ebmlChildren(bytes: Uint8Array, start: number, end: number, limit = 8192): Element[] {
   const out: Element[] = [];
   let pos = start;
   let guard = 0;
-  while (pos < end && guard++ < 8192) {
+  while (pos < end && guard++ < limit) {
     const el = readElement(bytes, pos, end);
     if (!el) break;
     out.push(el);
@@ -574,6 +580,411 @@ export function readWebmStructure(bytes: Uint8Array): ReadStructure | null {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Packet-table extraction (per-sample metadata) — no-engine, for the golden-packets comparator.
+//
+// Emits ONE row per coded sample/block, so an oracle can compare a candidate's OWN output packet table
+// against the baked ffprobe golden (fixtures/golden/**.packets.json) with NO scored/reference engine.
+// Same defensive contract as the structure readers: never throws, returns null (or bails to null) on
+// anything malformed/ambiguous, and NEVER fabricates a size or timestamp it cannot read faithfully.
+//
+//   trackIndex : moov `trak` order (MP4) / `Tracks` declaration order (EBML) == ffprobe stream_index.
+//   size       : coded sample bytes (MP4 stsz/stz2; EBML block payload after the block header).
+//   dtsUs/ptsUs: rounded µs. MP4 dts=Σstts, pts=dts+ctts, over the mdhd (media) timescale. EBML has no
+//                per-block DTS, so dts=pts=(clusterTC+relTC)·TimecodeScale/1000; a track whose block
+//                PTS is non-monotonic in file order carries B-frame reorder whose true DTS a byte
+//                reader cannot reconstruct → the whole parse bails to null (never a wrong table).
+//   keyframe   : MP4 stss (absent ⇒ all sync); EBML SimpleBlock flag 0x80 / BlockGroup no ReferenceBlock.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One demuxed packet's metadata. Structurally mirrors engine.ts `PacketInfo` on purpose (kept local so
+ * this browser-pure module takes no dependency on the engine contract). The oracle's shared comparator
+ * consumes this shape directly.
+ */
+export interface PacketRow {
+  trackIndex: number;
+  size: number;
+  ptsUs: number;
+  dtsUs: number;
+  keyframe: boolean;
+}
+
+/** Reject absurd sample/entry counts BEFORE allocating (a corrupt box could claim billions). */
+const MAX_SAMPLES = 50_000_000;
+
+// ── ISO-BMFF sample tables ──────────────────────────────────────────────────────────────────────
+
+/** mdhd → media timescale (NOT mvhd's movie timescale). Handles version 0/1. 0 when unreadable. */
+function parseMdhdTimescale(dv: DataView, box: Box): number {
+  const b = box.bodyStart;
+  if (b + 4 > box.end || b >= dv.byteLength) return 0;
+  const version = dv.getUint8(b);
+  // v0: version+flags(4) creation(4) modification(4) timescale(4); v1: …creation(8) modification(8) timescale(4)
+  return version === 1 ? u32(dv, b + 20) : u32(dv, b + 12);
+}
+
+/** stsz/stz2 → per-sample sizes in decode order. null when unreadable. */
+function parseSampleSizes(dv: DataView, box: Box): number[] | null {
+  const b = box.bodyStart;
+  if (box.type === 'stsz') {
+    if (b + 12 > box.end) return null;
+    const sampleSize = u32(dv, b + 4);
+    const count = u32(dv, b + 8);
+    if (count > MAX_SAMPLES) return null;
+    if (sampleSize !== 0) return new Array<number>(count).fill(sampleSize); // constant-size: no table follows
+    const sizes = new Array<number>(count);
+    let p = b + 12;
+    for (let i = 0; i < count; i++) {
+      if (p + 4 > box.end) return null;
+      sizes[i] = u32(dv, p);
+      p += 4;
+    }
+    return sizes;
+  }
+  // stz2: version+flags(4) reserved(3) field_size(1) sample_count(4) then packed sizes (4/8/16-bit).
+  if (box.type === 'stz2') {
+    if (b + 12 > box.end) return null;
+    const fieldSize = dv.getUint8(b + 7);
+    const count = u32(dv, b + 8);
+    if (count > MAX_SAMPLES) return null;
+    const sizes = new Array<number>(count);
+    const p = b + 12;
+    if (fieldSize === 16) {
+      for (let i = 0; i < count; i++) {
+        const off = p + i * 2;
+        if (off + 2 > box.end) return null;
+        sizes[i] = u16(dv, off);
+      }
+    } else if (fieldSize === 8) {
+      for (let i = 0; i < count; i++) {
+        const off = p + i;
+        if (off + 1 > box.end) return null;
+        sizes[i] = dv.getUint8(off);
+      }
+    } else if (fieldSize === 4) {
+      for (let i = 0; i < count; i++) {
+        const off = p + (i >> 1);
+        if (off + 1 > box.end) return null;
+        const byte = dv.getUint8(off);
+        sizes[i] = (i & 1) === 0 ? byte >> 4 : byte & 0x0f;
+      }
+    } else {
+      return null;
+    }
+    return sizes;
+  }
+  return null;
+}
+
+/** stts → per-sample cumulative DTS in timescale units (decode order). null when unreadable. */
+function parseSttsDts(dv: DataView, box: Box): number[] | null {
+  const b = box.bodyStart;
+  if (b + 8 > box.end) return null;
+  const entryCount = u32(dv, b + 4);
+  if (entryCount > MAX_SAMPLES) return null;
+  const dts: number[] = [];
+  let p = b + 8;
+  let t = 0;
+  for (let e = 0; e < entryCount; e++) {
+    if (p + 8 > box.end) break;
+    const cnt = u32(dv, p);
+    const delta = u32(dv, p + 4);
+    p += 8;
+    if (cnt > MAX_SAMPLES || dts.length + cnt > MAX_SAMPLES) return null;
+    for (let i = 0; i < cnt; i++) {
+      dts.push(t);
+      t += delta;
+    }
+  }
+  return dts;
+}
+
+/**
+ * ctts → per-sample composition offset in timescale units. version 1 is signed int32 by spec; version
+ * 0 is nominally uint32 but MOV/QuickTime (and thus ffmpeg/ffprobe, which bakes the golden) interpret it
+ * as SIGNED int32 — real files carry negative offsets like 0xFFFFFFD8 (=-40). We read signed for both so
+ * pts = dts + ctts matches ffprobe (a genuine >2^31 positive offset would be ~millions of seconds, so
+ * signed interpretation is safe across the corpus).
+ */
+function parseCttsOffsets(dv: DataView, box: Box): number[] | null {
+  const b = box.bodyStart;
+  if (b + 8 > box.end) return null;
+  const entryCount = u32(dv, b + 4);
+  if (entryCount > MAX_SAMPLES) return null;
+  const offs: number[] = [];
+  let p = b + 8;
+  for (let e = 0; e < entryCount; e++) {
+    if (p + 8 > box.end) break;
+    const cnt = u32(dv, p);
+    const off = dv.getInt32(p + 4);
+    p += 8;
+    if (cnt > MAX_SAMPLES || offs.length + cnt > MAX_SAMPLES) return null;
+    for (let i = 0; i < cnt; i++) offs.push(off);
+  }
+  return offs;
+}
+
+/** stss → set of 1-based sync (keyframe) sample numbers. null when unreadable. */
+function parseStssSet(dv: DataView, box: Box): Set<number> | null {
+  const b = box.bodyStart;
+  if (b + 8 > box.end) return null;
+  const entryCount = u32(dv, b + 4);
+  if (entryCount > MAX_SAMPLES) return null;
+  const set = new Set<number>();
+  let p = b + 8;
+  for (let e = 0; e < entryCount; e++) {
+    if (p + 4 > box.end) break;
+    set.add(u32(dv, p));
+    p += 4;
+  }
+  return set;
+}
+
+/**
+ * Emit one PacketRow per sample for a single `trak`. Returns false to signal a FATAL parse problem (the
+ * caller then bails the whole file to null — an incomplete packet table would mis-compare vs golden).
+ * A trak with no media/sample table simply emits nothing and returns true.
+ */
+function parseTrakPackets(
+  bytes: Uint8Array,
+  dv: DataView,
+  trak: Box,
+  trackIndex: number,
+  out: PacketRow[],
+): boolean {
+  const trakChildren = readBoxes(bytes, dv, trak.bodyStart, trak.end);
+  const mdia = findBox(trakChildren, 'mdia');
+  if (!mdia) return true;
+  const mdiaChildren = readBoxes(bytes, dv, mdia.bodyStart, mdia.end);
+  const mdhd = findBox(mdiaChildren, 'mdhd');
+  const timescale = mdhd ? parseMdhdTimescale(dv, mdhd) : 0;
+  const minf = findBox(mdiaChildren, 'minf');
+  if (!minf) return true;
+  const stbl = findBox(readBoxes(bytes, dv, minf.bodyStart, minf.end), 'stbl');
+  if (!stbl) return true;
+  const stblChildren = readBoxes(bytes, dv, stbl.bodyStart, stbl.end);
+  const stszBox = findBox(stblChildren, 'stsz') ?? findBox(stblChildren, 'stz2');
+  if (!stszBox) return true; // no sample sizes → no packets for this trak
+  const sizes = parseSampleSizes(dv, stszBox);
+  if (!sizes) return false;
+  const n = sizes.length;
+  if (n === 0) return true; // e.g. a fragmented moov (samples live in moof) — handled by the caller
+  if (!timescale || timescale <= 0) return false; // cannot express timestamps → fatal
+
+  const sttsBox = findBox(stblChildren, 'stts');
+  const dts = sttsBox ? parseSttsDts(dv, sttsBox) : null;
+  if (!dts || dts.length < n) return false;
+  const cttsBox = findBox(stblChildren, 'ctts');
+  const cts = cttsBox ? parseCttsOffsets(dv, cttsBox) : null;
+  if (cttsBox && (!cts || cts.length < n)) return false;
+  const stssBox = findBox(stblChildren, 'stss');
+  const syncSet = stssBox ? parseStssSet(dv, stssBox) : null;
+  if (stssBox && !syncSet) return false;
+
+  for (let i = 0; i < n; i++) {
+    const d = dts[i]!;
+    const c = cts ? (cts[i] ?? 0) : 0;
+    out.push({
+      trackIndex,
+      size: sizes[i]!,
+      dtsUs: Math.round((d / timescale) * 1e6),
+      ptsUs: Math.round(((d + c) / timescale) * 1e6),
+      keyframe: syncSet ? syncSet.has(i + 1) : true, // absent stss ⇒ every sample is a sync sample
+    });
+  }
+  return true;
+}
+
+/**
+ * Parse ISO-BMFF (MP4/MOV/M4A) → per-sample packet table from the moov sample tables. Returns null when
+ * not parseable, or when the file is FRAGMENTED (mvex/moof) — those carry their samples in movie
+ * fragments this sample-table reader deliberately does not decode, so it honestly returns null (the
+ * oracle then routes to NA) rather than emit an empty/partial table. Never throws.
+ */
+export function readMp4Packets(bytes: Uint8Array): PacketRow[] | null {
+  try {
+    if (!bytes || bytes.length < 8) return null;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const top = readBoxes(bytes, dv, 0, bytes.length);
+    const moov = findBox(top, 'moov');
+    if (!moov) return null;
+    if (findBox(top, 'moof')) return null; // fragmented: samples in movie fragments, not moov stbl
+    const moovChildren = readBoxes(bytes, dv, moov.bodyStart, moov.end);
+    if (findBox(moovChildren, 'mvex')) return null; // declares fragmentation → moov stbl is empty
+
+    const out: PacketRow[] = [];
+    let trackIndex = 0;
+    let sawTrak = false;
+    for (const child of moovChildren) {
+      if (child.type !== 'trak') continue;
+      sawTrak = true;
+      if (!parseTrakPackets(bytes, dv, child, trackIndex, out)) return null;
+      trackIndex++;
+    }
+    if (!sawTrak) return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// ── EBML block tables ─────────────────────────────────────────────────────────────────────────────
+
+const EBML_BLOCK = {
+  Timecode: 0xe7,
+  SimpleBlock: 0xa3,
+  BlockGroup: 0xa0,
+  Block: 0xa1,
+  ReferenceBlock: 0xfb,
+  TrackNumber: 0xd7,
+} as const;
+
+/**
+ * Parse a SimpleBlock/Block header at [start,end) → one PacketRow. Returns:
+ *   PacketRow  — a laced-free block for a mapped track,
+ *   null       — FATAL (malformed header, or LACING which this reader will not fabricate) → bail file,
+ *   undefined  — SKIP (block for a track absent from the Tracks map; defensive, not fatal).
+ * `keyframe` comes from the SimpleBlock flag byte, or (BlockGroup) the caller's ReferenceBlock check.
+ */
+function parseEbmlBlock(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  clusterTc: number,
+  timecodeScale: number,
+  trackIndexByNumber: Map<number, number>,
+  keyframeFromFlags: boolean,
+  keyframeOverride: boolean,
+): PacketRow | null | undefined {
+  const tn = readVint(bytes, start, end, false);
+  if (!tn) return null;
+  let p = start + tn.length;
+  if (p + 3 > end) return null; // need int16 rel timecode + 1 flag byte
+  const relRaw = (u8(bytes, p) << 8) | u8(bytes, p + 1);
+  const rel = relRaw >= 0x8000 ? relRaw - 0x10000 : relRaw; // signed int16
+  p += 2;
+  const flags = u8(bytes, p);
+  p += 1;
+  if (((flags >> 1) & 0x03) !== 0) return null; // lacing present → bail (never fabricate laced sizes/ts)
+  const trackIndex = trackIndexByNumber.get(tn.value);
+  if (trackIndex === undefined) return undefined; // block for an undeclared track → skip
+  const size = Math.max(0, end - p); // remaining block payload = the single (unlaced) frame
+  const ptsUs = Math.round(((clusterTc + rel) * timecodeScale) / 1000); // TimecodeScale is ns → µs
+  return {
+    trackIndex,
+    size,
+    ptsUs,
+    dtsUs: ptsUs,
+    keyframe: keyframeFromFlags ? (flags & 0x80) !== 0 : keyframeOverride,
+  };
+}
+
+/**
+ * Parse WebM/MKV → per-block packet table (Segment → Cluster* → SimpleBlock/BlockGroup). Returns null
+ * when not parseable, on an unknown-size cluster, on lacing, or on B-frame reorder (a track whose block
+ * PTS is non-monotonic in file order — this reader carries no separate DTS and will not fabricate one).
+ * Never throws.
+ */
+export function readWebmPackets(bytes: Uint8Array): PacketRow[] | null {
+  try {
+    if (!bytes || bytes.length < 8) return null;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const topLevel = ebmlChildren(bytes, 0, bytes.length);
+    const segment = topLevel.find((el) => el.id === EBML_ID.Segment);
+    if (!segment) return null;
+    const bound = segment.bodyEnd - segment.bodyStart; // upper bound on element count within the segment
+    const segChildren = ebmlChildren(bytes, segment.bodyStart, segment.bodyEnd, bound);
+
+    // TimecodeScale (ns), default 1e6.
+    let timecodeScale = 1_000_000;
+    const info = segChildren.find((el) => el.id === EBML_ID.Info);
+    if (info) {
+      for (const el of ebmlChildren(bytes, info.bodyStart, info.bodyEnd)) {
+        if (el.id === EBML_ID.TimecodeScale) {
+          const v = ebmlUint(dv, el);
+          if (v > 0) timecodeScale = v;
+        }
+      }
+    }
+
+    // TrackNumber → 0-based declaration-order index (== ffprobe stream_index). Also record which
+    // declaration indices are AUDIO: ffmpeg/ffprobe flags every audio packet as a keyframe regardless
+    // of the block's own flag (audio frames are independently decodable), so we mirror that below.
+    const tracksEl = segChildren.find((el) => el.id === EBML_ID.Tracks);
+    if (!tracksEl) return null;
+    const trackIndexByNumber = new Map<number, number>();
+    const audioTrackIndices = new Set<number>();
+    let decl = 0;
+    for (const te of ebmlChildren(bytes, tracksEl.bodyStart, tracksEl.bodyEnd)) {
+      if (te.id !== EBML_ID.TrackEntry) continue;
+      let tn = -1;
+      let trackType = -1;
+      for (const c of ebmlChildren(bytes, te.bodyStart, te.bodyEnd)) {
+        if (c.id === EBML_BLOCK.TrackNumber) tn = ebmlUint(dv, c);
+        else if (c.id === EBML_ID.TrackType) trackType = ebmlUint(dv, c);
+      }
+      if (tn >= 0) trackIndexByNumber.set(tn, decl);
+      if (trackType === 2) audioTrackIndices.add(decl); // Matroska TrackType 2 = audio
+      decl++;
+    }
+    if (trackIndexByNumber.size === 0) return null;
+
+    const out: PacketRow[] = [];
+    for (const cluster of segChildren) {
+      if (cluster.id !== EBML_ID.Cluster) continue;
+      if (cluster.unknown) return null; // unknown-size cluster: cannot bound blocks safely → bail
+      const clusterBound = cluster.bodyEnd - cluster.bodyStart;
+      const clusterChildren = ebmlChildren(bytes, cluster.bodyStart, cluster.bodyEnd, clusterBound);
+      let clusterTc = 0;
+      let sawTc = false;
+      for (const c of clusterChildren) {
+        if (c.id === EBML_BLOCK.Timecode) {
+          clusterTc = ebmlUint(dv, c);
+          sawTc = true;
+          break;
+        }
+      }
+      if (!sawTc) return null; // a cluster without a Timecode cannot place its blocks
+      for (const c of clusterChildren) {
+        if (c.id === EBML_BLOCK.SimpleBlock) {
+          const row = parseEbmlBlock(bytes, c.bodyStart, c.bodyEnd, clusterTc, timecodeScale, trackIndexByNumber, true, false);
+          if (row === null) return null;
+          if (row) {
+            if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
+            out.push(row);
+          }
+        } else if (c.id === EBML_BLOCK.BlockGroup) {
+          const groupChildren = ebmlChildren(bytes, c.bodyStart, c.bodyEnd);
+          const blockEl = groupChildren.find((g) => g.id === EBML_BLOCK.Block);
+          if (!blockEl) continue;
+          const hasRef = groupChildren.some((g) => g.id === EBML_BLOCK.ReferenceBlock);
+          const row = parseEbmlBlock(bytes, blockEl.bodyStart, blockEl.bodyEnd, clusterTc, timecodeScale, trackIndexByNumber, false, !hasRef);
+          if (row === null) return null;
+          if (row) {
+            if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
+            out.push(row);
+          }
+        }
+      }
+    }
+
+    // B-frame reorder guard: with dts=pts, each track's PTS must be non-decreasing in file (decode)
+    // order. A decrease means presentation≠decode order (reorder), whose true DTS a container-only
+    // reader cannot reconstruct → bail rather than emit a table that mis-sorts against the golden.
+    const lastByTrack = new Map<number, number>();
+    for (const row of out) {
+      const prev = lastByTrack.get(row.trackIndex);
+      if (prev !== undefined && row.ptsUs < prev) return null;
+      lastByTrack.set(row.trackIndex, row.ptsUs);
+    }
+
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Dispatcher.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -614,6 +1025,34 @@ export function readOutputStructure(bytes: Uint8Array, containerHint?: string): 
 
     // Ambiguous header — try both; whichever parses wins (mp4 first, it's the common output).
     return readMp4Structure(bytes) ?? readWebmStructure(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sniff the header / `containerHint` and dispatch to the matching packet-table reader (same routing as
+ * readOutputStructure). Returns `PacketRow[]` on a faithful parse, or null when the container is outside
+ * mp4/webm coverage OR the parse bails (fragmented mp4, unknown-size cluster, lacing, B-frame reorder,
+ * truncation). Never throws. A null result means "packet truth unavailable" — the oracle routes to NA.
+ */
+export function readOutputPackets(bytes: Uint8Array, containerHint?: string): PacketRow[] | null {
+  try {
+    if (!bytes || bytes.length < 8) return null;
+
+    if (containerHint) {
+      const h = containerHint.toLowerCase();
+      if (/webm|mkv|matroska/.test(h)) return readWebmPackets(bytes);
+      if (/mp4|mov|m4a|m4v|m4b|quicktime|\bqt\b|isom|iso-?bmff|3gp|mpeg-?4/.test(h)) {
+        return readMp4Packets(bytes);
+      }
+    }
+
+    if (looksEbml(bytes)) return readWebmPackets(bytes);
+    if (looksIsoBmff(bytes)) return readMp4Packets(bytes);
+
+    // Ambiguous header — try both; whichever parses wins (mp4 first, it's the common output).
+    return readMp4Packets(bytes) ?? readWebmPackets(bytes);
   } catch {
     return null;
   }

@@ -29,6 +29,9 @@ import {
   readOutputStructure,
   readMp4Structure,
   readWebmStructure,
+  readOutputPackets,
+  readMp4Packets,
+  readWebmPackets,
   canonicalCodecToken,
 } from '../src/core/box-readers.ts';
 
@@ -472,18 +475,237 @@ function section4() {
   let ok = 0;
   for (let i = 0; i < cases.length; i++) {
     try {
-      const a = readOutputStructure(cases[i]);
-      const b = readMp4Structure(cases[i]);
-      const c = readWebmStructure(cases[i]);
-      void a;
-      void b;
-      void c;
+      // structure readers
+      void readOutputStructure(cases[i]);
+      void readMp4Structure(cases[i]);
+      void readWebmStructure(cases[i]);
+      // packet readers (the oracle calls these on arbitrary engine output — must never throw)
+      void readOutputPackets(cases[i]);
+      void readOutputPackets(cases[i], 'mp4');
+      void readOutputPackets(cases[i], 'webm');
+      void readMp4Packets(cases[i]);
+      void readWebmPackets(cases[i]);
       ok++;
     } catch (e) {
       mismatch('4', `fuzz#${i}`, `THREW: ${e?.message || e}`);
     }
   }
-  console.log(`    ok — ${ok}/${cases.length} inputs handled without throwing`);
+  console.log(`    ok — ${ok}/${cases.length} inputs handled without throwing (structure + packet readers)`);
+}
+
+// ── section [5]: packet-table parity vs baked ffprobe *.packets.json ───────────────────────────────
+//
+// The decisive proof for readOutputPackets: for every baked ffprobe packet golden whose media file is
+// on disk AND is an mp4/webm-family container (the only families this reader covers), parse the real
+// bytes and assert the packet table matches golden under the SAME comparator the oracle uses — per
+// track: exact count, exact sizes, exact keyframe flags, and pts/dts within 1ms AFTER a constant
+// per-track origin alignment. A null parse (fragmented mp4, unknown-size cluster, lacing, B-frame MKV
+// reorder) is a documented BAIL (honest NA in the oracle), reported separately — never a fabricated
+// table. Only a NON-null parse that diverges from golden is a MISMATCH (a real parser bug).
+
+const PACKET_TS_TOL_US = 1000; // mirrors oracles.ts DEFAULT_TOLERANCES.seekToleranceUs
+
+/** Group packets by trackIndex and sort each group by (dts,pts) — the oracle's order-independent view. */
+function groupByTrack(pkts) {
+  const m = new Map();
+  for (const p of pkts) {
+    const g = m.get(p.trackIndex);
+    if (g) g.push(p);
+    else m.set(p.trackIndex, [p]);
+  }
+  for (const g of m.values()) g.sort((x, y) => x.dtsUs - y.dtsUs || x.ptsUs - y.ptsUs);
+  return m;
+}
+
+/**
+ * Compare a parsed table to golden and CLASSIFY the outcome. Applies the same order-independent,
+ * per-track, origin-aligned logic as oracles.ts comparePacketTables (exact size/keyframe, pts/dts
+ * within tolUs after a constant per-track offset), then labels the result so the two GENUINE ffprobe
+ * conventions a CONTAINER-ONLY reader legitimately cannot mirror are documented (not silently passed,
+ * not falsely failed):
+ *   - 'keyframe-superset'  : counts+sizes+timestamps all match; the ONLY diffs are golden=keyframe /
+ *                            mine=not. ffprobe's H.264 parser flags non-IDR (open-GOP) I-frames the
+ *                            container stss omits — my reader faithfully reports the stss (a subset).
+ *   - 'edit-trailing-trim' : golden is an exact per-track PREFIX of mine; I carry a few extra TRAILING
+ *                            samples ffmpeg drops per the edit-list presentation duration.
+ * Anything else (missing packets, size/timestamp divergence, or a keyframe I assert that golden does
+ * NOT) is a hard 'mismatch' — a real parser bug. Conservative on purpose: a convention is claimed ONLY
+ * when the overlap is otherwise byte-clean, so a genuine defect can never hide inside a convention label.
+ */
+function classifyPackets(got, want, tolUs) {
+  const gb = groupByTrack(got), wb = groupByTrack(want);
+  const allTracks = new Set([...gb.keys(), ...wb.keys()]);
+  let worst = 'match';
+  const reasons = [];
+  const rank = { match: 0, 'keyframe-superset': 1, 'edit-trailing-trim': 1, mismatch: 2 };
+  const bump = (kind, why) => {
+    if (why) reasons.push(why);
+    if (rank[kind] > rank[worst]) worst = kind;
+    // two DIFFERENT convention labels on different tracks → still a documented convention, but note both
+    else if (rank[kind] === 1 && rank[worst] === 1 && worst !== kind) worst = 'convention-mixed';
+  };
+  for (const ti of allTracks) {
+    const gt = gb.get(ti) ?? [], wt = wb.get(ti) ?? [];
+    const nG = gt.length, nW = wt.length;
+    if (nG === 0 || nW === 0) { bump('mismatch', `track ${ti}: one side empty (${nG} vs ${nW})`); continue; }
+    const ptsOff = gt[0].ptsUs - wt[0].ptsUs;
+    const dtsOff = gt[0].dtsUs - wt[0].dtsUs;
+    const m = Math.min(nG, nW);
+    let sizeMis = 0, kfGoldTrue = 0, kfMineTrue = 0, ptsDrift = 0, dtsDrift = 0, maxDrift = 0;
+    for (let i = 0; i < m; i++) {
+      if (gt[i].size !== wt[i].size) sizeMis++;
+      if (!!gt[i].keyframe !== !!wt[i].keyframe) { if (wt[i].keyframe) kfGoldTrue++; else kfMineTrue++; }
+      const pr = Math.abs(gt[i].ptsUs - wt[i].ptsUs - ptsOff);
+      const dr = Math.abs(gt[i].dtsUs - wt[i].dtsUs - dtsOff);
+      if (pr > maxDrift) maxDrift = pr;
+      if (pr > tolUs) ptsDrift++;
+      if (dr > tolUs) dtsDrift++;
+    }
+    const hardOverlap = sizeMis > 0 || ptsDrift > 0 || dtsDrift > 0 || kfMineTrue > 0;
+    if (hardOverlap) {
+      const parts = [];
+      if (sizeMis) parts.push(`${sizeMis} size`);
+      if (ptsDrift) parts.push(`${ptsDrift} pts-drift(max ${maxDrift}µs)`);
+      if (dtsDrift) parts.push(`${dtsDrift} dts-drift`);
+      if (kfMineTrue) parts.push(`${kfMineTrue} keyframe I assert but golden does not`);
+      bump('mismatch', `track ${ti}: ${parts.join(', ')}`);
+      continue;
+    }
+    // Overlap is byte-clean apart from possible golden-only keyframes.
+    if (nG === nW) {
+      if (kfGoldTrue) bump('keyframe-superset', `track ${ti}: +${kfGoldTrue} ffprobe bitstream keyframe(s) beyond container stss`);
+      else bump('match');
+    } else if (nG > nW && kfGoldTrue === 0) {
+      bump('edit-trailing-trim', `track ${ti}: +${nG - nW} trailing sample(s) trimmed by ffmpeg edit-list duration`);
+    } else if (nG < nW) {
+      bump('mismatch', `track ${ti}: missing ${nW - nG} packet(s) vs golden`);
+    } else {
+      bump('mismatch', `track ${ti}: count ${nG} vs ${nW} with ${kfGoldTrue} keyframe delta`);
+    }
+  }
+  const convention = worst !== 'match' && worst !== 'mismatch';
+  return { kind: worst, convention, ok: worst === 'match', reasons };
+}
+
+/**
+ * Parse an on-disk media file's packet table. MP4 packets live in the moov sample tables (front for
+ * faststart, tail otherwise) so a bounded head + tail-moov read suffices and avoids loading a multi-GB
+ * mdat. WebM/MKV packets live in Clusters spread across the WHOLE file, so we must read it in full
+ * (capped so the harness never OOMs on an absurd fixture — such a file is reported as skipped).
+ */
+const WEBM_FULL_READ_CAP = 800 * 1024 * 1024;
+function parsePacketsFile(file, size, family) {
+  if (family === 'webm') {
+    if (size > WEBM_FULL_READ_CAP) return { tooLarge: true };
+    const all = readSlice(file, 0, size);
+    return readOutputPackets(all, family);
+  }
+  const head = readSlice(file, 0, Math.min(size, HEAD_CAP));
+  let res = readOutputPackets(head, family);
+  if (family === 'mp4' && res == null && size > HEAD_CAP) {
+    const tail = readSlice(file, Math.max(0, size - TAIL_CAP), Math.min(size, TAIL_CAP));
+    const moovAt = findLastMoov(tail);
+    if (moovAt >= 0) res = readOutputPackets(tail.subarray(moovAt), family);
+  }
+  return res;
+}
+
+/** Recursively collect every *.packets.json under fixtures/golden. */
+function findPacketGoldens(dir, acc = []) {
+  if (!fs.existsSync(dir)) return acc;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) findPacketGoldens(p, acc);
+    else if (e.name.endsWith('.packets.json')) acc.push(p);
+  }
+  return acc;
+}
+
+function readPacketsJson(file) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const arr = Array.isArray(j) ? j : Array.isArray(j.packets) ? j.packets : null;
+    if (!arr) return null;
+    return arr.map((p) => ({
+      trackIndex: Number(p.trackIndex) || 0,
+      size: Number(p.size) || 0,
+      ptsUs: Number(p.ptsUs) || 0,
+      dtsUs: Number(p.dtsUs ?? p.ptsUs) || 0,
+      keyframe: !!p.keyframe,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function section5() {
+  console.log('\n[5] Packet-table parity vs baked ffprobe *.packets.json (readOutputPackets)');
+  const goldens = findPacketGoldens(GOLDEN);
+  if (goldens.length === 0) {
+    console.log('    SKIPPED — no *.packets.json goldens found.');
+    return { attempted: 0, matched: 0, mismatched: 0, bailed: 0 };
+  }
+  let attempted = 0, matched = 0, mismatched = 0, bailed = 0, noMedia = 0, notCovered = 0, emptyGolden = 0, convention = 0;
+  const bailReasons = [];
+  const conventionNotes = [];
+  const byFamily = {};
+  for (const gpath of goldens) {
+    // golden path → media path (fixtures/golden/… → fixtures/media/…, strip .packets.json).
+    const rel = path.relative(GOLDEN, gpath).replace(/\.packets\.json$/, '');
+    const media = path.join(MEDIA, rel);
+    const ext = (rel.match(/\.([a-z0-9]+)$/i) || [])[1] || '';
+    const family = containerFamily(ext);
+    if (family !== 'mp4' && family !== 'webm') { notCovered++; continue; } // audio-only/ts/hls: out of packet-reader scope
+    if (!fs.existsSync(media)) { noMedia++; continue; }
+    const want = readPacketsJson(gpath);
+    if (!want || want.length === 0) { emptyGolden++; continue; }
+
+    const size = fs.statSync(media).size;
+    let got;
+    try {
+      got = parsePacketsFile(media, size, family);
+    } catch (e) {
+      attempted++;
+      mismatch('5', rel, `readOutputPackets THREW: ${e?.message || e}`);
+      mismatched++;
+      continue;
+    }
+    if (got && got.tooLarge) { noMedia++; continue; } // fixture too large to fully read in the harness
+    attempted++;
+    if (got == null) {
+      bailed++;
+      if (bailReasons.length < 30) bailReasons.push(`${family}:${rel}`);
+      continue;
+    }
+    const cls = classifyPackets(got, want, PACKET_TS_TOL_US);
+    if (cls.ok) {
+      matched++;
+      byFamily[family] = (byFamily[family] || 0) + 1;
+    } else if (cls.convention) {
+      convention++;
+      if (conventionNotes.length < 20) conventionNotes.push(`${cls.kind} — ${rel}: ${cls.reasons.join('; ')}`);
+    } else {
+      mismatch('5', rel, `packet table diverges — ${cls.reasons.join('; ')} [got ${got.length}, golden ${want.length}]`);
+      mismatched++;
+    }
+  }
+  console.log(`    attempted (mp4/webm w/ media+golden): ${attempted}`);
+  console.log(`    exact match: ${matched} ${JSON.stringify(byFamily)}`);
+  console.log(`    documented ffprobe conventions (container reader faithful, not a bug): ${convention}`);
+  console.log(`    bailed→null (fragmented/reorder/lacing/unknown-cluster — honest NA): ${bailed}`);
+  console.log(`    HARD mismatches (real parser bugs): ${mismatched}`);
+  console.log(`    (skipped: ${notCovered} non-mp4/webm goldens, ${noMedia} without on-disk media, ${emptyGolden} empty golden)`);
+  if (convention) {
+    console.log(`    convention detail (ffprobe bitstream-keyframe superset / edit-list trailing trim):`);
+    for (const c of conventionNotes) console.log(`      · ${c}`);
+    if (convention > conventionNotes.length) console.log(`      · … and ${convention - conventionNotes.length} more`);
+  }
+  if (bailed) {
+    console.log(`    bail sample (honest NA in the oracle — never a fabricated table):`);
+    for (const b of bailReasons.slice(0, 12)) console.log(`      · ${b}`);
+    if (bailed > 12) console.log(`      · … and ${bailed - 12} more`);
+  }
+  return { attempted, matched, mismatched, bailed, convention };
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────────────────────────
@@ -492,6 +714,7 @@ const s1 = section1();
 const s2 = section2();
 section3();
 section4();
+const s5 = section5();
 
 console.log('\n────────────────────────────────────────────────────────');
 if (s1.skipped && s2.tested === 0) {
@@ -500,6 +723,9 @@ if (s1.skipped && s2.tested === 0) {
 } else {
   console.log(`on-disk parity: [1] ${s1.tested} corpus file(s), [2] ${s2.tested} canonical asset(s)`);
 }
+console.log(
+  `packet-table parity [5]: ${s5.attempted} attempted → ${s5.matched} exact, ${s5.convention} documented-convention, ${s5.bailed} bailed→null, ${s5.mismatched} HARD mismatch`,
+);
 if (hardFail === 0) {
   console.log('RESULT: ALL CHECKS PASSED — 0 mismatches. Reader codec tokens are golden-parity safe.');
   process.exit(0);

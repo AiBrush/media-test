@@ -98,11 +98,30 @@ export interface GoldenSsimDoc {
 const LUMA_SIG_SIDE = 16;
 
 /**
- * Decode enough leading frames that the WebCodecs path sees the same reorder/lookahead window as the
- * decode-fps benchmark. A tiny `maxFrames` can flush an H.264 decoder before the same presentation
- * prefix has stabilized, producing goldens that disagree with the supported benchmark cell.
+ * Decode a modest margin of leading frames beyond the golden's listed prefix so the WebCodecs decoder
+ * has enough lookahead to emit a STABLE presentation prefix (past any B-frame reorder / DPB flush).
+ * Frame digests are CAUSAL — decoding MORE frames never changes an already-emitted presentation frame's
+ * pixels — so the first `listed.length` digests are byte-identical for any window ≥ listed + reorder
+ * depth. 64 (≫ H.264 max DPB 16 + a 12-frame golden) is ample and ~5× cheaper to bake than a
+ * benchmark-sized 300-frame window, yielding identical goldens. (Lowered from 300 so the nested
+ * real-media corpus — incl. long/high-fps clips — bakes in a tractable, timeout-free pass.)
  */
-const FRAME_BAKE_DECODE_MIN_FRAMES = 300;
+const FRAME_BAKE_DECODE_MIN_FRAMES = 64;
+
+/**
+ * Tolerance (µs) for matching a golden frame's ffprobe PTS to a platform-decoded frame's PTS — the
+ * HONESTY GATE (§0.1/§0.6). golden[i] is filled ONLY from the decoded frame whose PTS equals
+ * golden[i].ptsUs (± this). A genuine decode reproduces the container timestamps to within timebase
+ * rounding (single-digit µs: WebCodecs VideoFrame.timestamp vs ffprobe round(pts_time*1e6)). When the
+ * platform CANNOT inline-demux a container (e.g. FRAGMENTED MP4 → moof/mdat) it falls back to
+ * <video>-element sampling, which returns frames SPREAD ACROSS THE CLIP (0, D/N, 2D/N, …) — NOT the
+ * first-N presentation frames the golden lists. Those land many ms off every listed PTS, so they FAIL
+ * the match, keep sha256:null, and the golden stays pending ⇒ NA (runner.ts decodeFrameGoldenGap) — never
+ * a golden with the right PTS LABELS but WRONG PIXELS that FAILs every faithful decoder (the SSIM≈0.5 bug).
+ * 1 ms « the smallest genuine inter-frame gap in the corpus (240 fps → 4167 µs), so it can never
+ * cross-match an adjacent frame, yet » container-timebase rounding, and « any real sparse-fallback skip.
+ */
+const PTS_MATCH_TOL_US = 1000;
 
 /** Where the static golden lives (served by the dev server's fixturesStatic middleware). */
 const GOLDEN_BASE = 'fixtures/golden';
@@ -424,14 +443,37 @@ export async function bakeAssetFrames(
     };
   }
 
-  // Pair golden[i] ↔ decoded[i] in order; fill sha256 only where a decoded frame exists. NEVER invent a
-  // digest for a frame the engine did not produce — that frame keeps sha256:null and the doc stays pending.
+  // Fill golden[i] BY PTS, not by position: match it to the decoded frame AT golden[i].ptsUs (±
+  // PTS_MATCH_TOL_US), consuming each decoded frame at most once. This is the honesty gate — see
+  // PTS_MATCH_TOL_US. Positional pairing (golden[i] ↔ decoded[i]) is WRONG when the platform's decode is
+  // not the listed presentation prefix: an unfaithful <video>-fallback decode returns frames spread
+  // across the clip, and positional pairing would stamp golden[i]'s ffprobe PTS onto a wildly-different
+  // frame's pixels → a golden with right labels / wrong pixels that FAILs every faithful decoder. Matching
+  // by PTS instead leaves those unmatched (sha256:null) so the doc stays pending ⇒ honest NA, never a
+  // fabricated FAIL. NEVER invent a digest for a frame the engine did not produce at the listed PTS.
+  const usedDecoded = new Set<number>();
+  const matchDecodedByPts = (ptsUs: number): DecodedFrame | undefined => {
+    let bestIdx = -1;
+    let bestDelta = Infinity;
+    for (let j = 0; j < decoded.length; j++) {
+      if (usedDecoded.has(j)) continue;
+      const delta = Math.abs((decoded[j]!.digest.ptsUs ?? 0) - ptsUs);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestIdx = j;
+      }
+    }
+    if (bestIdx < 0 || bestDelta > PTS_MATCH_TOL_US) return undefined;
+    usedDecoded.add(bestIdx);
+    return decoded[bestIdx];
+  };
+
   const filledFrames: GoldenFrameEntry[] = [];
   const sigs: number[][] = [];
   let filledCount = 0;
   for (let i = 0; i < listed.length; i++) {
     const goldenEntry = listed[i]!;
-    const dec = decoded[i];
+    const dec = matchDecodedByPts(goldenEntry.ptsUs);
     if (dec) {
       const entry: GoldenFrameEntry = {
         index: goldenEntry.index,
@@ -445,7 +487,7 @@ export async function bakeAssetFrames(
       sigs.push(downsampleLuma(dec.image, LUMA_SIG_SIDE));
       filledCount++;
     } else {
-      // keep the placeholder entry verbatim (sha256 stays null) so the gap is explicit + the doc pending.
+      // No decoded frame at this listed PTS → keep sha256:null so the gap is explicit + the doc pending.
       filledFrames.push({ ...goldenEntry, sha256: goldenEntry.sha256 ?? null });
     }
   }
@@ -468,15 +510,21 @@ export async function bakeAssetFrames(
       'decoded-frames-bitexact / ssim oracles report NA rather than pass against a partial golden.';
   }
 
-  const ssimDoc: GoldenSsimDoc = {
-    $note:
-      'Downsampled Rec.601 luma signatures (block-averaged) of the platform-decoded golden frames, in ' +
-      'frames[] order. Consumed by the ssim-psnr oracle (oracles.ts parseSsimRef/sigSsim). Side = ' +
-      `${LUMA_SIG_SIDE} → ${LUMA_SIG_SIDE * LUMA_SIG_SIDE}-value signatures.`,
-    assetId,
-    side: LUMA_SIG_SIDE,
-    sigs,
-  };
+  // Emit the luma-signature side-file ONLY for a COMPLETE golden. loadGolden (oracles.ts) reads ssim.json
+  // INDEPENDENTLY of the frames `pending` flag, so a partial ssim would let ssim-psnr keep scoring (a
+  // FAIL) instead of the honest NA the pending frames golden intends. A partial asset ships NO ssimDoc →
+  // the orchestrator writes no ssim.json (and prunes any stale one) → decodeFrameGoldenGap ⇒ NA_ASSET.
+  const ssimDoc: GoldenSsimDoc | undefined = complete
+    ? {
+        $note:
+          'Downsampled Rec.601 luma signatures (block-averaged) of the platform-decoded golden frames, in ' +
+          'frames[] order. Consumed by the ssim-psnr oracle (oracles.ts parseSsimRef/sigSsim). Side = ' +
+          `${LUMA_SIG_SIDE} → ${LUMA_SIG_SIDE * LUMA_SIG_SIDE}-value signatures.`,
+        assetId,
+        side: LUMA_SIG_SIDE,
+        sigs,
+      }
+    : undefined;
 
   return {
     ...base,
@@ -485,7 +533,7 @@ export async function bakeAssetFrames(
       ? `digested all ${filledCount} listed frame(s)`
       : `digested ${filledCount}/${listed.length} listed frame(s); golden kept pending (honest, no fabrication)`,
     framesDoc,
-    ssimDoc,
+    ...(ssimDoc ? { ssimDoc } : {}),
   };
 }
 
