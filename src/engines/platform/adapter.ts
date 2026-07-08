@@ -518,9 +518,13 @@ export function platformEngineFactory(): MediaEngine {
   return new PlatformEngine();
 }
 
-/** Register the platform engine factory under the 'platform' id. */
+/**
+ * Register the platform engine factory under the 'platform' id as INSTRUMENT-ONLY: it backs the
+ * frame-golden baker (getEngine('platform')) and the in-browser decode oracles (direct import), but is
+ * excluded from listScoredEngines() so it is never scored/ranked and never appears as a matrix column.
+ */
 export function registerPlatform(): void {
-  registerEngine('platform', platformEngineFactory);
+  registerEngine('platform', platformEngineFactory, { instrumentOnly: true });
 }
 
 // Re-export the oracle helpers the runner injects into OracleContext (decodeWithPlatform +

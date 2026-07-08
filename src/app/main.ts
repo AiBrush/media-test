@@ -15,7 +15,7 @@
 
 import { detectEnv, detectCodecSupport } from '../core/feature-detect.ts';
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
-import { listEngines, listScenarios, getReferenceEngineId, getEngine } from '../core/registry.ts';
+import { listScenarios, listScoredEngines, getEngine } from '../core/registry.ts';
 import { buildExecutionOrder, runMatrix } from '../core/runner.ts';
 import type { RunOptions } from '../core/runner.ts';
 import type { BrowserName } from '../core/engine.ts';
@@ -48,8 +48,7 @@ interface SuiteControl {
   env: EnvInfo;
   support: CodecSupport;
   registration: RegistrationReport;
-  referenceEngineId: string;
-  /** all registered ids, so the launcher can resolve --engine/--pillar against reality. */
+  /** the scored engine ids, so the launcher can resolve --engine/--pillar against reality. */
   engineIds: string[];
   featureIds: ScenarioFamily[];
   scenarioIds: string[];
@@ -68,6 +67,8 @@ interface SuiteRunFilter {
   reuseSuccessful?: boolean;
   randomizeOrder?: boolean;
   randomSeed?: string;
+  /** §6.2 exhaustive media mode: run every candidate file per scenario and aggregate (AND status / median bench). */
+  exhaustiveMedia?: boolean;
 }
 
 declare global {
@@ -99,11 +100,11 @@ async function boot(): Promise<void> {
   // 2. Register engines + scenarios (tolerant of broken/missing modules).
   registration = await registerAll();
 
-  // 3. Build pickers from the registry.
-  const referenceEngineId = getReferenceEngineId();
-  const enginePickers = listEngines().map((e) => ({
+  // 3. Build pickers from the registry (scored engines only — instrument-only engines like 'platform'
+  // back the golden baker + decode oracles and are never scored/columned).
+  const enginePickers = listScoredEngines().map((e) => ({
     id: e.id,
-    label: e.id === referenceEngineId ? `${e.id} (ref)` : e.id,
+    label: e.id,
   }));
   // Surface engines that failed to register as disabled rows so the gap is visible, not silent.
   for (const e of registration.engines) {
@@ -134,7 +135,7 @@ async function boot(): Promise<void> {
   for (const e of registration.engines) if (!e.ok) notes.push(`engine ${e.id}: ${e.reason}`);
   for (const f of registration.scenarioFamilies)
     if (!f.ok) notes.push(`scenarios ${f.family}: ${f.reason}`);
-  notes.push(`${registration.engineCount} engines, ${registration.scenarioCount} scenarios registered`);
+  notes.push(`${listScoredEngines().length} engines (+1 instrument: platform), ${registration.scenarioCount} scenarios registered`);
   renderRegistrationBanner(notes);
 
   // 4. Wire controls.
@@ -147,14 +148,13 @@ async function boot(): Promise<void> {
     env,
     support,
     registration,
-    referenceEngineId,
-    engineIds: listEngines().map((e) => e.id),
+    engineIds: listScoredEngines().map((e) => e.id),
     featureIds: scenarioGroups.map((g) => g.id),
     scenarioIds: listScenarios().map((s) => s.id),
     ready: true,
   };
 
-  setRunStatus(`ready · ${registration.engineCount} engines · ${registration.scenarioCount} scenarios`);
+  setRunStatus(`ready · ${listScoredEngines().length} engines (+1 instrument: platform) · ${registration.scenarioCount} scenarios`);
   if (shouldAutoStart()) {
     window.setTimeout(() => {
       if (!activeRunController) void runFromUi();
@@ -216,6 +216,10 @@ async function runFromUi(): Promise<ScenarioResult[]> {
   const iters = Number(getEl<HTMLInputElement>('iters').value) || 1;
   const reuseSuccessful = getEl<HTMLInputElement>('reuse-successful').checked;
   const randomizeOrder = getEl<HTMLInputElement>('randomize-order').checked;
+  // §6.2: the browser UI defaults to exhaustive (all files per scenario) via this checkbox (checked by
+  // default in index.html). Uncheck for the faster one-seeded-file-per-run mode. (Headless launch.mjs
+  // stays opt-in via --exhaustive.)
+  const exhaustiveMedia = getEl<HTMLInputElement>('exhaustive-media').checked;
   return runFromFilter({
     engineIds,
     featureIds,
@@ -225,6 +229,7 @@ async function runFromUi(): Promise<ScenarioResult[]> {
     iters,
     reuseSuccessful,
     randomizeOrder,
+    exhaustiveMedia,
   });
 }
 
@@ -270,7 +275,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   // 'ffmpeg.wasm@0.12.15', 'mp4box@2.3.0'). Keying the matrix by the registration id left those four
   // columns permanently empty ('·'). Map each selected/registered engine to its instance .id (cheap —
   // constructors do no heavy work; load happens in init()), so columns match the streamed results.
-  const selectedEngineRegIds = engineIds ?? listEngines().map((e) => e.id);
+  const selectedEngineRegIds = engineIds ?? listScoredEngines().map((e) => e.id);
   const drawEngines = await Promise.all(
     selectedEngineRegIds.map(async (rid) => {
       const reg = getEngine(rid);
@@ -304,6 +309,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     onProgress: (done, total, label) => setProgress(done, total, label),
   };
   if (filter.reuseSuccessful !== false && resultCache) opts.resultReuse = resultCache;
+  if (filter.exhaustiveMedia) opts.exhaustiveMedia = true;
   if (engineIds) opts.engineIds = engineIds;
   if (scenarioIds) opts.scenarioIds = scenarioIds;
   if (filter.featureIds?.length) opts.featureIds = filter.featureIds;
@@ -371,7 +377,6 @@ function downloadResults(): void {
     generatedAtIso: new Date().toISOString(),
     env,
     support,
-    referenceEngineId: getReferenceEngineId(),
     results,
   };
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -400,7 +405,6 @@ async function downloadCachedResults(): Promise<void> {
       generatedAtIso: new Date().toISOString(),
       env,
       support,
-      referenceEngineId: getReferenceEngineId(),
       cache: {
         rowCount: entries.length,
         invalidatedCount,

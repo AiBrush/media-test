@@ -1057,7 +1057,7 @@ export class Mp4boxEngine implements MediaEngine {
  * "Register NOTHING; Phase D wires registry"). Phase D calls registerMp4box() where it assembles the
  * engine list. The registry KEY defaults to 'mp4box'; the engine reports its own versioned id.
  */
-export function registerMp4box(opts?: { id?: string; reference?: boolean }): void {
+export function registerMp4box(opts?: { id?: string }): void {
   const id = opts?.id ?? 'mp4box';
-  registerEngine(id, () => new Mp4boxEngine(), { reference: opts?.reference ?? false });
+  registerEngine(id, () => new Mp4boxEngine());
 }

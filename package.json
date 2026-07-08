@@ -9,6 +9,7 @@
   },
   "scripts": {
     "bake": "bash scripts/bake-fixtures.sh",
+    "bake:scenario-goldens": "bun fixtures/bake-scenario-goldens.mjs",
     "serve": "bash scripts/serve.sh",
     "run": "bash scripts/run.sh",
     "compare": "bash scripts/compare.sh",

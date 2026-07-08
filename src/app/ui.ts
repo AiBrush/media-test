@@ -9,7 +9,7 @@
 
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
 import type { ScenarioResult } from '../core/scenario.ts';
-import { visibleResult } from '../core/format.ts';
+import { visibleResult, pickExecutionMs } from '../core/format.ts';
 
 export interface MatrixCellRef {
   engineId: string;
@@ -240,6 +240,16 @@ export class MatrixView {
   private startedAtMs = 0;
   private elapsedTimer = 0;
   private scoreboardRaf = 0;
+  // ── live winner race ──
+  /** results grouped by scenario, so a row's winner is decided the moment its last engine reports. */
+  private byScenario = new Map<string, ScenarioResult[]>();
+  /** scenarios already tallied (each complete row scores its winner exactly once). */
+  private scoredRows = new Set<string>();
+  /** scenarios won per engine (the fastest PASS in a fully-reported row) → the race chart heights. */
+  private winByEngine = new Map<string, number>();
+  /** the race chart's per-engine column nodes; all cosmetic and guarded (never breaks a run). */
+  private raceCols = new Map<string, { col: HTMLElement; bar: HTMLElement; cnt: HTMLElement }>();
+  private raceRaf = 0;
 
   constructor(hostId = 'results') {
     this.host = $(hostId);
@@ -254,6 +264,14 @@ export class MatrixView {
     this.resolved.clear();
     this.runningCell = null;
     this.stopScoreboardTimers();
+    this.byScenario.clear();
+    this.scoredRows.clear();
+    this.winByEngine.clear();
+    this.raceCols.clear();
+    if (this.raceRaf) {
+      cancelAnimationFrame(this.raceRaf);
+      this.raceRaf = 0;
+    }
     // Mirror runMatrix's scenario-major iteration so we can guess the in-flight cell from order.
     this.execOrder = options.executionOrder?.length
       ? options.executionOrder.map((cell) => this.key(cell.engineId, cell.scenarioId))
@@ -267,6 +285,13 @@ export class MatrixView {
       byId('summary-section')?.setAttribute('hidden', '');
       this.host.append(el('p', { class: 'muted' }, 'Select at least one engine and one scenario.'));
       return;
+    }
+
+    // Live winner race on top of the matrix (cosmetic — guarded so a run never breaks).
+    try {
+      this.buildRace(engines);
+    } catch {
+      /* cosmetic */
     }
 
     const table = el('table');
@@ -412,10 +437,14 @@ export class MatrixView {
     this.runningCell = td;
   }
 
-  /** Advance the in-flight marker to the next not-yet-resolved cell after the resolved ones. */
+  /**
+   * Advance the in-flight marker. POSITION-based (robust to any engine-id form mismatch): the runner and
+   * this execOrder are built by the same buildExecutionOrder, so results arrive in order — after N cells
+   * have resolved, `execOrder[N]` is the one now executing. (The old id-match — "first execOrder key not
+   * in `resolved`" — would stick the spinner forever on any cell whose result id ≠ its layout id.)
+   */
   private advanceRunning(): void {
-    const next = this.execOrder.find((k) => !this.resolved.has(k));
-    this.markRunning(next);
+    this.markRunning(this.execOrder[this.resolved.size]);
   }
 
   /**
@@ -441,6 +470,15 @@ export class MatrixView {
     } catch {
       /* cosmetic */
     }
+    if (this.raceRaf) {
+      cancelAnimationFrame(this.raceRaf);
+      this.raceRaf = 0;
+    }
+    try {
+      this.renderRaceNow();
+    } catch {
+      /* cosmetic */
+    }
   }
 
   /** Fill the cell for a streamed result. */
@@ -452,6 +490,15 @@ export class MatrixView {
     // result's (engineId, scenarioId) doesn't map to a drawn cell.
     const cellKey = this.key(r.engineId, r.scenarioId);
     this.resolved.add(cellKey);
+    // Winner race: accumulate this scenario's results; tally the win once every engine has reported.
+    const rowList = this.byScenario.get(r.scenarioId) ?? [];
+    rowList.push(r);
+    this.byScenario.set(r.scenarioId, rowList);
+    try {
+      this.maybeScoreRow(r.scenarioId);
+    } catch {
+      /* cosmetic — the winner race must never break a run */
+    }
     const td = this.cells.get(cellKey);
     if (!td) {
       this.advanceRunning();
@@ -479,9 +526,112 @@ export class MatrixView {
     return this.results.slice();
   }
 
-  private key(engineId: string, scenarioId: string): string {
-    return `${engineId} ${scenarioId}`;
+  // ── live winner race ─────────────────────────────────────────────────────────────────────────
+
+  /** Build the empty race chart (one column per engine) and place it above the matrix. */
+  private buildRace(engines: string[]): void {
+    const wrap = el('div', { class: 'race-wrap' });
+    wrap.append(
+      el('div', { class: 'race-title' }, 'Winner race — scenarios won (most files passed, then fastest, per fully-reported row)'),
+    );
+    const chart = el('div', { class: 'race' });
+    for (const e of engines) {
+      const bar = el('div', { class: 'race-bar' });
+      const cnt = el('div', { class: 'race-cnt' }, '0');
+      const col = el('div', { class: 'race-col', title: e }, cnt, bar, el('div', { class: 'race-lbl' }, shortEngine(e)));
+      chart.append(col);
+      this.raceCols.set(shortEngine(e), { col, bar, cnt });
+    }
+    wrap.append(chart);
+    this.host.append(wrap);
+    this.renderRaceNow();
   }
+
+  /**
+   * Tally a row's winner once EVERY selected engine has reported for it (a "full result" row). Winner =
+   * the correct (PASS) framework that passed the most candidate files, ties broken by the lowest
+   * execution time shown (see rowWinner); bold that cell and grow its race column. A row with no timed
+   * PASS (all NA/FAIL, or no numbers) simply has no winner. Scored exactly once per row.
+   */
+  private maybeScoreRow(scenarioId: string): void {
+    if (this.scoredRows.has(scenarioId)) return;
+    const rows = this.byScenario.get(scenarioId) ?? [];
+    // Row is "fully reported" when every selected framework has landed a result — counted by DISTINCT
+    // engine (normalized short id), so it's robust to the registry-vs-instance id mismatch and to dups.
+    const reported = new Set(rows.map((r) => shortEngine(r.engineId)));
+    if (reported.size < this.engines.length) return;
+    this.scoredRows.add(scenarioId);
+    const winnerId = this.rowWinner(rows);
+    if (!winnerId) return; // no timed PASS ⇒ no winner (all NA/FAIL, or no comparable numbers)
+    this.cells.get(this.key(winnerId, scenarioId))?.classList.add('winner');
+    const k = shortEngine(winnerId);
+    this.winByEngine.set(k, (this.winByEngine.get(k) ?? 0) + 1);
+    this.scheduleRace();
+  }
+
+  /**
+   * The winning engine of a complete row, COVERAGE-FIRST (§6.2): among PASS cells, the one that passed
+   * the most candidate files wins REGARDLESS of speed; equal coverage → lowest displayed execution time
+   * (pickExecutionMs, which prefers the exhaustive total wall). In single-file mode coverage is absent
+   * (all 0), so this reduces to pure lowest-time — unchanged. None when no timed PASS exists in the row.
+   */
+  private rowWinner(rows: ScenarioResult[]): string | undefined {
+    let best: { engineId: string; passed: number; ms: number } | undefined;
+    for (const r of rows) {
+      if (r.status !== 'PASS') continue; // only a correct (PASS) framework can win
+      const ms = pickExecutionMs(r);
+      if (ms === undefined) continue; // no comparable number → can't win the row
+      const passed = r.coverage?.passed ?? 0; // exhaustive files passed (0 in single-file mode)
+      if (!best || passed > best.passed || (passed === best.passed && ms < best.ms)) {
+        best = { engineId: r.engineId, passed, ms };
+      }
+    }
+    return best?.engineId;
+  }
+
+  /** Coalesce race repaints to one per animation frame (row completions can burst). */
+  private scheduleRace(): void {
+    if (this.raceRaf) return;
+    this.raceRaf = requestAnimationFrame(() => {
+      this.raceRaf = 0;
+      try {
+        this.renderRaceNow();
+      } catch {
+        /* cosmetic */
+      }
+    });
+  }
+
+  /** Paint the race columns: height ∝ wins/leader, count label, reorder by wins desc, highlight the leader. */
+  private renderRaceNow(): void {
+    if (this.raceCols.size === 0) return;
+    let max = 0;
+    for (const c of this.winByEngine.values()) if (c > max) max = c;
+    const ranked = [...this.raceCols.keys()].sort(
+      (a, b) => (this.winByEngine.get(b) ?? 0) - (this.winByEngine.get(a) ?? 0),
+    );
+    ranked.forEach((e, rank) => {
+      const node = this.raceCols.get(e);
+      if (!node) return;
+      const wins = this.winByEngine.get(e) ?? 0;
+      node.col.style.order = String(rank); // flex reorder → the "race" ordering, DOM stays stable
+      node.col.classList.toggle('leading', wins > 0 && wins === max);
+      node.bar.style.height = `${max > 0 ? Math.round((wins / max) * 100) : 0}%`;
+      node.cnt.textContent = String(wins);
+    });
+  }
+
+  private key(engineId: string, scenarioId: string): string {
+    // Normalize the engine id (drop @version) so a column laid out with a REGISTRY id (e.g. 'web-demuxer')
+    // still matches results that carry the INSTANCE id ('web-demuxer@4.0.0'). Without this, such a column
+    // never fills and its row never "completes" for the winner tally. (Engine short-names are unique per run.)
+    return `${shortEngine(engineId)} ${scenarioId}`;
+  }
+}
+
+/** Short framework label for the race column (drop the @version): 'mediabunny@1.48.0' → 'mediabunny'. */
+function shortEngine(engineId: string): string {
+  return engineId.split('@')[0] ?? engineId;
 }
 
 // ── progress + status ─────────────────────────────────────────────────────────────────────────

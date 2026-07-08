@@ -500,6 +500,75 @@
       .status.SKIPPED {
         color: var(--na);
       }
+      /* Winner: the fastest passing framework in a fully-reported row is bold + trophied. */
+      td.winner {
+        background: rgba(240, 165, 0, 0.1);
+      }
+      td.winner .status.PASS {
+        font-weight: 800;
+      }
+      td.winner .status.PASS::after {
+        content: ' 🏆';
+        font-weight: 400;
+      }
+      /* Live winner race — one column per framework, height ∝ scenarios won, reorders as it updates. */
+      .race-wrap {
+        margin: 0 0 1rem;
+        padding: 0.75rem 0.9rem;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--card);
+      }
+      .race-title {
+        font-size: 0.76rem;
+        color: var(--na);
+        margin-bottom: 0.6rem;
+      }
+      .race {
+        display: flex;
+        align-items: flex-end;
+        gap: 0.6rem;
+        height: 120px;
+        overflow-x: auto;
+        padding-bottom: 2px;
+      }
+      .race-col {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        min-width: 62px;
+        height: 100%;
+      }
+      .race-cnt {
+        font-weight: 700;
+        font-size: 0.82rem;
+        margin-bottom: 3px;
+      }
+      .race-bar {
+        width: 32px;
+        min-height: 2px;
+        height: 0;
+        background: var(--accent-grad);
+        border-radius: 5px 5px 0 0;
+        transition: height 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      .race-col.leading .race-bar {
+        background: linear-gradient(180deg, #ffd93b, #f0a500);
+      }
+      .race-col.leading .race-cnt {
+        color: #cf8a00;
+      }
+      .race-lbl {
+        margin-top: 5px;
+        font-size: 0.66rem;
+        color: var(--na);
+        max-width: 70px;
+        text-align: center;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .metric {
         color: var(--na);
         font-size: 0.72rem;
@@ -792,6 +861,13 @@
           >
             <input id="randomize-order" type="checkbox" checked />
             Randomize next test row
+          </label>
+          <label
+            class="opt"
+            title="Run every scenario against ALL its candidate files (baked fixture + all real downloads), in the same order for every engine. The cell PASSes only if all files pass (a FAIL names the offending file); the number is the median across files. Uncheck for the faster one-file-per-run mode."
+          >
+            <input id="exhaustive-media" type="checkbox" checked />
+            Exhaustive (all files per scenario)
           </label>
         </fieldset>
       </div>

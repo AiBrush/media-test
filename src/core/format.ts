@@ -29,10 +29,22 @@ export const NOT_RUN_DISPLAY = '—';
 /** The minimal slice of a ScenarioResult this module needs to compute the display string. */
 export interface DisplayResult {
   status: ResultStatus;
-  /** aggregated bench stats; we read `bench.wall.median` (ms) as the preferred execution time. */
-  bench?: { wall?: { median?: number } } | undefined;
+  /**
+   * aggregated bench stats. We prefer the exhaustive-mode `bench.wall.aggregate` (total wall across the
+   * whole candidate file set) when present, else the single-file `bench.wall.median` (ms), as the
+   * execution time (see `pickExecutionMs`).
+   */
+  bench?: { wall?: { median?: number; aggregate?: number } } | undefined;
   /** wall-clock fallback (ms) for functional-only PASS cells that carry no bench. */
   durationMs?: number | undefined;
+  /**
+   * Exhaustive-mode (§6.2) file coverage for a PASS cell: `passed` files out of `total` candidates.
+   * When present with `total > 1` the display appends ` · <passed>/<total>`, so a partial-coverage PASS
+   * is VISIBLY partial and never silently shown as a full win. Absent in single-file mode (⇒ no suffix).
+   * `admissible` is intentionally omitted — the display only needs passed/total (a wider shape such as
+   * `ScenarioResult.coverage` is still assignable).
+   */
+  coverage?: { passed: number; total: number } | undefined;
 }
 
 /**
@@ -55,19 +67,35 @@ function trimNum(n: number): string {
 
 /**
  * The execution-time source for a PASS cell, in the directive's priority order (§"Pick The Execution
- * Time Source"): the measured wall median first, then the runner's `durationMs` fallback for
- * functional-only PASS cells with no bench. `engine.init()` is excluded from `bench.wall` by the
- * runner; `durationMs` is the whole-cell wall fallback used only when nothing was benched.
+ * Time Source"): the exhaustive-mode wall AGGREGATE (total wall across the whole candidate file set)
+ * first, else the single-file wall median, then the runner's `durationMs` fallback for functional-only
+ * PASS cells with no bench. Preferring the aggregate makes this both the displayed cost AND the
+ * coverage-first winner tiebreak (equal coverage → lowest total wall wins). `engine.init()` is excluded
+ * from `bench.wall` by the runner; `durationMs` is the whole-cell wall fallback used only when nothing
+ * was benched.
  */
 export function pickExecutionMs(r: DisplayResult): number | undefined {
-  const wall = r.bench?.wall?.median;
+  const wall = r.bench?.wall?.aggregate ?? r.bench?.wall?.median;
   if (typeof wall === 'number' && Number.isFinite(wall)) return wall;
   if (typeof r.durationMs === 'number' && Number.isFinite(r.durationMs)) return r.durationMs;
   return undefined;
 }
 
 /**
- * THE human-facing per-cell string. PASS with a time → `Pass (<time>)`; NA_* →
+ * The body of a PASS cell's `Pass (…)` string. Always the execution time; in exhaustive mode (coverage
+ * present with more than one candidate file) it appends ` · <passed>/<total>` so a partial-coverage PASS
+ * reads VISIBLY partial (e.g. `Pass (1.2 s · 2/4)`) and is never presented as a full winner. A
+ * single-file PASS (no coverage, or `total <= 1`) reads exactly `Pass (<time>)` as before.
+ */
+export function formatPassBody(r: DisplayResult, ms: number): string {
+  const time = formatExecTime(ms);
+  const cov = r.coverage;
+  return cov && cov.total > 1 ? `${time} · ${cov.passed}/${cov.total}` : time;
+}
+
+/**
+ * THE human-facing per-cell string. PASS with a time → `Pass (<time>)`, or `Pass (<time> · <passed>/
+ * <total>)` in exhaustive mode where the case ran against a whole candidate file set; NA_* →
  * `N/A`. A PASS missing any timing source, plus FAIL, ERROR and SKIPPED, are returned as raw internal
  * markers so an unfixed cell stays visibly broken rather than being masked as a pass or an N/A.
  * Callers that have driven their targeted matrix to all-PASS-or-NA with timing will therefore only
@@ -77,7 +105,7 @@ export function visibleResult(r: DisplayResult): string {
   switch (r.status) {
     case 'PASS': {
       const ms = pickExecutionMs(r);
-      return ms === undefined ? 'PASS' : `Pass (${formatExecTime(ms)})`;
+      return ms === undefined ? 'PASS' : `Pass (${formatPassBody(r, ms)})`;
     }
     case 'NA_ENGINE':
     case 'NA_BROWSER':

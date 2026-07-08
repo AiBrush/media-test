@@ -254,6 +254,16 @@ export interface BenchSummary {
   mad: number;
   unit: string;
   samples: number[];
+  /**
+   * Exhaustive-mode (§6.2) representative value COMBINING this metric across every per-file sample:
+   * additive lower-is-better cost metrics (wall, I/O counts, bytesOut, latency) SUM to a total cost;
+   * peakMemory takes the MAX (a peak is not additive); higher-is-better RATE metrics (ops/s, fps,
+   * packets/s, x-realtime) take the MEDIAN (summing rates is meaningless). `samples` holds the
+   * per-file values and `n` their count. Absent in single-file mode (there the single `median` IS the
+   * value). Fair to compare across engines ONLY when both were combined over the SAME file set — the
+   * runner enforces this via coverage-first ranking (ScenarioResult.coverage).
+   */
+  aggregate?: number;
 }
 
 export interface ScenarioResult {
@@ -273,10 +283,69 @@ export interface ScenarioResult {
    * back to inferring it from the bench keys when absent.
    */
   primaryMetric?: MetricId;
+  /**
+   * Per-scenario file rotation provenance (scenario-media-test-update-instructions §10). Records which
+   * input file this cell was actually run against so a result is reproducible from (runSeed, corpus)
+   * and a FAIL on a rotated real file is traceable to the exact bytes. Purely additive — NOT consumed
+   * by isAdmissible/scoring. Absent on legacy results (falls back to the scenario's baked input).
+   */
+  selection?: ResultSelection;
+  /**
+   * Exhaustive-mode (§6.2) per-file sub-results: present when the scenario was run against EVERY
+   * candidate file (baked + all shape-passing real files) in one run, in the same order for every
+   * engine. The top-level `status` is the AND of these (PASS only if EVERY file passed; any FAIL/ERROR
+   * makes the scenario FAIL and names the offending file); `bench.<metric>.aggregate` COMBINES the
+   * passing files (sum of cost for time/IO metrics, MAX for peak memory, median for rate metrics —
+   * never averaging a FAIL into a pass, §9) while `.samples` keeps each file's value. This array
+   * preserves each file's individual verdict + numbers so the spread is visible and a FAIL is
+   * traceable to its bytes. See `coverage` for how many files were scored (winner ranking is
+   * coverage-first).
+   */
+  exhaustive?: ExhaustiveFileResult[];
+  /**
+   * Exhaustive-mode (§6.2) file coverage: how many candidate files this engine was actually scored
+   * over. `passed` = files that PASSed (the ones combined into `bench.<metric>.aggregate`);
+   * `admissible` = PASS+FAIL+ERROR (files that produced a real signal); `total` = all candidate files
+   * offered. The per-case WINNER is ranked coverage-FIRST (higher `passed` wins) THEN by the aggregate
+   * number, so an engine that skips the hard files (NA on them) can never out-rank one that handled
+   * them all. Absent in single-file mode.
+   */
+  coverage?: { passed: number; admissible: number; total: number };
   /** environment captured at run time (browser build, GPU string, suite/engine versions) */
   env?: RunEnv;
   startedAtIso?: string;
   durationMs?: number;
+}
+
+/** One file's verdict + numbers within an exhaustive-mode cell (§6.2). */
+export interface ExhaustiveFileResult {
+  /** the file this sub-result ran against: baked flat asset id, or a real download 'NN.ext'. */
+  file: string;
+  sha256?: string;
+  isBaked: boolean;
+  status: ResultStatus;
+  reason?: string;
+  /** this file's own bench (present only when this file PASSed — correctness gates the number). */
+  bench?: Partial<Record<MetricId, BenchSummary>>;
+}
+
+/**
+ * Which input file a result cell was run against under per-scenario file rotation (§6/§10).
+ * `isBaked` distinguishes the golden-backed baked fixture (full oracle set) from a rotated real
+ * download (survivor oracles only; golden-keyed oracles → NA_ASSET). Every rotating cell in one run
+ * shares the same `runSeed`, so the pick is replayable.
+ */
+export interface ResultSelection {
+  /** on-disk file name actually fed to the engine: baked flat asset id, or a real download 'NN.ext'. */
+  file: string;
+  /** sha256 of the selected file (from _sources.ndjson for real files / manifest for baked, when known). */
+  sha256?: string;
+  /** true ⇒ the golden-backed baked fixture was selected; false ⇒ a rotated real internet file. */
+  isBaked: boolean;
+  /** the run's selection seed (RunOptions.randomSeed), so (runSeed, corpus) replays the pick byte-for-byte. */
+  runSeed?: string;
+  /** total candidate files considered for this scenario this run (baked + shape-passing real files). */
+  candidateCount?: number;
 }
 
 export interface RunEnv {

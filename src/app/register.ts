@@ -31,15 +31,15 @@ interface EngineWiring {
 
 /**
  * Engine wirings. Dynamic imports keep a single broken adapter from breaking module evaluation of
- * the others (a static `import { x } from` would fail the whole bundle if `x` is missing). The
- * reference engine (mediabunny) is wired with `reference: true` via its own register helper.
+ * the others (a static `import { x } from` would fail the whole bundle if `x` is missing). Every
+ * engine here is a plain scored candidate; mediabunny is wired via its own register helper.
  */
 const ENGINE_WIRINGS: EngineWiring[] = [
   {
-    label: 'mediabunny (reference)',
+    label: 'mediabunny',
     register: async () => {
       const mod = await import('../engines/mediabunny/register.ts');
-      mod.registerMediabunny({ reference: true });
+      mod.registerMediabunny();
     },
   },
   {

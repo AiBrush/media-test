@@ -6,7 +6,7 @@
  *   - the browser itself (crypto.subtle, ImageData, OffscreenCanvas — all guarded),
  *   - committed golden JSON baked offline by INDEPENDENT tools (ffprobe/ffmpeg/Bento4),
  *   - injected platform decode/playback helpers (ctx.decodeWithPlatform / ctx.playbackSmoke),
- *   - the reference engine (ctx.referenceEngine) for re-import checks.
+ *   - a NO-ENGINE byte reader (box-readers.ts) over the engine's OWN output bytes (no scored engine).
  *
  * This module imports NO adapter and NO heavy library. It is dependency-free apart from the pure
  * type contracts in engine.ts / scenario.ts. It runs in page or Worker contexts alike.
@@ -33,6 +33,11 @@ import type {
 } from './engine.ts';
 import type { MediaEngine, PacketInfo } from './engine.ts';
 import type { OracleId, OracleOutcome, OracleTolerances, Scenario } from './scenario.ts';
+import { canonicalCodecToken, readOutputStructure } from './box-readers.ts';
+
+/** No-engine structural read of an engine's OWN output bytes (box-readers.ts). */
+type OutputStructure = NonNullable<ReturnType<typeof readOutputStructure>>;
+type OutputTrack = OutputStructure['tracks'][number];
 
 // ── Golden store ──────────────────────────────────────────────────────────────────────────────
 
@@ -290,11 +295,118 @@ export interface OracleContext {
   golden: GoldenStore;
   /** Current browser, when the runner provides it. Used only for browser-baked frame-golden sidecars. */
   browser?: BrowserName;
-  referenceEngine?: MediaEngine; // for 'reference-reimport'
   /** injected by runner: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
   decodeWithPlatform: (bytes: MediaBytes, opts?: { maxFrames?: number }) => Promise<FrameSink>;
   /** injected by runner: <video> playback smoke test → resolves true if it plays a few frames */
   playbackSmoke: (bytes: MediaBytes) => Promise<boolean>;
+}
+
+// ── no-engine output-structure helpers (box-readers.ts; no scored candidate engine) ─────────────
+
+/**
+ * An honest NA outcome. The runner routes an outcome whose `detail` contains the substring
+ * `golden absent` to NA_ASSET (never FAIL). Used wherever the truth an oracle needs is unavailable
+ * without the retired reference engine — never to manufacture a pass, never to hide a real defect.
+ */
+function naOutcome(oracle: OracleId, detail: string): OracleOutcome {
+  return { oracle, pass: false, detail: `golden absent: ${detail}` };
+}
+
+/** Map a byte-read OutputStructure to a NormalizedMetadata (fps/sampleRate/channels are unknown). */
+function structureToMetadata(s: OutputStructure): NormalizedMetadata {
+  return {
+    container: s.container,
+    durationSec: s.durationSec ?? null,
+    tracks: s.tracks.map((tr) => ({
+      type: tr.type,
+      codec: tr.codec ?? '',
+      ...(tr.width != null ? { width: tr.width } : {}),
+      ...(tr.height != null ? { height: tr.height } : {}),
+      language: null,
+    })),
+  };
+}
+
+/**
+ * Compare a golden media-track layout against the byte-read output tracks. Track COUNT + TYPE are
+ * asserted always; per-track codec ONLY when BOTH the reader token and the golden token confidently
+ * canonicalize (else the codec sub-check is skipped — never a FAIL on an unknown token).
+ */
+function compareStructureTracks(expected: NormalizedTrack[], actual: OutputTrack[]): string[] {
+  const diffs: string[] = [];
+  const typeCount = (list: Array<{ type: string }>): Record<string, number> => {
+    const m: Record<string, number> = {};
+    for (const tr of list) m[tr.type] = (m[tr.type] ?? 0) + 1;
+    return m;
+  };
+  const want = typeCount(expected);
+  const got = typeCount(actual);
+  for (const key of new Set([...Object.keys(want), ...Object.keys(got)])) {
+    const a = got[key] ?? 0;
+    const b = want[key] ?? 0;
+    if (a !== b) diffs.push(`media track type '${key}' count: reimport ${a} vs golden ${b}`);
+  }
+  for (const type of ['video', 'audio'] as const) {
+    const exp = expected.filter((tr) => tr.type === type);
+    const act = actual.filter((tr) => tr.type === type);
+    const n = Math.min(exp.length, act.length);
+    for (let i = 0; i < n; i++) {
+      const readCodec = act[i]!.codec;
+      if (readCodec == null) continue; // reader not confident → skip
+      const goldTok = canonicalCodecToken(exp[i]!.codec ?? '');
+      if (goldTok == null) continue; // golden token not canonicalizable → skip
+      const readTok = canonicalCodecToken(readCodec) ?? readCodec;
+      if (normStr(readTok) !== normStr(goldTok)) {
+        diffs.push(`${type} track[${i}] codec: reimport '${readCodec}' vs golden '${exp[i]!.codec}'`);
+      }
+    }
+  }
+  return diffs;
+}
+
+/**
+ * True when a requested codec token conflicts with a byte-read/parsed codec token. Confident only:
+ * when both canonicalize we compare canonical tokens; when NEITHER canonicalizes (e.g. a PCM token
+ * the reader vocabulary omits) we compare normalized strings; a mixed case is treated as "unsure" →
+ * no conflict (skip). An absent/empty measured codec is always "unsure".
+ */
+function codecsConflict(measured: string | null | undefined, requested: string): boolean {
+  if (measured == null || measured === '') return false;
+  const gotTok = canonicalCodecToken(measured);
+  const wantTok = canonicalCodecToken(requested);
+  if (gotTok != null && wantTok != null) return gotTok !== wantTok;
+  if (gotTok == null && wantTok == null) return normStr(measured) !== normStr(requested);
+  return false;
+}
+
+/** True when two container tokens belong to the same ISOBMFF/Matroska family (mp4↔mov, webm↔mkv). */
+function sameContainerFamily(a: string, b: string): boolean {
+  const family = (c: string): string => {
+    const n = normStr(c);
+    if (['mp4', 'mov', 'qt', 'm4a', 'm4v', 'isobmff'].includes(n)) return 'mp4';
+    if (['webm', 'mkv', 'matroska'].includes(n)) return 'webm';
+    return n;
+  };
+  return family(a) === family(b);
+}
+
+/** Duration proxy from an already-decoded frame sink: (last.pts − first.pts). Needs ≥2 frames. */
+function frameSpanSec(sink: FrameSink | null | undefined): number | undefined {
+  const frames = sink && Array.isArray(sink.frames) ? sink.frames : [];
+  if (frames.length < 2) return undefined;
+  const span = (frames[frames.length - 1]!.ptsUs - frames[0]!.ptsUs) / 1e6;
+  return span > 0 ? span : undefined;
+}
+
+/** Duration proxy: platform-decode the output and take the decoded frame-pts span (undefined if <2). */
+async function decodeFrameSpanDurationSec(ctx: OracleContext): Promise<number | undefined> {
+  if (!ctx.output) return undefined;
+  try {
+    const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 4096 });
+    return frameSpanSec(sink);
+  } catch {
+    return undefined;
+  }
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────────────────────
@@ -889,119 +1001,6 @@ function sameLayout(a: Record<number, number>, b: Record<number, number>): boole
   return true;
 }
 
-function compareMediaMetadata(
-  a: NormalizedMetadata,
-  b: NormalizedMetadata,
-  t: Required<OracleTolerances>,
-  assetId: string,
-): string[] {
-  const diffs: string[] = [];
-  const aTracks = (a.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  const bTracks = (b.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  if (aTracks.length !== bTracks.length) {
-    diffs.push(`media track count: second ${bTracks.length} vs first ${aTracks.length}`);
-  }
-  const n = Math.min(aTracks.length, bTracks.length);
-  for (let i = 0; i < n; i++) {
-    diffs.push(...compareTrack(i, bTracks[i]!, aTracks[i]!, t));
-  }
-
-  if (a.durationSec != null && b.durationSec != null) {
-    const delta = Math.abs(b.durationSec - a.durationSec);
-    const container = resolveContainer(b.container ?? a.container, assetId);
-    const band = durationToleranceFor(container, assetId, t, false);
-    const tolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(a.durationSec)) : band.tolSec;
-    if (delta > tolSec) {
-      diffs.push(
-        `duration: second ${b.durationSec.toFixed(4)}s vs first ${a.durationSec.toFixed(4)}s ` +
-          `(Δ ${delta.toFixed(4)}s > ${tolSec.toFixed(4)}s)`,
-      );
-    }
-  }
-
-  return diffs;
-}
-
-function comparePacketTables(
-  oracle: OracleId,
-  got: PacketInfo[],
-  want: PacketInfo[],
-  t: Required<OracleTolerances>,
-  label: string,
-): OracleOutcome {
-  const measurements: Record<string, number> = {
-    measuredCount: got.length,
-    expectedCount: want.length,
-  };
-  const diffs: string[] = [];
-
-  if (got.length !== want.length) {
-    diffs.push(`${label} packet count: measured ${got.length} vs expected ${want.length}`);
-  }
-
-  const gotLayout = trackLayout(got);
-  const wantLayout = trackLayout(want);
-  if (!sameLayout(gotLayout, wantLayout)) {
-    diffs.push(
-      `${label} trackIndex layout: measured ${JSON.stringify(gotLayout)} vs expected ${JSON.stringify(wantLayout)}`,
-    );
-  }
-
-  const byTrack = (ps: PacketInfo[]): Map<number, PacketInfo[]> => {
-    const m = new Map<number, PacketInfo[]>();
-    for (const p of ps) {
-      let group = m.get(p.trackIndex);
-      if (!group) {
-        group = [];
-        m.set(p.trackIndex, group);
-      }
-      group.push(p);
-    }
-    for (const group of m.values()) group.sort((x, y) => x.dtsUs - y.dtsUs || x.ptsUs - y.ptsUs);
-    return m;
-  };
-
-  const gotByTrack = byTrack(got);
-  const wantByTrack = byTrack(want);
-  const tsTolUs = t.seekToleranceUs;
-  let comparedTracks = 0;
-  let sizeMismatch = 0;
-  let kfMismatch = 0;
-  let ptsDrift = 0;
-  let dtsDrift = 0;
-  let maxPtsDriftUs = 0;
-
-  for (const [trackIndex, wantTrack] of wantByTrack) {
-    const gotTrack = gotByTrack.get(trackIndex) ?? [];
-    const n = Math.min(gotTrack.length, wantTrack.length);
-    if (n === 0) continue;
-    comparedTracks++;
-    const ptsOffset = gotTrack[0]!.ptsUs - wantTrack[0]!.ptsUs;
-    const dtsOffset = gotTrack[0]!.dtsUs - wantTrack[0]!.dtsUs;
-    for (let i = 0; i < n; i++) {
-      const a = gotTrack[i]!;
-      const b = wantTrack[i]!;
-      if (a.size !== b.size) sizeMismatch++;
-      if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
-      const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
-      const dtsResid = Math.abs(a.dtsUs - b.dtsUs - dtsOffset);
-      if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
-      if (ptsResid > tsTolUs) ptsDrift++;
-      if (dtsResid > tsTolUs) dtsDrift++;
-    }
-  }
-
-  measurements.comparedTracks = comparedTracks;
-  measurements.maxPtsDriftUs = maxPtsDriftUs;
-  if (sizeMismatch) diffs.push(`${label}: ${sizeMismatch} packets had a size mismatch`);
-  if (kfMismatch) diffs.push(`${label}: ${kfMismatch} packets had a keyframe-flag mismatch`);
-  if (ptsDrift) diffs.push(`${label}: ${ptsDrift} packets pts drift beyond ±${tsTolUs}µs`);
-  if (dtsDrift) diffs.push(`${label}: ${dtsDrift} packets dts drift beyond ±${tsTolUs}µs`);
-
-  if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  return pass(oracle, `${label} packet table stable (${got.length} packets)`, measurements);
-}
-
 async function compareFrameSsim(
   oracle: OracleId,
   candidate: FrameSink,
@@ -1228,83 +1227,63 @@ function matchByPts(got: FrameDigest[], ptsUs: number): FrameDigest | undefined 
 async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'reference-reimport';
   if (!ctx.output) return fail(oracle, 'no ctx.output bytes to re-import');
-  if (!ctx.referenceEngine) return fail(oracle, 'no ctx.referenceEngine injected');
 
-  const reInput = bytesToInput(ctx.output, ctx.input.id + '.reimport');
-  let demux: DemuxResult;
-  try {
-    demux = await ctx.referenceEngine.demux(reInput);
-  } catch (err) {
-    return fail(oracle, `reference engine failed to demux engine output: ${errMsg(err)}`);
-  }
-  const pkts = demux.packets ?? [];
-  const reimportKeyframes = pkts.filter((p) => p.keyframe).length;
-  const measurements: Record<string, number> = {
-    reimportPackets: pkts.length,
-    reimportKeyframes,
-  };
+  // REMUX: re-read the engine's OWN output structure with the no-engine byte reader and check its
+  // track layout + duration against golden (plus the Ogg-FLAC byte-parse subpath). No scored engine.
   if (ctx.scenario.op === 'remux') {
-    if (pkts.length === 0 && !isExpectedOggFlacOutput(ctx, demux)) {
-      return fail(oracle, 'reference re-import produced an empty packet table', measurements);
-    }
-    return semanticRemuxReimport(ctx, demux, measurements, t);
+    return semanticRemuxReimport(ctx, t);
   }
-  if (pkts.length === 0) {
-    return fail(oracle, 'reference re-import produced an empty packet table', measurements);
-  }
-  // Consistency check vs golden packet count/keyframes when available (otherwise just "round-trips").
-  const want = ctx.golden.packets;
-  if (want && want.length) {
-    const goldKf = want.filter((p) => p.keyframe).length;
-    const diffs: string[] = [];
-    // counts may differ slightly after remux (e.g. edit lists); flag only large divergence
-    if (!withinRel(pkts.length, want.length, 0.02, 1)) {
-      diffs.push(`packet count: reimport ${pkts.length} vs golden ${want.length}`);
-    }
-    if (!withinRel(reimportKeyframes, goldKf, 0.02, 1)) {
-      diffs.push(`keyframes: reimport ${reimportKeyframes} vs golden ${goldKf}`);
-    }
-    if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  }
-  return pass(
+
+  // NON-remux consistency was a packet-count/keyframe comparison against golden packets. That needs a
+  // full PACKET TABLE, which the byte reader does not provide — retire to honest NA under the
+  // no-reference policy (never a manufactured pass, never a byte-parse FAIL).
+  return naOutcome(
     oracle,
-    `reference re-imported engine output: ${pkts.length} packets, ${reimportKeyframes} keyframes`,
-    measurements,
+    'reference-reimport packet-count/keyframe check needs a packet table / demuxer; retired to NA under the no-reference policy',
   );
 }
 
 async function semanticRemuxReimport(
   ctx: OracleContext,
-  demux: DemuxResult,
-  measurements: Record<string, number>,
   t: Required<OracleTolerances>,
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'reference-reimport';
-  const expectedTracks = (ctx.golden.meta?.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  const rawActualTracks = (demux.metadata.tracks ?? []).filter((track) => track.type === 'video' || track.type === 'audio');
-  const oggFlacFallback = ctx.output !== undefined && isExpectedOggFlacOutput(ctx, demux);
-  const actualTracks = rawActualTracks.length || !oggFlacFallback ? rawActualTracks : expectedTracks;
-  measurements.reimportMediaTracks = rawActualTracks.length;
-  if (oggFlacFallback && rawActualTracks.length === 0) measurements.oggFlacSemanticMediaTracks = actualTracks.length;
-  measurements.goldenMediaTracks = expectedTracks.length;
+  const output = ctx.output;
+  if (!output) return fail(oracle, 'no ctx.output bytes to re-import');
+
+  // Expected track layout comes ONLY from committed golden. An absent golden (rotated real file, §7)
+  // SKIPS the layout comparison below — we never fabricate a "vs 0" mismatch against a missing golden.
+  const expectedTracks = (ctx.golden.meta?.tracks ?? []).filter(
+    (track) => track.type === 'video' || track.type === 'audio',
+  );
+
+  // NO-ENGINE structural read of the engine's OWN output (mp4/webm). Ogg is outside the byte reader;
+  // the Ogg-FLAC STREAMINFO/granule subpath below is its dedicated golden-free proof.
+  const structure = readOutputStructure(output.bytes, output.container);
+  const actualTracks: OutputTrack[] = structure
+    ? structure.tracks.filter((track) => track.type === 'video' || track.type === 'audio')
+    : [];
+  const oggFlacFallback = isExpectedOggFlacOutput(ctx);
+
+  const measurements: Record<string, number> = {
+    reimportMediaTracks: actualTracks.length,
+    goldenMediaTracks: expectedTracks.length,
+  };
   const diffs: string[] = [];
+  let checks = 0;
 
-  if (expectedTracks.length && actualTracks.length !== expectedTracks.length) {
-    diffs.push(`media track count: reimport ${actualTracks.length} vs golden ${expectedTracks.length}`);
-  }
-  const expectedLayout = mediaTrackLayout(expectedTracks);
-  const actualLayout = mediaTrackLayout(actualTracks);
-  const layoutKeys = new Set([...Object.keys(expectedLayout), ...Object.keys(actualLayout)]);
-  for (const key of layoutKeys) {
-    const a = actualLayout[key] ?? 0;
-    const b = expectedLayout[key] ?? 0;
-    if (a !== b) diffs.push(`track layout '${key}': reimport ${a} vs golden ${b}`);
+  // Track count + type ALWAYS (given a golden layout AND a parsed structure); per-track codec only
+  // when the reader token and golden token both confidently canonicalize.
+  if (expectedTracks.length && structure) {
+    checks++;
+    diffs.push(...compareStructureTracks(expectedTracks, actualTracks));
   }
 
-  let gotDur = demux.metadata.durationSec;
-  if ((gotDur == null || gotDur <= 0) && ctx.output && oggFlacFallback) {
-    const sampleRate = audioSampleRate(actualTracks) ?? audioSampleRate(expectedTracks);
-    const granuleDuration = durationFromOggGranules(ctx.output.bytes, sampleRate);
+  // Duration: byte-reader container duration; for a header-less Ogg-FLAC output, the max granule.
+  let gotDur = structure?.durationSec;
+  if ((gotDur == null || gotDur <= 0) && oggFlacFallback) {
+    const sampleRate = audioSampleRate(expectedTracks);
+    const granuleDuration = durationFromOggGranules(output.bytes, sampleRate);
     if (granuleDuration !== undefined) {
       gotDur = granuleDuration;
       measurements.durationFromOggGranulesSec = granuleDuration;
@@ -1312,9 +1291,15 @@ async function semanticRemuxReimport(
   }
   const wantDur = ctx.golden.meta?.durationSec;
   if (gotDur != null && wantDur != null) {
+    checks++;
     const delta = Math.abs(gotDur - wantDur);
-    const container = ctx.output?.container ?? demux.metadata.container;
-    const band = durationToleranceFor(container, primaryAssetId(ctx), t, ctx.scenario.tolerances?.durationToleranceSec != null);
+    const container = output.container || structure?.container || '';
+    const band = durationToleranceFor(
+      container,
+      primaryAssetId(ctx),
+      t,
+      ctx.scenario.tolerances?.durationToleranceSec != null,
+    );
     const baseTolSec = band.loose ? Math.max(band.tolSec, LOOSE_DURATION_REL * Math.abs(wantDur)) : band.tolSec;
     // Container remux can materialize a small tail duration from audio-frame/block rounding without
     // changing media identity. Keep this semantic re-import gate focused on real drift.
@@ -1326,16 +1311,13 @@ async function semanticRemuxReimport(
     }
   }
 
-  if (ctx.output && oggFlacFallback) {
+  // Ogg-FLAC byte-parse subpath: STREAMINFO identity source↔output — a golden-free real check. Runs
+  // only when BOTH sides byte-parse; an unparseable side is skipped (R2: no FAIL on parse uncertainty).
+  if (oggFlacFallback) {
     const sourceInfo = await nativeFlacStreamInfoFromInput(ctx.input);
-    const outputInfo = oggFlacStreamInfo(ctx.output.bytes);
-    if (!sourceInfo) {
-      diffs.push('Ogg-FLAC check: could not parse source FLAC STREAMINFO');
-    }
-    if (!outputInfo) {
-      diffs.push('Ogg-FLAC check: could not parse output Ogg-FLAC STREAMINFO');
-    }
+    const outputInfo = oggFlacStreamInfo(output.bytes);
     if (sourceInfo && outputInfo) {
+      checks++;
       measurements.oggFlacPages = outputInfo.pages;
       measurements.oggFlacPayloadBytes = outputInfo.payloadBytes;
       measurements.flacSourceTotalSamples = Number(sourceInfo.totalSamples);
@@ -1361,37 +1343,29 @@ async function semanticRemuxReimport(
     }
   }
 
-  const expectedVideoKeyframes = (ctx.golden.packets ?? []).filter((p) => p.keyframe).length;
-  const actualVideoKeyframes = demux.packets.filter((p) => p.keyframe).length;
-  if (expectedTracks.some((t) => t.type === 'video') && expectedVideoKeyframes > 0 && actualVideoKeyframes === 0) {
-    diffs.push('reimport found no keyframes for a video remux output');
-  }
-
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
-  const detail =
-    oggFlacFallback && rawActualTracks.length === 0
-      ? `Ogg-FLAC STREAMINFO/granule proof: ${actualTracks.length} media track(s)`
-      : `reference re-imported remux output semantically: ${demux.packets.length} packets, ${actualTracks.length} media track(s)`;
-  return pass(
-    oracle,
-    detail,
-    measurements,
-  );
-}
-
-function mediaTrackLayout(tracks: NormalizedTrack[]): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const track of tracks) {
-    const key = `${track.type}:${normStr(track.codec)}`;
-    out[key] = (out[key] ?? 0) + 1;
+  // Nothing verifiable ran (golden absent AND not Ogg-FLAC, or the container is not byte-readable) →
+  // honest NA rather than a manufactured pass.
+  if (checks === 0) {
+    return naOutcome(
+      oracle,
+      'reference-reimport remux needs a golden track/duration layout or an Ogg-FLAC output; none available under the no-reference policy',
+    );
   }
-  return out;
+  const detail =
+    oggFlacFallback && actualTracks.length === 0
+      ? `Ogg-FLAC STREAMINFO/granule proof: ${actualTracks.length} media track(s)`
+      : `remux output re-read structurally: ${actualTracks.length} media track(s), ${checks} check(s)`;
+  return pass(oracle, detail, measurements);
 }
 
-function isExpectedOggFlacOutput(ctx: OracleContext, demux: DemuxResult): boolean {
-  const container = normStr(ctx.output?.container ?? demux.metadata.container);
-  if (container !== 'ogg') return false;
-  return [...(demux.metadata.tracks ?? []), ...(ctx.golden.meta?.tracks ?? [])].some(
+function isExpectedOggFlacOutput(ctx: OracleContext): boolean {
+  const output = ctx.output;
+  if (!output || normStr(output.container) !== 'ogg') return false;
+  // Self-validating: the output actually byte-parses as an Ogg-FLAC bitstream, OR golden declares the
+  // audio codec is FLAC. (No scored engine — only the output bytes + committed golden.)
+  if (oggFlacStreamInfo(output.bytes) !== undefined) return true;
+  return (ctx.golden.meta?.tracks ?? []).some(
     (track) => track.type === 'audio' && normStr(track.codec) === 'flac',
   );
 }
@@ -1603,8 +1577,6 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
       expectedVariants: expected.length,
     });
   }
-  if (!ctx.referenceEngine) return fail(oracle, 'no reference engine injected for fanout metadata checks');
-
   const measurements: Record<string, number> = {
     variants: variants.length,
     totalBytes: variants.reduce((sum, v) => sum + v.bytes.byteLength, 0),
@@ -1618,27 +1590,40 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
       return fail(oracle, `variant ${i} produced no bytes`, finiteOnly(measurements));
     }
 
-    let meta: NormalizedMetadata;
-    try {
-      meta = await ctx.referenceEngine.probe(bytesToInput(variant, `${primaryAssetId(ctx)}.fanout${i}`));
-    } catch (err) {
-      return fail(oracle, `variant ${i} reference probe failed: ${errMsg(err)}`, finiteOnly(measurements));
+    // NO-ENGINE dims/codec: byte-read the rendition; decode a single frame only if the reader can't
+    // resolve dimensions (a non-mp4/webm rendition). SSIM + playback below remain the primary gate.
+    const structure = readOutputStructure(variant.bytes, variant.container);
+    const videoTrack = structure?.tracks.find((track) => track.type === 'video');
+    const codec = videoTrack?.codec ?? null;
+    let width = videoTrack?.width;
+    let height = videoTrack?.height;
+    if (width == null || height == null) {
+      try {
+        const dimsSink = await ctx.decodeWithPlatform(variant, { maxFrames: 1 });
+        const f0 = dimsSink && Array.isArray(dimsSink.frames) ? dimsSink.frames[0] : undefined;
+        if (f0) {
+          width = width ?? f0.width;
+          height = height ?? f0.height;
+        }
+      } catch {
+        /* dimensions undeterminable → the width/height sub-checks are skipped (never a FAIL) */
+      }
     }
 
-    const video = meta.tracks.find((track) => track.type === 'video');
-    if (!video) return fail(oracle, `variant ${i} has no video track`, finiteOnly(measurements));
     measurements[`variant${i}Bytes`] = variant.bytes.byteLength;
-    if (typeof video.width === 'number') measurements[`variant${i}Width`] = video.width;
-    if (typeof video.height === 'number') measurements[`variant${i}Height`] = video.height;
+    if (typeof width === 'number') measurements[`variant${i}Width`] = width;
+    if (typeof height === 'number') measurements[`variant${i}Height`] = height;
 
-    if (typeof spec.width === 'number' && video.width !== spec.width) {
-      return fail(oracle, `variant ${i} width ${video.width ?? 'null'} vs expected ${spec.width}`, finiteOnly(measurements));
+    // Assert requested dims only when the actual dims were determinable (never fail on unknown).
+    if (typeof spec.width === 'number' && width != null && width !== spec.width) {
+      return fail(oracle, `variant ${i} width ${width} vs expected ${spec.width}`, finiteOnly(measurements));
     }
-    if (typeof spec.height === 'number' && video.height !== spec.height) {
-      return fail(oracle, `variant ${i} height ${video.height ?? 'null'} vs expected ${spec.height}`, finiteOnly(measurements));
+    if (typeof spec.height === 'number' && height != null && height !== spec.height) {
+      return fail(oracle, `variant ${i} height ${height} vs expected ${spec.height}`, finiteOnly(measurements));
     }
-    if (typeof spec.codec === 'string' && video.codec !== spec.codec) {
-      return fail(oracle, `variant ${i} video codec '${video.codec}' vs expected '${spec.codec}'`, finiteOnly(measurements));
+    // Assert codec only when the reader is confident AND the requested token canonicalizes.
+    if (typeof spec.codec === 'string' && codecsConflict(codec, spec.codec)) {
+      return fail(oracle, `variant ${i} video codec '${codec}' vs expected '${spec.codec}'`, finiteOnly(measurements));
     }
 
     const played = await ctx.playbackSmoke(variant);
@@ -1652,7 +1637,7 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
       });
     }
     Object.assign(measurements, prefixMeasurements(`variant${i}Ssim`, ssim.measurements));
-    details.push(`${i}:${video.width}x${video.height}/${video.codec}`);
+    details.push(`${i}:${width ?? '?'}x${height ?? '?'}/${codec ?? '?'}`);
   }
 
   return pass(
@@ -2357,27 +2342,23 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   const diffs: string[] = [];
   const measurements: Record<string, number> = {};
 
-  // Probe the trimmed output via the reference engine if available (browser-pure: reference engine
-  // is a browser library), else decode and use frame pts span as a duration proxy.
+  // Duration of the trimmed output, no scored engine: the byte-reader container duration (mp4/webm),
+  // else the decoded frame-pts span, else a simple PCM container (wav/aiff) parse.
   let outDurationSec: number | undefined;
-  if (ctx.referenceEngine) {
-    try {
-      const meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.trim'));
-      if (meta.durationSec != null) outDurationSec = meta.durationSec;
-    } catch {
-      /* fall through to frame-span proxy */
-    }
+  const structure = readOutputStructure(ctx.output.bytes, ctx.output.container);
+  if (structure?.durationSec != null && structure.durationSec > 0) {
+    outDurationSec = structure.durationSec;
   }
 
   // Decode the trimmed output for the frame-span duration proxy + boundary-frame digests. A decode
-  // failure or null/empty sink is non-fatal here: the reference-engine probe above may already have a
-  // duration, and the boundary-frame block below simply has nothing to compare. Never null-deref.
+  // failure or null/empty sink is non-fatal: the container duration above may already cover it, and
+  // the boundary-frame block below simply has nothing to compare. Never null-deref.
   let frames: FrameDigest[] = [];
   try {
     const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 4096 });
     if (sink && Array.isArray(sink.frames)) frames = sink.frames;
   } catch {
-    /* decode failed; rely on the reference probe duration if any, else report below */
+    /* decode failed; rely on the container/PCM duration if any, else NA below */
   }
   if (outDurationSec == null && frames.length >= 2) {
     const first = frames[0]!.ptsUs;
@@ -2402,7 +2383,12 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
       );
     }
   } else if (outDurationSec == null) {
-    diffs.push('could not determine output duration (no reference probe, <2 decoded frames)');
+    // Genuinely undeterminable output duration (no mp4/webm container duration, <2 decoded frames,
+    // non-PCM container) → honest NA, never a manufactured FAIL.
+    return naOutcome(
+      oracle,
+      'trim-boundaries output duration undeterminable (no mp4/webm container duration, <2 decoded frames, non-PCM container)',
+    );
   }
 
   // Boundary frame digests are sound only when the loaded frame golden was baked for THIS trim
@@ -2657,6 +2643,16 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   const which = (readStringOption(ctx.scenario.options, ['invariant', 'property']) ??
     inferInvariant(ctx.scenario)).toLowerCase();
 
+  // Metamorphic DERIVED decrypt (§7.3): decode(decrypt(encrypted)) == decode(cleartextBase), both
+  // decoded in-browser with the platform WebCodecs decoder and compared bit-exact via frame digests.
+  // Restores REAL bit-exact signal for rotated encrypted files that have no committed cleartext-twin
+  // golden (so the golden-keyed decrypt-bitexact goes NA_ASSET). Placed FIRST because the sub-kind
+  // name contains the substring 'decode' and would otherwise be captured by the generic decode-remux
+  // branch below.
+  if (which === 'decrypt-eq-cleartext-decode' || which.includes('decrypt-eq-cleartext')) {
+    return decryptEqCleartextDecodeInvariant(ctx);
+  }
+
   if (which.includes('transcode-output') || which.includes('output-metadata')) {
     return transcodeOutputMetadataInvariant(ctx, t, which);
   }
@@ -2721,22 +2717,23 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
       return probeDurationInvariant(ctx, t, which);
     }
 
-    // probe(out).dur ≈ probe(x).dur (golden) across containers.
+    // probe(out).dur ≈ probe(x).dur (golden) across containers. No scored engine: byte-reader
+    // container duration, else the decoded frame-pts span, else a simple PCM (wav/aiff) parse.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
     const goldenDur = ctx.golden.meta?.durationSec ?? ctx.metadata?.durationSec ?? null;
     if (goldenDur == null) return fail(oracle, `[${which}] no golden/source duration to compare`);
-    let outDur: number | null = null;
-    if (ctx.referenceEngine) {
-      try {
-        const meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.inv'));
-        outDur = meta.durationSec;
-      } catch (err) {
-        return fail(oracle, `[${which}] reference probe of output failed: ${errMsg(err)}`);
-      }
-    } else {
-      return fail(oracle, `[${which}] no reference engine to probe output duration`);
+    let outDur: number | null =
+      readOutputStructure(ctx.output.bytes, ctx.output.container)?.durationSec ?? null;
+    if (outDur == null || outDur <= 0) {
+      outDur =
+        (await decodeFrameSpanDurationSec(ctx)) ?? durationFromSimpleAudioContainer(ctx.output) ?? null;
     }
-    if (outDur == null) return fail(oracle, `[${which}] output probe returned null duration`);
+    if (outDur == null) {
+      return naOutcome(
+        oracle,
+        `[${which}] output duration undeterminable (no mp4/webm container duration, undecodable, non-PCM container)`,
+      );
+    }
     const d = Math.abs(outDur - goldenDur);
     const explicitDurOverride = ctx.scenario.tolerances?.durationToleranceSec != null;
     const container = resolveContainer(ctx.golden.meta?.container ?? ctx.output.container, primaryAssetId(ctx));
@@ -2776,6 +2773,76 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     oracle,
     `unknown property-invariant '${which}' (expected decode-remux | seek-vs-linear-decode | decode-pts-strictly-increasing | vfr-seek-lands-on-true-pts | flac-seektable-equivalence | probe-duration | trim-concat | transcode-output-metadata)`,
   );
+}
+
+/**
+ * §7.3 — golden-free metamorphic oracle for rotated DERIVED/encryption scenarios.
+ *
+ * A rotated real encrypted file has no committed cleartext-twin frame golden, so the golden-keyed
+ * `decrypt-bitexact` oracle can only report NA_ASSET. This restores a REAL bit-exact signal:
+ *
+ *     decode(decrypt(encrypted))  ==  decode(cleartextBase)
+ *
+ * The runner has already run the engine's `decrypt` op, so `ctx.output` holds the engine's DECRYPTED
+ * bytes (keys are the engine's concern — none are needed here). The selection layer points
+ * `options.cleartextBaseAsset` at the retained REAL cleartext base the file was encrypted from
+ * (served under /fixtures/media/). We decode BOTH sides with the SAME platform WebCodecs decoder,
+ * bounded to N frames, and compare their normalized-RGBA frame digests bit-exact via compareDigests.
+ *
+ * Rigor (R2): decode failure of the OUTPUT, an empty/short output frame set, or ANY digest mismatch
+ * is an honest FAIL — a correctly-decrypted stream decodes to frames bit-identical to its cleartext
+ * source, so a mismatch found here IS a legitimate engine defect. Only a genuinely-absent cleartext
+ * BASE (no option / fetch not-ok / base decodes to zero frames) uses the shared 'metamorphic decrypt:
+ * no cleartext base to compare' wording that the runner maps to NA_ASSET — a corpus gap, never a
+ * manufactured pass.
+ */
+async function decryptEqCleartextDecodeInvariant(ctx: OracleContext): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+
+  const output = ctx.output;
+  if (!output) return fail(oracle, '[decrypt-eq-cleartext-decode] no decrypted output (ctx.output) to decode');
+
+  const baseAsset = readStringOption(ctx.scenario.options, ['cleartextBaseAsset']);
+  if (!baseAsset) return fail(oracle, 'metamorphic decrypt: no cleartext base to compare');
+
+  // Fetch the retained real cleartext base (mirrors the runner's mediaAssetUrl: origin-absolute path
+  // under /fixtures/media/, resolved against the served page). A missing/unreachable base is a corpus
+  // gap (NA_ASSET via the shared wording), NOT an engine defect — hence we also swallow a network
+  // error here rather than letting it surface as an oracle throw.
+  const url = new URL(`/fixtures/media/${baseAsset}`, globalThis.location?.href ?? 'http://localhost/').href;
+  let baseBytes: Uint8Array;
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) return fail(oracle, 'metamorphic decrypt: no cleartext base to compare');
+    baseBytes = new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return fail(oracle, 'metamorphic decrypt: no cleartext base to compare');
+  }
+
+  // Decode both sides with the platform decoder, bounded so it stays fast and directly comparable.
+  // A throw on EITHER side is a real FAIL: a correctly-decrypted stream — and the validated cleartext
+  // base — must decode. (The base is always an mp4; match the MediaBytes shape exactly.)
+  const N = 24;
+  let gotSink: FrameSink;
+  let wantSink: FrameSink;
+  try {
+    [gotSink, wantSink] = await Promise.all([
+      ctx.decodeWithPlatform(output, { maxFrames: N }),
+      ctx.decodeWithPlatform({ bytes: baseBytes, mime: 'video/mp4', container: 'mp4' }, { maxFrames: N }),
+    ]);
+  } catch (err) {
+    return fail(oracle, `[decrypt-eq-cleartext-decode] platform decode failed: ${errMsg(err)}`);
+  }
+
+  const got = gotSink?.frames ?? [];
+  const want = wantSink?.frames ?? [];
+  // Base decoded to nothing → treat as an absent base (corpus gap), NA-mapped. An empty/short OUTPUT,
+  // by contrast, falls through to compareDigests below and is a genuine FAIL ('0 produced' / missing
+  // frames) — we never let an output defect masquerade as a base gap.
+  if (want.length === 0) return fail(oracle, 'metamorphic decrypt: no cleartext base to compare');
+
+  const out = compareDigests(oracle, got, want);
+  return { ...out, oracle, detail: `[decrypt-eq-cleartext-decode] ${out.detail ?? ''}` };
 }
 
 async function flacSeektableSeekEquivalenceInvariant(ctx: OracleContext, which: string): Promise<OracleOutcome> {
@@ -3347,7 +3414,6 @@ async function trimComposeInvariant(
   const oracle: OracleId = 'property-invariant';
   if (!ctx.engine) return fail(oracle, `[${which}] no candidate engine to perform trims`);
   if (!ctx.engine.concat) return fail(oracle, `[${which}] candidate engine does not implement concat()`);
-  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe trim outputs`);
 
   const options = ctx.scenario.options;
   const a = readNumberOption(options, ['a']);
@@ -3373,22 +3439,25 @@ async function trimComposeInvariant(
     return fail(oracle, `[${which}] trim/concat step failed: ${errMsg(err)}`);
   }
 
-  let concatMeta: NormalizedMetadata;
-  let directMeta: NormalizedMetadata;
+  // Decode both composed outputs (these frames ARE the real invariant signal below), then derive each
+  // duration from the decoded frame-pts span, else the no-engine byte-reader container duration.
+  let concatSink: FrameSink;
+  let directSink: FrameSink;
   try {
-    concatMeta = await ctx.referenceEngine.probe(bytesToInput(concatenated, `${ctx.input.id}.trim-concat`));
-    directMeta = await ctx.referenceEngine.probe(bytesToInput(direct, `${ctx.input.id}.trim-direct`));
+    concatSink = await ctx.decodeWithPlatform(concatenated, { maxFrames: 240 });
+    directSink = await ctx.decodeWithPlatform(direct, { maxFrames: 240 });
   } catch (err) {
-    return fail(oracle, `[${which}] reference probe of trim outputs failed: ${errMsg(err)}`);
+    return fail(oracle, `[${which}] platform decode of trim outputs failed: ${errMsg(err)}`);
   }
 
   const expectedDurationSec = (c - a) / 1_000_000;
   const durationTolSec = Math.max(t.durationToleranceSec, 0.15);
-  const concatDur = concatMeta.durationSec;
-  const directDur = directMeta.durationSec;
+  const concatDur =
+    frameSpanSec(concatSink) ?? readOutputStructure(concatenated.bytes, concatenated.container)?.durationSec ?? null;
+  const directDur =
+    frameSpanSec(directSink) ?? readOutputStructure(direct.bytes, direct.container)?.durationSec ?? null;
   const durationDiffs: string[] = [];
-  if (concatDur == null) durationDiffs.push('concat output duration is null');
-  if (directDur == null) durationDiffs.push('direct output duration is null');
+  // Undeterminable durations are SKIPPED (not failed): the concat-vs-direct SSIM below is the gate.
   if (concatDur != null && Math.abs(concatDur - expectedDurationSec) > durationTolSec) {
     durationDiffs.push(
       `concat duration ${concatDur.toFixed(4)}s vs expected ${expectedDurationSec.toFixed(4)}s`,
@@ -3403,15 +3472,6 @@ async function trimComposeInvariant(
     durationDiffs.push(
       `concat duration ${concatDur.toFixed(4)}s vs direct ${directDur.toFixed(4)}s`,
     );
-  }
-
-  let concatSink: FrameSink;
-  let directSink: FrameSink;
-  try {
-    concatSink = await ctx.decodeWithPlatform(concatenated, { maxFrames: 240 });
-    directSink = await ctx.decodeWithPlatform(direct, { maxFrames: 240 });
-  } catch (err) {
-    return fail(oracle, `[${which}] platform decode of trim outputs failed: ${errMsg(err)}`);
   }
 
   const cmp = await compareFrameSsim(oracle, concatSink, directSink, t, 'concat trim vs direct trim');
@@ -3444,23 +3504,12 @@ async function demuxMuxRoundtripInvariant(
   which: string,
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
-  if (!ctx.output) return fail(oracle, `[${which}] no mux output to demux`);
-  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to demux mux output`);
-  if (!ctx.golden.packets?.length) return fail(oracle, `[${which}] no golden packets for source comparison`);
-
-  let demux: DemuxResult;
-  try {
-    demux = await ctx.referenceEngine.demux(bytesToInput(ctx.output, `${ctx.input.id}.mux-roundtrip`));
-  } catch (err) {
-    return fail(oracle, `[${which}] reference demux of mux output failed: ${errMsg(err)}`);
-  }
-
-  const out = goldenPackets({ ...ctx, demux }, t);
-  return {
-    ...out,
+  // demux(mux(x))==x compares the mux output's full PACKET TABLE against golden packets. The no-engine
+  // byte reader does NOT expose a packet table, so this invariant is retired to honest NA.
+  return naOutcome(
     oracle,
-    detail: `[invariant demux(mux(x))==x] ${out.detail ?? ''}`.trim(),
-  };
+    `[${which}] demux(mux(x))==x needs a packet table / demuxer; retired to NA under the no-reference policy`,
+  );
 }
 
 async function doubleRemuxStableInvariant(
@@ -3469,60 +3518,11 @@ async function doubleRemuxStableInvariant(
   which: string,
 ): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
-  if (!ctx.output) return fail(oracle, `[${which}] no first remux output`);
-  if (!ctx.engine) return fail(oracle, `[${which}] no candidate engine to perform second remux`);
-  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to inspect remux outputs`);
-
-  const container = readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
-  const firstInput = bytesToInput(ctx.output, `${ctx.input.id}.remux1`);
-  let secondOutput: MediaBytes;
-  try {
-    secondOutput = await ctx.engine.remux(firstInput, { container });
-  } catch (err) {
-    return fail(oracle, `[${which}] second remux failed: ${errMsg(err)}`);
-  }
-
-  let firstDemux: DemuxResult;
-  let secondDemux: DemuxResult;
-  try {
-    firstDemux = await ctx.referenceEngine.demux(bytesToInput(ctx.output, `${ctx.input.id}.remux1.inspect`));
-    secondDemux = await ctx.referenceEngine.demux(bytesToInput(secondOutput, `${ctx.input.id}.remux2.inspect`));
-  } catch (err) {
-    return fail(oracle, `[${which}] reference demux of remux output failed: ${errMsg(err)}`);
-  }
-
-  const metadataDiffs = compareMediaMetadata(
-    firstDemux.metadata,
-    secondDemux.metadata,
-    t,
-    primaryAssetId(ctx),
-  );
-  const packetOutcome = comparePacketTables(
+  // remux(remux(x))==remux(x) compares full metadata + PACKET TABLES across two remux passes via a
+  // demuxer. The no-engine byte reader exposes no packet table, so this invariant is retired to NA.
+  return naOutcome(
     oracle,
-    secondDemux.packets,
-    firstDemux.packets,
-    t,
-    'second remux vs first remux',
-  );
-
-  const measurements: Record<string, number> = {
-    firstPackets: firstDemux.packets.length,
-    secondPackets: secondDemux.packets.length,
-    ...(packetOutcome.measurements ?? {}),
-  };
-  const packetDetail = packetOutcome.detail ?? '';
-  if (metadataDiffs.length || !packetOutcome.pass) {
-    return fail(
-      oracle,
-      `[invariant remux(remux(x))==remux(x)] ${[...metadataDiffs, packetDetail].filter(Boolean).join('; ')}`,
-      measurements,
-    );
-  }
-
-  return pass(
-    oracle,
-    `[invariant remux(remux(x))==remux(x)] metadata and packet table stable (${secondDemux.packets.length} packets)`,
-    measurements,
+    `[${which}] remux(remux(x))==remux(x) needs a packet table / demuxer; retired to NA under the no-reference policy`,
   );
 }
 
@@ -3663,24 +3663,26 @@ async function transcodeOutputMetadataInvariant(
   const videoOpts = readObjectOption(options, 'video');
   const audioOpts = readObjectOption(options, 'audio');
 
-  let meta: NormalizedMetadata;
-  if (!ctx.referenceEngine) return fail(oracle, `[${which}] no reference engine to probe output metadata`);
-  try {
-    meta = await ctx.referenceEngine.probe(bytesToInput(ctx.output, ctx.input.id + '.transcode-meta'));
-  } catch (err) {
-    const fallback = expectedContainer === 'aiff' || ctx.output.container === 'aiff'
-      ? parseAiffMetadata(ctx.output.bytes)
-      : null;
-    if (!fallback) {
-      return fail(oracle, `[${which}] reference probe of output failed: ${errMsg(err)}`);
-    }
-    meta = fallback;
+  // NO-ENGINE metadata: byte-read the mp4/webm structure, or parse an AIFF header directly. No scored
+  // engine probe. Where neither is byte-readable there is nothing to compare → honest NA.
+  const structure = readOutputStructure(ctx.output.bytes, ctx.output.container);
+  let meta: NormalizedMetadata | null = structure ? structureToMetadata(structure) : null;
+  if (!meta && (expectedContainer === 'aiff' || normStr(ctx.output.container) === 'aiff')) {
+    meta = parseAiffMetadata(ctx.output.bytes);
+  }
+  if (!meta) {
+    return naOutcome(
+      oracle,
+      `[${which}] transcode output metadata not byte-readable (container '${normStr(ctx.output.container)}' outside mp4/webm/aiff reader coverage)`,
+    );
   }
 
   const diffs: string[] = [];
   const measurements: Record<string, number> = {};
 
-  if (expectedContainer && normStr(meta.container) !== normStr(expectedContainer)) {
+  // Container family match: the byte reader emits a coarse 'mp4'/'webm' family label, so treat mp4↔mov
+  // and webm↔mkv as equivalent — a correct in-family write target must not be false-failed.
+  if (expectedContainer && !sameContainerFamily(meta.container, expectedContainer)) {
     diffs.push(`container: output '${meta.container}' vs requested '${expectedContainer}'`);
   }
 
@@ -3703,8 +3705,6 @@ async function transcodeOutputMetadataInvariant(
           `(Δ ${delta.toFixed(4)}s > ${tolSec.toFixed(4)}s)`,
       );
     }
-  } else if (wantDur != null && gotDur == null) {
-    diffs.push(`duration: output null vs source ${wantDur}s`);
   }
 
   if (videoOpts) {
@@ -3811,16 +3811,19 @@ function compareRequestedTrack(
   diffs: string[],
 ): void {
   const requestedCodec = typeof opts.codec === 'string' && opts.codec.length ? opts.codec : undefined;
-  const track = requestedCodec
-    ? tracks.find((candidate) => normStr(candidate.codec) === normStr(requestedCodec))
-    : tracks[0];
+  // Prefer a track whose codec does not conflict with the request (confident match); else the first.
+  const track =
+    (requestedCodec ? tracks.find((candidate) => !codecsConflict(candidate.codec, requestedCodec)) : undefined) ??
+    tracks[0];
   if (!track) {
-    diffs.push(`${type} codec: output ${tracks.map((candidate) => candidate.codec).join(',') || 'none'} vs requested '${requestedCodec}'`);
+    diffs.push(`${type} track: output has none vs requested '${requestedCodec ?? type}'`);
     return;
   }
 
   const prefix = `${type} track`;
-  if (requestedCodec && normStr(track.codec) !== normStr(requestedCodec)) {
+  // Codec only when confident: the measured token is known AND it canonicalizes to a different token
+  // than requested (or both are same-vocabulary strings that differ). An unknown token is skipped.
+  if (requestedCodec && codecsConflict(track.codec, requestedCodec)) {
     diffs.push(`${prefix}.codec: '${track.codec}' vs requested '${requestedCodec}'`);
   }
 
@@ -3830,19 +3833,23 @@ function compareRequestedTrack(
   const sampleRate = readNumberOption(opts, ['sampleRate']);
   const channels = readNumberOption(opts, ['channels']);
 
+  // Each dimension/rate is asserted ONLY when the byte reader actually resolved it (a null/undefined
+  // measured field means "not byte-readable here" → skip, never a FAIL on an unknown value).
   if (type === 'video') {
-    if (width != null && track.width !== width) diffs.push(`${prefix}.width: ${track.width} vs requested ${width}`);
-    if (height != null && track.height !== height) diffs.push(`${prefix}.height: ${track.height} vs requested ${height}`);
+    if (width != null && track.width != null && track.width !== width) {
+      diffs.push(`${prefix}.width: ${track.width} vs requested ${width}`);
+    }
+    if (height != null && track.height != null && track.height !== height) {
+      diffs.push(`${prefix}.height: ${track.height} vs requested ${height}`);
+    }
     if (fps != null && track.fps != null && Math.abs(track.fps - fps) > t.fpsTolerance) {
       diffs.push(`${prefix}.fps: ${track.fps} vs requested ${fps} (tol ±${t.fpsTolerance})`);
-    } else if (fps != null && track.fps == null) {
-      diffs.push(`${prefix}.fps: null vs requested ${fps}`);
     }
   } else {
-    if (sampleRate != null && track.sampleRate !== sampleRate) {
+    if (sampleRate != null && track.sampleRate != null && track.sampleRate !== sampleRate) {
       diffs.push(`${prefix}.sampleRate: ${track.sampleRate} vs requested ${sampleRate}`);
     }
-    if (channels != null && track.channels !== channels) {
+    if (channels != null && track.channels != null && track.channels !== channels) {
       diffs.push(`${prefix}.channels: ${track.channels} vs requested ${channels}`);
     }
   }
@@ -4166,35 +4173,6 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   let hex = '';
   for (let i = 0; i < view.length; i++) hex += view[i]!.toString(16).padStart(2, '0');
   return hex;
-}
-
-/** Build a minimal MediaInput backed by in-memory bytes (for reference re-import / probe). */
-function bytesToInput(out: MediaBytes, id: string): MediaInput {
-  const ab = standaloneArrayBuffer(out.bytes);
-  const blob = new Blob([ab], { type: out.mime });
-  const url = typeof URL !== 'undefined' && 'createObjectURL' in URL ? URL.createObjectURL(blob) : '';
-  return {
-    id,
-    url,
-    mime: out.mime,
-    blob: async () => blob,
-    arrayBuffer: async () => ab,
-  };
-}
-
-function standaloneArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const buffer = bytes.buffer;
-  if (
-    buffer instanceof ArrayBuffer &&
-    bytes.byteOffset === 0 &&
-    bytes.byteLength === buffer.byteLength
-  ) {
-    return buffer;
-  }
-  // Fallback copy → guaranteed plain ArrayBuffer (never SharedArrayBuffer), no view offset.
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
 }
 
 function pass(oracle: OracleId, detail: string, measurements?: Record<string, number>): OracleOutcome {

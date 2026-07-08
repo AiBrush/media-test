@@ -191,6 +191,41 @@ export function compareBench(
   return { verdict: rounded > 0 ? 'faster' : 'slower', deltaPct: rounded };
 }
 
+/**
+ * Combine one metric's per-file values into the exhaustive-mode (§6.2) representative aggregate.
+ * Direction-aware and physically meaningful:
+ *   - higher-is-better RATE metrics (ops/s, fps, packets/s, x-realtime) → MEDIAN (summing rates is
+ *     meaningless; the median per-file rate is the fair central value),
+ *   - peakMemory → MAX (a peak across files is the worst peak, not a sum),
+ *   - everything else (lower-is-better, additive cost: wall, I/O counts, bytesOut, latency) → SUM
+ *     (total cost to process the whole candidate set — the owner's "sum, not average").
+ * FAIR TO COMPARE ACROSS ENGINES ONLY over the same file set — the caller enforces coverage-first.
+ * Returns NaN when there are no finite values.
+ */
+export function combineMetricAcrossFiles(metric: MetricId, values: number[]): number {
+  const finite = values.filter((v) => Number.isFinite(v));
+  if (finite.length === 0) return Number.NaN;
+  if (metricHigherIsBetter(metric)) return median(finite);
+  if (metric === 'peakMemory') return Math.max(...finite);
+  return finite.reduce((a, b) => a + b, 0);
+}
+
+/**
+ * Build an exhaustive-mode aggregate BenchSummary from per-file values: `.aggregate` is the combined
+ * representative value (see combineMetricAcrossFiles), `.median`/`.p95`/`.mad` describe the per-file
+ * SPREAD, `.samples` are the per-file values, and `.n` is the file count. Used by the runner to
+ * collapse an exhaustive cell; the display / winner layers prefer `.aggregate` over `.median`.
+ */
+export function summarizeAcrossFiles(
+  metric: MetricId,
+  values: number[],
+  warmup: number,
+  unit?: string,
+): BenchSummary {
+  const base = summarize(metric, values, warmup, unit);
+  return { ...base, aggregate: combineMetricAcrossFiles(metric, values) };
+}
+
 // ── statistics helpers (pure) ──────────────────────────────────────────────────────────────────
 
 /** Median of a numeric list; 0 for empty input. Sorts a copy (does not mutate the argument). */

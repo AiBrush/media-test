@@ -3,14 +3,15 @@
  *
  * Pure assembly: takes the flat list of ScenarioResult produced by the runner and folds it into the
  * comparison product — a leaderboard of numbers, per-case primary-metric tables, a conformance view,
- * the Δ-vs-reference view, and a per-engine scorecard — rendered as GitHub-flavored markdown AND
- * emitted as a machine-readable JSON object. No DOM, no Node-only API: this runs in a Worker, the
- * page, or Node alike (it only builds strings + plain objects).
+ * and a per-engine scorecard — rendered as GitHub-flavored markdown AND emitted as a machine-readable
+ * JSON object. No DOM, no Node-only API: this runs in a Worker, the page, or Node alike (it only builds
+ * strings + plain objects). There is deliberately NO reference engine: oracles compare against pre-baked
+ * golden data, never a live candidate, so the report has no "vs reference" concept at all.
  *
  * Three laws are baked into the structure (§0, §8, §9, §13, §15):
- *   1. The comparison is the product, and every delta is "vs the reference engine, on the SAME
- *      browser, on the same corpus." Numbers are NEVER compared across browsers — the entire report
- *      is grouped by browser and deltas are only ever computed within a browser group.
+ *   1. The comparison is the product, and every number is read "within the SAME browser, on the same
+ *      corpus." Numbers are NEVER compared across browsers — the entire report is grouped by browser
+ *      and comparisons are only ever made within a browser group.
  *   2. A benchmark is admissible only behind a green conformance gate; a perf number with no PASS is
  *      not reported (§0.1). A FAIL (wrong output) is shown as FAIL, never as a benchmark number.
  *   3. THE NUMBERS ARE THE PRODUCT (§8, §9): the markdown leads with the primary-metric value (with
@@ -25,15 +26,18 @@
  * unaffected; only the human-facing rendering collapses. See `naLabelMd` / `statusLabelMd`.
  */
 
-import type { BenchSummary, MetricId, ResultStatus, ScenarioResult } from './scenario.ts';
+import type {
+  MetricId,
+  ResultSelection,
+  ResultStatus,
+  ScenarioResult,
+} from './scenario.ts';
 import type { BrowserName } from './engine.ts';
-import { compareBench, metricHigherIsBetter, metricUnit } from './bench.ts';
-import type { CompareVerdict } from './bench.ts';
+import { metricHigherIsBetter, metricUnit } from './bench.ts';
 import { visibleResult } from './format.ts';
 
 export interface ReportInput {
   results: ScenarioResult[];
-  referenceEngineId: string;
   suiteVersion?: string;
   generatedAtIso?: string;
 }
@@ -45,22 +49,47 @@ export interface ReportOutput {
 
 // ── machine-readable shape ───────────────────────────────────────────────────────────────────
 
-/** Conformance delta vs reference (per scenario, within a browser). */
-export type ConformanceDelta = 'gained' | 'regressed' | 'same' | 'NA';
-
 export interface ConformanceCell {
   status: ResultStatus | null; // null = not run (—)
   reason?: string;
   durationMs?: number;
+  /**
+   * Per-scenario file-rotation provenance (§10 reproducibility): the input file this cell was actually
+   * run against, its sha256, whether it was the baked golden fixture (`isBaked:true`) or a rotated real
+   * download (`isBaked:false`), and how many candidates were considered. Projected from
+   * `ScenarioResult.selection` (runSeed dropped — it is a run-level scalar, not per-cell). PURELY
+   * ADDITIVE: never read by `isAdmissible` or any PASS/admissible math. Absent on legacy results
+   * (⇒ treat as baked/unknown).
+   */
+  selection?: { file: string; sha256?: string; isBaked: boolean; candidateCount?: number };
+  /**
+   * §6.2 exhaustive-mode per-file breakdown: each candidate file's individual verdict, so the aggregate
+   * cell (PASS only if all pass; bench = median across files) is transparent and a FAIL traces to its
+   * bytes. Present only in exhaustive runs. PURELY ADDITIVE — the aggregate `status` above is what scores.
+   */
+  exhaustive?: Array<{ file: string; isBaked: boolean; status: ResultStatus; sha256?: string }>;
 }
 
 export interface BenchCell {
   /** wall-clock median/p95 in ms, when measured. */
   wallMedianMs?: number;
   wallP95Ms?: number;
+  /**
+   * Exhaustive-mode (§6.2) TOTAL wall across the whole candidate file set (BenchSummary.wall.aggregate):
+   * the cell's true end-to-end cost and the coverage-first tiebreak. Absent in single-file mode (there
+   * `wallMedianMs` is the value). The display prefers this over the median (see format.pickExecutionMs).
+   */
+  wallAggregateMs?: number;
   throughputRealtime?: number; // ×-realtime, median
   peakMemoryBytes?: number; // median
   longtaskMs?: number; // median
+  /**
+   * Exhaustive-mode (§6.2) file coverage for this PASS cell: `passed` files out of `total` candidates
+   * (projected from ScenarioResult.coverage). Drives the ` · <passed>/<total>` display suffix so a
+   * partial-coverage PASS is visibly partial, and the coverage-FIRST winner ranking. Absent in
+   * single-file mode.
+   */
+  coverage?: { passed: number; total: number };
   /**
    * THE headline number for this case (§8.1/§9): the case's primary ranking metric, its median value
    * for THIS engine, and the metric's unit — populated ONLY when the cell PASSed and actually measured
@@ -73,24 +102,12 @@ export interface BenchCell {
   primaryUnit?: string;
 }
 
-export interface DeltaCell {
-  /** perf verdict on the primary throughput metric (within this browser, vs reference). */
-  perf?: { verdict: CompareVerdict; deltaPct: number; metric: MetricId } | null;
-  /** conformance movement vs reference for this scenario in this browser. */
-  conformance: ConformanceDelta;
-  /** human reason when conformance moved or perf is NA. */
-  reason?: string;
-}
-
 export interface EngineScorecard {
   engineId: string;
-  isReference: boolean;
   /** conformance % across all NON-NA (admissible) cells, all browsers. */
   conformancePct: number;
   conformancePassCount: number;
   conformanceAdmissibleCount: number;
-  /** geomean of throughput ratios vs reference, per browser (only scenarios both passed). */
-  perfIndexByBrowser: Partial<Record<BrowserName, number | null>>;
   /** distinct scenario families this engine produced a PASS in (capability breadth). */
   capabilityBreadth: number;
   capabilityFamilies: string[];
@@ -146,38 +163,96 @@ export interface BrowserSection {
   scenarios: string[];
   conformance: Record<string, Record<string, ConformanceCell>>; // [engineId][scenarioId]
   bench: Record<string, Record<string, BenchCell>>; // [engineId][scenarioId]
-  deltas: Record<string, Record<string, DeltaCell>>; // [engineId][scenarioId] (reference excluded)
   conformancePctByEngine: Record<string, number>;
   /** per-case winner verdicts (§9), one per scenario, in scenario order. */
   winners: CaseWinner[];
 }
 
+/**
+ * One cell reference for the file-rotation provenance sections (§12). Identifies which engine × browser
+ * × scenario cell ran against which real file, with the sha256 for traceability and the result status +
+ * reason so a finding is actionable. Only ever built for ROTATED REAL cells (selection.isBaked===false).
+ */
+export interface RotationCell {
+  scenarioId: string;
+  engineId: string;
+  browser: BrowserName;
+  family: string;
+  file: string;
+  sha256?: string;
+  status: ResultStatus;
+  reason?: string;
+  candidateCount?: number;
+}
+
+/** Per-family rotation coverage (§12 DoD): which scenarios ran on a real file vs still baked-only. */
+export interface RotationFamilyCoverage {
+  family: string;
+  /** distinct scenarioIds with ≥1 cell run on a rotated real file this run. */
+  realScenarios: string[];
+  /** distinct scenarioIds that ran this run but never on a real file (baked/legacy only). */
+  bakedOnlyScenarios: string[];
+  /** result cells run on a rotated real file (selection.isBaked === false) in this family. */
+  realCellCount: number;
+  /** result cells baked/legacy/unknown (the complement) in this family. */
+  bakedCellCount: number;
+}
+
+/**
+ * Per-scenario file-rotation provenance, coverage & findings (§10/§11/§12). PURELY ADDITIVE reporting:
+ * nothing here feeds `isAdmissible` or any PASS/admissible score — it only surfaces WHICH real files were
+ * exercised this run and what they revealed.
+ */
+export interface RotationReport {
+  /**
+   * Cells where a ROTATED REAL file yielded ZERO admissible signal — every oracle was golden-keyed so
+   * the whole cell resolved to NA_ASSET (predicate: selection.isBaked===false && status==='NA_ASSET').
+   * These need survivor oracle coverage or per-file goldens (§7.4); surfaced, never hidden.
+   */
+  allNaRotated: RotationCell[];
+  allNaRotatedCount: number;
+  /**
+   * The VALUABLE findings (§12): cells where a rotated real file produced FAIL or ERROR
+   * (predicate: selection.isBaked===false && (status==='FAIL' || status==='ERROR')). These are real
+   * defects that real files exposed — traceable to the exact bytes via file + sha256.
+   */
+  realDefects: RotationCell[];
+  realDefectCount: number;
+  /** per-family real-vs-baked coverage, family-sorted. */
+  familyCoverage: RotationFamilyCoverage[];
+  /** distinct scenarios exercised on a real file this run (any engine/browser). */
+  realScenarioCount: number;
+  /** distinct scenarios that ran but never on a real file this run. */
+  bakedOnlyScenarioCount: number;
+  /** total result cells run on a rotated real file (selection.isBaked === false). */
+  realCellCount: number;
+  /** total result cells baked/legacy/unknown (the complement). */
+  bakedCellCount: number;
+}
+
 export interface ReportJson {
   suiteVersion: string;
   generatedAtIso: string;
-  referenceEngineId: string;
   engines: string[];
   browsers: BrowserName[];
   scenarios: string[];
   browserSections: BrowserSection[];
   scorecards: EngineScorecard[];
   caveats: string[];
+  /**
+   * Distinct, non-empty `env.corpusChecksum` values seen across all results (§10 reproducibility). One
+   * entry ⇒ a single corpus; MORE THAN ONE ⇒ results were merged across corpora/selections and a dynamic
+   * caveat is added (per-cell selected files differ — compare only within one checksum).
+   */
+  corpusChecksums: string[];
+  /** Per-scenario file-rotation provenance, coverage & findings (§10/§11/§12). Additive; never scoring. */
+  rotation: RotationReport;
 }
 
 // ── constants ────────────────────────────────────────────────────────────────────────────────
 
 const EM_DASH = '—';
 const BROWSER_ORDER: BrowserName[] = ['brave', 'chromium', 'webkit', 'firefox'];
-
-/** Primary throughput metric used for Δ + perf index, in priority order (first present wins). */
-const THROUGHPUT_METRICS: MetricId[] = [
-  'opsPerSec',
-  'packetsPerSec',
-  'framesPerSec',
-  'throughputRealtime',
-  'decodeFps',
-  'encodeFps',
-];
 
 /**
  * Priority order for INFERRING a case's primary ranking metric when results don't declare one
@@ -211,7 +286,7 @@ const WINNER_NOISE_BAND_PCT = 3;
 /** §13 reproducibility caveats, written into every report verbatim. */
 const CAVEATS: string[] = [
   'Browser numbers are INDICATIVE only. They depend on GPU, OS, drivers, and thermal state; a measurement made on one machine does not transfer to another.',
-  'NEVER compare a raw number across browsers or across machines. Every delta in this report is "vs the reference engine, on the SAME browser, on the same corpus." Cross-browser comparison is invalid by construction — that is why the report is grouped by browser.',
+  'NEVER compare a raw number across browsers or across machines. Every comparison in this report is within the SAME browser, on the same corpus. Cross-browser comparison is invalid by construction — that is why the report is grouped by browser.',
   'Hardware codec sessions are the real parallelism ceiling, not navigator.hardwareConcurrency. Contention for a limited number of hardware decode/encode sessions can dominate timing for codec-bound workloads.',
   'No measurement -> no claim. No green correctness oracle -> no admissible benchmark: a perf number is reported only after the engine produced correct output for that engine x browser x scenario. A speedup with wrong output is a regression, not a win.',
   'N/A = not supported by the framework, browser/runtime, or currently available corpus assets. The machine-readable report.json keeps the internal not-applicable statuses distinct; the human-facing table intentionally folds them into one marker.',
@@ -223,44 +298,191 @@ const CAVEATS: string[] = [
 export function buildReport(input: ReportInput): ReportOutput {
   const suiteVersion = input.suiteVersion ?? firstEnvSuiteVersion(input.results) ?? 'dev';
   const generatedAtIso = input.generatedAtIso ?? new Date().toISOString();
-  const referenceEngineId = input.referenceEngineId;
 
-  const engines = uniqueSorted(input.results.map((r) => r.engineId), referenceEngineId);
+  // Engines are derived purely from the results (no reference engine to hoist to the front).
+  const engines = uniqueSorted(input.results.map((r) => r.engineId));
   const browsers = orderBrowsers(uniqueRaw(input.results.map((r) => r.browser)));
   const scenarios = uniqueRaw(input.results.map((r) => r.scenarioId));
 
   const byKey = indexResults(input.results);
 
   const browserSections = browsers.map((browser) =>
-    buildBrowserSection(browser, engines, scenarios, byKey, referenceEngineId),
+    buildBrowserSection(browser, engines, scenarios, byKey),
   );
 
   const scorecards = engines.map((engineId) =>
-    buildScorecard(
-      engineId,
-      engineId === referenceEngineId,
-      browsers,
-      scenarios,
-      byKey,
-      referenceEngineId,
-      browserSections,
-    ),
+    buildScorecard(engineId, browsers, scenarios, byKey, browserSections),
   );
+
+  // §10/§13 reproducibility: WHICH corpus (checksum) produced these cells. When results were merged
+  // across MORE THAN ONE distinct corpus the per-cell selected files differ, so we append an honest
+  // dynamic caveat ON TOP of the static CAVEATS (copied, never mutating the shared const).
+  const corpusChecksums = collectCorpusChecksums(input.results);
+  const caveats = [...CAVEATS];
+  if (corpusChecksums.length > 1) {
+    caveats.push(
+      `Results merged across ${corpusChecksums.length} distinct corpusChecksums ` +
+        `(${corpusChecksums.map(shortChecksum).join(', ')}): per-cell selected files differ between ` +
+        'corpora/selections — compare only within a single checksum.',
+    );
+  }
+
+  // §11/§12 file-rotation provenance, coverage & findings (additive; never touches scoring).
+  const rotation = buildRotationReport(input.results);
 
   const json: ReportJson = {
     suiteVersion,
     generatedAtIso,
-    referenceEngineId,
     engines,
     browsers,
     scenarios,
     browserSections,
     scorecards,
-    caveats: CAVEATS,
+    caveats,
+    corpusChecksums,
+    rotation,
   };
 
   const markdown = renderMarkdown(json);
   return { markdown, json };
+}
+
+// ── rotation provenance & findings (§10/§11/§12) ───────────────────────────────────────────────
+
+/** Distinct, non-empty corpus checksums across results, sorted for deterministic output. */
+function collectCorpusChecksums(results: ScenarioResult[]): string[] {
+  const set = new Set<string>();
+  for (const r of results) {
+    const c = r.env?.corpusChecksum;
+    if (typeof c === 'string' && c.length > 0) set.add(c);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
+/** Project a runner `ResultSelection` into the per-cell provenance stored in report.json (drops runSeed). */
+function projectSelection(
+  sel: ResultSelection,
+): { file: string; sha256?: string; isBaked: boolean; candidateCount?: number } {
+  return {
+    file: sel.file,
+    isBaked: sel.isBaked,
+    ...(sel.sha256 !== undefined ? { sha256: sel.sha256 } : {}),
+    ...(sel.candidateCount !== undefined ? { candidateCount: sel.candidateCount } : {}),
+  };
+}
+
+/** Short, human-readable checksum for prose (the full value is kept in the machine JSON). */
+function shortChecksum(c: string): string {
+  return c.length > 12 ? `${c.slice(0, 12)}…` : c;
+}
+
+/**
+ * Fold the flat result list into the file-rotation provenance report (§11/§12). A cell is "real" iff its
+ * selection says it ran on a rotated real download (`isBaked === false`); everything else (the baked
+ * fixture, or legacy/absent selection ⇒ treat as baked/unknown) is "baked". Reads ONLY `r.selection`,
+ * `r.status`, `r.family`, `r.reason` and identity fields — NEVER anything that changes admissibility.
+ */
+function buildRotationReport(results: ScenarioResult[]): RotationReport {
+  const allNaRotated: RotationCell[] = [];
+  const realDefects: RotationCell[] = [];
+
+  // scenarioId → family + whether ANY cell ran it on a real file (scenario-level coverage).
+  const scenarioReal = new Map<string, { family: string; hadReal: boolean }>();
+  // family → cell counts (real vs baked) for the coverage table.
+  const famCells = new Map<string, { realCellCount: number; bakedCellCount: number }>();
+
+  let realCellCount = 0;
+  let bakedCellCount = 0;
+
+  for (const r of results) {
+    const sel = r.selection;
+    const isReal = sel?.isBaked === false;
+
+    if (isReal) realCellCount++;
+    else bakedCellCount++;
+
+    const fc = famCells.get(r.family) ?? { realCellCount: 0, bakedCellCount: 0 };
+    if (isReal) fc.realCellCount++;
+    else fc.bakedCellCount++;
+    famCells.set(r.family, fc);
+
+    const prev = scenarioReal.get(r.scenarioId);
+    if (prev) {
+      if (isReal) prev.hadReal = true;
+    } else {
+      scenarioReal.set(r.scenarioId, { family: r.family, hadReal: isReal });
+    }
+
+    if (isReal && sel) {
+      const ref: RotationCell = {
+        scenarioId: r.scenarioId,
+        engineId: r.engineId,
+        browser: r.browser,
+        family: r.family,
+        file: sel.file,
+        status: r.status,
+        ...(sel.sha256 !== undefined ? { sha256: sel.sha256 } : {}),
+        ...(r.reason !== undefined ? { reason: r.reason } : {}),
+        ...(sel.candidateCount !== undefined ? { candidateCount: sel.candidateCount } : {}),
+      };
+      // All-NA rotation guard (§7.4/§12): a rotated real file whose every oracle was golden-keyed → the
+      // whole cell is NA_ASSET (zero admissible signal). Needs survivor coverage or per-file goldens.
+      if (r.status === 'NA_ASSET') allNaRotated.push(ref);
+      // Valuable findings (§12): a rotated real file that produced a FAIL or ERROR — a real defect.
+      if (r.status === 'FAIL' || r.status === 'ERROR') realDefects.push(ref);
+    }
+  }
+
+  // Per-family scenario coverage, derived from the scenario-level map.
+  const famScenarios = new Map<string, { real: string[]; bakedOnly: string[] }>();
+  let realScenarioCount = 0;
+  let bakedOnlyScenarioCount = 0;
+  for (const [scenarioId, info] of scenarioReal) {
+    const entry = famScenarios.get(info.family) ?? { real: [], bakedOnly: [] };
+    if (info.hadReal) {
+      entry.real.push(scenarioId);
+      realScenarioCount++;
+    } else {
+      entry.bakedOnly.push(scenarioId);
+      bakedOnlyScenarioCount++;
+    }
+    famScenarios.set(info.family, entry);
+  }
+
+  const families = new Set<string>([...famCells.keys(), ...famScenarios.keys()]);
+  const familyCoverage: RotationFamilyCoverage[] = [...families]
+    .sort((a, b) => a.localeCompare(b))
+    .map((family) => {
+      const s = famScenarios.get(family) ?? { real: [], bakedOnly: [] };
+      const c = famCells.get(family) ?? { realCellCount: 0, bakedCellCount: 0 };
+      return {
+        family,
+        realScenarios: [...s.real].sort((a, b) => a.localeCompare(b)),
+        bakedOnlyScenarios: [...s.bakedOnly].sort((a, b) => a.localeCompare(b)),
+        realCellCount: c.realCellCount,
+        bakedCellCount: c.bakedCellCount,
+      };
+    });
+
+  const byCell = (a: RotationCell, b: RotationCell): number =>
+    a.family.localeCompare(b.family) ||
+    a.scenarioId.localeCompare(b.scenarioId) ||
+    a.engineId.localeCompare(b.engineId) ||
+    a.browser.localeCompare(b.browser);
+  allNaRotated.sort(byCell);
+  realDefects.sort(byCell);
+
+  return {
+    allNaRotated,
+    allNaRotatedCount: allNaRotated.length,
+    realDefects,
+    realDefectCount: realDefects.length,
+    familyCoverage,
+    realScenarioCount,
+    bakedOnlyScenarioCount,
+    realCellCount,
+    bakedCellCount,
+  };
 }
 
 // ── result indexing ──────────────────────────────────────────────────────────────────────────
@@ -296,11 +518,9 @@ function buildBrowserSection(
   engines: string[],
   scenarios: string[],
   byKey: Map<ResultKey, ScenarioResult>,
-  referenceEngineId: string,
 ): BrowserSection {
   const conformance: Record<string, Record<string, ConformanceCell>> = {};
   const bench: Record<string, Record<string, BenchCell>> = {};
-  const deltas: Record<string, Record<string, DeltaCell>> = {};
   const conformancePctByEngine: Record<string, number> = {};
 
   for (const engineId of engines) {
@@ -318,7 +538,20 @@ function buildBrowserSection(
       }
       const reasonProps = r.reason ? { reason: r.reason } : {};
       const durationProps = r.durationMs !== undefined ? { durationMs: r.durationMs } : {};
-      confRow[scenarioId] = { status: r.status, ...reasonProps, ...durationProps };
+      // §10 reproducibility: stamp the actually-tested file + sha per cell (rotated-real or baked).
+      // Spread only when present so legacy/absent results stay untouched (⇒ baked/unknown downstream).
+      const selectionProps = r.selection ? { selection: projectSelection(r.selection) } : {};
+      const exhaustiveProps = r.exhaustive?.length
+        ? {
+            exhaustive: r.exhaustive.map((e) => ({
+              file: e.file,
+              isBaked: e.isBaked,
+              status: e.status,
+              ...(e.sha256 ? { sha256: e.sha256 } : {}),
+            })),
+          }
+        : {};
+      confRow[scenarioId] = { status: r.status, ...reasonProps, ...durationProps, ...selectionProps, ...exhaustiveProps };
       benchRow[scenarioId] = benchCellFrom(r);
 
       if (isAdmissible(r.status)) {
@@ -330,16 +563,6 @@ function buildBrowserSection(
     conformance[engineId] = confRow;
     bench[engineId] = benchRow;
     conformancePctByEngine[engineId] = admissible === 0 ? 0 : round1((pass / admissible) * 100);
-  }
-
-  // Δ-vs-reference: only for non-reference engines, only within THIS browser.
-  for (const engineId of engines) {
-    if (engineId === referenceEngineId) continue;
-    const deltaRow: Record<string, DeltaCell> = {};
-    for (const scenarioId of scenarios) {
-      deltaRow[scenarioId] = computeDeltaCell(byKey, browser, referenceEngineId, engineId, scenarioId);
-    }
-    deltas[engineId] = deltaRow;
   }
 
   // Per-case winners (§9) — the deliverable for this browser.
@@ -376,7 +599,6 @@ function buildBrowserSection(
     scenarios,
     conformance,
     bench,
-    deltas,
     conformancePctByEngine,
     winners,
   };
@@ -389,8 +611,13 @@ function buildBrowserSection(
  *   1. Eligibility — only engines whose correctness oracle PASSed (rule §0.1) can win.
  *   2. Pick the ranking metric — the engines' declared primaryMetric if shared, else inferred from
  *      PRIMARY_METRIC_PRIORITY (first metric present in every eligible result).
- *   3. Rank by that metric, direction-aware; winner = rank 1; margin = Δ% over rank 2.
- *   4. tie when rank-1 and rank-2 are within max(noise, 3%); uncontested when only one is eligible.
+ *   3. Rank COVERAGE-FIRST (§6.2): an engine that PASSed more candidate files always outranks one that
+ *      passed fewer, REGARDLESS of speed; equal coverage falls back to the metric's exhaustive aggregate
+ *      (else the single-file median), direction-aware. Winner = rank 1. In single-file mode coverage is
+ *      absent (all 0), so this reduces to the historical pure-metric ranking.
+ *   4. Ties, runner-up and margin are computed ONLY among engines at the winner's coverage tier (a
+ *      lower-coverage engine is strictly beaten and cannot co-win): tie when ≥2 of them are within
+ *      max(noise, 3%); uncontested when only one engine is eligible at all.
  */
 function computeCaseWinner(
   browser: BrowserName,
@@ -432,10 +659,21 @@ function computeCaseWinner(
   }
 
   const higher = metricHigherIsBetter(metric);
+  // Coverage-FIRST: rank by files PASSed (DESC), then by the metric's exhaustive aggregate (SUM for cost
+  // metrics, MEDIAN for rates — see BenchSummary.aggregate) or the single-file median, direction-aware.
+  // In single-file mode `passed` is 0 for every engine and `aggregate` is absent, so this is exactly the
+  // historical pure-metric-on-median ranking.
   const ranked = eligibleResults
-    .map((r) => ({ id: r.engineId, v: r.bench?.[metric]?.median }))
-    .filter((x): x is { id: string; v: number } => typeof x.v === 'number' && Number.isFinite(x.v))
-    .sort((a, b) => (higher ? b.v - a.v : a.v - b.v));
+    .map((r) => ({
+      id: r.engineId,
+      v: r.bench?.[metric]?.aggregate ?? r.bench?.[metric]?.median,
+      passed: r.coverage?.passed ?? 0,
+    }))
+    .filter(
+      (x): x is { id: string; v: number; passed: number } =>
+        typeof x.v === 'number' && Number.isFinite(x.v),
+    )
+    .sort((a, b) => b.passed - a.passed || (higher ? b.v - a.v : a.v - b.v));
 
   if (ranked.length === 0) return { ...none, primaryMetric: metric };
 
@@ -451,12 +689,22 @@ function computeCaseWinner(
     };
   }
 
-  const second = ranked[1]!;
-  const marginPct = relativeBetterPct(top.v, second.v, higher);
+  // Ties, runner-up and margin are meaningful ONLY among engines at the winner's coverage tier: a
+  // lower-coverage engine is strictly beaten (coverage wins regardless of speed) so it can never co-win,
+  // and a speed "margin" over it would be misleading (it did less work). Lower-tier engines still appear
+  // in `eligible`, and their partial coverage shows in their own cell (` · passed/total`).
   const band = WINNER_NOISE_BAND_PCT;
-  const coWinners = ranked
+  const topTier = ranked.filter((x) => x.passed === top.passed);
+  const coWinners = topTier
     .filter((x) => Math.abs(relativeBetterPct(top.v, x.v, higher)) <= band)
     .map((x) => x.id);
+  const second = ranked[1]!; // next engine overall (may be at a lower coverage tier)
+  const sameTierSecond = topTier[1]; // closest rival AT the winner's coverage tier, if any
+  // A metric margin is only honest between equal-coverage engines; when the win was decided by coverage
+  // (no same-tier rival) there is no speed margin to claim, so it is null (rendered as —).
+  const marginPct = sameTierSecond
+    ? roundTo(relativeBetterPct(top.v, sameTierSecond.v, higher), 2)
+    : null;
   const flag = coWinners.length > 1 ? 'tie' : 'contested';
 
   return {
@@ -467,7 +715,7 @@ function computeCaseWinner(
     winnerValue: top.v,
     runnerUp: second.id,
     runnerUpValue: second.v,
-    marginPct: roundTo(marginPct, 2),
+    marginPct,
     flag,
     eligible,
     coWinners,
@@ -509,102 +757,35 @@ function relativeBetterPct(a: number, b: number, higherIsBetter: boolean): numbe
 
 function benchCellFrom(r: ScenarioResult): BenchCell {
   // Correctness gate: a non-PASS result carries no admissible benchmark (§0.1).
-  if (r.status !== 'PASS' || !r.bench) return {};
+  if (r.status !== 'PASS') return {};
   const cell: BenchCell = {};
-  const wall = r.bench.wall;
+  const wall = r.bench?.wall;
   if (wall) {
     cell.wallMedianMs = wall.median;
     cell.wallP95Ms = wall.p95;
+    // Exhaustive mode: total wall across the whole candidate file set (the coverage-first cost basis).
+    if (wall.aggregate !== undefined && Number.isFinite(wall.aggregate)) cell.wallAggregateMs = wall.aggregate;
   }
-  const tput = r.bench.throughputRealtime;
+  const tput = r.bench?.throughputRealtime;
   if (tput) cell.throughputRealtime = tput.median;
-  const mem = r.bench.peakMemory;
+  const mem = r.bench?.peakMemory;
   if (mem) cell.peakMemoryBytes = mem.median;
-  const lt = r.bench.longtasks;
+  const lt = r.bench?.longtasks;
   if (lt) cell.longtaskMs = lt.median;
+  // Exhaustive-mode file coverage → drives the ` · passed/total` display suffix + coverage-first winner.
+  // Attached for any PASS (independent of bench presence) so a functional-only exhaustive PASS still
+  // shows its coverage.
+  if (r.coverage) cell.coverage = { passed: r.coverage.passed, total: r.coverage.total };
   return cell;
-}
-
-function computeDeltaCell(
-  byKey: Map<ResultKey, ScenarioResult>,
-  browser: BrowserName,
-  referenceEngineId: string,
-  engineId: string,
-  scenarioId: string,
-): DeltaCell {
-  const ref = getResult(byKey, referenceEngineId, browser, scenarioId);
-  const cand = getResult(byKey, engineId, browser, scenarioId);
-
-  const conformance = conformanceDelta(ref?.status, cand?.status);
-
-  // Perf delta is admissible only when BOTH reference and candidate PASS (correctness gate) AND
-  // a shared throughput metric is present in both. Otherwise perf is NA with a reason.
-  if (!ref || !cand) {
-    return { perf: null, conformance, reason: !ref ? 'reference not run' : 'candidate not run' };
-  }
-  if (ref.status !== 'PASS' || cand.status !== 'PASS') {
-    const reason =
-      ref.status !== 'PASS'
-        ? `reference ${ref.status.toLowerCase()} (no admissible baseline)`
-        : `candidate ${cand.status.toLowerCase()} (no admissible benchmark)`;
-    return { perf: null, conformance, reason };
-  }
-
-  const metric = pickSharedThroughputMetric(ref, cand);
-  if (!metric) {
-    return { perf: null, conformance, reason: 'no shared throughput metric measured' };
-  }
-  const refSummary = ref.bench?.[metric];
-  const candSummary = cand.bench?.[metric];
-  if (!refSummary || !candSummary) {
-    return { perf: null, conformance, reason: 'no shared throughput metric measured' };
-  }
-
-  const { verdict, deltaPct } = compareBench(refSummary, candSummary, {
-    higherIsBetter: metricHigherIsBetter(metric),
-  });
-  return { perf: { verdict, deltaPct, metric }, conformance };
-}
-
-/** First throughput metric (priority order) present in BOTH results' bench. */
-function pickSharedThroughputMetric(ref: ScenarioResult, cand: ScenarioResult): MetricId | null {
-  for (const m of THROUGHPUT_METRICS) {
-    if (ref.bench?.[m] && cand.bench?.[m]) return m;
-  }
-  return null;
-}
-
-/**
- * gained  = candidate PASS where reference did NOT pass (admissible, non-NA on candidate side).
- * regressed = reference PASS where candidate did NOT pass.
- * same    = both PASS, or both equally non-pass-admissible.
- * NA      = comparison not meaningful (a side was NA / not run).
- */
-function conformanceDelta(
-  refStatus: ResultStatus | undefined,
-  candStatus: ResultStatus | undefined,
-): ConformanceDelta {
-  if (refStatus === undefined || candStatus === undefined) return 'NA';
-  const refNA = !isAdmissible(refStatus);
-  const candNA = !isAdmissible(candStatus);
-  if (refNA || candNA) return 'NA';
-
-  const refPass = refStatus === 'PASS';
-  const candPass = candStatus === 'PASS';
-  if (candPass && !refPass) return 'gained';
-  if (refPass && !candPass) return 'regressed';
-  return 'same';
 }
 
 // ── scorecards ───────────────────────────────────────────────────────────────────────────────
 
 function buildScorecard(
   engineId: string,
-  isReference: boolean,
   browsers: BrowserName[],
   scenarios: string[],
   byKey: Map<ResultKey, ScenarioResult>,
-  referenceEngineId: string,
   browserSections: BrowserSection[],
 ): EngineScorecard {
   let pass = 0;
@@ -630,13 +811,6 @@ function buildScorecard(
         if (r.status === 'PASS') robustnessPass++;
       }
     }
-  }
-
-  const perfIndexByBrowser: Partial<Record<BrowserName, number | null>> = {};
-  for (const browser of browsers) {
-    perfIndexByBrowser[browser] = isReference
-      ? 1
-      : perfIndexFor(engineId, referenceEngineId, browser, scenarios, byKey);
   }
 
   const capabilityFamilies = [...families].sort();
@@ -670,16 +844,13 @@ function buildScorecard(
     conformancePct,
     bundleSizeKb,
     robustnessRate,
-    isReference,
   });
 
   return {
     engineId,
-    isReference,
     conformancePct,
     conformancePassCount: pass,
     conformanceAdmissibleCount: admissible,
-    perfIndexByBrowser,
     capabilityBreadth: capabilityFamilies.length,
     capabilityFamilies,
     robustnessRate,
@@ -711,7 +882,8 @@ function perfIndexVsWinnerFor(
     if (!metric || w.winnerValue === null || !Number.isFinite(w.winnerValue)) continue;
     const r = getResult(byKey, engineId, section.browser, w.scenarioId);
     if (!r || r.status !== 'PASS') continue;
-    const val = r.bench?.[metric]?.median;
+    // aggregate??median to match `w.winnerValue` (both exhaustive-aggregate when present, else median).
+    const val = r.bench?.[metric]?.aggregate ?? r.bench?.[metric]?.median;
     if (val === undefined || !Number.isFinite(val) || val <= 0) continue;
     const winnerVal = w.winnerValue;
     if (winnerVal <= 0) continue;
@@ -753,7 +925,6 @@ function buildVerdict(s: {
   conformancePct: number;
   bundleSizeKb: number | null;
   robustnessRate: number | null;
-  isReference: boolean;
 }): string {
   const parts: string[] = [];
   const contested = s.wins - s.uncontestedWins;
@@ -771,39 +942,7 @@ function buildVerdict(s: {
   parts.push(`${fmtNum(s.conformancePct)}% conformant`);
   if (s.robustnessRate !== null) parts.push(`${fmtNum(s.robustnessRate)}% robust`);
   if (s.bundleSizeKb !== null) parts.push(`${fmtNum(s.bundleSizeKb)} kB bundle`);
-  if (s.isReference) parts.push('reference');
   return parts.join(' · ');
-}
-
-/**
- * Perf index = geometric mean of candidate/reference throughput ratios over every scenario where
- * BOTH engines PASS and share a throughput metric, in this browser. >1 means faster-than-reference
- * on average; <1 slower. null when there is no co-passing scenario to compare.
- */
-function perfIndexFor(
-  engineId: string,
-  referenceEngineId: string,
-  browser: BrowserName,
-  scenarios: string[],
-  byKey: Map<ResultKey, ScenarioResult>,
-): number | null {
-  let logSum = 0;
-  let count = 0;
-  for (const scenarioId of scenarios) {
-    const ref = getResult(byKey, referenceEngineId, browser, scenarioId);
-    const cand = getResult(byKey, engineId, browser, scenarioId);
-    if (!ref || !cand || ref.status !== 'PASS' || cand.status !== 'PASS') continue;
-    const metric = pickSharedThroughputMetric(ref, cand);
-    if (!metric) continue;
-    const refMed = ref.bench?.[metric]?.median;
-    const candMed = cand.bench?.[metric]?.median;
-    if (refMed === undefined || candMed === undefined) continue;
-    if (!Number.isFinite(refMed) || !Number.isFinite(candMed) || refMed <= 0 || candMed <= 0) continue;
-    logSum += Math.log(candMed / refMed);
-    count++;
-  }
-  if (count === 0) return null;
-  return round2(Math.exp(logSum / count));
 }
 
 // ── markdown rendering ───────────────────────────────────────────────────────────────────────
@@ -813,9 +952,7 @@ function renderMarkdown(json: ReportJson): string {
 
   out.push('# Browser Media-Engine Benchmark Report');
   out.push('');
-  out.push(
-    `Reference engine: \`${json.referenceEngineId}\` · Suite ${json.suiteVersion} · Generated ${json.generatedAtIso}`,
-  );
+  out.push(`Suite ${json.suiteVersion} · Generated ${json.generatedAtIso}`);
   out.push('');
   out.push(
     `Engines: ${json.engines.map((e) => `\`${e}\``).join(', ') || EM_DASH} · ` +
@@ -824,16 +961,17 @@ function renderMarkdown(json: ReportJson): string {
   );
   out.push('');
   out.push(
-    'All deltas are **within a single browser, vs the reference engine, on the same corpus.** ' +
+    'All comparisons are **within a single browser, on the same corpus.** ' +
       'Numbers are never compared across browsers (see Caveats).',
   );
   out.push('');
   // Benchmark-first reading guide (USER DIRECTIVE; §8/§9). The NUMBER is the product; correctness
   // gates it (§0.1); NA collapses the two not-supported flavors into one user-facing marker.
   out.push(
-    '> **Reading the matrix:** every completed cell shows **Pass (<execution time>)** when the ' +
-      'operation ran correctly, or **N/A** when the engine or browser/runtime cannot support that ' +
-      'case. Machine-readable `report.json` keeps the internal status distinction.',
+    '> **Reading the matrix:** every completed cell shows **Pass (<execution time>)** — or, when the ' +
+      'case was run against a whole set of real files, **Pass (<total time> · <files passed>/<files>)** ' +
+      '— when the operation ran correctly, or **N/A** when the engine or browser/runtime cannot support ' +
+      'that case. Machine-readable `report.json` keeps the internal status distinction.',
   );
   out.push('');
 
@@ -850,7 +988,7 @@ function renderMarkdown(json: ReportJson): string {
   out.push('');
 
   // Per-browser groups: BENCHMARK NUMBERS FIRST (the product), then winners, then the secondary
-  // letter-based conformance matrix, the detailed benchmark matrix, and Δ-vs-reference.
+  // letter-based conformance matrix, and the detailed benchmark matrix.
   for (const section of json.browserSections) {
     out.push(`## Browser: ${section.browser}`);
     out.push('');
@@ -865,9 +1003,9 @@ function renderMarkdown(json: ReportJson): string {
     out.push(renderBenchmarkNumbers(section));
     out.push('');
 
-    out.push('### 2. Winners — one per case (🏆 = fastest correct engine)');
+    out.push('### 2. Winners — one per case (🏆 = most files passed, then fastest correct engine)');
     out.push('');
-    out.push(renderWinners(section, json.referenceEngineId));
+    out.push(renderWinners(section));
     out.push('');
 
     out.push('### 3. Conformance matrix (same display rule, grouped by correctness)');
@@ -884,17 +1022,32 @@ function renderMarkdown(json: ReportJson): string {
     out.push('');
     out.push(renderBenchMatrix(section));
     out.push('');
-
-    out.push(`### 5. Δ vs reference (\`${json.referenceEngineId}\`)`);
-    out.push('');
-    out.push(renderDeltaMatrix(section, json.referenceEngineId));
-    out.push('');
   }
 
-  // 5. Per-engine scorecard (cross-browser layout, but perf index is per-browser).
-  out.push('## 5. Per-engine scorecard');
+  // Per-engine scorecard (cross-browser layout, but perf index is per-browser).
+  out.push('## Per-engine scorecard');
   out.push('');
   out.push(renderScorecards(json));
+  out.push('');
+
+  // File-rotation provenance & findings (§10/§12) — ADDITIVE reporting; never affects the score.
+  out.push('## File-rotation provenance & findings (§10/§12)');
+  out.push('');
+  out.push(renderCorpusChecksums(json));
+  out.push('');
+  out.push('### Rotation coverage — real vs baked-only, per family (§12)');
+  out.push('');
+  out.push(renderRotationCoverage(json.rotation));
+  out.push('');
+  out.push('### Real files that exposed defects — FAIL / ERROR on a rotated real file (§12)');
+  out.push('');
+  out.push(renderRotationDefects(json.rotation));
+  out.push('');
+  out.push(
+    '### Rotated real files with no admissible oracle (all-NA) — need survivor coverage or per-file goldens (§7.4)',
+  );
+  out.push('');
+  out.push(renderAllNaRotated(json.rotation));
   out.push('');
 
   // Caveats (§13).
@@ -918,7 +1071,7 @@ function renderConformanceSummary(json: ReportJson): string {
       const pct = section?.conformancePctByEngine[engineId];
       return pct === undefined ? EM_DASH : `${fmtNum(pct)}%`;
     });
-    rows.push([engineLabel(engineId, json.referenceEngineId), ...cells]);
+    rows.push([engineLabel(engineId), ...cells]);
   }
   return mdTable(header, rows);
 }
@@ -1025,44 +1178,24 @@ function renderBenchMatrix(section: BrowserSection): string {
   return blocks.join('\n');
 }
 
-function renderDeltaMatrix(section: BrowserSection, referenceEngineId: string): string {
-  const candidates = section.engines.filter((e) => e !== referenceEngineId);
-  if (candidates.length === 0) {
-    return '_Only the reference engine present in this browser; no deltas to compute._';
-  }
-  const header = ['Scenario', ...candidates.flatMap((e) => [`${e} perf`, `${e} conf`])];
-  const rows: string[][] = [];
-  for (const scenarioId of section.scenarios) {
-    const cells: string[] = [];
-    for (const engineId of candidates) {
-      const d = section.deltas[engineId]?.[scenarioId];
-      cells.push(perfDeltaLabel(d));
-      cells.push(conformanceDeltaLabel(d?.conformance));
-    }
-    rows.push([`\`${scenarioId}\``, ...cells]);
-  }
-  return mdTable(header, rows);
-}
-
 function renderScorecards(json: ReportJson): string {
   if (json.scorecards.length === 0) return '_No engines._';
   const header = [
     'Engine',
     'Conformance %',
     'Pass / applicable',
-    ...json.browsers.map((b) => `Perf idx (${b})`),
+    ...json.browsers.map((b) => `Perf idx vs winner (${b})`),
     'Capability breadth',
     'Robustness %',
   ];
   const rows: string[][] = [];
   for (const sc of json.scorecards) {
     const perfCells = json.browsers.map((b) => {
-      if (sc.isReference) return '1.00× (ref)';
-      const idx = sc.perfIndexByBrowser[b];
+      const idx = sc.perfIndexVsWinnerByBrowser[b];
       return idx === undefined || idx === null ? EM_DASH : `${fmtNum(idx)}×`;
     });
     rows.push([
-      engineLabel(sc.engineId, json.referenceEngineId),
+      engineLabel(sc.engineId),
       `${fmtNum(sc.conformancePct)}%`,
       `${sc.conformancePassCount} / ${sc.conformanceAdmissibleCount}`,
       ...perfCells,
@@ -1073,7 +1206,7 @@ function renderScorecards(json: ReportJson): string {
   return [
     mdTable(header, rows),
     '',
-    '_Perf index = geometric mean of throughput ratios vs reference, per browser, over co-passing scenarios. >1.00× = faster than reference on average; null/— = no co-passing scenario to compare._',
+    '_Perf index = geometric mean of throughput ratios vs the per-case WINNER, per browser, over co-eligible scenarios. 1.00× = the fastest correct engine on every rankable case; <1.00× = slower than the winner on average; null/— = no co-eligible scenario to compare._',
   ].join('\n');
 }
 
@@ -1087,7 +1220,7 @@ function renderLeaderboard(json: ReportJson): string {
   ranked.forEach((sc, i) => {
     rows.push([
       String(i + 1),
-      engineLabel(sc.engineId, json.referenceEngineId),
+      engineLabel(sc.engineId),
       sc.uncontestedWins ? `${sc.wins} (${sc.uncontestedWins} unc.)` : String(sc.wins),
       `${fmtNum(sc.conformancePct)}%`,
       sc.robustnessRate === null ? EM_DASH : `${fmtNum(sc.robustnessRate)}%`,
@@ -1099,13 +1232,14 @@ function renderLeaderboard(json: ReportJson): string {
   return [
     mdTable(header, rows),
     '',
-    '_Wins = cases where the engine was the fastest CORRECT engine; co-winners of a tie both count, ' +
-      '"unc." = uncontested (the only eligible engine). Win COUNTS are aggregated across browsers ' +
-      '(counts are safe to sum; raw timing numbers are not — see Caveats). Ranked by wins, then conformance._',
+    '_Wins = cases where the engine was the winner — the CORRECT engine that passed the most candidate ' +
+      'files, ties broken by lowest total time; co-winners of a tie both count, "unc." = uncontested ' +
+      '(the only eligible engine). Win COUNTS are aggregated across browsers (counts are safe to sum; ' +
+      'raw timing numbers are not — see Caveats). Ranked by wins, then conformance._',
   ].join('\n');
 }
 
-function renderWinners(section: BrowserSection, _referenceEngineId: string): string {
+function renderWinners(section: BrowserSection): string {
   if (section.winners.length === 0) return '_No cases._';
   const header = ['Case', 'Winner', 'Value', 'Runner-up', 'Margin', 'Eligible', 'Flag'];
   const rows: string[][] = [];
@@ -1172,51 +1306,129 @@ function benchmarkCellMd(
   return visibleCellMd(cell, conf);
 }
 
+// ── rotation provenance rendering (§10/§12) ────────────────────────────────────────────────────
+
+/** Reproducibility line: the corpus checksum(s) these cells came from (§10/§13). */
+function renderCorpusChecksums(json: ReportJson): string {
+  const sums = json.corpusChecksums;
+  if (sums.length === 0) {
+    return '_Corpus checksum: not recorded in any result env — reproducibility of the selected files is unverifiable._';
+  }
+  const list = sums.map((c) => `\`${c}\``).join(', ');
+  if (sums.length === 1) {
+    return `Corpus checksum: ${list} — single corpus, so the per-cell selected files are directly comparable.`;
+  }
+  return (
+    `**Corpus checksum: ${sums.length} DISTINCT values** — ${list}. Results were merged across different ` +
+    'corpora/selections, so the per-cell selected files differ; compare only within one checksum (see Caveats).'
+  );
+}
+
+/** §12 DoD (a): per-family real-vs-baked coverage, with the actually-exercised real scenarios enumerated. */
+function renderRotationCoverage(rot: RotationReport): string {
+  const totals =
+    `_Totals: ${rot.realScenarioCount} scenario(s) exercised on a rotated real file, ` +
+    `${rot.bakedOnlyScenarioCount} still baked-only; ${rot.realCellCount} real cell(s) vs ` +
+    `${rot.bakedCellCount} baked/legacy cell(s). A cell is "real" iff selection.isBaked === false; ` +
+    'absent selection ⇒ baked/unknown. Coverage is provenance only — it never affects scoring._';
+  if (rot.familyCoverage.length === 0) {
+    return ['_No results._', '', totals].join('\n');
+  }
+  const header = ['Family', 'Scenarios on real file', 'Baked-only scenarios', 'Real cells', 'Baked cells'];
+  const rows = rot.familyCoverage.map((f) => [
+    f.family,
+    String(f.realScenarios.length),
+    String(f.bakedOnlyScenarios.length),
+    String(f.realCellCount),
+    String(f.bakedCellCount),
+  ]);
+  const detailFamilies = rot.familyCoverage.filter((f) => f.realScenarios.length > 0);
+  const details =
+    detailFamilies.length === 0
+      ? []
+      : [
+          '',
+          '<details><summary>Scenarios exercised on a real file, per family</summary>',
+          '',
+          ...detailFamilies.map(
+            (f) => `- **${f.family}**: ${f.realScenarios.map((s) => `\`${s}\``).join(', ')}`,
+          ),
+          '',
+          '</details>',
+        ];
+  return [mdTable(header, rows), '', totals, ...details].join('\n');
+}
+
+/** §12 DoD (b): the VALUABLE findings — a rotated real file that produced FAIL/ERROR (a real defect). */
+function renderRotationDefects(rot: RotationReport): string {
+  if (rot.realDefects.length === 0) {
+    return '_None — no rotated real file produced a FAIL or ERROR this run._';
+  }
+  const header = ['Case', 'Engine', 'Browser', 'Status', 'File', 'sha256', 'Reason'];
+  const rows = rot.realDefects.map((c) => [
+    `\`${c.scenarioId}\``,
+    `\`${c.engineId}\``,
+    c.browser,
+    c.status,
+    `\`${c.file}\``,
+    c.sha256 ? `\`${c.sha256}\`` : EM_DASH,
+    c.reason ?? EM_DASH,
+  ]);
+  return [
+    mdTable(header, rows),
+    '',
+    `_${rot.realDefectCount} defect(s) exposed by rotated real files — real bugs, traceable to the exact ` +
+      'bytes (file + sha256). These are the payoff of rotation (§12)._',
+  ].join('\n');
+}
+
+/** §11 phase 2 / §12: rotated real files whose every oracle was golden-keyed → the cell is all-NA. */
+function renderAllNaRotated(rot: RotationReport): string {
+  if (rot.allNaRotated.length === 0) {
+    return '_None — every rotated real file produced at least one admissible oracle outcome._';
+  }
+  const header = ['Case', 'Engine', 'Browser', 'File', 'sha256', 'Candidates'];
+  const rows = rot.allNaRotated.map((c) => [
+    `\`${c.scenarioId}\``,
+    `\`${c.engineId}\``,
+    c.browser,
+    `\`${c.file}\``,
+    c.sha256 ? `\`${c.sha256}\`` : EM_DASH,
+    c.candidateCount === undefined ? EM_DASH : String(c.candidateCount),
+  ]);
+  return [
+    mdTable(header, rows),
+    '',
+    `_${rot.allNaRotatedCount} rotated real cell(s) resolved to NA_ASSET (every oracle was golden-keyed to ` +
+      'the baked fixture, so the real file produced zero admissible signal). Add a survivor oracle ' +
+      '(golden-free invariant) or a per-file golden so these files can actually be scored (§7.4)._',
+  ].join('\n');
+}
+
 // ── label / format helpers ───────────────────────────────────────────────────────────────────
 
 function visibleCellMd(cell: BenchCell | undefined, conf: ConformanceCell | undefined): string {
   const status = conf?.status ?? null;
   if (status === null) return EM_DASH;
-  const bench =
-    cell?.wallMedianMs !== undefined && Number.isFinite(cell.wallMedianMs)
-      ? { wall: { median: cell.wallMedianMs } }
-      : undefined;
+  // Wall stats: pickExecutionMs prefers the exhaustive aggregate (total across the candidate file set),
+  // else the single-file median. Include whichever the cell measured so the displayed time is the total.
+  const median = cell?.wallMedianMs;
+  const aggregate = cell?.wallAggregateMs;
+  const wall: { median?: number; aggregate?: number } = {};
+  if (median !== undefined && Number.isFinite(median)) wall.median = median;
+  if (aggregate !== undefined && Number.isFinite(aggregate)) wall.aggregate = aggregate;
+  const hasWall = wall.median !== undefined || wall.aggregate !== undefined;
   return visibleResult({
     status,
-    ...(bench ? { bench } : {}),
+    ...(hasWall ? { bench: { wall } } : {}),
     ...(conf?.durationMs !== undefined ? { durationMs: conf.durationMs } : {}),
+    // Coverage drives the ` · passed/total` suffix on exhaustive PASS cells (absent ⇒ no suffix).
+    ...(cell?.coverage ? { coverage: cell.coverage } : {}),
   });
 }
 
-function perfDeltaLabel(d: DeltaCell | undefined): string {
-  if (!d || d.perf === undefined || d.perf === null) {
-    return 'N/A';
-  }
-  const { verdict, deltaPct } = d.perf;
-  const sign = deltaPct > 0 ? '+' : '';
-  // deltaPct is normalized so positive == better.
-  if (verdict === 'within-noise') return `within-noise (${sign}${fmtNum(deltaPct)}%)`;
-  if (verdict === 'faster') return `faster (${sign}${fmtNum(deltaPct)}%)`;
-  return `slower (${sign}${fmtNum(deltaPct)}%)`;
-}
-
-function conformanceDeltaLabel(d: ConformanceDelta | undefined): string {
-  switch (d) {
-    case 'gained':
-      return 'gained';
-    case 'regressed':
-      return 'regressed';
-    case 'same':
-      return 'same';
-    case 'NA':
-    case undefined:
-    default:
-      return 'N/A';
-  }
-}
-
-function engineLabel(engineId: string, referenceEngineId: string): string {
-  return engineId === referenceEngineId ? `\`${engineId}\` (ref)` : `\`${engineId}\``;
+function engineLabel(engineId: string): string {
+  return `\`${engineId}\``;
 }
 
 /** Admissible = the cell counts toward conformance % (excludes NA_*, SKIPPED). ERROR/FAIL count. */

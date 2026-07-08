@@ -45,6 +45,8 @@ const opts = {
   timeoutMs: 30 * 60 * 1000, // 30 min default cap for a whole matrix run
   headed: false,
   reuseSuccessful: true,
+  randomSeed: /** @type {string|undefined} */ (undefined), // §10: pin per-scenario media pick for reproducibility
+  exhaustive: false, // §6.2: run every candidate file per scenario (AND status / median bench), not one
 };
 
 const argv = process.argv.slice(2);
@@ -64,6 +66,8 @@ for (let i = 0; i < argv.length; i++) {
     case '--warmup': opts.warmup = Number(next()); break;
     case '--iters': opts.iters = Number(next()); break;
     case '--timeout-ms': opts.timeoutMs = Number(next()); break;
+    case '--random-seed': opts.randomSeed = next(); break;
+    case '--exhaustive': opts.exhaustive = true; break;
     case '--headed': opts.headed = true; break;
     case '--no-reuse': opts.reuseSuccessful = false; break;
     case '-h': case '--help':
@@ -161,12 +165,11 @@ try {
   const suiteInfo = await page.evaluate(() => ({
     engineIds: window.__SUITE__.engineIds,
     scenarioIds: window.__SUITE__.scenarioIds,
-    referenceEngineId: window.__SUITE__.referenceEngineId,
     env: window.__SUITE__.env,
   }));
   console.log(
     `[launch] ${opts.browser} booted: ${suiteInfo.engineIds.length} engines, ` +
-      `${suiteInfo.scenarioIds.length} scenarios; ref=${suiteInfo.referenceEngineId}`,
+      `${suiteInfo.scenarioIds.length} scenarios`,
   );
 
   if (opts.reuseSuccessful) {
@@ -190,6 +193,8 @@ try {
     ...(opts.scenarios.length ? { scenarioIds: opts.scenarios } : {}),
     ...(Number.isFinite(opts.warmup) ? { warmup: opts.warmup } : {}),
     ...(Number.isFinite(opts.iters) ? { iters: opts.iters } : {}),
+    ...(opts.randomSeed !== undefined ? { randomSeed: opts.randomSeed } : {}),
+    ...(opts.exhaustive ? { exhaustiveMedia: true } : {}),
   };
   activeFilter = filter;
 
@@ -278,7 +283,6 @@ async function saveResultsPayload(page, partialReason, options = {}) {
     // partial save must still persist whatever results exist rather than abort the whole run.
     env: window.__SUITE__?.env,
     support: window.__SUITE__?.support,
-    referenceEngineId: window.__SUITE__?.referenceEngineId,
     results: window.__RESULTS__ ?? [],
     ...(reason ? { partialReason: reason } : {}),
   }), partialReason ?? null);

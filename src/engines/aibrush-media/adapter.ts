@@ -5319,6 +5319,6 @@ class AibrushMediaEngine implements MediaEngine {
 }
 
 /** Phase D wiring hook — called from src/app/register.ts (ENGINE_WIRINGS). */
-export function registerAibrushMedia(opts?: { id?: string; reference?: boolean }): void {
-  registerEngine(opts?.id ?? REGISTER_ID, () => new AibrushMediaEngine(), { reference: opts?.reference ?? false });
+export function registerAibrushMedia(opts?: { id?: string }): void {
+  registerEngine(opts?.id ?? REGISTER_ID, () => new AibrushMediaEngine());
 }

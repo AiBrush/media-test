@@ -6,11 +6,11 @@
  * measured, oracle-gated results.
  *
  * Run with bun (which executes TypeScript directly, so the .ts import of report.ts resolves):
- *   bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md] [--reference <id>]
+ *   bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md]
  *
- * The reference engine defaults to the one recorded in the raw files (the page exposes
- * referenceEngineId); --reference overrides it. Later runs supersede earlier ones for the same
- * (engine, browser, scenario) triple (report.ts does last-write-wins on that key).
+ * There is no reference engine — every candidate is scored on its own oracle-gated result. Later runs
+ * supersede earlier ones for the same (engine, browser, scenario) triple (report.ts does
+ * last-write-wins on that key).
  */
 
 import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -26,7 +26,6 @@ const ROOT = resolve(__dirname, '..');
 const opts = {
   rawDir: 'results/raw',
   out: 'results/report.md',
-  reference: null,
   bundleSizes: 'results/bundle-sizes.json',
 };
 const argv = process.argv.slice(2);
@@ -34,11 +33,15 @@ for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--raw-dir') opts.rawDir = argv[++i];
   else if (a === '--out') opts.out = argv[++i];
-  else if (a === '--reference') opts.reference = argv[++i];
-  else if (a === '--bundle-sizes') opts.bundleSizes = argv[++i];
+  else if (a === '--reference') {
+    // Deprecated no-op: there is no reference engine anymore. Consume + ignore the value so old
+    // invocations keep working instead of erroring on an "unknown arg".
+    const ignored = argv[++i];
+    console.error(`[compare] --reference '${ignored}' ignored: the reference-engine concept was removed.`);
+  } else if (a === '--bundle-sizes') opts.bundleSizes = argv[++i];
   else if (a === '-h' || a === '--help') {
     console.log(
-      'bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md] [--reference <id>] [--bundle-sizes results/bundle-sizes.json]',
+      'bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md] [--bundle-sizes results/bundle-sizes.json]',
     );
     process.exit(0);
   } else {
@@ -66,7 +69,6 @@ if (files.length === 0) {
 
 /** @type {import('../src/core/scenario.ts').ScenarioResult[]} */
 const allResults = [];
-let referenceFromData = null;
 let suiteVersion;
 
 for (const file of files) {
@@ -83,7 +85,6 @@ for (const file of files) {
     continue;
   }
   allResults.push(...results);
-  if (!referenceFromData && payload.referenceEngineId) referenceFromData = payload.referenceEngineId;
   for (const r of results) {
     if (!suiteVersion && r.env?.suiteVersion) suiteVersion = r.env.suiteVersion;
   }
@@ -94,8 +95,6 @@ if (allResults.length === 0) {
   console.error('compare.mjs: no results loaded from any file.');
   process.exit(1);
 }
-
-const referenceEngineId = opts.reference ?? referenceFromData ?? 'mediabunny';
 
 // ── inject offline per-engine bundle sizes into the bundle-size case ──────────────────────────
 // The `performance/bundle-size` case is a build-time metric: there is nothing to measure at run time,
@@ -113,7 +112,6 @@ const bundleInjected = injectBundleSizes(allResults, resolve(ROOT, opts.bundleSi
 // ── build the report ───────────────────────────────────────────────────────────────────────
 const { markdown, json } = buildReport({
   results: allResults,
-  referenceEngineId,
   ...(suiteVersion ? { suiteVersion } : {}),
 });
 
@@ -128,7 +126,7 @@ writeFileSync(outJson, JSON.stringify(json, null, 2) + '\n');
 console.log(
   `[compare] wrote ${opts.out} + ${outJson.replace(ROOT + '/', '')} ` +
     `· ${allResults.length} results · ${json.engines.length} engines · ${json.browsers.length} browsers · ` +
-    `${json.scenarios.length} scenarios · ref=${referenceEngineId}` +
+    `${json.scenarios.length} scenarios` +
     (bundleInjected > 0 ? ` · bundle-sizes injected into ${bundleInjected} cell(s)` : ''),
 );
 

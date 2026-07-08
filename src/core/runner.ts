@@ -18,9 +18,9 @@
  *   5. ALWAYS calls `engine.dispose()` in a finally.
  *
  * Everything is wrapped in try/catch → status ERROR with the error message. The oracle hooks
- * (`decodeWithPlatform`, `playbackSmoke`) and the reference engine are injected by the caller via
- * `opts` so the registry/app wires the platform engine; if absent, oracles that need them fail
- * with a clear reason (handled in oracles.ts).
+ * (`decodeWithPlatform`, `playbackSmoke`) are injected by the caller via `opts` so the registry/app
+ * wires the platform engine; if absent, oracles that need them fail with a clear reason (handled in
+ * oracles.ts).
  */
 
 import type {
@@ -43,6 +43,7 @@ import type {
 } from './engine.ts';
 import type {
   BenchSummary,
+  ExhaustiveFileResult,
   MetricId,
   MetricSample,
   OracleOutcome,
@@ -57,13 +58,25 @@ import type { BenchOptions } from './bench.ts';
 import type { MeasureContext } from './measure.ts';
 import type { GoldenStore, OracleContext } from './oracles.ts';
 
-import { getEngine, getReferenceEngineId, listEngines, listScenarios, getScenario } from './registry.ts';
+import { getEngine, listScoredEngines, listScenarios, getScenario } from './registry.ts';
 import type { RegisteredEngine } from './registry.ts';
 import { detectCodecSupport, detectEnv } from './feature-detect.ts';
 import { Meter } from './measure.ts';
-import { DEFAULT_BENCH, metricSampleValue, summarize } from './bench.ts';
+import { DEFAULT_BENCH, metricSampleValue, summarize, summarizeAcrossFiles } from './bench.ts';
 import { loadGolden, runOracle } from './oracles.ts';
 import { disabledCellReason } from './disabled-cells.ts';
+// Per-scenario media-file rotation (§6/§10): the ONE seeded RNG shared with media-selection, plus the
+// selection API. The runner only decides WHICH file is fetched — it never mutates bytes, softens an
+// oracle, or routes a real defect to NA (hard rules R1/R2/R3).
+import { mulberry32, hashSeed } from './seeded-rng.ts';
+import {
+  loadScenarioSources,
+  selectForRun,
+  candidatesForRun,
+  selectionCacheTag,
+  computeCorpusChecksum,
+} from './media-selection.ts';
+import type { ResolvedInput, ScenarioSelection } from './media-selection.ts';
 // The platform engine IS the browser-pure oracle decoder/player (§8). runMatrix injects these into
 // every cell so oracles that decode output / smoke-play it work without the caller wiring them.
 import { decodeBytesToFrames, playbackSmoke as platformPlaybackSmoke } from '../engines/platform/oracle-helpers.ts';
@@ -383,6 +396,19 @@ export interface RunOptions {
   randomizeOrder?: boolean;
   /** Optional seed used when randomizeOrder is enabled, so UI highlighting can mirror the runner. */
   randomSeed?: string;
+  /**
+   * Per-scenario media-file rotation (§6/§10). true (default) ⇒ pick ONE input per scenario from
+   * {baked fixture} ∪ {shape-matching real files}, seeded on randomSeed. false ⇒ force the baked
+   * fixture everywhere (baked-canonical audit / debug). Never mutates a file, never softens an oracle.
+   */
+  rotateMedia?: boolean;
+  /**
+   * Exhaustive media mode (§6.2). true ⇒ run EVERY candidate file (baked + all shape/duration-passing
+   * real files) per scenario, in the same order for every engine, and aggregate: the cell PASSes only
+   * if ALL files pass (any file FAIL/ERROR ⇒ cell FAIL, naming the file), and the bench is the MEDIAN
+   * across the passing files (+ per-file spread). Default off (one seeded file per run, ~constant time).
+   */
+  exhaustiveMedia?: boolean;
   onResult?: (r: ScenarioResult) => void;
   onProgress?: (done: number, total: number, label: string) => void;
   /** Reuse cached PASS/NA cells and write every completed cell back to persistent storage. */
@@ -414,21 +440,28 @@ export function buildExecutionOrder(
 }
 
 /**
- * The injected oracle hooks + reference engine. INTERNAL_API.md types `runOne`'s `opts` as
- * `Partial<RunOptions>`, but the oracle context (oracles.ts) needs the platform-decode /
- * playback-smoke hooks and an optional reference engine. The runner accepts them alongside the
- * public RunOptions so the caller (registry/app) wires the platform engine. This widening is
- * additive — every `Partial<RunOptions>` is assignable to `RunOneOptions`.
+ * The injected oracle hooks. INTERNAL_API.md types `runOne`'s `opts` as `Partial<RunOptions>`, but the
+ * oracle context (oracles.ts) needs the platform-decode / playback-smoke hooks. The runner accepts them
+ * alongside the public RunOptions so the caller (registry/app) wires the platform engine. This widening
+ * is additive — every `Partial<RunOptions>` is assignable to `RunOneOptions`.
  */
 export interface RunOneOptions extends Partial<RunOptions> {
   /** injected by caller: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
   decodeWithPlatform?: OracleContext['decodeWithPlatform'];
   /** injected by caller: <video> playback smoke test → resolves true if it plays a few frames */
   playbackSmoke?: OracleContext['playbackSmoke'];
-  /** injected by caller: the reference engine instance (for 'reference-reimport' oracle) */
-  referenceEngine?: MediaEngine;
   /** environment captured once per run (attached to every result) */
   env?: RunEnv;
+  /**
+   * Per-scenario rotation (§6.4): the concrete inputs this cell fetches. `id` drives golden/identity
+   * (baked ⇒ flat asset id; real ⇒ scenario-dir path that 404s its golden); `urlAssetPath` is the bytes
+   * actually fetched. When present, it REPLACES the scenario.input-derived asset list in runOne/runBench.
+   */
+  resolvedInputs?: ResolvedInput[];
+  /** provenance of the rotated pick, stamped onto the result's `selection` field (purely additive). */
+  selection?: { file: string; sha256?: string; isBaked: boolean; candidateCount?: number };
+  /** the run's selection seed (RunOptions.randomSeed), recorded in the result's selection for replay. */
+  runSeed?: string;
 }
 
 // ── MediaInput construction from the served corpus ─────────────────────────────────────────────
@@ -513,18 +546,52 @@ async function missingAssetReason(assetId: string): Promise<string | undefined> 
 }
 
 /**
- * Build a `MediaInput` for a corpus asset served as a static file at `/fixtures/media/<id>`.
+ * Missing-asset preflight for a ROTATED resolved input (§6). Rotated real files live in the on-disk
+ * scenario catalog, NOT in fixtures/manifest.json, so the manifest-based `missingAssetReason` would
+ * falsely NA_ASSET a perfectly present file. We instead HEAD-check the actual bytes URL (`urlAssetPath`)
+ * and route to NA_ASSET ONLY on a definitive 404 ('selected file missing on disk'). Any other status
+ * (405/HEAD-unsupported, transient error) is tolerated so a present file NEVER becomes a false NA — a
+ * genuine unreadable file still surfaces honestly as ERROR when the op fetches it (R2/R3).
+ */
+async function resolvedInputMissingReason(resolved: ResolvedInput): Promise<string | undefined> {
+  const url = mediaAssetUrl(resolved.urlAssetPath);
+  try {
+    const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+    if (res.status === 404) {
+      return `selected file missing on disk: '${resolved.urlAssetPath}' (404 ${res.statusText})`;
+    }
+  } catch {
+    // Network hiccup / HEAD unsupported: do not manufacture an NA. A real read failure surfaces later.
+  }
+  return undefined;
+}
+
+/**
+ * Build a `MediaInput` for a corpus asset served as a static file under `/fixtures/media/`.
  * `blob()`/`arrayBuffer()` fetch lazily and cache; an optional `mutate` (robustness) rewrites the
  * bytes after fetch so the engine is fed corrupted input.
+ *
+ * §6.4 id/url decoupling: `id` stays the golden/identity key (baked ⇒ flat asset id whose golden
+ * resolves; real ⇒ scenario-dir path whose golden 404s), while the OPTIONAL `urlAssetPath` overrides
+ * ONLY which bytes are fetched. `sizeHint` supplies MediaInput.sizeBytes for rotated real files, which
+ * are NOT in fixtures/manifest.json (the manifest still wins for baked ids when present). Both new
+ * params are optional, so every existing caller is unaffected.
  */
-function buildMediaInput(assetId: string, mutate?: (bytes: Uint8Array) => Uint8Array): MediaInput {
-  const url = mediaAssetUrl(assetId);
+function buildMediaInput(
+  assetId: string,
+  mutate?: (bytes: Uint8Array) => Uint8Array,
+  urlAssetPath?: string,
+  sizeHint?: number,
+): MediaInput {
+  const url = mediaAssetUrl(urlAssetPath ?? assetId);
   const mime = mimeForAssetId(assetId);
   const manifestSize = fixtureManifestCache?.get(assetId)?.sizeBytes;
   const sizeBytes =
     typeof manifestSize === 'number' && Number.isSafeInteger(manifestSize) && manifestSize >= 0
       ? manifestSize
-      : undefined;
+      : typeof sizeHint === 'number' && Number.isSafeInteger(sizeHint) && sizeHint >= 0
+        ? sizeHint
+        : undefined;
 
   let cached: Promise<ArrayBuffer> | undefined;
   const fetchBytes = (): Promise<ArrayBuffer> => {
@@ -794,7 +861,25 @@ function isGoldenBakeGap(outcome: OracleOutcome): boolean {
     detail.includes('no golden frame') ||
     detail.includes('golden frames pending') ||
     detail.includes('frame-bake pending') ||
-    detail.includes('frame-bake must run')
+    detail.includes('frame-bake must run') ||
+    // Oracles that RETIRE to NA (oracles.ts) on a rotated, golden-less real file emit the canonical
+    // substring 'golden absent' so a missing base routes to NA_ASSET, never a FAIL (P0 contract).
+    detail.includes('golden absent') ||
+    // §11 broadening: a golden-KEYED oracle that fails ONLY because its golden is ABSENT (a rotated,
+    // golden-less real file) is honestly NA_ASSET, not FAIL. Each substring below is emitted by
+    // oracles.ts EXCLUSIVELY on a missing-golden/absent-base branch — verified to be either an early
+    // `return fail(...)` guarded by golden-absence or a mutually-exclusive `else` arm — so it can NEVER
+    // be concatenated alongside a real comparison MISMATCH detail (R2: a real defect stays a FAIL). For
+    // a BAKED fixture the golden is present, so none of these fire and baked outcomes are unchanged.
+    detail.includes('no golden meta') || // goldenMetadata (oracles.ts:603)
+    detail.includes('no golden packets') || // goldenPackets (711) + demuxMuxRoundtrip (3449)
+    detail.includes('no golden packets for source comparison') || // demuxMuxRoundtrip (3449)
+    detail.includes('no golden video packet pts table') || // vfr linear-decode PTS table (3610)
+    detail.includes('from golden packets/frames') || // seek-accuracy else-arm (2231)
+    detail.includes('could not resolve linear-decode frame pts from golden') || // linear-decode invariant (3542)
+    detail.includes('no golden sample rate/duration') || // gapless decoded-sample-count (2920)
+    detail.includes('no golden/source duration to compare') || // property-invariant duration (2727/3875)
+    detail.includes('metamorphic decrypt: no cleartext base to compare') // DERIVED metamorphic base-absent (2819/2829/2832/2855)
   );
 }
 
@@ -957,6 +1042,190 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+// ── Exhaustive media mode (§6.2) ───────────────────────────────────────────────────────────────
+
+/**
+ * Run one (engine, scenario) cell against EVERY candidate file and aggregate into a single result.
+ * `firstEngine` (already constructed + negotiated OK) runs file 0; a FRESH engine is constructed per
+ * subsequent file (runOne inits+disposes each). Never caches.
+ */
+async function runExhaustiveCell(
+  firstEngine: MediaEngine,
+  engineId: string,
+  reg: RegisteredEngine,
+  candidates: ScenarioSelection[],
+  scenario: Scenario,
+  opts: RunOptions,
+  support: CodecSupport,
+  runEnvBase: RunEnv,
+  pillar: NonNullable<RunOptions['pillar']>,
+): Promise<ScenarioResult> {
+  // The aggregate result MUST carry the engine's INSTANCE id (engine.id) — the same id runOne stamps on
+  // every non-exhaustive result and the same id the UI lays its columns out with. Using the registry
+  // `engineId` here (e.g. 'ffmpeg-wasm' vs the instance 'ffmpeg.wasm@0.12.15') left the cell unmatched,
+  // so it never filled and the running-spinner stuck on it. Captured before runOne disposes firstEngine.
+  const instanceId = firstEngine.id ?? engineId;
+
+  const perFile: Array<{ sel: ScenarioSelection; result: ScenarioResult }> = [];
+  for (let i = 0; i < candidates.length; i++) {
+    if (opts.signal?.aborted) break;
+    const sel = candidates[i]!;
+    const engine = i === 0 ? firstEngine : await reg.factory();
+    const runOneOpts: RunOneOptions = {
+      browser: opts.browser,
+      pillar,
+      env: { ...runEnvBase, engineId },
+      decodeWithPlatform: opts.decodeWithPlatform ?? decodeBytesToFrames,
+      playbackSmoke: opts.playbackSmoke ?? platformPlaybackSmoke,
+      ...(opts.benchOptions ? { benchOptions: opts.benchOptions } : {}),
+      resolvedInputs: sel.resolvedInputs,
+      selection: {
+        file: sel.selectedFile,
+        isBaked: sel.isBaked,
+        ...(sel.selectedSha256 ? { sha256: sel.selectedSha256 } : {}),
+        candidateCount: candidates.length,
+      },
+      ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
+    };
+    let result: ScenarioResult;
+    try {
+      result = await runOne(engine, sel.effectiveScenario, opts.browser, support, runOneOpts);
+    } catch (err) {
+      // runOne is total, but guard anyway; a construct/init failure surfaces as this file's ERROR.
+      result = {
+        engineId,
+        browser: opts.browser,
+        scenarioId: scenario.id,
+        family: scenario.family,
+        status: 'ERROR',
+        oracleOutcomes: [],
+        reason: errMessage(err),
+        env: { ...runEnvBase, engineId },
+      };
+    }
+    perFile.push({ sel, result });
+  }
+
+  return aggregateExhaustive(instanceId, opts.browser, scenario, perFile, runEnvBase, opts.randomSeed);
+}
+
+/**
+ * Aggregate per-file results into ONE cell (§6.2/§9). CORRECTNESS = logical AND: any admissible
+ * FAIL/ERROR ⇒ the cell FAILs/ERRORs and names the offending file(s) (a FAIL is NEVER averaged into a
+ * pass); all admissible PASS ⇒ PASS; no admissible file (all NA_*) ⇒ carry the NA kind. PERFORMANCE =
+ * summarizeAcrossFiles per metric — `.aggregate` COMBINES the passing files (SUM for additive cost
+ * metrics, MAX for peakMemory, MEDIAN for rate metrics) while `.samples` keeps the per-file spread.
+ * `coverage` records passed/admissible/total so winners rank coverage-first. The `exhaustive[]` array
+ * preserves every file's verdict + numbers so the spread is visible and a FAIL traces to its bytes.
+ */
+function aggregateExhaustive(
+  engineId: string,
+  browser: BrowserName,
+  scenario: Scenario,
+  perFile: Array<{ sel: ScenarioSelection; result: ScenarioResult }>,
+  runEnvBase: RunEnv,
+  runSeed: string | undefined,
+): ScenarioResult {
+  const files: ExhaustiveFileResult[] = perFile.map(({ sel, result }) => ({
+    file: sel.selectedFile,
+    ...(sel.selectedSha256 ? { sha256: sel.selectedSha256 } : {}),
+    isBaked: sel.isBaked,
+    status: result.status,
+    ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.bench ? { bench: result.bench } : {}),
+  }));
+  const admissible = perFile.filter(
+    (p) => p.result.status === 'PASS' || p.result.status === 'FAIL' || p.result.status === 'ERROR',
+  );
+  const failures = admissible.filter((p) => p.result.status === 'FAIL' || p.result.status === 'ERROR');
+  const passes = admissible.filter((p) => p.result.status === 'PASS');
+
+  const base: Omit<ScenarioResult, 'status' | 'oracleOutcomes'> = {
+    engineId,
+    browser,
+    scenarioId: scenario.id,
+    family: scenario.family,
+    exhaustive: files,
+    // §6.2 coverage: how many candidate files this engine was actually scored over. `passed` are the
+    // files combined into bench.<metric>.aggregate; `admissible` = PASS+FAIL+ERROR (real signal);
+    // `total` = every candidate offered. The report ranks winners coverage-FIRST (higher passed wins).
+    coverage: { passed: passes.length, admissible: admissible.length, total: perFile.length },
+    // Representative provenance: this cell spanned N files (per-file detail is in `exhaustive`).
+    selection: {
+      file: `${perFile.length} files (exhaustive)`,
+      isBaked: files.length > 0 && files.every((f) => f.isBaked),
+      ...(runSeed !== undefined ? { runSeed } : {}),
+      candidateCount: perFile.length,
+    },
+    env: { ...runEnvBase, engineId },
+    ...(perFile[0]?.result.startedAtIso ? { startedAtIso: perFile[0].result.startedAtIso } : {}),
+    ...(perFile[0]?.result.primaryMetric ? { primaryMetric: perFile[0].result.primaryMetric } : {}),
+  };
+
+  if (failures.length > 0) {
+    const anyFail = failures.some((f) => f.result.status === 'FAIL');
+    const names = failures.map((f) => `${f.sel.selectedFile}(${f.result.status})`).join(', ');
+    return {
+      ...base,
+      status: anyFail ? 'FAIL' : 'ERROR',
+      oracleOutcomes: failures[0]!.result.oracleOutcomes ?? [],
+      reason: `${failures.length}/${admissible.length} file(s) failed [${names}]: ${failures[0]!.result.reason ?? 'no detail'}`,
+    };
+  }
+  if (passes.length > 0) {
+    const bench = aggregateBenchAcrossFiles(passes.map((p) => p.result.bench));
+    return {
+      ...base,
+      status: 'PASS',
+      oracleOutcomes: passes[0]!.result.oracleOutcomes ?? [],
+      reason: `all ${passes.length} file(s) passed`,
+      ...(bench ? { bench } : {}),
+    };
+  }
+  // No admissible file → all NA_*. Keep the actual NA kind: all-same → that; mixed → prefer NA_ASSET.
+  const kinds = new Set(perFile.map((p) => p.result.status));
+  const status =
+    kinds.size === 1
+      ? [...kinds][0]!
+      : perFile.some((p) => p.result.status === 'NA_ASSET')
+        ? 'NA_ASSET'
+        : (perFile[0]?.result.status ?? 'NA_ASSET');
+  return {
+    ...base,
+    status,
+    oracleOutcomes: perFile[0]?.result.oracleOutcomes ?? [],
+    ...(perFile[0]?.result.reason ? { reason: perFile[0].result.reason } : {}),
+  };
+}
+
+/**
+ * Exhaustive-mode headline bench (§6.2). For every metric the passing files carry, take each passing
+ * file's representative value (its `bench[metric].median`) and summarize across files via
+ * `summarizeAcrossFiles`: `.aggregate` COMBINES them per metric policy (SUM for additive cost metrics,
+ * MAX for peakMemory, MEDIAN for higher-is-better rate metrics), while `.median`/`.p95`/`.mad`/`.samples`
+ * describe the per-file SPREAD and `.n` is the file count. Undefined if no passing file carried a number.
+ */
+function aggregateBenchAcrossFiles(
+  benches: Array<ScenarioResult['bench'] | undefined>,
+): ScenarioResult['bench'] | undefined {
+  const present = benches.filter((b): b is Partial<Record<MetricId, BenchSummary>> => !!b);
+  if (present.length === 0) return undefined;
+  const metrics = new Set<MetricId>();
+  for (const b of present) for (const k of Object.keys(b)) metrics.add(k as MetricId);
+  const out: Partial<Record<MetricId, BenchSummary>> = {};
+  for (const m of metrics) {
+    const values: number[] = [];
+    for (const b of present) {
+      const s = b[m];
+      if (s && typeof s.median === 'number' && Number.isFinite(s.median)) values.push(s.median);
+    }
+    if (values.length === 0) continue;
+    // warmup=0: these per-file medians are already-summarized representatives, not primed iterations.
+    out[m] = summarizeAcrossFiles(m, values, 0);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 // ── runOne ───────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -987,6 +1256,21 @@ export async function runOne(
     family: scenario.family,
     startedAtIso,
     ...(opts?.env ? { env: opts.env } : {}),
+    // §10 provenance: record WHICH file this cell ran against so a result replays from (runSeed, corpus)
+    // and a FAIL on a rotated real file traces to the exact bytes. Purely additive — not read by scoring.
+    ...(opts?.selection
+      ? {
+          selection: {
+            file: opts.selection.file,
+            ...(opts.selection.sha256 ? { sha256: opts.selection.sha256 } : {}),
+            isBaked: opts.selection.isBaked,
+            ...(opts?.runSeed ? { runSeed: opts.runSeed } : {}),
+            ...(opts.selection.candidateCount !== undefined
+              ? { candidateCount: opts.selection.candidateCount }
+              : {}),
+          },
+        }
+      : {}),
   };
 
   const finalize = (
@@ -1004,13 +1288,32 @@ export async function runOne(
   });
 
   try {
-    const assetIds = Array.isArray(scenario.input) ? scenario.input : [scenario.input];
+    // §6.4: when the caller passed rotated resolvedInputs, THEY are authoritative — `id` drives golden
+    // (baked flat id resolves; real scenario-dir path 404s) and later `urlAssetPath` drives the bytes.
+    // Without them we fall back to the scenario's own baked-by-flat-id input(s).
+    const resolvedInputs = opts?.resolvedInputs;
+    const assetIds =
+      resolvedInputs && resolvedInputs.length > 0
+        ? resolvedInputs.map((r) => r.id)
+        : Array.isArray(scenario.input)
+          ? scenario.input
+          : [scenario.input];
     if (assetIds.length === 0) {
       return finalize('ERROR', [], 'scenario declares no input asset');
     }
-    for (const assetId of assetIds) {
-      const missing = await missingAssetReason(assetId);
-      if (missing) return finalize('NA_ASSET', [], missing);
+    // Missing-asset preflight. Rotated real files aren't in fixtures/manifest.json, so the manifest
+    // check must NOT run for them (it would falsely NA a present file); we HEAD-check the on-disk URL
+    // instead and NA only on a real 404. The non-rotated/baked-by-flat-id path keeps the manifest check.
+    if (resolvedInputs && resolvedInputs.length > 0) {
+      for (const resolved of resolvedInputs) {
+        const missing = await resolvedInputMissingReason(resolved);
+        if (missing) return finalize('NA_ASSET', [], missing);
+      }
+    } else {
+      for (const assetId of assetIds) {
+        const missing = await missingAssetReason(assetId);
+        if (missing) return finalize('NA_ASSET', [], missing);
+      }
     }
     let golden: GoldenStore | undefined;
     if (scenario.op === 'decodeFrames') {
@@ -1057,8 +1360,12 @@ export async function runOne(
       }
     }
 
-    // 3) Build MediaInput(s) from the served corpus. Robustness scenarios mutate bytes first.
-    const inputs = assetIds.map((id) => buildMediaInput(id, scenario.mutate));
+    // 3) Build MediaInput(s) from the served corpus. Robustness scenarios mutate bytes first. Rotated
+    //    inputs keep `id` (golden/identity) but fetch `urlAssetPath`, with the real file's size hint.
+    const inputs =
+      resolvedInputs && resolvedInputs.length > 0
+        ? resolvedInputs.map((r) => buildMediaInput(r.id, scenario.mutate, r.urlAssetPath, r.sizeBytes))
+        : assetIds.map((id) => buildMediaInput(id, scenario.mutate));
     const primaryInput = inputs[0]!;
 
     // 4) Graceful-failure path: malformed/degenerate inputs expect clean reject/return within timeout.
@@ -1107,12 +1414,26 @@ export async function runOne(
       );
       oracleOutcomes.push(outcome);
     }
-    const firstFail = oracleOutcomes.find((o) => !o.pass);
-    if (firstFail) {
-      if (isGoldenBakeGap(firstFail)) {
-        return finalize('NA_ASSET', oracleOutcomes, `oracle '${firstFail.oracle}' unavailable: ${firstFail.detail}`);
+    // §7 rotation: partition outcomes so a golden-ABSENT gap on a rotated, golden-less real file
+    // (NA_ASSET) can neither MASK a real survivor defect (R2 — that would hide a FAIL) nor DISCARD a
+    // survivor PASS. Order among oracles must NOT decide the verdict.
+    //  1) any real (non-bake-gap) failure is decisive → FAIL (the valuable finding a real file exposed);
+    //  2) else if any oracle actually rendered a verdict (passed) → PASS — the survivor oracles carry
+    //     the cell; golden-keyed oracles that went NA_ASSET are excluded, not blockers;
+    //  3) else EVERY oracle was a golden/asset gap → no admissible signal at all → the cell is itself
+    //     NA_ASSET (the "all-NA" case surfaced by the §11.2 guard).
+    // For a BAKED fixture there are no bake-gap outcomes, so this reduces to the prior semantics exactly
+    // (any fail → FAIL, else PASS).
+    const realFail = oracleOutcomes.find((o) => !o.pass && !isGoldenBakeGap(o));
+    if (realFail) {
+      return finalize('FAIL', oracleOutcomes, `oracle '${realFail.oracle}' failed: ${realFail.detail ?? 'no detail'}`);
+    }
+    if (!oracleOutcomes.some((o) => o.pass)) {
+      // No real failure and nothing passed ⇒ every non-pass was a golden/asset gap ⇒ honest NA_ASSET.
+      const gap = oracleOutcomes.find((o) => !o.pass);
+      if (gap) {
+        return finalize('NA_ASSET', oracleOutcomes, `oracle '${gap.oracle}' unavailable: ${gap.detail}`);
       }
-      return finalize('FAIL', oracleOutcomes, `oracle '${firstFail.oracle}' failed: ${firstFail.detail ?? 'no detail'}`);
     }
 
     // 8) PASS. ONLY now, and only if the pillar includes performance, run the bench (§0.1).
@@ -1124,7 +1445,7 @@ export async function runOne(
     let benchResult: ScenarioResult['bench'];
     try {
       benchResult = await withTimeout(
-        runBench(engine, scenario, inputs, golden, opts?.benchOptions),
+        runBench(engine, scenario, inputs, golden, opts?.benchOptions, opts?.resolvedInputs),
         DEFAULT_BENCH_TIMEOUT_MS,
       );
     } catch (err) {
@@ -1189,7 +1510,6 @@ function buildOracleContext(
     ...(opResult.demux ? { demux: opResult.demux } : {}),
     ...(opResult.frames ? { frames: opResult.frames } : {}),
     ...(opResult.seek ? { seek: opResult.seek } : {}),
-    ...(opts?.referenceEngine ? { referenceEngine: opts.referenceEngine } : {}),
   };
 }
 
@@ -1277,16 +1597,22 @@ async function runRobustness(
     oracleOutcomes.push(outcome);
   }
 
-  const firstFail = oracleOutcomes.find((o) => !o.pass);
-  if (firstFail) {
-    if (isGoldenBakeGap(firstFail)) {
-      return finalize('NA_ASSET', oracleOutcomes, `oracle '${firstFail.oracle}' unavailable: ${firstFail.detail}`);
-    }
+  // Same partition as the functional path: a golden/asset gap must not mask a real defect or discard a
+  // survivor verdict. (Robustness is baked-only, so bake-gaps don't arise in practice — kept identical
+  // for safety/consistency.) Real failure → FAIL; else all-gap → NA_ASSET; else PASS.
+  const realFail = oracleOutcomes.find((o) => !o.pass && !isGoldenBakeGap(o));
+  if (realFail) {
     return finalize(
       'FAIL',
       oracleOutcomes,
-      `robustness oracle '${firstFail.oracle}' failed: ${firstFail.detail ?? verdict}`,
+      `robustness oracle '${realFail.oracle}' failed: ${realFail.detail ?? verdict}`,
     );
+  }
+  if (!oracleOutcomes.some((o) => o.pass)) {
+    const gap = oracleOutcomes.find((o) => !o.pass);
+    if (gap) {
+      return finalize('NA_ASSET', oracleOutcomes, `oracle '${gap.oracle}' unavailable: ${gap.detail}`);
+    }
   }
   // Robustness never benches. Record the graceful-throw detail (if any) as the reason for context.
   const passReason = opError ? `graceful: ${errMessage(opError)}` : undefined;
@@ -1308,6 +1634,7 @@ async function runBench(
   inputs: MediaInput[],
   golden: GoldenStore,
   benchOptions: BenchOptions | undefined,
+  resolvedInputs?: ResolvedInput[],
 ): Promise<ScenarioResult['bench']> {
   const out: Partial<Record<MetricId, BenchSummary>> = {};
 
@@ -1316,8 +1643,12 @@ async function runBench(
   const observeLongtasks = scenario.metrics.includes('longtasks');
 
   const runSample = async (): Promise<MetricSample> => {
-    // Fresh input per iteration: re-fetch bytes (cache is per-MediaInput, so rebuild).
-    const freshInputs = inputs.map((i) => buildMediaInput(i.id, scenario.mutate));
+    // Fresh input per iteration: re-fetch bytes (cache is per-MediaInput, so rebuild). Rotated inputs
+    // rebuild from resolvedInputs so the `urlAssetPath`/size overrides persist across bench iterations.
+    const freshInputs =
+      resolvedInputs && resolvedInputs.length > 0
+        ? resolvedInputs.map((r) => buildMediaInput(r.id, scenario.mutate, r.urlAssetPath, r.sizeBytes))
+        : inputs.map((i) => buildMediaInput(i.id, scenario.mutate));
     const meter = new Meter({ observeLongtasks });
     meter.begin();
     const opResult = await withTimeout(executeOp(engine, scenario, freshInputs), scenario.timeoutMs);
@@ -1392,8 +1723,7 @@ function estimatedFrameCount(golden: GoldenStore): number | undefined {
  * Build engines from registry factories, detect env + support ONCE per run, iterate
  * scenarioIds × engineIds, run each feature/scenario across all engines, fire onResult/onProgress,
  * and collect ScenarioResult[].
- * Scenarios are filtered by pillar (robustness family vs functional/performance). The reference
- * engine (if registered and distinct) is constructed once and injected for 'reference-reimport'.
+ * Scenarios are filtered by pillar (robustness family vs functional/performance).
  */
 export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const pillar = opts.pillar ?? 'all';
@@ -1403,7 +1733,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   // matrix. Matching is forgiving so short names work: an arg matches a registration when it equals
   // the registration id, equals the engine's `.id`, or is a case-insensitive prefix of either (so
   // `mp4box` → `mp4box.js@0.5.4`, `mediabunny` → `mediabunny@1.48.0`). Exact ids still match.
-  const allEngines = listEngines();
+  const allEngines = listScoredEngines();
   const engineIds = opts.engineIds
     ? await resolveEngineIds(opts.engineIds, allEngines)
     : allEngines.map((e) => e.id);
@@ -1433,7 +1763,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const [env, support]: [EnvInfo, CodecSupport] = await Promise.all([detectEnv(), detectCodecSupport()]);
 
   // Build the run env (attached to every result) once.
-  const referenceEngineId = getReferenceEngineId();
   const runEnvBase: RunEnv = {
     suiteVersion: SUITE_VERSION,
     engineId: '', // filled per engine below
@@ -1445,6 +1774,50 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
 
   const results: ScenarioResult[] = [];
   const scenarioById = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
+
+  // §6/§10 Per-scenario media-file rotation: pick ONE input per scenario for THIS run (seeded on
+  // randomSeed, reproducible), shared by every engine so a run replays from (runSeed, corpus). A
+  // selection-subsystem failure NEVER nukes the matrix — we warn and fall back to baked-only inputs
+  // (today's behavior). corpusChecksum makes the picked corpus visible in every result's env; §6.3
+  // shape warnings surface corpus bugs instead of hiding them (a dropped real file is a corpus bug,
+  // never an engine NA).
+  const rotate = opts.rotateMedia ?? true;
+  const exhaustive = opts.exhaustiveMedia === true;
+  let selections = new Map<string, ScenarioSelection>();
+  // Exhaustive mode (§6.2): every scenario's FULL ordered candidate list (baked + all real files), run
+  // per-file and aggregated. Empty ⇒ fall back to the single-selection path (baked-only per scenario).
+  let exhaustiveCandidates = new Map<string, ScenarioSelection[]>();
+  try {
+    const mediaSources = await loadScenarioSources();
+    selections = selectForRun(scenarios, opts.randomSeed ?? '', mediaSources, { rotate });
+    if (exhaustive) exhaustiveCandidates = candidatesForRun(scenarios, mediaSources, { rotate });
+    // corpusChecksum reflects everything actually run: all candidates in exhaustive mode, else the picks.
+    runEnvBase.corpusChecksum = exhaustive
+      ? computeCorpusChecksum([...exhaustiveCandidates.values()].flat())
+      : computeCorpusChecksum(selections.values());
+    let rotatedReal = 0;
+    let bakedCount = 0;
+    for (const sel of selections.values()) {
+      if (sel.isBaked) bakedCount += 1;
+      else rotatedReal += 1;
+      for (const warning of sel.shapeWarnings) {
+        console.warn(`media-selection [${sel.scenarioId}]: ${warning}`);
+      }
+    }
+    const exhaustiveFiles = exhaustive ? [...exhaustiveCandidates.values()].reduce((n, c) => n + c.length, 0) : 0;
+    console.info(
+      `media-selection: ${selections.size} scenarios — ${rotatedReal} rotated-real, ${bakedCount} baked ` +
+        `(rotate=${rotate}, exhaustive=${exhaustive}${exhaustive ? ` [${exhaustiveFiles} file-runs]` : ''}, ` +
+        `seed='${opts.randomSeed ?? ''}', corpus=${runEnvBase.corpusChecksum})`,
+    );
+  } catch (err) {
+    console.warn(
+      `media-selection: selection unavailable (${errMessage(err)}); falling back to baked-only inputs`,
+    );
+    selections = new Map();
+    exhaustiveCandidates = new Map();
+  }
+
   const executionOrder = buildExecutionOrder(
     engineIds,
     scenarios.map((scenario) => scenario.id),
@@ -1456,7 +1829,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
 
   for (const cell of executionOrder) {
     if (opts.signal?.aborted) break;
-    const scenario = scenarioById.get(cell.scenarioId);
+    // Use the selection's effectiveScenario downstream (negotiate/disabled/reuse/runOne). Its id/family/
+    // requires are UNCHANGED (so those behave identically); only `input` and, for a rotated DERIVED file,
+    // `options`/`oracles` differ. Falls back to the registry scenario if selection is unavailable.
+    const selection = selections.get(cell.scenarioId);
+    const scenario = selection?.effectiveScenario ?? scenarioById.get(cell.scenarioId);
     if (!scenario) continue;
     const engineId = cell.engineId;
     const reg = getEngine(engineId);
@@ -1535,6 +1912,16 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
+      // §10 STALE-PASS guard: fold the selection tag into the reuse key so a run that picked a DIFFERENT
+      // file for this scenario can never reuse a prior PASS validated against other bytes. `selectionCacheTag`
+      // is 'baked' for the baked fixture, else the picked file's sha prefix. The store keys `put` off
+      // result.scenarioId, so we stamp the composite key onto the STORED copy only (via withCacheKey) and
+      // restore the true scenarioId on the cache-hit read path — live results always carry the real id.
+      const cacheTag = selection ? selectionCacheTag(selection) : undefined;
+      const cacheScenarioKey = cacheTag ? `${scenario.id}#${cacheTag}` : scenario.id;
+      const withCacheKey = (r: ScenarioResult): ScenarioResult =>
+        cacheScenarioKey === scenario.id ? r : { ...r, scenarioId: cacheScenarioKey };
+
       const preNeg = negotiate(engine.capabilities(), support, scenario.requires, scenario.options);
       if (!preNeg.ok) {
         result = {
@@ -1554,7 +1941,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             /* swallow */
           }
         }
-        await opts.resultReuse?.put(result).catch(() => undefined);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;
@@ -1562,11 +1949,17 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      const cached = await opts.resultReuse?.get(engine.id, scenario.id, opts.browser).catch(() => undefined);
+      // Exhaustive mode runs every file fresh (a thorough audit) — never serve a single-file cached PASS.
+      const cached = exhaustive
+        ? undefined
+        : await opts.resultReuse?.get(engine.id, cacheScenarioKey, opts.browser).catch(() => undefined);
       if (cached && cached.status === 'PASS') {
         const cachedReason = cached.reason?.replace(/^(cached:\s*)+/i, '');
         result = {
           ...cached,
+          // The stored copy was keyed under the composite `${id}#${tag}`; restore the true scenario id so
+          // the live/reported result is never polluted by the cache-key encoding.
+          scenarioId: scenario.id,
           reason:
             cachedReason && cachedReason !== 'cached previous PASS result'
               ? `cached: ${cachedReason}`
@@ -1586,24 +1979,24 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // Build the reference engine for oracles that re-import. When the candidate is the registered
-      // reference, reuse that already-initialized instance for the oracle instead of omitting it.
-      let referenceEngine: MediaEngine | undefined;
-      let disposeReferenceEngine = false;
-      if (referenceEngineId === engineId) {
-        referenceEngine = engine;
-      } else {
-        const refReg = getEngine(referenceEngineId);
-        if (refReg) {
-          try {
-            referenceEngine = await refReg.factory();
-            if (referenceEngine.init) await referenceEngine.init();
-            disposeReferenceEngine = true;
-          } catch {
-            referenceEngine = undefined; // oracle that needs it will fail with a clear reason
-            disposeReferenceEngine = false;
+      // §6.2 EXHAUSTIVE: run EVERY candidate file for this cell (same order for every engine) and
+      // aggregate — cell PASSes only if ALL files pass; bench combines across passing files (sum/max/
+      // median per metric). `engine` (constructed + negotiated OK) is reused for file 0; fresh engines
+      // for the rest (runOne inits+disposes each). Bypasses the single-file path.
+      if (exhaustive) {
+        const list = exhaustiveCandidates.get(scenario.id) ?? (selection ? [selection] : []);
+        if (list.length > 0) {
+          result = await runExhaustiveCell(engine, engineId, reg, list, scenario, opts, support, runEnvBase, pillar);
+          if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
+            result.primaryMetric = scenario.primaryMetric;
           }
+          results.push(result);
+          opts.onResult?.(result);
+          done += 1;
+          opts.onProgress?.(done, total, `${label} (exhaustive ×${list.length})`);
+          continue;
         }
+        // list empty ⇒ selection subsystem unavailable ⇒ fall through to the normal single (baked) path.
       }
 
       const runOneOpts: RunOneOptions = {
@@ -1616,7 +2009,22 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         decodeWithPlatform: opts.decodeWithPlatform ?? decodeBytesToFrames,
         playbackSmoke: opts.playbackSmoke ?? platformPlaybackSmoke,
         ...(opts.benchOptions ? { benchOptions: opts.benchOptions } : {}),
-        ...(referenceEngine ? { referenceEngine } : {}),
+        // §6/§10: hand runOne the rotated pick so it fetches the right bytes, records provenance, and
+        // keys the reuse cache per file. Absent selection ⇒ omitted ⇒ today's baked-by-flat-id path.
+        ...(selection?.resolvedInputs ? { resolvedInputs: selection.resolvedInputs } : {}),
+        ...(selection
+          ? {
+              selection: {
+                file: selection.selectedFile,
+                isBaked: selection.isBaked,
+                ...(selection.selectedSha256 ? { sha256: selection.selectedSha256 } : {}),
+                ...(selection.candidateCount !== undefined
+                  ? { candidateCount: selection.candidateCount }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
       };
 
       try {
@@ -1633,15 +2041,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           reason: errMessage(err),
           env: { ...runEnvBase, engineId },
         };
-      } finally {
-        // Dispose the reference engine we spun up for this cell.
-        if (disposeReferenceEngine && referenceEngine?.dispose) {
-          try {
-            await referenceEngine.dispose();
-          } catch {
-            /* swallow */
-          }
-        }
       }
 
       // §9: stamp the case's primary ranking metric so the report ranks winners precisely (it only
@@ -1653,7 +2052,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         result.env = { ...result.env, configUsed: engine.configUsed };
       }
 
-      await opts.resultReuse?.put(result).catch(() => undefined);
+      await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
       results.push(result);
       opts.onResult?.(result);
       done += 1;
@@ -1701,27 +2100,6 @@ function shuffleInPlace<T>(items: T[], seed: string): void {
     const j = Math.floor(rand() * (i + 1));
     [items[i], items[j]] = [items[j]!, items[i]!];
   }
-}
-
-function hashSeed(seed: string): number {
-  const text = seed || `${Date.now()}:${Math.random()}`;
-  let h = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-function mulberry32(seed: number): () => number {
-  let t = seed >>> 0;
-  return () => {
-    t += 0x6d2b79f5;
-    let x = t;
-    x = Math.imul(x ^ (x >>> 15), x | 1);
-    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
-    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
-  };
 }
 
 interface EngineIdCandidate {
