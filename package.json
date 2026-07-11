@@ -22,7 +22,7 @@
   "devDependencies": {
     "@webgpu/types": "^0.1.70",
     "playwright": "^1.48.0",
-    "typescript": "^5.6.0",
+    "typescript": "^7.0.2",
     "vite": "^5.4.0"
   },
   "dependencies": {

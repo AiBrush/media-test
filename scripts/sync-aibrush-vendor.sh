@@ -18,8 +18,8 @@
 # Usage:  bun run sync-vendor        (from media-browser-test/)   — or —   bash scripts/sync-aibrush-vendor.sh
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # media-browser-test/
-MEDIA="$(cd "$HERE/../../media" && pwd)"                  # aibrush.lib/media/
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # media-test/
+MEDIA="$(cd "$HERE/../media" && pwd)"                     # aibrush.lib/media/
 VENDOR="$HERE/src/engines/aibrush-media/vendor"
 
 echo "[sync-vendor] media source: $MEDIA"

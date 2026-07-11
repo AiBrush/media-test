@@ -286,7 +286,7 @@
       "source": "generated",
       "sizeBucket": "tiny",
       "genMethod": "ffmpeg -hls_key_info_file key_info -f hls (AES-128 segment encryption). KEY URI + IV in playlist; key bytes + IV recorded in golden for the decrypt oracle.",
-      "sha256": "ba0bec7b7ab3e76b13e1861a6e12e002ddfff1a25b516c52fc4b4ef09aa82bb9",
+      "sha256": "914920fe43ba31fc85d1aba682cc5c10d5f9e00acb781f8104c76f73f97e9891",
       "sizeBytes": 378,
       "notes": "AES-128 encrypted HLS. ffmpeg 8 supports -hls_key_info_file natively (no Bento4 needed). If key generation unavailable in the bake env, recorded as SKIPPED with reason."
     },
@@ -331,7 +331,7 @@
       "source": "generated",
       "sizeBucket": "small",
       "genMethod": "ffmpeg -encryption_scheme cenc-aes-ctr -encryption_key <hex> -encryption_kid <hex> over the H.264/AAC clear baseline, emitted as faststart MP4. Key/KID recorded in golden for decrypt oracle.",
-      "sha256": "ff588222b7f22f5d92d23528e4c3b17cdcd6f775a2227a3773f6249d8b4ce095",
+      "sha256": "c8259c7272afd80cc00413f419dbc0b569754d8ed6cd7d7d0c7dafb22e40fd5e",
       "sizeBytes": 2205784,
       "notes": "CENC AES-CTR (cenc) encrypted MP4. ffmpeg muxer supports -encryption_scheme cenc-aes-ctr. If unsupported in bake env, SKIPPED with reason; decrypt oracle then NA."
     },
@@ -348,7 +348,7 @@
       "genMethod": "cbcs pattern encryption (AES-CBC w/ pattern). ffmpeg mov muxer -encryption_scheme cenc-aes-ctr only covers ctr; cbcs requires shaka/Bento4 (mp4encrypt --method MPEG-CENC scheme cbcs).",
       "sourceUrl": null,
       "acquire": "If Bento4 (mp4encrypt) or shaka packager is installed on the bake host, bake.mjs generates cenc_cbcs.mp4 automatically (source effectively becomes generated) — install one and re-run `bun fixtures/bake.mjs cenc_cbcs.mp4`. Otherwise produce it manually: `mp4encrypt --method MPEG-CENC --encryption-scheme cbcs --key 1:0123456789abcdef0123456789abcdef:random --property 1:KID:abcdef00112233445566778899aabbcc <plain_h264_aac.mp4> fixtures/media/cenc_cbcs.mp4`, where <plain_h264_aac.mp4> is the cenc_ctr.mp4 cleartext baseline (libx264 yuv420p + AAC, +faststart). Record key/KID into fixtures/golden/cenc_cbcs.mp4.keys.json for the decrypt oracle.",
-      "sha256": "1b3f92f5c62c82e4d9483cee3d8678f8884a85ab77c3032389a0a2e70e5d966c",
+      "sha256": "8f9605cc24a4a04e4219e0d7806d7f214324c4fadfe688f375cb6ee162734cd5",
       "sizeBytes": 2201135,
       "notes": "CENC cbcs (pattern) encrypted MP4. ffmpeg cannot emit cbcs; needs Bento4/shaka. provided (SKIPPED with reason / MISSING ASSETS) when those binaries are absent; decrypt oracle then NA(asset-missing)."
     },
@@ -520,8 +520,8 @@
       "sizeBucket": "tiny",
       "genMethod": "IN-BROWSER MediaRecorder capture (canvas.captureStream + MediaRecorder, video/webm). Cannot be produced by ffmpeg: MediaRecorder WebM is non-seekable / cluster-only / lacks a cues/duration header. Baked by a one-time browser pass (see bake.mjs RECORDER_NOTE).",
       "acquire": "Open fixtures/tools/record-fixture.html in a browser, click Record (~3s), save the download as fixtures/media/recorder_headerless.webm, then re-run `bun fixtures/bake.mjs recorder_headerless.webm` to checksum it.",
-      "sha256": "4423ec5c7a9f50c6615190e642cdd8c0f501284b304a5a7824e226cd4e39c82d",
-      "sizeBytes": 192412,
+      "sha256": "08128b5c82952dc328d1a21c7833126877008296f333e17b898be4ce0f0a428f",
+      "sizeBytes": 165148,
       "notes": "Headerless/streaming MediaRecorder WebM. NOT faked by ffmpeg. Produced via tools/record-fixture.html in a browser, then dropped into fixtures/media/. bake.mjs records it as SKIPPED(browser-capture) until present."
     },
     {
@@ -699,8 +699,8 @@
       "source": "generated",
       "sizeBucket": "massive",
       "genMethod": "ffmpeg testsrc2 1920x1080@30 7200s (2h) + sine 48k mono, libx264 yuv420p -b:v 1200k (low bitrate, capped) -g 60 closed GOP, AAC 64k, +faststart. Low-bitrate long-form so the file lands ~1-1.4 GB / many-thousand-sample with bounded encode time. Lazy-read / streaming / peak-memory / OOM-resistance + many-samples sample-table stress. VERY slow + very large; gated by --skip-longform.",
-      "sha256": "6353e5f1dc03d0b81958e7489b2f749ea33bf7fb37bb03bc53bd5150d2d3120d",
-      "sizeBytes": 1144400182,
+      "sha256": "c7017e1c4d13f6a2bd2fccfaf2636b26c1fd3d1cdb2c77a7fed0c97ccdbbc2c5",
+      "sizeBytes": 1144401376,
       "notes": "massive bucket (~1-1.4 GB, 2h, ~216k video frames) low-bitrate 1080p. Exercises lazy/partial reading, streaming demux, peak-memory and OOM-resistance, and many-thousand-sample sample-table parsing. Generated offline but slow; --skip-longform omits it. Real multi-hour camera/broadcast captures may additionally be supplied as 'provided'."
     },
     {
@@ -1190,8 +1190,8 @@
       "source": "generated",
       "sizeBucket": "small",
       "genMethod": "fixtures/bake.mjs applies deterministic bit flips to cenc_ctr.mp4.",
-      "sha256": "c64d7445ecfa080b9c7840dfba437fa81dd4714f90055ef17eef755c8decee54",
-      "sizeBytes": 2209644,
+      "sha256": "cf37841293bca7eadc55ba22ba03c5c102b8379d1b544abb941e5bf20b7f01cf",
+      "sizeBytes": 2205784,
       "notes": "Malformed CENC AES-CTR MP4 with corrupted protection/sample-encryption bytes."
     },
     {
@@ -1205,8 +1205,8 @@
       "source": "generated",
       "sizeBucket": "small",
       "genMethod": "fixtures/bake.mjs zeroes deterministic protection/payload spans in cenc_ctr.mp4.",
-      "sha256": "d165dcd14d33c9372c85f1b42fb8354e1787e95511d2d3e95c7436aea14b62dd",
-      "sizeBytes": 2209644,
+      "sha256": "aac2f8c0059f3a62445964d1bf5250af8fea18b92986d5f21f5e66741c3912ac",
+      "sizeBytes": 2205784,
       "notes": "Malformed CENC AES-CTR MP4 with zeroed protection/payload spans."
     },
     {
@@ -1220,8 +1220,8 @@
       "source": "generated",
       "sizeBucket": "small",
       "genMethod": "fixtures/bake.mjs keeps the first 60 percent of cenc_ctr.mp4.",
-      "sha256": "3837e9ee3672bacfee5c886c22a78f84fc03385d0d4a79efc22eabbb951c0e51",
-      "sizeBytes": 1325786,
+      "sha256": "73047cc97a1d3ade8d0d1c4cba7fc2428b320eb5ca65d8c624614f3ea38597a3",
+      "sizeBytes": 1323470,
       "notes": "Malformed CENC AES-CTR MP4 truncated mid-fragment."
     },
     {
@@ -1468,8 +1468,8 @@
       "source": "generated",
       "sizeBucket": "small",
       "genMethod": "fixtures/bake.mjs zeroes deterministic ciphertext spans in cenc_ctr.mp4.",
-      "sha256": "53ab4bd60cbc05fb839d1d87cf261ceb84be20106f6f7444bb212110585309c6",
-      "sizeBytes": 2209644,
+      "sha256": "7e33188b9d133a68d3aab2fbb6e2cfa4270822f6d521fc2d309df58be889bca2",
+      "sizeBytes": 2205784,
       "notes": "CENC AES-CTR MP4 with corrupted ciphertext spans for decrypt/decode robustness."
     },
     {
