@@ -1123,7 +1123,16 @@ interface AibrushHlsMasterPlaylist {
 }
 type AibrushHlsPlaylist = AibrushHlsMediaPlaylist | AibrushHlsMasterPlaylist;
 interface AibrushHlsCore {
+  hlsPlaylistHasEncryptedSegments(text: string, baseUrl?: string): boolean;
   parseM3u8(text: string, baseUrl?: string): AibrushHlsPlaylist;
+  resolveHlsProbeSource(
+    playlistText: string,
+    opts: {
+      fetchResource: (uri: string) => Promise<Uint8Array>;
+      baseUrl: string;
+      signal?: AbortSignal;
+    },
+  ): Promise<AibrushSourceLike>;
   resolveHlsSource(
     playlistText: string,
     opts: {
@@ -3402,13 +3411,26 @@ async function fastHlsProbeMetadata(
   signal: AbortSignal,
 ): Promise<NormalizedMetadata | undefined> {
   const playlistText = new TextDecoder().decode(await inputBytes(input));
-  const plan = hlsVodProbePlan(playlistText, inputUrl(input).href);
+  const baseUrl = inputUrl(input).href;
+  const core = (await import('./vendor/core.js')) as unknown as AibrushHlsCore;
+  const plan = hlsVodProbePlan(playlistText, baseUrl);
   if (plan === undefined) return undefined;
-  const segmentBytes = await hlsFetch(plan.firstSegmentUrl, signal);
-  const segmentSource = engine.from(segmentBytes, {
-    mime: 'video/mp2t',
-    size: segmentBytes.byteLength,
-  });
+  let segmentSource: unknown;
+  if (core.hlsPlaylistHasEncryptedSegments(playlistText, baseUrl)) {
+    segmentSource = engine.from(
+      await core.resolveHlsProbeSource(playlistText, {
+        baseUrl,
+        fetchResource: (uri) => hlsFetch(uri, signal),
+        signal,
+      }),
+    );
+  } else {
+    const segmentBytes = await hlsFetch(plan.firstSegmentUrl, signal);
+    segmentSource = engine.from(segmentBytes, {
+      mime: 'video/mp2t',
+      size: segmentBytes.byteLength,
+    });
+  }
   const info =
     engine.probeContainer !== undefined
       ? await engine.probeContainer(segmentSource, 'ts', { signal })
