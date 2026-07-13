@@ -11,9 +11,9 @@
  * `@ffmpeg/core` and record coreBuild:"st"; the mt URLs remain wired for future opt-in testing.
  *
  * LOCAL HOSTING (dossier §8, suite §0.8): the wrapper's defaults point at unpkg.com and the docs'
- * `toBlobURL` helper is a CDN/CSP workaround — BOTH are forbidden at run time. We vendor the core
- * files under ./vendor/{core-mt,core}/ and import them as same-origin `?url` assets (Vite emits them
- * content-hashed, same-origin). No network fetch happens inside any measured window.
+ * `toBlobURL` helper is a CDN/CSP workaround — BOTH are forbidden at run time. Vite serves the pinned
+ * @ffmpeg/core(-mt) ESM assets from local node_modules at stable same-origin /vendor/ URLs and copies
+ * them into dist/ during production builds. No network fetch happens inside any measured window.
  *
  * HONEST capabilities (dossier §6/§9): FFmpeg's matrix is 100% compile-time-determined. init() runs
  * `ffmpeg -encoders` / `-decoders` / `-formats` once and parses the log (codecs.ts) to build the
@@ -61,11 +61,11 @@
 
 import type { FFmpeg } from '@ffmpeg/ffmpeg';
 
-// Same-origin, locally vendored core files (NO CDN, NO toBlobURL). These are served by the
-// /vendor/ffmpeg-wasm/ raw-static Vite middleware. Do not import the Emscripten core files via
-// `?url`: Vite dev transforms `.js` assets into module-flavored code, while the mt core launches its
-// pthread helper with classic `new Worker(url)`, which would throw "Cannot use import statement
-// outside a module".
+// Same-origin, locally hosted core files (NO CDN, NO toBlobURL). These are served by the
+// /vendor/ffmpeg-wasm/ raw-static Vite middleware. It serves the packages' ESM core build unchanged:
+// @ffmpeg/ffmpeg launches its class worker as a module and dynamically imports coreURL. Do not import
+// these files through Vite's JS transform pipeline; the mt core's pthread helper is loaded separately
+// through workerURL.
 const coreMtJsUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.js';
 const coreMtWasmUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.wasm';
 const coreMtWorkerUrl = '/vendor/ffmpeg-wasm/core-mt/ffmpeg-core.worker.js';

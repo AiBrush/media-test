@@ -12,7 +12,7 @@
  * thrown. This is the one place that knows the concrete module paths; the rest of the app is generic.
  */
 
-import { listEngines, listScenarios, registerEngine, registerScenarios } from '../core/registry.ts';
+import { listEngines, listScenarios, registerScenarios } from '../core/registry.ts';
 import type { Scenario } from '../core/scenario.ts';
 
 export interface RegistrationReport {
@@ -65,10 +65,10 @@ const ENGINE_WIRINGS: EngineWiring[] = [
     },
   },
   {
-    label: 'remotion-media-parser',
+    label: 'remotion',
     register: async () => {
-      const mod = await import('../engines/remotion-media-parser/adapter.ts');
-      mod.registerRemotionMediaParser();
+      const mod = await import('../engines/remotion/adapter.ts');
+      mod.registerRemotion();
     },
   },
   {
@@ -76,14 +76,6 @@ const ENGINE_WIRINGS: EngineWiring[] = [
     register: async () => {
       const mod = await import('../engines/web-demuxer/adapter.ts');
       mod.registerWebDemuxer();
-    },
-  },
-  {
-    label: 'remotion-webcodecs',
-    register: async () => {
-      // No register helper exported — wire the engine class directly via a fresh-per-iteration factory.
-      const mod = await import('../engines/remotion-webcodecs/adapter.ts');
-      registerEngine(new mod.RemotionWebcodecsEngine().id, () => new mod.RemotionWebcodecsEngine());
     },
   },
   {

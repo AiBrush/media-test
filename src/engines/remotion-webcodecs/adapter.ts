@@ -79,15 +79,6 @@ import {
   type RemotionVideoCodec,
 } from './codecs.ts';
 import { digestImageData } from './digest.ts';
-import {
-  remuxCompatibleMovToMp4,
-  shouldUseCompatibleMovToMp4FastPath,
-} from './compatible-mov-mp4.ts';
-import {
-  demuxProgressiveMp4SampleTable,
-  mp4SampleTableKeyframes,
-  shouldUseProgressiveMp4SampleTableFastPath,
-} from './mp4-sample-table.ts';
 
 const ENGINE_ID = 'remotion-webcodecs@4.0.479';
 const PROTECTED_TRACK_METADATA_FEATURE = 'metadata:protected-tracks';
@@ -123,10 +114,6 @@ export const CONFIG_USED = {
   queueDepth: 'waitForQueueToBeLessThan',
   writer: 'bufferWriter',
   worker: 'convert=main-thread; extractFrames/parse=worker-capable',
-  adapterFastPaths: [
-    'mp4-sample-table:http-range for selected large/progressive MP4/MOV demux rows',
-    'compatible MOV->MP4 ftyp rewrite for the huge MOV copy row',
-  ],
 } as const;
 
 /** A FrameSink backed by digests + cached ImageData for SSIM/PSNR pixel access. */
@@ -392,12 +379,6 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * sorted the same way so packets[i].trackIndex aligns with metadata.tracks[trackIndex].
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
-    if (shouldUseProgressiveMp4SampleTableFastPath(input)) {
-      // Remotion's sample callback exposes sample.data, so these huge faststart MP4/MOV rows would
-      // otherwise pull mdat just to emit packet-table fields already present in moov sample tables.
-      return demuxProgressiveMp4SampleTable(input);
-    }
-
     const { mp } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
 
@@ -450,7 +431,6 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     }
 
     const container = await canonicalContainerForInput(input, result.container);
-    const sampleTableKeyframes = await keyframesFromMp4SampleTableIfAligned(input, container, tagged, indexByTrackId);
     const normalizedTagged = normalizeElementaryMp3PacketTimes(
       result.container,
       result.tracks,
@@ -461,16 +441,11 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       ),
     );
 
-    const perTrackPacketIndex = new Map<number, number>();
     const packets: PacketInfo[] = normalizedTagged.map(({ trackId, packet }) => {
       const trackIndex = indexByTrackId.get(trackId)!;
-      const packetIndex = perTrackPacketIndex.get(trackIndex) ?? 0;
-      perTrackPacketIndex.set(trackIndex, packetIndex + 1);
-      const keyframes = sampleTableKeyframes?.get(trackIndex);
       return {
         trackIndex,
         ...packet,
-        keyframe: keyframes?.[packetIndex] ?? packet.keyframe,
       };
     });
 
@@ -494,17 +469,6 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
     const container = canonicalToRemotionContainer(opts.container);
     if (!container) throw new Error(`${ENGINE_ID} cannot write container '${opts.container}'`);
-
-    if (container === 'mp4' && shouldUseCompatibleMovToMp4FastPath(input)) {
-      const bytes = await remuxCompatibleMovToMp4(input);
-      if (bytes) {
-        return {
-          bytes,
-          mime: mimeForContainer(container),
-          container,
-        };
-      }
-    }
 
     return this.convert(input, { container });
   }
@@ -864,36 +828,6 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 }
 
 // ── module-level helpers ─────────────────────────────────────────────────────────────────────────
-
-async function keyframesFromMp4SampleTableIfAligned(
-  input: MediaInput,
-  container: string,
-  tagged: TaggedPacket[],
-  indexByTrackId: Map<number, number>,
-): Promise<Map<number, boolean[]> | null> {
-  if (input.mutated || (container !== 'mp4' && container !== 'mov')) return null;
-
-  let keyframes: Map<number, boolean[]>;
-  try {
-    keyframes = await mp4SampleTableKeyframes(input);
-  } catch {
-    return null;
-  }
-
-  const measuredCounts = new Map<number, number>();
-  for (const { trackId } of tagged) {
-    const trackIndex = indexByTrackId.get(trackId);
-    if (trackIndex == null) return null;
-    measuredCounts.set(trackIndex, (measuredCounts.get(trackIndex) ?? 0) + 1);
-  }
-
-  if (measuredCounts.size !== keyframes.size) return null;
-  for (const [trackIndex, count] of measuredCounts) {
-    if (keyframes.get(trackIndex)?.length !== count) return null;
-  }
-
-  return keyframes;
-}
 
 function normalizeTransportStreamAacPacketTimes(
   container: import('@remotion/media-parser').MediaParserContainer,

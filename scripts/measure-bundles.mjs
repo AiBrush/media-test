@@ -100,16 +100,15 @@ const ENGINES = [
     note: 'JS wrapper bundled here; the FFmpeg-based .wasm is a RUN-TIME asset loaded separately and is excluded from the shipped-JS number.',
   },
   {
-    id: 'remotion-media-parser@4.0.479',
-    alias: 'remotion-media-parser',
-    imports: ['@remotion/media-parser', '@remotion/media-parser/web'],
-    note: 'Pure-TS, zero-dependency parser. The optional /worker entry is loaded lazily at run time and is excluded.',
-  },
-  {
-    id: 'remotion-webcodecs@4.0.479',
-    alias: 'remotion-webcodecs',
-    imports: ['@remotion/webcodecs', '@remotion/webcodecs/buffer'],
-    note: 'WebCodecs-based; the optional /worker entry is loaded lazily at run time and is excluded.',
+    id: 'remotion@4.0.479',
+    alias: 'remotion',
+    imports: [
+      '@remotion/media-parser',
+      '@remotion/media-parser/web',
+      '@remotion/webcodecs',
+      '@remotion/webcodecs/buffer',
+    ],
+    note: 'Unified Remotion stack: Media Parser for read-side operations and WebCodecs for decode/encode/conversion. The optional parser worker entry is loaded lazily at run time and is excluded.',
   },
   {
     id: 'ffmpeg.wasm@0.12.15',

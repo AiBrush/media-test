@@ -83,7 +83,6 @@ import {
 } from '@remotion/media-parser';
 import { webReader } from '@remotion/media-parser/web';
 
-import { registerEngine } from '../../core/registry.ts';
 import type {
   CapabilitySet,
   DecryptKey,
@@ -106,12 +105,6 @@ import {
   mpContainerToCanonical,
   mpVideoToCanonical,
 } from './codecs.ts';
-import {
-  demuxMp4SampleTable,
-  readMp4ProtectedTrackMetadata,
-  readMp4SyncSampleMap,
-  shouldUseMp4SampleTableDemux,
-} from './mp4-sample-table.ts';
 
 const ENGINE_ID = 'remotion-media-parser@4.0.479';
 
@@ -216,7 +209,6 @@ export class RemotionMediaParserEngine implements MediaEngine {
         'streaming-read', // progressive parse, async-callback back-pressure
         'worker', // parseMediaOnWebWorker main-thread offload (when bundler allows)
         'packets:dts', // sample.decodingTimestamp is surfaced separately from timestamp
-        'metadata:protected-tracks', // encrypted MP4 track metadata can be parsed without decrypting
         'webcodecs:samples', // emits EncodedVideoChunk/EncodedAudioChunk-compatible samples
       ],
     };
@@ -351,15 +343,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       return withVideoFpsFromPackets(metadata, packets);
     }
 
-    const headerMetadata = await webmHeaderMetadata(input);
-    if (shouldUseHeaderOnlyWebmProbe(input, headerMetadata)) {
-      this.config = { ...this.config, reader: 'webReader', worker: false, fieldsTier: 'metadata-only' };
-      return headerMetadata;
-    }
-
-    const headerFps = singleVideoFpsFromMetadata(headerMetadata);
     const srcOptions = await this.chooseSrcOptions(input);
-    const includeContainerFps = headerFps == null;
     const result = await this.runParse<{
       durationInSeconds: number | null;
       container: MediaParserContainer;
@@ -377,19 +361,13 @@ export class RemotionMediaParserEngine implements MediaEngine {
           tracks: true,
           metadata: true,
           rotation: true,
-          ...(includeContainerFps ? { fps: true } : {}),
+          fps: true,
         },
       },
       'metadata-only',
     );
 
-    let metadata = await withProtectedMp4TrackMetadata(
-      input,
-      this.toNormalizedMetadata(result, undefined, input),
-    );
-    if (shouldPreferHeaderWebmFps(input, metadata, headerFps)) {
-      metadata = withSingleVideoFps(metadata, headerFps, { replace: true });
-    }
+    const metadata = this.toNormalizedMetadata(result, undefined, input);
     if (needsTsPacketProbeFallback(metadata)) {
       const { metadata: demuxMetadata, packets } = await this.demux(input);
       return withTsProbeFieldsFromPackets(demuxMetadata, packets);
@@ -401,9 +379,6 @@ export class RemotionMediaParserEngine implements MediaEngine {
     }
 
     if (!needsSingleVideoFpsFallback(metadata)) return metadata;
-    const withHeaderFps = withSingleVideoFps(metadata, headerFps);
-    if (!needsSingleVideoFpsFallback(withHeaderFps)) return withHeaderFps;
-
     const slow = await this.runParse<{ slowFps: number }>(
       {
         ...srcOptions,
@@ -434,34 +409,15 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * is ordered by the SAME canonical map so packet.trackIndex ↔ tracks[trackIndex] stay aligned.
    */
   async demux(input: MediaInput): Promise<DemuxResult> {
-    if (shouldUseMp4SampleTableDemux(input)) {
-      // Remotion's public sample-callback API includes sample.data, so this exact faststart 1GB+
-      // packet-table cell would read the whole mdat. The helper derives the same packet fields from
-      // the real MP4 moov tables, keeping the row lazy without fabricating packets.
-      const metadata = await this.probe(input);
-      const result = await demuxMp4SampleTable(input, metadata);
-      this.config = {
-        ...this.config,
-        reader: 'webReader',
-        worker: false,
-        fieldsTier: 'full-parse(demux)',
-      };
-      return result;
-    }
-
-    const mp4SyncSamplesByTrackId = await maybeReadMp4SyncSampleMap(input);
-
     // Packets tagged with the parser's stable trackId; remapped to canonical stream-index after parse.
     const tagged: TaggedPacket[] = [];
-    const sampleNumberByTrackId = new Map<number, number>();
 
     const onVideoTrack: MediaParserOnVideoTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserVideoSample) => {
-        const sampleNumber = nextSampleNumber(sampleNumberByTrackId, trackId);
         tagged.push({
           trackId,
-          packet: sampleToPacket(sample, -1, mp4KeyframeOverride(mp4SyncSamplesByTrackId, trackId, sampleNumber)),
+          packet: sampleToPacket(sample, -1),
           h264AudPrefixBytes: h264AudStartCodePrefixBytes(sample.data),
         });
       };
@@ -469,7 +425,6 @@ export class RemotionMediaParserEngine implements MediaEngine {
     const onAudioTrack: MediaParserOnAudioTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserAudioSample) => {
-        nextSampleNumber(sampleNumberByTrackId, trackId);
         tagged.push({
           trackId,
           packet: sampleToPacket(sample, -1),
@@ -664,28 +619,6 @@ function withDurationFromPackets(
 ): NormalizedMetadata {
   const durationSec = metadata.durationSec ?? durationFromPacketPts(packets);
   return durationSec == null ? metadata : { ...metadata, durationSec };
-}
-
-async function withProtectedMp4TrackMetadata(
-  input: MediaInput,
-  metadata: NormalizedMetadata,
-): Promise<NormalizedMetadata> {
-  if (!needsProtectedMp4TrackMetadata(input, metadata)) return metadata;
-  const protectedMetadata = await readMp4ProtectedTrackMetadata(input);
-  if (!protectedMetadata) return metadata;
-  return {
-    ...metadata,
-    durationSec: metadata.durationSec ?? protectedMetadata.durationSec,
-    tracks: protectedMetadata.tracks,
-  };
-}
-
-function needsProtectedMp4TrackMetadata(input: MediaInput, metadata: NormalizedMetadata): boolean {
-  if (input.mutated || metadata.container !== 'mp4') return false;
-  const hasUnknownTracks = metadata.tracks.some((track) => track.type === 'other' || track.codec === 'unknown');
-  if (!hasUnknownTracks) return false;
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  return hint.includes('cenc');
 }
 
 function withTsProbeFieldsFromPackets(
@@ -1290,44 +1223,6 @@ function h264AudStartCodePrefixBytes(data: Uint8Array): 3 | 4 | undefined {
   return undefined;
 }
 
-async function maybeReadMp4SyncSampleMap(input: MediaInput): Promise<Map<number, Set<number> | null> | null> {
-  if (!isMp4SyncSampleInput(input)) return null;
-  try {
-    return await readMp4SyncSampleMap(input);
-  } catch {
-    // Best-effort normalization only. If the auxiliary range read fails, keep Remotion's public
-    // sample.type flags rather than failing a demux that can otherwise produce packets.
-    return null;
-  }
-}
-
-function isMp4SyncSampleInput(input: MediaInput): boolean {
-  if (input.mutated) return false;
-  const idOrUrl = (input.id || input.url || '').toLowerCase();
-  return (
-    idOrUrl.endsWith('.mp4') ||
-    idOrUrl.endsWith('.mov') ||
-    idOrUrl.endsWith('.m4v') ||
-    idOrUrl.endsWith('.m4a')
-  );
-}
-
-function nextSampleNumber(sampleNumberByTrackId: Map<number, number>, trackId: number): number {
-  const n = (sampleNumberByTrackId.get(trackId) ?? 0) + 1;
-  sampleNumberByTrackId.set(trackId, n);
-  return n;
-}
-
-function mp4KeyframeOverride(
-  syncSamplesByTrackId: Map<number, Set<number> | null> | null,
-  trackId: number,
-  sampleNumber: number,
-): boolean | undefined {
-  if (!syncSamplesByTrackId?.has(trackId)) return undefined;
-  const syncSamples = syncSamplesByTrackId.get(trackId);
-  return syncSamples ? syncSamples.has(sampleNumber) : true;
-}
-
 /**
  * Build a canonical `trackId → 0-based index` map matching the container STREAM-INDEX convention the
  * golden uses: video tracks first, then audio, then 'other'; ties within a class broken by trackId
@@ -1440,20 +1335,3 @@ function isFatalWorkerError(err: unknown): boolean {
     /Worker is not defined/i.test(msg)
   );
 }
-
-/**
- * Registration helper. Phase D wires this into the registry; this adapter registers NOTHING on its
- * own (the call below is commented out to honor "Register NOTHING").
- *
- * export function registerRemotionMediaParser(): void {
- *   registerEngine(ENGINE_ID, () => new RemotionMediaParserEngine());
- * }
- */
-export function registerRemotionMediaParser(): void {
-  registerEngine(ENGINE_ID, () => new RemotionMediaParserEngine());
-}
-
-// `registerEngine` is imported so registerRemotionMediaParser() type-checks; it is exported (not
-// called here) so Phase D can wire it. Reference it to satisfy strict unused-symbol checks until
-// the central wiring imports it.
-void registerEngine;

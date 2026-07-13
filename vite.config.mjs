@@ -7,7 +7,7 @@
 //
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, normalize } from 'node:path';
 
 const MIME = {
@@ -161,19 +161,46 @@ function fixturesStatic() {
   };
 }
 
-/** Serve /vendor/ffmpeg-wasm/** raw, ahead of Vite transforms, for classic Emscripten workers. */
+/**
+ * Serve /vendor/ffmpeg-wasm/** raw, ahead of Vite transforms, for Emscripten workers.
+ *
+ * A checked-out `src/engines/ffmpeg-wasm/vendor` directory is optional (and gitignored). The pinned
+ * package assets in node_modules are the primary source, with that directory as a legacy fallback.
+ * Keeping the public URL stable matters because Emscripten resolves its wasm/pthread worker relative
+ * to the core script.
+ */
 function ffmpegVendorStatic() {
   const publicPrefix = '/vendor/ffmpeg-wasm/';
   const vendorRoot = join(process.cwd(), 'src', 'engines', 'ffmpeg-wasm', 'vendor');
-  const vendorRootPrefix = vendorRoot.endsWith('/') ? vendorRoot : `${vendorRoot}/`;
+  const packageRoots = {
+    // FFmpeg.load() starts its class worker as `type: module`. That worker falls back from the
+    // unavailable importScripts() to dynamic import(coreURL), so coreURL must expose an ESM default
+    // export. Serving the UMD build here produces the wrapper's opaque "failed to import" error.
+    core: join(process.cwd(), 'node_modules', '@ffmpeg', 'core', 'dist', 'esm'),
+    'core-mt': join(process.cwd(), 'node_modules', '@ffmpeg', 'core-mt', 'dist', 'esm'),
+  };
+  const allowedFiles = new Set(['ffmpeg-core.js', 'ffmpeg-core.wasm', 'ffmpeg-core.worker.js']);
+
+  const resolveFile = (rel) => {
+    const parts = rel.split('/');
+    if (parts.length !== 2 || !Object.hasOwn(packageRoots, parts[0]) || !allowedFiles.has(parts[1])) {
+      return null;
+    }
+
+    const packaged = join(packageRoots[parts[0]], parts[1]);
+    if (existsSync(packaged)) return packaged;
+
+    const vendored = join(vendorRoot, parts[0], parts[1]);
+    return existsSync(vendored) ? vendored : null;
+  };
 
   const serve = (req, res, next) => {
     const url = (req.url || '').split('?')[0];
     if (!url.startsWith(publicPrefix)) return next();
 
     const rel = decodeURIComponent(url.slice(publicPrefix.length));
-    const filePath = normalize(join(vendorRoot, rel));
-    if (!(filePath === vendorRoot || filePath.startsWith(vendorRootPrefix)) || !existsSync(filePath)) {
+    const filePath = resolveFile(rel);
+    if (!filePath) {
       res.statusCode = 404;
       return res.end('ffmpeg vendor: not found');
     }
@@ -189,6 +216,30 @@ function ffmpegVendorStatic() {
 
   return {
     name: 'ffmpeg-vendor-static',
+    buildStart() {
+      for (const rel of ['core/ffmpeg-core.js', 'core/ffmpeg-core.wasm']) {
+        if (!resolveFile(rel)) this.error(`Missing ffmpeg.wasm runtime asset: ${rel}. Run bun install.`);
+      }
+    },
+    writeBundle(outputOptions) {
+      // Vite's dev/preview middleware serves package assets directly. A standalone dist/ build also
+      // needs physical copies because there is no middleware after deployment.
+      const outDir = outputOptions.dir;
+      if (!outDir) return;
+      for (const rel of [
+        'core/ffmpeg-core.js',
+        'core/ffmpeg-core.wasm',
+        'core-mt/ffmpeg-core.js',
+        'core-mt/ffmpeg-core.wasm',
+        'core-mt/ffmpeg-core.worker.js',
+      ]) {
+        const source = resolveFile(rel);
+        if (!source) continue;
+        const target = join(outDir, 'vendor', 'ffmpeg-wasm', rel);
+        mkdirSync(dirname(target), { recursive: true });
+        copyFileSync(source, target);
+      }
+    },
     configureServer(server) {
       server.middlewares.use(serve);
     },

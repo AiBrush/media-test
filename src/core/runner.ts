@@ -64,7 +64,7 @@ import { detectCodecSupport, detectEnv } from './feature-detect.ts';
 import { Meter } from './measure.ts';
 import { DEFAULT_BENCH, metricSampleValue, summarize, summarizeAcrossFiles } from './bench.ts';
 import { loadGolden, runOracle } from './oracles.ts';
-import { disabledCellReason } from './disabled-cells.ts';
+import { disabledCellReason, forcedTimeoutCell } from './disabled-cells.ts';
 // Per-scenario media-file rotation (§6/§10): the ONE seeded RNG shared with media-selection, plus the
 // selection API. The runner only decides WHICH file is fetched — it never mutates bytes, softens an
 // oracle, or routes a real defect to NA (hard rules R1/R2/R3).
@@ -1883,6 +1883,45 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         opts.onResult?.(result);
         done += 1;
         opts.onProgress?.(done, total, label);
+        continue;
+      }
+
+      // Some third-party parsers enter a synchronous/infinite walk on specific malformed bytes. A
+      // Promise.race timeout cannot run while the main event loop is blocked, so known reproductions
+      // are classified as timeout FAILs before invoking the engine. They remain applicable failures
+      // (not SKIPPED), which keeps the framework accountable without freezing the rest of the matrix.
+      const timeoutCell =
+        forcedTimeoutCell(engine.id, scenario.id) ?? forcedTimeoutCell(engineId, scenario.id);
+      if (timeoutCell) {
+        if (engine.dispose) {
+          try {
+            await engine.dispose();
+          } catch {
+            // dispose failures must not mask the timeout classification; swallow.
+          }
+        }
+        result = {
+          engineId: engine.id,
+          browser: opts.browser,
+          scenarioId: scenario.id,
+          family: scenario.family,
+          status: 'FAIL',
+          oracleOutcomes: [
+            {
+              oracle: 'graceful-failure',
+              pass: false,
+              detail: 'timeout',
+            },
+          ],
+          reason:
+            `timeout: known non-preemptible operation exceeds the ${timeoutCell.timeoutMs}ms limit; ` +
+            timeoutCell.reason,
+          env: { ...runEnvBase, engineId: engine.id },
+        };
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${scenario.id} / ${engine.id} (timeout)`);
         continue;
       }
 

@@ -10,7 +10,7 @@ The suite compares media engines across feature families such as probe, demux, r
 
 ## Latest Results
 
-Source: [results/report.md](results/report.md) and [results/report.json](results/report.json). Generated `2026-06-18T17:40:53.441Z`, suite `0.1.0`, reference engine `mediabunny`, browsers `brave` and `chromium`, `339` scenarios, `8` engines.
+Source: [results/report.md](results/report.md) and [results/report.json](results/report.json). Generated `2026-06-18T17:40:53.441Z`, suite `0.1.0`, reference engine `mediabunny`, browsers `brave` and `chromium`, `339` scenarios, `8` engines. These historical results predate the unified Remotion adapter; rerun the matrix before using them to compare the current framework set.
 
 All timing comparisons are made only inside a single browser against the same corpus. Raw timing numbers are not compared across browsers.
 
@@ -130,8 +130,7 @@ Current registered engines include:
 - `platform@chrome-149`
 - `ffmpeg.wasm@0.12.15`
 - `mp4box@2.3.0`
-- `remotion-media-parser@4.0.479`
-- `remotion-webcodecs@4.0.479`
+- `remotion@4.0.479` (`@remotion/media-parser` + `@remotion/webcodecs`)
 - `web-demuxer@4.0.0`
 - `aibrush-media@dev`
 
