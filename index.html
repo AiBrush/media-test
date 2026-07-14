@@ -850,10 +850,10 @@
           </label>
           <label
             class="opt"
-            title="Reuse previous PASS cells from this browser instead of running them again. N/A cells are revalidated against the current framework capabilities and available assets."
+            title="Reuse previously stored results from this browser instead of running them again, regardless of result status."
           >
-            <input id="reuse-successful" type="checkbox" checked />
-            Reuse previous PASS results
+            <input id="reuse-data" type="checkbox" checked />
+            Reuse all data
           </label>
           <label
             class="opt"
@@ -884,6 +884,22 @@
           title="Download every test result currently stored in this browser's persistent cache, without starting a new run."
         >
           Export stored test data
+        </button>
+        <button
+          id="clear-cache"
+          type="button"
+          disabled
+          title="Delete every test result currently stored in this browser's persistent cache."
+        >
+          Clear data
+        </button>
+        <button
+          id="clear-aibrush-cache"
+          type="button"
+          disabled
+          title="Delete only stored test results for aibrush-media, including all versioned aibrush-media engine IDs."
+        >
+          Clear aibrush-media data
         </button>
         <span id="run-status" class="muted"></span>
       </div>

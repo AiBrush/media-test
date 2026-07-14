@@ -18,5 +18,5 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src", "fixtures/bake.mjs"],
-  "exclude": ["node_modules", "dist", "src/engines/**/vendor"]
+  "exclude": ["node_modules", "dist"]
 }

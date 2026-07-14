@@ -7,9 +7,6 @@ dist/
 .vite/
 bun.lockb
 
-# vendored engine bundles (dynamically imported browser libs)
-src/engines/**/vendor/
-
 # raw per-run results & snapshots (only results/report.md is committed)
 results/
 

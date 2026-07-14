@@ -411,7 +411,7 @@ export interface RunOptions {
   exhaustiveMedia?: boolean;
   onResult?: (r: ScenarioResult) => void;
   onProgress?: (done: number, total: number, label: string) => void;
-  /** Reuse cached PASS/NA cells and write every completed cell back to persistent storage. */
+  /** Reuse cached cells regardless of status and write every completed executable cell back to storage. */
   resultReuse?: ResultReuseStore;
   /** Optional cancellation signal. Aborts between cells so in-flight engine cleanup stays orderly. */
   signal?: AbortSignal;
@@ -1978,6 +1978,38 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       const withCacheKey = (r: ScenarioResult): ScenarioResult =>
         cacheScenarioKey === scenario.id ? r : { ...r, scenarioId: cacheScenarioKey };
 
+      // Reuse any prior result keyed by the EXACT input(s): the single picked file (normal) OR the full
+      // candidate SET (exhaustive — cacheScenarioKey encodes every file via the `exhaustive:<n>:…` tag).
+      // A changed pick/set produces a different key, so results from different bytes are never mixed.
+      // This lookup intentionally precedes negotiation so stored N/A rows are reusable too.
+      const cached = await opts.resultReuse?.get(engine.id, cacheScenarioKey, opts.browser).catch(() => undefined);
+      if (cached) {
+        const cachedReason = cached.reason?.replace(/^(cached:\s*)+/i, '');
+        const defaultCachedReason = `cached previous ${cached.status} result`;
+        result = {
+          ...cached,
+          // The stored copy was keyed under the composite `${id}#${tag}`; restore the true scenario id so
+          // the live/reported result is never polluted by the cache-key encoding.
+          scenarioId: scenario.id,
+          reason:
+            cachedReason && !/^cached previous [A-Z_]+ result$/i.test(cachedReason)
+              ? `cached: ${cachedReason}`
+              : defaultCachedReason,
+        };
+        if (engine.dispose) {
+          try {
+            await engine.dispose();
+          } catch {
+            /* swallow */
+          }
+        }
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${label} (cached)`);
+        continue;
+      }
+
       const preNeg = negotiate(engine.capabilities(), support, scenario.requires, scenario.options);
       if (!preNeg.ok) {
         result = {
@@ -2005,37 +2037,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // Reuse a prior PASS keyed by the EXACT input(s): the single picked file (normal) OR the full
-      // candidate SET (exhaustive — cacheScenarioKey encodes every file via the `exhaustive:<n>:…` tag, so
-      // the aggregate PASS is only served when the whole set is unchanged). A changed pick/set produces a
-      // different key → an honest re-run. Only PASS is served (below); NA/FAIL always re-run.
-      const cached = await opts.resultReuse?.get(engine.id, cacheScenarioKey, opts.browser).catch(() => undefined);
-      if (cached && cached.status === 'PASS') {
-        const cachedReason = cached.reason?.replace(/^(cached:\s*)+/i, '');
-        result = {
-          ...cached,
-          // The stored copy was keyed under the composite `${id}#${tag}`; restore the true scenario id so
-          // the live/reported result is never polluted by the cache-key encoding.
-          scenarioId: scenario.id,
-          reason:
-            cachedReason && cachedReason !== 'cached previous PASS result'
-              ? `cached: ${cachedReason}`
-              : 'cached previous PASS result',
-        };
-        if (engine.dispose) {
-          try {
-            await engine.dispose();
-          } catch {
-            /* swallow */
-          }
-        }
-        results.push(result);
-        opts.onResult?.(result);
-        done += 1;
-        opts.onProgress?.(done, total, `${label} (cached)`);
-        continue;
-      }
-
       // §6.2 EXHAUSTIVE: run EVERY candidate file for this cell (same order for every engine) and
       // aggregate — cell PASSes only if ALL files pass; bench combines across passing files (sum/max/
       // median per metric). `engine` (constructed + negotiated OK) is reused for file 0; fresh engines
@@ -2048,7 +2049,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             result.primaryMetric = scenario.primaryMetric;
           }
           // Persist the aggregate under the SET-encoded key so a later run with the identical candidate
-          // set reuses this PASS instead of re-running every file. Only a PASS is ever served back (above).
+          // set can reuse the result instead of re-running every file.
           await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
           results.push(result);
           opts.onResult?.(result);

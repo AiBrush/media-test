@@ -64,6 +64,8 @@ interface SuiteRunFilter {
   browser?: BrowserName;
   warmup?: number;
   iters?: number;
+  reuseData?: boolean;
+  /** Backward-compatible alias used by older launchers. */
   reuseSuccessful?: boolean;
   randomizeOrder?: boolean;
   randomSeed?: string;
@@ -175,13 +177,29 @@ function wireControls(): void {
   getEl<HTMLButtonElement>('select-all-scn').addEventListener('click', () => setAllChecked('scenarios-list', true));
   getEl<HTMLButtonElement>('download').addEventListener('click', downloadResults);
   const cacheExportBtn = getEl<HTMLButtonElement>('export-cache');
-  cacheExportBtn.disabled = !resultCache;
+  const cacheClearBtn = getEl<HTMLButtonElement>('clear-cache');
+  const aibrushCacheClearBtn = getEl<HTMLButtonElement>('clear-aibrush-cache');
+  setCacheControlsDisabled(false);
   if (!resultCache) {
     cacheExportBtn.title = 'Stored result export is unavailable because IndexedDB is not available.';
+    cacheClearBtn.title = 'Stored data cannot be cleared because IndexedDB is not available.';
+    aibrushCacheClearBtn.title = 'Stored data cannot be cleared because IndexedDB is not available.';
   }
   cacheExportBtn.addEventListener('click', () => {
     void downloadCachedResults();
   });
+  cacheClearBtn.addEventListener('click', () => {
+    void clearCachedResults();
+  });
+  aibrushCacheClearBtn.addEventListener('click', () => {
+    void clearCachedResults('aibrush-media');
+  });
+}
+
+function setCacheControlsDisabled(disabled: boolean): void {
+  for (const id of ['export-cache', 'clear-cache', 'clear-aibrush-cache']) {
+    getEl<HTMLButtonElement>(id).disabled = disabled || !resultCache;
+  }
 }
 
 function shouldAutoStart(): boolean {
@@ -214,7 +232,7 @@ async function runFromUi(): Promise<ScenarioResult[]> {
   const scenarioIds = getCheckedScenarios();
   const warmup = Number(getEl<HTMLInputElement>('warmup').value) || 1;
   const iters = Number(getEl<HTMLInputElement>('iters').value) || 1;
-  const reuseSuccessful = getEl<HTMLInputElement>('reuse-successful').checked;
+  const reuseData = getEl<HTMLInputElement>('reuse-data').checked;
   const randomizeOrder = getEl<HTMLInputElement>('randomize-order').checked;
   // §6.2: the browser UI defaults to exhaustive (all files per scenario) via this checkbox (checked by
   // default in index.html). Uncheck for the faster one-seeded-file-per-run mode. (Headless launch.mjs
@@ -227,7 +245,7 @@ async function runFromUi(): Promise<ScenarioResult[]> {
     pillar: 'all',
     warmup,
     iters,
-    reuseSuccessful,
+    reuseData,
     randomizeOrder,
     exhaustiveMedia,
   });
@@ -247,6 +265,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   runBtn.disabled = false;
   runBtn.textContent = 'Stop';
   dlBtn.disabled = true;
+  setCacheControlsDisabled(true);
   window.__RUN_DONE__ = false;
   window.__RESULTS__ = undefined;
 
@@ -308,7 +327,8 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     },
     onProgress: (done, total, label) => setProgress(done, total, label),
   };
-  if (filter.reuseSuccessful !== false && resultCache) opts.resultReuse = resultCache;
+  const reuseData = filter.reuseData ?? filter.reuseSuccessful ?? true;
+  if (reuseData && resultCache) opts.resultReuse = resultCache;
   if (filter.exhaustiveMedia) opts.exhaustiveMedia = true;
   if (engineIds) opts.engineIds = engineIds;
   if (scenarioIds) opts.scenarioIds = scenarioIds;
@@ -336,6 +356,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     window.__RUN_DONE__ = true;
     dlBtn.disabled = results.length === 0;
     if (activeRunController === controller) activeRunController = null;
+    setCacheControlsDisabled(false);
     runBtn.textContent = controller.signal.aborted ? 'Continue run' : 'Run selected features';
   }
   return results;
@@ -419,8 +440,44 @@ async function downloadCachedResults(): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     setRunStatus(`stored result export failed: ${msg}`);
   } finally {
-    cacheExportBtn.disabled = false;
+    cacheExportBtn.disabled = !resultCache || activeRunController !== null;
     cacheExportBtn.textContent = originalText;
+  }
+}
+
+async function clearCachedResults(engineId?: string): Promise<void> {
+  if (!resultCache) {
+    setRunStatus('stored data cannot be cleared because IndexedDB is not available');
+    return;
+  }
+  if (activeRunController) {
+    setRunStatus('stop the current run before clearing stored data');
+    return;
+  }
+
+  const aibrushOnly = engineId === 'aibrush-media';
+  const description = aibrushOnly ? 'stored aibrush-media test data' : 'all stored test data';
+  if (!window.confirm(`Clear ${description}? This cannot be undone.`)) return;
+
+  const button = getEl<HTMLButtonElement>(aibrushOnly ? 'clear-aibrush-cache' : 'clear-cache');
+  const originalText = button.textContent ?? (aibrushOnly ? 'Clear aibrush-media data' : 'Clear data');
+  setCacheControlsDisabled(true);
+  button.textContent = 'Clearing...';
+  try {
+    const deleted = aibrushOnly ? await resultCache.clearEngine(engineId) : await resultCache.clear();
+    if (deleted === 0) {
+      setRunStatus(`no ${aibrushOnly ? 'aibrush-media ' : ''}stored test data to clear`);
+    } else {
+      setRunStatus(
+        `cleared ${deleted} stored ${aibrushOnly ? 'aibrush-media ' : ''}result${deleted === 1 ? '' : 's'}`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    setRunStatus(`stored data clear failed: ${msg}`);
+  } finally {
+    setCacheControlsDisabled(false);
+    button.textContent = originalText;
   }
 }
 

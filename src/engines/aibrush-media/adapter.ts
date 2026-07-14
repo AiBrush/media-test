@@ -1,7 +1,8 @@
 /**
  * src/engines/aibrush-media/adapter.ts — MediaEngine adapter for `aibrush-media` (`@aibrush/media`),
- * the in-browser, capability-routed media engine built in ../../../../media. The runtime is **vendored
- * locally** (./vendor, copied from that package's `dist/` — hermetic, no CDN). Both the pure-TS tier
+ * the in-browser, capability-routed media engine built in ../../../../media. The runtime is installed
+ * as a `file:../media` dependency (node_modules/@aibrush/media — its `dist/`, refreshed by
+ * `bun run sync-vendor`; hermetic, no CDN). Both the pure-TS tier
  * (containers + probe + remux + keyframe-trim + CENC decrypt + audio-dsp + FLAC decode) AND the
  * WebCodecs/GPU codec tier (decode + frame-accurate seek + transcode/convert + GPU filters) back the
  * declared capabilities. Codec families the running browser cannot configure surface as NA_BROWSER via
@@ -3412,7 +3413,7 @@ async function fastHlsProbeMetadata(
 ): Promise<NormalizedMetadata | undefined> {
   const playlistText = new TextDecoder().decode(await inputBytes(input));
   const baseUrl = inputUrl(input).href;
-  const core = (await import('./vendor/core.js')) as unknown as AibrushHlsCore;
+  const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
   const plan = hlsVodProbePlan(playlistText, baseUrl);
   if (plan === undefined) return undefined;
   let segmentSource: unknown;
@@ -3504,7 +3505,7 @@ class AibrushMediaEngine implements MediaEngine {
     // Arm the page-error safety net for this cell BEFORE any work, so an init/op teardown race cannot
     // zero the run. Disarmed (after a grace tail) in dispose(), keeping the net inert for other engines.
     armSafetyNet();
-    const [lib, core] = await Promise.all([import('./vendor/index.js'), import('./vendor/core.js')]);
+    const [lib, core] = await Promise.all([import('@aibrush/media'), import('@aibrush/media/core')]);
     this.#lib = lib as unknown as AibrushMedia;
     this.#core = core as unknown as AibrushCore;
   }
@@ -3544,7 +3545,7 @@ class AibrushMediaEngine implements MediaEngine {
     signal?: AbortSignal,
     keyOverride?: { readonly keyBytes: Uint8Array; readonly ivHex?: string },
   ): Promise<AibrushSourceLike> {
-    const core = (await import('./vendor/core.js')) as unknown as AibrushHlsCore;
+    const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
     const playlistText = new TextDecoder().decode(await inputBytes(input));
     const baseUrl = inputUrl(input).href;
     const keyUris = new Set<string>();

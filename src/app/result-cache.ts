@@ -29,6 +29,8 @@ export interface ResultCache {
   get(engineId: string, scenarioId: string, browser: string): Promise<CachedScenarioResult | undefined>;
   put(result: ScenarioResult): Promise<void>;
   list(): Promise<CachedResultRow[]>;
+  clear(): Promise<number>;
+  clearEngine(engineId: string): Promise<number>;
 }
 
 interface StoredResultRow {
@@ -49,7 +51,7 @@ function shouldInvalidateCachedResult(result: ScenarioResult, validationEpoch?: 
 }
 
 export function isReusableResult(result: ScenarioResult | undefined): result is ScenarioResult {
-  return result?.status === 'PASS';
+  return result !== undefined;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -68,6 +70,28 @@ export function createResultCache(): ResultCache | undefined {
   if (typeof indexedDB === 'undefined') return undefined;
   let dbPromise: Promise<IDBDatabase> | undefined;
   const db = () => (dbPromise ??= openDb());
+
+  const deleteMatching = async (matches: (row: StoredResultRow) => boolean): Promise<number> => {
+    const database = await db();
+    return new Promise((resolve, reject) => {
+      const tx = database.transaction(STORE, 'readwrite');
+      const req = tx.objectStore(STORE).openCursor();
+      let deleted = 0;
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        const row = cursor.value as StoredResultRow;
+        if (matches(row)) {
+          cursor.delete();
+          deleted += 1;
+        }
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error ?? new Error('failed to scan result cache'));
+      tx.oncomplete = () => resolve(deleted);
+      tx.onerror = () => reject(tx.error ?? new Error('failed to clear result cache'));
+    });
+  };
 
   return {
     async get(engineId, scenarioId, browser) {
@@ -131,6 +155,15 @@ export function createResultCache(): ResultCache | undefined {
           a.result.engineId.localeCompare(b.result.engineId) ||
           a.result.scenarioId.localeCompare(b.result.scenarioId),
       );
+    },
+    async clear() {
+      return deleteMatching(() => true);
+    },
+    async clearEngine(engineId) {
+      return deleteMatching((row) => {
+        const storedEngineId = row.result?.engineId;
+        return storedEngineId === engineId || storedEngineId?.startsWith(`${engineId}@`) === true;
+      });
     },
   };
 }

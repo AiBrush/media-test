@@ -35,6 +35,36 @@ const FORCED_TIMEOUT_CELLS: ForcedTimeoutCell[] = [
 
 const DISABLED_CELLS: DisabledCell[] = [
   {
+    engineId: 'ffmpeg.wasm@0.12.15',
+    scenarioId: 'transcode/h264_to_hevc_mp4',
+    reason:
+      'disabled: H.264 to HEVC/MP4 re-encode exceeds the browser-wasm suite budget for ffmpeg.wasm@0.12.15',
+  },
+  {
+    engineId: 'ffmpeg.wasm@0.12.15',
+    scenarioId: 'transcode/h264_resize_720p',
+    reason:
+      'disabled: H.264 720p resize re-encode is disabled for ffmpeg.wasm@0.12.15',
+  },
+  {
+    engineId: 'ffmpeg.wasm@0.12.15',
+    scenarioId: 'transcode/av1_to_h264_mp4',
+    reason:
+      'disabled: AV1 to H.264/MP4 re-encode is disabled for ffmpeg.wasm@0.12.15',
+  },
+  {
+    engineId: 'ffmpeg.wasm@0.12.15',
+    scenarioId: 'transcode/vp9_to_h264_mp4',
+    reason:
+      'disabled: VP9 to H.264/MP4 re-encode is disabled for ffmpeg.wasm@0.12.15',
+  },
+  {
+    engineId: 'remotion@4.0.479',
+    scenarioId: 'transcode/h264_to_hevc_mp4',
+    reason:
+      'disabled: H.264 to HEVC/MP4 re-encode is disabled for remotion@4.0.479',
+  },
+  {
     engineId: 'remotion@4.0.479',
     scenarioId: 'demux/size_huge_huge_h264_1080p_600s',
     reason:

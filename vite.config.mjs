@@ -325,4 +325,8 @@ function saveEndpoint() {
 export default {
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
   plugins: [crossOriginIsolation(), ffmpegVendorStatic(), saveEndpoint(), fixturesStatic()],
+  // @aibrush/media is a file: dependency in node_modules, so vite would otherwise pre-bundle it with
+  // esbuild — which rewrites the codec tails' `new URL('./x.wasm', import.meta.url)` and breaks wasm
+  // loading. Exclude it so vite serves the engine as-is (same as when it lived under src/…/vendor).
+  optimizeDeps: { exclude: ['@aibrush/media'] },
 };

@@ -19,8 +19,8 @@
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 1800000 = 30 min).
 #   --headed             show the browser window (debugging).
-#   --no-reuse           force every selected PASS-capable cell to execute instead of reusing stored
-#                        successful results from prior runs.
+#   --no-reuse           force every selected executable cell to run instead of reusing stored
+#                        results from prior runs.
 #   --no-serve           do not start a server; assume one is already up at --base-url.
 #   --base-url <url>     use this base url instead of starting a server (implies --no-serve).
 #   --keep-serving       leave the server running after the run (for manual inspection).

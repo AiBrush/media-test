@@ -44,7 +44,7 @@ const opts = {
   iters: undefined,
   timeoutMs: 30 * 60 * 1000, // 30 min default cap for a whole matrix run
   headed: false,
-  reuseSuccessful: true,
+  reuseData: true,
   randomSeed: /** @type {string|undefined} */ (undefined), // §10: pin per-scenario media pick for reproducibility
   exhaustive: false, // §6.2: run every candidate file per scenario (AND status / median bench), not one
 };
@@ -69,7 +69,7 @@ for (let i = 0; i < argv.length; i++) {
     case '--random-seed': opts.randomSeed = next(); break;
     case '--exhaustive': opts.exhaustive = true; break;
     case '--headed': opts.headed = true; break;
-    case '--no-reuse': opts.reuseSuccessful = false; break;
+    case '--no-reuse': opts.reuseData = false; break;
     case '-h': case '--help':
       console.log('bun scripts/launch.mjs --base-url URL --browser brave|chromium|webkit|firefox (always non-headless) [--feature id] [--operation op] [--engine id] [--scenario id] [--pillar p] [--out dir] [--warmup N] [--iters N] [--timeout-ms MS] [--no-reuse]');
       process.exit(0);
@@ -172,11 +172,11 @@ try {
       `${suiteInfo.scenarioIds.length} scenarios`,
   );
 
-  if (opts.reuseSuccessful) {
+  if (opts.reuseData) {
     const reusableResults = loadReusableResultsForSeed(opts.browser);
     const seeded = await seedReusableResults(page, reusableResults);
     if (seeded > 0) {
-      console.log(`[launch] ${opts.browser} seeded ${seeded} reusable PASS result(s) into the page cache`);
+      console.log(`[launch] ${opts.browser} seeded ${seeded} reusable result(s) into the page cache`);
     }
   } else {
     console.log(`[launch] ${opts.browser} result reuse disabled; every selected executable cell will run fresh`);
@@ -186,7 +186,7 @@ try {
   const filter = {
     browser: opts.browser,
     pillar: opts.pillar,
-    reuseSuccessful: opts.reuseSuccessful,
+    reuseData: opts.reuseData,
     ...(opts.engines.length ? { engineIds: opts.engines } : {}),
     ...(opts.features.length ? { featureIds: opts.features } : {}),
     ...(opts.operations.length ? { operations: opts.operations } : {}),
@@ -376,7 +376,15 @@ function resultFiles(rawDir) {
 }
 
 function isReusableStatus(status) {
-  return status === 'PASS';
+  return (
+    status === 'PASS' ||
+    status === 'FAIL' ||
+    status === 'ERROR' ||
+    status === 'NA_ENGINE' ||
+    status === 'NA_BROWSER' ||
+    status === 'NA_ASSET' ||
+    status === 'SKIPPED'
+  );
 }
 
 async function seedReusableResults(page, results) {
