@@ -240,6 +240,12 @@ const MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES = 512 * 1024;
 const ISO_BMFF_BUFFER_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const STREAM_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const NON_ISO_STREAM_TARGET_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+// Below this size, decode/seek feed the engine one bulk-fetched in-memory buffer instead of a fresh
+// per-call URL range source. A small clip's decode/seek reads the whole (or nearly all) file anyway, so a
+// single GET beats the routeContainer-head + moov + sample range round-trips that dominate a tiny op's
+// wall; larger inputs keep the range source so seek/streaming never buffers a huge file. Size-gated on the
+// real input length (a general runtime property), never on a fixture identity.
+const SEEK_DECODE_BULK_FETCH_MAX_BYTES = 4 * 1024 * 1024;
 
 /** A bounded-timeout rejection (NOT a capability miss; `naIfMiss` re-throws it → a real per-scenario verdict). */
 class OpTimeoutError extends Error {
@@ -2183,12 +2189,19 @@ function canUseSeekForSingleFrameDecode(input: MediaInput, maxFrames: number): b
   return containerFromInput(input) === 'mp4';
 }
 
-function canUseDirectPacketInfoSingleFrameDecode(input: MediaInput, maxFrames: number): boolean {
-  return (
-    canUseSeekForSingleFrameDecode(input, maxFrames) &&
-    input.sizeBytes !== undefined &&
-    input.sizeBytes <= DIRECT_SINGLE_FRAME_MP4_MAX_BYTES
-  );
+/** Max frames the bounded direct-decode path will materialize (keeps peak VideoFrames small). */
+const DIRECT_BOUNDED_DECODE_MAX_FRAMES = 32;
+
+function canUseDirectBoundedDecode(input: MediaInput, maxFrames: number): boolean {
+  // Try the direct byte+pooled-decoder path for an mp4 decode of a SMALL, bounded frame count, whenever the
+  // known size is small OR unknown (baked fixtures carry no manifest size). #tryDirectBoundedDecode does a
+  // bounded read and bails to the seek/streaming path if the file exceeds the cap, so an unknown-but-large
+  // file is never fully buffered here. Skips mutated/malformed/still-image inputs (their own paths handle
+  // rejection/frame semantics).
+  if (input.mutated || isMalformedHarnessInput(input) || isStillImageInput(input)) return false;
+  if (!Number.isFinite(maxFrames) || maxFrames < 1 || maxFrames > DIRECT_BOUNDED_DECODE_MAX_FRAMES) return false;
+  if (containerFromInput(input) !== 'mp4') return false;
+  return input.sizeBytes === undefined || input.sizeBytes <= DIRECT_SINGLE_FRAME_MP4_MAX_BYTES;
 }
 
 function videoDecoderConfigFromTrackInfo(track: AibrushTrackInfo): VideoDecoderConfig | undefined {
@@ -2216,14 +2229,15 @@ function videoDecoderConfigFromTrackInfo(track: AibrushTrackInfo): VideoDecoderC
 
 function directVideoPacketRows(
   table: AibrushPacketInfoTable,
-): { readonly config: VideoDecoderConfig; readonly rows: readonly AibrushPacketInfoMetadata[] } | undefined {
+  maxRows: number,
+): { readonly config: VideoDecoderConfig; readonly rows: readonly AibrushPacketInfoMetadata[]; readonly hasMore: boolean } | undefined {
   const trackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
   if (trackIndex < 0) return undefined;
   const track = table.tracks[trackIndex];
   if (track === undefined) return undefined;
   const config = videoDecoderConfigFromTrackInfo(track);
   if (config === undefined) return undefined;
-  const rows = table.packets
+  const all = table.packets
     .filter(
       (row) =>
         row.trackIndex === trackIndex &&
@@ -2235,69 +2249,13 @@ function directVideoPacketRows(
         Number.isFinite(row.ptsUs) &&
         Number.isFinite(row.dtsUs),
     )
-    .sort((a, b) => a.dtsUs - b.dtsUs || a.ptsUs - b.ptsUs)
-    .slice(0, 1 + DIRECT_SINGLE_FRAME_MP4_SUBMIT_MARGIN);
+    .sort((a, b) => a.dtsUs - b.dtsUs || a.ptsUs - b.ptsUs);
+  const rows = all.slice(0, maxRows);
   if (rows.length === 0 || rows[0]?.keyframe !== true) return undefined;
-  return { config, rows };
-}
-
-async function decodeFirstPacketInfoFrame(
-  config: VideoDecoderConfig,
-  sourceBytes: Uint8Array,
-  rows: readonly AibrushPacketInfoMetadata[],
-): Promise<FrameSink | undefined> {
-  if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return undefined;
-  const collected: VideoFrame[] = [];
-  let decodeError: Error | undefined;
-  const decoder = new VideoDecoder({
-    output(frame): void {
-      collected.push(frame);
-    },
-    error(error): void {
-      decodeError = error instanceof Error ? error : new Error(String(error));
-    },
-  });
-  try {
-    decoder.configure(config);
-    for (const row of rows) {
-      const offset = row.offset;
-      if (offset === undefined) return undefined;
-      decoder.decode(
-        new EncodedVideoChunk({
-          type: row.keyframe ? 'key' : 'delta',
-          timestamp: Math.round(row.ptsUs),
-          ...(row.durationUs !== undefined ? { duration: Math.round(row.durationUs) } : {}),
-          data: sourceBytes.subarray(offset, offset + row.size),
-        }),
-      );
-    }
-    await decoder.flush();
-    if (decodeError !== undefined) throw decodeError;
-    collected.sort((a, b) => a.timestamp - b.timestamp);
-    const first = collected[0];
-    if (first === undefined) return undefined;
-    return await frameSinkFromSingleVideoFrame(first);
-  } finally {
-    for (const frame of collected) closeFrame(frame);
-    try {
-      decoder.close();
-    } catch {
-      /* already closed */
-    }
-  }
-}
-
-async function tryDirectPacketInfoSingleFrameDecode(
-  core: AibrushCore,
-  input: MediaInput,
-  signal: AbortSignal,
-): Promise<FrameSink | undefined> {
-  const bytes = await inputBytes(input);
-  if (signal.aborted) return undefined;
-  const table = await core.mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
-  const planned = directVideoPacketRows(table);
-  if (planned === undefined) return undefined;
-  return decodeFirstPacketInfoFrame(planned.config, bytes, planned.rows);
+  // `hasMore` = the track has coded packets beyond this window. When set and the window yields fewer than
+  // the requested frames, the bounded decode falls back to the full streaming path (rather than returning a
+  // short frame set) — so a real, many-frame video is never truncated by this fast path.
+  return { config, rows, hasMore: all.length > rows.length };
 }
 
 async function decodeToFrameSink(
@@ -2658,11 +2616,11 @@ async function tryPreparedWavIdentityTranscode(
   if (engine.pcm === undefined || containerFromInput(input) !== 'wav') return undefined;
   const prepared = await prepareCanonicalWavStreamMux(input);
   if (prepared === undefined || !canUsePreparedWavIdentity(prepared, opts)) return undefined;
-  const out = await engine.pcm(prepared.bytes, 'wav', {
-    to: 'wav',
-    ...(opts.audio !== undefined ? { audio: opts.audio } : {}),
-  });
-  return toMediaBytes(out, 'wav');
+  // `canUsePreparedWavIdentity` certified a genuine no-op (target codec/sampleRate/channels equal the
+  // source and every audio field is neutral), so the PCM transform would only reproduce these exact
+  // canonical WAV bytes. Return them directly and skip `engine.pcm` — the dynamic `pcm-convert-plan`
+  // import, container routing, and stream materialization it entails all collapse to a byte copy here.
+  return toMediaBytes(prepared.bytes, 'wav');
 }
 
 async function tryPreparedWavF32GainTranscode(
@@ -3500,6 +3458,14 @@ class AibrushMediaEngine implements MediaEngine {
   #preparedAudioMuxOutput: PreparedAudioMuxOutput | undefined;
   #preparedWebmMuxOutput: PreparedWebmMuxOutput | undefined;
   #preparedTsMuxOutput: PreparedTsMuxOutput | undefined;
+  // A pooled direct-decode VideoDecoder reused across repeated SAME-CONFIG decodeFrames calls within this
+  // cell. The harness builds a FRESH adapter per (engine, scenario) cell, so the pool NEVER spans inputs —
+  // no cross-input state. Keyed by the exact VideoDecoderConfig; a config change or decode error rebuilds
+  // it. Reusing a warm decoder avoids the per-call construct+configure (hardware init) cost that dominates
+  // tiny/single-frame decode wall (competitors keep a warm decoder too). Closed in dispose().
+  #directDecoder: VideoDecoder | undefined;
+  #directDecoderKey: string | undefined;
+  #directDecoderSink: { frames: VideoFrame[]; error: Error | undefined } | undefined;
 
   async init(): Promise<void> {
     // Arm the page-error safety net for this cell BEFORE any work, so an init/op teardown race cannot
@@ -3518,9 +3484,185 @@ class AibrushMediaEngine implements MediaEngine {
     this.#preparedWebmMuxOutput = undefined;
     this.#preparedTsMuxOutput = undefined;
     this.#preparedTsMuxOutput = undefined;
+    this.#dropDirectDecoder();
     this.#core = undefined;
     this.#engineInstance = undefined;
     disarmSafetyNet();
+  }
+
+  /** Close + forget the pooled direct-decode VideoDecoder (on dispose, config change, or a decode error). */
+  #dropDirectDecoder(): void {
+    const decoder = this.#directDecoder;
+    this.#directDecoder = undefined;
+    this.#directDecoderKey = undefined;
+    if (decoder !== undefined && decoder.state !== 'closed') {
+      try {
+        decoder.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  #directDecoderConfigKey(config: VideoDecoderConfig): string {
+    // codec + coded dims + description length uniquely identify the config within a cell (one input per
+    // cell, so the config never actually changes — this key only guards the pool against a config swap).
+    const descLen = config.description === undefined ? 0 : (config.description as { byteLength: number }).byteLength;
+    return `${config.codec}|${config.codedWidth}x${config.codedHeight}|${descLen}`;
+  }
+
+  /**
+   * Decode the first presentation frame of `rows` with the POOLED direct-decode VideoDecoder — reused for
+   * repeated same-config calls in this cell (a fresh adapter per cell means the pool never spans inputs).
+   * Every collected VideoFrame is `close()`d exactly once; the decoder stays open (pooled) and is closed in
+   * dispose(). Returns `undefined` when WebCodecs is absent or no frame is produced. On any decode error the
+   * pooled decoder is dropped (so the fallback/next call rebuilds) and the error is rethrown for the caller.
+   */
+  /** Get (or build+configure) the pooled direct-decode VideoDecoder for `config`. Frame outputs route to
+   *  the current call's `#directDecoderSink`; a config change or closed state rebuilds it. */
+  #acquireDirectDecoder(config: VideoDecoderConfig): VideoDecoder {
+    const key = this.#directDecoderConfigKey(config);
+    const existing = this.#directDecoder;
+    if (existing !== undefined && this.#directDecoderKey === key && existing.state !== 'closed') {
+      return existing;
+    }
+    this.#dropDirectDecoder();
+    const decoder = new VideoDecoder({
+      output: (frame): void => {
+        const sink = this.#directDecoderSink;
+        if (sink !== undefined) sink.frames.push(frame);
+        else closeFrame(frame); // no active call owns it → never leak a stray frame
+      },
+      error: (error): void => {
+        const sink = this.#directDecoderSink;
+        if (sink !== undefined) sink.error = error instanceof Error ? error : new Error(String(error));
+      },
+    });
+    decoder.configure(config);
+    this.#directDecoder = decoder;
+    this.#directDecoderKey = key;
+    return decoder;
+  }
+
+  async #decodeDirectPooledFirstFrame(
+    config: VideoDecoderConfig,
+    sourceBytes: Uint8Array,
+    rows: readonly AibrushPacketInfoMetadata[],
+  ): Promise<FrameSink | undefined> {
+    if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return undefined;
+    const decoder = this.#acquireDirectDecoder(config);
+    const sink: { frames: VideoFrame[]; error: Error | undefined } = { frames: [], error: undefined };
+    this.#directDecoderSink = sink;
+    try {
+      for (const row of rows) {
+        const offset = row.offset;
+        if (offset === undefined) {
+          this.#dropDirectDecoder(); // malformed row mid-stream → discard the now-inconsistent decoder
+          return undefined;
+        }
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: row.keyframe ? 'key' : 'delta',
+            timestamp: Math.round(row.ptsUs),
+            ...(row.durationUs !== undefined ? { duration: Math.round(row.durationUs) } : {}),
+            data: sourceBytes.subarray(offset, offset + row.size),
+          }),
+        );
+      }
+      await decoder.flush();
+      if (sink.error !== undefined) throw sink.error;
+      sink.frames.sort((a, b) => a.timestamp - b.timestamp);
+      const first = sink.frames[0];
+      if (first === undefined) return undefined;
+      return await frameSinkFromSingleVideoFrame(first);
+    } catch (e) {
+      this.#dropDirectDecoder(); // a broken pooled decoder must never be reused
+      throw e;
+    } finally {
+      for (const frame of sink.frames) closeFrame(frame);
+      this.#directDecoderSink = undefined;
+    }
+  }
+
+  /** Fast bounded decode (1..N frames) via the pooled direct decoder (mp4 packet-info byte path). */
+  async #tryDirectBoundedDecode(
+    input: MediaInput,
+    maxFrames: number,
+    signal: AbortSignal,
+  ): Promise<FrameSink | undefined> {
+    // Bounded bulk read: known-small inputs read whole; unknown-size inputs read up to the cap and only
+    // proceed if the file fit (a larger file yields undefined → fall back to the seek/streaming path).
+    const bytes =
+      input.sizeBytes !== undefined && input.sizeBytes <= DIRECT_SINGLE_FRAME_MP4_MAX_BYTES
+        ? await inputBytes(input)
+        : await inputBytesIfAtMost(input, DIRECT_SINGLE_FRAME_MP4_MAX_BYTES);
+    if (bytes === undefined || signal.aborted) return undefined;
+    const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
+    // Submit enough packets to yield `maxFrames` output frames even with B-frame reordering; the decode
+    // helper trims the sorted output to exactly `maxFrames`.
+    const planned = directVideoPacketRows(table, maxFrames + DIRECT_SINGLE_FRAME_MP4_SUBMIT_MARGIN);
+    if (planned === undefined) return undefined;
+    return maxFrames <= 1
+      ? this.#decodeDirectPooledFirstFrame(planned.config, bytes, planned.rows)
+      : this.#decodeDirectPooledFrames(planned.config, bytes, planned.rows, maxFrames, planned.hasMore);
+  }
+
+  /**
+   * Decode the first `maxFrames` presentation frames of `rows` with the POOLED decoder and return a
+   * RetainingFrameSink of their digests — the same (presentation-ordered, 0..N-1 re-indexed) shape the
+   * streaming path produces, so the decoded-frames-bitexact oracle pairs frame[i]↔golden[i]. Every decoded
+   * VideoFrame is closed exactly once; the decoder stays pooled (closed in dispose); on error it is dropped.
+   */
+  async #decodeDirectPooledFrames(
+    config: VideoDecoderConfig,
+    sourceBytes: Uint8Array,
+    rows: readonly AibrushPacketInfoMetadata[],
+    maxFrames: number,
+    hasMore: boolean,
+  ): Promise<FrameSink | undefined> {
+    if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return undefined;
+    const decoder = this.#acquireDirectDecoder(config);
+    const sink: { frames: VideoFrame[]; error: Error | undefined } = { frames: [], error: undefined };
+    this.#directDecoderSink = sink;
+    try {
+      for (const row of rows) {
+        const offset = row.offset;
+        if (offset === undefined) {
+          this.#dropDirectDecoder();
+          return undefined;
+        }
+        decoder.decode(
+          new EncodedVideoChunk({
+            type: row.keyframe ? 'key' : 'delta',
+            timestamp: Math.round(row.ptsUs),
+            ...(row.durationUs !== undefined ? { duration: Math.round(row.durationUs) } : {}),
+            data: sourceBytes.subarray(offset, offset + row.size),
+          }),
+        );
+      }
+      await decoder.flush();
+      if (sink.error !== undefined) throw sink.error;
+      sink.frames.sort((a, b) => a.timestamp - b.timestamp);
+      const emit = sink.frames.slice(0, maxFrames);
+      // A short window on a longer track → defer to the full streaming path rather than return too few
+      // frames. When the track truly has fewer frames than requested (hasMore=false), the short set is
+      // the correct, complete result.
+      if (emit.length === 0 || (emit.length < maxFrames && hasMore)) return undefined;
+      const out = new RetainingFrameSink();
+      for (let i = 0; i < emit.length; i++) {
+        const frame = emit[i]!;
+        const img = await imageDataFromAibrushFrame(frame);
+        const digest = await digestImageData(img, i, frame.timestamp);
+        out.add(digest, img);
+      }
+      return out;
+    } catch (e) {
+      this.#dropDirectDecoder();
+      throw e;
+    } finally {
+      for (const frame of sink.frames) closeFrame(frame);
+      this.#directDecoderSink = undefined;
+    }
   }
 
   #engine(): AibrushEngine {
@@ -3579,6 +3721,32 @@ class AibrushMediaEngine implements MediaEngine {
       rangeRequests: true,
       ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
     });
+  }
+
+  /**
+   * Like {@link #src}, but for whole-file consumers (decode/seek): a small, non-mutated, non-HLS input is
+   * fed as one bulk-fetched in-memory buffer (reusing the harness's per-input cache) so the op pays a
+   * single GET instead of repeated URL range round-trips. Anything over the cap (or mutated/HLS) keeps the
+   * streaming range source via {@link #src}. Probe deliberately does NOT use this — it needs only a bounded
+   * header window, which the range path already reads in one shot.
+   */
+  async #srcWholeForSmall(engine: AibrushEngine, input: MediaInput, maxBytes: number): Promise<unknown> {
+    // Only containers whose demux materializes the whole file benefit: for them the bulk buffer also skips
+    // the extra container-sniff range GET, a real per-op win. ISO-BMFF (mp4/mov) instead random-accesses
+    // only the `moov` + the seek target's byte range, so bulk-fetching its (large) `mdat` would be pure
+    // waste — those keep the streaming range source. Container is a general property of the input bytes.
+    const container = containerFromInput(input);
+    if (
+      container !== 'mp4' &&
+      container !== 'mov' &&
+      !input.mutated &&
+      !isHlsAsset(input) &&
+      input.sizeBytes !== undefined &&
+      input.sizeBytes <= maxBytes
+    ) {
+      return engine.from(await inputBytes(input), { mime: input.mime });
+    }
+    return this.#src(engine, input);
   }
 
   capabilities(): CapabilitySet {
@@ -3967,11 +4135,14 @@ class AibrushMediaEngine implements MediaEngine {
         }
         const preparedWavF32Gain = await tryPreparedWavF32GainTranscode(this.#driverCore(), input, opts, signal);
         if (preparedWavF32Gain !== undefined) return preparedWavF32Gain;
-        const preparedWavDirect = await tryPreparedWavDirectPcmTranscode(this.#driverCore(), input, opts, signal);
-        if (preparedWavDirect !== undefined) return preparedWavDirect;
         const engine = this.#engine();
+        // Identity (no-op) WAV transcode is checked BEFORE the direct resample/format attempt: a request
+        // whose target codec/sampleRate/channels already match the source is a verified passthrough, so it
+        // returns the canonical bytes immediately instead of parsing the header to decline two conversions.
         const preparedWav = await tryPreparedWavIdentityTranscode(engine, input, opts);
         if (preparedWav !== undefined) return preparedWav;
+        const preparedWavDirect = await tryPreparedWavDirectPcmTranscode(this.#driverCore(), input, opts, signal);
+        if (preparedWavDirect !== undefined) return preparedWavDirect;
         const preparedAiffWav = await tryPreparedAiffWavTranscode(this.#driverCore(), input, opts);
         if (preparedAiffWav !== undefined) return preparedAiffWav;
         // MISMATCH GUARD (A.16): when the request EXPLICITLY targets media type(s) the source does not
@@ -4045,9 +4216,9 @@ class AibrushMediaEngine implements MediaEngine {
     return withOpTimeout('decodeFrames', async (signal) => {
       try {
         const engine = this.#engine();
-        if (canUseDirectPacketInfoSingleFrameDecode(input, maxFrames)) {
+        if (canUseDirectBoundedDecode(input, maxFrames)) {
           try {
-            const direct = await tryDirectPacketInfoSingleFrameDecode(this.#driverCore(), input, signal);
+            const direct = await this.#tryDirectBoundedDecode(input, maxFrames, signal);
             if (direct !== undefined) return direct;
           } catch {
             // Fall through to the seek/linear decode paths; packet-info first-frame decode is a fast path.
@@ -4055,7 +4226,11 @@ class AibrushMediaEngine implements MediaEngine {
         }
         if (canUseSeekForSingleFrameDecode(input, maxFrames)) {
           try {
-            const frame = await engine.seek(await this.#src(engine, input), 0, { signal });
+            const frame = await engine.seek(
+              await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
+              0,
+              { signal },
+            );
             return await frameSinkFromSingleVideoFrame(frame);
           } catch {
             // Fall back to the normal linear decode path; this shortcut must never turn a valid decode
@@ -4070,7 +4245,10 @@ class AibrushMediaEngine implements MediaEngine {
             hasAudio: info.tracks.some((track) => track.type === 'audio'),
           };
         }
-        const streams = engine.decode(await this.#src(engine, input), { signal });
+        const streams = engine.decode(
+          await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
+          { signal },
+        );
         return await decodeToFrameSink(streams, maxFrames, presence);
       } catch (e) {
         return naIfMiss('decodeFrames', e, input);
@@ -4094,7 +4272,11 @@ class AibrushMediaEngine implements MediaEngine {
     return withOpTimeout('seek', async (signal) => {
       try {
         const engine = this.#engine();
-        const frame = await engine.seek(await this.#src(engine, input), seekUs, { signal });
+        const frame = await engine.seek(
+          await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
+          seekUs,
+          { signal },
+        );
         try {
           const img = await imageDataFromVideoFrame(frame);
           const landedPtsUs = Math.round(frame.timestamp);
@@ -4723,6 +4905,11 @@ class AibrushMediaEngine implements MediaEngine {
               continue;
             }
           }
+          const mp4Fast = await this.#tryEncodedMp4TracksFromBytes(input, signal);
+          if (mp4Fast !== undefined) {
+            for (const track of mp4Fast) tracks.push(track);
+            continue;
+          }
           const engine = this.#engine();
           const demuxed = await engine.demux(await this.#src(engine, input), { signal });
           try {
@@ -4941,6 +5128,12 @@ class AibrushMediaEngine implements MediaEngine {
           firstByteMs: Math.max(0, nowMs() - startMs),
         };
       }
+      // The tracks were already demuxed once by prepareMuxTracks (they arrive here as `selectedTracks`,
+      // post track-select). Pack THOSE coded packets straight into the target container instead of letting
+      // #muxMultiSource re-demux every source a second time — a full redundant fetch+parse pass. Falls back
+      // to the streaming multi-source mux on any shape the prepared packers do not cover (identical output).
+      const packedMulti = await this.#tryMuxPreparedMultiSource(selectedTracks, target, opts);
+      if (packedMulti !== undefined) return packedMulti;
       return this.#muxMultiSource(recorded, target, opts);
     }
 
@@ -5165,6 +5358,92 @@ class AibrushMediaEngine implements MediaEngine {
    * `tracks[]`. The demuxers stay open until the mux drains (the packet streams are lazy), and are closed
    * in a finally. An illegal codec→container pair raises a typed CapabilityError → NA (never wrong output).
    */
+  /**
+   * Fast prepared-source materialization for an MP4/MOV mux input: bulk-fetch once + parse the packet
+   * table with offsets, yielding EncodedTracks whose chunk `data` are zero-copy subarray views — the same
+   * path the single-source MP4 prepared mux uses. Avoids the streaming `engine.demux` per-packet pull +
+   * per-packet byte copy on multi-source assembly. Returns `undefined` (→ caller falls back to
+   * `engine.demux`) for non-MP4 sources, over-cap files, or any codec the byte-table packer cannot express.
+   */
+  async #tryEncodedMp4TracksFromBytes(
+    input: MediaInput,
+    signal: AbortSignal,
+  ): Promise<EncodedTrack[] | undefined> {
+    const container = containerFromInput(input);
+    if (input.mutated || (container !== 'mp4' && container !== 'mov')) return undefined;
+    try {
+      const bytes =
+        input.sizeBytes !== undefined && input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES
+          ? await inputBytes(input)
+          : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
+      if (bytes === undefined) return undefined;
+      const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
+      const tracks = encodedMp4TracksFromPacketInfo(table, bytes);
+      return tracks !== undefined && tracks.length === table.tracks.length ? tracks : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Wrap already-authored container bytes as MediaBytes, adding buffer-target telemetry when requested. */
+  async #finishPreparedMuxBytes(bytes: Uint8Array, target: string, opts: MuxOptions): Promise<MediaBytes> {
+    const startMs = nowMs();
+    const media = await toMediaBytes(bytes, target);
+    if ((opts as { target?: unknown }).target !== 'buffer') return media;
+    return {
+      ...media,
+      targetWrites: media.bytes.byteLength > 0 ? 1 : 0,
+      firstByteMs: Math.max(0, nowMs() - startMs),
+    };
+  }
+
+  /**
+   * MULTI-SOURCE mux without a second demux: pack the already-demuxed, already-selected coded tracks
+   * (`selectedTracks`, produced by prepareMuxTracks + track-select) straight into the target container via
+   * the same proven prepared muxers the single-source paths use. Returns `undefined` for shapes those
+   * muxers do not cover (stream/append-only/fragmented targets, non-mp4/webm containers, or a track the
+   * packer cannot express) so the caller falls back to the streaming `#muxMultiSource` — byte-equivalent
+   * output either way. This removes the redundant re-fetch+re-demux pass on assembly rows.
+   */
+  #tryMuxPreparedMultiSource(
+    selectedTracks: readonly EncodedTrack[],
+    target: string,
+    opts: MuxOptions,
+  ): Promise<MediaBytes | undefined> | undefined {
+    if ((opts as { target?: unknown }).target === 'stream') return undefined;
+    // A prepared muxer that rejects a codec/container combination it does not cover throws synchronously;
+    // fall back to the streaming multi-source mux (which arbitrates legality identically) rather than
+    // surfacing a raw error. An illegal pair then still becomes a typed NA via #muxMultiSource, unchanged.
+    try {
+      if (target === 'mp4' || target === 'mov') {
+        const fragmented = wantsFragmented(opts);
+        const faststart = (opts as { fastStart?: unknown }).fastStart !== false;
+        const prepared = preparedMp4PacketTracksFromEncoded(selectedTracks);
+        if (prepared === undefined) return undefined;
+        const bytes = this.#driverCore().muxPreparedMp4PacketTracks({
+          tracks: prepared,
+          container: target,
+          faststart,
+          fragmented,
+        });
+        return this.#finishPreparedMuxBytes(bytes, target, opts);
+      }
+      if (target === 'webm' || target === 'mkv') {
+        if (wantsFragmented(opts) || wantsAppendOnly(opts)) return undefined;
+        const prepared = preparedWebmChunkTracksFromEncodedTracks(selectedTracks);
+        if (prepared === undefined) return undefined;
+        const bytes = this.#driverCore().muxPreparedWebmChunkTracks({
+          tracks: prepared,
+          container: target,
+        });
+        return this.#finishPreparedMuxBytes(bytes, target, opts);
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
   async #muxMultiSource(
     inputs: MediaInput[],
     target: string,
