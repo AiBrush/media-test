@@ -1,176 +1,71 @@
-# Browser Media-Engine Benchmark
+# media-test
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Suite](https://img.shields.io/badge/suite-browser_media_benchmark-0f766e)](#browser-media-engine-benchmark)
-[![Reference](https://img.shields.io/badge/reference-mediabunny_1.48.0-orange)](#latest-results)
+`media-test` is a browser-only conformance and benchmark matrix for comparing media-framework adapters against one engine-independent scenario battery. The battery covers 13 feature families, from probing and packet work through transcoding, streaming output, robustness, and performance. Scenarios declare the operation, inputs, required capabilities, oracles, metrics, and tolerances without naming an engine. [src/core/scenario.ts:74-119](src/core/scenario.ts#L74-L119) [src/core/scenario.ts:145-177](src/core/scenario.ts#L145-L177)
 
-Library-agnostic, browser-only media-engine conformance and benchmark suite. The product is the comparison: every engine is run against the same local media corpus, the same browser runtime, and the same correctness oracles before performance numbers are trusted.
+The scored adapters are AiBrush Media, ffmpeg.wasm, Mediabunny, MP4Box.js, Remotion, and web-demuxer. A separate browser-platform implementation supplies WebCodecs decode/playback evidence but is registered as an instrument, not a seventh competitor. [src/app/register.ts:37-92](src/app/register.ts#L37-L92) [src/core/registry.ts:18-26](src/core/registry.ts#L18-L26) [src/core/registry.ts:63-70](src/core/registry.ts#L63-L70)
 
-The suite compares media engines across feature families such as probe, demux, remux, mux, metadata, encryption, decode/seek, transcode, audio DSP, and performance sweeps. Execution is feature-first: choose the feature or scenario, then compare the selected frameworks on that exact case.
+This documentation has two jobs: describe the implementation that exists today and define the target contracts for later code-cleanup agents. In every owned page, **As-built** is current and code-cited; **Target design and known gaps** is required future behavior and must not be read as implemented.
 
-## Latest Results
+## Run and score mental model
 
-Source: [results/report.md](results/report.md) and [results/report.json](results/report.json). Generated `2026-06-18T17:40:53.441Z`, suite `0.1.0`, reference engine `mediabunny`, browsers `brave` and `chromium`, `339` scenarios, `8` engines. These historical results predate the unified Remotion adapter; rerun the matrix before using them to compare the current framework set.
+1. The registry loads scored engine factories and engine-independent scenarios; an individual registration failure is reported without blanking the whole suite. [src/app/register.ts:149-181](src/app/register.ts#L149-L181)
+2. The runner expands selected scenarios and engines into browser-specific [cells](docs/glossary.md#cell), then checks engine declarations and runtime browser codec support before execution. [src/core/runner.ts:124-202](src/core/runner.ts#L124-L202) [src/core/runner.ts:1728-1769](src/core/runner.ts#L1728-L1769)
+3. A fresh adapter instance performs the operation and returns normalized metadata, packets, bytes, frames, or a seek result. [src/core/engine.ts:196-240](src/core/engine.ts#L196-L240) [src/core/runner.ts:794-845](src/core/runner.ts#L794-L845)
+4. Engine-independent oracles judge the observation. In the current implementation, any substantive `pass: false` outcome makes the cell `FAIL`; only a current `PASS` reaches benchmark iterations. [src/core/scenario.ts:208-222](src/core/scenario.ts#L208-L222) [src/core/runner.ts:1411-1463](src/core/runner.ts#L1411-L1463)
+5. Reporting folds cells into browser-separated conformance, benchmark, winner, and scorecard views; benchmark numbers are admissible only behind the correctness gate. [src/core/report.ts:4-19](src/core/report.ts#L4-L19) [src/core/report.ts:160-169](src/core/report.ts#L160-L169)
 
-All timing comparisons are made only inside a single browser against the same corpus. Raw timing numbers are not compared across browsers.
+The browser UI and headless launcher drive the same `runMatrix()` surface. Project scripts expose development, serving, browser-run, comparison, build, and typecheck entry points. [src/app/main.ts:43-74](src/app/main.ts#L43-L74) [package.json:10-20](package.json#L10-L20)
 
-| # | Engine | Wins | Conf % | Robust % | Bundle | Breadth | Verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `mediabunny@1.48.0` | 30 (29 unc.) | 31.8% | 100% | 165.2 kB | 8 | 30 wins (1 contested, 29 uncontested); perf 0.99x vs winners |
-| 2 | `remotion-webcodecs@4.0.479` | 7 (7 unc.) | 46.5% | - | 94 kB | 6 | 7 wins; perf 0.15x vs winners |
-| 3 | `mp4box@2.3.0` | 4 (3 unc.) | 63.4% | - | 41.3 kB | 5 | 4 wins; perf 1x vs winners |
-| 4 | `ffmpeg.wasm@0.12.15` | 2 | 75% | - | 1.4 kB | 1 | 2 wins; perf 0.74x vs winners |
-| 5 | `web-demuxer@4.0.0` | 2 (2 unc.) | 37.1% | - | 43.2 kB | 4 | 2 wins; perf 0.22x vs winners |
-| 6 | `remotion-media-parser@4.0.479` | 1 | 53.8% | - | 72.6 kB | 4 | 1 win; perf 0.06x vs winners |
-| 7 | `platform@chrome-149` | 1 | 47.8% | - | - | 4 | 1 win; perf 0.95x vs winners |
-| 8 | `aibrush-media@dev` | 0 | 0% | - | - | 0 | 0 wins |
+## Status vocabulary
 
-Latest focused Brave verification: [results/raw/brave-2026-06-18T23-19-12-344Z.json](results/raw/brave-2026-06-18T23-19-12-344Z.json).
+The [glossary](docs/glossary.md) is normative. The short version is:
 
-| Scenario | Engine | Status | Duration | Notes |
-| --- | --- | --- | ---: | --- |
-| `remux/flac_seektable_flac_to_ogg` | `mediabunny@1.48.0` | `NA_ENGINE` | 11 ms | Engine does not declare `remux:flac-in-ogg`. |
-| `remux/prop_bframes_decode_remux_mp4_mkv` | `mediabunny@1.48.0` | `FAIL` | 1144 ms | Real property failure: `decode(remux(x)) == decode(x)` frame digests differ for 12/12 frames. |
+| Term | State | Meaning |
+| --- | --- | --- |
+| `PASS` | Current status; target oracle verdict | The cell is green today. In the target model it specifically means the semantic and structural contract holds after documented normalization and tolerances. |
+| `DIFF` | **Target only** | Valid and semantically acceptable, but represented differently from the ffmpeg-baked golden. It is absent from the current status and boolean oracle types. |
+| `FAIL` | Current status; narrowed target meaning | A substantive oracle non-pass today. The target reserves it for truly wrong, invalid, unusable, or tolerance-violating output—not a legal representation difference. |
+| `NA_ENGINE` | Current | The engine cannot perform the operation or concrete combination, including a runtime `NotApplicableError`. |
+| `NA_BROWSER` | Current | The browser/runtime lacks a required API or supported codec configuration. |
+| `NA_ASSET` | Current | Required source or golden evidence is unavailable. |
+| `ERROR` | Current | Unexpected harness/adapter execution failure, not ordinary non-applicability. |
+| `SKIPPED` | Current | An intentionally disabled cell; not a capability result. |
+| partial coverage | **Target only as a grade** | Preserve and grade mixed per-file outcomes such as `PASS`/`FAIL`/`FAIL`. Current exhaustive results retain per-file evidence and counters but collapse the top-level status. [src/core/scenario.ts:294-313](src/core/scenario.ts#L294-L313) [src/core/runner.ts:1118-1205](src/core/runner.ts#L1118-L1205) |
 
-For the full matrix, see [results/report.md](results/report.md). Machine-readable results live in [results/report.json](results/report.json) and [results/raw/](results/raw/).
+## Documentation map
 
-## What It Tests
+### Features
 
-- Correctness first: probe, demux, remux, mux, metadata, encryption, decode/seek, transcode, and audio DSP scenarios are checked against local golden metadata, packet, frame, SSIM, and property oracles.
-- Performance second: speed, throughput, memory, long tasks, source reads, target writes, output bytes, decode FPS, and encode FPS are measured only after correctness passes.
-- Runtime capability honesty: unsupported engine, browser, codec, fixture, or asset cases become explicit `N/A` statuses instead of hidden failures.
-- Local corpus discipline: scenarios run against media in `fixtures/media` and goldens in `fixtures/golden`, so inputs and expected outputs are inspectable in the repository.
-- Browser realism: `scripts/run.sh` launches real browser runs and stores raw JSON under `results/raw`.
+- [Audio DSP](docs/features/audio-dsp.md)
+- [Decode and seek](docs/features/decode-seek.md)
+- [Demux](docs/features/demux.md)
+- [Encryption](docs/features/encryption.md)
+- [Metadata](docs/features/metadata.md)
+- [Mux](docs/features/mux.md)
+- [Performance](docs/features/performance.md)
+- [Probe](docs/features/probe.md)
+- [Remux](docs/features/remux.md)
+- [Robustness](docs/features/robustness.md)
+- [Streaming output](docs/features/streaming-output.md)
+- [Transcode](docs/features/transcode.md)
+- [Trim](docs/features/trim.md)
 
-## Installation
+### Subsystems
 
-This project uses Bun. In this workspace, use Bun/Bunx rather than npm/npx.
+- [Application and browser UI](docs/subsystems/app-ui.md)
+- [Engine adapter contract](docs/subsystems/engine-adapter-contract.md)
+- [Golden baking and fixtures](docs/subsystems/golden-baking-fixtures.md)
+- [Media selection](docs/subsystems/media-selection.md)
+- [Oracle system](docs/subsystems/oracle-system.md)
+- [Reporting and aggregation](docs/subsystems/reporting-aggregation.md)
+- [Runner and capability negotiation](docs/subsystems/runner-capability-negotiation.md)
+- [Scenario DSL and registry](docs/subsystems/scenario-dsl-registry.md)
 
-```bash
-bun install
-```
+### Engines
 
-## Usage
-
-Serve the interactive browser UI:
-
-```bash
-bun run serve
-```
-
-Then open:
-
-```text
-http://localhost:5173/index.html
-```
-
-Run the benchmark launcher in a real browser:
-
-```bash
-bun run run --browser brave --engine mediabunny --feature remux --warmup 1 --iters 1
-```
-
-Run one scenario:
-
-```bash
-bun run run --browser brave --engine mediabunny --scenario remux/prop_bframes_decode_remux_mp4_mkv --warmup 1 --iters 1
-```
-
-Generate the consolidated report:
-
-```bash
-bun run compare
-```
-
-Bake or refresh fixtures and goldens:
-
-```bash
-bun run bake
-```
-
-Check the TypeScript build:
-
-```bash
-bun run typecheck
-bun run build
-```
-
-Full multi-engine bake, per browser (no --engine = ALL engines; full perf iters, not --iters 1)
-
-```bash
-cd ../media-test/media-browser-test
-bash scripts/run.sh --browser chromium --no-reuse
-bash scripts/run.sh --browser webkit   --no-reuse
-bash scripts/run.sh --browser firefox  --no-reuse
-```
-
-Rank + leaderboard + comparison
-
-```
-bun scripts/aggregate.mjs
-bash scripts/compare.sh
-```
-
-## Feature-First Flow
-
-The default execution model is:
-
-1. Choose one or more feature families, such as `probe`, `demux`, or `remux`.
-2. Optionally narrow to specific scenarios.
-3. Choose one or more engines.
-4. Run correctness and performance on each selected scenario across those engines.
-
-This keeps the table centered on media capabilities instead of making the framework column the primary workflow.
-
-## Engines
-
-Current registered engines include:
-
-- `mediabunny@1.48.0`
-- `platform@chrome-149`
-- `ffmpeg.wasm@0.12.15`
-- `mp4box@2.3.0`
-- `remotion@4.0.479` (`@remotion/media-parser` + `@remotion/webcodecs`)
-- `web-demuxer@4.0.0`
-- `aibrush-media@dev`
-
-Add a new engine with:
-
-```bash
-bun run add-engine
-```
-
-## Repository Layout
-
-```text
-src/app/        Browser UI, feature/scenario selection, result matrix
-src/core/       Benchmark protocol, runner, oracles, registry, report generation
-src/engines/    Engine adapters
-src/scenarios/  Feature-family scenario definitions
-fixtures/       Local media corpus, golden metadata, packets, frames, keys, segments
-scripts/        Serve, run, compare, bake, and engine scaffolding scripts
-results/        Consolidated reports and raw browser result JSON
-```
-
-## Status Meanings
-
-| Status | Meaning |
-| --- | --- |
-| `PASS` | Correctness passed and timing/metrics were collected. |
-| `FAIL` | The engine produced an output, but an oracle or property check failed. |
-| `ERROR` | The engine threw an unexpected exception. |
-| `NA_ENGINE` | The engine does not claim the required feature. |
-| `NA_BROWSER` | The browser/runtime lacks a required capability. |
-| `NA_ASSET` | The fixture, golden, or bake artifact required by the scenario is not available. |
-
-## Contributing
-
-We welcome contributions. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing expectations, engine-adapter guidance, and result-reporting rules.
-
-## Security
-
-To report a vulnerability, please see [SECURITY.md](SECURITY.md). Do not open a public issue for security-sensitive reports.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+- [AiBrush Media](docs/engines/aibrush-media.md)
+- [ffmpeg.wasm](docs/engines/ffmpeg-wasm.md)
+- [Mediabunny](docs/engines/mediabunny.md)
+- [MP4Box.js](docs/engines/mp4box.md)
+- [Remotion](docs/engines/remotion.md)
+- [web-demuxer](docs/engines/web-demuxer.md)
