@@ -6,14 +6,13 @@
  *
  *   • convert-peak-memory (§A.14 'peak memory bytes ↓', §8.3 measureUserAgentSpecificMemory): the
  *     heavy convert ranked by peakMemory. peakMemory materializes only under cross-origin-isolated
- *     Chromium (the only cross-engine-correct memory API); elsewhere the sample is null → that cell is
- *     honestly NA, never zero.
+ *     Chromium (the only cross-engine-comparable memory API); the protocol samples baseline, operation,
+ *     end and settle window, otherwise the metric is typed NA_BROWSER.
  *
  *   • convert-longtasks (§A.14 'longtask ms ↓', §8.3 PerformanceObserver): the same heavy convert
  *     ranked by longtasks — exposes engines that BLOCK the main thread (no Worker offload) during a
- *     1080p→180p transcode (the §8.5 "streaming/pipelined, Worker offload" fast-path claim, otherwise
- *     unmeasured). The Meter attaches PerformanceObserver('longtask') only for the longtasks metric
- *     pass (Chromium-only); on engines/browsers without it the sample is 0/absent → honest NA.
+ *     1080p→180p transcode. Observation first proves `longtask` support and filters buffered records to
+ *     the exact operation window; zero is valid only with an active observer.
  *
  * Both keep ssim-psnr + playback-smoke so a fast/cheap-but-WRONG convert FAILs and cannot win the
  * memory or responsiveness crown (correctness gates the bench, §0.1). Input is the big-read golden
@@ -52,7 +51,8 @@ const convertPeakMemory: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§A.14 peak-memory↓: convert ${BIG_READ_GOLDEN} → WebM/VP9/Opus @320×180 ranked by peakMemory ` +
-    `(lower-better). peakMemory present only on cross-origin-isolated Chromium; NA elsewhere. Gated by ` +
+    `(lower-better). Records one UA-specific API, baseline, maximum, delta and settle window; unsupported ` +
+    `browser instrumentation is NA_BROWSER. Gated by ` +
     `ssim-psnr + playback-smoke so a cheap-but-wrong convert can't win.`,
 });
 
@@ -69,7 +69,7 @@ const convertLongtasks: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§A.14 longtask-ms↓ (§8.5 Worker-offload claim): convert ${BIG_READ_GOLDEN} → WebM/VP9/Opus @320×180 ` +
-    `ranked by main-thread longtask ms (lower-better; PerformanceObserver, Chromium-only → NA elsewhere). ` +
+    `ranked by in-window main-thread longtask ms (lower-better; unsupported entry type → NA_BROWSER). ` +
     `Exposes engines that block the main thread. Gated by ssim-psnr + playback-smoke.`,
 });
 

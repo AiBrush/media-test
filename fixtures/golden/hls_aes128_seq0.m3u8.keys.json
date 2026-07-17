@@ -1,0 +1,6 @@
+{
+  "$note": "Offline deterministic HLS key contract. Resource bytes are independently bound by the .resources.json index.",
+  "assetId": "hls_aes128_seq0.m3u8",
+  "keyHex": "102132435465768798a9bacbdcedfe0f",
+  "scheme": "hls-aes128"
+}

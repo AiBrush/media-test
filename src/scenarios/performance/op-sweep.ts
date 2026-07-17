@@ -40,8 +40,8 @@ import type { Scenario } from '../../core/scenario.ts';
 
 const T_TRANSCODE_SWEEP = 120_000;
 
-// probe → ops/sec (distinct from the headline extract-metadata only in being part of the named sweep;
-// kept with a sweep-specific id so both appear without colliding).
+// Probe/demux aliases remain visible in the operation-sweep view but catalog.ts excludes them from
+// aggregate win weighting, so the same underlying question is never counted twice.
 const sweepProbe: Scenario = perfCase({
   id: 'performance/op-sweep-probe',
   op: 'probe',
@@ -53,7 +53,7 @@ const sweepProbe: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§8.2 per-op sweep — PROBE throughput on ${BIG_READ_GOLDEN}. Score = probes/sec; gated by ` +
-    `golden-metadata (ctx.metadata vs golden meta). Complements headline extract-metadata as the ranked sweep entry.`,
+    `golden-metadata. Explicit display alias of performance/extract-metadata; excluded from aggregate weighting.`,
 });
 
 // demux → packets/sec
@@ -68,7 +68,8 @@ const sweepDemux: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§8.2 per-op sweep — DEMUX throughput on ${BIG_READ_GOLDEN}. Score = packets/sec (denominator is ` +
-    `the demuxed packet count, the same table golden-packets validates). throughputRealtime reported alongside.`,
+    `the observed demux packet count). Explicit display alias of performance/iterate-video-packets; ` +
+    `excluded from aggregate weighting. throughputRealtime uses source presentation duration.`,
 });
 
 // remux MP4 → MKV → throughput × realtime (I/O-bound sample copy; no re-encode).
@@ -90,7 +91,8 @@ const sweepRemux: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§8.2 per-op sweep — REMUX ${BIG_READ_GOLDEN} (MP4 → MKV). Score = throughput × realtime ` +
-    `(media-sec/wall-sec). Correctness gated by reference-reimport (packet count/keyframes vs golden) + playback-smoke.`,
+    `(source presentation seconds after edit-list mapping / measured wall seconds). Correctness gated by ` +
+    `reference-reimport + playback-smoke.`,
 });
 
 // transcode → WebM/VP9/Opus @180p → encode fps (heavy re-encode; perceptual gate).
@@ -111,7 +113,8 @@ const sweepTranscode: Scenario = perfCase({
   tolerances: CONVERT_OUTPUT_METADATA_TOLERANCES,
   timeoutMs: T_TRANSCODE_SWEEP,
   notes:
-    `§8.2 per-op sweep — TRANSCODE ${BIG_READ_GOLDEN} → WebM/VP9/Opus @320×180. Score = encode fps. ` +
+    `§8.2 per-op sweep — TRANSCODE ${BIG_READ_GOLDEN} → WebM/VP9/Opus @320×180. Score = actual output ` +
+    `presentation units/sec (adapter final counter corroborated by neutral re-import when available). ` +
     `Gated by ssim-psnr (perceptual; golden-frame path once baked, reference-source fallback today) + ` +
     `property-invariant output metadata (container/codecs/dimensions/duration; no source packet-count ` +
     `gate for re-encoded WebM) + playback-smoke.`,

@@ -24,20 +24,11 @@
  *      • `golden-packets`  reads `ctx.demux` → same; never attached.
  *    The only oracles that actually OBSERVE a mux output are the four below.
  *
- *  - `reference-reimport` (oracles.ts referenceReimport): re-imports `ctx.output` with the reference
- *    engine and diffs the packet table vs `ctx.golden.packets`. CRITICAL CAVEAT for mux: golden is
- *    keyed on the SOURCE asset id (runner loadGolden(primaryInput.id)). For a SAME-container or
- *    same-NAL-framing target (mp4↔mov, the source's own container) the source packet count/keyframe
- *    count is a faithful reference. For a CROSS-CONTAINER target that legitimately reframes the
- *    bitstream (MP4→TS Annex-B/PES, →MKV SimpleBlock lacing, ctts regeneration) the COUNT and even the
- *    keyframe COUNT can shift, so the `withinRel(...,0.02,1)` count gate + EXACT keyframe-count gate can
- *    FALSE-FAIL a correct mux. We therefore attach `reference-reimport` ONLY where the source golden is
- *    a faithful packet reference for the target (no reframing): mp4/mov targets of an mp4/mov source,
- *    and same-container identity-ish writes. For reframing targets we rely on
- *    `property-invariant:probe-duration` (container-agnostic) instead of a packet-count gate keyed on a
- *    mismatched golden. This is the explicit fix for the dossier's "golden keyed on source, mismatched
- *    to a cross-container mux target" oracle gap — we do not let a count gate keyed on the wrong
- *    reference either FALSE-FAIL a correct engine or (worse) mask a real bug.
+ *  - `reference-reimport` (oracles.ts referenceReimport): the mux branch uses neutral readers for the
+ *    requested target, semantic track identity/timeline evidence, and three-way verdicts. It is attached
+ *    to every non-negative mux row. Legal Annex-B/AVCC, lacing, page, interleave, or timebase changes may
+ *    be DIFF; missing/malformed/mistimed media is FAIL. It never compares a cross-container output to a
+ *    source-keyed packet serialization.
  *
  *  - `playback-smoke` (oracles.ts playbackSmoke): plays `ctx.output` in a plain `<video>`. The raw
  *    Brave run showed this is not a reliable mux-family structural gate: outputs that reference-reimport
@@ -45,7 +36,7 @@
  *    Audio-only outputs also fail the "advance a video element" premise outright. We therefore do NOT
  *    attach playback-smoke by default for mux cases. Browser-playback coverage belongs to targeted
  *    scenarios with a playback oracle designed for the output shape; mux conformance is gated here by
- *    reference re-import where faithful and by probe-duration everywhere.
+ *    semantic reference re-import and by probe-duration everywhere.
  *
  *  - `property-invariant` (oracles.ts propertyInvariant; `options.invariant` selects the branch):
  *      • PROBE_DUR ('probe…dur') reference-probes the output duration and compares to
@@ -98,17 +89,6 @@ export const MUX_STREAM_METRICS = [
   'bytesOut',
   'longtasks',
 ] as const;
-
-// ── Container classification (drives the default oracle set) ─────────────────────────────────────
-
-/**
- * Targets that DO NOT reframe an mp4/mov source's coded samples, so the SOURCE golden packet table is a
- * faithful reference for `reference-reimport`. mp4 and mov share ISO-BMFF length-prefixed (AVCC) NAL
- * framing and the same sample model, so an mp4/mov→mp4/mov mux preserves packet count + keyframe count.
- * Anything that re-laces/re-frames (mkv SimpleBlock, ts Annex-B/PES, webm clusters, elementary streams)
- * is NOT faithful to a source-keyed golden and must NOT be count-gated.
- */
-const FAITHFUL_REIMPORT_TARGETS = new Set(['mp4', 'mov']);
 
 function mp4LayoutOracleApplies(container: string, options?: Record<string, unknown>): boolean {
   const target = container.trim().toLowerCase();
@@ -163,10 +143,8 @@ export interface MuxCase {
   /** Per-case oracle tolerances, e.g. cross-source mux duration rounding. */
   tolerances?: Scenario['tolerances'];
   /**
-   * Override the default oracle set. Default is derived from the target container:
-   *   - reference-reimport is included ONLY for FAITHFUL_REIMPORT_TARGETS of an ISO-BMFF source
-   *     (source golden is a faithful packet reference); see _shared.ts header.
-   *   - every case keeps property-invariant:probe-duration (container-agnostic structural gate).
+   * Override the default oracle set. Every ordinary row defaults to neutral semantic re-import plus
+   * property-invariant:probe-duration; output-mode rows add their structural layout oracle.
    */
   oracles?: OracleId[];
   /** hard wall-clock cap (ms); bounds large/long size-ladder muxes. */
@@ -175,23 +153,11 @@ export interface MuxCase {
 }
 
 /**
- * Default oracle set for a mux cell. We deliberately ALWAYS include the container-agnostic
- * probe-duration property-invariant (the faithful cross-container gate), and add reference-reimport
- * only where the source golden is a faithful packet reference (no reframing). We do not attach
- * playback-smoke here; see the header for why plain `<video>` smoke is too brittle for mux outputs.
+ * Default oracle set for a mux cell. Neutral semantic re-import is decisive for every advertised
+ * target and probe-duration remains an independent container-agnostic invariant.
  */
-function defaultOracles(c: MuxCase): OracleId[] {
-  const sourceIsIsoBmff = c.containersIn.every((cc) => cc === 'mp4' || cc === 'mov');
-  const hasTrackSelection = Array.isArray(c.extraOptions?.trackSelect);
-  const isSingleSource = !Array.isArray(c.input);
-  const oracles: OracleId[] = [];
-  if (isSingleSource && !hasTrackSelection && sourceIsIsoBmff && FAITHFUL_REIMPORT_TARGETS.has(c.to)) {
-    oracles.push('reference-reimport');
-  }
-  // probe-duration: works for video AND audio, and is invariant under the container change — the one
-  // gate that is always faithful regardless of source/target reframing.
-  oracles.push('property-invariant');
-  return oracles;
+function defaultOracles(): OracleId[] {
+  return ['reference-reimport', 'property-invariant'];
 }
 
 /** The single source of truth for the options object: container + invariant + any write-shape knobs. */
@@ -202,7 +168,7 @@ function muxOptions(c: MuxCase): Record<string, unknown> {
 
 /** Build a single mux Scenario from a MuxCase. */
 export function buildMux(c: MuxCase): Scenario {
-  const oracles = withMp4LayoutOracle(c.oracles ?? defaultOracles(c), c.to, c.extraOptions);
+  const oracles = withMp4LayoutOracle(c.oracles ?? defaultOracles(), c.to, c.extraOptions);
   const metrics = (c.metrics ?? MUX_METRICS) as readonly MetricId[];
   const features = muxFeatures(c);
   return defineScenario({
@@ -245,7 +211,7 @@ export interface MuxPropertyCase {
   audioCodecs?: string[];
   features?: string[];
   extraOptions?: Record<string, unknown>;
-  /** default: ['property-invariant']; pass extra (e.g. add reference-reimport for track survival) */
+  /** default: semantic reference-reimport + the requested property invariant */
   oracles?: OracleId[];
   tolerances?: Scenario['tolerances'];
   timeoutMs?: number;
@@ -259,7 +225,11 @@ export interface MuxPropertyCase {
  *   - PROBE_DUR   → reference-probed output duration ≈ golden source duration (VIDEO+AUDIO).
  */
 export function buildMuxProperty(c: MuxPropertyCase): Scenario {
-  const oracles = withMp4LayoutOracle(c.oracles ?? ['property-invariant'], c.to, c.extraOptions);
+  const requestedOracles = c.oracles ?? ['property-invariant'];
+  const semanticOracles = requestedOracles.includes('reference-reimport')
+    ? requestedOracles
+    : [...requestedOracles, 'reference-reimport' as const];
+  const oracles = withMp4LayoutOracle(semanticOracles, c.to, c.extraOptions);
   const features = [...(c.features ?? [])];
   if (c.invariant === DECODE_MUX && !features.includes(MUX_BROWSER_DECODE_FEATURE)) {
     features.push(MUX_BROWSER_DECODE_FEATURE);

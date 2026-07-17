@@ -66,6 +66,8 @@ export interface RemuxCase {
   oracles?: OracleId[];
   /** hard wall-clock cap (ms); used to bound very large size-ladder remuxes. */
   timeoutMs?: number;
+  /** Optional ranked metric, included before the immutable definition identity is computed. */
+  primaryMetric?: Scenario['primaryMetric'];
   notes?: string;
 }
 
@@ -98,6 +100,7 @@ export function buildRemux(c: RemuxCase): Scenario {
     },
     oracles: c.oracles ?? defaultOracles(c),
     metrics: [...REMUX_OUT_METRICS],
+    ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
@@ -136,6 +139,10 @@ export interface RemuxPropertyCase {
  *   - round-trip variants reuse 'decode(remux(x))==decode(x)' (the runner re-wraps per extraOptions).
  */
 export function buildRemuxProperty(c: RemuxPropertyCase): Scenario {
+  const roundTrip = c.extraOptions?.roundTrip;
+  const outputContainers = Array.isArray(roundTrip)
+    ? [...new Set([c.to, ...roundTrip.filter((value): value is string => typeof value === 'string')])]
+    : [c.to];
   return defineScenario({
     id: `remux/${c.id}`,
     op: 'remux',
@@ -144,7 +151,8 @@ export function buildRemuxProperty(c: RemuxPropertyCase): Scenario {
     requires: {
       operations: ['remux'],
       containersIn: [c.from],
-      containersOut: [c.to],
+      // A named two-leg property must negotiate every target wrapper, not only the outbound leg.
+      containersOut: outputContainers,
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),

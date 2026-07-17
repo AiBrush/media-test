@@ -49,6 +49,9 @@
 import type { FrameDigest, FrameSink, MediaEngine, MediaInput } from './engine.ts';
 import { getEngine } from './registry.ts';
 import { digestFrame } from './oracles.ts';
+import { canonicalizeJson, canonicalJsonSha256 } from './canonical-json.ts';
+import { sha256Hex } from './seeded-rng.ts';
+import { pairFramesByTimestamp } from './golden-frame-evidence.ts';
 
 // ── The golden frame-json shape we read (placeholder) and write (filled) ────────────────────────
 
@@ -61,14 +64,60 @@ export interface GoldenFrameEntry {
   sha256: string | null;
   width?: number;
   height?: number;
+  /** Evidence that the digest/signature came from actual decoded pixels at this exact PTS. */
+  pixelProvenance?: FramePixelProvenance;
+}
+
+export interface FramePixelProvenance {
+  state: 'real-pixels' | 'missing-pixels';
+  source: 'FrameSink.getPixels' | 'ImageDecoder' | 'createImageBitmap' | 'unavailable';
+  expectedPtsUs: number;
+  observedPtsUs?: number;
+  pixelNormalizationVersion: typeof PIXEL_NORMALIZATION_VERSION;
+  codedDimensions: { width: number | null; height: number | null };
+  displayDimensions: { width: number | null; height: number | null };
+  colorSpace: { state: 'not-exposed-by-frame-sink' | 'recorded'; value?: Record<string, unknown> };
+  crop: { state: 'not-exposed-by-frame-sink' | 'recorded'; value?: Record<string, number> };
+  rotation: { state: 'not-exposed-by-frame-sink' | 'recorded'; degrees?: number };
+}
+
+export interface FrameBakeSourceIdentity {
+  sha256: string;
+  sizeBytes: number;
+}
+
+export interface FrameBakeRuntimeProvenance {
+  browser: {
+    family: string;
+    version: string;
+    executable: string | null;
+    userAgent: string;
+  };
+  platform: {
+    os: string;
+    arch: string;
+    locale: string;
+    timezone: string;
+  };
+  decoderConfiguration: Record<string, unknown>;
+  startedAtIso: string;
+  finishedAtIso?: string;
 }
 
 /** The `fixtures/golden/<id>.frames.json` document (both the $todo placeholder and the filled form). */
 export interface GoldenFramesDoc {
+  schema?: 'media-test/golden-artifact@1';
+  schemaVersion?: '1.0.0';
+  artifactKind?: 'frames';
   $todo?: string;
   /** true while digests are unfilled; this pass sets it false ONLY when EVERY listed frame is filled. */
   pending: boolean;
   assetId: string;
+  sourceMedia?: FrameBakeSourceIdentity;
+  pixelNormalizationVersion?: typeof PIXEL_NORMALIZATION_VERSION;
+  availability?: { state: 'ready' | 'pending' | 'producer-failed'; reasonCode?: string; detail?: string };
+  provenance?: Record<string, unknown>;
+  payload?: Record<string, unknown>;
   frames: GoldenFrameEntry[];
   /** provenance stamp added by this pass (informational; never read by the oracle). */
   bakedBy?: string;
@@ -79,8 +128,15 @@ export interface GoldenFramesDoc {
 
 /** The `fixtures/golden/<id>.ssim.json` side-file: one downsampled-luma signature per filled frame. */
 export interface GoldenSsimDoc {
+  schema: 'media-test/golden-artifact@1';
+  schemaVersion: '1.0.0';
+  artifactKind: 'ssim';
   $note: string;
   assetId: string;
+  sourceMedia: FrameBakeSourceIdentity;
+  availability: { state: 'ready' };
+  provenance: Record<string, unknown>;
+  payload: Record<string, unknown>;
   /** square side of each signature (signature length === side*side); consumed via round(sqrt(len)). */
   side: number;
   /** per-frame block-averaged Rec.601 luma signatures (number[][]); oracles.ts parseSsimRef reads this. */
@@ -96,6 +152,7 @@ export interface GoldenSsimDoc {
  * side is accepted; we pick a single fixed side for every asset so the committed golden is uniform.
  */
 const LUMA_SIG_SIDE = 16;
+export const PIXEL_NORMALIZATION_VERSION = 'normalized-rgba-tight-top-left-straight-alpha@1' as const;
 
 /**
  * Decode a modest margin of leading frames beyond the golden's listed prefix so the WebCodecs decoder
@@ -278,7 +335,7 @@ function isImageAsset(assetId: string): boolean {
  */
 async function decodeImageToFrame(
   input: MediaInput,
-): Promise<{ digest: FrameDigest; image: ImageData } | null> {
+): Promise<DecodedFrameEvidence | null> {
   const buf = await input.arrayBuffer();
   const bytes = new Uint8Array(buf);
 
@@ -298,7 +355,7 @@ async function decodeImageToFrame(
       const image = imageDataFromCanvasSource(frame, frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight);
       if (image) {
         const digest = await digestFrame(image, 0, 0);
-        return { digest, image };
+        return { digest, image, pixelSource: 'ImageDecoder' };
       }
     } catch {
       /* fall through to createImageBitmap */
@@ -320,7 +377,7 @@ async function decodeImageToFrame(
       const image = imageDataFromCanvasSource(bitmap, bitmap.width, bitmap.height);
       if (image) {
         const digest = await digestFrame(image, 0, 0);
-        return { digest, image };
+        return { digest, image, pixelSource: 'createImageBitmap' };
       }
     } catch {
       /* unreadable image */
@@ -382,6 +439,7 @@ export async function bakeAssetFrames(
   assetId: string,
   engine: MediaEngine,
   force = false,
+  runtimeProvenance?: FrameBakeRuntimeProvenance,
 ): Promise<FrameBakeAssetResult> {
   const framesFile = `${assetId}.frames.json`;
   const ssimFile = `${assetId}.ssim.json`;
@@ -424,8 +482,32 @@ export async function bakeAssetFrames(
     // HEAD may be unsupported by the static middleware; fall through and let the decode attempt report.
   }
 
+  // Bind every browser-qualified artifact to the exact source bytes. A placeholder produced for a
+  // different digest is stale evidence and must never be silently relabeled.
+  let sourceIdentity: FrameBakeSourceIdentity;
+  try {
+    const sourceBytes = new Uint8Array(await input.arrayBuffer());
+    sourceIdentity = { sha256: sha256Hex(sourceBytes), sizeBytes: sourceBytes.byteLength };
+  } catch (err) {
+    return {
+      ...base,
+      status: 'failed',
+      note: `source bytes unavailable (${errMsg(err)}) — golden left pending`,
+    };
+  }
+  if (
+    placeholder.sourceMedia &&
+    (placeholder.sourceMedia.sha256 !== sourceIdentity.sha256 || placeholder.sourceMedia.sizeBytes !== sourceIdentity.sizeBytes)
+  ) {
+    return {
+      ...base,
+      status: 'failed',
+      note: 'source digest/size differs from the frame placeholder — explicit fixture update + rebake required',
+    };
+  }
+
   // Decode → an ordered list of decoded frames (with pixels for the luma signature).
-  let decoded: DecodedFrame[];
+  let decoded: DecodedFrameEvidence[];
   try {
     decoded = await decodeAssetFrames(assetId, engine, input, Math.max(listed.length, FRAME_BAKE_DECODE_MIN_FRAMES));
   } catch (err) {
@@ -443,63 +525,41 @@ export async function bakeAssetFrames(
     };
   }
 
-  // Fill golden[i] BY PTS, not by position: match it to the decoded frame AT golden[i].ptsUs (±
-  // PTS_MATCH_TOL_US), consuming each decoded frame at most once. This is the honesty gate — see
-  // PTS_MATCH_TOL_US. Positional pairing (golden[i] ↔ decoded[i]) is WRONG when the platform's decode is
-  // not the listed presentation prefix: an unfaithful <video>-fallback decode returns frames spread
-  // across the clip, and positional pairing would stamp golden[i]'s ffprobe PTS onto a wildly-different
-  // frame's pixels → a golden with right labels / wrong pixels that FAILs every faithful decoder. Matching
-  // by PTS instead leaves those unmatched (sha256:null) so the doc stays pending ⇒ honest NA, never a
-  // fabricated FAIL. NEVER invent a digest for a frame the engine did not produce at the listed PTS.
-  const usedDecoded = new Set<number>();
-  const matchDecodedByPts = (ptsUs: number): DecodedFrame | undefined => {
-    let bestIdx = -1;
-    let bestDelta = Infinity;
-    for (let j = 0; j < decoded.length; j++) {
-      if (usedDecoded.has(j)) continue;
-      const delta = Math.abs((decoded[j]!.digest.ptsUs ?? 0) - ptsUs);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestIdx = j;
-      }
-    }
-    if (bestIdx < 0 || bestDelta > PTS_MATCH_TOL_US) return undefined;
-    usedDecoded.add(bestIdx);
-    return decoded[bestIdx];
-  };
-
-  const filledFrames: GoldenFrameEntry[] = [];
-  const sigs: number[][] = [];
-  let filledCount = 0;
-  for (let i = 0; i < listed.length; i++) {
-    const goldenEntry = listed[i]!;
-    const dec = matchDecodedByPts(goldenEntry.ptsUs);
-    if (dec) {
-      const entry: GoldenFrameEntry = {
-        index: goldenEntry.index,
-        ptsUs: goldenEntry.ptsUs,
-        sha256: dec.digest.sha256,
-      };
-      if (goldenEntry.keyframe !== undefined) entry.keyframe = goldenEntry.keyframe;
-      if (dec.digest.width !== undefined) entry.width = dec.digest.width;
-      if (dec.digest.height !== undefined) entry.height = dec.digest.height;
-      filledFrames.push(entry);
-      sigs.push(downsampleLuma(dec.image, LUMA_SIG_SIDE));
-      filledCount++;
-    } else {
-      // No decoded frame at this listed PTS → keep sha256:null so the gap is explicit + the doc pending.
-      filledFrames.push({ ...goldenEntry, sha256: goldenEntry.sha256 ?? null });
-    }
-  }
+  const materialized = materializeFrameEvidence(listed, decoded, PTS_MATCH_TOL_US);
+  const { frames: filledFrames, sigs, filledCount } = materialized;
   base.filledFrames = filledCount;
 
   const complete = filledCount === listed.length;
-  const stamp = bakeStamp();
+  const stamp = bakeStamp(runtimeProvenance);
+  const runtime = runtimeProvenance ?? defaultRuntimeProvenance(stamp.iso);
+  const framesPayload = jsonSafe({
+    pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+    decoderAvailability: {
+      state: 'available',
+      decoder: 'platform-engine',
+      configuration: runtime.decoderConfiguration,
+    },
+    frames: filledFrames,
+  });
+  const framesProvenance = browserGoldenProvenance('frames', assetId, sourceIdentity, framesPayload, runtime, stamp.iso);
   const framesDoc: GoldenFramesDoc = {
-    // Keep the $todo note for provenance, but flip pending only when EVERY frame is filled.
-    $todo: placeholder.$todo,
+    schema: 'media-test/golden-artifact@1',
+    schemaVersion: '1.0.0',
+    artifactKind: 'frames',
+    ...(placeholder.$todo !== undefined ? { $todo: placeholder.$todo } : {}),
     pending: !complete,
     assetId,
+    sourceMedia: sourceIdentity,
+    pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+    availability: complete
+      ? { state: 'ready' }
+      : {
+          state: 'pending',
+          reasonCode: 'FRAME_PIXELS_OR_TIMESTAMP_MISSING',
+          detail: `real pixels matched ${filledCount}/${listed.length} expected presentation timestamps`,
+        },
+    provenance: framesProvenance,
+    payload: framesPayload,
     frames: filledFrames,
     bakedBy: stamp.bakedBy,
     bakedAtIso: stamp.iso,
@@ -515,15 +575,34 @@ export async function bakeAssetFrames(
   // FAIL) instead of the honest NA the pending frames golden intends. A partial asset ships NO ssimDoc →
   // the orchestrator writes no ssim.json (and prunes any stale one) → decodeFrameGoldenGap ⇒ NA_ASSET.
   const ssimDoc: GoldenSsimDoc | undefined = complete
-    ? {
-        $note:
-          'Downsampled Rec.601 luma signatures (block-averaged) of the platform-decoded golden frames, in ' +
-          'frames[] order. Consumed by the ssim-psnr oracle (oracles.ts parseSsimRef/sigSsim). Side = ' +
-          `${LUMA_SIG_SIDE} → ${LUMA_SIG_SIDE * LUMA_SIG_SIDE}-value signatures.`,
-        assetId,
-        side: LUMA_SIG_SIDE,
-        sigs,
-      }
+    ? (() => {
+        const ssimPayload = jsonSafe({
+          pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+          side: LUMA_SIG_SIDE,
+          frames: materialized.matches.map((match, index) => ({
+            expectedPtsUs: match.expectedPtsUs,
+            observedPtsUs: match.observedPtsUs,
+            signature: sigs[index],
+          })),
+          sigs,
+        });
+        return {
+          schema: 'media-test/golden-artifact@1',
+          schemaVersion: '1.0.0',
+          artifactKind: 'ssim',
+          $note:
+            'Downsampled Rec.601 luma signatures (block-averaged) of the platform-decoded golden frames, in ' +
+            'frames[] order. Consumed by the ssim-psnr oracle (oracles.ts parseSsimRef/sigSsim). Side = ' +
+            `${LUMA_SIG_SIDE} → ${LUMA_SIG_SIDE * LUMA_SIG_SIDE}-value signatures.`,
+          assetId,
+          sourceMedia: sourceIdentity,
+          availability: { state: 'ready' as const },
+          provenance: browserGoldenProvenance('ssim', assetId, sourceIdentity, ssimPayload, runtime, stamp.iso),
+          payload: ssimPayload,
+          side: LUMA_SIG_SIDE,
+          sigs,
+        };
+      })()
     : undefined;
 
   return {
@@ -537,9 +616,80 @@ export async function bakeAssetFrames(
   };
 }
 
-interface DecodedFrame {
+export interface DecodedFrameEvidence {
   digest: FrameDigest;
-  image: ImageData;
+  /** Absent means the decoder exposed a digest without real source pixels. */
+  image?: ImageData;
+  pixelSource?: FramePixelProvenance['source'];
+}
+
+interface FrameMaterializationResult {
+  frames: GoldenFrameEntry[];
+  sigs: number[][];
+  filledCount: number;
+  matches: Array<{ expectedPtsUs: number; observedPtsUs: number }>;
+}
+
+/** Pure honesty gate used by unit tests and the browser pass. Missing pixels can never become SSIM. */
+export function materializeFrameEvidence(
+  listed: readonly GoldenFrameEntry[],
+  decoded: readonly DecodedFrameEvidence[],
+  toleranceUs = PTS_MATCH_TOL_US,
+): FrameMaterializationResult {
+  const pairing = pairFramesByTimestamp(
+    listed.map((frame) => ({ ptsUs: frame.ptsUs })),
+    decoded.map((frame) => ({ ptsUs: frame.digest.ptsUs })),
+    { toleranceUs, unmatchedPolicy: 'require-all-reference' },
+  );
+  const decodedByExpected = new Map(pairing.pairs.map((pair) => [pair.referenceIndex, decoded[pair.candidateIndex]!]));
+  const frames: GoldenFrameEntry[] = [];
+  const sigs: number[][] = [];
+  const matches: Array<{ expectedPtsUs: number; observedPtsUs: number }> = [];
+  let filledCount = 0;
+  for (let expectedIndex = 0; expectedIndex < listed.length; expectedIndex++) {
+    const expected = listed[expectedIndex]!;
+    const observed = decodedByExpected.get(expectedIndex);
+    const width = observed?.digest.width ?? null;
+    const height = observed?.digest.height ?? null;
+    const pixelProvenance: FramePixelProvenance = {
+      state: observed?.image ? 'real-pixels' : 'missing-pixels',
+      source: observed?.image ? observed.pixelSource ?? 'FrameSink.getPixels' : 'unavailable',
+      expectedPtsUs: expected.ptsUs,
+      ...(observed ? { observedPtsUs: observed.digest.ptsUs } : {}),
+      pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+      codedDimensions: { width, height },
+      displayDimensions: {
+        width: observed?.image?.width ?? width,
+        height: observed?.image?.height ?? height,
+      },
+      colorSpace: { state: 'not-exposed-by-frame-sink' },
+      crop: { state: 'not-exposed-by-frame-sink' },
+      rotation: { state: 'not-exposed-by-frame-sink' },
+    };
+    if (!observed?.image) {
+      frames.push({
+        index: expected.index,
+        ptsUs: expected.ptsUs,
+        ...(expected.keyframe !== undefined ? { keyframe: expected.keyframe } : {}),
+        sha256: null,
+        pixelProvenance,
+      });
+      continue;
+    }
+    frames.push({
+      index: expected.index,
+      ptsUs: expected.ptsUs,
+      ...(expected.keyframe !== undefined ? { keyframe: expected.keyframe } : {}),
+      sha256: observed.digest.sha256,
+      ...(observed.digest.width !== undefined ? { width: observed.digest.width } : {}),
+      ...(observed.digest.height !== undefined ? { height: observed.digest.height } : {}),
+      pixelProvenance,
+    });
+    sigs.push(downsampleLuma(observed.image, LUMA_SIG_SIDE));
+    matches.push({ expectedPtsUs: expected.ptsUs, observedPtsUs: observed.digest.ptsUs });
+    filledCount++;
+  }
+  return { frames, sigs, filledCount, matches };
 }
 
 /**
@@ -553,7 +703,7 @@ async function decodeAssetFrames(
   engine: MediaEngine,
   input: MediaInput,
   count: number,
-): Promise<DecodedFrame[]> {
+): Promise<DecodedFrameEvidence[]> {
   if (isImageAsset(assetId)) {
     const one = await decodeImageToFrame(input);
     return one ? [one] : [];
@@ -561,13 +711,12 @@ async function decodeAssetFrames(
 
   const sink: FrameSink = await engine.decodeFrames(input, { maxFrames: count });
   const frames = Array.isArray(sink.frames) ? sink.frames : [];
-  const out: DecodedFrame[] = [];
+  const out: DecodedFrameEvidence[] = [];
   const getPixels = typeof sink.getPixels === 'function' ? sink.getPixels.bind(sink) : undefined;
   for (let i = 0; i < frames.length && i < count; i++) {
     const digest = frames[i]!;
-    // The luma signature needs pixels. A platform FrameSink retains ImageData (getPixels); if a frame's
-    // pixels are unavailable we still keep the digest but cannot emit its signature — fall back to a
-    // zero-length sig (the ssim oracle simply gets no evidence for that frame, never a wrong one).
+    // A digest without pixels is retained only as an explicit missing-pixels observation. It cannot
+    // fill the frame golden and can never produce a luma signature.
     let image: ImageData | null = null;
     if (getPixels) {
       try {
@@ -576,17 +725,9 @@ async function decodeAssetFrames(
         image = null;
       }
     }
-    out.push({ digest, image: image ?? emptyImage(digest) });
+    out.push({ digest, ...(image ? { image, pixelSource: 'FrameSink.getPixels' as const } : {}) });
   }
   return out;
-}
-
-/** A 1x1 transparent ImageData stand-in when a decoded frame's pixels could not be read (sig → zeros). */
-function emptyImage(digest: FrameDigest): ImageData {
-  const w = 1;
-  const h = 1;
-  void digest;
-  return new ImageData(new Uint8ClampedArray(w * h * 4), w, h);
 }
 
 // ── Top-level pass (decode every pending asset, return the write-back map) ───────────────────────
@@ -598,6 +739,8 @@ export interface FrameBakeOptions {
   force?: boolean;
   /** progress callback (done, total, current asset id). */
   onProgress?: (done: number, total: number, assetId: string) => void;
+  /** Exact browser executable/build and host perimeter supplied by the filesystem orchestrator. */
+  provenance?: FrameBakeRuntimeProvenance;
 }
 
 /**
@@ -619,7 +762,7 @@ export async function runFrameBake(opts: FrameBakeOptions = {}): Promise<FrameBa
       opts.onProgress?.(i, ids.length, id);
       let result: FrameBakeAssetResult;
       try {
-        result = await bakeAssetFrames(id, engine, opts.force === true);
+        result = await bakeAssetFrames(id, engine, opts.force === true, opts.provenance);
       } catch (err) {
         result = {
           assetId: id,
@@ -643,7 +786,7 @@ export async function runFrameBake(opts: FrameBakeOptions = {}): Promise<FrameBa
     }
     opts.onProgress?.(ids.length, ids.length, '');
 
-    const stamp = bakeStamp();
+    const stamp = bakeStamp(opts.provenance);
     return {
       generatedAtIso: stamp.iso,
       bakedBy: stamp.bakedBy,
@@ -812,15 +955,104 @@ function mimeForAsset(assetId: string): string {
   }
 }
 
+function defaultRuntimeProvenance(startedAtIso: string): FrameBakeRuntimeProvenance {
+  let userAgent = 'browser';
+  let locale = 'und';
+  let timezone = 'not-exposed';
+  let os = 'not-exposed';
+  let arch = 'not-exposed';
+  try {
+    if (typeof navigator !== 'undefined') {
+      userAgent = navigator.userAgent || userAgent;
+      locale = navigator.language || locale;
+      os = navigator.platform || os;
+      const navData = (navigator as Navigator & { userAgentData?: { platform?: string; architecture?: string } }).userAgentData;
+      os = navData?.platform || os;
+      arch = navData?.architecture || arch;
+    }
+    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || timezone;
+  } catch {
+    /* keep explicit not-exposed values */
+  }
+  return {
+    browser: { family: 'unknown', version: 'unknown', executable: null, userAgent },
+    platform: { os, arch, locale, timezone },
+    decoderConfiguration: {
+      engine: PLATFORM_ENGINE_ID,
+      framePixelAccess: 'FrameSink.getPixels',
+      pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+    },
+    startedAtIso,
+  };
+}
+
+/** Remove `undefined` before canonical hashing; provenance must be strict JSON. */
+function jsonSafe<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function browserGoldenProvenance(
+  artifactKind: 'frames' | 'ssim',
+  assetId: string,
+  sourceMedia: FrameBakeSourceIdentity,
+  payload: Record<string, unknown>,
+  runtime: FrameBakeRuntimeProvenance,
+  finishedAtIso: string,
+): Record<string, unknown> {
+  const normalizedArguments = {
+    assetId,
+    artifactKind,
+    sourceSha256: sourceMedia.sha256,
+    sourceSizeBytes: sourceMedia.sizeBytes,
+    pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+  };
+  const canonicalPayload = canonicalizeJson(payload);
+  return {
+    schema: 'media-test/golden-provenance@1',
+    schemaVersion: '1.0.0',
+    artifactKind,
+    assetId,
+    sourceMedia,
+    buildDefinition: {
+      recipe: `src/core/frame-bake.ts#${artifactKind}`,
+      normalizedArguments,
+      normalizedArgumentsSha256: canonicalJsonSha256(normalizedArguments),
+      dependencies: [],
+    },
+    runDetails: {
+      baker: 'media-test/frame-bake@1',
+      perimeter: {
+        browser: runtime.browser,
+        platform: runtime.platform,
+        decoderConfiguration: runtime.decoderConfiguration,
+      },
+      startedAtIso: runtime.startedAtIso,
+      finishedAtIso: runtime.finishedAtIso ?? finishedAtIso,
+      timeMode: 'browser-qualified-wall-clock',
+      browserQualified: true,
+    },
+    outputArtifact: {
+      digestScope: 'canonical-payload',
+      sha256: sha256Hex(new TextEncoder().encode(canonicalPayload)),
+      sizeBytes: new TextEncoder().encode(canonicalPayload).byteLength,
+    },
+  };
+}
+
 /** Provenance stamp (browser build, from the UA) so a committed golden records what produced it. */
-function bakeStamp(): { bakedBy: string; iso: string } {
+function bakeStamp(runtime?: FrameBakeRuntimeProvenance): { bakedBy: string; iso: string } {
   let ua = 'browser';
   try {
-    if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string') ua = navigator.userAgent;
+    if (runtime?.browser.userAgent) ua = runtime.browser.userAgent;
+    else if (typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string') ua = navigator.userAgent;
   } catch {
     /* ignore */
   }
-  return { bakedBy: `frame-bake (platform engine) · ${ua}`, iso: new Date().toISOString() };
+  const browser = runtime ? `${runtime.browser.family} ${runtime.browser.version}` : 'browser';
+  return {
+    bakedBy: `frame-bake (platform engine) · ${browser} · ${ua}`,
+    iso: runtime?.finishedAtIso ?? new Date().toISOString(),
+  };
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

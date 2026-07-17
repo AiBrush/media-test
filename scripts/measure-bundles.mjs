@@ -1,294 +1,385 @@
+#!/usr/bin/env bun
 /**
- * scripts/measure-bundles.mjs — OFFLINE, per-engine "shipped JS cost" measurement (§8.1 / §A.14).
+ * Measure the files that a production Vite build actually emits for each engine.
  *
- * This is the build-time half of the headline `performance/bundle-size` case. It is run OFFLINE
- * (never at run time, never in the browser) and writes a single map of engineId → kBytes that the
- * suite later injects as MetricSample.bundleSizeKb. It does NO media work and reads NO corpus asset.
- *
- * WHAT IT MEASURES
- *   For each engine entrypoint it synthesizes a tiny ESM entry that imports exactly the library
- *   surface the engine's adapter imports (the real shipped surface — same specifiers as
- *   src/engines/<engine>/adapter.ts), then bundles + tree-shakes + minifies it for the browser and
- *   gzips the result. The reported number is gzip(min(bundle)) in kB (1 kB = 1024 bytes), rounded to
- *   one decimal — the apples-to-apples "what each library costs to ship" number, matching how
- *   Mediabunny publishes its own bundle-size chart (min + gzip).
- *
- *   Excluded from the JS number (by design, documented per engine below):
- *     - WASM binaries / Workers loaded at RUN TIME as separate assets (ffmpeg-core.wasm,
- *       web-demuxer's .wasm, etc.). Those are NOT shipped JS; folding them into the JS bundle-size
- *       metric would be dishonest. They are listed in `notes` so the report can surface them.
- *     - The `platform` engine ships NO third-party library at all (pure WebCodecs/DOM glue), so its
- *       shipped-library cost is 0 kB — recorded honestly as 0, not omitted.
- *
- * HOW THE SUITE READS THIS MAP (the contract — keep in sync with src/scenarios/performance/index.ts)
- *   Output: results/bundle-sizes.json  ::  { "<engineId>": <kBytes:number>, ... }
- *   The keys are MediaEngine.id values (e.g. "mediabunny@1.48.0", "mp4box@2.3.0"). The
- *   `performance/bundle-size` scenario is modeled as a normal Scenario whose primaryMetric is
- *   'bundleSize'. At report-assembly time the suite/runner:
- *     1. reads results/bundle-sizes.json,
- *     2. for each (engine) cell of performance/bundle-size, looks up the engine's id in the map,
- *     3. injects the value into MetricSample.bundleSizeKb (the field scenario.ts reserves for
- *        "set from the offline per-engine build, not measured at run time"),
- *     4. the report ranks engines by primaryMetric=bundleSize (lower-is-better) like any other case.
- *   A missing/zero entry is an honest FAIL/NA for that cell — never a fabricated number. The map also
- *   carries an alias for each engine's bare registration id (e.g. "mediabunny", "mp4box") so the
- *   join still works whether the suite keys by MediaEngine.id or by the registry id.
- *
- * ── TODO (ORCHESTRATOR / runner+app wiring — NOT owned by src/scenarios/performance/index.ts) ──────
- * The scenario side (oracle=golden-metadata, op=probe, input=tiny_h264_360p_2s.mp4, metric=bundleSize)
- * is done. Two small reads remain, in files the scenario author may not edit:
- *   [APP]    src/app/main.ts boot(): fetch this file once and stash it on a global the runner reads:
- *              try { window.__BUNDLE_SIZES__ = await (await fetch('results/bundle-sizes.json')).json(); }
- *              catch { window.__BUNDLE_SIZES__ = {}; }   // absent ⇒ honest FAIL/NA, never fabricated
- *            (declare `__BUNDLE_SIZES__?: Record<string, number>` on the Window interface there.)
- *   [RUNNER] src/core/runner.ts runBench() sample closure: for the bundle-size cell, inject the size:
- *              if (scenario.id === 'performance/bundle-size') {
- *                const m = (globalThis).__BUNDLE_SIZES__ ?? {};
- *                const kb = m[engine.id] ?? m[bareRegistryId];   // bareRegistryId = the alias key
- *                if (typeof kb === 'number' && Number.isFinite(kb)) sample.bundleSizeKb = kb;
- *              }
- *            bench() already maps metric 'bundleSize' → MetricSample.bundleSizeKb (src/core/bench.ts
- *            METRIC_FIELD) and report.ts engineBundleSizeKb() already reads bench.bundleSize.median, so
- *            no other change is needed. A missing key ⇒ NaN ⇒ n=0 ⇒ no number (honest FAIL/NA).
- *
- * RUNTIME: bun-only. Uses Bun.build (Bun's bundler) + Bun.gzipSync — no node, no network, no CDN.
- *   esbuild@0.21.5 is also present in node_modules and is used as a documented fallback bundler if
- *   Bun.build is ever unavailable (kept identical flags: browser target, esm, minify, bundle).
- *
- *   Run:   bun scripts/measure-bundles.mjs [--out results/bundle-sizes.json] [--only <id,id>] [--json]
+ * The previous producer bundled a synthetic package import and listed WASM/workers/codec cores as
+ * exclusions.  That makes a thin wrapper look artificially cheap.  This producer instead walks the
+ * production manifest from the engine's real lazy entry, follows its emitted import graph and asset
+ * references, adds separately copied runtime files (ffmpeg.wasm), and publishes four disjoint
+ * transfer components plus their sum.  `compressedBytes` remains the reporting subsystem's ranked
+ * field, but now means the complete transfer total rather than JavaScript alone.
  */
-
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, extname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(__dirname, '..');
+import {
+  canonicalContentHash,
+  createBundleMeasurementsArtifact,
+  stablePrettyJson,
+} from '../src/core/report.ts';
 
-// ── engine entrypoint table ──────────────────────────────────────────────────────────────────────
-// `id`     : the MediaEngine.id the suite keys by (must match src/engines/<engine>/adapter.ts). This
-//            is the EXACT key the results carry (e.g. 'mediabunny@1.48.0', 'platform@chrome-149'), so
-//            the report-time join in scripts/compare.mjs hits on the engine id with no remapping.
-// `alias`  : the bare registry id (registerEngine(...)) — emitted as a second key so the join is
-//            robust to whichever id the suite uses.
-// `aliases`: optional EXTRA keys emitted with the same kB value. Used for engines whose runtime id is
-//            navigator-derived and therefore not a single fixed string — `platform` derives
-//            'platform@<family>-<major>' from the UA at run time (platform/adapter.ts deriveId()), so
-//            we emit the common variants here AND compare.mjs falls back to a 'platform@*' prefix match
-//            so any browser/version still joins to the 0 kB shipped-library cost.
-// `imports`: the library specifiers the adapter actually imports (the real shipped surface). An empty
-//            list means the engine ships no third-party library (cost 0 kB).
-// `entry`  : optional explicit entry source; defaults to re-exporting everything from `imports`.
-// `note`   : run-time-only assets excluded from the JS number, surfaced for the report.
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const GZIP_LEVEL = 9;
+const COMPONENT_KINDS = [
+  'javascript-minified-gzip',
+  'runtime-wasm',
+  'worker',
+  'codec-core',
+];
 const ENGINES = [
-  {
-    id: 'mediabunny@1.48.0',
-    alias: 'mediabunny',
-    imports: ['mediabunny'],
-    note: 'Pure-JS/TS library; no separate WASM/Worker asset. Full shipped JS cost.',
-  },
-  {
-    id: 'mp4box@2.3.0',
-    alias: 'mp4box',
-    imports: ['mp4box'],
-    note: 'Pure-JS demux/mux library; no separate WASM. Full shipped JS cost.',
-  },
-  {
-    id: 'web-demuxer@4.0.0',
-    alias: 'web-demuxer',
-    imports: ['web-demuxer'],
-    note: 'JS wrapper bundled here; the FFmpeg-based .wasm is a RUN-TIME asset loaded separately and is excluded from the shipped-JS number.',
-  },
-  {
-    id: 'remotion@4.0.479',
-    alias: 'remotion',
-    imports: [
-      '@remotion/media-parser',
-      '@remotion/media-parser/web',
-      '@remotion/webcodecs',
-      '@remotion/webcodecs/buffer',
+  engine(
+    'mediabunny@1.48.0',
+    '1.48.0',
+    'mediabunny',
+    'src/engines/mediabunny/adapter.ts',
+    (manifest) => findByDynamicImport(manifest, 'node_modules/mediabunny/'),
+  ),
+  engine(
+    'mp4box@2.3.0',
+    '2.3.0',
+    'mp4box',
+    'src/engines/mp4box/adapter.ts',
+    (manifest) => exactEntry(manifest, 'src/engines/mp4box/adapter.ts'),
+  ),
+  engine(
+    'web-demuxer@4.0.0',
+    '4.0.0',
+    'web-demuxer',
+    'src/engines/web-demuxer/adapter.ts',
+    (manifest) => exactEntry(manifest, 'src/engines/web-demuxer/adapter.ts'),
+  ),
+  engine(
+    'remotion@4.0.479',
+    '4.0.479',
+    'remotion',
+    'src/engines/remotion/adapter.ts',
+    (manifest) => findByDynamicImport(manifest, 'node_modules/@remotion/webcodecs/'),
+  ),
+  engine(
+    'ffmpeg.wasm@0.12.15',
+    '0.12.15',
+    'ffmpeg.wasm',
+    'src/engines/ffmpeg-wasm/adapter.ts',
+    (manifest) => exactEntry(manifest, 'src/engines/ffmpeg-wasm/register.ts'),
+    [
+      'vendor/ffmpeg-wasm/core/ffmpeg-core.js',
+      'vendor/ffmpeg-wasm/core/ffmpeg-core.wasm',
     ],
-    note: 'Unified Remotion stack: Media Parser for read-side operations and WebCodecs for decode/encode/conversion. The optional parser worker entry is loaded lazily at run time and is excluded.',
-  },
-  {
-    id: 'ffmpeg.wasm@0.12.15',
-    alias: 'ffmpeg.wasm',
-    imports: ['@ffmpeg/ffmpeg'],
-    note: 'Only the @ffmpeg/ffmpeg JS WRAPPER is shipped JS. ffmpeg-core.js/.wasm/.worker.js (the multi-MB core) load at RUN TIME from the local vendor dir and are EXCLUDED from the shipped-JS number (they are runtime assets, not bundled JS).',
-  },
-  {
-    // The platform engine's runtime id is navigator-derived (platform/adapter.ts deriveId() →
-    // 'platform@<family>-<major>', e.g. the Chrome run records 'platform@chrome-149'). There is no
-    // fixed version, so we make that the canonical key (matching what results carry) and emit the bare
-    // 'platform' + common browser variants as aliases; compare.mjs additionally does a 'platform@*'
-    // prefix fallback so ANY browser/version joins to this 0 kB cost.
-    id: 'platform@chrome-149',
-    alias: 'platform',
-    aliases: ['platform@chrome', 'platform@firefox', 'platform@webkit', 'platform@safari', 'platform@browser'],
-    imports: [], // ships NO third-party library — pure WebCodecs/MSE/DOM glue
-    note: 'No third-party library shipped (uses built-in WebCodecs/<video>/MediaRecorder). Shipped-library cost is 0 kB by construction. The engine id is navigator-derived (platform@<family>-<major>); compare.mjs falls back to a platform@* prefix match so every browser variant joins.',
-  },
-  {
-    // PLACEHOLDER / stub engine (src/engines/aibrush-media/adapter.ts): pure local TypeScript that
-    // imports NO third-party library and ships "no run-time bytes of any kind" (no package, no
-    // WASM/Worker/CDN). Its honest shipped-library cost is therefore 0 kB by construction, exactly like
-    // `platform`. Recorded so all 8 engine ids the results carry are present in the map (the cell is
-    // NA(engine) today because the stub declares no operations, so it never actually ranks).
-    id: 'aibrush-media@dev',
-    alias: 'aibrush-media',
-    imports: [],
-    note: 'Placeholder/stub adapter — pure local TypeScript, imports no third-party library and ships no run-time bytes (no package/WASM/Worker/CDN). Shipped-library cost is 0 kB by construction. Currently NA(engine) (declares no operations), so this cell does not rank; the id is emitted so the bundle-size map covers all 8 engine ids.',
-  },
+  ),
+  engine(
+    'platform',
+    'browser-runtime',
+    'platform',
+    'src/engines/platform/adapter.ts',
+    (manifest) => exactEntry(manifest, 'src/engines/platform/adapter.ts'),
+  ),
+  engine(
+    'aibrush-media@dev',
+    'dev',
+    'aibrush-media',
+    'src/engines/aibrush-media/adapter.ts',
+    (manifest) => exactEntry(manifest, 'src/engines/aibrush-media/adapter.ts'),
+  ),
 ];
 
-// ── args ───────────────────────────────────────────────────────────────────────────────────────
-const opts = { out: 'results/bundle-sizes.json', only: null, json: false };
-const argv = process.argv.slice(2);
-for (let i = 0; i < argv.length; i++) {
-  const a = argv[i];
-  if (a === '--out') opts.out = argv[++i];
-  else if (a === '--only') opts.only = String(argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean);
-  else if (a === '--json') opts.json = true;
-  else if (a === '-h' || a === '--help') {
-    console.log('bun scripts/measure-bundles.mjs [--out results/bundle-sizes.json] [--only <id,id>] [--json]');
-    process.exit(0);
-  } else {
-    console.error(`measure-bundles.mjs: unknown arg '${a}'`);
-    process.exit(2);
-  }
-}
-
-if (typeof Bun === 'undefined') {
-  console.error('measure-bundles.mjs is bun-only. Run it with: bun scripts/measure-bundles.mjs');
-  process.exit(1);
-}
-
-const KB = 1024;
-const kb = (bytes) => Math.round((bytes / KB) * 10) / 10;
-
-// Build one engine's synthetic entry, bundle+minify it (browser/esm), gzip, return { bytes, error }.
-async function measure(engine, tmpDir) {
-  // No library ⇒ 0 kB shipped cost (honest, not omitted).
-  if (!engine.imports || engine.imports.length === 0) {
-    return { rawBytes: 0, gzipBytes: 0 };
-  }
-
-  // Synthesize an entry that imports + re-exports each library surface, so nothing is tree-shaken
-  // away as "unused" — we want the cost of the surface the adapter actually pulls in.
-  const lines = engine.imports.map((spec, i) => `import * as _m${i} from ${JSON.stringify(spec)};`);
-  const refs = engine.imports.map((_, i) => `_m${i}`).join(', ');
-  // globalThis sink keeps the imports live under aggressive minification/DCE.
-  const entrySrc = `${lines.join('\n')}\nglobalThis.__sizeProbe = [${refs}];\n`;
-  const entryPath = join(tmpDir, `${sanitize(engine.id)}.entry.mjs`);
-  writeFileSync(entryPath, entrySrc);
-
-  // PRIMARY bundler: Bun.build (Bun's native bundler). Browser target, minified, tree-shaken.
-  try {
-    const result = await Bun.build({
-      entrypoints: [entryPath],
-      target: 'browser',
-      format: 'esm',
-      minify: true,
-      sourcemap: 'none',
-      // The wasm core / worker assets are runtime-loaded; if any specifier pulls a .wasm import it is
-      // left external (we only want the shipped JS). Node built-ins are externalized defensively.
-      external: ['*.wasm'],
-    });
-    if (!result.success) {
-      const msg = result.logs?.map((l) => l.message).join('; ') || 'Bun.build failed';
-      // Fall back to esbuild rather than failing outright.
-      return await measureWithEsbuild(engine, entryPath).catch(() => ({ error: msg }));
-    }
-    let raw = 0;
-    let gz = 0;
-    for (const out of result.outputs) {
-      if (out.kind !== 'entry-point' && out.kind !== 'chunk') continue;
-      const bytes = new Uint8Array(await out.arrayBuffer());
-      raw += bytes.byteLength;
-      gz += Bun.gzipSync(bytes).byteLength;
-    }
-    return { rawBytes: raw, gzipBytes: gz };
-  } catch (e) {
-    // Bun.build unavailable/threw — documented fallback path.
-    return await measureWithEsbuild(engine, entryPath).catch(() => ({ error: describe(e) }));
-  }
-}
-
-// Documented fallback: esbuild@0.21.5 (present in node_modules), identical intent/flags to Bun.build.
-async function measureWithEsbuild(engine, entryPath) {
-  const esbuild = await import('esbuild');
-  const res = await esbuild.build({
-    entryPoints: [entryPath],
-    bundle: true,
-    minify: true,
-    format: 'esm',
-    platform: 'browser',
-    write: false,
-    sourcemap: false,
-    legalComments: 'none',
-    external: ['*.wasm'],
-    logLevel: 'silent',
-  });
-  let raw = 0;
-  let gz = 0;
-  for (const f of res.outputFiles) {
-    raw += f.contents.byteLength;
-    gz += Bun.gzipSync(f.contents).byteLength;
-  }
-  return { rawBytes: raw, gzipBytes: gz };
-}
-
-function sanitize(id) {
-  return id.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
-function describe(e) {
-  return e instanceof Error ? e.message : String(e);
-}
-
-// ── run ──────────────────────────────────────────────────────────────────────────────────────────
-const selected = opts.only
-  ? ENGINES.filter((e) => opts.only.includes(e.id) || opts.only.includes(e.alias))
+const options = parseArgs(process.argv.slice(2));
+if (typeof Bun === 'undefined') fail('this producer requires Bun');
+const selected = options.only
+  ? ENGINES.filter((entry) => options.only.includes(entry.engineId) || options.only.includes(entry.aliases[0]))
   : ENGINES;
+if (selected.length === 0) fail('--only did not match any configured engine', 2);
 
-const tmpDir = join(ROOT, '.bundle-tmp');
-rmSync(tmpDir, { recursive: true, force: true });
-mkdirSync(tmpDir, { recursive: true });
-
-/** @type {Record<string, number>} engineId → kBytes (gzip+min). */
-const sizes = {};
-/** Diagnostic detail, written alongside for transparency (never read by the join). */
-const detail = {};
-
-for (const engine of selected) {
-  const r = await measure(engine, tmpDir);
-  if (r.error) {
-    console.error(`[bundle] ${engine.id}: ERROR — ${r.error} (omitted from map ⇒ honest FAIL/NA in report)`);
-    detail[engine.id] = { error: r.error, note: engine.note };
-    continue;
+const distRoot = resolve(ROOT, options.dist);
+const manifestPath = resolve(distRoot, '.vite/manifest.json');
+if (!existsSync(manifestPath)) {
+  fail(`production manifest not found at ${relative(ROOT, manifestPath)}; run 'bun run build' first`);
+}
+const manifest = parseManifest(JSON.parse(readFileSync(manifestPath, 'utf8')));
+const viteVersion = packageVersion('vite');
+const measurementDefinition = {
+  bundler: { name: 'vite', version: viteVersion },
+  runtime: { name: 'bun', version: Bun.version },
+  target: 'browser-production-artifacts',
+  treeShake: true,
+  minify: true,
+  flags: ['format=esm', 'manifest=true', 'runtime-components=included'],
+  byteUnit: 'byte',
+  compression: { algorithm: 'gzip', options: { level: GZIP_LEVEL } },
+};
+const toolchainContentHash = canonicalContentHash(measurementDefinition);
+const measurements = [];
+for (const entry of selected) {
+  const source = sourceRecord(entry);
+  try {
+    const measured = measureProductionEntry(entry, manifest, distRoot, toolchainContentHash);
+    measurements.push({
+      state: 'MEASURED',
+      engineId: entry.engineId,
+      engineVersion: entry.engineVersion,
+      aliases: entry.aliases,
+      source,
+      rawBytes: measured.rawBytes,
+      compressedBytes: measured.transferTotalBytes,
+      includedFiles: measured.includedFiles,
+      excludedRuntimeAssets: [],
+      sourceContentHash: source.contentHash,
+      toolchainContentHash,
+      components: measured.components,
+      transferTotalBytes: measured.transferTotalBytes,
+    });
+    if (!options.json) {
+      const componentText = measured.components
+        .map((component) => `${component.kind}=${component.transferBytes}`)
+        .join(', ');
+      console.log(
+        `[bundle] ${entry.engineId.padEnd(30)} ${String(measured.transferTotalBytes).padStart(10)} transfer bytes `
+        + `(${componentText})`,
+      );
+    }
+  } catch (error) {
+    const reason = describe(error);
+    measurements.push({
+      state: 'UNAVAILABLE',
+      engineId: entry.engineId,
+      engineVersion: entry.engineVersion,
+      aliases: entry.aliases,
+      source,
+      reasonCode: 'BUNDLE_BUILD_ARTIFACTS_UNAVAILABLE',
+      reason,
+      sourceContentHash: source.contentHash,
+      toolchainContentHash,
+    });
+    if (!options.json) console.error(`[bundle] ${entry.engineId}: UNAVAILABLE — ${reason}`);
   }
-  const k = kb(r.gzipBytes);
-  sizes[engine.id] = k;
-  // Robust join keys: the bare registry alias + any extra navigator-derived id variants, all sharing
-  // the same kB. (compare.mjs additionally does a prefix fallback for variant ids it doesn't find.)
-  for (const a of [engine.alias, ...(engine.aliases ?? [])]) {
-    if (a && a !== engine.id) sizes[a] = k;
-  }
-  detail[engine.id] = {
-    kBytesGzip: k,
-    kBytesRaw: kb(r.rawBytes),
-    imports: engine.imports,
-    note: engine.note,
-  };
-  console.log(`[bundle] ${engine.id.padEnd(32)} ${String(k).padStart(8)} kB (min+gzip)  raw ${kb(r.rawBytes)} kB`);
 }
 
-rmSync(tmpDir, { recursive: true, force: true });
+// REP-17 validates and hashes the stable reporting projection. Component maps are additive fields
+// permitted by that schema; retain them in the serialized evidence while keeping the canonical hash
+// compatible with existing readers. The ranked `compressedBytes` is already the complete total.
+const reportingMeasurements = measurements.map(stripComponentExtension);
+const validated = createBundleMeasurementsArtifact({
+  artifactId: `bundle-${canonicalContentHash({ measurementDefinition, engines: selected.map((entry) => entry.engineId) }).slice(0, 24)}`,
+  measurementDefinition,
+  measurements: reportingMeasurements,
+});
+const artifact = { ...validated, measurements };
+const output = resolve(ROOT, options.out);
+mkdirSync(dirname(output), { recursive: true });
+writeFileSync(output, stablePrettyJson(artifact));
+if (options.json) process.stdout.write(stablePrettyJson(artifact));
+else console.log(`[bundle] wrote ${relative(ROOT, output)} · ${artifact.contentHash}`);
 
-const outPath = resolve(ROOT, opts.out);
-mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, JSON.stringify(sizes, null, 2) + '\n');
-// Sibling detail file (transparency only; the suite reads bundle-sizes.json).
-writeFileSync(outPath.replace(/\.json$/, '.detail.json'), JSON.stringify(detail, null, 2) + '\n');
+function measureProductionEntry(entry, productionManifest, productionRoot, toolchainHash) {
+  const start = entry.findManifestEntry(productionManifest);
+  if (!start) throw new Error(`manifest has no production entry for ${entry.adapterEntry}`);
+  const paths = collectManifestFiles(productionManifest, start.key);
+  for (const extra of entry.runtimeFiles) paths.add(extra);
+  discoverAbsoluteRuntimeAssets(paths, productionRoot);
 
-console.log(`\n[bundle] wrote ${opts.out} (${Object.keys(sizes).length} keys) + ${opts.out.replace(/\.json$/, '.detail.json')}`);
-if (opts.json) console.log(JSON.stringify(sizes, null, 2));
+  const files = [...paths].sort().map((path) => measureFile(path, productionRoot));
+  if (files.length === 0) throw new Error('production entry emitted no measurable files');
+  const components = COMPONENT_KINDS.map((kind) => {
+    const selectedFiles = files.filter((file) => classifyComponent(file.path) === kind);
+    return {
+      kind,
+      rawBytes: selectedFiles.reduce((sum, file) => sum + file.rawBytes, 0),
+      transferBytes: selectedFiles.reduce((sum, file) => sum + file.transferBytes, 0),
+      files: selectedFiles.map(({ path, sha256, rawBytes, transferBytes }) => ({
+        path,
+        sha256,
+        rawBytes,
+        transferBytes,
+      })),
+      compression: { algorithm: 'gzip', options: { level: GZIP_LEVEL } },
+    };
+  });
+  const transferTotalBytes = components.reduce((sum, component) => sum + component.transferBytes, 0);
+  return {
+    rawBytes: files.reduce((sum, file) => sum + file.rawBytes, 0),
+    transferTotalBytes,
+    includedFiles: files.map((file) => file.path),
+    sourceContentHash: sourceRecord(entry).contentHash,
+    toolchainContentHash: toolchainHash,
+    components,
+  };
+}
+
+function collectManifestFiles(productionManifest, startKey) {
+  const files = new Set();
+  const seen = new Set();
+  const queue = [startKey];
+  while (queue.length > 0) {
+    const key = queue.shift();
+    if (!key || key === 'index.html' || seen.has(key)) continue;
+    seen.add(key);
+    const record = productionManifest[key];
+    if (!record) throw new Error(`manifest dependency '${key}' is absent`);
+    if (record.file) files.add(normalizeArtifactPath(record.file));
+    for (const asset of record.assets ?? []) files.add(normalizeArtifactPath(asset));
+    for (const dependency of [...(record.imports ?? []), ...(record.dynamicImports ?? [])]) {
+      if (dependency !== 'index.html') queue.push(dependency);
+    }
+  }
+  return files;
+}
+
+/** Vite rewrites Worker URLs into absolute /assets/... strings that are not always manifest edges. */
+function discoverAbsoluteRuntimeAssets(paths, productionRoot) {
+  const queue = [...paths];
+  const visited = new Set();
+  while (queue.length > 0) {
+    const path = queue.shift();
+    if (!path || visited.has(path) || extname(path) !== '.js') continue;
+    visited.add(path);
+    const absolute = resolve(productionRoot, path);
+    if (!existsSync(absolute)) continue;
+    const source = readFileSync(absolute, 'utf8');
+    for (const match of source.matchAll(/["'`](\/assets\/[A-Za-z0-9._/-]+)["'`]/g)) {
+      const referenced = normalizeArtifactPath(match[1]);
+      if (!paths.has(referenced) && existsSync(resolve(productionRoot, referenced))) {
+        paths.add(referenced);
+        queue.push(referenced);
+      }
+    }
+  }
+}
+
+function measureFile(path, productionRoot) {
+  const absolute = resolve(productionRoot, path);
+  if (!existsSync(absolute)) throw new Error(`emitted runtime file '${path}' is missing from dist`);
+  const bytes = new Uint8Array(readFileSync(absolute));
+  return {
+    path,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    rawBytes: bytes.byteLength,
+    transferBytes: Bun.gzipSync(bytes, { level: GZIP_LEVEL }).byteLength,
+  };
+}
+
+function classifyComponent(path) {
+  const lower = path.toLowerCase();
+  if (lower.endsWith('.wasm')) return 'runtime-wasm';
+  if (/(?:^|[/.\-_])worker(?:[/.\-_]|$)/.test(lower)) return 'worker';
+  if (/(?:^|[/.\-_])(?:codec-)?core(?:[/.\-_]|$)/.test(lower) || /ffmpeg-core\.js$/.test(lower)) {
+    return 'codec-core';
+  }
+  return 'javascript-minified-gzip';
+}
+
+function exactEntry(manifest, key) {
+  const record = manifest[key];
+  return record ? { key, record } : undefined;
+}
+
+function findByDynamicImport(manifest, prefix) {
+  const matches = Object.entries(manifest).filter(([, record]) =>
+    (record.dynamicImports ?? []).some((dependency) => dependency.startsWith(prefix)));
+  if (matches.length !== 1) {
+    throw new Error(`expected one manifest entry importing '${prefix}', found ${matches.length}`);
+  }
+  return { key: matches[0][0], record: matches[0][1] };
+}
+
+function parseManifest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('production Vite manifest must be an object');
+  }
+  return value;
+}
+
+function stripComponentExtension(measurement) {
+  if (measurement.state === 'UNAVAILABLE') {
+    const { sourceContentHash: _sourceContentHash, toolchainContentHash: _toolchainContentHash, ...base } = measurement;
+    return base;
+  }
+  const {
+    sourceContentHash: _sourceContentHash,
+    toolchainContentHash: _toolchainContentHash,
+    components: _components,
+    transferTotalBytes: _transferTotalBytes,
+    ...base
+  } = measurement;
+  return base;
+}
+
+function sourceRecord(entry) {
+  const adapterSource = readFileSync(resolve(ROOT, entry.adapterEntry), 'utf8');
+  return {
+    entry: entry.adapterEntry,
+    imports: [],
+    contentHash: canonicalContentHash({
+      schema: 'media-test/bundle-source@2-production-entry',
+      entry: entry.adapterEntry,
+      adapterSource,
+    }),
+  };
+}
+
+function engine(engineId, engineVersion, alias, adapterEntry, findManifestEntry, runtimeFiles = []) {
+  return {
+    engineId,
+    engineVersion,
+    aliases: alias ? [alias] : [],
+    adapterEntry,
+    findManifestEntry,
+    runtimeFiles,
+  };
+}
+
+function packageVersion(name) {
+  const value = JSON.parse(readFileSync(resolve(ROOT, 'node_modules', name, 'package.json'), 'utf8'));
+  if (typeof value.version !== 'string' || value.version.length === 0) {
+    throw new Error(`${name} package version is unavailable`);
+  }
+  return value.version;
+}
+
+function parseArgs(argv) {
+  const options = { out: 'results/bundle-measurements.json', dist: 'dist', only: undefined, json: false };
+  for (let index = 0; index < argv.length; index++) {
+    const value = argv[index];
+    if (value === '--out') options.out = requiredArg(argv, ++index, value);
+    else if (value === '--dist') options.dist = requiredArg(argv, ++index, value);
+    else if (value === '--only') {
+      options.only = requiredArg(argv, ++index, value).split(',').map((entry) => entry.trim()).filter(Boolean);
+    } else if (value === '--json') options.json = true;
+    else if (value === '-h' || value === '--help') {
+      console.log(
+        'bun scripts/measure-bundles.mjs [--dist dist] [--out results/bundle-measurements.json] '
+        + '[--only id,id] [--json]',
+      );
+      process.exit(0);
+    } else fail(`unknown argument '${value}'`, 2);
+  }
+  return options;
+}
+
+function normalizeArtifactPath(value) {
+  const normalized = String(value).replace(/^\/+/, '').replace(/\\/g, '/');
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) {
+    throw new Error(`invalid emitted artifact path '${value}'`);
+  }
+  return normalized;
+}
+
+function requiredArg(values, index, flag) {
+  const value = values[index];
+  if (!value) fail(`${flag} requires a value`, 2);
+  return value;
+}
+
+function describe(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function fail(message, code = 1) {
+  console.error(`measure-bundles.mjs: ${message}`);
+  process.exit(code);
+}

@@ -1,0 +1,46 @@
+{
+  "schema": "media-test/hls-resource-index@1",
+  "playlist": {
+    "assetId": "hls_aes128_seq0.m3u8",
+    "sha256": "9d4dcced78a70ce1be2fe42b7fc168d110ca6c63c8427ca7afbd7b335d3f9c7a",
+    "sizeBytes": 370
+  },
+  "resources": [
+    {
+      "role": "key",
+      "uri": "hls_aes128_seq0.key",
+      "sha256": "fe59c1e129ae2ab78126e2b0eca377d6cc99c83b903cec1b40f5c095ae7118f3",
+      "sizeBytes": 16
+    },
+    {
+      "role": "segment",
+      "uri": "hls_aes128_seq0_000.ts",
+      "sha256": "572a83a3f907c0a55eccc5f91c4395acb75f65ef409e6796bed8fd2fc552e79c",
+      "sizeBytes": 920272
+    },
+    {
+      "role": "segment",
+      "uri": "hls_aes128_seq0_001.ts",
+      "sha256": "f197ef82587dae46f4bd1a2c7e3ea8f7af779788b6b22c813f443f8884a3fd19",
+      "sizeBytes": 936816
+    },
+    {
+      "role": "segment",
+      "uri": "hls_aes128_seq0_002.ts",
+      "sha256": "9078d400ba4cfa39edc546ea1a319663e6056d6ad604efc0149fd69eeb28ff02",
+      "sizeBytes": 906736
+    },
+    {
+      "role": "segment",
+      "uri": "hls_aes128_seq0_003.ts",
+      "sha256": "f908e9db99680457f6044667f4d5476522d4372abe8efe2f154fcdc8730053dd",
+      "sizeBytes": 937184
+    },
+    {
+      "role": "segment",
+      "uri": "hls_aes128_seq0_004.ts",
+      "sha256": "c4f099ce273fe9f42f8ae4e5103fa6a43d82a737de6766d55f9a22476958cab4",
+      "sizeBytes": 897712
+    }
+  ]
+}

@@ -125,7 +125,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096 },
+    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096, target: 'stream' },
     features: ['fastStart:reserve'],
     tolerances: { durationToleranceSec: 0.125 },
     notes:

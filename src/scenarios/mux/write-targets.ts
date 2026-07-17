@@ -2,7 +2,7 @@
  * src/scenarios/mux/write-targets.ts — the MISSING mux WRITE-target containers (spec §A.3).
  *
  * §A.3 enumerates the writeable container set {mp4(progressive·fastStart·in-place-reserve·
- * fragmented/CMAF·streaming), mov, mkv, webm, wav, mp3, ogg, adts, ts}. The legacy mux family only
+ * fragmented MP4·streaming), mov, mkv, webm, wav, mp3, ogg, adts, ts}. The legacy mux family only
  * ever WROTE mp4 / mkv / ts / webm. This file adds the WRITE paths the family was missing, each a
  * distinct muxer authoring path the spec lists:
  *
@@ -25,9 +25,8 @@
  *   - playback-smoke is not a default mux-family gate. The raw Brave run showed mux-authored outputs
  *     that re-import and duration-probe correctly can still fail to advance in a plain `<video>`, and
  *     audio-only outputs do not satisfy that oracle's premise.
- *   - reference-reimport is attached ONLY for faithful targets (mp4/mov of an ISO-BMFF source); a
- *     reframing target (mkv/webm/ts/ogg/wav/adts/mp3) is gated by probe-duration instead of a
- *     packet-count check keyed on a source golden that does not describe the reframed output.
+ *   - reference-reimport uses a neutral target reader for every advertised output. Reframing is a
+ *     legal representation difference; selected codec/content/timing and structural validity decide.
  *   - probe-duration (property-invariant) is ALWAYS attached — the container-agnostic structural gate
  *     that a correct mux materializes the right output duration. (buildMux adds it by default.)
  */
@@ -58,7 +57,7 @@ const WRITE_TARGET_CASES: MuxCase[] = [
     audioCodecs: ['opus'],
     notes:
       'WRITE TARGET ogg (§A.3): demux Opus from OGG, re-mux into OGG (re-author pages + granulepos). ' +
-      'Reframing target → gated by probe-duration, not a source-keyed packet count.',
+      'Neutral Ogg re-import validates codec headers, pages, packets, and media semantics.',
   },
   {
     id: 'vorbis_to_ogg',
@@ -125,7 +124,7 @@ const WRITE_TARGET_CASES: MuxCase[] = [
     audioCodecs: ['mp3'],
     notes:
       'WRITE TARGET mp3 (§A.3): mux MP3 frames into an elementary/ID3 MP3 stream. mp3 as a TARGET. ' +
-      'Raw frame stream → not reliably <video>-playable → gated by probe-duration only.',
+      'Raw frame stream → neutral MP3 frame parsing plus probe-duration; no brittle video smoke gate.',
   },
 
   // ── AUDIO HALF of the WRITE matrix beyond AAC→MP4 (legacy had only audio_only_aac_to_mp4) ──

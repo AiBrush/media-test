@@ -22,12 +22,9 @@
  * that honours it; correctness is gated by probe-duration (materialized duration of the assembled
  * output).
  *
- * ORACLE NOTE on multi-source + reference-reimport (the dossier's "multi-source half-unchecked" gap):
- * for a list input, the runner loads golden = loadGolden(input[0]) — the FIRST asset only. A
- * reference-reimport packet-count check would compare the COMBINED multi-track output against a
- * single-source golden and FALSE-FAIL (the second track inflates the count). So multi-source cases do
- * NOT attach reference-reimport; they gate on probe-duration (container-agnostic). A true per-track
- * count check needs a demux(mux(x)) oracle that does not yet exist in oracles.ts.
+ * ORACLE NOTE: every list input carries explicit source-qualified selectors. Neutral semantic
+ * re-import matches the selected content identities and ignores output-local track order/IDs; the
+ * independent duration invariant remains as a second gate.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -42,12 +39,12 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    extraOptions: { trackSelect: ['video:0@0', 'audio:0@1'] },
     tolerances: { durationToleranceSec: 0.125 },
-    // probe-duration only; reference-reimport is correctly omitted (multi-source golden).
     notes:
       'MULTI-SOURCE → NON-mp4: H.264 video (asset A) + AAC audio (asset B, raw ADTS) assembled into ' +
-      'MKV. Legacy multi-source only ever wrote mp4. probe-duration gate; no source-keyed ' +
-      'packet count (two sources, single-asset golden).',
+      'MKV. Legacy multi-source only ever wrote mp4. Semantic re-import verifies both selected ' +
+      'content identities; duration is an independent gate.',
   },
   {
     id: 'vp9_video_plus_opus_audio_to_webm',
@@ -56,6 +53,7 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'webm',
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
+    extraOptions: { trackSelect: ['video:0@0', 'audio:0@1'] },
     notes:
       'MULTI-SOURCE → WebM: VP9 video (from a WebM) + Opus audio (from an OGG) assembled into one WebM. ' +
       'Both codecs are native WebM payloads; exercises cross-source A/V interleave into Matroska/WebM.',
@@ -69,6 +67,7 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac', 'mp3'],
+    extraOptions: { trackSelect: ['video:0@0', 'audio:0@1', 'audio:0@2'] },
     tolerances: { durationToleranceSec: 0.125 },
     notes:
       '3-TRACK ASSEMBLY: H.264 video + AAC audio + MP3 audio from three sources muxed into one MKV ' +
@@ -89,8 +88,7 @@ const MULTI_SOURCE_CASES: MuxCase[] = [
     notes:
       'TRACK DROP / SUBSET: source has 1 video + 2 audio; mux only {video, audio#0} into mp4 (drop ' +
       'audio#1). Output must contain exactly the selected tracks. options.trackSelect carries the ' +
-      'subset; probe-duration gates the result (reference-reimport omitted: subset ≠ source ' +
-      'golden packet count).',
+      'subset; semantic re-import requires exactly those identities while probe-duration remains independent.',
   },
 
   // ── audio SWAP / replace (§A.7): keep a video, replace its audio with another source's audio ──

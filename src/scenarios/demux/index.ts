@@ -1,11 +1,10 @@
 /**
  * src/scenarios/demux/index.ts — Pillar 1, family "demux".
  *
- * Demux MP4/MOV/WebM/MKV/TS/HLS + the audio-elementary containers and assert the packet table
- * (per-track index, pts/dts in µs, keyframe flags, sizes) against committed independent golden via
- * the `golden-packets` oracle. This is the structural test that catches reordering, dropped packets,
- * wrong timescales, or missing keyframe flags. Audio-only containers are exercised too so single-track
- * demux is covered.
+ * Demux MP4/MOV/WebM/MKV/TS/HLS + audio containers and judge both semantic packet evidence and
+ * normalized metadata against committed, independent evidence. DTS is optional observation coverage:
+ * adapters that do not expose it never substitute PTS, while adapters declaring `packets:dts` are
+ * held to the complete decode timeline.
  *
  * The battery is built in sub-blocks, all framework-blind (a case never names a library) and all
  * cited against committed golden the offline bake produced from ffprobe (`fixtures/golden/<asset>.packets.json`):
@@ -24,28 +23,16 @@
  *   (4) GRACEFUL-FAILURE     — zero-length and header-truncated containers fed to demux from concrete
  *       fixture files. The engine must reject/handle cleanly within the timeout. Oracle:
  *       `graceful-failure`.
- *   (5) METAMORPHIC FLAC ±SEEKTABLE — `packets(flac_noseektable) == packets(flac_seektable)`: the
- *       packet enumeration must be identical with or without a SEEKTABLE metadata block. Implemented
- *       against `flac_noseektable`'s OWN independent golden (which the bake made equal to the seektable
- *       variant), so it is admissible TODAY with the existing `golden-packets` oracle — it catches a
- *       demuxer that relies on the SEEKTABLE to enumerate frames. Oracle: `golden-packets`.
- *
- * WHY SOME DOSSIER-FLAGGED CASES ARE NOT HERE (honest scope, never fabricated — rule §0.6, §5.4):
- *   - The metamorphic `demux(mux(x))` round-trip, MPEG-TS 33-bit/90kHz PTS-WRAPAROUND / PCR
- *     discontinuity, GAPLESS encoder-delay/padding assertions, and the mislabeled-container demux are
- *     all genuine spec gaps — but each needs EITHER a new oracle branch in `src/core/oracles.ts`
- *     (the `property-invariant` oracle has no demux/mux case today; the constant-single-anchor offset
- *     would break across a PTS wrap) OR a newly-baked asset+golden. Both are outside this writer's
- *     scope (this file may only add scenarios under src/scenarios/demux/, and may not invent a corpus
- *     asset that the manifest/golden does not yet contain). They are documented in the return notes so
- *     the orchestrator can land the oracle/bake change, rather than wired to an oracle that would FAIL
- *     unconditionally (an inadmissible test is worse than an honest omission).
- *   - AVI / FLV / 3GP / CAF / fragmented-CMAF INPUT / elementary-AAC-vs-ADTS have NO manifest asset and
- *     NO golden in the corpus, so no runnable case can point at them without fabricating an input.
+ *   (5) METAMORPHIC FLAC ±SEEKTABLE — execute both inputs on the same candidate and compare their
+ *       semantic FLAC frame inventories/timelines directly. Oracle: `property-invariant`.
+ *   (6) OMITTED AXES — committed fragmented MP4/CMAF, mislabeled-extension, gapless AAC, TS
+ *       discontinuity, and CAF/PCM inputs carry both metadata and packet evidence.
  */
 
 import type { MetricId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import { FLAC_SEEKTABLE_INVARIANT, defineDemuxScaleContract } from '../../features/demux/index.ts';
+import { defineRobustnessContract } from '../robustness/contracts.ts';
 
 // ── (1) CORE format-axis cases (each backed by golden/<asset>.packets.json) ──────────────────────
 
@@ -70,7 +57,6 @@ const DEMUX_CASES: DemuxCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['packets:dts'],
     notes:
       'Real-world fetched corpus smoke: MDN CC0 flower.mp4. Golden-packets ensures the downloaded MP4 ' +
       'actually demuxes into the expected H.264/AAC packet table.',
@@ -80,7 +66,6 @@ const DEMUX_CASES: DemuxCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['packets:dts'],
     notes: 'B-frames: dts < pts on reordered frames — golden encodes the exact dts/pts spread.',
   },
   {
@@ -88,7 +73,6 @@ const DEMUX_CASES: DemuxCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['packets:dts'],
     notes: 'VFR: uneven inter-packet pts deltas; demux must preserve per-sample timestamps verbatim.',
   },
   {
@@ -134,6 +118,14 @@ const DEMUX_CASES: DemuxCase[] = [
 
   // ── Audio-only single-track demux ──
   { asset: 'aac_adts.aac', container: 'adts', audioCodecs: ['aac'], notes: 'ADTS frame boundaries → audio packets.' },
+  {
+    asset: 'aac_audio_only.m4a',
+    container: 'mp4',
+    audioCodecs: ['aac'],
+    notes:
+      'Raw AAC access units in MP4/AudioSpecificConfig counterpart to aac_adts.aac: transport headers ' +
+      'must not be confused with coded-audio frame identity.',
+  },
   { asset: 'opus.ogg', container: 'ogg', audioCodecs: ['opus'], notes: 'OGG page → Opus packet boundaries.' },
   { asset: 'flac_seektable.flac', container: 'flac', audioCodecs: ['flac'] },
 
@@ -251,6 +243,54 @@ const DEMUX_CASES: DemuxCase[] = [
       'AIFF big-endian PCM single-track demux (the previous audio set omitted AIFF entirely). Engines ' +
       "that don't read AIFF (e.g. mediabunny lists AIFF as unsupported) report a clean NA(engine).",
   },
+
+  // ── Previously omitted, now backed by digest-bound assets + metadata/packet evidence ──
+  {
+    id: 'fragmented_cmaf',
+    asset: 'fragmented_cmaf.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'Fragmented MP4/CMAF-style input: empty moov plus moof/mdat media fragments must expose the ' +
+      'complete semantic packet timeline and metadata, not only progressive sample tables.',
+  },
+  {
+    id: 'mislabeled_h264',
+    asset: 'mislabeled_h264.webm',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'Mislabeled-container detection: the .webm extension lies, while digest-bound bytes and golden ' +
+      'identify MP4/H.264/AAC. Engines must sniff/parse content rather than trust the filename.',
+  },
+  {
+    id: 'gapless_aac',
+    asset: 'gapless_aac.m4a',
+    container: 'mp4',
+    audioCodecs: ['aac'],
+    notes:
+      'Gapless AAC priming/padding: packet PTS/duration and semantic metadata preserve the edit-list ' +
+      'presentation timeline for a deliberately non-frame-aligned source duration.',
+  },
+  {
+    id: 'ts_discontinuity',
+    asset: 'ts_discontinuity.ts',
+    container: 'ts',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'MPEG-TS splice discontinuity: preserve both timeline epochs without hanging, wrapping negative, ' +
+      'or flattening the ~597s forward discontinuity.',
+  },
+  {
+    id: 'pcm_s16_caf',
+    asset: 'pcm_s16.caf',
+    container: 'caf',
+    audioCodecs: ['pcm-s16'],
+    notes: 'CAF/PCM input coverage: judge packet inventory plus sample-rate/channel/duration metadata.',
+  },
 ];
 
 const coreScenarios: Scenario[] = DEMUX_CASES.map((c) =>
@@ -267,7 +307,7 @@ const coreScenarios: Scenario[] = DEMUX_CASES.map((c) =>
       ...(c.encryption ? { encryption: c.encryption } : {}),
       ...(c.features ? { features: c.features } : {}),
     },
-    oracles: ['golden-packets'],
+    oracles: ['golden-packets', 'golden-metadata'],
     metrics: ['wall'],
     ...(c.notes ? { notes: c.notes } : {}),
   }),
@@ -289,8 +329,8 @@ interface SizeCase {
 /** Big assets can legitimately take a while to walk every packet; gate them so a stall is a clean FAIL. */
 const LARGE_DEMUX_TIMEOUT_MS = 120_000;
 const HUGE_DEMUX_TIMEOUT_MS = 600_000;
-/** Memory/longtask-aware metrics for the at-scale rungs (vs the default `wall`-only). */
-const SCALE_METRICS: MetricId[] = ['wall', 'peakMemory', 'longtasks'];
+/** Memory/read/long-task evidence for the at-scale rungs (vs the default `wall`-only). */
+const SCALE_METRICS: MetricId[] = ['wall', 'peakMemory', 'sourceReads', 'longtasks'];
 
 const SIZE_CASES: SizeCase[] = [
   // micro (~1 KB / 1 frame) — header/edge robustness of the packet walk at the smallest valid size.
@@ -389,11 +429,23 @@ const sizeScenarios: Scenario[] = SIZE_CASES.map((c) =>
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
-    oracles: ['golden-packets'],
-    // At-scale rungs record memory + long tasks (and carry a hard timeout) so a non-lazy / OOM-prone
-    // demux is caught; small rungs keep the cheap `wall`-only profile.
+    oracles: [
+      'golden-packets',
+      'golden-metadata',
+      ...(c.memoryGated ? ['property-invariant' as const] : []),
+    ],
+    // At-scale rungs retain explicit, machine-readable memory/read/long-task/first+last-packet
+    // thresholds. Full scans may compete, but cannot silently present themselves as lazy reads.
     metrics: c.memoryGated ? SCALE_METRICS : ['wall'],
-    ...(c.memoryGated ? { timeoutMs: demuxTimeoutForBucket(c.bucket) } : {}),
+    ...(c.memoryGated
+      ? {
+          timeoutMs: demuxTimeoutForBucket(c.bucket),
+          options: {
+            invariant: 'demux-scale-budgets',
+            robustness: defineDemuxScaleContract(c.bucket as 'large' | 'huge' | 'massive'),
+          },
+        }
+      : {}),
     notes: c.notes,
   }),
 );
@@ -412,7 +464,7 @@ const emptyAudioDemux: Scenario = defineScenario({
   // golden/empty_audio.wav.packets.json is `[]` — a valid container with no audio data. golden-packets
   // passes iff the engine returns exactly zero packets (0 measured == 0 golden), so an engine that
   // fabricates a phantom packet or crashes on an empty data chunk FAILs.
-  oracles: ['golden-packets'],
+  oracles: ['golden-packets', 'golden-metadata'],
   metrics: ['wall'],
   notes:
     'No-tracks/empty demux: a valid WAV whose PCM data chunk is empty must demux to ZERO packets cleanly ' +
@@ -485,7 +537,15 @@ const gracefulScenarios: Scenario[] = GRACEFUL_CASES.map((c) =>
     },
     oracles: ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
+    options: {
+      ...(c.gracefulAllowOutput ? { gracefulAllowOutput: true } : {}),
+      robustness: defineRobustnessContract(
+        c.gracefulAllowOutput ? 'boundary' : 'negative',
+        'packet-structure',
+        ['graceful-failure'],
+        GRACEFUL_TIMEOUT_MS,
+      ),
+    },
     timeoutMs: GRACEFUL_TIMEOUT_MS,
     notes: c.notes,
   }),
@@ -493,30 +553,24 @@ const gracefulScenarios: Scenario[] = GRACEFUL_CASES.map((c) =>
 
 // ── (5) METAMORPHIC — packets(flac_noseektable) == packets(flac_seektable) ───────────────────────
 
-/**
- * The packet table itself must be IDENTICAL with or without a SEEKTABLE metadata block. flac_seektable
- * and flac_noseektable are the same audio (105 frames each) baked with/without a SEEKTABLE; their golden
- * packet tables are equal. We assert it metamorphically by demuxing the NO-seektable variant against the
- * (independent) golden — which the bake made equal to the seektable variant — so a demuxer that relies on
- * the SEEKTABLE to enumerate frames (and thus drops/mis-sizes frames without it) FAILs. This uses the
- * existing `golden-packets` oracle, so it is admissible today (the dedicated cross-input property oracle
- * `demux(x)==demux(y)` is not yet implemented in oracles.ts — see the file header).
- *
- * The plain `demux/flac_noseektable` case above already runs this exact comparison; this second entry
- * exists to document the metamorphic INTENT under a stable, discoverable id (and would be the seam to
- * retarget once a true cross-input demux-equality oracle lands).
- */
+/** Both inputs are executed by the same candidate; the property compares their outputs directly. */
 const flacSeektableMetamorphic: Scenario = defineScenario({
   id: 'demux/metamorphic_flac_seektable_invariance',
   op: 'demux',
-  input: 'flac_noseektable.flac',
+  input: ['flac_seektable.flac', 'flac_noseektable.flac'],
+  inputs: [
+    { assetId: 'flac_seektable.flac', variantId: 'with-seektable', role: 'with-seektable' },
+    { assetId: 'flac_noseektable.flac', variantId: 'without-seektable', role: 'without-seektable' },
+  ],
+  inputVariantIds: ['with-seektable', 'without-seektable'],
   requires: { operations: ['demux'], containersIn: ['flac'], audioCodecs: ['flac'] },
-  oracles: ['golden-packets'],
+  options: { invariant: FLAC_SEEKTABLE_INVARIANT },
+  oracles: ['property-invariant'],
   metrics: ['wall'],
   notes:
-    'Metamorphic packets(flac_noseektable)==packets(flac_seektable): SEEKTABLE presence must not change ' +
-    'the packet table. Asserted via flac_noseektable golden (bake-equalized to the seektable variant); ' +
-    'catches a demuxer that needs the SEEKTABLE to enumerate frames.',
+    'Metamorphic demux(flac_seektable)==demux(flac_noseektable): execute both inputs, normalize their ' +
+    'semantic FLAC frame inventories/timelines, and compare directly. SEEKTABLE metadata may differ; ' +
+    'dropping or changing any audio frame fails.',
 });
 
 // ── battery ──────────────────────────────────────────────────────────────────────────────────────

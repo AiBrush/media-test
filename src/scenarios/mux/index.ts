@@ -4,16 +4,15 @@
  * Pack already-encoded tracks into a container. The engine's mux() takes EncodedTracks; the runner
  * obtains those tracks by demuxing the named source asset(s) (the source provides the coded chunks +
  * codec private data), then asks the engine to remux them into the target container via mux().
- * Because the coded samples are copied, the output must round-trip: `reference-reimport` re-parses the
- * muxed file with the reference engine and diffs the packet table where source-keyed packets are a
- * faithful reference, and `property-invariant:probe-duration` checks the materialized output duration ≈
- * the source (the container-agnostic gate that survives cross-container reframing).
+ * Because the coded samples are copied, the output must round-trip: `reference-reimport` uses neutral
+ * target readers plus semantic track/timeline evidence, while `property-invariant:probe-duration`
+ * independently checks materialized duration across container reframing.
  *
  * `input` is the source asset whose demuxed tracks feed the muxer. For multi-track muxing we name a
  * list so the runner can assemble tracks from more than one source.
  *
  * STRUCTURE (mirrors src/scenarios/remux/): the legacy LEGACY_CASES below are preserved VERBATIM
- * (same ids, oracles, options, metrics — existing behavior is not altered). The missing + deep-edge /
+ * (same ids and operation intent; correctness oracles now use the semantic mux contract). The missing + deep-edge /
  * metamorphic coverage lives in sibling files, each emitting the same Scenario shape via _shared.ts:
  *   - write-targets.ts : the missing WRITE-target containers (mov/ogg/wav/adts/mp3) + audio write matrix
  *   - multi-source.ts  : multi-source → non-mp4, 3-track, track-drop, audio-swap
@@ -39,9 +38,8 @@ type LegacyMuxCase = MuxCase;
 
 /**
  * The original 7 mux cases — stable ids and inputs are preserved, but they now route through the shared
- * mux builder so their oracle set matches the rest of the mux family: faithful reference re-import where
- * source-keyed packet counts are valid, plus probe-duration everywhere, and no brittle plain-<video>
- * smoke gate for mux-authored bytes.
+ * mux builder so their oracle set matches the rest of the mux family: neutral semantic re-import plus
+ * probe-duration everywhere, and no brittle plain-<video> smoke gate for mux-authored bytes.
  */
 const LEGACY_CASES: LegacyMuxCase[] = [
   {
@@ -97,6 +95,7 @@ const LEGACY_CASES: LegacyMuxCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    extraOptions: { trackSelect: ['video:0@0', 'audio:0@1'] },
     notes: 'Multi-source mux: video track from one asset + audio track from another into one MP4.',
   },
   {

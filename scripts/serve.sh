@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/serve.sh — static-serve the suite so index.html runs in any browser (§13: "Suite also runs
-# by opening index.html"). Serves the app (Vite dev server) AND the fixtures/ tree (media + golden)
+# scripts/serve.sh — serve the manual-idle suite URL in any supported browser. Serves the app
+# (Vite dev server) AND the fixtures/ tree (media + golden)
 # from the same origin so the runner can fetch /fixtures/media/<id> and /fixtures/golden/<id>.*.json.
 #
 # Uses bun/bunx (npm/npx are unavailable in this environment, §1). Vite is the default — it resolves
@@ -9,7 +9,7 @@
 #
 #   serve.sh                 # vite dev server on :5173 (default)
 #   serve.sh --port 8080     # choose a port
-#   serve.sh --host          # expose on the LAN (0.0.0.0)
+#   serve.sh --host          # explicitly expose on the LAN (0.0.0.0; review trust boundary first)
 #   serve.sh --preview       # build then `vite preview` (serves dist/ + fixtures via symlink)
 #
 # Cross-origin isolation: performance.measureUserAgentSpecificMemory needs COOP/COEP headers. Vite's
@@ -23,17 +23,21 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 PORT="5173"
-HOST_FLAG=""
+HOST_VALUE="127.0.0.1"
 PREVIEW=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --port=*) PORT="${1#*=}"; shift ;;
-    --host) HOST_FLAG="--host"; shift ;;
+    --host) HOST_VALUE="0.0.0.0"; echo "warning: explicitly exposing the media-test dev server on the LAN" >&2; shift ;;
     --preview) PREVIEW=1; shift ;;
     -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      printf '%s\n' \
+        "bash scripts/serve.sh [--port <n>] [--host] [--preview]" \
+        "Serves on loopback by default. --host explicitly exposes 0.0.0.0 to the LAN." \
+        "The suite can be opened manually or automated in a visible browser window by scripts/run.sh."
+      exit 0 ;;
     *) echo "serve.sh: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
@@ -55,13 +59,18 @@ export VITE_COOP="same-origin"
 export VITE_COEP="require-corp"
 
 if [[ "${PREVIEW}" -eq 1 ]]; then
-  echo "→ building suite (bunx vite build) then serving dist/ via vite preview on :${PORT}"
+  echo "→ building suite then serving dist/ via vite preview on :${PORT}"
   run_vite build
   # vite preview serves dist/; fixtures live outside dist, so symlink them in for the preview server.
   if [[ ! -e dist/fixtures ]]; then ln -s ../fixtures dist/fixtures; fi
-  run_vite preview --port "${PORT}" ${HOST_FLAG}
+  run_vite preview --port "${PORT}" --host "${HOST_VALUE}" --strictPort
+  exit $?
 fi
 
-echo "→ serving suite (bunx vite dev) on http://localhost:${PORT}/  (fixtures/ served from repo root)"
-echo "  open http://localhost:${PORT}/index.html in any browser, or drive headlessly with scripts/run.sh"
-run_vite --port "${PORT}" ${HOST_FLAG}
+if [[ "${HOST_VALUE}" == "127.0.0.1" ]]; then
+  echo "→ serving suite on http://127.0.0.1:${PORT}/  (loopback only; fixtures served from repo root)"
+else
+  echo "→ serving suite on 0.0.0.0:${PORT}  (explicit LAN exposure enabled; fixtures served from repo root)"
+fi
+echo "  open http://127.0.0.1:${PORT}/index.html in any browser, or automate the visible browser with scripts/run.sh"
+run_vite --port "${PORT}" --host "${HOST_VALUE}" --strictPort

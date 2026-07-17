@@ -47,7 +47,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', target: 'stream', fragmented: true },
     oracles: ['reference-reimport'],
     primaryMetric: 'peakMemory',
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
@@ -63,7 +63,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
     to: 'webm',
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
-    shape: { container: 'webm', target: 'stream' },
+    shape: { container: 'webm', target: 'stream', appendOnly: true },
     oracles: ['reference-reimport'],
     primaryMetric: 'peakMemory',
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
@@ -77,7 +77,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', target: 'stream', fragmented: true },
     oracles: ['reference-reimport'],
     primaryMetric: 'peakMemory',
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
@@ -94,7 +94,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', target: 'stream', fragmented: true },
     oracles: ['reference-reimport'],
     primaryMetric: 'peakMemory',
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
@@ -113,13 +113,14 @@ const SIZE_LADDER_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'buffer' },
+    // Match the stream rung's packaging exactly; only target/retention policy differs.
+    shape: { container: 'mp4', target: 'buffer', fragmented: true },
     oracles: ['reference-reimport'],
     primaryMetric: 'peakMemory',
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
     notes:
       'SIZE LADDER (massive ~1-1.4 GB) BUFFER target — the contrast partner to stream_massive_h264_mp4: ' +
-      'a BufferTarget materializes the whole output in memory → file-sized peak memory (or OOM at the ' +
+      'a BufferTarget materializes the same fragmented output in memory → file-sized peak memory (or OOM at the ' +
       'massive rung). The buffer-vs-stream peak-memory divergence that makes this family meaningful.',
   },
 ];

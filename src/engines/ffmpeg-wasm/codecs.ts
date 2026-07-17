@@ -82,6 +82,9 @@ const CONTAINER_DEMUX_NAMES: Record<CanonicalContainer, string[]> = {
   adts: ['aac'],
   aiff: ['aiff'],
   caf: ['caf'],
+  jpeg: ['image2', 'mjpeg', 'jpeg_pipe'],
+  png: ['image2', 'png_pipe'],
+  webp: ['webp', 'image2', 'webp_pipe'],
 };
 
 const CONTAINER_MUX_NAMES: Record<CanonicalContainer, string[]> = {
@@ -98,6 +101,9 @@ const CONTAINER_MUX_NAMES: Record<CanonicalContainer, string[]> = {
   adts: ['adts'],
   aiff: ['aiff'],
   caf: ['caf'],
+  jpeg: ['image2', 'mjpeg'],
+  png: ['image2', 'png'],
+  webp: ['webp', 'image2'],
 };
 
 // ── On-disk filename extension / output MIME per container ─────────────────────────────────────
@@ -264,6 +270,24 @@ export function parseFormats(log: string): { demux: Set<string>; mux: Set<string
     if (canMux) mux.add(name);
   }
   return { demux, mux };
+}
+
+/** Parse canonical filter names from `ffmpeg -filters` output. */
+export function parseFilters(log: string): Set<string> {
+  const names = new Set<string>();
+  let started = false;
+  for (const rawLine of log.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!started) {
+      if (/^\s*-{3,}\s*$/.test(line)) started = true;
+      continue;
+    }
+    // Rows are a three-character timeline/slice/command flag field followed by the filter name.
+    // Some builds add an extra media-signature column later; only the first token is relevant.
+    const match = /^\s*[TSC.]{3}\s+(\S+)/.exec(line);
+    if (match?.[1]) names.add(match[1]);
+  }
+  return names;
 }
 
 // ── Capability derivation from probe sets ────────────────────────────────────────────────────

@@ -1,0 +1,39 @@
+{
+  "schema": "media-test/probe-wrapper-equivalence@1",
+  "groupId": "h264-aac-10s-mp4-matroska",
+  "wrappers": [
+    {
+      "assetId": "h264_rotated90.mp4",
+      "container": "mp4",
+      "streams": [
+        {
+          "type": "video",
+          "codec": "h264",
+          "sha256": "2d1f4d4ddd15480117f079540baef83e875bfdf939fb2ead569480288a2ed766"
+        },
+        {
+          "type": "audio",
+          "codec": "aac",
+          "sha256": "b43d4b3059e9748c057675af560e60c0cc7e3afca1e4904b10773d96941f0fec"
+        }
+      ]
+    },
+    {
+      "assetId": "h264_in_mkv.mkv",
+      "container": "mkv",
+      "streams": [
+        {
+          "type": "video",
+          "codec": "h264",
+          "sha256": "2d1f4d4ddd15480117f079540baef83e875bfdf939fb2ead569480288a2ed766"
+        },
+        {
+          "type": "audio",
+          "codec": "aac",
+          "sha256": "b43d4b3059e9748c057675af560e60c0cc7e3afca1e4904b10773d96941f0fec"
+        }
+      ]
+    }
+  ],
+  "generatedBy": "ffmpeg -map 0:{v:0,a:0} -c copy -f hash -hash sha256"
+}

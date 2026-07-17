@@ -39,6 +39,29 @@ export interface ReadStructure {
   durationSec?: number;
 }
 
+export type ReaderState =
+  | 'OK'
+  | 'UNSUPPORTED_FORMAT'
+  | 'UNSUPPORTED_STRUCTURE'
+  | 'MALFORMED'
+  | 'INCOMPLETE';
+
+export interface ReaderEvidence {
+  reader: 'structure' | 'packets';
+  byteLength: number;
+  containerHint?: string;
+  detectedFormat?: 'mp4' | 'webm';
+  markers?: string[];
+}
+
+export type ReaderResult<T> =
+  | { state: 'OK'; value: T; evidence: ReaderEvidence }
+  | {
+      state: Exclude<ReaderState, 'OK'>;
+      reasonCode: string;
+      evidence: ReaderEvidence;
+    };
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // Codec vocabulary mapping (the ONLY place a raw fourcc / CodecID becomes a golden token).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -56,8 +79,15 @@ export function canonicalCodecToken(raw: string): string | null {
     const s = raw.replace(/\0+$/g, '').trim();
     if (!s) return null;
 
+    // RFC 6381 codec strings retain the four-character sample entry as their base token, followed
+    // by profile/level/configuration fields (for example av01.0.08M.08 or mp4a.40.2).  Compare the
+    // base token here so every caller gets the same canonical family; do not require each oracle to
+    // maintain its own incomplete prefix list.
+    const lower = s.toLowerCase();
+    const sampleEntry = /^([a-z0-9]{4})(?:\.|$)/i.exec(s)?.[1]?.toLowerCase() ?? lower;
+
     // ── ISO-BMFF / QuickTime fourccs (4 chars). Compared case-insensitively ('Opus', 'fLaC', …). ──
-    switch (s.toLowerCase()) {
+    switch (sampleEntry) {
       // video
       case 'avc1':
       case 'avc3':
@@ -88,6 +118,7 @@ export function canonicalCodecToken(raw: string): string | null {
         return 'flac';
       case '.mp3':
       case 'mp3 ':
+      case 'mp3':
         return 'mp3';
       // NOTE: PCM fourccs (twos/sowt/lpcm/in24/in32/fl32/fl64/raw /NONE) and AC-3 (ac-3/ec-3) are
       // deliberately NOT mapped here — their exact golden token (pcm-s16 vs pcm-s24 vs pcm-s16be …,
@@ -235,6 +266,64 @@ function parseTkhdDims(dv: DataView, box: Box): { w: number; h: number } {
   return { w: u32(dv, wOff) >>> 16, h: u32(dv, hOff) >>> 16 };
 }
 
+/** mdhd media duration in seconds. Unknown sentinels stay absent rather than becoming huge values. */
+function parseMdhdDurationSec(dv: DataView, box: Box): number | undefined {
+  const b = box.bodyStart;
+  if (b + 4 > box.end || b >= dv.byteLength) return undefined;
+  const version = dv.getUint8(b);
+  const timescale = version === 1 ? u32(dv, b + 20) : u32(dv, b + 12);
+  const duration = version === 1 ? u64(dv, b + 24) : u32(dv, b + 16);
+  if (
+    timescale <= 0 ||
+    duration <= 0 ||
+    duration === 0xffff_ffff ||
+    duration >= 0x1f_ffff_ffff_ffff
+  ) return undefined;
+  return duration / timescale;
+}
+
+/** Sum stts run lengths without expanding a potentially multi-million-sample table. */
+function parseSttsSpanSec(dv: DataView, box: Box, timescale: number): number | undefined {
+  const b = box.bodyStart;
+  if (timescale <= 0 || b + 8 > box.end) return undefined;
+  const entryCount = u32(dv, b + 4);
+  if (entryCount > 1_000_000 || b + 8 + entryCount * 8 > box.end) return undefined;
+  let ticks = 0;
+  let p = b + 8;
+  for (let index = 0; index < entryCount; index++, p += 8) {
+    const sampleCount = u32(dv, p);
+    const sampleDelta = u32(dv, p + 4);
+    const contribution = sampleCount * sampleDelta;
+    if (!Number.isSafeInteger(contribution) || !Number.isSafeInteger(ticks + contribution)) return undefined;
+    ticks += contribution;
+  }
+  return ticks > 0 ? ticks / timescale : undefined;
+}
+
+function trackDurationEvidence(
+  bytes: Uint8Array,
+  dv: DataView,
+  trak: Box,
+): { durationSec?: number; hasEditList: boolean } {
+  const trakChildren = readBoxes(bytes, dv, trak.bodyStart, trak.end);
+  const edts = findBox(trakChildren, 'edts');
+  const hasEditList = edts
+    ? findBox(readBoxes(bytes, dv, edts.bodyStart, edts.end), 'elst') !== undefined
+    : false;
+  const mdia = findBox(trakChildren, 'mdia');
+  if (!mdia) return { hasEditList };
+  const mdiaChildren = readBoxes(bytes, dv, mdia.bodyStart, mdia.end);
+  const mdhd = findBox(mdiaChildren, 'mdhd');
+  const timescale = mdhd ? parseMdhdTimescale(dv, mdhd) : 0;
+  const minf = findBox(mdiaChildren, 'minf');
+  const stbl = minf ? findBox(readBoxes(bytes, dv, minf.bodyStart, minf.end), 'stbl') : undefined;
+  const stts = stbl ? findBox(readBoxes(bytes, dv, stbl.bodyStart, stbl.end), 'stts') : undefined;
+  const headerDuration = mdhd ? parseMdhdDurationSec(dv, mdhd) : undefined;
+  const sampleDuration = stts ? parseSttsSpanSec(dv, stts, timescale) : undefined;
+  const durationSec = Math.max(headerDuration ?? 0, sampleDuration ?? 0) || undefined;
+  return { ...(durationSec !== undefined ? { durationSec } : {}), hasEditList };
+}
+
 /** hdlr handler_type → track kind. */
 function parseHandlerType(bytes: Uint8Array, box: Box): 'video' | 'audio' | 'other' {
   // version(1)+flags(3) pre_defined(4) handler_type(4)
@@ -366,10 +455,33 @@ export function readMp4Structure(bytes: Uint8Array): ReadStructure | null {
     }
 
     const tracks: ReadTrack[] = [];
+    const mediaDurations: number[] = [];
+    let hasEditList = false;
     for (const child of moovChildren) {
       if (child.type !== 'trak') continue;
       const t = parseTrak(bytes, dv, child);
       if (t) tracks.push(t);
+      const duration = trackDurationEvidence(bytes, dv, child);
+      if (duration.durationSec !== undefined) mediaDurations.push(duration.durationSec);
+      hasEditList ||= duration.hasEditList;
+    }
+
+    // A few valid producer outputs carry a stale/short mvhd while every mdhd/sample timeline spans
+    // the complete program. With no edit list authoring a shorter presentation, prefer the longest
+    // evidenced media duration; this prevents the neutral reader from truncating valid content.
+    if (!hasEditList && mediaDurations.length > 0) {
+      durationSec = Math.max(durationSec ?? 0, ...mediaDurations);
+    }
+    if (findBox(top, 'moof') || findBox(moovChildren, 'mvex')) {
+      const fragmentPackets = readMp4FragmentPackets(bytes, dv, top, moov);
+      if (fragmentPackets?.length) {
+        const fragmentEndUs = Math.max(
+          ...fragmentPackets.map((packet) => packet.ptsUs + (packet.durationUs ?? 0)),
+        );
+        if (Number.isFinite(fragmentEndUs) && fragmentEndUs > 0) {
+          durationSec = Math.max(durationSec ?? 0, fragmentEndUs / 1_000_000);
+        }
+      }
     }
 
     const out: ReadStructure = { container: 'mp4', tracks };
@@ -606,7 +718,26 @@ export interface PacketRow {
   size: number;
   ptsUs: number;
   dtsUs: number;
+  durationUs?: number;
   keyframe: boolean;
+}
+
+interface PacketReaderDiagnostic {
+  failure?: {
+    state: 'UNSUPPORTED_STRUCTURE' | 'MALFORMED' | 'INCOMPLETE';
+    reasonCode: string;
+    marker?: string;
+  };
+}
+
+function packetReaderFailure(
+  diagnostic: PacketReaderDiagnostic | undefined,
+  state: 'UNSUPPORTED_STRUCTURE' | 'MALFORMED' | 'INCOMPLETE',
+  reasonCode: string,
+  marker?: string,
+): null {
+  if (diagnostic) diagnostic.failure = { state, reasonCode, ...(marker ? { marker } : {}) };
+  return null;
 }
 
 /** Reject absurd sample/entry counts BEFORE allocating (a corrupt box could claim billions). */
@@ -784,15 +915,196 @@ function parseTrakPackets(
   for (let i = 0; i < n; i++) {
     const d = dts[i]!;
     const c = cts ? (cts[i] ?? 0) : 0;
+    const duration = i + 1 < dts.length
+      ? dts[i + 1]! - d
+      : i > 0
+        ? d - dts[i - 1]!
+        : 0;
     out.push({
       trackIndex,
       size: sizes[i]!,
       dtsUs: Math.round((d / timescale) * 1e6),
       ptsUs: Math.round(((d + c) / timescale) * 1e6),
+      ...(duration > 0 ? { durationUs: Math.round((duration / timescale) * 1e6) } : {}),
       keyframe: syncSet ? syncSet.has(i + 1) : true, // absent stss ⇒ every sample is a sync sample
     });
   }
   return true;
+}
+
+interface FragmentTrackDefaults {
+  trackIndex: number;
+  timescale: number;
+  defaultDuration: number;
+  defaultSize: number;
+  defaultFlags: number;
+}
+
+function fullBoxFlags(dv: DataView, box: Box): number {
+  const b = box.bodyStart;
+  if (b + 4 > box.end) return 0;
+  return (dv.getUint8(b + 1) << 16) | (dv.getUint8(b + 2) << 8) | dv.getUint8(b + 3);
+}
+
+function parseTkhdTrackId(dv: DataView, box: Box): number {
+  const b = box.bodyStart;
+  if (b + 4 > box.end) return 0;
+  return dv.getUint8(b) === 1 ? u32(dv, b + 20) : u32(dv, b + 12);
+}
+
+function fragmentTrackDefaults(bytes: Uint8Array, dv: DataView, moov: Box): Map<number, FragmentTrackDefaults> {
+  const children = readBoxes(bytes, dv, moov.bodyStart, moov.end);
+  const defaultsById = new Map<number, FragmentTrackDefaults>();
+  let trackIndex = 0;
+  for (const trak of children) {
+    if (trak.type !== 'trak') continue;
+    const trakChildren = readBoxes(bytes, dv, trak.bodyStart, trak.end);
+    const tkhd = findBox(trakChildren, 'tkhd');
+    const mdia = findBox(trakChildren, 'mdia');
+    const mdhd = mdia ? findBox(readBoxes(bytes, dv, mdia.bodyStart, mdia.end), 'mdhd') : undefined;
+    const trackId = tkhd ? parseTkhdTrackId(dv, tkhd) : 0;
+    const timescale = mdhd ? parseMdhdTimescale(dv, mdhd) : 0;
+    if (trackId > 0) {
+      defaultsById.set(trackId, {
+        trackIndex,
+        timescale,
+        defaultDuration: 0,
+        defaultSize: 0,
+        defaultFlags: 0,
+      });
+    }
+    trackIndex++;
+  }
+  const mvex = findBox(children, 'mvex');
+  if (mvex) {
+    for (const trex of readBoxes(bytes, dv, mvex.bodyStart, mvex.end)) {
+      if (trex.type !== 'trex' || trex.bodyStart + 24 > trex.end) continue;
+      const trackId = u32(dv, trex.bodyStart + 4);
+      const current = defaultsById.get(trackId);
+      if (!current) continue;
+      current.defaultDuration = u32(dv, trex.bodyStart + 12);
+      current.defaultSize = u32(dv, trex.bodyStart + 16);
+      current.defaultFlags = u32(dv, trex.bodyStart + 20);
+    }
+  }
+  return defaultsById;
+}
+
+function sampleFlagsAreSync(flags: number): boolean {
+  return (flags & 0x0001_0000) === 0;
+}
+
+/** Parse moof/traf/tfhd/tfdt/trun sample runs. Returns null rather than a partial table. */
+function readMp4FragmentPackets(
+  bytes: Uint8Array,
+  dv: DataView,
+  top: Box[],
+  moov: Box,
+): PacketRow[] | null {
+  const defaultsById = fragmentTrackDefaults(bytes, dv, moov);
+  if (defaultsById.size === 0) return null;
+  const nextDecodeByTrack = new Map<number, number>();
+  const out: PacketRow[] = [];
+  let sawRun = false;
+
+  for (const moof of top) {
+    if (moof.type !== 'moof') continue;
+    for (const traf of readBoxes(bytes, dv, moof.bodyStart, moof.end)) {
+      if (traf.type !== 'traf') continue;
+      const children = readBoxes(bytes, dv, traf.bodyStart, traf.end);
+      const tfhd = findBox(children, 'tfhd');
+      if (!tfhd || tfhd.bodyStart + 8 > tfhd.end) return null;
+      const tfhdFlags = fullBoxFlags(dv, tfhd);
+      const trackId = u32(dv, tfhd.bodyStart + 4);
+      const base = defaultsById.get(trackId);
+      if (!base || base.timescale <= 0) return null;
+      let p = tfhd.bodyStart + 8;
+      if (tfhdFlags & 0x000001) p += 8; // base_data_offset
+      if (tfhdFlags & 0x000002) p += 4; // sample_description_index
+      let defaultDuration = base.defaultDuration;
+      let defaultSize = base.defaultSize;
+      let defaultFlags = base.defaultFlags;
+      if (tfhdFlags & 0x000008) {
+        if (p + 4 > tfhd.end) return null;
+        defaultDuration = u32(dv, p);
+        p += 4;
+      }
+      if (tfhdFlags & 0x000010) {
+        if (p + 4 > tfhd.end) return null;
+        defaultSize = u32(dv, p);
+        p += 4;
+      }
+      if (tfhdFlags & 0x000020) {
+        if (p + 4 > tfhd.end) return null;
+        defaultFlags = u32(dv, p);
+      }
+
+      const tfdt = findBox(children, 'tfdt');
+      let decodeTime = nextDecodeByTrack.get(trackId) ?? 0;
+      if (tfdt) {
+        if (tfdt.bodyStart + 8 > tfdt.end) return null;
+        decodeTime = dv.getUint8(tfdt.bodyStart) === 1
+          ? u64(dv, tfdt.bodyStart + 4)
+          : u32(dv, tfdt.bodyStart + 4);
+      }
+
+      for (const trun of children) {
+        if (trun.type !== 'trun') continue;
+        sawRun = true;
+        if (trun.bodyStart + 8 > trun.end) return null;
+        const version = dv.getUint8(trun.bodyStart);
+        const flags = fullBoxFlags(dv, trun);
+        const sampleCount = u32(dv, trun.bodyStart + 4);
+        if (sampleCount > MAX_SAMPLES || out.length + sampleCount > MAX_SAMPLES) return null;
+        let q = trun.bodyStart + 8;
+        if (flags & 0x000001) q += 4; // data_offset
+        let firstSampleFlags: number | undefined;
+        if (flags & 0x000004) {
+          if (q + 4 > trun.end) return null;
+          firstSampleFlags = u32(dv, q);
+          q += 4;
+        }
+        for (let i = 0; i < sampleCount; i++) {
+          let duration = defaultDuration;
+          let size = defaultSize;
+          let sampleFlags = i === 0 && firstSampleFlags !== undefined ? firstSampleFlags : defaultFlags;
+          let compositionOffset = 0;
+          if (flags & 0x000100) {
+            if (q + 4 > trun.end) return null;
+            duration = u32(dv, q);
+            q += 4;
+          }
+          if (flags & 0x000200) {
+            if (q + 4 > trun.end) return null;
+            size = u32(dv, q);
+            q += 4;
+          }
+          if (flags & 0x000400) {
+            if (q + 4 > trun.end) return null;
+            sampleFlags = u32(dv, q);
+            q += 4;
+          }
+          if (flags & 0x000800) {
+            if (q + 4 > trun.end) return null;
+            compositionOffset = version === 1 ? dv.getInt32(q) : u32(dv, q);
+            q += 4;
+          }
+          if (duration <= 0 || size <= 0) return null;
+          out.push({
+            trackIndex: base.trackIndex,
+            size,
+            dtsUs: Math.round((decodeTime / base.timescale) * 1_000_000),
+            ptsUs: Math.round(((decodeTime + compositionOffset) / base.timescale) * 1_000_000),
+            durationUs: Math.round((duration / base.timescale) * 1_000_000),
+            keyframe: sampleFlagsAreSync(sampleFlags),
+          });
+          decodeTime += duration;
+        }
+      }
+      nextDecodeByTrack.set(trackId, decodeTime);
+    }
+  }
+  return sawRun && out.length > 0 ? out : null;
 }
 
 /**
@@ -808,9 +1120,10 @@ export function readMp4Packets(bytes: Uint8Array): PacketRow[] | null {
     const top = readBoxes(bytes, dv, 0, bytes.length);
     const moov = findBox(top, 'moov');
     if (!moov) return null;
-    if (findBox(top, 'moof')) return null; // fragmented: samples in movie fragments, not moov stbl
     const moovChildren = readBoxes(bytes, dv, moov.bodyStart, moov.end);
-    if (findBox(moovChildren, 'mvex')) return null; // declares fragmentation → moov stbl is empty
+    if (findBox(top, 'moof') || findBox(moovChildren, 'mvex')) {
+      return readMp4FragmentPackets(bytes, dv, top, moov);
+    }
 
     const out: PacketRow[] = [];
     let trackIndex = 0;
@@ -836,13 +1149,15 @@ const EBML_BLOCK = {
   BlockGroup: 0xa0,
   Block: 0xa1,
   ReferenceBlock: 0xfb,
+  BlockDuration: 0x9b,
   TrackNumber: 0xd7,
+  DefaultDuration: 0x23e383,
 } as const;
 
 /**
- * Parse a SimpleBlock/Block header at [start,end) → one PacketRow. Returns:
- *   PacketRow  — a laced-free block for a mapped track,
- *   null       — FATAL (malformed header, or LACING which this reader will not fabricate) → bail file,
+ * Parse a SimpleBlock/Block header at [start,end) → one or more complete PacketRows. Returns:
+ *   PacketRow[] — unlaced or fully decoded Xiph/fixed/EBML lacing,
+ *   null       — FATAL (malformed header, or lacing without timing evidence) → bail file,
  *   undefined  — SKIP (block for a track absent from the Tracks map; defensive, not fatal).
  * `keyframe` comes from the SimpleBlock flag byte, or (BlockGroup) the caller's ReferenceBlock check.
  */
@@ -853,30 +1168,125 @@ function parseEbmlBlock(
   clusterTc: number,
   timecodeScale: number,
   trackIndexByNumber: Map<number, number>,
+  defaultDurationNsByTrack: Map<number, number>,
   keyframeFromFlags: boolean,
   keyframeOverride: boolean,
-): PacketRow | null | undefined {
+  blockDurationTc?: number,
+  diagnostic?: PacketReaderDiagnostic,
+): PacketRow[] | null | undefined {
   const tn = readVint(bytes, start, end, false);
-  if (!tn) return null;
+  if (!tn) return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_BLOCK_HEADER_MALFORMED');
   let p = start + tn.length;
-  if (p + 3 > end) return null; // need int16 rel timecode + 1 flag byte
+  if (p + 3 > end) return packetReaderFailure(diagnostic, 'INCOMPLETE', 'READER_WEBM_BLOCK_HEADER_INCOMPLETE');
   const relRaw = (u8(bytes, p) << 8) | u8(bytes, p + 1);
   const rel = relRaw >= 0x8000 ? relRaw - 0x10000 : relRaw; // signed int16
   p += 2;
   const flags = u8(bytes, p);
   p += 1;
-  if (((flags >> 1) & 0x03) !== 0) return null; // lacing present → bail (never fabricate laced sizes/ts)
   const trackIndex = trackIndexByNumber.get(tn.value);
   if (trackIndex === undefined) return undefined; // block for an undeclared track → skip
-  const size = Math.max(0, end - p); // remaining block payload = the single (unlaced) frame
-  const ptsUs = Math.round(((clusterTc + rel) * timecodeScale) / 1000); // TimecodeScale is ns → µs
-  return {
-    trackIndex,
-    size,
-    ptsUs,
-    dtsUs: ptsUs,
-    keyframe: keyframeFromFlags ? (flags & 0x80) !== 0 : keyframeOverride,
-  };
+  const lacing = (flags >> 1) & 0x03;
+  let sizes: number[];
+  if (lacing === 0) {
+    sizes = [Math.max(0, end - p)];
+  } else {
+    if (p >= end) return packetReaderFailure(diagnostic, 'INCOMPLETE', 'READER_WEBM_LACING_HEADER_INCOMPLETE');
+    const frameCount = u8(bytes, p) + 1;
+    p++;
+    if (frameCount < 2 || frameCount > 256) {
+      return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_LACING_COUNT_MALFORMED');
+    }
+    const parsed = parseEbmlLaceSizes(bytes, p, end, frameCount, lacing);
+    if (!parsed) return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_LACING_SIZES_MALFORMED');
+    p = parsed.payloadStart;
+    sizes = parsed.sizes;
+  }
+  const payloadBytes = end - p;
+  if (sizes.some((size) => size < 0) || sizes.reduce((sum, size) => sum + size, 0) !== payloadBytes) {
+    return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_LACING_PAYLOAD_MALFORMED');
+  }
+  const basePtsUs = Math.round(((clusterTc + rel) * timecodeScale) / 1000); // ns → µs
+  const blockDurationUs = blockDurationTc !== undefined
+    ? Math.round((blockDurationTc * timecodeScale) / 1000)
+    : undefined;
+  const defaultDurationUs = (defaultDurationNsByTrack.get(trackIndex) ?? 0) / 1000;
+  const durationUs = blockDurationUs !== undefined && blockDurationUs > 0
+    ? blockDurationUs / sizes.length
+    : defaultDurationUs > 0
+      ? defaultDurationUs
+      : sizes.length === 1
+        ? undefined
+        : 0;
+  if (sizes.length > 1 && (!durationUs || durationUs <= 0)) {
+    return packetReaderFailure(
+      diagnostic,
+      'UNSUPPORTED_STRUCTURE',
+      'READER_WEBM_LACING_TIMING_UNAVAILABLE',
+      'lacing-without-duration',
+    );
+  }
+  const keyframe = keyframeFromFlags ? (flags & 0x80) !== 0 : keyframeOverride;
+  return sizes.map((size, index) => {
+    const ptsUs = Math.round(basePtsUs + index * (durationUs ?? 0));
+    return {
+      trackIndex,
+      size,
+      ptsUs,
+      dtsUs: ptsUs,
+      ...(durationUs !== undefined && durationUs > 0 ? { durationUs: Math.round(durationUs) } : {}),
+      keyframe,
+    };
+  });
+}
+
+function parseEbmlLaceSizes(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  frameCount: number,
+  lacing: number,
+): { sizes: number[]; payloadStart: number } | null {
+  let p = start;
+  const sizes: number[] = [];
+  if (lacing === 1) {
+    // Xiph: each of the first N-1 sizes is a sum of 0xff bytes plus one terminating byte.
+    for (let i = 0; i < frameCount - 1; i++) {
+      let size = 0;
+      while (p < end) {
+        const value = u8(bytes, p++);
+        size += value;
+        if (value !== 0xff) break;
+      }
+      if (p > end) return null;
+      sizes.push(size);
+    }
+  } else if (lacing === 2) {
+    // Fixed: no size headers; the remaining payload divides evenly across all frames.
+    const remaining = end - p;
+    if (remaining < 0 || remaining % frameCount !== 0) return null;
+    return { sizes: new Array(frameCount).fill(remaining / frameCount), payloadStart: p };
+  } else if (lacing === 3) {
+    const first = readVint(bytes, p, end, false);
+    if (!first) return null;
+    sizes.push(first.value);
+    p += first.length;
+    for (let i = 1; i < frameCount - 1; i++) {
+      const encoded = readVint(bytes, p, end, false);
+      if (!encoded) return null;
+      const bias = Math.pow(2, 7 * encoded.length - 1) - 1;
+      const size = sizes[i - 1]! + encoded.value - bias;
+      if (size < 0) return null;
+      sizes.push(size);
+      p += encoded.length;
+    }
+  } else {
+    return null;
+  }
+  const remaining = end - p;
+  const last = remaining - sizes.reduce((sum, size) => sum + size, 0);
+  if (last < 0) return null;
+  sizes.push(last);
+  return sizes.length === frameCount ? { sizes, payloadStart: p } : null;
 }
 
 /**
@@ -885,13 +1295,15 @@ function parseEbmlBlock(
  * PTS is non-monotonic in file order — this reader carries no separate DTS and will not fabricate one).
  * Never throws.
  */
-export function readWebmPackets(bytes: Uint8Array): PacketRow[] | null {
+export function readWebmPackets(bytes: Uint8Array, diagnostic?: PacketReaderDiagnostic): PacketRow[] | null {
   try {
-    if (!bytes || bytes.length < 8) return null;
+    if (!bytes || bytes.length < 8) {
+      return packetReaderFailure(diagnostic, 'INCOMPLETE', 'READER_WEBM_INPUT_INCOMPLETE');
+    }
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const topLevel = ebmlChildren(bytes, 0, bytes.length);
     const segment = topLevel.find((el) => el.id === EBML_ID.Segment);
-    if (!segment) return null;
+    if (!segment) return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_SEGMENT_MISSING');
     const bound = segment.bodyEnd - segment.bodyStart; // upper bound on element count within the segment
     const segChildren = ebmlChildren(bytes, segment.bodyStart, segment.bodyEnd, bound);
 
@@ -911,9 +1323,10 @@ export function readWebmPackets(bytes: Uint8Array): PacketRow[] | null {
     // declaration indices are AUDIO: ffmpeg/ffprobe flags every audio packet as a keyframe regardless
     // of the block's own flag (audio frames are independently decodable), so we mirror that below.
     const tracksEl = segChildren.find((el) => el.id === EBML_ID.Tracks);
-    if (!tracksEl) return null;
+    if (!tracksEl) return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_TRACKS_MISSING');
     const trackIndexByNumber = new Map<number, number>();
     const audioTrackIndices = new Set<number>();
+    const defaultDurationNsByTrack = new Map<number, number>();
     let decl = 0;
     for (const te of ebmlChildren(bytes, tracksEl.bodyStart, tracksEl.bodyEnd)) {
       if (te.id !== EBML_ID.TrackEntry) continue;
@@ -922,17 +1335,27 @@ export function readWebmPackets(bytes: Uint8Array): PacketRow[] | null {
       for (const c of ebmlChildren(bytes, te.bodyStart, te.bodyEnd)) {
         if (c.id === EBML_BLOCK.TrackNumber) tn = ebmlUint(dv, c);
         else if (c.id === EBML_ID.TrackType) trackType = ebmlUint(dv, c);
+        else if (c.id === EBML_BLOCK.DefaultDuration) defaultDurationNsByTrack.set(decl, ebmlUint(dv, c));
       }
       if (tn >= 0) trackIndexByNumber.set(tn, decl);
       if (trackType === 2) audioTrackIndices.add(decl); // Matroska TrackType 2 = audio
       decl++;
     }
-    if (trackIndexByNumber.size === 0) return null;
+    if (trackIndexByNumber.size === 0) {
+      return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_TRACK_DECLARATIONS_MISSING');
+    }
 
     const out: PacketRow[] = [];
     for (const cluster of segChildren) {
       if (cluster.id !== EBML_ID.Cluster) continue;
-      if (cluster.unknown) return null; // unknown-size cluster: cannot bound blocks safely → bail
+      if (cluster.unknown) {
+        return packetReaderFailure(
+          diagnostic,
+          'UNSUPPORTED_STRUCTURE',
+          'READER_WEBM_UNKNOWN_SIZE_CLUSTER_UNSUPPORTED',
+          'unknown-size-cluster',
+        );
+      }
       const clusterBound = cluster.bodyEnd - cluster.bodyStart;
       const clusterChildren = ebmlChildren(bytes, cluster.bodyStart, cluster.bodyEnd, clusterBound);
       let clusterTc = 0;
@@ -944,43 +1367,74 @@ export function readWebmPackets(bytes: Uint8Array): PacketRow[] | null {
           break;
         }
       }
-      if (!sawTc) return null; // a cluster without a Timecode cannot place its blocks
+      if (!sawTc) return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_CLUSTER_TIMECODE_MISSING');
       for (const c of clusterChildren) {
         if (c.id === EBML_BLOCK.SimpleBlock) {
-          const row = parseEbmlBlock(bytes, c.bodyStart, c.bodyEnd, clusterTc, timecodeScale, trackIndexByNumber, true, false);
-          if (row === null) return null;
-          if (row) {
-            if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
-            out.push(row);
+          const rows = parseEbmlBlock(
+            bytes, c.bodyStart, c.bodyEnd, clusterTc, timecodeScale,
+            trackIndexByNumber, defaultDurationNsByTrack, true, false, undefined, diagnostic,
+          );
+          if (rows === null) return null;
+          if (rows) {
+            for (const row of rows) {
+              if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
+              out.push(row);
+            }
           }
         } else if (c.id === EBML_BLOCK.BlockGroup) {
           const groupChildren = ebmlChildren(bytes, c.bodyStart, c.bodyEnd);
           const blockEl = groupChildren.find((g) => g.id === EBML_BLOCK.Block);
           if (!blockEl) continue;
           const hasRef = groupChildren.some((g) => g.id === EBML_BLOCK.ReferenceBlock);
-          const row = parseEbmlBlock(bytes, blockEl.bodyStart, blockEl.bodyEnd, clusterTc, timecodeScale, trackIndexByNumber, false, !hasRef);
-          if (row === null) return null;
-          if (row) {
-            if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
-            out.push(row);
+          const blockDuration = groupChildren.find((g) => g.id === EBML_BLOCK.BlockDuration);
+          const rows = parseEbmlBlock(
+            bytes, blockEl.bodyStart, blockEl.bodyEnd, clusterTc, timecodeScale,
+            trackIndexByNumber, defaultDurationNsByTrack, false, !hasRef,
+            blockDuration ? ebmlUint(dv, blockDuration) : undefined,
+            diagnostic,
+          );
+          if (rows === null) return null;
+          if (rows) {
+            for (const row of rows) {
+              if (audioTrackIndices.has(row.trackIndex)) row.keyframe = true;
+              out.push(row);
+            }
           }
         }
       }
     }
 
-    // B-frame reorder guard: with dts=pts, each track's PTS must be non-decreasing in file (decode)
-    // order. A decrease means presentation≠decode order (reorder), whose true DTS a container-only
-    // reader cannot reconstruct → bail rather than emit a table that mis-sorts against the golden.
-    const lastByTrack = new Map<number, number>();
-    for (const row of out) {
-      const prev = lastByTrack.get(row.trackIndex);
-      if (prev !== undefined && row.ptsUs < prev) return null;
-      lastByTrack.set(row.trackIndex, row.ptsUs);
-    }
+    // Blocks are stored in decode order. Keep their independent presentation timestamps and derive a
+    // monotonic DTS axis per track from explicit/default duration (or a timestamp-delta fallback).
+    assignWebmDecodeTimestamps(out);
 
     return out;
   } catch {
-    return null;
+    return packetReaderFailure(diagnostic, 'MALFORMED', 'READER_WEBM_INTERNAL_PARSE_GUARD');
+  }
+}
+
+function assignWebmDecodeTimestamps(rows: PacketRow[]): void {
+  const byTrack = new Map<number, PacketRow[]>();
+  for (const row of rows) {
+    const list = byTrack.get(row.trackIndex);
+    if (list) list.push(row);
+    else byTrack.set(row.trackIndex, [row]);
+  }
+  for (const trackRows of byTrack.values()) {
+    const sortedPts = [...new Set(trackRows.map((row) => row.ptsUs))].sort((a, b) => a - b);
+    const deltas: number[] = [];
+    for (let i = 1; i < sortedPts.length; i++) {
+      const delta = sortedPts[i]! - sortedPts[i - 1]!;
+      if (delta > 0) deltas.push(delta);
+    }
+    deltas.sort((a, b) => a - b);
+    const fallback = deltas[Math.floor(deltas.length / 2)] ?? 1;
+    let decodeTime = Math.min(...trackRows.map((row) => row.ptsUs));
+    for (const row of trackRows) {
+      row.dtsUs = Math.round(decodeTime);
+      decodeTime += row.durationUs && row.durationUs > 0 ? row.durationUs : fallback;
+    }
   }
 }
 
@@ -1056,4 +1510,142 @@ export function readOutputPackets(bytes: Uint8Array, containerHint?: string): Pa
   } catch {
     return null;
   }
+}
+
+/** Typed structure-reader boundary used by correctness oracles. Never throws. */
+export function readOutputStructureResult(
+  bytes: Uint8Array,
+  containerHint?: string,
+): ReaderResult<ReadStructure> {
+  const evidence = readerEvidence('structure', bytes, containerHint);
+  try {
+    if (!bytes || bytes.length < 8) {
+      return { state: 'INCOMPLETE', reasonCode: 'READER_INPUT_INCOMPLETE', evidence };
+    }
+    const format = resolveReaderFormat(bytes, containerHint);
+    if (!format) {
+      return { state: 'UNSUPPORTED_FORMAT', reasonCode: 'READER_FORMAT_UNSUPPORTED', evidence };
+    }
+    evidence.detectedFormat = format;
+    const value = format === 'mp4' ? readMp4Structure(bytes) : readWebmStructure(bytes);
+    if (value) return { state: 'OK', value, evidence };
+    if (format === 'mp4' && isoTopLevelIsTruncated(bytes)) {
+      return { state: 'INCOMPLETE', reasonCode: 'READER_ISOBMFF_INCOMPLETE', evidence };
+    }
+    return {
+      state: 'MALFORMED',
+      reasonCode: format === 'mp4' ? 'READER_ISOBMFF_MALFORMED' : 'READER_EBML_MALFORMED',
+      evidence,
+    };
+  } catch {
+    return { state: 'MALFORMED', reasonCode: 'READER_INTERNAL_PARSE_GUARD', evidence };
+  }
+}
+
+/** Typed packet-reader boundary used by correctness oracles. Never throws or emits partial tables. */
+export function readOutputPacketsResult(
+  bytes: Uint8Array,
+  containerHint?: string,
+): ReaderResult<PacketRow[]> {
+  const evidence = readerEvidence('packets', bytes, containerHint);
+  try {
+    if (!bytes || bytes.length < 8) {
+      return { state: 'INCOMPLETE', reasonCode: 'READER_INPUT_INCOMPLETE', evidence };
+    }
+    const format = resolveReaderFormat(bytes, containerHint);
+    if (!format) {
+      return { state: 'UNSUPPORTED_FORMAT', reasonCode: 'READER_FORMAT_UNSUPPORTED', evidence };
+    }
+    evidence.detectedFormat = format;
+    const diagnostic: PacketReaderDiagnostic = {};
+    const value = format === 'mp4' ? readMp4Packets(bytes) : readWebmPackets(bytes, diagnostic);
+    if (value) return { state: 'OK', value, evidence };
+
+    const structure = format === 'mp4' ? readMp4Structure(bytes) : readWebmStructure(bytes);
+    if (format === 'mp4' && isoTopLevelIsTruncated(bytes)) {
+      return { state: 'INCOMPLETE', reasonCode: 'READER_ISOBMFF_INCOMPLETE', evidence };
+    }
+    if (!structure) {
+      return {
+        state: 'MALFORMED',
+        reasonCode: format === 'mp4' ? 'READER_ISOBMFF_MALFORMED' : 'READER_EBML_MALFORMED',
+        evidence,
+      };
+    }
+
+    if (format === 'webm' && diagnostic.failure) {
+      if (diagnostic.failure.marker) evidence.markers = [diagnostic.failure.marker];
+      return {
+        state: diagnostic.failure.state,
+        reasonCode: diagnostic.failure.reasonCode,
+        evidence,
+      };
+    }
+
+    if (format === 'mp4' && (containsAscii(bytes, 'moof') || containsAscii(bytes, 'mvex'))) {
+      evidence.markers = ['fragmented-isobmff'];
+      return {
+        state: 'UNSUPPORTED_STRUCTURE',
+        reasonCode: 'READER_ISOBMFF_FRAGMENTED_UNIMPLEMENTED',
+        evidence,
+      };
+    }
+    return {
+      state: 'UNSUPPORTED_STRUCTURE',
+      reasonCode:
+        format === 'webm'
+          ? 'READER_WEBM_PACKET_STRUCTURE_UNIMPLEMENTED'
+          : 'READER_ISOBMFF_SAMPLE_STRUCTURE_UNIMPLEMENTED',
+      evidence,
+    };
+  } catch {
+    return { state: 'MALFORMED', reasonCode: 'READER_INTERNAL_PARSE_GUARD', evidence };
+  }
+}
+
+function readerEvidence(
+  reader: ReaderEvidence['reader'],
+  bytes: Uint8Array,
+  containerHint: string | undefined,
+): ReaderEvidence {
+  return {
+    reader,
+    byteLength: bytes?.byteLength ?? 0,
+    ...(containerHint ? { containerHint } : {}),
+  };
+}
+
+function resolveReaderFormat(bytes: Uint8Array, containerHint: string | undefined): 'mp4' | 'webm' | undefined {
+  if (containerHint) {
+    const hint = containerHint.toLowerCase();
+    if (/webm|mkv|matroska/.test(hint)) return 'webm';
+    if (/mp4|mov|m4a|m4v|m4b|quicktime|\bqt\b|isom|iso-?bmff|3gp|mpeg-?4/.test(hint)) return 'mp4';
+  }
+  if (looksEbml(bytes)) return 'webm';
+  if (looksIsoBmff(bytes)) return 'mp4';
+  return undefined;
+}
+
+function isoTopLevelIsTruncated(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 8 || !looksIsoBmff(bytes)) return false;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const declared = u32(dv, 0);
+  if (declared === 1) return bytes.byteLength < 16 || u64(dv, 8) > bytes.byteLength;
+  return declared > bytes.byteLength;
+}
+
+function containsAscii(bytes: Uint8Array, value: string): boolean {
+  if (!value || bytes.byteLength < value.length) return false;
+  const codes = [...value].map((char) => char.charCodeAt(0));
+  for (let i = 0; i <= bytes.byteLength - codes.length; i++) {
+    let match = true;
+    for (let j = 0; j < codes.length; j++) {
+      if (bytes[i + j] !== codes[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
 }

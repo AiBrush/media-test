@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aibrush.dev/schemas/media-test/fixture-manifest-v1.schema.json",
+  "title": "media-test fixture corpus manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "suiteCorpusVersion", "assets"],
+  "properties": {
+    "$schema": { "const": "./schemas/fixture-manifest-v1.schema.json" },
+    "suiteCorpusVersion": { "type": "string", "minLength": 1 },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "family", "container", "codecs", "source", "sizeBucket", "genMethod", "sha256", "sizeBytes"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$" },
+          "family": { "type": "string", "minLength": 1 },
+          "container": { "type": "string", "minLength": 1 },
+          "codecs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "source": { "enum": ["generated", "fetched", "provided", "captured"] },
+          "sizeBucket": { "type": "string", "minLength": 1 },
+          "genMethod": { "type": "string", "minLength": 1 },
+          "sha256": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{64}$" }, { "type": "null" }] },
+          "sizeBytes": { "anyOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+          "notes": { "type": "string" },
+          "sourceUrl": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "acquire": { "type": "string" },
+          "declaredExtension": { "type": "string" },
+          "expectedSizeBytes": { "type": "integer", "minimum": 0 }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "sha256": { "type": "null" } } },
+            "then": { "properties": { "sizeBytes": { "type": "null" } } }
+          },
+          {
+            "if": { "properties": { "sha256": { "type": "string" } } },
+            "then": { "properties": { "sizeBytes": { "type": "integer" } } }
+          }
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

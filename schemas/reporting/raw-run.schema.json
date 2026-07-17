@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aibrush.dev/schemas/media-test/raw-run/1.0.0",
+  "title": "media-test raw run artifact",
+  "type": "object",
+  "required": ["schemaId", "schemaVersion", "runId", "suiteVersion", "generatedAtIso", "results"],
+  "properties": {
+    "schemaId": { "const": "https://aibrush.dev/schemas/media-test/raw-run/1.0.0" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+(?:[-+].*)?$" },
+    "runId": { "type": "string", "minLength": 1 },
+    "suiteVersion": { "type": "string", "minLength": 1 },
+    "generatedAtIso": { "type": "string", "format": "date-time" },
+    "scenarioDefinitionHashes": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "expected": { "$ref": "#/$defs/expectedMatrix" },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scenarioResult" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "expectedMatrix": {
+      "type": "object",
+      "required": ["definitionId", "cells"],
+      "properties": {
+        "definitionId": { "type": "string", "minLength": 1 },
+        "cells": { "type": "array", "items": { "$ref": "#/$defs/expectedCell" } }
+      },
+      "additionalProperties": true
+    },
+    "expectedCell": {
+      "type": "object",
+      "required": ["engineId", "browser", "scenarioId", "family", "variants"],
+      "properties": {
+        "engineId": { "type": "string", "minLength": 1 },
+        "browser": { "type": "string", "minLength": 1 },
+        "scenarioId": { "type": "string", "minLength": 1 },
+        "family": { "type": "string", "minLength": 1 },
+        "variants": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["variantId", "file"],
+            "properties": {
+              "variantId": { "type": "string", "minLength": 1 },
+              "file": { "type": "string", "minLength": 1 },
+              "sha256": { "type": "string" },
+              "isBaked": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "scenarioResult": {
+      "type": "object",
+      "required": ["engineId", "browser", "scenarioId", "family", "status", "oracleOutcomes"],
+      "properties": {
+        "engineId": { "type": "string", "minLength": 1 },
+        "browser": { "type": "string", "minLength": 1 },
+        "scenarioId": { "type": "string", "minLength": 1 },
+        "family": { "type": "string", "minLength": 1 },
+        "status": {
+          "enum": ["PASS", "DIFF", "FAIL", "NA_ENGINE", "NA_BROWSER", "NA_ASSET", "ERROR", "SKIPPED"]
+        },
+        "oracleOutcomes": { "type": "array" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

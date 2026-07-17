@@ -5,8 +5,9 @@
  * sweep; this adds one with an explicit `primaryMetric` so the §9 leaderboard ranks engines by it.
  *
  * primaryMetric = 'throughputRealtime' (decrypt wall vs media duration, higher-is-better), matching
- * how the remux/mux size-ladder perf cells express throughput. The runner derives the realtime factor
- * from golden meta durationSec (cenc_ctr.mp4.meta.json: 5.021s) ÷ measured wall.
+ * how the remux/mux size-ladder perf cells express throughput. The numerator belongs to the exact
+ * selected source: catalog duration for DERIVED inputs, baked golden duration for the baked row, or
+ * a neutral probe when explicitly available.
  *
  * CORRECTNESS GATES THE NUMBER (§0.1): the case carries `decrypt-bitexact`, so the runner benches ONLY
  * after the decrypt PASSes frame-exact vs the offline cleartext golden. A fast-but-wrong decrypt
@@ -24,7 +25,12 @@ const decryptThroughput: Scenario = defineScenario({
   id: 'encryption/perf_cenc_ctr_decrypt_throughput',
   op: 'decrypt',
   input: 'cenc_ctr.mp4',
-  options: { scheme: 'cenc-ctr', key: decryptKeyFor('cenc_ctr'), cleartextAsset: 'cenc_ctr_clear.mp4' },
+  options: {
+    scheme: 'cenc-ctr',
+    key: decryptKeyFor('cenc_ctr', { use: 'authoritative-positive' }),
+    cleartextAsset: 'cenc_ctr_clear.mp4',
+    invariant: 'decrypt-throughput-selected-duration',
+  },
   requires: {
     operations: ['decrypt'],
     containersIn: ['mp4'],
@@ -40,7 +46,8 @@ const decryptThroughput: Scenario = defineScenario({
   timeoutMs: PERF_TIMEOUT_MS,
   notes:
     'HEADLINE TIMED DECRYPT (§A.14/§8.2): CENC AES-CTR decrypt throughput. primaryMetric=' +
-    'throughputRealtime (decrypt wall vs 5.021s media duration, higher-is-better); ranked per §9. ' +
+    'throughputRealtime (exact selected-source duration divided by decrypt wall, higher-is-better); ' +
+    'ranked only when every requested measured iteration yields a finite positive sample. ' +
     'Correctness (decrypt-bitexact vs offline cleartext golden) gates the bench — no green oracle, ' +
     'no admissible number. Requires feature webcrypto:cenc-ctr-clear-output so an engine must first ' +
     'declare clear-sample export for CENC-CTR before this performance cell can run.',

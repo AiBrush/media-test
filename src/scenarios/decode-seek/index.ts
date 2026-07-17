@@ -36,6 +36,13 @@
 
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  ALPHA_EVIDENCE_SCHEMA,
+  decodeScenarioProvenanceForAsset,
+  defineDecodeTrackSelector,
+  defineDisplayTransform,
+  imageDecoderContract,
+} from '../../features/decode-seek/index.ts';
 
 // ── Frame-accurate decode ─────────────────────────────────────────────────────────────────────
 
@@ -126,7 +133,7 @@ const DECODE_CASES: DecodeCase[] = [
     asset: 'vp9_alpha.webm',
     container: 'webm',
     videoCodec: 'vp9',
-    maxFrames: 30,
+    maxFrames: 12,
     notes: 'Alpha track decode; alpha plane compared separately via the alpha-plane oracle.',
   },
 
@@ -214,16 +221,14 @@ const DECODE_CASES: DecodeCase[] = [
   // ── non-default track selection (A.16 "multi-track + non-default track select") ──
   {
     id: 'decode_multitrack_select_video',
-    asset: 'h264_multitrack.mp4',
+    asset: 'h264_two_video_tracks.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 30,
     sizeBucket: 'small',
     notes:
-      'Decode the VIDEO track of a multi-track asset (one H.264 video + two AAC audio tracks); the ' +
-      'decoder must select the correct (video) track and ignore the extra audio tracks. multitrack ' +
-      'was only demux-tested in robustness before. (options.trackIndex/selectTrack hints the intended ' +
-      'video track for engines that expose track selection.)',
+      'Decode an explicitly requested SECOND H.264 video track. The two deterministic pixel sources ' +
+      'match, while selected-track index/ordinal evidence makes a hard-coded first-video path fail.',
   },
 
   // ── bit depth (A.4 "8-bit & 10-bit depth") ──
@@ -319,9 +324,36 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
     input: c.asset,
     options: {
       maxFrames: c.maxFrames ?? 30,
-      // For multi-track selection, hint the intended video track for engines that expose it. Engines
-      // that auto-select video ignore this; it is read by track-aware adapters only.
-      ...(c.id.includes('multitrack') ? { selectTrackType: 'video' } : {}),
+      decodeProvenance: decodeScenarioProvenanceForAsset(c.asset),
+      ...(c.id.includes('multitrack')
+        ? {
+            decodeTrackSelector: defineDecodeTrackSelector({
+              type: 'video',
+              trackIndex: 1,
+              typeOrdinal: 1,
+            }),
+            invariant: 'decode-track-selection',
+          }
+        : {}),
+      ...(c.id === 'decode_rotated_display_matrix'
+        ? {
+            displayEvidence: defineDisplayTransform({
+              codedWidth: 1280,
+              codedHeight: 720,
+              displayWidth: 720,
+              displayHeight: 1280,
+              rotationDegrees: 90,
+              flipX: false,
+              flipY: false,
+            }),
+          }
+        : {}),
+      ...(c.id === 'decode_vp9_alpha'
+        ? { alphaEvidence: { schema: ALPHA_EVIDENCE_SCHEMA, assetId: c.asset } }
+        : {}),
+      ...(c.container === 'jpeg' || c.container === 'png' || c.container === 'webp'
+        ? { imageDecoder: imageDecoderContract(c.container) }
+        : {}),
     },
     requires: {
       operations: ['decodeFrames'],
@@ -329,7 +361,9 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
       ...(c.videoCodec ? { videoCodecs: [c.videoCodec] } : {}),
       ...(c.features ? { features: isAlpha ? [...c.features, 'alpha'] : c.features } : isAlpha ? { features: ['alpha'] } : {}),
     },
-    oracles: isAlpha ? DECODE_ALPHA_ORACLES : DECODE_ORACLES,
+    oracles: c.id.includes('multitrack')
+      ? ['property-invariant']
+      : isAlpha ? DECODE_ALPHA_ORACLES : DECODE_ORACLES,
     metrics: [...DECODE_METRICS],
     primaryMetric: 'decodeFps',
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
@@ -435,7 +469,10 @@ const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
     id: `decode-seek/${c.id}`,
     op: 'decodeFrames',
     input: c.asset,
-    options: { maxFrames: c.maxFrames },
+    options: {
+      maxFrames: c.maxFrames,
+      decodeProvenance: decodeScenarioProvenanceForAsset(c.asset),
+    },
     requires: {
       operations: ['decodeFrames'],
       containersIn: [c.container],

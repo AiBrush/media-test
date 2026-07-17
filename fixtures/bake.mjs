@@ -48,6 +48,38 @@ import {
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import {
+  DEFAULT_FRAME_READ_COUNT,
+  buildGoldenPacketProbeArgs,
+  buildGoldenSemanticDecodeArgs,
+  buildFramePlaceholder,
+  canonicalSha256,
+  goldenInputOptions,
+  normalizeGoldenPacketEvidence,
+  normalizeProbeMetadata,
+  parseMappedFrameMd5,
+} from './lib/golden-normalization.mjs';
+import {
+  collectToolPerimeter,
+  createGoldenEnvelope,
+  createGoldenProvenance,
+  deterministicFixtureBytes,
+  validateFixtureManifest,
+} from './lib/golden-contract.mjs';
+import {
+  activeArtifactsForMerge,
+  activeAvailabilityForMerge,
+  assessMediaReuse,
+  publishGeneration,
+  readActiveGenerationIndex,
+  resolveExplicitAssetUpdateScope,
+  stageReadyPublicationRecord,
+  stageUnavailablePublicationRecord,
+} from './lib/generation-publication.mjs';
+import {
+  HLS_RESOURCE_FIXTURE_IDS,
+  validatePinnedHlsResourceClosure,
+} from './lib/hls-resource-fixtures.mjs';
 
 // ── Paths ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -56,6 +88,13 @@ const FIXTURES_DIR = __dirname;
 const MEDIA_DIR = join(FIXTURES_DIR, 'media');
 const GOLDEN_DIR = join(FIXTURES_DIR, 'golden');
 const MANIFEST_PATH = join(FIXTURES_DIR, 'manifest.json');
+const FIXTURE_SEED_PATH = join(FIXTURES_DIR, 'fixture-seed.json');
+const TOOLCHAIN_LOCK_PATH = join(FIXTURES_DIR, 'toolchain.lock.json');
+const FIXTURE_SEED = JSON.parse(readFileSync(FIXTURE_SEED_PATH, 'utf8')).seedHex;
+const TOOLCHAIN_LOCK = JSON.parse(readFileSync(TOOLCHAIN_LOCK_PATH, 'utf8'));
+const FIXTURE_SOURCE_DATE_EPOCH = process.env.SOURCE_DATE_EPOCH ?? TOOLCHAIN_LOCK.sourceDateEpoch;
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE_BIN = process.env.FFPROBE_PATH || 'ffprobe';
 
 // ── Determinism knobs ────────────────────────────────────────────────────────────────────────
 
@@ -78,9 +117,11 @@ const flags = {
   goldenOnly: false,
   mediaOnly: false,
   skipLongform: false,
+  update: false,
   subset: /** @type {string[] | null} */ (null),
 };
 const subsetTerms = [];
+let explicitUpdateScope;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--force') flags.force = true;
@@ -88,6 +129,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--golden-only') flags.goldenOnly = true;
   else if (a === '--media-only') flags.mediaOnly = true;
   else if (a === '--skip-longform') flags.skipLongform = true;
+  else if (a === '--update') flags.update = true;
   else if (a === '--subset') {
     const next = argv[++i] ?? '';
     for (const t of next.split(',')) if (t.trim()) subsetTerms.push(t.trim());
@@ -109,7 +151,8 @@ function printHelpAndExit(code = 0) {
       'fixtures/bake.mjs — offline media + golden bake (binaries allowed here ONLY)',
       '',
       'bun fixtures/bake.mjs [--subset a,b | <id> <id> ...] [--force] [--golden-only]',
-      '                      [--media-only] [--skip-longform] [--quiet]',
+      '                      [--media-only] [--skip-longform] [--update] [--quiet]',
+      '  --update explicitly replaces a mismatched source identity and invalidates dependent evidence',
     ].join('\n'),
   );
   process.exit(code);
@@ -130,8 +173,8 @@ function toolExists(bin) {
 }
 
 const TOOLS = {
-  ffmpeg: toolExists('ffmpeg'),
-  ffprobe: toolExists('ffprobe'),
+  ffmpeg: toolExists(FFMPEG_BIN),
+  ffprobe: toolExists(FFPROBE_BIN),
   metaflac: toolExists('metaflac'),
   mp4encrypt: toolExists('mp4encrypt'), // Bento4
   packager: toolExists('packager') || toolExists('shaka-packager'), // shaka
@@ -144,12 +187,22 @@ if (!TOOLS.ffmpeg || !TOOLS.ffprobe) {
   );
   process.exit(2);
 }
+const TOOL_PERIMETER = collectToolPerimeter();
+TOOL_PERIMETER.declaredLock = {
+  sha256: sha256File(TOOLCHAIN_LOCK_PATH),
+  sourceDateEpoch: TOOLCHAIN_LOCK.sourceDateEpoch,
+  locale: TOOLCHAIN_LOCK.locale,
+  timezone: TOOLCHAIN_LOCK.timezone,
+  required: TOOLCHAIN_LOCK.required,
+  optional: TOOLCHAIN_LOCK.optional,
+};
+TOOL_PERIMETER.environment.SOURCE_DATE_EPOCH = String(FIXTURE_SOURCE_DATE_EPOCH);
 
 function ffmpeg(args, label) {
   // -y overwrite, -nostdin so a background run never blocks on a prompt, -loglevel error to keep
   // the bake quiet unless something breaks.
   const full = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', ...args];
-  const res = spawnSync('ffmpeg', full, { encoding: 'utf8', maxBuffer: 1 << 28 });
+  const res = spawnSync(FFMPEG_BIN, full, { encoding: 'utf8', maxBuffer: 1 << 28 });
   if (res.status !== 0) {
     throw new Error(`ffmpeg failed for ${label}: ${res.stderr || res.error?.message || `exit ${res.status}`}`);
   }
@@ -157,7 +210,7 @@ function ffmpeg(args, label) {
 
 function ffprobeJson(args, label) {
   const full = ['-hide_banner', '-loglevel', 'error', '-of', 'json', ...args];
-  const res = spawnSync('ffprobe', full, { encoding: 'utf8', maxBuffer: 1 << 28 });
+  const res = spawnSync(FFPROBE_BIN, full, { encoding: 'utf8', maxBuffer: 1 << 28 });
   if (res.status !== 0) {
     throw new Error(`ffprobe failed for ${label}: ${res.stderr || res.error?.message || `exit ${res.status}`}`);
   }
@@ -316,6 +369,21 @@ function corruptWavFmtFixture() {
   };
 }
 
+let curatedHlsFixturesReady = false;
+function ensureCuratedHlsFixtures() {
+  if (curatedHlsFixturesReady) return;
+  const result = spawnSync(process.execPath, [join(FIXTURES_DIR, 'curate-hls-resource-indices.mjs')], {
+    encoding: 'utf8',
+    maxBuffer: 1 << 24,
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      `HLS resource fixture curation failed: ${result.stderr || result.stdout || result.error?.message || `exit ${result.status}`}`,
+    );
+  }
+  curatedHlsFixturesReady = true;
+}
+
 /** @type {Record<string, (out: string) => ('ok' | { skipped: true, reason: string, extra?: any })>} */
 const RECIPES = {
   // ── Video MP4 / MOV ──────────────────────────────────────────────────────────────────────
@@ -434,21 +502,35 @@ const RECIPES = {
     return 'ok';
   },
   'h264_rotated90.mp4': (out) => {
-    ffmpeg(
-      [
-        '-f', 'lavfi', '-i', TESTSRC(1280, 720, 30, 10),
-        '-f', 'lavfi', '-i', SINE(440, 10),
-        ...BITEXACT, ...NOMETA,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-g', '60', '-keyint_min', '60',
-        '-x264-params', 'scenecut=0:bframes=0',
-        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
-        '-metadata:s:v:0', 'rotate=90', // display-matrix rotation
-        '-movflags', '+faststart',
-        out,
-      ],
-      'h264_rotated90.mp4',
-    );
-    return 'ok';
+    // The pinned FFmpeg build writes the ISO-BMFF display matrix while stream-copying an authored
+    // track; setting rotate on the initial encoder invocation is silently discarded.
+    const tmp = mkdtempBake();
+    try {
+      const plain = join(tmp, 'plain.mp4');
+      ffmpeg(
+        [
+          '-f', 'lavfi', '-i', TESTSRC(1280, 720, 30, 10),
+          '-f', 'lavfi', '-i', SINE(440, 10),
+          ...BITEXACT, ...NOMETA,
+          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-g', '60', '-keyint_min', '60',
+          '-x264-params', 'scenecut=0:bframes=0',
+          '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+          '-movflags', '+faststart', plain,
+        ],
+        'h264_rotated90.mp4 encode',
+      );
+      ffmpeg(
+        [
+          '-display_rotation:v:0', '90', '-i', plain, ...NOMETA,
+          '-map', '0', '-c', 'copy',
+          '-movflags', '+faststart', out,
+        ],
+        'h264_rotated90.mp4 display matrix',
+      );
+      return 'ok';
+    } finally {
+      rmSafe(tmp);
+    }
   },
   'h264_multitrack.mp4': (out) => {
     ffmpeg(
@@ -465,6 +547,22 @@ const RECIPES = {
         out,
       ],
       'h264_multitrack.mp4',
+    );
+    return 'ok';
+  },
+  'h264_two_video_tracks.mp4': (out) => {
+    ffmpeg(
+      [
+        '-f', 'lavfi', '-i', TESTSRC(1280, 720, 30, 10),
+        '-f', 'lavfi', '-i', SINE(440, 10),
+        ...BITEXACT, ...NOMETA,
+        '-map', '0:v', '-map', '0:v', '-map', '1:a',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-g', '60', '-keyint_min', '60',
+        '-x264-params', 'scenecut=0:bframes=0',
+        '-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-movflags', '+faststart', out,
+      ],
+      'h264_two_video_tracks.mp4',
     );
     return 'ok';
   },
@@ -684,8 +782,8 @@ const RECIPES = {
     const base = out.replace(/\.m3u8$/, '');
     const tmp = mkdtempBake();
     try {
-      const keyBytes = randomBytes16();
-      const ivBytes = randomBytes16();
+      const keyBytes = randomBytes16('hls_aes128:key');
+      const ivBytes = randomBytes16('hls_aes128:iv');
       const keyFile = join(MEDIA_DIR, 'hls_aes128.key'); // served alongside the playlist
       writeFileSync(keyFile, keyBytes);
       // key_info_file: line1 = key URI (as referenced in the playlist), line2 = key file path on
@@ -732,6 +830,26 @@ const RECIPES = {
       ],
       'hls_aes128_clear.mp4',
     );
+    return 'ok';
+  },
+  'hls_sample_aes.m3u8': () => {
+    ensureCuratedHlsFixtures();
+    return 'ok';
+  },
+  'hls_aes128_seq0.m3u8': () => {
+    ensureCuratedHlsFixtures();
+    return 'ok';
+  },
+  'hls_aes128_seq42.m3u8': () => {
+    ensureCuratedHlsFixtures();
+    return 'ok';
+  },
+  'hls_aes128_rotation.m3u8': () => {
+    ensureCuratedHlsFixtures();
+    return 'ok';
+  },
+  'hls_aes128_method_none.m3u8': () => {
+    ensureCuratedHlsFixtures();
     return 'ok';
   },
 
@@ -806,17 +924,18 @@ const RECIPES = {
       );
       const keyHex = '0123456789abcdef0123456789abcdef';
       const kidHex = 'abcdef00112233445566778899aabbcc';
+      const cbcs = buildBento4CbcsEncryptionArgs({
+        keyHex,
+        kidHex,
+        seedHex: FIXTURE_SEED,
+        plainPath: plain,
+        outputPath: out,
+      });
       if (TOOLS.mp4encrypt) {
         // Bento4 cbcs pattern (1:9 crypt:skip is the common AVC cbcs pattern).
         const res = spawnSync(
           'mp4encrypt',
-          [
-            '--method', 'MPEG-CBCS',
-            '--key', `1:${keyHex}:random`,
-            '--property', `1:KID:${kidHex}`,
-            plain,
-            out,
-          ],
+          cbcs.args,
           { encoding: 'utf8' },
         );
         if (res.status !== 0) throw new Error(res.stderr || `mp4encrypt exit ${res.status}`);
@@ -828,13 +947,13 @@ const RECIPES = {
             `input=${plain},stream=video,output=${out}`,
             '--enable_raw_key_encryption',
             '--protection_scheme', 'cbcs',
-            '--keys', `label=:key_id=${kidHex}:key=${keyHex}`,
+            '--keys', `label=:key_id=${kidHex}:key=${keyHex}:iv=${cbcs.ivHex}`,
           ],
           { encoding: 'utf8' },
         );
         if (res.status !== 0) throw new Error(res.stderr || `packager exit ${res.status}`);
       }
-      ENC_SECRETS['cenc_cbcs.mp4'] = { keyHex, kid: kidHex, scheme: 'cenc-cbcs' };
+      ENC_SECRETS['cenc_cbcs.mp4'] = { keyHex, kid: kidHex, ivHex: cbcs.ivHex, scheme: 'cenc-cbcs' };
       return 'ok';
     } catch (e) {
       return { skipped: true, reason: `cbcs encryption failed: ${String(e?.message || e)}` };
@@ -1490,14 +1609,33 @@ let NOSEEKTABLE_CAVEAT = false;
 function toHex(buf) {
   return Buffer.from(buf).toString('hex');
 }
-function randomBytes16() {
-  const b = Buffer.alloc(16);
-  // Deterministic-ish but unique per run is fine for fixtures; use crypto for real randomness.
-  return Buffer.from(globalThis.crypto?.getRandomValues?.(new Uint8Array(16)) ?? cryptoRandom16(b));
+function randomBytes16(label) {
+  return deterministicFixtureBytes(FIXTURE_SEED, label, 16);
 }
-function cryptoRandom16() {
-  // node:crypto fallback
-  return new Uint8Array(createHash('sha256').update(String(Date.now() + Math.random())).digest().subarray(0, 16));
+
+export const BENTO4_CBCS_IV_LABEL = 'cenc_cbcs.mp4:bento4:track-1:iv';
+
+/** Build the exact Bento4 CBCS arguments with seed-derived IV material and unchanged key/KID. */
+export function buildBento4CbcsEncryptionArgs({
+  keyHex,
+  kidHex,
+  seedHex,
+  plainPath,
+  outputPath,
+}) {
+  if (!/^[0-9a-f]{32}$/i.test(keyHex)) throw new TypeError('CBCS key must be 16-byte hex');
+  if (!/^[0-9a-f]{32}$/i.test(kidHex)) throw new TypeError('CBCS KID must be 16-byte hex');
+  const ivHex = deterministicFixtureBytes(seedHex, BENTO4_CBCS_IV_LABEL, 16).toString('hex');
+  return {
+    ivHex,
+    args: [
+      '--method', 'MPEG-CBCS',
+      '--key', `1:${keyHex.toLowerCase()}:${ivHex}`,
+      '--property', `1:KID:${kidHex.toLowerCase()}`,
+      plainPath,
+      outputPath,
+    ],
+  };
 }
 function mkdtempBake() {
   const d = join(tmpdir(), `bake-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
@@ -1586,75 +1724,6 @@ document.getElementById('rec').onclick = async () => {
 
 // ── Golden derivation (ffprobe → NormalizedMetadata + PacketInfo[]) ──────────────────────────────
 
-/** Map an ffprobe codec_name to our canonical token vocabulary (engine.ts CANONICAL_*). */
-function canonicalCodec(name) {
-  const n = (name || '').toLowerCase();
-  const map = {
-    h264: 'h264',
-    hevc: 'hevc',
-    h265: 'hevc',
-    vp8: 'vp8',
-    vp9: 'vp9',
-    av1: 'av1',
-    aac: 'aac',
-    opus: 'opus',
-    mp3: 'mp3',
-    flac: 'flac',
-    vorbis: 'vorbis',
-    pcm_s16le: 'pcm-s16',
-    pcm_s24le: 'pcm-s24',
-    pcm_f32le: 'pcm-f32',
-    pcm_s16be: 'pcm-s16be',
-    pcm_s24be: 'pcm-s24be',
-    mjpeg: 'mjpeg',
-    png: 'png',
-    webp: 'webp',
-  };
-  return map[n] ?? n;
-}
-
-function canonicalContainer(formatName, assetId) {
-  // ffprobe format_name is a comma list ("mov,mp4,m4a,3gp,..."). Prefer the asset's known suffix.
-  const lower = assetId.toLowerCase();
-  // Deliberately-mislabeled asset (§A.16): its .webm extension LIES — the bytes are really MP4/ISOBMFF.
-  // Report the TRUE container so golden meta stays honest (the suffix heuristic below must not win).
-  if (lower === 'mislabeled_h264.webm') return 'mp4';
-  if (lower.endsWith('.mov')) return 'mov';
-  if (lower.endsWith('.mp4') || lower.endsWith('.m4a') || lower.endsWith('.m4v')) return 'mp4';
-  if (lower.endsWith('.mkv')) return 'mkv';
-  if (lower.endsWith('.webm')) return 'webm';
-  if (lower.endsWith('.ts')) return 'ts';
-  if (lower.endsWith('.m3u8')) return 'hls';
-  if (lower.endsWith('.wav')) return 'wav';
-  if (lower.endsWith('.aiff') || lower.endsWith('.aif')) return 'aiff';
-  if (lower.endsWith('.mp3')) return 'mp3';
-  if (lower.endsWith('.flac')) return 'flac';
-  if (lower.endsWith('.ogg') || lower.endsWith('.opus')) return 'ogg';
-  if (lower.endsWith('.aac')) return 'adts';
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'jpeg';
-  if (lower.endsWith('.png')) return 'png';
-  if (lower.endsWith('.webp')) return 'webp';
-  return (formatName || '').split(',')[0] || 'unknown';
-}
-
-function parseFps(stream) {
-  const r = stream.avg_frame_rate && stream.avg_frame_rate !== '0/0' ? stream.avg_frame_rate : stream.r_frame_rate;
-  if (!r || r === '0/0') return undefined;
-  const [num, den] = r.split('/').map(Number);
-  if (!den) return undefined;
-  const fps = num / den;
-  return Number.isFinite(fps) ? Math.round(fps * 1000) / 1000 : undefined;
-}
-
-function rotationOf(stream) {
-  // Rotation may live in side_data_list (Display Matrix) or tags.rotate.
-  const sd = (stream.side_data_list || []).find((s) => typeof s.rotation === 'number');
-  if (sd) return ((Math.round(sd.rotation) % 360) + 360) % 360;
-  const tagRot = stream.tags?.rotate;
-  if (tagRot != null) return ((parseInt(tagRot, 10) % 360) + 360) % 360;
-  return undefined;
-}
-
 /**
  * Per-asset ffprobe/ffmpeg *input* options for the golden derivation. HLS playlists that reference
  * a sibling AES-128 key file need `-allowed_extensions ALL` (the .key extension is blocked for
@@ -1662,72 +1731,64 @@ function rotationOf(stream) {
  * the encrypted segments. Returned args must precede the input path (they are *input* demux options).
  */
 function goldenInputOpts(assetId) {
-  if (assetId.toLowerCase().endsWith('.m3u8')) {
-    return ['-allowed_extensions', 'ALL', '-protocol_whitelist', 'file,crypto,data,http,https,tcp,tls'];
-  }
-  return [];
+  return goldenInputOptions(assetId);
 }
 
 /** Build NormalizedMetadata (engine.ts) from ffprobe -show_format -show_streams JSON. */
+export function normalizeFlatProbeForGolden(probe, frameProbe, assetId = 'fixture.bin') {
+  return normalizeProbeMetadata(probe, { assetId, frameProbe });
+}
+
+export function flatFramePlaceholderForGolden(assetId, sourceMedia, frameProbe) {
+  return buildFramePlaceholder(assetId, sourceMedia, frameProbe);
+}
+
 function normalizedMetadataFor(assetId, mediaPath) {
   const inOpts = goldenInputOpts(assetId);
   const probe = ffprobeJson([...inOpts, '-show_format', '-show_streams', mediaPath], `${assetId} meta`);
-  const fmt = probe.format || {};
-  const streams = probe.streams || [];
-
-  const tracks = streams.map((s) => {
-    const type =
-      s.codec_type === 'video' ? 'video' : s.codec_type === 'audio' ? 'audio' : s.codec_type === 'subtitle' ? 'subtitle' : 'other';
-    /** @type {any} */
-    const track = { type, codec: canonicalCodec(s.codec_name) };
-    if (s.width) track.width = s.width;
-    if (s.height) track.height = s.height;
-    const fps = parseFps(s);
-    if (type === 'video' && fps !== undefined) track.fps = fps;
-    const rot = rotationOf(s);
-    if (rot !== undefined && rot !== 0) track.rotation = rot;
-    if (s.sample_rate) track.sampleRate = Number(s.sample_rate);
-    if (s.channels) track.channels = s.channels;
-    const br = s.bit_rate ? Number(s.bit_rate) : fmt.bit_rate ? Number(fmt.bit_rate) : null;
-    track.bitrate = Number.isFinite(br) ? br : null;
-    track.language = s.tags?.language ?? null;
-    return track;
-  });
-
-  const durRaw = fmt.duration != null ? Number(fmt.duration) : NaN;
-  const durationSec = Number.isFinite(durRaw) ? Math.round(durRaw * 1000) / 1000 : null;
-
-  /** @type {any} */
-  const meta = {
-    container: canonicalContainer(fmt.format_name, assetId),
-    durationSec,
-    tracks,
-  };
-  // Carry the handful of tags that the metadata scenarios read.
-  const tagKeys = ['title', 'artist', 'album', 'comment', 'encoder', 'major_brand'];
-  const tags = {};
-  for (const k of tagKeys) if (fmt.tags?.[k]) tags[k] = String(fmt.tags[k]);
-  if (Object.keys(tags).length) meta.tags = tags;
-  return meta;
+  const frameProbe = ffprobeJson(
+    [...inOpts, '-select_streams', 'v', '-show_frames', '-show_entries', 'frame=stream_index,pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${DEFAULT_FRAME_READ_COUNT}`, mediaPath],
+    `${assetId} cadence`,
+  );
+  return normalizeFlatProbeForGolden(probe, frameProbe, assetId);
 }
 
 /** Build PacketInfo[] (engine.ts) from ffprobe -show_packets JSON. Times normalized to integer µs. */
 function packetsFor(assetId, mediaPath) {
   const inOpts = goldenInputOpts(assetId);
-  const probe = ffprobeJson([...inOpts, '-show_packets', '-show_entries', 'packet=stream_index,size,pts_time,dts_time,flags', mediaPath], `${assetId} packets`);
-  const pkts = probe.packets || [];
-  return pkts.map((p) => {
-    const ptsUs = p.pts_time != null && p.pts_time !== 'N/A' ? Math.round(Number(p.pts_time) * 1e6) : 0;
-    const dtsUs = p.dts_time != null && p.dts_time !== 'N/A' ? Math.round(Number(p.dts_time) * 1e6) : ptsUs;
-    const keyframe = typeof p.flags === 'string' ? p.flags.includes('K') : false;
-    return {
-      trackIndex: Number(p.stream_index) || 0,
-      size: Number(p.size) || 0,
-      ptsUs,
-      dtsUs,
-      keyframe,
-    };
+  const probe = ffprobeJson(buildGoldenPacketProbeArgs(inOpts, mediaPath), `${assetId} packets`);
+  const decoded = decodedFrameHashes(assetId, mediaPath, inOpts, probe.streams ?? []);
+  return normalizeGoldenPacketEvidence(probe, {
+    assetId,
+    decodedUnits: decoded.units,
+    decoderObservation: decoded.observation,
   });
+}
+
+function decodedFrameHashes(assetId, mediaPath, inOpts, inputStreams) {
+  const result = spawnSync(
+    FFMPEG_BIN,
+    buildGoldenSemanticDecodeArgs(inOpts, mediaPath),
+    { encoding: 'utf8', maxBuffer: 1 << 28 },
+  );
+  if (result.status !== 0) {
+    if (assetId.endsWith('hls_sample_aes.m3u8')) {
+      // FFmpeg's HLS demuxer does not currently provide an independent SAMPLE-AES reference decode.
+      // Only classify that limitation after the strict runtime resource-index contract proves the
+      // playlist and every key/segment byte are the pinned fixture. Corrupt/missing bytes still throw.
+      validatePinnedHlsResourceClosure({ assetId, mediaPath, goldenDir: GOLDEN_DIR });
+      return {
+        units: [],
+        observation: {
+          state: 'reference-unavailable',
+          reasonCode: 'REFERENCE_DECODER_SAMPLE_AES_UNAVAILABLE',
+          detail: 'independent ffmpeg reference decode unavailable for source-bound SAMPLE-AES fixture',
+        },
+      };
+    }
+    throw new Error(`ffmpeg semantic decode failed for ${assetId}: ${result.stderr || result.error?.message || `exit ${result.status}`}`);
+  }
+  return { units: parseMappedFrameMd5(result.stdout, inputStreams), observation: { state: 'validated' } };
 }
 
 /**
@@ -1737,43 +1798,215 @@ function packetsFor(assetId, mediaPath) {
  * browser pass knows which presentation times to digest. This is a TODO hook, NOT a fake digest.
  */
 function frameHookFor(assetId, mediaPath, meta) {
-  const hasVideo = (meta.tracks || []).some((t) => t.type === 'video');
+  const hasVideo = (meta.metadata?.tracks || []).some((t) => t.type === 'video');
   if (!hasVideo) return null; // audio-only / image: no frame-digest golden
-  // Pull the first ~12 video frame PTS so the browser pass digests a deterministic, bounded set.
-  let ptsList = [];
+  let probe = { frames: [] };
   try {
     const inOpts = goldenInputOpts(assetId);
-    const probe = ffprobeJson(
-      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time,key_frame', '-read_intervals', '%+#12', mediaPath],
+    probe = ffprobeJson(
+      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=stream_index,pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${DEFAULT_FRAME_READ_COUNT}`, mediaPath],
       `${assetId} frames-hook`,
     );
-    ptsList = (probe.frames || [])
-      .filter((f) => f.pts_time != null && f.pts_time !== 'N/A')
-      .map((f) => ({ ptsUs: Math.round(Number(f.pts_time) * 1e6), keyframe: f.key_frame === 1 || f.key_frame === '1' }));
   } catch {
-    ptsList = [];
+    // Shared placeholder emits an explicit producer-failed record for this observation.
   }
-  return {
-    $todo:
-      'BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer ' +
-      '(src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. ' +
-      'Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each ' +
-      'listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is ' +
-      'a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.',
-    pending: true,
-    assetId,
-    /** the deterministic, bounded presentation times the browser pass must digest, in order */
-    frames: ptsList.map((p, index) => ({
-      index,
-      ptsUs: p.ptsUs,
-      keyframe: p.keyframe,
-      sha256: null, // <-- filled by the browser frame pass
-    })),
-  };
+  return flatFramePlaceholderForGolden(assetId, sourceIdentity(mediaPath), probe);
 }
 
 function writeJson(path, obj) {
   writeFileSync(path, JSON.stringify(obj, null, 2) + '\n');
+}
+
+function sourceIdentity(path) {
+  return { sha256: sha256File(path), sizeBytes: statSync(path).size };
+}
+
+function artifactEnvelope(artifactKind, assetId, mediaPath, payload, availability = { state: 'ready' }) {
+  const sourceMedia = sourceIdentity(mediaPath);
+  const provenance = createGoldenProvenance({
+    artifactKind,
+    assetId,
+    sourceMedia,
+    recipe: `fixtures/bake.mjs#${artifactKind}`,
+    normalizedArguments: {
+      assetId,
+      artifactKind,
+      sourceSha256: sourceMedia.sha256,
+      normalizationVersion: payload.schemaVersion ?? null,
+    },
+    baker: 'media-test/bake@1',
+    perimeter: TOOL_PERIMETER,
+    payload,
+    sourceDateEpoch: FIXTURE_SOURCE_DATE_EPOCH,
+    browserQualified: false,
+  });
+  let legacy;
+  if (artifactKind === 'metadata') {
+    legacy = { ...payload.metadata, metadata: payload.metadata, raw: payload.raw, canonical: payload.canonical };
+  } else if (artifactKind === 'packets') {
+    legacy = { packets: payload.packets, raw: payload.raw, semantic: payload.semantic, representation: payload.representation };
+  } else if (artifactKind === 'frames') {
+    legacy = {
+      $todo:
+        'BROWSER-PRODUCED GOLDEN. Real normalized RGBA pixels and timestamp identity are required; ' +
+        'run scripts/frame-bake.mjs. Until then frame evidence is pending and routes to NA_ASSET.',
+      pending: true,
+      pixelNormalizationVersion: payload.pixelNormalizationVersion,
+      evidenceState: payload.evidenceState,
+      ...(payload.producerFailure ? { producerFailure: payload.producerFailure } : {}),
+      frames: payload.frames,
+    };
+  } else {
+    legacy = { ...payload };
+  }
+  return createGoldenEnvelope({ artifactKind, assetId, sourceMedia, payload, legacy, provenance, availability });
+}
+
+const staged = new Map();
+const stagedAvailability = new Map();
+// Exact root assets represented by this invocation. HLS key/map/segment sidecars are deliberately
+// staged through stageRawArtifact, so they never become independent selected asset IDs.
+const stagedRootAssetIds = new Set();
+
+function stageEnvelope(relativeGoldenPath, document) {
+  stagedRootAssetIds.add(document.assetId);
+  const logicalPath = `golden/${relativeGoldenPath}`;
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    artifactKind: document.artifactKind,
+    bytes: `${JSON.stringify(document, null, 2)}\n`,
+    sourceMediaSha256: document.sourceMedia.sha256,
+    provenanceSha256: canonicalSha256(document.provenance),
+    directPath: join(FIXTURES_DIR, logicalPath),
+    document,
+  });
+}
+
+function stageMedia(assetId, path, sourceMedia, oldSha256) {
+  stagedRootAssetIds.add(assetId);
+  const logicalPath = `media/${assetId}`;
+  const provenance = {
+    schema: 'media-test/media-provenance@1', assetId, sourceMedia,
+    recipe: 'fixtures/bake.mjs#media', baker: 'media-test/bake@1', perimeter: TOOL_PERIMETER,
+  };
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    artifactKind: 'media',
+    sourcePath: path,
+    sourceMediaSha256: sourceMedia.sha256,
+    provenanceSha256: canonicalSha256(provenance),
+    audit: {
+      recipe: provenance.recipe,
+      bakerVersion: provenance.baker,
+      outputArtifactSha256: sourceMedia.sha256,
+    },
+  });
+  if (oldSha256 && oldSha256 !== sourceMedia.sha256) invalidateOldDependents(oldSha256);
+}
+
+function stageRawArtifact({ logicalPath, artifactKind, sourcePath, sourceMediaSha256, recipe }) {
+  const output = sourceIdentity(sourcePath);
+  const provenance = {
+    schema: 'media-test/indexed-artifact-provenance@1',
+    logicalPath,
+    artifactKind,
+    sourceMediaSha256,
+    output,
+    recipe,
+    baker: 'media-test/bake@1',
+    perimeter: TOOL_PERIMETER,
+  };
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    artifactKind,
+    sourcePath,
+    sourceMediaSha256,
+    provenanceSha256: canonicalSha256(provenance),
+    audit: {
+      recipe,
+      bakerVersion: provenance.baker,
+      outputArtifactSha256: output.sha256,
+    },
+  });
+}
+
+function stageAvailability(logicalPath, state, reasonCode, detail) {
+  if (logicalPath.startsWith('media/')) stagedRootAssetIds.add(logicalPath.slice('media/'.length));
+  stageUnavailablePublicationRecord(staged, stagedAvailability, { logicalPath, state, reasonCode, detail });
+}
+
+function invalidateOldDependents(oldSha256) {
+  const active = readActiveGenerationIndex(FIXTURES_DIR);
+  if (!active) return;
+  for (const entry of active.entries) {
+    if (entry.sourceMediaSha256 !== oldSha256 || entry.artifactKind === 'media') continue;
+    stageAvailability(
+      entry.logicalPath,
+      'pending',
+      'FIXTURE_SOURCE_UPDATED_REBAKE_REQUIRED',
+      'source media identity changed; old dependent evidence was invalidated',
+    );
+  }
+}
+
+function publishStaged(manifest) {
+  const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
+  const manifestSha256 = createHash('sha256').update(manifestBytes).digest('hex');
+  const manifestProvenance = {
+    schema: 'media-test/manifest-provenance@1', manifestSha256,
+    recipe: 'fixtures/bake.mjs#manifest', baker: 'media-test/bake@1', perimeter: TOOL_PERIMETER,
+  };
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath: 'manifest.json', artifactKind: 'manifest', bytes: manifestBytes,
+    sourceMediaSha256: manifestSha256,
+    provenanceSha256: canonicalSha256(manifestProvenance),
+    audit: {
+      recipe: manifestProvenance.recipe,
+      bakerVersion: manifestProvenance.baker,
+      outputArtifactSha256: manifestSha256,
+    },
+    directPath: MANIFEST_PATH, document: manifest,
+  });
+  const replacements = [...new Set([...staged.keys(), ...stagedAvailability.keys()])];
+  const additions = [...staged.values()].map(({ directPath: _directPath, document: _document, ...artifact }) => artifact);
+  const artifacts = [...activeArtifactsForMerge(FIXTURES_DIR, replacements), ...additions];
+  const availability = [...activeAvailabilityForMerge(FIXTURES_DIR, replacements), ...stagedAvailability.values()];
+  const publicationScope = publicationScopeForMerge(manifest, artifacts, availability);
+  const publication = publishGeneration({
+    rootDir: FIXTURES_DIR,
+    artifacts,
+    availability,
+    publicationScope,
+    sourceDateEpoch: FIXTURE_SOURCE_DATE_EPOCH,
+  });
+  for (const artifact of staged.values()) {
+    if (!artifact.directPath || artifact.document === undefined) continue;
+    if (artifact.logicalPath === 'manifest.json') writeFileSync(artifact.directPath, manifestBytes);
+    else writeJson(artifact.directPath, artifact.document);
+  }
+  return publication;
+}
+
+function publicationScopeForMerge(manifest, artifacts, availability) {
+  const activeScope = readActiveGenerationIndex(FIXTURES_DIR)?.publicationScope;
+  if (activeScope?.mode === 'complete-corpus') return { mode: 'complete-corpus' };
+
+  const representedPaths = new Set([
+    ...artifacts.map((entry) => entry.logicalPath),
+    ...availability.map((entry) => entry.logicalPath),
+  ]);
+  const manifestAssetIds = manifest.assets.map((asset) => asset.id);
+  if (manifestAssetIds.every((assetId) => representedPaths.has(`media/${assetId}`))) {
+    return { mode: 'complete-corpus' };
+  }
+
+  const assetIds = new Set(activeScope?.mode === 'selected-assets' ? activeScope.assetIds : []);
+  for (const assetId of stagedRootAssetIds) assetIds.add(assetId);
+  return { mode: 'selected-assets', assetIds: [...assetIds].sort(compareCodepoint) };
+}
+
+function compareCodepoint(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 // ── Manifest IO ────────────────────────────────────────────────────────────────────────────────
@@ -1787,6 +2020,7 @@ function loadManifest() {
 // ── Main ─────────────────────────────────────────────────────────────────────────────────────
 
 function selected(assetId) {
+  if (explicitUpdateScope) return explicitUpdateScope.has(assetId);
   if (!flags.subset) return true;
   return flags.subset.some((term) => assetId.includes(term));
 }
@@ -1796,6 +2030,11 @@ async function main() {
   mkdirSync(GOLDEN_DIR, { recursive: true });
 
   const manifest = loadManifest();
+  explicitUpdateScope = resolveExplicitAssetUpdateScope({
+    explicit: flags.update,
+    selectionTerms: flags.subset ?? [],
+    assetIds: manifest.assets.map((asset) => asset.id),
+  });
   const summary = { generated: [], reused: [], skipped: [], golden: [], goldenPending: [], goldenSkipped: [], errors: [], missing: [] };
 
   log('media-browser-test fixture bake');
@@ -1812,6 +2051,10 @@ async function main() {
     if (!selected(id)) continue;
 
     const out = join(MEDIA_DIR, id);
+    const previousIdentity = {
+      sha256: typeof entry.sha256 === 'string' ? entry.sha256 : null,
+      sizeBytes: Number.isSafeInteger(entry.sizeBytes) ? entry.sizeBytes : null,
+    };
 
     // In golden-only mode we don't generate, but we still flag any provided/captured asset that
     // hasn't been dropped in yet so the MISSING ASSETS block stays accurate.
@@ -1825,11 +2068,20 @@ async function main() {
       const exists = existsSync(out);
 
       if (exists && !flags.force) {
-        // Idempotent: reuse the existing file (incl. drop-in `provided`/`captured` assets), just
-        // refresh its checksum below. This is how a manually-dropped 'provided' asset enters the
-        // corpus: on the next bake it is found on disk and checksummed like anything else.
+        if (previousIdentity.sha256 && previousIdentity.sizeBytes !== null) {
+          const reuse = assessMediaReuse(out, previousIdentity);
+          if (reuse.state !== 'REUSABLE' && !flags.update) {
+            summary.errors.push({ id, reason: `${reuse.reasonCode}: existing bytes do not match manifest digest+size; use --update for an intentional replacement` });
+            log(`  ! ${id}: REUSE REJECTED — ${reuse.reasonCode} (pass --update only if replacement is intentional)`);
+            continue;
+          }
+        } else if (!flags.update) {
+          summary.errors.push({ id, reason: 'unidentified existing bytes require explicit --update admission' });
+          log(`  ! ${id}: REUSE REJECTED — manifest has no digest+size (pass --update to admit these bytes)`);
+          continue;
+        }
         summary.reused.push(id);
-        log(`  = ${id} (reuse existing)`);
+        log(`  = ${id} (${flags.update ? 'explicit update/admission' : 'digest+size verified reuse'})`);
       } else if (!recipe) {
         if (entry.source === 'fetched') {
           mkdirSync(dirname(out), { recursive: true });
@@ -1893,9 +2145,38 @@ async function main() {
       }
     }
 
+    // Golden-only still verifies identity. A contaminated local path can never redefine truth by
+    // being merely present; only --update may bind a new digest and invalidate old dependents.
+    if (existsSync(out)) {
+      if (previousIdentity.sha256 && previousIdentity.sizeBytes !== null) {
+        const reuse = assessMediaReuse(out, previousIdentity);
+        if (reuse.state !== 'REUSABLE' && !flags.update) {
+          summary.errors.push({ id, reason: `${reuse.reasonCode}: media quarantined before golden derivation` });
+          log(`  ! ${id}: QUARANTINED — ${reuse.reasonCode}`);
+          continue;
+        }
+      } else if (flags.goldenOnly && !previousIdentity.sha256 && !flags.update) {
+        summary.errors.push({ id, reason: 'golden-only cannot admit unidentified source bytes without --update' });
+        continue;
+      }
+      const identity = sourceIdentity(out);
+      if (
+        previousIdentity.sha256 &&
+        (previousIdentity.sha256 !== identity.sha256 || previousIdentity.sizeBytes !== identity.sizeBytes) &&
+        !flags.update
+      ) {
+        summary.errors.push({ id, reason: 'freshly produced bytes differ from the committed identity; pass --update to publish a replacement generation' });
+        continue;
+      }
+      entry.sha256 = identity.sha256;
+      entry.sizeBytes = identity.sizeBytes;
+      stageMedia(id, out, identity, previousIdentity.sha256);
+    }
+
     // 2. Golden derivation (unless media-only). Skip for assets that don't exist (were skipped).
     if (!flags.mediaOnly) {
       if (!existsSync(out)) {
+        stageAvailability(`media/${id}`, 'absent-expected', 'FIXTURE_MEDIA_NOT_ACQUIRED', `source '${entry.source}' is not present in this checkout`);
         log(`  · ${id}: golden skipped (no media present)`);
         continue;
       }
@@ -1903,6 +2184,9 @@ async function main() {
       // and record a clear note instead of emitting a GOLDEN ERROR (which would fail the bake). The
       // graceful-failure oracle compares the engine's behavior, not against ffprobe-derived golden.
       if (EXPECT_GOLDEN_FAILURE.has(id)) {
+        for (const suffix of ['meta.json', 'packets.json', 'frames.json']) {
+          stageAvailability(`golden/${id}.${suffix}`, 'absent-expected', 'INTENTIONALLY_MALFORMED_NO_GOLDEN', 'malformed-input rejection is the expected oracle; no reference golden is produced');
+        }
         summary.goldenSkipped.push(id);
         log(`  · ${id}: no golden (intentionally broken — graceful-failure oracle, ffprobe failure expected)`);
         continue;
@@ -1911,10 +2195,10 @@ async function main() {
       // golden we can; the oracle for negatives is graceful-failure, not meta.
       try {
         const meta = normalizedMetadataFor(id, out);
-        writeJson(join(GOLDEN_DIR, `${id}.meta.json`), meta);
+        stageEnvelope(`${id}.meta.json`, artifactEnvelope('metadata', id, out, meta));
 
         const packets = packetsFor(id, out);
-        writeJson(join(GOLDEN_DIR, `${id}.packets.json`), packets);
+        stageEnvelope(`${id}.packets.json`, artifactEnvelope('packets', id, out, packets));
 
         const frames = frameHookFor(id, out, meta);
         if (frames) {
@@ -1934,7 +2218,10 @@ async function main() {
               /* fall through to rewrite the placeholder */
             }
           }
-          writeJson(fp, frames);
+          const availability = frames.evidenceState === 'producer-failed'
+            ? { state: 'producer-failed', reasonCode: frames.producerFailure?.reasonCode ?? 'FRAME_PLACEHOLDER_EMPTY', detail: frames.producerFailure?.detail }
+            : { state: 'pending', reasonCode: 'FRAME_PIXELS_NOT_BAKED', detail: 'browser-qualified pixels have not been produced' };
+          stageEnvelope(`${id}.frames.json`, artifactEnvelope('frames', id, out, frames, availability));
           summary.goldenPending.push(id);
         }
         summary.golden.push(id);
@@ -1949,45 +2236,103 @@ async function main() {
     maybeWriteEncGolden(id);
   }
 
-  // Persist manifest (checksums + sizes).
-  if (!flags.goldenOnly) {
-    writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + '\n');
-  }
-
   // Record HLS segment listing in golden notes (streaming oracle needs to know the segment files).
-  recordHlsSegments(summary);
+  if (!flags.mediaOnly) recordHlsSegments(summary);
+  recordHlsResourceClosures(summary, !flags.mediaOnly);
 
   printSummary(summary);
   printMissingAssets(summary);
 
   // Exit non-zero if any hard error occurred (skips and MISSING are NOT errors — MISSING is an
   // expected, honest state for provided/captured assets the bake cannot produce, §5.4).
-  if (summary.errors.length) process.exitCode = 1;
+  if (summary.errors.length) {
+    process.exitCode = 1;
+    return;
+  }
+  const manifestValidation = validateFixtureManifest(manifest);
+  if (!manifestValidation.ok) throw new Error(`manifest schema validation failed: ${manifestValidation.issues.join('; ')}`);
+  publishStaged(manifest);
 }
 
 function maybeWriteEncGolden(id) {
   const secret = ENC_SECRETS[id];
   if (!secret) return;
-  writeJson(join(GOLDEN_DIR, `${id}.keys.json`), {
+  const mediaPath = join(MEDIA_DIR, id);
+  if (!existsSync(mediaPath)) return;
+  const payload = {
     $note: 'Decrypt-oracle ground truth (key/KID/IV) baked offline. Browser decrypt output is compared bit-exact against the golden frames decoded from the cleartext.',
     assetId: id,
     ...secret,
-  });
+  };
+  stageEnvelope(`${id}.keys.json`, artifactEnvelope('keys', id, mediaPath, payload));
 }
 
 function recordHlsSegments(summary) {
   for (const playlist of ['hls_vod.m3u8', 'hls_aes128.m3u8']) {
+    if (!selected(playlist)) continue;
     const p = join(MEDIA_DIR, playlist);
     if (!existsSync(p)) continue;
     const base = playlist.replace(/\.m3u8$/, '');
-    const segments = readdirSync(MEDIA_DIR).filter((f) => f.startsWith(`${base}_`) && f.endsWith('.ts'));
-    writeJson(join(GOLDEN_DIR, `${playlist}.segments.json`), {
+    const segmentPattern = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}_\\d{3}\\.ts$`);
+    const segments = readdirSync(MEDIA_DIR).filter((file) => segmentPattern.test(file));
+    const payload = {
       $note: 'HLS segment listing for the streaming oracle. Segments are served as siblings of the playlist under fixtures/media/.',
       playlist,
       segments: segments.sort(),
       ...(playlist === 'hls_aes128.m3u8' ? { keyFile: 'hls_aes128.key' } : {}),
-    });
+    };
+    stageEnvelope(`${playlist}.segments.json`, artifactEnvelope('segments', playlist, p, payload));
     summary.golden.push(`${playlist} (segments)`);
+  }
+}
+
+/** Publish every HLS key/map/segment plus the exact resource index and authoritative key record. */
+function recordHlsResourceClosures(summary, includeEvidence) {
+  for (const assetId of HLS_RESOURCE_FIXTURE_IDS) {
+    if (!selected(assetId)) continue;
+    const playlistPath = join(MEDIA_DIR, assetId);
+    const indexPath = join(GOLDEN_DIR, `${assetId}.resources.json`);
+    const keysPath = join(GOLDEN_DIR, `${assetId}.keys.json`);
+    if (!existsSync(playlistPath)) {
+      if (includeEvidence) {
+        stageAvailability(`golden/${assetId}.resources.json`, 'absent-expected', 'HLS_PLAYLIST_NOT_ACQUIRED', 'playlist root is absent');
+      }
+      continue;
+    }
+    try {
+      const index = validatePinnedHlsResourceClosure({ assetId, mediaPath: playlistPath, goldenDir: GOLDEN_DIR });
+      const rootIdentity = sourceIdentity(playlistPath);
+      if (includeEvidence) {
+        stageRawArtifact({
+          logicalPath: `golden/${assetId}.resources.json`,
+          artifactKind: 'hls-resource-index',
+          sourcePath: indexPath,
+          sourceMediaSha256: rootIdentity.sha256,
+          recipe: 'fixtures/curate-hls-resource-indices.mjs#resource-index',
+        });
+      }
+      for (const resource of index.resources) {
+        const resourcePath = join(MEDIA_DIR, resource.uri);
+        stageRawArtifact({
+          logicalPath: `media/${resource.uri}`,
+          artifactKind: 'media',
+          sourcePath: resourcePath,
+          sourceMediaSha256: resource.sha256,
+          recipe: 'fixtures/curate-hls-resource-indices.mjs#resource-sidecar',
+        });
+      }
+      if (includeEvidence) {
+        if (!existsSync(keysPath)) throw new Error(`authoritative key record '${keysPath}' is absent`);
+        const keyDocument = JSON.parse(readFileSync(keysPath, 'utf8'));
+        const keyPayload = keyDocument.schema === 'media-test/golden-artifact@1'
+          ? keyDocument.payload
+          : keyDocument;
+        stageEnvelope(`${assetId}.keys.json`, artifactEnvelope('keys', assetId, playlistPath, keyPayload));
+        summary.golden.push(`${assetId} (resource-closure+keys)`);
+      }
+    } catch (error) {
+      summary.errors.push({ id: assetId, reason: `HLS resource closure: ${String(error?.message || error)}` });
+    }
   }
 }
 
@@ -2015,7 +2360,7 @@ function printSummary(s) {
     for (const k of s.errors) log(`      ! ${k.id} — ${k.reason}`);
   }
   log('────────────────────────────────────────────────────────────────');
-  log('Re-run is idempotent: existing files are reused (use --force to regenerate).');
+  log('Re-run is idempotent: --force may recompute pinned bytes; identity changes require scoped --update with exact asset ids.');
 }
 
 /**
@@ -2065,7 +2410,9 @@ function printMissingAssets(s) {
   out('══════════════════════════════════════════════════════════════════');
 }
 
-main().catch((e) => {
-  console.error(`FATAL bake error: ${String(e?.stack || e?.message || e)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error(`FATAL bake error: ${String(e?.stack || e?.message || e)}`);
+    process.exit(1);
+  });
+}

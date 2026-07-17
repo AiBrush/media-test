@@ -89,11 +89,16 @@ import {
   deriveVideoCodecs,
   deriveVideoDecodeCodecs,
   parseCodecNames,
+  parseFilters,
   parseFormats,
   videoEncoderName,
 } from './codecs.ts';
 import type {
   CapabilitySet,
+  ApplicabilityTupleSummary,
+  ConcreteOperationRequest,
+  DecodeOptions,
+  DecodeTrackSelector,
   DecryptKey,
   DemuxResult,
   EncodedTracks,
@@ -103,28 +108,99 @@ import type {
   MediaBytes,
   MediaEngine,
   MediaInput,
+  LifecycleContext,
   NormalizedMetadata,
   NormalizedTrack,
+  OperationContext,
+  OperationFinalCounters,
   PacketInfo,
+  SupportDecision,
   TrackType,
   TranscodeOptions,
 } from '../../core/engine.ts';
+import {
+  CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  DECODE_TRACK_SELECTOR_SCHEMA,
+  captureConfigUsedSnapshot,
+  createMalformedInputError,
+  createNotApplicableError,
+  validateEncodedTracks,
+  validateSupportDecision,
+} from '../../core/engine.ts';
+import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/index.ts';
+import {
+  applyObservedFrameCadence,
+  FfmpegFsLedger,
+  parseFfprobeFramesJson,
+  parseFfprobeJson,
+  representationForTracks,
+  splitAdtsFrames,
+  splitPreparedBytes,
+  type FfmpegOperationPhase,
+  type FfmpegPhaseEvidence,
+  type StructuredProbeResult,
+} from './evidence.ts';
+import { FfmpegLifecycleGate, FfmpegWorkerStateError } from './lifecycle.ts';
+import {
+  classifyHlsDecryptApplicability,
+  classifyIsoDecryptApplicability,
+  inspectHlsProtection,
+  inspectIsoBmffProtection as inspectProtectionStructure,
+} from './protection.ts';
+import {
+  FFMPEG_BATCH_LAYOUT_FEATURES,
+  FFMPEG_FASTSTART_MOVFLAGS,
+  FFMPEG_FRAGMENT_MOVFLAGS,
+  redactFfmpegArg,
+  redactFfmpegCommand,
+} from './provenance.ts';
+import {
+  buildTimedMp4,
+  canBuildTimedMp4,
+  TimedMp4UnsupportedError,
+} from './timed-mp4.ts';
+import {
+  DEFAULT_FFMPEG_LIMITS,
+  decideFfmpegSupport,
+  muxLegality,
+  tupleSummary,
+  type FfmpegAdapterLimits,
+  type FfmpegRuntimeBuild,
+} from './support.ts';
 
 const ENGINE_ID = 'ffmpeg.wasm@0.12.15';
 /** Vendored core version (both @ffmpeg/core and @ffmpeg/core-mt). */
 const CORE_VERSION = '0.12.10';
+const WRAPPER_VERSION = '0.12.15';
+const UTIL_VERSION = '0.12.2';
+const CORE_ST_INTEGRITY = 'sha512-dzNplnn2Nxle2c2i2rrDhqcB19q9cglCkWnoMTDN9Q9l3PvdjZWd1HfSPjCNWc/p8Q3CT+Es9fWOR0UhAeYQZA==';
+const CORE_MT_INTEGRITY = 'sha512-atyRTOpa58bLCIgd6GXBZAXWyWD3AUoQyzxqjvGhp9MuSzdILtOTI62ffLswBsCnLq15lQ8IETHUpm1oe4V9FQ==';
+const WORKERFS_THRESHOLD_BYTES = 8 * 1024 * 1024;
+const WRAPPER_HEAP_ESTIMATE_BYTES = 32 * 1024 * 1024;
 
-/** Thrown for paths this adapter intentionally does not claim at runtime; the runner records NA_ENGINE. */
-class NotApplicableError extends Error {
-  constructor(op: string, reason: string) {
-    super(`${ENGINE_ID}: ${op} not applicable: ${reason}`);
-    this.name = 'NotApplicableError';
-  }
+interface ActiveOperationEvidence {
+  startedAtMs: number;
+  phase: FfmpegOperationPhase;
+  bytesIn: number;
+  bytesOut: number;
+  packetCount?: number;
+  decodedFrames?: number;
+  context: OperationContext;
 }
 
 /** The best-path config we resolved at init(), recorded per §8.5 and surfaced via configUsed. */
 export interface FfmpegWasmConfig {
+  framework: 'ffmpeg.wasm';
+  packageVersions: Record<string, string>;
   backend: 'wasm';
+  hardwareAcceleration: 'none';
+  workerCount: number;
+  threadCount: number;
+  readerMode: 'WORKERFS-or-MEMFS';
+  writerMode: 'MEMFS-batch';
+  targetMode: 'batch-buffer';
+  codecConfigs: Array<Record<string, unknown>>;
   hwAccel: false;
   /** 'mt' = @ffmpeg/core-mt (cross-origin isolated), 'st' = @ffmpeg/core fallback. */
   coreBuild: 'mt' | 'st';
@@ -141,6 +217,25 @@ export interface FfmpegWasmConfig {
   coreURL: string;
   wasmURL: string;
   workerURL: string | null;
+  classWorkerURL: string;
+  coreAssetIntegrity: Record<string, string>;
+  capabilitySource: 'static-unverified' | 'runtime-probed';
+  runtimeProbeDigest: string | null;
+  ffmpegBanner: string | null;
+  ffmpegBuildConfiguration: string | null;
+  commands: string[][];
+  phaseTelemetry: FfmpegPhaseEvidence[];
+  memory: ReturnType<FfmpegFsLedger['snapshot']>;
+  memoryModel: {
+    wrapperHeapEstimateBytes: number;
+    wasmHardCeilingBytes: number;
+    workingEstimate: 'input-plus-four-rgba-frames';
+  };
+  userAgent: string;
+  hardwareConcurrency: number;
+  workerTimeoutMs: number;
+  policyReasonCodes: string[];
+  encoderNondeterministic: true;
 }
 
 /** Documented-build fallback used ONLY if the runtime probe parses to an empty set (defensive). */
@@ -197,6 +292,103 @@ function plainObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+function resolveDecodeTrack(
+  tracks: readonly NormalizedTrack[],
+  selector: DecodeTrackSelector | undefined,
+  sourceTrackIndexes: readonly number[],
+  tuple: ApplicabilityTupleSummary,
+): {
+  track: NormalizedTrack & { type: 'video' | 'audio' };
+  trackIndex: number;
+  typeOrdinal: number;
+  sourceTrackIndex: number;
+} {
+  const reject = (reason: string): never => {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'decodeFrames',
+      reason,
+      tuple,
+      'FFMPEG_DECODE_TRACK_SELECTION_UNSUPPORTED',
+    );
+  };
+  if (selector && selector.schema !== DECODE_TRACK_SELECTOR_SCHEMA) {
+    reject(`decode selector must use schema '${DECODE_TRACK_SELECTOR_SCHEMA}'`);
+  }
+  if (selector?.trackId !== undefined) {
+    reject('ffprobe stream evidence does not expose a stable cross-adapter trackId selector');
+  }
+
+  const wantedType = selector?.type;
+  const candidates = tracks.flatMap((track, trackIndex) =>
+    (track.type === 'video' || track.type === 'audio') && (!wantedType || track.type === wantedType)
+      ? [{ track: track as NormalizedTrack & { type: 'video' | 'audio' }, trackIndex }]
+      : [],
+  );
+  const defaultCandidate = candidates.find((item) => item.track.type === 'video') ?? candidates[0];
+  const byAbsolute = selector?.trackIndex === undefined
+    ? undefined
+    : candidates.find((item) => item.trackIndex === selector.trackIndex);
+  const byOrdinal = selector?.typeOrdinal === undefined ? undefined : candidates[selector.typeOrdinal];
+  const chosen = selector?.trackIndex !== undefined
+    ? byAbsolute
+    : selector?.typeOrdinal !== undefined
+      ? byOrdinal
+      : defaultCandidate;
+  if (!chosen) {
+    return reject(
+      selector
+        ? `requested ${selector.type} track does not exist (${selector.trackIndex === undefined ? '' : `index ${selector.trackIndex}`}${selector.trackIndex !== undefined && selector.typeOrdinal !== undefined ? ', ' : ''}${selector.typeOrdinal === undefined ? '' : `ordinal ${selector.typeOrdinal}`})`
+        : 'input has no decodable video or audio track',
+    );
+  }
+  const typeOrdinal = tracks
+    .slice(0, chosen.trackIndex)
+    .filter((track) => track.type === chosen.track.type)
+    .length;
+  if (selector?.typeOrdinal !== undefined && typeOrdinal !== selector.typeOrdinal) {
+    reject(
+      `requested track index ${chosen.trackIndex} is ${chosen.track.type} ordinal ${typeOrdinal}, not ${selector.typeOrdinal}`,
+    );
+  }
+  const sourceTrackIndex = sourceTrackIndexes[chosen.trackIndex] ?? chosen.trackIndex;
+  if (!Number.isSafeInteger(sourceTrackIndex) || sourceTrackIndex < 0) {
+    reject(`selected track ${chosen.trackIndex} has no stable ffmpeg stream mapping`);
+  }
+  return { ...chosen, typeOrdinal, sourceTrackIndex };
+}
+
+function inputExtension(input: MediaInput): string {
+  const source = (input.id || input.url || '').split(/[?#]/, 1)[0] ?? '';
+  const match = /\.([A-Za-z0-9]{1,8})$/.exec(source);
+  return match ? `.${match[1]!.toLowerCase()}` : '.bin';
+}
+
+function fallbackOperationContext(
+  operation: ConcreteOperationRequest['operation'],
+  signal: AbortSignal,
+): OperationContext {
+  return {
+    signal,
+    emit: () => undefined,
+    phase: 'functional',
+    checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+    request: {
+      protocol: CONCRETE_OPERATION_PROTOCOL,
+      scenarioId: 'ffmpeg-wasm/direct-call',
+      operation,
+      inputs: [],
+      options: {},
+    },
+  };
 }
 
 function numberOption(obj: Record<string, unknown> | null | undefined, names: string[]): number | undefined {
@@ -295,18 +487,8 @@ interface PreparedMuxTrackCandidate {
   inputIndex: number;
   type: 'video' | 'audio';
   typeOrdinal: number;
-  track: FfmpegPreparedMuxTrack;
+  track: EncodedTracks['tracks'][number];
 }
-
-interface FfmpegMuxSource {
-  sourceKey: string;
-  sourceBytes: Uint8Array;
-  sourceExt: string;
-  inputOptions: string[];
-  streamIndex: number;
-}
-
-type FfmpegPreparedMuxTrack = EncodedTracks['tracks'][number] & { ffmpegMuxSource?: FfmpegMuxSource };
 
 /** Parse `Duration: HH:MM:SS.ms` from an `ffmpeg -i` log; null if absent/`N/A`. */
 function parseDurationSecFromLog(log: string): number | null {
@@ -478,12 +660,19 @@ function parseFramecrcPackets(out: string): PacketInfo[] {
     const spt = timebase.get(trackIndex) ?? 0;
     const toUs = (ticks: number): number | null =>
       Number.isFinite(ticks) && ticks !== AV_NOPTS ? Math.round(ticks * spt * 1_000_000) : null;
-    let ptsUs = toUs(ptsTicks);
-    let dtsUs = toUs(dtsTicks);
-    if (ptsUs === null) ptsUs = 0;
-    if (dtsUs === null) dtsUs = ptsUs;
+    const ptsUs = toUs(ptsTicks) ?? 0;
+    const dtsUs = toUs(dtsTicks);
+    const durationTicks = Number(parts[3]);
+    const durationUs = toUs(durationTicks);
 
-    packets.push({ trackIndex, size, ptsUs, dtsUs, keyframe });
+    packets.push({
+      trackIndex,
+      size,
+      ptsUs,
+      ...(dtsUs !== null ? { dtsUs } : {}),
+      ...(durationUs !== null && durationUs >= 0 ? { durationUs } : {}),
+      keyframe,
+    });
   }
   return packets;
 }
@@ -724,16 +913,26 @@ function isMp3(data: Uint8Array): boolean {
   return data.length >= 2 && data[0] === 0xff && (data[1]! & 0xe0) === 0xe0;
 }
 
-function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): void {
-  let originUs = Infinity;
-  for (const chunk of chunks) {
-    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs);
+/** Raw demuxers can reconstruct only contiguous, effectively constant-rate clocks. */
+function hasImplicitRawDemuxTiming(track: EncodedTracks['tracks'][number]): boolean {
+  if (track.chunks.length <= 1) return true;
+  if (track.packetOrdering !== undefined && track.packetOrdering !== 'decode') return false;
+  const durations = track.chunks.map((chunk) => chunk.durationUs);
+  if (durations.some((duration) => duration <= 0)) return false;
+  const minDuration = Math.min(...durations);
+  const maxDuration = Math.max(...durations);
+  if (maxDuration - minDuration > Math.max(2, minDuration * 0.005)) return false;
+  const hasDts = track.chunks.some((chunk) => chunk.dtsUs !== undefined);
+  if (hasDts && track.chunks.some((chunk) => chunk.dtsUs === undefined)) return false;
+  if (hasDts) {
+    for (let index = 1; index < track.chunks.length; index++) {
+      const previous = track.chunks[index - 1]!;
+      const current = track.chunks[index]!;
+      const expected = previous.dtsUs! + previous.durationUs;
+      if (Math.abs(current.dtsUs! - expected) > Math.max(2, previous.durationUs * 0.005)) return false;
+    }
   }
-  if (!Number.isFinite(originUs) || originUs === 0) return;
-  for (const chunk of chunks) {
-    chunk.ptsUs -= originUs;
-    chunk.dtsUs -= originUs;
-  }
+  return true;
 }
 
 function selectPreparedMuxTracks(
@@ -916,7 +1115,7 @@ function assertRemuxContainerCompatible(tracks: NormalizedTrack[], container: st
       .filter((track) => track.type === 'video' || track.type === 'audio')
       .map((track) => canonicalCodec(track.codec))
       .join(', ');
-    throw new NotApplicableError('remux', `WebM cannot stream-copy track codecs [${codecs}]`);
+    throw createNotApplicableError(ENGINE_ID, 'remux', `WebM cannot stream-copy track codecs [${codecs}]`);
   }
 }
 
@@ -1427,6 +1626,20 @@ export class FfmpegWasmEngine implements MediaEngine {
   private logTail: string[] = [];
   /** Capability set built from the runtime probe in init(). */
   private caps: CapabilitySet | null = null;
+  /** Parsed capability facts for the exact loaded core; pre-init fallback is explicitly unverified. */
+  private runtimeBuild: FfmpegRuntimeBuild | null = null;
+  private readonly limits: FfmpegAdapterLimits;
+  private readonly lifecycle = new FfmpegLifecycleGate();
+  private readonly fsLedger = new FfmpegFsLedger();
+  private readonly fallbackAbort = new AbortController();
+  private activeOperation: ActiveOperationEvidence | null = null;
+  private activeConfig: FfmpegWasmConfig | null = null;
+  private mountedWorkerFs = new Set<string>();
+  private lastStructuredProbe: StructuredProbeResult | null = null;
+
+  constructor(options: { limits?: Partial<FfmpegAdapterLimits> } = {}) {
+    this.limits = { ...DEFAULT_FFMPEG_LIMITS, ...options.limits };
+  }
 
   /**
    * The best-path config chosen at init(), recorded into the report per §8.5 (coreBuild mt/st,
@@ -1440,7 +1653,12 @@ export class FfmpegWasmEngine implements MediaEngine {
    * is `object | undefined`, NOT nullable); the runner's `if (engine.configUsed)` guard skips it
    * pre-init anyway.
    */
-  configUsed?: FfmpegWasmConfig;
+  configUsed?: object;
+
+  supports(request: ConcreteOperationRequest): SupportDecision {
+    const decision = decideFfmpegSupport(request, this.runtimeBuild ?? this.fallbackRuntimeBuild(), this.limits);
+    return validateSupportDecision(ENGINE_ID, decision);
+  }
 
   capabilities(): CapabilitySet {
     // Prefer the runtime-probed caps; before init() return the conservative documented-build set so
@@ -1471,9 +1689,25 @@ export class FfmpegWasmEngine implements MediaEngine {
       videoCodecsIn: [...FALLBACK_VIDEO_IN],
       audioCodecsIn: [...FALLBACK_AUDIO],
       videoCodecsOut: [...FALLBACK_VIDEO],
-      audioCodecsOut: [...FALLBACK_AUDIO],
+      audioCodecsOut: FALLBACK_AUDIO.filter((codec) => codec !== 'opus'),
       encryption: ['cenc-ctr', 'hls-aes128'], // CENC-CTR standalone decrypt + transparent HLS demux.
       features: this.featureList(),
+      probeReadModes: ['whole-file'],
+    };
+  }
+
+  private fallbackRuntimeBuild(): FfmpegRuntimeBuild {
+    return {
+      verified: false,
+      capabilities: this.staticCapabilities(),
+      encoders: new Set(),
+      decoders: new Set(),
+      muxers: new Set(),
+      demuxers: new Set(),
+      filters: new Set([
+        'scale', 'zscale', 'crop', 'pad', 'hflip', 'vflip', 'colorspace', 'tonemap', 'fps',
+        'volume', 'afade', 'aresample',
+      ]),
     };
   }
 
@@ -1498,11 +1732,8 @@ export class FfmpegWasmEngine implements MediaEngine {
       'trim:flac-no-seektable-frame-scan', // FFmpeg packet scan + STREAMINFO repair for no-seektable FLAC
       'flac:seektable-seek-equivalence', // paired FLAC trims prove SEEKTABLE is only an index
       'decode:audio-pcm', // decode audio-only PCM inputs to normalized f32 sample-frame digests
-      'fragmented', // -movflags frag_keyframe+empty_moov
+      ...FFMPEG_BATCH_LAYOUT_FEATURES,
       'streaming:decode-equality',
-      'fastStart:reserve', // -movflags +faststart (moov-first; reserve approximated)
-      'fastStart:in-memory', // same moov-first output shape through MEMFS/BufferTarget
-      'fastStart:none', // explicit control: leave moov at the default tail position
       'metadata:write', // -metadata key=value while stream-copying remux outputs
       'metadata:protected-tracks', // stream metadata is reported for encrypted MP4 without decrypting
       'webcrypto:cenc-ctr-clear-output', // WebCrypto clears CENC samples; ffmpeg.wasm emits clear MP4
@@ -1515,6 +1746,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       'upmix', // -ac N where N > input channels
       'gain', // -af volume
       'fade', // -af afade
+      'audio-dsp:endianness-roundtrip', // exposes the encoded AIFF/s16be first leg in MediaBytes.intermediates
       'webcodecs:independent', // software codecs; do not browser-gate on WebCodecs
       'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
       'remux:vp9-opus-in-mp4', // VP9+Opus WebM -> MP4 copy
@@ -1522,8 +1754,22 @@ export class FfmpegWasmEngine implements MediaEngine {
     ];
   }
 
-  async init(): Promise<void> {
-    if (this.ff) return;
+  async init(context?: LifecycleContext): Promise<void> {
+    const signal = context?.signal ?? this.fallbackAbort.signal;
+    return this.lifecycle.init(signal, (loadSignal) => this.loadWorker(loadSignal));
+  }
+
+  private async loadWorker(signal: AbortSignal): Promise<void> {
+    if (this.ff) {
+      try {
+        this.ff.terminate();
+      } catch {
+        // A prior broken generation is discarded before the fresh load.
+      }
+      this.ff = null;
+    }
+    this.fsLedger.reset();
+    this.mountedWorkerFs.clear();
 
     let mod: typeof import('@ffmpeg/ffmpeg');
     try {
@@ -1534,6 +1780,10 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
 
     const ff = new mod.FFmpeg();
+    this.lifecycle.setTerminator(() => {
+      ff.terminate();
+      if (this.ff === ff) this.ff = null;
+    });
     ff.on('log', ({ message }) => {
       this.logTail.push(message);
       if (this.logTail.length > 4000) this.logTail.shift();
@@ -1551,13 +1801,53 @@ export class FfmpegWasmEngine implements MediaEngine {
     const useMtCore = false;
     const threads = useMtCore && isolated ? Math.max(1, Math.min(hwThreads, 8)) : 1;
 
+    const baseEvidence = {
+      framework: 'ffmpeg.wasm' as const,
+      packageVersions: {
+        '@ffmpeg/ffmpeg': WRAPPER_VERSION,
+        '@ffmpeg/core': CORE_VERSION,
+        '@ffmpeg/core-mt': CORE_VERSION,
+        '@ffmpeg/util': UTIL_VERSION,
+      },
+      backend: 'wasm' as const,
+      hardwareAcceleration: 'none' as const,
+      workerCount: 1,
+      readerMode: 'WORKERFS-or-MEMFS' as const,
+      writerMode: 'MEMFS-batch' as const,
+      targetMode: 'batch-buffer' as const,
+      codecConfigs: [],
+      classWorkerURL: ffmpegClassWorkerUrl,
+      coreAssetIntegrity: {
+        '@ffmpeg/core': CORE_ST_INTEGRITY,
+        '@ffmpeg/core-mt': CORE_MT_INTEGRITY,
+      },
+      capabilitySource: 'static-unverified' as const,
+      runtimeProbeDigest: null,
+      ffmpegBanner: null,
+      ffmpegBuildConfiguration: null,
+      commands: [],
+      phaseTelemetry: [],
+      memory: this.fsLedger.snapshot(),
+      memoryModel: {
+        wrapperHeapEstimateBytes: WRAPPER_HEAP_ESTIMATE_BYTES,
+        wasmHardCeilingBytes: this.limits.wasmCeilingBytes,
+        workingEstimate: 'input-plus-four-rgba-frames' as const,
+      },
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unavailable',
+      hardwareConcurrency: hwThreads,
+      workerTimeoutMs: READ_EXEC_TIMEOUT_MS,
+      policyReasonCodes: [],
+      encoderNondeterministic: true as const,
+    };
     const config: FfmpegWasmConfig = useMtCore && isolated
       ? {
+          ...baseEvidence,
           backend: 'wasm',
           hwAccel: false,
           coreBuild: 'mt',
           coreVersion: CORE_VERSION,
           wasmThreads: threads,
+          threadCount: threads,
           pipeline: 'batch',
           queueDepth: null,
           webgpu: false,
@@ -1569,11 +1859,13 @@ export class FfmpegWasmEngine implements MediaEngine {
           workerURL: coreMtWorkerUrl,
         }
       : {
+          ...baseEvidence,
           backend: 'wasm',
           hwAccel: false,
           coreBuild: 'st',
           coreVersion: CORE_VERSION,
           wasmThreads: 1,
+          threadCount: 1,
           pipeline: 'batch',
           queueDepth: null,
           webgpu: false,
@@ -1611,7 +1903,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         timer = setTimeout(() => rej(new Error(`ff.load(${cfg.coreBuild}) exceeded ${ms}ms`)), ms);
       });
       try {
-        await Promise.race([ffInst.load(loadCfg), to]);
+        await Promise.race([ffInst.load(loadCfg, { signal }), to]);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
@@ -1623,6 +1915,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       await loadCore(ff, config, config.coreBuild === 'mt' ? 30_000 : 90_000);
     } catch (e) {
       if (config.coreBuild !== 'mt') {
+        try {
+          ff.terminate();
+        } catch {
+          // The failing load may already have terminated its class worker.
+        }
         const sab = typeof SharedArrayBuffer !== 'undefined';
         throw new Error(
           `${ENGINE_ID}: vendored ffmpeg-core (st) failed to load ` +
@@ -1638,11 +1935,13 @@ export class FfmpegWasmEngine implements MediaEngine {
         /* ignore */
       }
       const stConfig: FfmpegWasmConfig = {
+        ...baseEvidence,
         backend: 'wasm',
         hwAccel: false,
         coreBuild: 'st',
         coreVersion: CORE_VERSION,
         wasmThreads: 1,
+        threadCount: 1,
         pipeline: 'batch',
         queueDepth: null,
         webgpu: false,
@@ -1654,53 +1953,83 @@ export class FfmpegWasmEngine implements MediaEngine {
         workerURL: null,
       };
       const ff2 = new mod.FFmpeg();
+      this.lifecycle.setTerminator(() => {
+        ff2.terminate();
+        if (this.ff === ff2) this.ff = null;
+      });
       ff2.on('log', ({ message }) => {
         this.logTail.push(message);
         if (this.logTail.length > 4000) this.logTail.shift();
       });
-      await loadCore(ff2, stConfig, 90_000);
+      try {
+        await loadCore(ff2, stConfig, 90_000);
+      } catch (error) {
+        try {
+          ff2.terminate();
+        } catch {
+          // Preserve the load failure as the primary cause.
+        }
+        throw error;
+      }
       activeFf = ff2;
       activeConfig = stConfig;
     }
 
     this.ff = activeFf;
-    // Record the resolved best-path config as a PROPERTY the runner reads by value (§8.5).
-    this.configUsed = activeConfig;
+    this.activeConfig = activeConfig;
+    this.snapshotConfig();
 
     // Build HONEST capabilities from a runtime probe of the actual vendored core.
-    this.caps = await this.probeCapabilities(activeFf);
+    this.runtimeBuild = await this.probeCapabilities(activeFf, signal);
+    this.caps = this.runtimeBuild.capabilities;
+    activeConfig.capabilitySource = this.runtimeBuild.verified ? 'runtime-probed' : 'static-unverified';
+    this.snapshotConfig();
 
     // Warm-up: a tiny synthetic transcode so the first measured op isn't paying JIT/alloc costs.
-    await this.warmUp(activeFf).catch(() => {
+    await this.warmUp(activeFf, signal).catch(() => {
       /* warm-up is best-effort; never fail init() over it */
     });
   }
 
-  /** Run `-encoders` / `-decoders` / `-formats` once and parse the log into a CapabilitySet. */
-  private async probeCapabilities(ff: FFmpeg): Promise<CapabilitySet> {
+  /** Parse the exact loaded build; any defensive fallback is retained but explicitly unverified. */
+  private async probeCapabilities(ff: FFmpeg, signal: AbortSignal): Promise<FfmpegRuntimeBuild> {
     const capture = async (args: string[]): Promise<string> => {
+      this.recordCommand(args);
       this.logTail = [];
       try {
-        await ff.exec(args);
+        await ff.exec(args, undefined, { signal });
       } catch {
         /* listing commands may set a nonzero ret; the log is what we want regardless */
       }
       return this.logTail.join('\n');
     };
 
+    let verified = true;
+    let encoders = new Set<string>();
+    let decoders = new Set<string>();
+    let demuxers = new Set<string>();
+    let muxers = new Set<string>();
+    let filters = new Set<string>();
     let videoCodecs: string[];
     let videoCodecsIn: string[];
     let audioCodecs: string[];
     let containersIn: string[];
     let containersOut: string[];
+    let probeEvidence = '';
     try {
+      const versionLog = await capture(['-version']);
       const encodersLog = await capture(['-hide_banner', '-encoders']);
       const decodersLog = await capture(['-hide_banner', '-decoders']);
       const formatsLog = await capture(['-hide_banner', '-formats']);
+      const filtersLog = await capture(['-hide_banner', '-filters']);
+      probeEvidence = [versionLog, encodersLog, decodersLog, formatsLog, filtersLog].join('\n--probe--\n');
 
-      const encoders = parseCodecNames(encodersLog);
-      const decoders = parseCodecNames(decodersLog);
+      encoders = parseCodecNames(encodersLog);
+      decoders = parseCodecNames(decodersLog);
       const { demux, mux } = parseFormats(formatsLog);
+      demuxers = demux;
+      muxers = mux;
+      filters = parseFilters(filtersLog);
 
       videoCodecs = deriveVideoCodecs(encoders, decoders);
       videoCodecsIn = deriveVideoDecodeCodecs(decoders);
@@ -1711,19 +2040,40 @@ export class FfmpegWasmEngine implements MediaEngine {
       // If parsing produced nothing usable (unexpected log format), fall back to the documented set
       // rather than wrongly declaring zero capability.
       if (videoCodecs.length === 0 && audioCodecs.length === 0) {
+        verified = false;
         videoCodecs = [...FALLBACK_VIDEO];
         videoCodecsIn = [...FALLBACK_VIDEO_IN];
         audioCodecs = [...FALLBACK_AUDIO];
       }
-      if (videoCodecsIn.length === 0) videoCodecsIn = Array.from(new Set([...videoCodecs, ...FALLBACK_VIDEO_IN]));
-      if (containersIn.length === 0) containersIn = [...FALLBACK_CONTAINERS_IN];
-      if (containersOut.length === 0) containersOut = [...FALLBACK_CONTAINERS_OUT];
+      if (videoCodecsIn.length === 0) {
+        verified = false;
+        videoCodecsIn = Array.from(new Set([...videoCodecs, ...FALLBACK_VIDEO_IN]));
+      }
+      if (containersIn.length === 0) {
+        verified = false;
+        containersIn = [...FALLBACK_CONTAINERS_IN];
+      }
+      if (containersOut.length === 0) {
+        verified = false;
+        containersOut = [...FALLBACK_CONTAINERS_OUT];
+      }
+      if (filters.size === 0) {
+        verified = false;
+        filters = this.fallbackRuntimeBuild().filters as Set<string>;
+      }
+      if (this.activeConfig) {
+        this.activeConfig.ffmpegBanner = versionLog.split('\n').find((line) => /^ffmpeg version/i.test(line)) ?? null;
+        this.activeConfig.ffmpegBuildConfiguration =
+          versionLog.split('\n').find((line) => /^configuration:/i.test(line.trim()))?.trim() ?? null;
+      }
     } catch {
+      verified = false;
       videoCodecs = [...FALLBACK_VIDEO];
       videoCodecsIn = [...FALLBACK_VIDEO_IN];
       audioCodecs = [...FALLBACK_AUDIO];
       containersIn = [...FALLBACK_CONTAINERS_IN];
       containersOut = [...FALLBACK_CONTAINERS_OUT];
+      filters = this.fallbackRuntimeBuild().filters as Set<string>;
     } finally {
       this.logTail = [];
     }
@@ -1731,7 +2081,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     // HLS is multi-file/pathed; not deliverable as a single MediaBytes → exclude from declared out.
     containersOut = containersOut.filter((c) => c !== 'hls');
 
-    return {
+    const capabilities: CapabilitySet = {
       operations: {
         probe: true,
         demux: true,
@@ -1753,15 +2103,30 @@ export class FfmpegWasmEngine implements MediaEngine {
       videoCodecsIn,
       audioCodecsIn: audioCodecs,
       videoCodecsOut: videoCodecs,
-      audioCodecsOut: audioCodecs,
+      audioCodecsOut: audioCodecs.filter((codec) => codec !== 'opus'),
       encryption: ['cenc-ctr', 'hls-aes128'],
       features: this.featureList(),
+      probeReadModes: ['whole-file'],
+    };
+    if (this.activeConfig) {
+      this.activeConfig.runtimeProbeDigest = probeEvidence
+        ? await sha256Hex(new TextEncoder().encode(probeEvidence))
+        : null;
+    }
+    return {
+      verified,
+      capabilities,
+      encoders,
+      decoders,
+      muxers,
+      demuxers,
+      filters,
     };
   }
 
   /** Tiny synthetic transcode to warm the encoder path (UNTIMED). Uses the first probed video codec
    *  that has a software encoder (prefer h264), so warm-up matches a real declared capability. */
-  private async warmUp(ff: FFmpeg): Promise<void> {
+  private async warmUp(ff: FFmpeg, signal: AbortSignal): Promise<void> {
     const declared = this.caps?.videoCodecs ?? [];
     const pick = declared.includes('h264') ? 'h264' : declared[0];
     const enc = pick ? videoEncoderName(pick) : null;
@@ -1776,26 +2141,66 @@ export class FfmpegWasmEngine implements MediaEngine {
       out,
     ];
     this.logTail = [];
-    const code = await ff.exec(args);
+    this.recordCommand(args);
+    const code = await ff.exec(args, READ_EXEC_TIMEOUT_MS, { signal });
     try {
-      if (code === 0) await ff.deleteFile(out);
+      if (code === 0) await ff.deleteFile(out, { signal });
     } catch {
       /* ignore */
     }
   }
 
-  async dispose(): Promise<void> {
-    if (this.ff) {
-      try {
-        this.ff.terminate();
-      } catch {
-        /* terminate is best-effort */
-      }
-      this.ff = null;
-    }
+  async dispose(context?: LifecycleContext): Promise<void> {
+    this.recordPhase('cleanup', { workerTerminated: true });
+    this.snapshotConfig();
+    await this.lifecycle.dispose(context?.signal.reason);
+    this.ff = null;
     this.logTail = [];
     this.caps = null;
-    this.configUsed = undefined;
+    this.runtimeBuild = null;
+    this.activeOperation = null;
+    this.mountedWorkerFs.clear();
+    this.fsLedger.reset();
+  }
+
+  private snapshotConfig(): void {
+    if (!this.activeConfig) return;
+    this.activeConfig.memory = this.fsLedger.snapshot();
+    this.configUsed = captureConfigUsedSnapshot(ENGINE_ID, this.activeConfig, { requireProfile: true });
+  }
+
+  private recordCommand(args: string[]): void {
+    if (!this.activeConfig) return;
+    this.activeConfig.commands.push(args.map(redactFfmpegArg));
+    this.snapshotConfig();
+  }
+
+  private recordPolicy(reasonCode: string): void {
+    if (!this.activeConfig || this.activeConfig.policyReasonCodes.includes(reasonCode)) return;
+    this.activeConfig.policyReasonCodes.push(reasonCode);
+    this.snapshotConfig();
+  }
+
+  private recordPhase(
+    phase: FfmpegOperationPhase,
+    extra: Pick<FfmpegPhaseEvidence, 'workerTerminated' | 'reasonCode'> = {},
+  ): void {
+    const active = this.activeOperation;
+    if (!active || !this.activeConfig) return;
+    active.phase = phase;
+    const memory = this.fsLedger.snapshot();
+    this.activeConfig.phaseTelemetry.push({
+      phase,
+      atMs: Math.max(0, nowMs() - active.startedAtMs),
+      bytesIn: active.bytesIn,
+      bytesOut: active.bytesOut,
+      memfsBytes: memory.memfsBytes,
+      workerFsBytes: memory.workerFsBytes,
+      wrapperHeapBytes: memory.wrapperHeapBytes,
+      estimatedPeakBytes: memory.estimatedPeakBytes,
+      ...extra,
+    });
+    this.snapshotConfig();
   }
 
   private requireFf(): FFmpeg {
@@ -1805,7 +2210,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   /** `-threads N` for thread-aware encoders (mt fast path). Empty on the single-thread core. */
   private threadArgs(): string[] {
-    const n = this.configUsed?.wasmThreads ?? 1;
+    const n = this.activeConfig?.wasmThreads ?? 1;
     return n > 1 ? ['-threads', String(n)] : [];
   }
 
@@ -1817,10 +2222,7 @@ export class FfmpegWasmEngine implements MediaEngine {
   /** Run an ffmpeg exec, throwing a diagnostic error (with log tail) on non-zero exit. The optional
    *  `timeoutMs` guards fuzz/malformed inputs from hanging the worker (robustness dimension). */
   private async run(args: string[], timeoutMs?: number): Promise<void> {
-    const ff = this.requireFf();
-    this.logTail = [];
-    const code =
-      typeof timeoutMs === 'number' ? await ff.exec(args, timeoutMs) : await ff.exec(args);
+    const code = await this.execObserved(args, timeoutMs);
     if (code !== 0) {
       throw new Error(
         `${ENGINE_ID}: ffmpeg exited ${code} for [${args.join(' ')}]. ` +
@@ -1829,75 +2231,577 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
+  /** Execute while retaining nonzero exits for read/probe commands whose failure is interpreted later. */
+  private async execObserved(args: string[], timeoutMs?: number): Promise<number> {
+    const ff = this.requireFf();
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    this.updateWorkingEstimate();
+    this.recordPhase('execute');
+    this.recordCommand(args);
+    this.logTail = [];
+    const startedAt = nowMs();
+    try {
+      const code = await ff.exec(args, timeoutMs, { signal });
+      this.throwIfTimedOut(code, timeoutMs, nowMs() - startedAt, 'ffmpeg');
+      return code;
+    } catch (error) {
+      if (signal.aborted) {
+        const broken = this.lifecycle.reason ?? this.lifecycle.breakWorker(
+          'FFMPEG_WORKER_CANCELLED',
+          `ffmpeg worker was terminated during ${this.activeOperation?.phase ?? 'execute'}`,
+          signal.reason,
+        );
+        throw broken;
+      }
+      if (timeoutMs !== undefined && nowMs() - startedAt >= timeoutMs * 0.9) {
+        throw this.breakTimedOutWorker(timeoutMs, 'ffmpeg', error);
+      }
+      throw error;
+    }
+  }
+
+  private async ffprobeObserved(args: string[], timeoutMs: number): Promise<number> {
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    this.updateWorkingEstimate();
+    this.recordPhase('execute');
+    this.recordCommand(['ffprobe', ...args]);
+    const startedAt = nowMs();
+    try {
+      const code = await this.requireFf().ffprobe(args, timeoutMs, { signal });
+      this.throwIfTimedOut(code, timeoutMs, nowMs() - startedAt, 'ffprobe');
+      return code;
+    } catch (error) {
+      if (signal.aborted) {
+        const broken = this.lifecycle.reason ?? this.lifecycle.breakWorker(
+          'FFMPEG_WORKER_CANCELLED',
+          `ffprobe worker was terminated during ${this.activeOperation?.phase ?? 'execute'}`,
+          signal.reason,
+        );
+        throw broken;
+      }
+      if (nowMs() - startedAt >= timeoutMs * 0.9) {
+        throw this.breakTimedOutWorker(timeoutMs, 'ffprobe', error);
+      }
+      throw error;
+    }
+  }
+
+  private throwIfTimedOut(code: number, timeoutMs: number | undefined, elapsedMs: number, program: string): void {
+    if (code !== 0 && timeoutMs !== undefined && elapsedMs >= timeoutMs * 0.9) {
+      throw this.breakTimedOutWorker(timeoutMs, program);
+    }
+  }
+
+  private breakTimedOutWorker(timeoutMs: number, program: string, cause?: unknown): FfmpegWorkerStateError {
+    this.recordPhase(this.activeOperation?.phase ?? 'execute', {
+      workerTerminated: true,
+      reasonCode: 'FFMPEG_WORKER_TIMEOUT',
+    });
+    return this.lifecycle.breakWorker(
+      'FFMPEG_WORKER_TIMEOUT',
+      `${program} execution exceeded ${timeoutMs}ms and the worker was terminated; call init() for a fresh load`,
+      cause,
+    );
+  }
+
+  private updateWorkingEstimate(): void {
+    const memory = this.fsLedger.snapshot();
+    const request = this.activeOperation?.context.request;
+    let maxPixels = 0;
+    if (request) {
+      for (const input of request.inputs) {
+        for (const track of input.tracks) {
+          if (track.type === 'video' && track.width && track.height) {
+            maxPixels = Math.max(maxPixels, track.width * track.height);
+          }
+        }
+      }
+      if (request.output?.width && request.output.height) {
+        maxPixels = Math.max(maxPixels, request.output.width * request.output.height);
+      }
+    }
+    const materializedInput = memory.memfsBytes + memory.workerFsBytes;
+    const fourRgbaFrames = maxPixels * 4 * 4;
+    this.fsLedger.setWorkingEstimate(Math.min(
+      Number.MAX_SAFE_INTEGER,
+      materializedInput + fourRgbaFrames,
+    ));
+  }
+
   private async readBinary(path: string): Promise<Uint8Array> {
-    const data = await this.requireFf().readFile(path, 'binary');
-    if (typeof data === 'string') return new TextEncoder().encode(data);
-    return copyBytes(data);
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    this.recordPhase('read');
+    const data = await this.requireFf().readFile(path, 'binary', { signal });
+    const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : copyBytes(data);
+    if (!this.fsLedger.snapshot().livePaths.includes(path)) this.fsLedger.add(path, bytes.byteLength, 'MEMFS');
+    this.fsLedger.addJsCopy(bytes.byteLength);
+    this.recordOutputBytes(bytes.byteLength);
+    return bytes;
   }
 
   private async readText(path: string): Promise<string> {
-    const data = await this.requireFf().readFile(path, 'utf8');
-    return typeof data === 'string' ? data : new TextDecoder().decode(data);
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    this.recordPhase('read');
+    const data = await this.requireFf().readFile(path, 'utf8', { signal });
+    const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+    this.fsLedger.add(path, new TextEncoder().encode(text).byteLength, 'MEMFS');
+    return text;
+  }
+
+  private async writeScratch(path: string, source: Uint8Array, countAsInput = false): Promise<void> {
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    const bytes = copyBytes(source);
+    this.recordPhase('materialize');
+    this.fsLedger.addJsCopy(bytes.byteLength);
+    try {
+      await this.requireFf().writeFile(path, bytes, { signal });
+    } finally {
+      this.fsLedger.releaseJsCopy(bytes.byteLength);
+    }
+    this.fsLedger.add(path, bytes.byteLength, 'MEMFS');
+    if (countAsInput) this.recordInputBytes(bytes.byteLength);
   }
 
   private async cleanup(paths: string[]): Promise<void> {
-    const ff = this.requireFf();
+    // Timeout/cancellation terminates the worker, which also destroys its virtual FS. Cleanup must
+    // not mask that distinct worker-state error by trying to address an already-dead worker.
+    if (!this.ff) {
+      for (const path of paths) {
+        this.mountedWorkerFs.delete(path);
+        this.fsLedger.remove(path);
+      }
+      return;
+    }
+    const ff = this.ff;
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
     for (const p of paths) {
       try {
-        await ff.deleteFile(p);
+        if (this.mountedWorkerFs.has(p)) {
+          await ff.unmount(p);
+          await ff.deleteDir(p, { signal });
+          this.mountedWorkerFs.delete(p);
+        } else {
+          await ff.deleteFile(p, { signal });
+        }
+        this.fsLedger.remove(p);
       } catch {
-        /* file may not exist (op failed before producing it) */
+        // A path never materialized by this operation is not a cleanup failure. A tracked path is
+        // retained in the ledger and executeOperation() turns it into a distinct worker/FS ERROR.
+        if (!this.fsLedger.snapshot().livePaths.includes(p)) continue;
       }
     }
   }
 
   /** Write a MediaInput into MEMFS; HLS playlists also get their referenced segments/keys. */
-  private async writeInput(input: MediaInput, name: string): Promise<WrittenInput> {
-    const bytes = copyBytes(await input.arrayBuffer());
+  private async writeInput(input: MediaInput, name: string, preloadedBytes?: Uint8Array): Promise<WrittenInput> {
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    const hintedHls = isHlsPlaylistInput(input);
+    if (!hintedHls && preloadedBytes === undefined) {
+      const blob = await input.blob();
+      this.enforceInputCeiling(blob.size, input);
+      if (blob.size >= WORKERFS_THRESHOLD_BYTES) {
+        const mountPoint = `/${name}.workerfs`;
+        const fileName = `input${inputExtension(input)}`;
+        try {
+          await this.requireFf().createDir(mountPoint, { signal });
+          await this.requireFf().mount(
+            'WORKERFS' as import('@ffmpeg/ffmpeg').FFFSType,
+            { blobs: [{ name: fileName, data: blob }] },
+            mountPoint,
+          );
+          this.mountedWorkerFs.add(mountPoint);
+          this.fsLedger.add(mountPoint, blob.size, 'WORKERFS');
+          this.recordInputBytes(blob.size);
+          return { name: `${mountPoint}/${fileName}`, cleanupPaths: [mountPoint], inputOptions: [] };
+        } catch (error) {
+          try {
+            await this.requireFf().deleteDir(mountPoint, { signal });
+          } catch {
+            // The directory may not have been created, or a failed mount may still own it.
+          }
+          throw new Error(`${ENGINE_ID}: WORKERFS mount failed for ${blob.size}-byte input`, { cause: error });
+        }
+      }
+    }
+
+    const bytes = preloadedBytes ?? copyBytes(await input.arrayBuffer());
+    this.enforceInputCeiling(bytes.byteLength, input);
+    this.fsLedger.addJsCopy(bytes.byteLength);
     const hls = isHlsPlaylistInput(input, bytes);
     const inName = hls && !name.endsWith('.m3u8') ? `${name}.m3u8` : name;
     const cleanupPaths = [inName];
 
     try {
       if (!hls) {
-        await this.requireFf().writeFile(inName, bytes);
+        await this.requireFf().writeFile(inName, bytes, { signal });
+        this.fsLedger.add(inName, bytes.byteLength, 'MEMFS');
+        this.recordInputBytes(bytes.byteLength);
+        this.fsLedger.releaseJsCopy(bytes.byteLength);
         return { name: inName, cleanupPaths, inputOptions: [] };
       }
 
       const playlistText = new TextDecoder().decode(bytes);
       const materialized = rewriteHlsPlaylistUris(playlistText, inName);
-      await this.requireFf().writeFile(inName, new TextEncoder().encode(materialized.playlist));
+      if (materialized.sidecars.length > this.limits.hlsSidecarCeiling) {
+        throw this.materializationMiss(
+          'FFMPEG_HLS_SIDECAR_LIMIT',
+          `HLS playlist references ${materialized.sidecars.length} objects; limit is ${this.limits.hlsSidecarCeiling}`,
+        );
+      }
+      const playlistBytes = new TextEncoder().encode(materialized.playlist);
+      await this.requireFf().writeFile(inName, playlistBytes, { signal });
+      this.fsLedger.add(inName, playlistBytes.byteLength, 'MEMFS');
+      this.recordInputBytes(bytes.byteLength);
+      this.fsLedger.releaseJsCopy(bytes.byteLength);
+      let hlsBytes = playlistBytes.byteLength;
 
       for (const sidecar of materialized.sidecars) {
-        const res = await fetch(resolveHlsSidecarUrl(input, sidecar.sourceUri), { cache: 'no-store' });
+        const res = await fetch(resolveHlsSidecarUrl(input, sidecar.sourceUri), { cache: 'no-store', signal });
         if (!res.ok) {
           throw new Error(
             `${ENGINE_ID}: failed to materialize HLS sidecar '${sidecar.sourceUri}' ` +
-              `(${res.status} ${res.statusText})`,
+            `(${res.status} ${res.statusText})`,
           );
         }
-        await this.requireFf().writeFile(sidecar.localName, copyBytes(await res.arrayBuffer()));
         cleanupPaths.push(sidecar.localName);
+        const contentLength = Number(res.headers.get('content-length'));
+        if (
+          Number.isFinite(contentLength) &&
+          contentLength >= 0 &&
+          hlsBytes + contentLength > this.limits.hlsMaterializedBytesCeiling
+        ) {
+          throw this.materializationMiss(
+            'FFMPEG_HLS_BYTE_LIMIT',
+            `HLS materialization exceeds ${this.limits.hlsMaterializedBytesCeiling} bytes`,
+          );
+        }
+        const sidecarBytes = copyBytes(await res.arrayBuffer());
+        hlsBytes += sidecarBytes.byteLength;
+        if (hlsBytes > this.limits.hlsMaterializedBytesCeiling) {
+          throw this.materializationMiss(
+            'FFMPEG_HLS_BYTE_LIMIT',
+            `HLS materialization exceeds ${this.limits.hlsMaterializedBytesCeiling} bytes`,
+          );
+        }
+        this.fsLedger.addJsCopy(sidecarBytes.byteLength);
+        try {
+          await this.requireFf().writeFile(sidecar.localName, sidecarBytes, { signal });
+        } finally {
+          this.fsLedger.releaseJsCopy(sidecarBytes.byteLength);
+        }
+        this.fsLedger.add(sidecar.localName, sidecarBytes.byteLength, 'MEMFS');
+        this.recordInputBytes(sidecarBytes.byteLength);
       }
 
       return { name: inName, cleanupPaths, inputOptions: ['-allowed_extensions', 'ALL'] };
     } catch (e) {
+      this.fsLedger.releaseJsCopy(bytes.byteLength);
       await this.cleanup(cleanupPaths);
       throw e;
     }
   }
 
+  private enforceInputCeiling(bytes: number, input: MediaInput): void {
+    if (bytes >= this.limits.wasmCeilingBytes) {
+      throw this.materializationMiss(
+        'FFMPEG_WASM_2GB_CEILING',
+        `${bytes}-byte input '${input.id}' reaches the ffmpeg.wasm 2 GB ceiling`,
+      );
+    }
+  }
+
+  private materializationMiss(reasonCode: string, reason: string): Error {
+    const request = this.activeOperation?.context.request;
+    if (request?.inputs.some((input) => input.mutated)) {
+      return new Error(`${ENGINE_ID}: malformed/mutated input exceeded a materialization guard: ${reason}`);
+    }
+    this.recordPolicy(reasonCode);
+    return createNotApplicableError(
+      ENGINE_ID,
+      request?.operation ?? 'probe',
+      reason,
+      request ? tupleSummary(request) : {},
+      reasonCode,
+    ) as unknown as Error;
+  }
+
+  private applicabilityMiss(reasonCode: string, reason: string): Error {
+    const request = this.activeOperation?.context.request;
+    this.recordPolicy(reasonCode);
+    return createNotApplicableError(
+      ENGINE_ID,
+      request?.operation ?? 'decrypt',
+      reason,
+      request ? tupleSummary(request) : {},
+      reasonCode,
+    ) as unknown as Error;
+  }
+
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    return this.executeOperation('probe', context, () => this.probeImpl(input));
+  }
+
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    return this.executeOperation('demux', context, () => this.demuxImpl(input));
+  }
+
+  async remux(
+    input: MediaInput,
+    opts: { container: string; tags?: Record<string, string> } & Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    return this.executeOperation('remux', context, () => this.remuxImpl(input, opts));
+  }
+
+  async decrypt(
+    input: MediaInput,
+    key: DecryptKey,
+    opts: { scheme: EncryptionScheme },
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    return this.executeOperation('decrypt', context, () => this.decryptImpl(input, key, opts));
+  }
+
+  async transcode(input: MediaInput, opts: TranscodeOptions, context?: OperationContext): Promise<MediaBytes> {
+    return this.executeOperation('transcode', context, () => this.transcodeImpl(input, opts));
+  }
+
+  async trim(
+    input: MediaInput,
+    range: { startUs: number; endUs: number },
+    opts: { container: string; frameAccurate: boolean },
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    return this.executeOperation('trim', context, () => this.trimImpl(input, range, opts));
+  }
+
+  async decodeFrames(
+    input: MediaInput,
+    opts?: DecodeOptions,
+    context?: OperationContext,
+  ): Promise<FrameSink> {
+    return this.executeOperation('decodeFrames', context, () => this.decodeFramesImpl(input, opts));
+  }
+
+  async seek(
+    input: MediaInput,
+    tUs: number,
+    context?: OperationContext,
+  ): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
+    return this.executeOperation('seek', context, () => this.seekImpl(input, tUs));
+  }
+
+  async prepareMuxTracks(
+    inputs: MediaInput[],
+    options?: Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<EncodedTracks> {
+    return this.executeOperation('mux', context, () => this.prepareMuxTracksImpl(inputs, options));
+  }
+
+  async mux(
+    tracks: EncodedTracks,
+    opts: { container: string } & Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    return this.executeOperation('mux', context, () => this.muxImpl(tracks, opts));
+  }
+
+  async concat(
+    segments: MediaBytes[],
+    opts: { container: string } & Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    return this.executeOperation('trim', context, () => this.concatImpl(segments, opts));
+  }
+
+  private async executeOperation<T extends object>(
+    operation: ConcreteOperationRequest['operation'],
+    suppliedContext: OperationContext | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const context = suppliedContext ?? fallbackOperationContext(operation, this.fallbackAbort.signal);
+    // Runner calls carry the complete concrete tuple and are preflighted here. Legacy/direct API
+    // calls do not, so applying an empty synthetic tuple would itself create false NA_ENGINE (most
+    // visibly for decrypt's absent encryption field); their operation-specific checks remain active.
+    if (suppliedContext !== undefined) {
+      const decision = this.supports(context.request);
+      if (!decision.supported) {
+        this.recordPolicy(decision.reasonCode);
+        throw createNotApplicableError(
+          ENGINE_ID,
+          operation,
+          decision.reason,
+          tupleSummary(context.request),
+          decision.reasonCode,
+        );
+      }
+    }
+    return this.lifecycle.operation(context.signal, async () => {
+      this.fsLedger.assertEmpty();
+      this.fsLedger.reset();
+      this.fsLedger.setWrapperHeapEstimate(WRAPPER_HEAP_ESTIMATE_BYTES);
+      this.activeOperation = {
+        startedAtMs: nowMs(),
+        phase: 'materialize',
+        bytesIn: 0,
+        bytesOut: 0,
+        context,
+      };
+      this.recordPhase('materialize');
+      let completed = false;
+      try {
+        const result = await run();
+        completed = true;
+        const telemetry = this.finalCounters();
+        (result as T & { telemetry?: OperationFinalCounters }).telemetry = telemetry;
+        this.snapshotConfig();
+        return result;
+      } finally {
+        const broken = this.lifecycle.reason;
+        if (broken) {
+          this.recordPhase(this.activeOperation?.phase ?? 'cleanup', {
+            workerTerminated: true,
+            reasonCode: broken.reasonCode,
+          });
+        }
+        this.fsLedger.setWorkingEstimate(0);
+        this.recordPhase('cleanup', broken
+          ? { workerTerminated: true, reasonCode: broken.reasonCode }
+          : {});
+        const live = this.fsLedger.snapshot().livePaths;
+        this.activeOperation = null;
+        this.snapshotConfig();
+        if (live.length > 0) {
+          throw this.lifecycle.breakWorker(
+            'FFMPEG_FS_CLEANUP_FAILED',
+            `ffmpeg virtual filesystem retained ${live.join(', ')} after ${operation}${completed ? '' : ' failure'}`,
+          );
+        }
+      }
+    });
+  }
+
+  private finalCounters(): OperationFinalCounters {
+    const active = this.activeOperation;
+    if (!active) return {};
+    return {
+      ...(active.bytesIn > 0 ? { bytesRead: active.bytesIn } : {}),
+      ...(active.bytesOut > 0 ? { bytesWritten: active.bytesOut } : {}),
+      ...(active.packetCount !== undefined ? { packetCount: active.packetCount } : {}),
+      ...(active.decodedFrames !== undefined ? { decodedFrames: active.decodedFrames } : {}),
+    };
+  }
+
+  private recordInputBytes(bytes: number): void {
+    const active = this.activeOperation;
+    if (!active || bytes <= 0) return;
+    active.bytesIn += bytes;
+    active.context.emit({ type: 'bytes-read', atMs: nowMs() - active.startedAtMs, bytes: active.bytesIn });
+  }
+
+  private recordOutputBytes(bytes: number): void {
+    const active = this.activeOperation;
+    if (!active || bytes <= 0) return;
+    active.bytesOut += bytes;
+    active.context.emit({ type: 'bytes-written', atMs: nowMs() - active.startedAtMs, bytes: active.bytesOut });
+  }
+
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
 
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
+  private async structuredProbe(
+    inName: string,
+    inputOptions: string[],
+    input: MediaInput,
+  ): Promise<StructuredProbeResult | null> {
+    const outName = `${this.scratch()}.ffprobe.json`;
+    const args = [
+      '-v', 'error',
+      ...inputOptions,
+      '-count_frames',
+      '-show_format',
+      '-show_streams',
+      '-show_data',
+      '-of', 'json',
+      '-i', inName,
+      '-o', outName,
+    ];
+    try {
+      const code = await this.ffprobeObserved(args, READ_EXEC_TIMEOUT_MS);
+      if (code !== 0) return null;
+      const text = await this.readText(outName);
+      this.fsLedger.add(outName, new TextEncoder().encode(text).byteLength, 'MEMFS');
+      const parsed = parseFfprobeJson(text, containerFromInput(input));
+      this.lastStructuredProbe = parsed;
+      if (this.activeConfig) {
+        const configs: Array<Record<string, unknown>> = [];
+        for (const [trackIndex, bytes] of parsed.decoderConfigs) {
+          configs.push({ trackIndex, bytes: bytes.byteLength, sha256: await sha256Hex(bytes) });
+        }
+        this.activeConfig.codecConfigs = configs;
+        this.snapshotConfig();
+      }
+      return parsed;
+    } catch (error) {
+      if (this.lifecycle.reason || this.activeOperation?.context.signal.aborted) throw error;
+      return null;
+    } finally {
+      await this.cleanup([outName]);
+    }
+  }
+
+  private async observedFrameTimeline(
+    inName: string,
+    inputOptions: string[],
+    sampleDurationSec?: number,
+    videoOrdinal = 0,
+  ): Promise<ReturnType<typeof parseFfprobeFramesJson>> {
+    const outName = `${this.scratch()}.frames.json`;
+    const args = [
+      '-v', 'error',
+      ...inputOptions,
+      ...(sampleDurationSec !== undefined ? ['-read_intervals', `0%+${sampleDurationSec}`] : []),
+      '-select_streams', `v:${videoOrdinal}`,
+      '-show_frames',
+      '-show_entries', 'frame=best_effort_timestamp_time,pts_time,pkt_duration_time,key_frame',
+      '-of', 'json',
+      '-i', inName,
+      '-o', outName,
+    ];
+    try {
+      const code = await this.ffprobeObserved(args, READ_EXEC_TIMEOUT_MS);
+      if (code !== 0) return [];
+      const text = await this.readText(outName);
+      this.fsLedger.add(outName, new TextEncoder().encode(text).byteLength, 'MEMFS');
+      return parseFfprobeFramesJson(text);
+    } finally {
+      await this.cleanup([outName]);
+    }
+  }
+
+  private async probeImpl(input: MediaInput): Promise<NormalizedMetadata> {
     if (isStillImageInput(input)) {
       throw new Error(`${ENGINE_ID}: probe rejected still-image input; this suite probes media containers only`);
     }
     const base = this.scratch();
     const written = await this.writeInput(input, `${base}.in`);
     try {
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      if (structured) {
+        const observed = await this.observedFrameTimeline(written.name, written.inputOptions, 10);
+        const metadata = applyObservedFrameCadence(structured.metadata, observed);
+        metadata.probeEvidence = { readMode: 'whole-file' };
+        return metadata;
+      }
       const log = await this.runInfo(written.name, written.inputOptions);
-      return this.metadataFromLog(log, input);
+      const metadata = this.metadataFromLog(log, input);
+      for (const track of metadata.tracks) {
+        if (track.type === 'video' && track.fps !== undefined) {
+          track.fpsProvenance = { source: 'nominal', cadence: 'UNKNOWN' };
+        }
+      }
+      metadata.probeEvidence = { readMode: 'whole-file' };
+      return metadata;
     } finally {
       await this.cleanup(written.cleanupPaths);
     }
@@ -1910,15 +2814,8 @@ export class FfmpegWasmEngine implements MediaEngine {
    * error. We only fail if the log shows the input could not be opened/parsed at all.
    */
   private async runInfo(inName: string, inputOptions: string[] = []): Promise<string> {
-    const ff = this.requireFf();
-    this.logTail = [];
-    try {
-      // timeoutMs guards fuzzed/truncated inputs from hanging the worker (§9.10/§11). On timeout exec
-      // returns 1 (no throw) and no Input block is logged → the check below throws a clean error.
-      await ff.exec(['-hide_banner', ...inputOptions, '-i', inName], READ_EXEC_TIMEOUT_MS);
-    } catch {
-      /* exec may reject on the deliberate "no output file" abort; the log is captured regardless */
-    }
+    // Nonzero is expected because no output is requested; timeout and worker failures remain fatal.
+    await this.execObserved(['-hide_banner', ...inputOptions, '-i', inName], READ_EXEC_TIMEOUT_MS);
     const log = this.logTail.join('\n');
     this.logTail = [];
     if (!/^Input #\d+/m.test(log)) {
@@ -1958,12 +2855,16 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
 
-  async demux(input: MediaInput): Promise<DemuxResult> {
+  private async demuxImpl(input: MediaInput): Promise<DemuxResult> {
     const base = this.scratch();
     const crcName = `${base}.framecrc.txt`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
-      const ff = this.requireFf();
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      if (structured) {
+        const observed = await this.observedFrameTimeline(written.name, written.inputOptions, 10);
+        applyObservedFrameCadence(structured.metadata, observed);
+      }
 
       // ONE pass does both jobs: `-map 0 -c copy -f framecrc` re-packetizes nothing (stream copy) and
       // writes a per-COPIED-packet table to crcName, while the SAME run prints the Input block to the
@@ -1972,30 +2873,23 @@ export class FfmpegWasmEngine implements MediaEngine {
       // secondary audio/subtitle/data tracks from multi-track packet walks. framecrc enumerates the real
       // container packets, so its row count + sizes + keyframe flags match an ffprobe `-show_packets`
       // walk for compressed bitstreams. (Verified byte-for-byte vs golden for mp4/mov/webm/mkv/ts/ogg.)
-      this.logTail = [];
       let exitCode: number | null = null;
-      try {
-        // timeoutMs guards fuzzed/truncated inputs from wedging the worker (§9.10/§11/§A.16). On
-        // timeout exec returns 1 (no throw); the Input-block + readText checks below then throw clean.
-        exitCode = await ff.exec(
-          [
-            '-hide_banner',
-            ...written.inputOptions,
-            '-i',
-            written.name,
-            '-map',
-            '0',
-            '-c',
-            'copy',
-            '-f',
-            'framecrc',
-            crcName,
-          ],
-          READ_EXEC_TIMEOUT_MS,
-        );
-      } catch {
-        /* a hard demux error rejects; surfaced below once we've inspected the log/output */
-      }
+      exitCode = await this.execObserved(
+        [
+          '-hide_banner',
+          ...written.inputOptions,
+          '-i',
+          written.name,
+          '-map',
+          '0',
+          '-c',
+          'copy',
+          '-f',
+          'framecrc',
+          crcName,
+        ],
+        READ_EXEC_TIMEOUT_MS,
+      );
       const log = this.logTail.join('\n');
       this.logTail = [];
 
@@ -2006,7 +2900,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         );
       }
 
-      const metadata = this.metadataFromLog(log, input);
+      const metadata = structured?.metadata ?? this.metadataFromLog(log, input);
 
       let crc: string;
       try {
@@ -2019,8 +2913,42 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
 
       const packets = parseFramecrcPackets(crc);
-      packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
-      return { metadata, packets };
+      const representations = representationForTracks(
+        metadata.container,
+        metadata.tracks,
+        structured?.decoderConfigs ?? new Map(),
+        structured?.timebases ?? new Map(),
+        structured?.trackIndexes ?? metadata.tracks.map((_, index) => index),
+      );
+      for (const packet of packets) {
+        const track = metadata.tracks[packet.trackIndex];
+        const representation = representations.find((item) => item.trackIndex === packet.trackIndex);
+        if (track) {
+          packet.trackType = track.type;
+          packet.codec = track.codec;
+        }
+        if (representation) packet.framing = representation.framing;
+        packet.randomAccessKind = packet.keyframe ? 'ffmpeg-packet-key-flag' : 'non-random-access';
+      }
+      packets.sort(
+        (a, b) =>
+          (a.dtsUs ?? a.ptsUs) - (b.dtsUs ?? b.ptsUs) ||
+          a.trackIndex - b.trackIndex,
+      );
+      if (this.activeOperation) this.activeOperation.packetCount = packets.length;
+      return {
+        metadata,
+        packets,
+        packetOrdering: 'decode',
+        representations,
+        ffmpegRepresentation: {
+          muxer: 'framecrc',
+          bitstreamFilters: [],
+          command: redactFfmpegCommand([
+            '-hide_banner', ...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy', '-f', 'framecrc', crcName,
+          ]),
+        },
+      } as DemuxResult;
     } finally {
       await this.cleanup([...written.cleanupPaths, crcName]);
     }
@@ -2028,7 +2956,7 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── remux ────────────────────────────────────────────────────────────────────────────────────
 
-  async remux(
+  private async remuxImpl(
     input: MediaInput,
     opts: { container: string; tags?: Record<string, string> } & Record<string, unknown>,
   ): Promise<MediaBytes> {
@@ -2036,17 +2964,40 @@ export class FfmpegWasmEngine implements MediaEngine {
     const outName = `${base}.out.${containerExt(opts.container)}`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      const inputMetadata = structured?.metadata ?? this.metadataFromLog(
+        await this.runInfo(written.name, written.inputOptions),
+        input,
+      );
       assertRemuxContainerCompatible(inputMetadata.tracks, opts.container);
+      const legality = muxLegality(inputMetadata.tracks, opts.container);
+      if (legality) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'remux',
+          legality,
+          this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+          'FFMPEG_MUX_TUPLE_ILLEGAL',
+        );
+      }
+      if (opts.fastStart === 'reserve') {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'remux',
+          'reserved-moov output is not advertised without verified -moov_size sizing',
+          this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+          'FFMPEG_FASTSTART_RESERVE_UNSUPPORTED',
+        );
+      }
 
       // Stream copy: no re-encode, just rewrap. Explicitly map every input stream so ffmpeg's
       // default "one stream per type" selection does not drop secondary audio tracks.
       const args = [...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (opts.fragmented === true || opts.fastStart === 'fragmented') {
-          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+          args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
         } else if (opts.fastStart !== false) {
-          args.push('-movflags', '+faststart');
+          args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
         }
       } else if (opts.container === 'ts') {
         // FFmpeg's MPEG-TS muxer defaults to a ~1.4s preload/start offset. Keep remuxed TS output
@@ -2062,7 +3013,19 @@ export class FfmpegWasmEngine implements MediaEngine {
       args.push(outName);
       await this.run(args);
       const bytes = await this.readBinary(outName);
-      return { bytes, mime: containerMime(opts.container), container: opts.container };
+      return {
+        bytes,
+        mime: containerMime(opts.container),
+        container: opts.container,
+        ffmpegRepresentation: {
+          muxer: opts.container,
+          bitstreamFilters: [],
+          command: redactFfmpegCommand(args),
+          codecTags: inputMetadata.tracks.map((track) => track.nativeCodecTag ?? track.codec),
+          extradataForms: inputMetadata.tracks.map((track) =>
+            track.codec === 'h264' ? 'avcC-or-in-band' : track.codec === 'hevc' ? 'hvcC-or-in-band' : 'codec-native'),
+        },
+      } as MediaBytes;
     } finally {
       await this.cleanup([...written.cleanupPaths, outName]);
     }
@@ -2070,11 +3033,24 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── decrypt ──────────────────────────────────────────────────────────────────────────────────
 
-  async decrypt(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes> {
-    // Scheme dispatch. Two schemes are honestly supported and declared (encryption capability set is
-    // ['cenc-ctr','hls-aes128']); everything else throws a PLAIN Error so graceful-failure robustness
-    // cases record a clean reject (runRobustness maps NotApplicableError→NA_ENGINE, plain throw→graceful).
-    if (opts.scheme === 'hls-aes128') {
+  private async decryptImpl(input: MediaInput, key: DecryptKey, opts: { scheme: EncryptionScheme }): Promise<MediaBytes> {
+    // Inspect syntax/protection metadata before making an applicability decision. This is the key
+    // boundary between valid-but-unimplemented protection (NA_ENGINE) and damaged input (ERROR/FAIL).
+    const encryptedBytes = copyBytes(await input.arrayBuffer());
+    this.enforceInputCeiling(encryptedBytes.byteLength, input);
+    const hlsInput = isHlsPlaylistInput(input, encryptedBytes);
+
+    if (hlsInput) {
+      const protection = inspectHlsProtection(encryptedBytes);
+      const applicability = classifyHlsDecryptApplicability(protection, opts.scheme);
+      if (!applicability.supported) {
+        this.recordInputBytes(encryptedBytes.byteLength);
+        throw this.applicabilityMiss(
+          applicability.reasonCode,
+          applicability.reason,
+        );
+      }
+
       // Native FFmpeg HLS decrypt-on-demux + stream copy. writeInput() materializes the EXT-X-KEY URI
       // and referenced .ts segments into MEMFS and returns inputOptions (['-allowed_extensions','ALL'])
       // plus the playlist name. The HLS demuxer transparently decrypts METHOD=AES-128 segments during
@@ -2082,7 +3058,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       // -protocol_whitelist is needed (the HLS demuxer auto-whitelists crypto+file).
       const base = this.scratch();
       const outName = `${base}.clear.mp4`;
-      const written = await this.writeInput(input, `${base}.in`);
+      const written = await this.writeInput(input, `${base}.in`, encryptedBytes);
       try {
         await this.run(
           [
@@ -2094,7 +3070,7 @@ export class FfmpegWasmEngine implements MediaEngine {
             '-c',
             'copy',
             '-movflags',
-            '+faststart',
+            FFMPEG_FASTSTART_MOVFLAGS,
             outName,
           ],
           READ_EXEC_TIMEOUT_MS,
@@ -2106,11 +3082,11 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
     }
 
-    if (opts.scheme !== 'cenc-ctr') {
-      // clearkey / cenc-cens / hls-sample-aes / cenc-cbcs: not a native ffmpeg.wasm decrypt path. A plain
-      // throw (NOT NotApplicableError) yields a graceful-reject verdict for the *_decrypt_na robustness
-      // scenarios. Declared encryption set stays ['cenc-ctr','hls-aes128'] — these are intentionally absent.
-      throw new Error(`${ENGINE_ID}: unsupported decrypt scheme '${opts.scheme}'`);
+    const protection = inspectProtectionStructure(encryptedBytes);
+    const applicability = classifyIsoDecryptApplicability(protection, opts.scheme);
+    if (!applicability.supported) {
+      this.recordInputBytes(encryptedBytes.byteLength);
+      throw this.applicabilityMiss(applicability.reasonCode, applicability.reason);
     }
 
     const keyHex = key.keyHex.trim().toLowerCase();
@@ -2121,7 +3097,9 @@ export class FfmpegWasmEngine implements MediaEngine {
     const base = this.scratch();
     const clearName = `${base}.cenc-clear-input.mp4`;
     const outName = `${base}.clear.mp4`;
-    const encryptedBytes = copyBytes(await input.arrayBuffer());
+    const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
+    this.fsLedger.addJsCopy(encryptedBytes.byteLength);
+    this.recordInputBytes(encryptedBytes.byteLength);
     let clearBytes: Uint8Array;
     try {
       clearBytes = await decryptCencCtrMp4(encryptedBytes, hexToBytesStrict(keyHex, 'CENC key'), key.kid);
@@ -2133,7 +3111,9 @@ export class FfmpegWasmEngine implements MediaEngine {
       // Clear MP4 no-op decrypt case: preserve usable media by remuxing the original bytes below.
       clearBytes = encryptedBytes;
     }
-    await this.requireFf().writeFile(clearName, clearBytes);
+    if (clearBytes !== encryptedBytes) this.fsLedger.addJsCopy(clearBytes.byteLength);
+    await this.requireFf().writeFile(clearName, clearBytes, { signal });
+    this.fsLedger.add(clearName, clearBytes.byteLength, 'MEMFS');
     try {
       await this.run(
         [
@@ -2148,7 +3128,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           '-tag:a',
           'mp4a',
           '-movflags',
-          '+faststart',
+          FFMPEG_FASTSTART_MOVFLAGS,
           outName,
         ],
         READ_EXEC_TIMEOUT_MS,
@@ -2157,27 +3137,16 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { bytes, mime: containerMime('mp4'), container: 'mp4' };
     } finally {
       await this.cleanup([clearName, outName]);
+      this.fsLedger.releaseJsCopy(encryptedBytes.byteLength);
+      if (clearBytes !== encryptedBytes) this.fsLedger.releaseJsCopy(clearBytes.byteLength);
     }
   }
 
   // ── transcode ────────────────────────────────────────────────────────────────────────────────
 
-  async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
+  private async transcodeImpl(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     if (isStillImageInput(input)) {
       throw new Error(`${ENGINE_ID}: transcode rejected still-image input`);
-    }
-    const suiteBudgetNa = isSuiteBudgetTranscodeNa(input, opts);
-    if (suiteBudgetNa) {
-      throw new NotApplicableError('transcode', suiteBudgetNa);
-    }
-
-    if (opts.variants && opts.variants.length > 0) {
-      // 'fanout' is intentionally NOT declared: one ffmpeg invocation can emit N renditions, but the
-      // single-MediaBytes contract can return only one blob → honest NA(engine) for ABR ladders.
-      throw new NotApplicableError(
-        'transcode',
-        'multi-output fan-out returns one MediaBytes; call transcode() per variant',
-      );
     }
     if (input.mutated) {
       throw new Error(`${ENGINE_ID}: transcode rejected mutated/robustness input`);
@@ -2185,14 +3154,27 @@ export class FfmpegWasmEngine implements MediaEngine {
     if (input.id.includes('truncated')) {
       throw new Error(`${ENGINE_ID}: transcode rejected known truncated input '${input.id}' before wasm encode`);
     }
+    const suiteBudgetNa = isSuiteBudgetTranscodeNa(input, opts);
+    if (suiteBudgetNa) {
+      throw createNotApplicableError(ENGINE_ID, 'transcode', suiteBudgetNa);
+    }
+
+    if (opts.variants && opts.variants.length > 0) {
+      // 'fanout' is intentionally NOT declared: one ffmpeg invocation can emit N renditions, but the
+      // single-MediaBytes contract can return only one blob → honest NA(engine) for ABR ladders.
+      throw createNotApplicableError(ENGINE_ID,
+        'transcode',
+        'multi-output fan-out returns one MediaBytes; call transcode() per variant',
+      );
+    }
     if (opts.video && ((opts.video.width !== undefined && opts.video.width <= 1) || (opts.video.height !== undefined && opts.video.height <= 1))) {
       throw new Error(`${ENGINE_ID}: transcode rejected degenerate video dimensions`);
     }
     if (opts.video?.fps !== undefined && opts.video.fps > 120) {
-      throw new NotApplicableError('transcode', `fps=${opts.video.fps} is too large for this wasm encode path`);
+      throw createNotApplicableError(ENGINE_ID, 'transcode', `fps=${opts.video.fps} is too large for this wasm encode path`);
     }
     if (opts.audio?.codec === 'opus') {
-      throw new NotApplicableError(
+      throw createNotApplicableError(ENGINE_ID,
         'transcode',
         'libopus encode in the vendored wasm core traps or exceeds the suite timeout; Opus encode is not declared as a reliable transcode path',
       );
@@ -2203,7 +3185,11 @@ export class FfmpegWasmEngine implements MediaEngine {
     const written = await this.writeInput(input, `${base}.in`);
     const cleanupPaths = [...written.cleanupPaths, outName];
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      const inputMetadata = structured?.metadata ?? this.metadataFromLog(
+        await this.runInfo(written.name, written.inputOptions),
+        input,
+      );
       const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
       const hasAudio = inputMetadata.tracks.some((t) => t.type === 'audio');
       // Track mismatch is a graceful-failure robustness case (mismatch_audio_only_to_video_target,
@@ -2219,16 +3205,16 @@ export class FfmpegWasmEngine implements MediaEngine {
       const audioRoundtripCodec = stringOption(plainObject(opts.audio), ['roundtrip']);
       if (audioRoundtripCodec) {
         if (hasVideo) {
-          throw new NotApplicableError('transcode', 'audio roundtrip invariant is only wired for audio-only inputs');
+          throw createNotApplicableError(ENGINE_ID, 'transcode', 'audio roundtrip invariant is only wired for audio-only inputs');
         }
         const finalCodec = opts.audio?.codec;
         const roundtripEnc = audioEncoderName(audioRoundtripCodec);
         const finalEnc = finalCodec ? audioEncoderName(finalCodec) : null;
         if (!roundtripEnc) {
-          throw new NotApplicableError('transcode', `no encoder for audio roundtrip codec '${audioRoundtripCodec}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `no encoder for audio roundtrip codec '${audioRoundtripCodec}'`);
         }
         if (!finalCodec || !finalEnc) {
-          throw new NotApplicableError('transcode', `no encoder for final audio codec '${finalCodec ?? 'copy'}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `no encoder for final audio codec '${finalCodec ?? 'copy'}'`);
         }
 
         const midContainer = audioRoundtripCodec.endsWith('be') ? 'aiff' : opts.container;
@@ -2254,8 +3240,19 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (opts.audio?.bitrate) finalArgs.push('-b:a', String(opts.audio.bitrate));
         finalArgs.push(outName);
         await this.run(finalArgs);
+        const intermediate = await this.readBinary(midName);
         const bytes = await this.readBinary(outName);
-        return { bytes, mime: containerMime(opts.container), container: opts.container };
+        return {
+          bytes,
+          mime: containerMime(opts.container),
+          container: opts.container,
+          intermediates: [{
+            role: 'audio-dsp-roundtrip-leg-1',
+            bytes: intermediate,
+            mime: containerMime(midContainer),
+            container: midContainer,
+          }],
+        };
       }
 
       const extra = opts as unknown as Record<string, unknown>;
@@ -2276,23 +3273,23 @@ export class FfmpegWasmEngine implements MediaEngine {
         const videoExtra = plainObject(v);
         const enc = v.codec ? videoEncoderName(v.codec) : null;
         if (v.codec && !enc) {
-          throw new NotApplicableError('transcode', `no software encoder for video codec '${v.codec}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `no software encoder for video codec '${v.codec}'`);
         }
         const requestedBitDepth = numberOption(videoExtra, ['bitDepth', 'depth']);
         if (requestedBitDepth !== undefined && requestedBitDepth > 8) {
           if (enc !== 'libx265') {
-            throw new NotApplicableError('transcode', `10-bit output is only wired for HEVC/libx265, got '${v.codec ?? 'copy'}'`);
+            throw createNotApplicableError(ENGINE_ID, 'transcode', `10-bit output is only wired for HEVC/libx265, got '${v.codec ?? 'copy'}'`);
           }
-          throw new NotApplicableError(
+          throw createNotApplicableError(ENGINE_ID,
             'transcode',
             '10-bit HEVC output encode exceeds the browser-wasm suite budget in the stable ffmpeg.wasm core',
           );
         }
         if (keepAlpha && enc !== 'libvpx' && enc !== 'libvpx-vp9') {
-          throw new NotApplicableError('transcode', `alpha-preserving transcode is not wired for '${v.codec ?? 'copy'}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `alpha-preserving transcode is not wired for '${v.codec ?? 'copy'}'`);
         }
         if (keepAlpha && enc === 'libvpx-vp9') {
-          throw new NotApplicableError(
+          throw createNotApplicableError(ENGINE_ID,
             'transcode',
             'VP9 alpha encode traps in the vendored wasm libvpx-vp9 path; VP8 alpha transcode is the stable alpha-preserving WebM output',
           );
@@ -2347,7 +3344,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           const pqSource = from === 'pq' || from === 'smpte2084' || from === 'hdr10';
           const sdrTarget = to === 'sdr' || to === 'bt709' || to === 'rec709';
           if (!pqSource || !sdrTarget) {
-            throw new NotApplicableError('transcode', `tone-map path '${from}' -> '${to}' is not wired`);
+            throw createNotApplicableError(ENGINE_ID, 'transcode', `tone-map path '${from}' -> '${to}' is not wired`);
           }
           const algo = ffmpegToneMapAlgorithm(stringOption(tonemap, ['algorithm', 'algo', 'tonemap']));
           filters.push(
@@ -2375,14 +3372,14 @@ export class FfmpegWasmEngine implements MediaEngine {
         }
         const requestedPasses = numberOption(videoExtra, ['passes']) ?? numberOption(extra, ['passes']);
         if (requestedPasses !== undefined && requestedPasses !== 1 && requestedPasses !== 2) {
-          throw new NotApplicableError('transcode', `unsupported pass count '${requestedPasses}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `unsupported pass count '${requestedPasses}'`);
         }
         if (requestedPasses === 2) {
           if (!v.bitrate) {
-            throw new NotApplicableError('transcode', 'two-pass encode requires a target video bitrate');
+            throw createNotApplicableError(ENGINE_ID, 'transcode', 'two-pass encode requires a target video bitrate');
           }
           if (enc !== 'libx264' && enc !== 'libx265') {
-            throw new NotApplicableError('transcode', `two-pass encode is not wired for '${v.codec ?? 'copy'}'`);
+            throw createNotApplicableError(ENGINE_ID, 'transcode', `two-pass encode is not wired for '${v.codec ?? 'copy'}'`);
           }
           twoPassLog = `${base}.passlog`;
           cleanupPaths.push(`${twoPassLog}-0.log`, `${twoPassLog}-0.log.mbtree`);
@@ -2467,7 +3464,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         };
         const enc = a.codec ? audioEncoderName(a.codec) : null;
         if (a.codec && !enc) {
-          throw new NotApplicableError('transcode', `no encoder for audio codec '${a.codec}'`);
+          throw createNotApplicableError(ENGINE_ID, 'transcode', `no encoder for audio codec '${a.codec}'`);
         }
         if (enc) args.push('-c:a', enc);
         const audioFilters: string[] = [];
@@ -2495,7 +3492,7 @@ export class FfmpegWasmEngine implements MediaEngine {
               const start = Math.max(0, durationSec - fade.outSec);
               audioFilters.push(`afade=t=out:st=${start}:d=${fade.outSec}${curve}`);
             } else {
-              throw new NotApplicableError('transcode', 'fade-out requires a known input duration');
+              throw createNotApplicableError(ENGINE_ID, 'transcode', 'fade-out requires a known input duration');
             }
           }
         }
@@ -2516,9 +3513,9 @@ export class FfmpegWasmEngine implements MediaEngine {
 
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (extra.fastStart === 'fragmented' || extra.fragmented === true) {
-          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+          args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
         } else if (extra.fastStart !== false) {
-          args.push('-movflags', '+faststart');
+          args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
         }
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
@@ -2535,14 +3532,14 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── trim ─────────────────────────────────────────────────────────────────────────────────────
 
-  async trim(
+  private async trimImpl(
     input: MediaInput,
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
     const inputName = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
     if (inputName.endsWith('vp9_alpha.webm') && !opts.frameAccurate) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(ENGINE_ID,
         'trim',
         'VP9 alpha WebM copy-trim cannot meet the suite boundary tolerance in this ffmpeg.wasm path',
       );
@@ -2564,7 +3561,11 @@ export class FfmpegWasmEngine implements MediaEngine {
     const outName = `${base}.out.${containerExt(opts.container)}`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
-      const inputMetadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      const inputMetadata = structured?.metadata ?? this.metadataFromLog(
+        await this.runInfo(written.name, written.inputOptions),
+        input,
+      );
       const startSec = range.startUs / 1_000_000;
       const durationSec = (range.endUs - range.startUs) / 1_000_000;
       if (inputMetadata.durationSec !== null && startSec >= inputMetadata.durationSec) {
@@ -2588,12 +3589,12 @@ export class FfmpegWasmEngine implements MediaEngine {
         const audio = inputMetadata.tracks.find((t) => t.type === 'audio');
         if (video) {
           const enc = videoEncoderName(video.codec);
-          if (!enc) throw new NotApplicableError('trim', `no frame-accurate encoder for video codec '${video.codec}'`);
+          if (!enc) throw createNotApplicableError(ENGINE_ID, 'trim', `no frame-accurate encoder for video codec '${video.codec}'`);
           args.push('-c:v', enc);
           if (enc === 'libx264') {
             args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
           } else if (enc === 'libx265') {
-            throw new NotApplicableError(
+            throw createNotApplicableError(ENGINE_ID,
               'trim',
               'frame-accurate HEVC trim exceeds the suite timeout in the stable single-thread wasm core',
             );
@@ -2606,7 +3607,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (audio) {
           const enc = audioEncoderName(audio.codec);
           if (enc === 'libopus') {
-            throw new NotApplicableError('trim', 'libopus encode is not reliable in this wasm core');
+            throw createNotApplicableError(ENGINE_ID, 'trim', 'libopus encode is not reliable in this wasm core');
           }
           if (enc) args.push('-c:a', enc);
         }
@@ -2628,7 +3629,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
       args.push('-avoid_negative_ts', 'make_zero');
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        args.push('-movflags', '+faststart');
+        args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }
@@ -2646,24 +3647,41 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── decodeFrames ─────────────────────────────────────────────────────────────────────────────
 
-  async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
+  private async decodeFramesImpl(input: MediaInput, opts?: DecodeOptions): Promise<FrameSink> {
     const suiteBudgetNa = isSuiteBudgetDecodeNa(input);
     if (suiteBudgetNa) {
-      throw new NotApplicableError('decodeFrames', suiteBudgetNa);
+      throw createNotApplicableError(ENGINE_ID, 'decodeFrames', suiteBudgetNa);
     }
     const base = this.scratch();
     const rawName = `${base}.rgba`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
       const inputLog = await this.runInfo(written.name, written.inputOptions);
-      const inputMetadata = this.metadataFromLog(inputLog, input);
-      const videoTrack = inputMetadata.tracks.find((t) => t.type === 'video');
-      const audioTrack = inputMetadata.tracks.find((t) => t.type === 'audio');
-      if (!videoTrack && audioTrack) {
+      const inputMetadata = structured?.metadata ?? this.metadataFromLog(inputLog, input);
+      const selected = resolveDecodeTrack(
+        inputMetadata.tracks,
+        opts?.track,
+        structured?.trackIndexes ?? inputMetadata.tracks.map((_, index) => index),
+        this.activeOperation
+          ? tupleSummary(this.activeOperation.context.request)
+          : { inputContainers: [], inputCodecs: [], outputCodecs: [] },
+      );
+      const selectedEvidence: NonNullable<FrameSink['selectedTrack']> = {
+        schema: DECODE_TRACK_SELECTOR_SCHEMA,
+        type: selected.track.type as 'video' | 'audio',
+        trackIndex: selected.trackIndex,
+        typeOrdinal: selected.typeOrdinal,
+        codec: canonicalCodec(selected.track.codec),
+        ...(selected.track.width !== undefined ? { width: selected.track.width } : {}),
+        ...(selected.track.height !== undefined ? { height: selected.track.height } : {}),
+      };
+      if (selected.track.type === 'audio') {
+        const audioTrack = selected.track;
         const sampleRate = audioTrack.sampleRate && audioTrack.sampleRate > 0 ? audioTrack.sampleRate : 48_000;
         const channels = audioTrack.channels && audioTrack.channels > 0 ? audioTrack.channels : 1;
         const maxSamples = Math.max(0, Math.floor(opts?.maxFrames ?? 4096));
-        const args = [...written.inputOptions, '-i', written.name, '-map', '0:a:0', '-vn'];
+        const args = [...written.inputOptions, '-i', written.name, '-map', `0:${selected.sourceTrackIndex}`, '-vn'];
         if (maxSamples > 0) args.push('-t', (maxSamples / sampleRate).toFixed(9));
         args.push('-f', 'f32le', '-acodec', 'pcm_f32le', rawName);
         await this.run(args);
@@ -2683,20 +3701,46 @@ export class FfmpegWasmEngine implements MediaEngine {
             width: channels,
             height: 1,
           });
+          if (i === 0) opts?.onFirstFrame?.(nowMs());
         }
-        return { frames };
+        if (this.activeOperation) this.activeOperation.decodedFrames = frames.length;
+        return { frames, selectedTrack: selectedEvidence };
       }
 
       // Learn dimensions + frame rate (from the `ffmpeg -i` log, no ffprobe) so we can slice the raw
       // stream and assign PTS.
-      const v = this.firstVideoTrack(inputLog, 'decodeFrames');
+      const structuredVideo = selected.track.width !== undefined && selected.track.height !== undefined
+        ? selected.track as NormalizedTrack & { width: number; height: number }
+        : undefined;
+      if (!structuredVideo && opts?.track) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'decodeFrames',
+          `selected video track ${selected.trackIndex} has no observable coded dimensions`,
+          this.activeOperation
+            ? tupleSummary(this.activeOperation.context.request)
+            : { inputContainers: [], inputCodecs: [], outputCodecs: [] },
+          'FFMPEG_DECODE_TRACK_DIMENSIONS_UNAVAILABLE',
+        );
+      }
+      const v = structuredVideo ?? this.firstVideoTrack(inputLog, 'decodeFrames');
       const width = v.width;
       const height = v.height;
       const fps = v.fps && v.fps > 0 ? v.fps : 30;
       const maxFrames = opts?.maxFrames;
+      const observedTimeline = await this.observedFrameTimeline(
+        written.name,
+        written.inputOptions,
+        undefined,
+        selected.typeOrdinal,
+      );
 
       // Decode to tight, straight-alpha, top-left RGBA rawvideo (frames back-to-back, no padding).
-      const args = [...written.inputOptions, '-i', written.name];
+      const args = [
+        ...written.inputOptions,
+        '-i', written.name,
+        '-map', `0:${selected.sourceTrackIndex}`,
+      ];
       if (maxFrames && maxFrames > 0) args.push('-frames:v', String(maxFrames));
       args.push('-vf', rawRgbaColorFilter(width, height));
       args.push('-pix_fmt', 'rgba', '-f', 'rawvideo', rawName);
@@ -2714,15 +3758,19 @@ export class FfmpegWasmEngine implements MediaEngine {
         const start = i * frameBytes;
         const view = raw.subarray(start, start + frameBytes);
         const sha256 = await sha256Hex(view);
-        const ptsUs = Math.round((i / fps) * 1_000_000);
+        const ptsUs = observedTimeline[i]?.ptsUs ?? Math.round((i / fps) * 1_000_000);
         frames.push({ index: i, ptsUs, sha256, width, height });
         const clamped = new Uint8ClampedArray(frameBytes);
         clamped.set(view);
         pixels.push(clamped);
+        if (i === 0) opts?.onFirstFrame?.(nowMs());
       }
+
+      if (this.activeOperation) this.activeOperation.decodedFrames = frames.length;
 
       return {
         frames,
+        selectedTrack: selectedEvidence,
         async getPixels(i: number): Promise<ImageData> {
           const buf = pixels[i];
           if (!buf) throw new Error(`${ENGINE_ID}: frame ${i} out of range (have ${pixels.length})`);
@@ -2736,14 +3784,19 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── seek ─────────────────────────────────────────────────────────────────────────────────────
 
-  async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
+  private async seekImpl(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
     const base = this.scratch();
     const rawName = `${base}.rgba`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
       // Dimensions from the `ffmpeg -i` log (no ffprobe).
+      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
       const log = await this.runInfo(written.name, written.inputOptions);
-      const v = this.firstVideoTrack(log, 'seek');
+      const structuredVideo = structured?.metadata.tracks.find(
+        (track): track is NormalizedTrack & { width: number; height: number } =>
+          track.type === 'video' && track.width !== undefined && track.height !== undefined,
+      );
+      const v = structuredVideo ?? this.firstVideoTrack(log, 'seek');
       const width = v.width;
       const height = v.height;
       const durationSec = parseDurationSecFromLog(log);
@@ -2752,12 +3805,17 @@ export class FfmpegWasmEngine implements MediaEngine {
         const frameStepSec = v.fps && v.fps > 0 ? 1 / v.fps : 1 / 30;
         tSec = Math.min(tSec, Math.max(0, durationSec - frameStepSec));
       }
+      const timeline = await this.observedFrameTimeline(written.name, written.inputOptions);
+      const requestedUs = Math.round(tSec * 1_000_000);
+      const observed = timeline.find((frame) => frame.ptsUs >= requestedUs) ?? timeline.at(-1);
+      const landedPtsUs = observed?.ptsUs ?? requestedUs;
+      const landedSec = landedPtsUs / 1_000_000;
 
       // Decode-accurate seek: -ss AFTER -i decodes from the start and lands exactly on tSec, then
       // grab a single frame. The output stream restarts its clock at 0, so we report the requested
       // target as the landed presentation time.
       await this.run([
-        '-ss', tSec.toFixed(6), ...written.inputOptions, '-i', written.name, '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
+        ...written.inputOptions, '-i', written.name, '-ss', landedSec.toFixed(6), '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
       ]);
       const raw = await this.readBinary(rawName);
       const frameBytes = width * height * 4;
@@ -2766,7 +3824,6 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
       const view = raw.subarray(0, frameBytes);
       const sha256 = await sha256Hex(view);
-      const landedPtsUs = Math.round(tSec * 1_000_000);
       return { landedPtsUs, frame: { index: 0, ptsUs: landedPtsUs, sha256, width, height } };
     } finally {
       await this.cleanup([...written.cleanupPaths, rawName]);
@@ -2788,8 +3845,7 @@ export class FfmpegWasmEngine implements MediaEngine {
   // cannot frame as a valid FFmpeg input throws NotApplicableError so the runner records an honest
   // NA_ENGINE instead of a fake green or a runner-level prepare error.
 
-  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
-    const ff = this.requireFf();
+  private async prepareMuxTracksImpl(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
     const candidates: PreparedMuxTrackCandidate[] = [];
     const cleanup: string[] = [];
 
@@ -2798,21 +3854,14 @@ export class FfmpegWasmEngine implements MediaEngine {
         const input = inputs[inputIndex];
         if (!input) continue;
         const base = `${this.scratch()}.muxsrc${inputIndex}`;
-        const sourceBytes = copyBytes(await input.arrayBuffer());
         const written = await this.writeInput(input, `${base}.in`);
         cleanup.push(...written.cleanupPaths);
 
-        const metadata = this.metadataFromLog(await this.runInfo(written.name, written.inputOptions), input);
-        const sourceContainer = containerFromInput(input);
-        const sourceMuxBase =
-          written.inputOptions.length === 0
-            ? {
-                sourceKey: `${inputIndex}:${input.id || input.url || base}`,
-                sourceBytes,
-                sourceExt: sourceContainer ? containerExt(sourceContainer) : 'bin',
-                inputOptions: [...written.inputOptions],
-              }
-            : undefined;
+        const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+        const metadata = structured?.metadata ?? this.metadataFromLog(
+          await this.runInfo(written.name, written.inputOptions),
+          input,
+        );
         const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
         for (let streamIndex = 0; streamIndex < metadata.tracks.length; streamIndex++) {
           const track = metadata.tracks[streamIndex]!;
@@ -2822,38 +3871,65 @@ export class FfmpegWasmEngine implements MediaEngine {
           const codec = canonicalCodec(track.codec);
           const prep = this.muxPrepForCodec(codec);
           if (!prep) {
-            throw new NotApplicableError(
+            throw createNotApplicableError(ENGINE_ID,
               'mux',
               `cannot prepare codec '${codec}' as a demuxable ffmpeg mux input`,
             );
           }
 
           const outName = `${base}.s${streamIndex}.${prep.ext}`;
-          cleanup.push(outName);
+          const packetName = `${base}.s${streamIndex}.framecrc.txt`;
+          cleanup.push(outName, packetName);
           const args = [...written.inputOptions, '-i', written.name, '-map', `0:${streamIndex}`, '-c', 'copy'];
           if (prep.bitstreamFilter) args.push(prep.bitstreamFilterKind, prep.bitstreamFilter);
           args.push('-f', prep.format, outName);
           await this.run(args, READ_EXEC_TIMEOUT_MS);
           const bytes = await this.readBinary(outName);
           if (bytes.length === 0) continue;
-          const durationUs =
-            metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
-              ? Math.round(metadata.durationSec * 1_000_000)
-              : 0;
-          const chunks: EncodedTracks['tracks'][number]['chunks'] = [
-            { data: bytes, ptsUs: 0, dtsUs: 0, durationUs, keyframe: true },
-          ];
-          rebaseChunksToZero(chunks);
-          const encodedTrack: FfmpegPreparedMuxTrack = {
+          await this.run(['-i', outName, '-map', '0', '-c', 'copy', '-f', 'framecrc', packetName], READ_EXEC_TIMEOUT_MS);
+          const packetRows = parseFramecrcPackets(await this.readText(packetName));
+          const slices = prep.format === 'adts'
+            ? splitAdtsFrames(bytes)
+            : splitPreparedBytes(bytes, packetRows);
+          const durationUs = metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
+            ? Math.round(metadata.durationSec * 1_000_000)
+            : 0;
+          const chunks: EncodedTracks['tracks'][number]['chunks'] =
+            slices.length === packetRows.length
+              ? packetRows.map((packet, packetIndex) => ({
+                  data: slices[packetIndex]!,
+                  ptsUs: packet.ptsUs,
+                  ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
+                  decodeIndex: packetIndex,
+                  durationUs:
+                    packet.durationUs ??
+                    Math.max(0, (packetRows[packetIndex + 1]?.ptsUs ?? durationUs) - packet.ptsUs),
+                  keyframe: packet.keyframe,
+                }))
+              : [{ data: bytes, ptsUs: 0, decodeIndex: 0, durationUs, keyframe: true }];
+          const framing = prep.format === 'h264' || prep.format === 'hevc'
+            ? 'annexb'
+            : prep.format === 'adts'
+              ? 'adts'
+              : prep.format === 'ivf'
+                ? 'ivf'
+                : 'codec-private';
+          const sourceStreamIndex = structured?.trackIndexes[streamIndex] ?? streamIndex;
+          const sourceTimebase = structured?.timebases.get(sourceStreamIndex);
+          const encodedTrack: EncodedTracks['tracks'][number] = {
             type,
             codec,
             timescale: 1_000_000,
+            packetOrdering: 'decode',
+            ...(sourceTimebase ? { timebase: sourceTimebase } : {}),
+            framing,
+            accessUnitGrouping: 'one-packet-per-chunk',
+            parameterSetLocation: framing === 'annexb' ? 'in-band' : 'not-applicable',
             ...(track.width !== undefined ? { width: track.width } : {}),
             ...(track.height !== undefined ? { height: track.height } : {}),
             ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
             ...(track.channels !== undefined ? { channels: track.channels } : {}),
             chunks,
-            ...(sourceMuxBase ? { ffmpegMuxSource: { ...sourceMuxBase, streamIndex } } : {}),
           };
           candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
         }
@@ -2896,16 +3972,68 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
-  async mux(tracks: EncodedTracks, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+  private async muxImpl(tracks: EncodedTracks, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+    const request = this.activeOperation?.context.request;
+    const deliberateNegative = request !== undefined &&
+      (ILLEGAL_MUX_SCENARIO_IDS as readonly string[]).includes(request.scenarioId);
+    validateEncodedTracks(ENGINE_ID, tracks, 'encodedTracks', { allowEmptyTracks: deliberateNegative });
     const realTracks = tracks.tracks.filter((t) => t.type === 'video' || t.type === 'audio');
     if (realTracks.length === 0) {
+      if (deliberateNegative) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'mux',
+          'validate',
+          'mux requires at least one audio/video track',
+          'FFMPEG_ILLEGAL_MUX_REJECTED',
+          request?.inputs[0]?.id,
+        );
+      }
       throw new Error(`${ENGINE_ID}: mux requires at least one audio/video track`);
     }
-    this.assertMuxContainerCompatible(realTracks, opts.container);
+    const legality = muxLegality(realTracks, opts.container);
+    if (legality) {
+      if (deliberateNegative) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'mux',
+          'validate',
+          legality,
+          'FFMPEG_ILLEGAL_MUX_REJECTED',
+          request?.inputs[0]?.id,
+        );
+      }
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'mux',
+        legality,
+        this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+        'FFMPEG_MUX_TUPLE_ILLEGAL',
+      );
+    }
+    if (opts.fastStart === 'reserve') {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'mux',
+        'reserved-moov output is not advertised without verified -moov_size sizing',
+        this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+        'FFMPEG_FASTSTART_RESERVE_UNSUPPORTED',
+      );
+    }
 
-    const preparedSourceTracks = realTracks as FfmpegPreparedMuxTrack[];
-    if (preparedSourceTracks.every((t) => t.ffmpegMuxSource !== undefined)) {
-      return this.muxPreparedSources(preparedSourceTracks, opts);
+    if (canBuildTimedMp4(realTracks)) {
+      return this.muxTimedTracks(realTracks, opts);
+    }
+    for (const track of realTracks) {
+      if (!hasImplicitRawDemuxTiming(track)) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          `raw ${track.codec} staging cannot preserve this track's explicit/VFR timing`,
+          this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+          'FFMPEG_TIMED_STAGING_CODEC_UNSUPPORTED',
+        );
+      }
     }
 
     const base = this.scratch();
@@ -2917,21 +4045,27 @@ export class FfmpegWasmEngine implements MediaEngine {
         const t = realTracks[ti]!;
         const codec = canonicalCodec(t.codec);
         const { name, bytes } = this.buildElementaryStream(t, codec, `${base}.t${ti}`);
-        await this.requireFf().writeFile(name, copyBytes(bytes));
+        await this.writeScratch(name, bytes, true);
         inputNames.push(name);
       }
 
       // 2) Stream-copy mux: one -i per elementary stream, then -map each so every track lands.
       const args: string[] = [];
-      for (const n of inputNames) args.push('-i', n);
+      for (let index = 0; index < inputNames.length; index++) {
+        const track = realTracks[index]!;
+        if (track.type === 'video' && track.chunks[0]?.durationUs) {
+          args.push('-r', (1_000_000 / track.chunks[0].durationUs).toFixed(9));
+        }
+        args.push('-i', inputNames[index]!);
+      }
       for (let i = 0; i < inputNames.length; i++) args.push('-map', String(i));
       args.push('-c', 'copy');
       args.push('-avoid_negative_ts', 'make_zero');
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (opts.fragmented === true || opts.fastStart === 'fragmented') {
-          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
+          args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
         } else if (opts.fastStart !== false) {
-          args.push('-movflags', '+faststart');
+          args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
         }
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
@@ -2940,13 +4074,91 @@ export class FfmpegWasmEngine implements MediaEngine {
 
       await this.run(args, READ_EXEC_TIMEOUT_MS);
       const muxed = await this.readBinary(outName);
-      return { bytes: muxed, mime: containerMime(opts.container), container: opts.container };
+      return {
+        bytes: muxed,
+        mime: containerMime(opts.container),
+        container: opts.container,
+        ffmpegRepresentation: {
+          muxer: opts.container,
+          bitstreamFilters: realTracks.flatMap((track) =>
+            track.codec === 'h264' || track.codec === 'hevc' ? [`${track.framing}->annexb-input`] : []),
+          command: redactFfmpegCommand(args),
+          inputFraming: realTracks.map((track) => track.framing ?? 'missing'),
+          fragmentFlags:
+            opts.fragmented === true || opts.fastStart === 'fragmented'
+              ? FFMPEG_FRAGMENT_MOVFLAGS
+              : null,
+        },
+      } as MediaBytes;
     } finally {
       await this.cleanup([...inputNames, outName]);
     }
   }
 
-  async concat(segments: MediaBytes[], opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+  private async muxTimedTracks(
+    tracks: EncodedTracks['tracks'],
+    opts: { container: string } & Record<string, unknown>,
+  ): Promise<MediaBytes> {
+    const base = this.scratch();
+    const stageName = `${base}.timed-input.mp4`;
+    const outName = `${base}.out.${containerExt(opts.container)}`;
+    let stage: Uint8Array;
+    try {
+      stage = buildTimedMp4(tracks);
+    } catch (error) {
+      if (error instanceof TimedMp4UnsupportedError) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          error.message,
+          this.activeOperation ? tupleSummary(this.activeOperation.context.request) : {},
+          error.reasonCode,
+          error,
+        );
+      }
+      throw error;
+    }
+    this.fsLedger.addJsCopy(stage.byteLength);
+    try {
+      await this.writeScratch(stageName, stage, true);
+    } finally {
+      this.fsLedger.releaseJsCopy(stage.byteLength);
+    }
+    try {
+      const args = ['-copyts', '-i', stageName, '-map', '0', '-c', 'copy', '-avoid_negative_ts', 'make_zero'];
+      if (opts.container === 'mp4' || opts.container === 'mov') {
+        if (opts.fragmented === true || opts.fastStart === 'fragmented') {
+          args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
+        } else if (opts.fastStart !== false) {
+          args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
+        }
+      } else if (opts.container === 'ts') {
+        args.push('-muxdelay', '0', '-muxpreload', '0');
+      }
+      args.push(outName);
+      await this.run(args, READ_EXEC_TIMEOUT_MS);
+      const bytes = await this.readBinary(outName);
+      return {
+        bytes,
+        mime: containerMime(opts.container),
+        container: opts.container,
+        ffmpegRepresentation: {
+          muxer: opts.container,
+          command: redactFfmpegCommand(args),
+          timingSource: 'explicit-iso-bmff-sample-tables',
+          inputFraming: tracks.map((track) => track.framing ?? 'missing'),
+          fragmentFlags:
+            opts.fragmented === true || opts.fastStart === 'fragmented'
+              ? FFMPEG_FRAGMENT_MOVFLAGS
+              : null,
+        },
+      } as MediaBytes;
+    } finally {
+      await this.cleanup([stageName, outName]);
+    }
+  }
+
+  private async concatImpl(segments: MediaBytes[], opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
     if (segments.length === 0) {
       throw new Error(`${ENGINE_ID}: concat requires at least one segment`);
     }
@@ -2959,15 +4171,15 @@ export class FfmpegWasmEngine implements MediaEngine {
         const segment = segments[i]!;
         const ext = containerExt(segment.container || opts.container);
         const name = `${base}.seg${i}.${ext}`;
-        await this.requireFf().writeFile(name, copyBytes(segment.bytes));
+        await this.writeScratch(name, segment.bytes, true);
         inputNames.push(name);
       }
       const list = inputNames.map((name) => `file '${name}'`).join('\n') + '\n';
-      await this.requireFf().writeFile(listName, new TextEncoder().encode(list));
+      await this.writeScratch(listName, new TextEncoder().encode(list));
 
       const args = ['-f', 'concat', '-safe', '0', '-i', listName, '-c', 'copy'];
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        args.push('-movflags', '+faststart');
+        args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
       }
       args.push(outName);
       await this.run(args);
@@ -2975,115 +4187,6 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { bytes, mime: containerMime(opts.container), container: opts.container };
     } finally {
       await this.cleanup([...inputNames, listName, outName]);
-    }
-  }
-
-  private async muxPreparedSources(
-    tracks: FfmpegPreparedMuxTrack[],
-    opts: { container: string } & Record<string, unknown>,
-  ): Promise<MediaBytes> {
-    const { container } = opts;
-    const base = this.scratch();
-    const outName = `${base}.out.${containerExt(container)}`;
-    const cleanup = [outName];
-    const groups: Array<{ key: string; source: FfmpegMuxSource; name: string; inputNumber: number }> = [];
-    const groupByKey = new Map<string, (typeof groups)[number]>();
-
-    try {
-      for (const track of tracks) {
-        const source = track.ffmpegMuxSource;
-        if (!source) {
-          throw new Error(`${ENGINE_ID}: source-copy mux path received a track without source metadata`);
-        }
-        let group = groupByKey.get(source.sourceKey);
-        if (!group) {
-          const sourceExt = source.sourceExt || 'bin';
-          const name = `${base}.src${groups.length}.${sourceExt}`;
-          group = { key: source.sourceKey, source, name, inputNumber: groups.length };
-          groupByKey.set(source.sourceKey, group);
-          groups.push(group);
-          cleanup.push(name);
-          await this.requireFf().writeFile(name, copyBytes(source.sourceBytes));
-        }
-      }
-
-      const args: string[] = [];
-      for (const group of groups) {
-        args.push(...group.source.inputOptions, '-i', group.name);
-      }
-      for (const track of tracks) {
-        const source = track.ffmpegMuxSource!;
-        const group = groupByKey.get(source.sourceKey);
-        if (!group) {
-          throw new Error(`${ENGINE_ID}: missing source group for prepared mux track`);
-        }
-        args.push('-map', `${group.inputNumber}:${source.streamIndex}`);
-      }
-      args.push('-c', 'copy');
-      args.push('-avoid_negative_ts', 'make_zero');
-      if (container === 'mp4' || container === 'mov') {
-        if (opts.fragmented === true || opts.fastStart === 'fragmented') {
-          args.push('-movflags', 'frag_keyframe+empty_moov+default_base_moof');
-        } else if (opts.fastStart !== false) {
-          args.push('-movflags', '+faststart');
-        }
-      } else if (container === 'ts') {
-        args.push('-muxdelay', '0', '-muxpreload', '0');
-      }
-      args.push(outName);
-
-      await this.run(args, READ_EXEC_TIMEOUT_MS);
-      const muxed = await this.readBinary(outName);
-      return { bytes: muxed, mime: containerMime(container), container };
-    } finally {
-      await this.cleanup(cleanup);
-    }
-  }
-
-  private assertMuxContainerCompatible(tracks: EncodedTracks['tracks'], container: string): void {
-    const codecs = tracks.map((t) => canonicalCodec(t.codec));
-    const hasVideo = tracks.some((t) => t.type === 'video');
-    const audioCodecs = tracks.filter((t) => t.type === 'audio').map((t) => canonicalCodec(t.codec));
-    const reject = (reason: string): never => {
-      throw new Error(`${ENGINE_ID}: mux cannot write ${reason}`);
-    };
-
-    if (container === 'wav') {
-      if (hasVideo || audioCodecs.length !== 1 || !['pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'].includes(audioCodecs[0] ?? '')) {
-        reject(`tracks [${codecs.join(', ')}] into WAV`);
-      }
-    } else if (container === 'adts') {
-      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'aac') {
-        reject(`tracks [${codecs.join(', ')}] into ADTS`);
-      }
-    } else if (container === 'mp3') {
-      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'mp3') {
-        reject(`tracks [${codecs.join(', ')}] into MP3`);
-      }
-    } else if (container === 'flac') {
-      if (hasVideo || audioCodecs.length !== 1 || audioCodecs[0] !== 'flac') {
-        reject(`tracks [${codecs.join(', ')}] into FLAC`);
-      }
-    } else if (container === 'ogg') {
-      if (hasVideo || audioCodecs.some((c) => !['opus', 'vorbis', 'flac'].includes(c))) {
-        reject(`tracks [${codecs.join(', ')}] into Ogg`);
-      }
-    } else if (container === 'webm') {
-      const bad = tracks.some((t) => {
-        const codec = canonicalCodec(t.codec);
-        return t.type === 'video'
-          ? !['vp8', 'vp9'].includes(codec)
-          : !['opus', 'vorbis'].includes(codec);
-      });
-      if (bad) reject(`tracks [${codecs.join(', ')}] into WebM`);
-    } else if (container === 'ts') {
-      const bad = tracks.some((t) => {
-        const codec = canonicalCodec(t.codec);
-        return t.type === 'video'
-          ? !['h264', 'hevc'].includes(codec)
-          : !['aac', 'mp3'].includes(codec);
-      });
-      if (bad) reject(`tracks [${codecs.join(', ')}] into MPEG-TS`);
     }
   }
 
@@ -3098,11 +4201,24 @@ export class FfmpegWasmEngine implements MediaEngine {
   ): { name: string; bytes: Uint8Array } {
     const chunks = track.chunks ?? [];
     if (codec === 'h264' || codec === 'hevc') {
-      if (chunks.length > 0 && chunks.every((c) => isAnnexB(c.data))) {
+      if (track.framing === 'annexb') {
+        if (!chunks.every((chunk) => isAnnexB(chunk.data))) {
+          throw new Error(`${ENGINE_ID}: declared Annex B ${codec} chunk lacks a start code`);
+        }
         return {
           name: `${baseName}.${codec === 'h264' ? 'h264' : 'hevc'}`,
           bytes: concatBytes(chunks.map((c) => c.data)),
         };
+      }
+      const expectedFraming = codec === 'h264' ? 'avc' : 'hevc';
+      if (track.framing !== expectedFraming) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          `codec '${codec}' requires explicit '${expectedFraming}' or 'annexb' framing`,
+          {},
+          'FFMPEG_CODED_FRAMING_UNSUPPORTED',
+        );
       }
       const nalLen =
         codec === 'h264'
@@ -3123,8 +4239,14 @@ export class FfmpegWasmEngine implements MediaEngine {
       return { name: `${baseName}.${ext}`, bytes: concatBytes(parts) };
     }
     if (codec === 'aac') {
-      if (chunks.length > 0 && chunks.every((c) => isAdts(c.data))) {
+      if (track.framing === 'adts') {
+        if (!chunks.every((chunk) => isAdts(chunk.data))) {
+          throw new Error(`${ENGINE_ID}: declared ADTS chunk lacks an ADTS header`);
+        }
         return { name: `${baseName}.aac`, bytes: concatBytes(chunks.map((c) => c.data)) };
+      }
+      if (track.framing !== 'raw') {
+        throw createNotApplicableError(ENGINE_ID, 'mux', `AAC framing '${track.framing ?? 'missing'}' is unsupported`, {}, 'FFMPEG_CODED_FRAMING_UNSUPPORTED');
       }
       const params = aacParamsFromAsc(track.description, track.sampleRate ?? 0, track.channels ?? 0);
       const parts: Uint8Array[] = [];
@@ -3135,28 +4257,28 @@ export class FfmpegWasmEngine implements MediaEngine {
       if (chunks.length === 1 && isIvf(chunks[0]!.data)) {
         return { name: `${baseName}.ivf`, bytes: chunks[0]!.data };
       }
-      throw new NotApplicableError('mux', `codec '${codec}' requires IVF framing for ffmpeg mux input`);
+      throw createNotApplicableError(ENGINE_ID, 'mux', `codec '${codec}' requires IVF framing for ffmpeg mux input`);
     }
     if (codec === 'opus' || codec === 'vorbis') {
       if (chunks.length === 1 && isOgg(chunks[0]!.data)) {
         return { name: `${baseName}.ogg`, bytes: chunks[0]!.data };
       }
-      throw new NotApplicableError('mux', `codec '${codec}' requires Ogg framing for ffmpeg mux input`);
+      throw createNotApplicableError(ENGINE_ID, 'mux', `codec '${codec}' requires Ogg framing for ffmpeg mux input`);
     }
     if (codec === 'mp3') {
       if (chunks.length > 0 && chunks.every((c) => isMp3(c.data))) {
         return { name: `${baseName}.mp3`, bytes: concatBytes(chunks.map((c) => c.data)) };
       }
-      throw new NotApplicableError('mux', "codec 'mp3' requires MP3 frame data for ffmpeg mux input");
+      throw createNotApplicableError(ENGINE_ID, 'mux', "codec 'mp3' requires MP3 frame data for ffmpeg mux input");
     }
     if (codec === 'flac') {
       if (chunks.length === 1 && isFlac(chunks[0]!.data)) {
         return { name: `${baseName}.flac`, bytes: chunks[0]!.data };
       }
-      throw new NotApplicableError('mux', "codec 'flac' requires a FLAC stream for ffmpeg mux input");
+      throw createNotApplicableError(ENGINE_ID, 'mux', "codec 'flac' requires a FLAC stream for ffmpeg mux input");
     }
     // Codecs that need a full intermediate container to be demuxable: fail honestly (never guess).
-    throw new NotApplicableError(
+    throw createNotApplicableError(ENGINE_ID,
       'mux',
       `cannot reconstruct an elementary stream for codec '${codec}'`,
     );

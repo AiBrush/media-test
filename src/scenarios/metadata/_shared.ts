@@ -6,64 +6,28 @@
  * family stays a single exported `metadataScenarios` array (index.ts concatenates them); nothing here
  * is registered on its own.
  *
- * ════════════════════════════════════════════════════════════════════════════════════════════════
- * ORACLE TRUTH for the metadata family (verified against src/core/{oracles,runner,engine}.ts — read
- * before adding ANY case so a scenario never claims a gate the harness cannot actually enforce):
- *
- * 1. `golden-metadata` (oracles.ts goldenMetadata + compareTrack, ~lines 345-431) compares ONLY:
- *      container, durationSec (±tolerance), and per-track {type, codec, width, height, fps,
- *      sampleRate, channels} matched POSITIONALLY by golden track order.
- *    It does NOT compare `tags`, `track.rotation`, `track.language`, or `track.bitrate`. Therefore a
- *    `read_*` PROBE case gates the STRUCTURAL metadata (container/duration/track layout/codec/dims/
- *    fps/sr/ch) honestly — but it can NOT gate tag CONTENT, a rotation VALUE, or a language VALUE.
- *    Attaching `golden-metadata` and CLAIMING it verifies tags/rotation/language would be an
- *    over-claim (§0 honest-capabilities). We attach it only for what it truly checks and document the
- *    residual gap in `notes`.
- *
- * 2. The runner's `op:'remux'` dispatch calls `engine.remux(input, { container, tags? })` and exposes
- *    the bytes as `ctx.output`. It forwards `options.tags` to engines that support metadata writes,
- *    but it does NOT re-probe the output into `ctx.metadata`. Consequently for a remux op:
- *      • `golden-metadata` reads `ctx.metadata` → ALWAYS "no probe metadata on ctx.metadata" → FAIL
- *        for a PLUMBING reason, masking whether any tag was written. So `golden-metadata` is NEVER a
- *        valid remux gate and is never attached to a write case.
- *      • The desired tags do reach the engine, but a genuine write→readback of tag CONTENT is NOT
- *        asserted until an oracle re-probes `ctx.output` and compares the tag map. We keep
- *        `options.tags` on the scenario and gate the write with
- *        the oracles that DO observe a remux output: `reference-reimport` (the output is a real,
- *        parseable container) + `property-invariant` (the tag rewrite must NOT corrupt media —
- *        decode(remux(x))==decode(x) for video, probe(remux(x)).dur≈probe(x).dur for audio).
- *
- * 3. `property-invariant` (oracles.ts propertyInvariant) computes a metamorphic invariant IN-BROWSER
- *    from `ctx.output` and selects the branch by SUBSTRING of `options.invariant`:
- *      • token contains 'decode' OR 'remux'  → decode-remux: decode(ctx.output) frame digests must
- *        equal golden.frames (== the offline decode of x). VIDEO-ONLY + needs `<asset>.frames.json`.
- *      • token contains 'duration' OR 'probe' (and NEITHER 'decode' NOR 'remux') → probe-duration:
- *        reference-probed output duration ≈ golden duration. Works for VIDEO and AUDIO.
- *      Routing trap (mirrors remux/metamorphic.ts): a human token like 'probe(remux(x)).dur' contains
- *      'remux' and MISROUTES to decode-remux. Use the bare tokens DECODE_REMUX / PROBE_DUR below and
- *      put human phrasing in `notes`.
- *
- * 4. Rotation: the reference engine (mediabunny adapter normalizeTrack) sets
- *    `rotation = getRotation()||0` and its decode path (CanvasSink/VideoSample.draw) BAKES rotation
- *    into the decoded RGBA. So golden frames for a rotated asset are baked rotation-APPLIED, and
- *    decode(x)==decode(remux(x)) catches a dropped/garbled display matrix (a demuxer that lost the
- *    matrix, or one that baked rotation into width/height instead of exposing it, changes the decoded
- *    presentation → frame-digest mismatch). This is the ONLY rotation gate expressible from a
- *    scenario file today; a rotation-VALUE-via-probe gate would require compareTrack to compare
- *    `rotation` (an oracles.ts edit, out of scope).
- *
- * 5. Chapters / edit-lists / cover-art / timecode: `NormalizedMetadata`/`NormalizedTrack` (engine.ts)
- *    have NO fields for these, and no oracle reads them. They are UNVERIFIABLE from a scenario file
- *    until the model + golden + an oracle gain the fields. We deliberately do NOT add fabricated
- *    cases for them (a case with no real gate is worse than an honest absence, §0.1); the gap is
- *    recorded in index.ts so the model owner can close it.
- * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * Correctness is deliberately split into independent observations:
+ *   - golden-metadata judges semantic structural evidence;
+ *   - metadata tag contracts ask the neutral carrier reader to re-probe authored bytes;
+ *   - reference-reimport / decoded properties prove that a successful tag write did not corrupt
+ *     media; and
+ *   - metadata recovery contracts validate any returned malformed-region recovery before the
+ *     graceful oracle may count it as safe.
+ * A tag match can therefore never hide corrupt media, and intact media can never hide a lost tag.
  */
 
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  defineMetadataRecoveryContract,
+  defineMetadataTagContract,
+  type MetadataCarrier,
+  type MetadataRecoveryContract,
+  type MetadataTagContract,
+  type SemanticTagKey,
+} from '../../features/metadata/index.ts';
 
-// Property-invariant tokens (see ORACLE TRUTH §3 — bare, routing-safe tokens; human phrasing → notes).
+// Property-invariant tokens are bare/routing-safe; human phrasing belongs in notes.
 export const DECODE_REMUX = 'decode(remux(x))==decode(x)'; // routes to decode-remux (contains 'decode')
 export const PROBE_DUR = 'probe-duration'; // routes to probe-duration (contains 'probe', no 'decode'/'remux')
 
@@ -101,7 +65,7 @@ export interface TagWriteCase {
   /** unique id suffix (namespaced under metadata/) */
   id: string;
   asset: string;
-  container: string;
+  container: MetadataCarrier;
   videoCodecs?: string[];
   audioCodecs?: string[];
   /**
@@ -131,11 +95,22 @@ export interface TagWriteCase {
  * declare the feature run it; everyone else gets a clean NA_ENGINE.
  */
 export function buildWrite(c: TagWriteCase): Scenario {
+  const tagContract = defineMetadataTagContract({
+    mode: 'write-reprobe',
+    carrier: c.container,
+    requested: c.tags as Partial<Record<SemanticTagKey, string>>,
+  });
   return defineScenario({
     id: `metadata/${c.id}`,
+    revision: 2,
     op: 'remux',
     input: c.asset,
-    options: { container: c.container, tags: c.tags, invariant: c.invariant },
+    options: {
+      container: c.container,
+      tags: c.tags,
+      invariant: c.invariant,
+      robustness: { metadataTags: tagContract },
+    },
     requires: {
       operations: ['remux', 'probe'],
       containersIn: [c.container],
@@ -156,6 +131,7 @@ export function buildWrite(c: TagWriteCase): Scenario {
 export interface MetaPropertyCase {
   /** unique id suffix (namespaced under metadata/) */
   id: string;
+  revision?: number;
   /** invariant token the property-invariant oracle interprets (use DECODE_REMUX / PROBE_DUR) */
   invariant: typeof DECODE_REMUX | typeof PROBE_DUR;
   input: string;
@@ -164,6 +140,10 @@ export interface MetaPropertyCase {
   videoCodecs?: string[];
   audioCodecs?: string[];
   features?: string[];
+  /** Optional semantic tags written by this remux property. */
+  tags?: Record<string, string>;
+  /** Neutral tag re-probe contract, composed independently from the media-preservation invariant. */
+  metadataTagContract?: MetadataTagContract;
   /** Optional per-case oracle tolerances for container-estimation edges. */
   tolerances?: OracleTolerances;
   /** override the default ['property-invariant'] oracle set (e.g. add reference-reimport) */
@@ -176,9 +156,15 @@ export interface MetaPropertyCase {
 export function buildProperty(c: MetaPropertyCase): Scenario {
   return defineScenario({
     id: `metadata/${c.id}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'remux',
     input: c.input,
-    options: { container: c.to, invariant: c.invariant },
+    options: {
+      container: c.to,
+      invariant: c.invariant,
+      ...(c.tags ? { tags: c.tags } : {}),
+      ...(c.metadataTagContract ? { robustness: { metadataTags: c.metadataTagContract } } : {}),
+    },
     requires: {
       operations: ['remux'],
       containersIn: [c.from],
@@ -252,6 +238,8 @@ export interface MetaNegativeCase {
    * "mandatory reject".
    */
   gracefulAllowOutput?: boolean;
+  /** Semantic policy for any returned recovery; rejection remains independently valid. */
+  recovery?: MetadataRecoveryContract;
   timeoutMs?: number;
   notes: string;
 }
@@ -264,6 +252,7 @@ export interface MetaNegativeCase {
 export function buildNegative(c: MetaNegativeCase): Scenario {
   return defineScenario({
     id: `metadata/${c.id}`,
+    ...(c.recovery ? { revision: 2 } : {}),
     op: 'probe',
     input: c.asset,
     requires: {
@@ -272,9 +261,21 @@ export function buildNegative(c: MetaNegativeCase): Scenario {
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
-    oracles: ['graceful-failure'],
+    oracles: c.recovery ? ['graceful-failure', 'property-invariant'] : ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
-    ...(c.gracefulAllowOutput ? { options: { gracefulAllowOutput: true } } : {}),
+    ...(c.gracefulAllowOutput || c.recovery
+      ? {
+          options: {
+            ...(c.gracefulAllowOutput ? { gracefulAllowOutput: true } : {}),
+            ...(c.recovery
+              ? {
+                  invariant: 'metadata-safe-recovery',
+                  robustness: { metadataRecovery: defineMetadataRecoveryContract(c.recovery) },
+                }
+              : {}),
+          },
+        }
+      : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   });

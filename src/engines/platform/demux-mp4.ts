@@ -75,9 +75,25 @@ export interface Mp4VideoTrack {
 export interface Mp4AudioConfig {
   /** canonical token: 'aac' (the only audio sample-entry the inline demuxer identifies in MP4/MOV) */
   codec: string;
+  /** Fully-qualified WebCodecs codec string derived from the MPEG-4 AudioSpecificConfig. */
+  codecString: string;
+  /** DecoderSpecificInfo / AudioSpecificConfig bytes from `esds`. */
+  description?: Uint8Array;
+  /** MPEG-4 Audio object type (AAC-LC is 2). */
+  audioObjectType: number;
   sampleRate: number;
   channels: number;
   timescale: number;
+}
+
+/** Explicit ISO-BMFF timing facts used by the native-rate gapless oracle. */
+export interface Mp4GaplessAudioTrack extends Mp4AudioTrack {
+  codedSampleFrames: number;
+  primingFrames: number;
+  remainderFrames: number;
+  presentationSampleFrames: number;
+  editListMediaStartFrame: number;
+  timingSource: 'edit-list' | 'media-timeline';
 }
 
 export interface Mp4AudioTrack {
@@ -269,13 +285,20 @@ function audioCodecTokenForEntry(entryType: string): string | undefined {
  * AudioSampleEntry, verified against the corpus): bodyStart + 6 reserved + 2 data_ref_idx + 8
  * reserved + 2 channelcount + 2 samplesize + 2 predefined + 2 reserved + 4 samplerate(16.16 fixed),
  * then child boxes (esds/btrt) from bodyStart + 28. The 16.16 sample rate's integer part is the rate
- * for the common 0..65535 Hz range (48000 fits). We do not need esds contents for the token (mp4a ⇒
- * aac), only its presence as the AAC marker.
+ * for the common 0..65535 Hz range (48000 fits). `esds` is also parsed for its DecoderSpecificInfo:
+ * raw AAC access units require that AudioSpecificConfig when fed to WebCodecs.
  */
 function parseAudioStsd(
   buf: Uint8Array,
   stsd: Box,
-): { token: string; sampleRate: number; channels: number } | undefined {
+): {
+  token: string;
+  codecString: string;
+  description?: Uint8Array;
+  audioObjectType: number;
+  sampleRate: number;
+  channels: number;
+} | undefined {
   const entriesStart = stsd.bodyStart + 8;
   const entry = [...iterBoxes(buf, entriesStart, stsd.bodyEnd)][0];
   if (!entry) return undefined;
@@ -289,7 +312,89 @@ function parseAudioStsd(
   const channels = qtV2?.channels ?? be16(buf, entry.bodyStart + 16);
   // Version 0/1 samplerate is a 16.16 fixed-point value; QuickTime version 2 stores a Float64.
   const sampleRate = qtV2?.sampleRate ?? (be32(buf, entry.bodyStart + 24) >>> 16);
-  return { token, sampleRate, channels };
+  const esds = findBox(buf, childStart, entry.bodyEnd, 'esds');
+  const description = esds ? findAudioSpecificConfig(buf, esds.bodyStart + 4, esds.bodyEnd) : undefined;
+  const audioObjectType = description ? audioObjectTypeFromAsc(description) : 2;
+  const result: {
+    token: string;
+    codecString: string;
+    description?: Uint8Array;
+    audioObjectType: number;
+    sampleRate: number;
+    channels: number;
+  } = {
+    token,
+    codecString: `mp4a.40.${audioObjectType}`,
+    audioObjectType,
+    sampleRate,
+    channels,
+  };
+  if (description) result.description = description;
+  return result;
+}
+
+interface Mpeg4Descriptor {
+  tag: number;
+  payloadStart: number;
+  payloadEnd: number;
+}
+
+function readMpeg4Descriptor(buf: Uint8Array, offset: number, end: number): Mpeg4Descriptor | undefined {
+  if (offset >= end) return undefined;
+  const tag = buf[offset++]!;
+  let length = 0;
+  let complete = false;
+  for (let i = 0; i < 4 && offset < end; i++) {
+    const byte = buf[offset++]!;
+    length = (length << 7) | (byte & 0x7f);
+    if ((byte & 0x80) === 0) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete || length < 0 || offset + length > end) return undefined;
+  return { tag, payloadStart: offset, payloadEnd: offset + length };
+}
+
+/** Walk the known ES_Descriptor/DecoderConfigDescriptor nesting and return tag 0x05 bytes. */
+function findAudioSpecificConfig(buf: Uint8Array, start: number, end: number): Uint8Array | undefined {
+  const visit = (offset: number, limit: number): Uint8Array | undefined => {
+    while (offset < limit) {
+      const descriptor = readMpeg4Descriptor(buf, offset, limit);
+      if (!descriptor) return undefined;
+      if (descriptor.tag === 0x05 && descriptor.payloadEnd > descriptor.payloadStart) {
+        return buf.subarray(descriptor.payloadStart, descriptor.payloadEnd).slice();
+      }
+
+      let childStart: number | undefined;
+      if (descriptor.tag === 0x03) {
+        // ES_ID(2), flags(1), followed by optional dependsOn/url/OCR fields.
+        let cursor = descriptor.payloadStart + 3;
+        const flags = buf[descriptor.payloadStart + 2] ?? 0;
+        if (flags & 0x80) cursor += 2;
+        if (flags & 0x40) cursor += 1 + (buf[cursor] ?? 0);
+        if (flags & 0x20) cursor += 2;
+        childStart = cursor;
+      } else if (descriptor.tag === 0x04) {
+        // objectTypeIndication(1), streamType/upstream/reserved(1), bufferSizeDB(3), max/avg bitrate(8).
+        childStart = descriptor.payloadStart + 13;
+      }
+      if (childStart !== undefined && childStart < descriptor.payloadEnd) {
+        const found = visit(childStart, descriptor.payloadEnd);
+        if (found) return found;
+      }
+      offset = descriptor.payloadEnd;
+    }
+    return undefined;
+  };
+  return visit(start, end);
+}
+
+function audioObjectTypeFromAsc(asc: Uint8Array): number {
+  if (asc.length === 0) return 2;
+  let objectType = (asc[0]! >> 3) & 0x1f;
+  if (objectType === 31 && asc.length >= 2) objectType = 32 + ((asc[0]! & 0x07) << 3) + (asc[1]! >> 5);
+  return objectType > 0 ? objectType : 2;
 }
 
 function audioSampleEntryChildStart(bodyStart: number, version: number): number {
@@ -432,6 +537,49 @@ function parseMdhdDurationTicks(buf: Uint8Array, mdhd: Box): number {
   const durationOff = mdhd.bodyStart + (version === 1 ? 4 + 16 + 4 : 4 + 8 + 4);
   if (version === 1) return durationOff + 8 <= mdhd.bodyEnd ? Number(be64(buf, durationOff)) : 0;
   return durationOff + 4 <= mdhd.bodyEnd ? be32(buf, durationOff) : 0;
+}
+
+function parseMvhdTimescale(buf: Uint8Array, mvhd: Box): number {
+  const version = buf[mvhd.bodyStart] ?? 0;
+  const timescaleOffset = mvhd.bodyStart + (version === 1 ? 20 : 12);
+  return timescaleOffset + 4 <= mvhd.bodyEnd ? be32(buf, timescaleOffset) : 0;
+}
+
+interface EditListTiming {
+  presentationTicks: number;
+  mediaStartTicks: number;
+}
+
+/** Read unit-rate, non-empty edit segments. Empty leading edits do not contribute program frames. */
+function parseEditListTiming(buf: Uint8Array, trak: Box): EditListTiming | undefined {
+  const edts = findBox(buf, trak.bodyStart, trak.bodyEnd, 'edts');
+  const elst = edts ? findBox(buf, edts.bodyStart, edts.bodyEnd, 'elst') : undefined;
+  if (!elst || elst.bodyEnd - elst.bodyStart < 8) return undefined;
+  const version = buf[elst.bodyStart] ?? 0;
+  if (version !== 0 && version !== 1) throw new UnsupportedMp4Error(`unsupported elst version ${version}`);
+  const entryBytes = version === 1 ? 20 : 12;
+  const entriesStart = elst.bodyStart + 8;
+  const count = boundEntryCount(be32(buf, elst.bodyStart + 4), entriesStart, entryBytes, elst.bodyEnd);
+  let cursor = entriesStart;
+  let presentationTicks = 0;
+  let mediaStartTicks: number | undefined;
+  for (let index = 0; index < count; index++) {
+    const view = new DataView(buf.buffer, buf.byteOffset + cursor, entryBytes);
+    const segmentDuration = version === 1 ? Number(view.getBigUint64(0, false)) : view.getUint32(0, false);
+    const mediaTime = version === 1 ? Number(view.getBigInt64(8, false)) : view.getInt32(4, false);
+    const rateInteger = view.getInt16(version === 1 ? 16 : 8, false);
+    const rateFraction = view.getInt16(version === 1 ? 18 : 10, false);
+    if (rateInteger !== 1 || rateFraction !== 0) {
+      throw new UnsupportedMp4Error('gapless timing does not support non-unit edit-list media rates');
+    }
+    if (mediaTime >= 0) {
+      presentationTicks += segmentDuration;
+      if (mediaStartTicks === undefined) mediaStartTicks = mediaTime;
+    }
+    cursor += entryBytes;
+  }
+  if (mediaStartTicks === undefined || presentationTicks <= 0) return undefined;
+  return { presentationTicks, mediaStartTicks };
 }
 
 function parseTkhdTrackId(buf: Uint8Array, tkhd: Box): number | null {
@@ -758,10 +906,13 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       }
       const config: Mp4AudioConfig = {
         codec: audioDesc.token,
+        codecString: audioDesc.codecString,
+        audioObjectType: audioDesc.audioObjectType,
         sampleRate: audioDesc.sampleRate,
         channels: audioDesc.channels,
         timescale,
       };
+      if (audioDesc.description) config.description = audioDesc.description;
       tracks.push({ kind: 'audio', config, samples });
     }
     // Other handlers (text/hint/meta) are not enumerated.
@@ -769,6 +920,82 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
 
   if (tracks.length === 0) throw new UnsupportedMp4Error('no decodable video/audio track found in moov');
   return tracks;
+}
+
+/**
+ * Demux the first AAC track and retain the independent coded, edit-list, priming, and remainder
+ * facts needed by the native gapless oracle. AAC-LC is deliberately the only frame-capacity model
+ * implemented here: applying 1,024 frames blindly to SBR/PS output-rate views would manufacture
+ * evidence, so those object types remain typed unsupported until their dual-rate model is added.
+ */
+export function demuxMp4GaplessAudio(bytes: Uint8Array): Mp4GaplessAudioTrack {
+  const moov = findBox(bytes, 0, bytes.length, 'moov');
+  if (!moov) throw new UnsupportedMp4Error('gapless audio evidence requires a progressive MP4 moov');
+  const mvhd = findBox(bytes, moov.bodyStart, moov.bodyEnd, 'mvhd');
+  const movieTimescale = mvhd ? parseMvhdTimescale(bytes, mvhd) : 0;
+  if (movieTimescale <= 0) throw new UnsupportedMp4Error('gapless audio evidence requires mvhd timescale');
+
+  for (const trak of iterBoxes(bytes, moov.bodyStart, moov.bodyEnd)) {
+    if (trak.type !== 'trak') continue;
+    const mdia = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'mdia');
+    if (!mdia) continue;
+    const hdlr = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'hdlr');
+    if (!hdlr || hdlrType(bytes, hdlr) !== 'soun') continue;
+    const mdhd = findBox(bytes, mdia.bodyStart, mdia.bodyEnd, 'mdhd');
+    const { stbl, timescale } = locateStbl(bytes, trak);
+    const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
+    const stts = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stts');
+    if (!stsd || !stts) throw new UnsupportedMp4Error('gapless audio track lacks stsd/stts timing');
+    const audioDesc = parseAudioStsd(bytes, stsd);
+    if (!audioDesc) continue;
+    if (audioDesc.audioObjectType !== 2) {
+      throw new UnsupportedMp4Error(
+        `gapless AAC frame-capacity model does not support audio object type ${audioDesc.audioObjectType}`,
+      );
+    }
+    if (!audioDesc.description) {
+      throw new UnsupportedMp4Error('gapless AAC WebCodecs evidence requires esds AudioSpecificConfig');
+    }
+
+    const samples = buildSamplesFromStbl(bytes, stbl, timescale);
+    const codedSampleFrames = samples.length * 1024;
+    const edits = parseEditListTiming(bytes, trak);
+    const mediaDurationTicks = mdhd ? parseMdhdDurationTicks(bytes, mdhd) : parseStts(bytes, stts).reduce((a, b) => a + b, 0);
+    const presentationSampleFrames = edits
+      ? Math.round((edits.presentationTicks * audioDesc.sampleRate) / movieTimescale)
+      : Math.round((mediaDurationTicks * audioDesc.sampleRate) / timescale);
+    const editListMediaStartFrame = edits
+      ? Math.round((edits.mediaStartTicks * audioDesc.sampleRate) / timescale)
+      : 0;
+    const primingFrames = editListMediaStartFrame;
+    const remainderFrames = codedSampleFrames - primingFrames - presentationSampleFrames;
+    if (presentationSampleFrames <= 0 || remainderFrames < 0) {
+      throw new UnsupportedMp4Error(
+        `inconsistent AAC timing: coded=${codedSampleFrames}, priming=${primingFrames}, presentation=${presentationSampleFrames}`,
+      );
+    }
+
+    const config: Mp4AudioConfig = {
+      codec: audioDesc.token,
+      codecString: audioDesc.codecString,
+      description: audioDesc.description,
+      audioObjectType: audioDesc.audioObjectType,
+      sampleRate: audioDesc.sampleRate,
+      channels: audioDesc.channels,
+      timescale,
+    };
+    return {
+      config,
+      samples,
+      codedSampleFrames,
+      primingFrames,
+      remainderFrames,
+      presentationSampleFrames,
+      editListMediaStartFrame,
+      timingSource: edits ? 'edit-list' : 'media-timeline',
+    };
+  }
+  throw new UnsupportedMp4Error('no AAC audio track found for gapless evidence');
 }
 
 /**
@@ -821,10 +1048,13 @@ export function probeMp4Metadata(bytes: Uint8Array): Mp4MetadataProbe {
       if (!audioDesc) continue;
       const config: Mp4AudioConfig = {
         codec: audioDesc.token,
+        codecString: audioDesc.codecString,
+        audioObjectType: audioDesc.audioObjectType,
         sampleRate: audioDesc.sampleRate,
         channels: audioDesc.channels,
         timescale,
       };
+      if (audioDesc.description) config.description = audioDesc.description;
       tracks.push({ kind: 'audio', config, samples: [], sampleCount, durationUs });
     }
   }

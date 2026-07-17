@@ -16,34 +16,9 @@
  *   - ./capability-findings.ts : Appendix-B NA rows for live EME/key acquisition (ClearKey) —
  *                                registered + attributed, never silently omitted.
  *
- * ──────────────────────────────────────────────────────────────────────────────────────────────
- * ORACLE-SOUNDNESS FIXES vs the previous version (all within scenario scope):
- *  1. KEY-MATERIAL DRIFT (the unsound-oracle bug): keys are no longer hardcoded to values that
- *     DISAGREE with the golden ground truth. They come from `_shared.GOLDEN_KEYS`, a drift-checked
- *     mirror of `fixtures/golden/<asset>.keys.json` (see _shared.ts). Feeding the correct key is what
- *     makes `decrypt-bitexact` a SOUND gate instead of one that FAILs a correct engine.
- *  2. Dead `expectNoop`: removed. Nothing in the frozen runner/oracles read it. The no-op property is
- *     now gated by the metamorphic sub-battery (frame-exact + structural + playback). A TRUE
- *     byte-identity oracle (output bytes === input bytes) and a "reference reports encryptionInfo===
- *     null on the output" de-protection oracle are CORE-LEVEL gaps (need new oracles in oracles.ts,
- *     outside this writer's scope) — recorded here so they are not lost.
- *  3. Structural + playback secondary oracles: every positive decrypt case now also runs
- *     reference-reimport + playback-smoke (decrypt analogue of the remux secondary gates), so a
- *     decrypted MP4 that decodes frame-exact but is structurally invalid for <video>, or that leaves
- *     a track mangled, is caught — not only the decoded-frame digests.
- *
- * KNOWN ROUTING TODAY (honest NA, not a silent omission):
- *  - cbcs (cenc_cbcs.mp4) is manifest source:'provided' (needs Bento4/shaka) and ships no committed
- *    golden/keys yet → NA(asset-missing) until baked. The case is registered with the documented
- *    mp4encrypt key (mirrored in _shared) so it lights up the moment the asset+golden land.
- *  - hls-aes128: the mediabunny DOSSIER (§4.10 line 181, A.12) says mediabunny SUPPORTS HLS AES-128,
- *    but the mediabunny ADAPTER declares encryption: ['cenc-ctr','cenc-cbcs'] only (comment: "HLS
- *    AES-128 not exposed as a decrypt primitive in 1.48.0"). That adapter-vs-dossier reconciliation
- *    is the ADAPTER writer's call (engine scope, not scenario scope): if the dossier is right, add
- *    'hls-aes128' to the adapter's capabilities and this case proves an HLS-AES winner; until then it
- *    is correctly NA(engine) for mediabunny. The scenario stays faithful — it declares the requirement
- *    and lets negotiation report the truth.
- * ──────────────────────────────────────────────────────────────────────────────────────────────
+ * Key parity, structural clear-output evidence, complete frame cardinality, method/pattern
+ * contracts, and byte-no-op equality are executable gates. Fixture availability and engine/browser
+ * applicability come from typed preflight evidence rather than comments in this module.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -52,6 +27,44 @@ import { encryptionMetamorphicScenarios } from './metamorphic.ts';
 import { encryptionRobustnessScenarios } from './robustness.ts';
 import { encryptionPerformanceScenarios } from './performance.ts';
 import { encryptionCapabilityFindingScenarios } from './capability-findings.ts';
+import {
+  defineHlsEncryptionContract,
+  definePatternContract,
+} from '../../features/encryption/contracts.ts';
+
+const CENS_PATTERN = definePatternContract({
+  scheme: 'cenc-cens',
+  cipherMode: 'AES-CTR',
+  cryptByteBlock: 1,
+  skipByteBlock: 9,
+  ivRule: 'per-sample',
+  ivSize: 16,
+  boundaryVectorId: 'cens-avc-nal-crypt1-skip9-v1',
+  boundarySubsamples: [{ clearBytes: 902, protectedBytes: 57_168 }],
+  fixtureBoundaryVectors: [
+    { sampleCount: 150, firstBoundarySubsamples: [{ clearBytes: 902, protectedBytes: 57_168 }] },
+    { sampleCount: 329, firstBoundarySubsamples: [{ clearBytes: 875, protectedBytes: 259_376 }] },
+    { sampleCount: 161, firstBoundarySubsamples: [{ clearBytes: 906, protectedBytes: 47_344 }] },
+  ],
+});
+
+const CBCS_PATTERN = definePatternContract({
+  scheme: 'cenc-cbcs',
+  cipherMode: 'AES-CBC',
+  cryptByteBlock: 1,
+  skipByteBlock: 9,
+  ivRule: 'constant',
+  ivSize: 16,
+  boundaryVectorId: 'cbcs-avc-nal-crypt1-skip9-v1',
+  boundarySubsamples: [{ clearBytes: 816, protectedBytes: 57_254 }],
+  fixtureBoundaryVectors: [
+    { sampleCount: 150, firstBoundarySubsamples: [{ clearBytes: 816, protectedBytes: 57_254 }] },
+    { sampleCount: 329, firstBoundarySubsamples: [{ clearBytes: 786, protectedBytes: 259_465 }] },
+    { sampleCount: 161, firstBoundarySubsamples: [{ clearBytes: 816, protectedBytes: 47_434 }] },
+    // The baked non-fragmented Bento4 fixture uses an implicit constant-IV whole-sample map.
+    { sampleCount: 150, firstBoundarySubsamples: [{ clearBytes: 0, protectedBytes: 24_654 }] },
+  ],
+});
 
 // ── Positive decrypt cases (frame-exact + structural re-import + playback smoke) ─────────────────
 
@@ -83,6 +96,7 @@ const DECRYPT_CASES: DecryptCase[] = [
     cleartextAsset: 'cenc_ctr_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    pattern: CENS_PATTERN,
     notes:
       'CENC cens patterned AES-CTR encryption (crypt:skip 1:9) over the H.264 video samples. ' +
       'Decrypt output must decode bit-exact to the independent clear MP4 twin cenc_ctr_clear.mp4; ' +
@@ -95,16 +109,15 @@ const DECRYPT_CASES: DecryptCase[] = [
     container: 'mp4',
     scheme: 'cenc-cbcs',
     keyName: 'cenc_cbcs',
+    cleartextAsset: 'cenc_ctr_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    // cbcs output re-import structural check is meaningful, but the asset is provided/absent today so
-    // the whole case is NA(asset-missing) until baked; keep the full oracle set for when it lands.
+    pattern: CBCS_PATTERN,
     notes:
       'CENC cbcs pattern (subsample AES-CBC, crypt:skip pattern, per-subsample IV). Exercises the ' +
-      'pattern-block boundary. Asset is manifest source:provided (Bento4/shaka) → NA(asset-missing) ' +
-      'until baked; key/KID mirror the manifest acquire note (record into cenc_cbcs.mp4.keys.json). ' +
-      'NOTE: a pattern-SPECIFIC oracle assertion (that the crypt/skip block boundary was honored, not ' +
-      'just whole-frame digests) needs a new oracle in oracles.ts — a core-level gap recorded here.',
+      'pattern-block boundary. The committed Bento4 artifact, key record, packet table, and frame ' +
+      'evidence are authoritative; pattern contract cbcs-avc-nal-crypt1-skip9-v1 localizes wrong ' +
+      'scheme, IV, crypt:skip, or subsample handling.',
   },
   {
     id: 'hls_aes128_decrypt',
@@ -115,16 +128,29 @@ const DECRYPT_CASES: DecryptCase[] = [
     cleartextAsset: 'hls_aes128_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-explicit-iv',
+      mediaSequence: 0,
+      transitions: [{
+        firstSequence: 0,
+        method: 'AES-128',
+        keyRef: 'hls_aes128.key',
+        ivMode: 'explicit',
+        explicitIvHex: 'c0643a1737869dcf50b7d5daa37b466b',
+      }],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128.m3u8.resources.json',
+    }),
     // HLS is segmented; reference-reimport of a playlist-as-one-blob is not well-defined for every
     // reference engine, so gate frame-exactness + playback only (avoid an unsound structural gate).
     oracles: ['decrypt-bitexact', 'playback-smoke'],
     notes:
       'HLS AES-128 full-segment CBC decrypt. Key + explicit IV from fixtures/golden/hls_aes128.m3u8.' +
       'keys.json (the playlist #EXT-X-KEY carried an explicit IV, so the EXPLICIT-IV path is exercised; ' +
-      'the media-sequence-derived-IV default path is a separate variant a future golden without ivHex ' +
-      'would cover). decrypt-bitexact vs the offline MP4 cleartext reference hls_aes128_clear.mp4 + ' +
+      'the media-sequence-derived-IV branches are separate matrix rows below). decrypt-bitexact vs ' +
+      'the offline MP4 cleartext reference hls_aes128_clear.mp4 + ' +
       'playback-smoke. Routes NA(engine) for any ' +
-      'engine that does not declare hls-aes128 (see index header: mediabunny adapter-vs-dossier note).',
+      'engine that does not support the concrete hls-aes128 tuple.',
   },
   {
     id: 'hls_sample_aes_decrypt',
@@ -135,6 +161,19 @@ const DECRYPT_CASES: DecryptCase[] = [
     cleartextAsset: 'hls_aes128_clear.mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    hls: defineHlsEncryptionContract({
+      case: 'sample-aes',
+      mediaSequence: 0,
+      transitions: [{
+        firstSequence: 0,
+        method: 'SAMPLE-AES',
+        keyRef: 'hls_sample_aes.key',
+        ivMode: 'explicit',
+        explicitIvHex: '101112131415161718191a1b1c1d1e1f',
+      }],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_sample_aes.m3u8.resources.json',
+    }),
     oracles: ['decrypt-bitexact', 'playback-smoke'],
     notes:
       'HLS SAMPLE-AES key-provided decrypt over five real MPEG-TS VOD segments. The segments are ' +
@@ -142,6 +181,106 @@ const DECRYPT_CASES: DecryptCase[] = [
       'compares decoded frames to the clear MP4 reference hls_aes128_clear.mp4 and playback-smoke ' +
       'proves the adapter returns browser-playable MP4 bytes. Key/IV from ' +
       'fixtures/golden/hls_sample_aes.m3u8.keys.json.',
+  },
+  {
+    id: 'hls_aes128_sequence_zero_iv_decrypt',
+    asset: 'hls_aes128_seq0.m3u8',
+    container: 'hls',
+    scheme: 'hls-aes128',
+    keyName: 'hls_aes128_seq0',
+    cleartextAsset: 'hls_aes128_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    oracles: ['decrypt-bitexact', 'playback-smoke'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-sequence-zero',
+      mediaSequence: 0,
+      transitions: [{
+        firstSequence: 0,
+        method: 'AES-128',
+        keyRef: 'hls_aes128_seq0.key',
+        ivMode: 'media-sequence',
+      }],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128_seq0.m3u8.resources.json',
+    }),
+    notes:
+      'HLS AES-128 with IV omitted at MEDIA-SEQUENCE 0. The IV is the 128-bit big-endian segment ' +
+      'sequence number; output is compared with the retained clear source.',
+  },
+  {
+    id: 'hls_aes128_sequence_nonzero_iv_decrypt',
+    asset: 'hls_aes128_seq42.m3u8',
+    container: 'hls',
+    scheme: 'hls-aes128',
+    keyName: 'hls_aes128_seq42',
+    cleartextAsset: 'hls_aes128_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    oracles: ['decrypt-bitexact', 'playback-smoke'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-sequence-nonzero',
+      mediaSequence: 42,
+      transitions: [{
+        firstSequence: 42,
+        method: 'AES-128',
+        keyRef: 'hls_aes128_seq42.key',
+        ivMode: 'media-sequence',
+      }],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128_seq42.m3u8.resources.json',
+    }),
+    notes:
+      'HLS AES-128 with IV omitted at MEDIA-SEQUENCE 42. Every segment derives its own 128-bit ' +
+      'big-endian IV; using zero or one static IV fails the retained-clear comparison.',
+  },
+  {
+    id: 'hls_aes128_key_rotation_decrypt',
+    asset: 'hls_aes128_rotation.m3u8',
+    container: 'hls',
+    scheme: 'hls-aes128',
+    keyName: 'hls_aes128_rotation',
+    cleartextAsset: 'hls_aes128_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    oracles: ['decrypt-bitexact', 'playback-smoke'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-key-rotation',
+      mediaSequence: 7,
+      transitions: [
+        { firstSequence: 7, method: 'AES-128', keyRef: 'hls_aes128_rotation_a.key', ivMode: 'media-sequence' },
+        { firstSequence: 9, method: 'AES-128', keyRef: 'hls_aes128_rotation_b.key', ivMode: 'media-sequence' },
+      ],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128_rotation.m3u8.resources.json',
+    }),
+    notes:
+      'HLS AES-128 key rotation at sequence 9. Both source-bound 128-bit keys and sequence-derived ' +
+      'IVs must be honored; output is compared with the retained clear source.',
+  },
+  {
+    id: 'hls_aes128_method_none_transition_decrypt',
+    asset: 'hls_aes128_method_none.m3u8',
+    container: 'hls',
+    scheme: 'hls-aes128',
+    keyName: 'hls_aes128_method_none',
+    cleartextAsset: 'hls_aes128_clear.mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    oracles: ['decrypt-bitexact', 'playback-smoke'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-method-none-transition',
+      mediaSequence: 3,
+      transitions: [
+        { firstSequence: 3, method: 'AES-128', keyRef: 'hls_aes128_method_none.key', ivMode: 'media-sequence' },
+        { firstSequence: 5, method: 'NONE' },
+      ],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128_method_none.m3u8.resources.json',
+    }),
+    notes:
+      'HLS AES-128 to METHOD=NONE transition. Encrypted prefix segments use sequence-derived IVs; ' +
+      'clear suffix segments must not be decrypted a second time.',
   },
 ];
 

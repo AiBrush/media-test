@@ -1,0 +1,214 @@
+{
+  "schema": "media-test/fixture-generation-index@1",
+  "schemaVersion": "1.0.0",
+  "generationId": "83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f",
+  "createdAtIso": "2026-07-16T00:00:00.000Z",
+  "publicationScope": {
+    "mode": "selected-assets",
+    "assetIds": [
+      "cenc_ctr_clear.mp4",
+      "gapless_aac.m4a",
+      "h264_rotated90.mp4",
+      "h264_two_video_tracks.mp4"
+    ]
+  },
+  "entries": [
+    {
+      "logicalPath": "golden/cenc_ctr_clear.mp4.meta.json",
+      "artifactKind": "metadata",
+      "sha256": "99a0894c20bfc78c8fcf0e96ce10a3363a0a379797d4c6f065accfd481f63442",
+      "sizeBytes": 43528,
+      "sourceMediaSha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7",
+      "provenanceSha256": "928838570fce67a4ab0f9b963ffd0c422a54c7f25659b15338fe483d327cd0ec",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#metadata",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "69406f168c34fc128c0d7544b736a27e795f49aaa630aa2b301374601b29fef0"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/cenc_ctr_clear.mp4.meta.json"
+    },
+    {
+      "logicalPath": "golden/cenc_ctr_clear.mp4.packets.json",
+      "artifactKind": "packets",
+      "sha256": "8824067e2b3e81eccfd5e28150575eef67fe7bad738d973e16d756b792a234cd",
+      "sizeBytes": 379276,
+      "sourceMediaSha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7",
+      "provenanceSha256": "43034d739a6e17e5cc3d2d0b0aef857b64e13b74278a9fdf3fa7992f5c70f1bd",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#packets",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "4a4c2dfec04d963f2a714aae30ffba5d2fcd119decb58a4c6dda57bdb284f93c"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/cenc_ctr_clear.mp4.packets.json"
+    },
+    {
+      "logicalPath": "golden/gapless_aac.m4a.meta.json",
+      "artifactKind": "metadata",
+      "sha256": "f57975fb36f0532a4314d74f61aff6a71d2c76fd1c26fdf4247c5dffa8e7c7ee",
+      "sizeBytes": 12996,
+      "sourceMediaSha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "provenanceSha256": "3f74d611d1e43fe0050fded9d07e184840a2aa6bd0df094c7ec4af3c36c53490",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#metadata",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "15e1707e5ec9075e25f12625465141a4cc9f776c69b0ca0d26799ba84e783a9f"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/gapless_aac.m4a.meta.json"
+    },
+    {
+      "logicalPath": "golden/gapless_aac.m4a.packets.json",
+      "artifactKind": "packets",
+      "sha256": "bd9ff193a39a5b0b576aeea1ae95ff54aa91d37df8c22d93cc51a1e3490137ec",
+      "sizeBytes": 155285,
+      "sourceMediaSha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "provenanceSha256": "3cbea4d8152a09ead717b4e9b92d58d69bcf5eb484b140ab400247234272a5a4",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#packets",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "23374f4a0a6171636cecda6ee7b71158f55cedaa15fae2b4b8301ab37409fcf6"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/gapless_aac.m4a.packets.json"
+    },
+    {
+      "logicalPath": "golden/h264_rotated90.mp4.meta.json",
+      "artifactKind": "metadata",
+      "sha256": "3ed5d2d86a86bbbd6eb25f6cab8fbf2b8c32a833e9cfc8cb99caba6e9dfa52c1",
+      "sizeBytes": 30082,
+      "sourceMediaSha256": "d536492b202984b92e4f9cbe87d66c35c5c7e0f93a08a515936ea794e990b096",
+      "provenanceSha256": "ddcaef7e8c21eb04b6293df3b14cb73f3d2096ecdc15e736bffe670fc028bd85",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#metadata",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "f4609b6dfbcfbe2e35de4d3ffc8723a4418a197868f6ea914b66ab8709b46123"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/h264_rotated90.mp4.meta.json"
+    },
+    {
+      "logicalPath": "golden/h264_rotated90.mp4.packets.json",
+      "artifactKind": "packets",
+      "sha256": "ec9e87cf9a2e128b44f7df27ebad7a33b1d4a2b0cec02c3ef71fd0b59f6651d6",
+      "sizeBytes": 2609065,
+      "sourceMediaSha256": "d536492b202984b92e4f9cbe87d66c35c5c7e0f93a08a515936ea794e990b096",
+      "provenanceSha256": "ece001692e079c2f037cf4690e74002ed68fcd128b5865dcdb495254e205ca22",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#packets",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "dd1c165b0443103239336dae3f84a8a0589d2a520219ddf1ea9e17e30f68345a"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/h264_rotated90.mp4.packets.json"
+    },
+    {
+      "logicalPath": "golden/h264_two_video_tracks.mp4.frames.json",
+      "artifactKind": "frames",
+      "sha256": "af6cbbabee99508758d1e489a018006c61d66127a97f83cec5e6fc81fa059abd",
+      "sizeBytes": 7347,
+      "sourceMediaSha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362",
+      "provenanceSha256": "68ef40d7864dbafe01a0771f38de09e32c61a98d968248b0cbb2fabf991b82df",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#frames",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "184e90743a472d6e474b896ad83d8eb416a89b221d88e70452442d40c285487b"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/h264_two_video_tracks.mp4.frames.json"
+    },
+    {
+      "logicalPath": "golden/h264_two_video_tracks.mp4.meta.json",
+      "artifactKind": "metadata",
+      "sha256": "2a97f5c6ba73bd7fab41f0fd565812a56f67b3ea82e73a249f77366b51f04eed",
+      "sizeBytes": 38811,
+      "sourceMediaSha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362",
+      "provenanceSha256": "3e609cc6f5a222e7072bcc4e950fe8ca5ecb94b280e574f32d5216534cdfc19c",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#metadata",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "3f6798655728b79681c7589ccf57bfe8250111d39277f8e5be03d152aad9baec"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/h264_two_video_tracks.mp4.meta.json"
+    },
+    {
+      "logicalPath": "golden/h264_two_video_tracks.mp4.packets.json",
+      "artifactKind": "packets",
+      "sha256": "896e04228e9c2915528fbde8ae729a7a8d0b21975e83ea170fcf473125c55754",
+      "sizeBytes": 3640399,
+      "sourceMediaSha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362",
+      "provenanceSha256": "1ca333e11394add0ad9186bd3c4358e03d23dc06d93c734bb0657b118ea70e78",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#packets",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "d850c589850f4f974cac267fb32eb2d53617bee7ca7d78d79cfa4c6d4d93c311"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/golden/h264_two_video_tracks.mp4.packets.json"
+    },
+    {
+      "logicalPath": "manifest.json",
+      "artifactKind": "manifest",
+      "sha256": "418600d5a3460b293c33f4bd6250de7528937c321cbb8b7fd31f5cd1d1df7bd7",
+      "sizeBytes": 68436,
+      "sourceMediaSha256": "418600d5a3460b293c33f4bd6250de7528937c321cbb8b7fd31f5cd1d1df7bd7",
+      "provenanceSha256": "fbb156ba45af48392eb7ea0349d1252e4a15240e6e84ccbd5eae391c6ce901df",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#manifest",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "418600d5a3460b293c33f4bd6250de7528937c321cbb8b7fd31f5cd1d1df7bd7"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/manifest.json"
+    },
+    {
+      "logicalPath": "media/cenc_ctr_clear.mp4",
+      "artifactKind": "media",
+      "sha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7",
+      "sizeBytes": 2200098,
+      "sourceMediaSha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7",
+      "provenanceSha256": "f7e3267643a5f98c9ff12af0635bbacf2770d7dabc22960f77780ed341cb89c9",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#media",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "dffb8673b7e3cd7cf68e7d170286acee6632af290e52f9eb9444d7efe31858a7"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/media/cenc_ctr_clear.mp4"
+    },
+    {
+      "logicalPath": "media/gapless_aac.m4a",
+      "artifactKind": "media",
+      "sha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "sizeBytes": 13504,
+      "sourceMediaSha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "provenanceSha256": "59beda45c80983e14717ff0e9f7bd39fd3bd29b79645b8cb6c744424cb7b00ad",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#media",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/media/gapless_aac.m4a"
+    },
+    {
+      "logicalPath": "media/h264_rotated90.mp4",
+      "artifactKind": "media",
+      "sha256": "d536492b202984b92e4f9cbe87d66c35c5c7e0f93a08a515936ea794e990b096",
+      "sizeBytes": 4369279,
+      "sourceMediaSha256": "d536492b202984b92e4f9cbe87d66c35c5c7e0f93a08a515936ea794e990b096",
+      "provenanceSha256": "71f63b589c1c758b78c68ec04e99f98688cecc492429a0b4e543e5c6c0c5f643",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#media",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "d536492b202984b92e4f9cbe87d66c35c5c7e0f93a08a515936ea794e990b096"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/media/h264_rotated90.mp4"
+    },
+    {
+      "logicalPath": "media/h264_two_video_tracks.mp4",
+      "artifactKind": "media",
+      "sha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362",
+      "sizeBytes": 8570945,
+      "sourceMediaSha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362",
+      "provenanceSha256": "a877175e07162b97aba0904e263bac71b6ef6c3785f7076107e640edfb2016ac",
+      "audit": {
+        "recipe": "fixtures/bake.mjs#media",
+        "bakerVersion": "media-test/bake@1",
+        "outputArtifactSha256": "0219af0f810f730a8491ce099cabc4c7f8a90f3577ae7ab9177390a3b931b362"
+      },
+      "generationPath": "generations/83bf313251f0518fea7ab1271175a65590d73d40b03ee86635279e28a288b96f/media/h264_two_video_tracks.mp4"
+    }
+  ],
+  "availability": []
+}

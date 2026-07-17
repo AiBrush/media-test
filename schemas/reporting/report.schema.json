@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aibrush.dev/schemas/media-test/report/1.0.0",
+  "title": "media-test lossless normalized report artifact",
+  "type": "object",
+  "required": [
+    "schemaId", "schemaVersion", "suiteVersion", "contentHash", "envelope", "expected",
+    "observations", "cohorts", "engines", "browsers", "scenarios"
+  ],
+  "properties": {
+    "schemaId": { "const": "https://aibrush.dev/schemas/media-test/report/1.0.0" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+(?:[-+].*)?$" },
+    "suiteVersion": { "type": "string", "minLength": 1 },
+    "contentHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "envelope": {
+      "type": "object",
+      "required": ["generatedAtIso"],
+      "properties": { "generatedAtIso": { "type": "string", "format": "date-time" } },
+      "additionalProperties": true
+    },
+    "expected": { "type": "object" },
+    "observations": { "type": "array" },
+    "cohorts": { "type": "array" },
+    "engines": { "type": "array", "items": { "type": "string" } },
+    "browsers": { "type": "array", "items": { "type": "string" } },
+    "scenarios": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true
+}

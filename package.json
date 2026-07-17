@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Library-agnostic, browser-only media-engine conformance & benchmark suite. The comparison vs the reference engine (Mediabunny) is the product.",
+  "description": "Library-agnostic browser media-engine conformance and benchmark suite using golden evidence, neutral readers, and an unscored browser reference instrument.",
   "engines": {
     "note": "Use bun/bunx. npm/npx are unavailable in this environment."
   },
@@ -17,6 +17,7 @@
     "add-engine": "bash scripts/add-engine.sh",
     "dev": "vite",
     "build": "vite build",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

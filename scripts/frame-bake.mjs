@@ -157,6 +157,7 @@ console.log(`[frame-bake] ${opts.browser} -> ${pageUrl}`);
 const browser = await browserType.launch(launchOpts);
 let exitCode = 0;
 try {
+  const startedAtIso = new Date().toISOString();
   const context = await browser.newContext();
   const page = await context.newPage();
   page.on('console', (msg) => {
@@ -177,10 +178,46 @@ try {
   const bootError = await page.evaluate(() => window.__SUITE_ERROR__ ?? null);
   if (bootError) throw new Error(`suite boot failed: ${bootError}`);
 
+  const browserVersion = browser.version();
+  const browserRealm = await page.evaluate(() => ({
+    userAgent: navigator.userAgent,
+    locale: navigator.language,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    platform: navigator.platform,
+    userAgentData: 'userAgentData' in navigator
+      ? {
+          platform: navigator.userAgentData?.platform ?? null,
+          architecture: navigator.userAgentData?.architecture ?? null,
+        }
+      : null,
+  }));
+  const provenance = {
+    browser: {
+      family: opts.browser,
+      version: browserVersion,
+      executable: browserCfg.executablePath ?? null,
+      userAgent: browserRealm.userAgent,
+    },
+    platform: {
+      os: browserRealm.userAgentData?.platform ?? browserRealm.platform ?? process.platform,
+      arch: browserRealm.userAgentData?.architecture ?? process.arch,
+      locale: browserRealm.locale || process.env.LANG || 'und',
+      timezone: browserRealm.timezone || process.env.TZ || 'not-exposed',
+    },
+    decoderConfiguration: {
+      engine: 'platform',
+      framePixelAccess: 'FrameSink.getPixels',
+      pixelNormalizationVersion: 'normalized-rgba-tight-top-left-straight-alpha@1',
+      playwrightBrowserType: browserCfg.type,
+      headless: opts.headless,
+    },
+    startedAtIso,
+  };
+
   const start = Date.now();
   const reportPromise = page.evaluate(
-    ({ assetIds, force }) => window.__FRAME_BAKE__.run({ assetIds, force }),
-    { assetIds: opts.assetIds, force: opts.force },
+    ({ assetIds, force, provenance }) => window.__FRAME_BAKE__.run({ assetIds, force, provenance }),
+    { assetIds: opts.assetIds, force: opts.force, provenance },
   );
   let settled = false;
   const progress = (async () => {

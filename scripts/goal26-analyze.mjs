@@ -1,68 +1,144 @@
 #!/usr/bin/env bun
-// goal26-analyze.mjs — mirror the harness winner logic (report.ts computeCaseWinner) for a results
-// JSON (full or .partial), restricted to a scenario id list. Prints per-scenario: winner engine,
-// winner value, aibrush value, aibrush status, and whether aibrush wins/co-wins. Read-only.
+/**
+ * Read-only goal analysis over the canonical reporting pipeline.
+ *
+ * This command deliberately contains no metric selection, coverage reduction, alias shortening,
+ * noise band, or winner implementation. Raw runs are validated and normalized through buildReport;
+ * an existing report is validated at its boundary and its recorded ranking decisions are rendered.
+ */
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
-const PRIORITY = ['opsPerSec','packetsPerSec','framesPerSec','decodeFps','encodeFps','throughputRealtime','seekMs','timeToFirstFrame','timeToFirstByte','bundleSize','loadInit','wall','peakMemory','bytesOut','sourceReads','targetWrites','longtasks'];
-const HIGHER = new Set(['throughputRealtime','decodeFps','encodeFps','opsPerSec','packetsPerSec','framesPerSec']);
-const BAND = 3;
+import {
+  buildReport,
+  parseRawRunArtifact,
+  stablePrettyJson,
+  validateReportArtifact,
+} from '../src/core/report.ts';
 
-const file = process.argv[2];
-const only = process.argv[3] ? new Set(readFileSync(process.argv[3],'utf8').split('\n').map(s=>s.trim()).filter(Boolean)) : undefined;
-const d = JSON.parse(readFileSync(file,'utf8'));
-const results = d.results ?? [];
+const options = parseArgs(process.argv.slice(2));
+const input = JSON.parse(readFileSync(resolve(options.file), 'utf8'));
+const report = isReportArtifact(input) ? validatedReport(input) : reportFromRaw(input, options.latest);
+const only = options.only
+  ? new Set(readFileSync(resolve(options.only), 'utf8').split(/\r?\n/).map((value) => value.trim()).filter(Boolean))
+  : undefined;
+const rows = report.cohorts
+  .flatMap((cohort) => cohort.rankings.map((ranking) => {
+    const ai = ranking.contenders.find((contender) => isAibrushEngine(contender.engineId));
+    const aiCell = cohort.cells.find((cell) => cell.scenarioId === ranking.scenarioId && ai && cell.engineId === ai.engineId);
+    const winners = ranking.winner ? [ranking.winner] : ranking.coWinners;
+    return {
+      scenarioId: ranking.scenarioId,
+      browser: ranking.browser,
+      cohortId: ranking.cohortId,
+      comparable: ranking.comparable,
+      metric: ranking.primaryMetric,
+      aggregation: ranking.aggregation,
+      unit: ranking.unit,
+      flag: ranking.flag,
+      winner: ranking.winner,
+      winnerValue: ranking.winnerValue,
+      coWinners: ranking.coWinners,
+      aibrushEngineId: ai?.engineId ?? null,
+      aibrushGrade: aiCell?.grade ?? 'ABSENT',
+      aibrushEligibility: ai?.eligibility ?? 'ABSENT',
+      aibrushValue: ai?.observation?.state === 'AVAILABLE' ? ai.observation.rankedValue : null,
+      aibrushWins: ai ? winners.includes(ai.engineId) : false,
+      reasons: ranking.reasons,
+    };
+  }))
+  .filter((row) => !only || only.has(row.scenarioId))
+  .sort((a, b) =>
+    a.scenarioId.localeCompare(b.scenarioId)
+    || a.browser.localeCompare(b.browser)
+    || a.cohortId.localeCompare(b.cohortId));
 
-// group by scenarioId
-const byScenario = new Map();
-for (const r of results) {
-  if (only && !only.has(r.scenarioId)) continue;
-  if (!byScenario.has(r.scenarioId)) byScenario.set(r.scenarioId, []);
-  byScenario.get(r.scenarioId).push(r);
+if (options.json) {
+  process.stdout.write(stablePrettyJson({
+    schema: 'media-test/goal-analysis@1',
+    reportContentHash: report.contentHash,
+    rows,
+  }));
+} else {
+  printTable(rows, report.contentHash);
 }
 
-function benchVal(r, m) {
-  const b = r.bench?.[m];
-  if (!b) return undefined;
-  const v = b.aggregate ?? b.median;
-  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+function reportFromRaw(value, latest) {
+  const run = parseRawRunArtifact(value);
+  return buildReport({
+    results: run.results,
+    suiteVersion: run.suiteVersion,
+    generatedAtIso: run.generatedAtIso,
+    ...(run.expected ? { expected: run.expected } : {}),
+    contextForResult: () => ({ runId: run.runId, observedAtIso: run.generatedAtIso }),
+    dedupePolicy: latest ? 'latest' : 'strict',
+  }).json;
 }
-function pickMetric(passes) {
-  const declared = passes.map(r=>r.primaryMetric).filter(Boolean);
-  for (const m of declared) if (passes.every(r=>r.bench?.[m])) return m;
-  for (const m of PRIORITY) if (passes.every(r=>r.bench?.[m])) return m;
-  for (const m of PRIORITY) if (passes.some(r=>r.bench?.[m])) return m;
-  return null;
+
+function validatedReport(value) {
+  validateReportArtifact(value);
+  return value;
 }
-const short = id => id.replace(/@.*/,'');
-const rows = [];
-for (const [sid, rs] of byScenario) {
-  const passes = rs.filter(r=>r.status==='PASS');
-  const ai = rs.find(r=>short(r.engineId)==='aibrush-media');
-  const aiStatus = ai?.status ?? 'ABSENT';
-  if (passes.length===0) { rows.push({sid, metric:'-', winner:'(none pass)', wv:NaN, ai:short(ai?.engineId??''), av:NaN, aiStatus, aiWins:false}); continue; }
-  const metric = pickMetric(passes);
-  const higher = HIGHER.has(metric);
-  const ranked = passes.map(r=>({id:short(r.engineId), v:benchVal(r,metric), passed:r.coverage?.passed??0}))
-    .filter(x=>typeof x.v==='number')
-    .sort((a,b)=> b.passed-a.passed || (higher? b.v-a.v : a.v-b.v));
-  const top = ranked[0];
-  const aiRow = ranked.find(x=>x.id==='aibrush-media');
-  // co-winner check at top coverage tier within noise band
-  const rel = (a,b)=> b===0?(a===b?0:100):(higher?((a-b)/b*100):((b-a)/b*100));
-  const aiWins = aiRow && aiRow.passed===top.passed && Math.abs(rel(aiRow.v, top.v))<=BAND || (top && top.id==='aibrush-media');
-  rows.push({sid, metric, winner:top?.id??'?', wv:top?.v??NaN, av:aiRow?.v??NaN, aiStatus, aiWins: !!aiWins,
-    others: ranked.map(x=>`${x.id}:${x.v.toFixed(2)}`).join('  ')});
+
+function isReportArtifact(value) {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof value.schemaId === 'string'
+    && value.schemaId.includes('/report/');
 }
-// preserve goal order if provided
-const order = only ? [...only] : [...byScenario.keys()];
-rows.sort((a,b)=> order.indexOf(a.sid)-order.indexOf(b.sid));
-let losing=0;
-const fmt=(v)=> Number.isFinite(v)? v.toFixed(2):'—';
-console.log('WIN?  scenario                                             metric            winner            win_val   aibrush   ai_status');
-for (const r of rows) {
-  if (!r.aiWins) losing++;
-  console.log(`${r.aiWins?' ✓ ':' ✗ '}  ${r.sid.padEnd(52)} ${String(r.metric).padEnd(16)} ${String(r.winner).padEnd(16)} ${fmt(r.wv).padStart(9)} ${fmt(r.av).padStart(9)}   ${r.aiStatus}`);
+
+function isAibrushEngine(engineId) {
+  return engineId === 'aibrush-media' || engineId.startsWith('aibrush-media@');
 }
-console.log(`\naibrush loses/ties-not-won ${losing}/${rows.length}`);
-for (const r of rows) if(!r.aiWins) console.log(`  LOSS ${r.sid}\n        ${r.others}`);
+
+function printTable(rows, contentHash) {
+  console.log(`report ${contentHash}`);
+  console.log('WIN?  scenario                                      browser    metric               winner                          aibrush                         status');
+  let losses = 0;
+  for (const row of rows) {
+    if (!row.aibrushWins) losses += 1;
+    const metric = row.metric
+      ? `${row.metric}/${row.aggregation ?? '—'}`
+      : '—';
+    const winner = row.winner ?? (row.coWinners.length > 0 ? `tie:${row.coWinners.join(',')}` : `(${row.flag})`);
+    console.log(
+      `${row.aibrushWins ? ' ✓ ' : ' ✗ '}  ${row.scenarioId.padEnd(45)} ${row.browser.padEnd(10)} `
+      + `${metric.padEnd(20)} ${winner.padEnd(31)} ${(row.aibrushEngineId ?? 'ABSENT').padEnd(31)} `
+      + `${row.aibrushGrade}/${row.aibrushEligibility}`,
+    );
+  }
+  console.log(`\naibrush not selected ${losses}/${rows.length}`);
+  for (const row of rows) {
+    if (!row.aibrushWins) console.log(`  ${row.scenarioId} [${row.browser}] ${row.reasons.join('; ') || 'no ranking reason'}`);
+  }
+}
+
+function parseArgs(argv) {
+  const options = { file: undefined, only: undefined, latest: false, json: false };
+  for (let index = 0; index < argv.length; index++) {
+    const value = argv[index];
+    if (value === '--only') options.only = requiredArg(argv, ++index, value);
+    else if (value === '--latest') options.latest = true;
+    else if (value === '--json') options.json = true;
+    else if (value === '-h' || value === '--help') {
+      console.log('bun scripts/goal26-analyze.mjs <raw-run-or-report.json> [scenario-ids.txt|--only file] [--latest] [--json]');
+      process.exit(0);
+    } else if (!options.file) options.file = value;
+    else if (!options.only) options.only = value;
+    else fail(`unexpected argument '${value}'`, 2);
+  }
+  if (!options.file) fail('a validated raw-run or report JSON path is required', 2);
+  return options;
+}
+
+function requiredArg(values, index, flag) {
+  const value = values[index];
+  if (!value) fail(`${flag} requires a value`, 2);
+  return value;
+}
+
+function fail(message, code = 1) {
+  console.error(`goal26-analyze.mjs: ${message}`);
+  process.exit(code);
+}

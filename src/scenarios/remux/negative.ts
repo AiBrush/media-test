@@ -23,6 +23,7 @@
 
 import type { Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import { defineRobustnessContract } from '../robustness/contracts.ts';
 
 const REMUX_NEG_TIMEOUT_MS = 15_000;
 
@@ -34,7 +35,7 @@ interface RemuxNegativeCase {
   to: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
-  gracefulAllowOutput?: boolean;
+  validateSafePartial?: boolean;
   notes: string;
 }
 
@@ -57,7 +58,7 @@ const NEGATIVE_CASES: RemuxNegativeCase[] = [
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    gracefulAllowOutput: true,
+    validateSafePartial: true,
     notes:
       'MP4 cut at 50% (incomplete moov/mdat) -> remux to MKV: engine must reject or emit nothing ' +
       'cleanly, or emit a safe partial output, within the timeout — no OOM on a half-present sample table.',
@@ -80,7 +81,16 @@ export const remuxNegativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
     id: `remux/${c.id}`,
     op: 'remux',
     input: c.asset,
-    options: { container: c.to, ...(c.gracefulAllowOutput ? { gracefulAllowOutput: true } : {}) },
+    options: {
+      container: c.to,
+      ...(c.validateSafePartial ? { invariant: 'safe-partial-output' } : {}),
+      robustness: defineRobustnessContract(
+        'negative',
+        'media-structure',
+        c.validateSafePartial ? ['graceful-failure', 'property-invariant'] : ['graceful-failure'],
+        REMUX_NEG_TIMEOUT_MS,
+      ),
+    },
     requires: {
       operations: ['remux'],
       containersIn: [c.from],
@@ -88,7 +98,7 @@ export const remuxNegativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
-    oracles: ['graceful-failure'],
+    oracles: c.validateSafePartial ? ['graceful-failure', 'property-invariant'] : ['graceful-failure'],
     metrics: ['wall', 'peakMemory'],
     timeoutMs: REMUX_NEG_TIMEOUT_MS,
     notes: c.notes,

@@ -13,16 +13,10 @@
  * CORRECTNESS GATES (same oracle truth as the headlines): probe → golden-metadata (ctx.metadata vs
  * golden meta); demux → golden-packets (ctx.demux vs golden packets). A fast-but-wrong op FAILs.
  *
- * GOLDEN STATE (verified) — which rungs rank for real TODAY vs degrade to honest NA:
- *   • tiny  tiny_h264_360p_2s.mp4   — meta+packets baked  → ranks NOW
- *   • medium h264_1080p_30s.mp4     — meta+packets baked  → ranks NOW
- *   • large4k h264_4k_10s.mp4       — meta+packets baked  → ranks NOW (large bucket, real 4K read)
- *   • large  large_h264_1080p_120s.mp4   — manifest-defined, golden NOT baked → NA/golden-absent FAIL until bake
- *   • huge   huge_h264_1080p_600s.mov    — manifest-defined, golden NOT baked → NA until bake
- *   • massive massive_h264_1080p_2h.mp4  — ~216k frames, golden NOT baked → NA until bake
- * loadGolden() drops absent golden, so the un-baked rungs produce a CLEAN golden-absent FAIL / NA —
- * never a fabricated number — and light up the moment the bake commits asset+golden. Wired now so the
- * leaderboard cells + golden filenames line up (mirrors remux/size-ladder.ts, the sanctioned pattern).
+ * AVAILABILITY is intentionally not declared here. The selected asset must have a resolved manifest
+ * digest+size and the typed golden loader must return OK for the row's required evidence. Missing
+ * evidence is NA_ASSET; invalid committed evidence is ERROR. This makes newly committed long-form
+ * evidence available without changing scenario source or stale hand-maintained flags.
  *
  * PEAK-MEMORY VARIANTS (§A.14 'peak memory bytes ↓', §8.3 measureUserAgentSpecificMemory): demux on
  * the large/huge rung ranked by peakMemory (lower-better) asserts an engine STREAMS rather than
@@ -41,23 +35,20 @@ interface Rung {
   key: string;
   asset: string;
   timeoutMs: number;
-  baked: boolean; // golden meta+packets present TODAY (informational; the runner decides at run time)
 }
 
-// Ordered small→large. `baked` annotates which rank for real now vs NA-until-bake.
+// Ordered small→large. Runtime manifest/golden evidence is the sole availability authority.
 const RUNGS: Rung[] = [
-  { key: 'tiny', asset: LADDER.tiny, timeoutMs: T_FAST, baked: true },
-  { key: 'medium', asset: LADDER.medium, timeoutMs: T_FAST, baked: true },
-  { key: 'large4k', asset: LADDER.large4k, timeoutMs: T_LARGE, baked: true },
-  { key: 'large', asset: LADDER.large, timeoutMs: T_LARGE, baked: false },
-  { key: 'huge', asset: LADDER.huge, timeoutMs: T_HUGE, baked: false },
-  { key: 'massive', asset: LADDER.massive, timeoutMs: T_HUGE, baked: false },
+  { key: 'tiny', asset: LADDER.tiny, timeoutMs: T_FAST },
+  { key: 'medium', asset: LADDER.medium, timeoutMs: T_FAST },
+  { key: 'large4k', asset: LADDER.large4k, timeoutMs: T_LARGE },
+  { key: 'large', asset: LADDER.large, timeoutMs: T_LARGE },
+  { key: 'huge', asset: LADDER.huge, timeoutMs: T_HUGE },
+  { key: 'massive', asset: LADDER.massive, timeoutMs: T_HUGE },
 ];
 
-function bakeNote(r: Rung): string {
-  return r.baked
-    ? `golden baked → ranks now`
-    : `golden NOT baked → NA/golden-absent FAIL until the bake adds ${r.asset} + golden`;
+function availabilityNote(r: Rung): string {
+  return `availability for ${r.asset} is derived from its verified manifest identity and typed golden evidence`;
 }
 
 function h264AacRequiresForRung(r: Rung, op: Requires['operations'][number]): Requires {
@@ -78,7 +69,7 @@ const extractLadder: Scenario[] = RUNGS.map((r) =>
     timeoutMs: r.timeoutMs,
     notes:
       `§5.3 size axis (${r.key}): extract-metadata on ${r.asset}, rank by ops/sec. Gated by ` +
-      `golden-metadata. ${bakeNote(r)}.`,
+      `golden-metadata; ${availabilityNote(r)}.`,
   }),
 );
 
@@ -95,7 +86,7 @@ const iterateLadder: Scenario[] = RUNGS.map((r) =>
     timeoutMs: r.timeoutMs,
     notes:
       `§5.3 size axis (${r.key}): iterate every video packet of ${r.asset}, rank by packets/sec ` +
-      `(stresses streaming/lazy demux + sample-table parsing at scale). Gated by golden-packets. ${bakeNote(r)}.`,
+      `(stresses streaming/lazy demux + sample-table parsing at scale). Gated by golden-packets; ${availabilityNote(r)}.`,
   }),
 );
 
@@ -116,8 +107,9 @@ const memoryPressure: Scenario[] = MEMORY_RUNGS.map((r) =>
     timeoutMs: r.timeoutMs,
     notes:
       `§A.16 memory-pressure (${r.key}): demux ${r.asset} ranked by peakMemory↓ — asserts the engine ` +
-      `streams rather than buffering the whole file (OOM-resistance). peakMemory present only on ` +
-      `cross-origin-isolated Chromium; NA elsewhere. Gated by golden-packets. ${bakeNote(r)}.`,
+      `streams rather than buffering the whole file (OOM-resistance). The protocol records a baseline, ` +
+      `in-operation samples, end sample, settle window, UA memory API, maximum and delta; unsupported ` +
+      `browser instrumentation is NA_BROWSER. Gated by golden-packets; ${availabilityNote(r)}.`,
   }),
 );
 

@@ -43,24 +43,23 @@
  * only gives seconds). Frame digests use the shared normalization (digest.ts) so they line up with
  * golden data and other engines.
  *
- * BEST PATH (dossier §6, recorded as `configUsed`): hardware-accelerated WebCodecs for all coded
- * video/audio (no WASM, no CPU codec); `hardwareAcceleration: 'prefer-hardware'` on every decoder
- * sink and on every Conversion video block; a `CanvasSink` ring-buffer (`poolSize`) keeps VRAM
- * constant during repeated frame extraction; the Conversion API runs read→decode→encode→mux in
- * streaming lockstep with automatic backpressure (queue depth auto-managed — no manual
- * encode/decodeQueueSize tuning). No SharedArrayBuffer / COOP+COEP required by mediabunny itself.
+ * EFFECTIVE PATH (recorded as `configUsed`): TypeScript container work plus exact-config WebCodecs
+ * where decode/encode is required. Hardware acceleration defaults to `no-preference` unless the
+ * request pins another mode. Frame extraction owns and closes VideoSamples, preferring direct RGBA
+ * copy; output-target waits and positioned writes are measured, while unobservable internal queue
+ * behavior is not claimed. No SharedArrayBuffer / COOP+COEP is required by Mediabunny itself.
  *
  * LOAD/INIT (dossier §3, rule §0.7 — UNTIMED): the mediabunny module is DYNAMICALLY IMPORTED inside
  * init() (so module parse/instantiate is excluded from the measured window) and the WebCodecs
- * feature-detection caches are WARMED there (getDecodable + getEncodable codec probes build memoized
- * maps and configure throw-away codecs) so the first measured op pays no isConfigSupported / codec
- * warm-up cost. dispose() drops the namespace handle for clean peak-memory accounting.
+ * feature-detection caches are broadly WARMED there. Every concrete operation still probes its exact
+ * codec/profile/dimensions/rate/channel configuration before use. dispose() cancels active
+ * conversions and drops the namespace handle for clean peak-memory accounting.
  *
  * mediabunny surface used (verified against installed 1.48.0 .d.ts):
  *   Input, BlobSource, ALL_FORMATS, <format singletons>  — reading/probing/demuxing
  *   InputVideoTrack/InputAudioTrack getters               — normalized metadata
  *   EncodedPacketSink (.packets / .getKeyPacket / .getPacket / .getNextPacket) — packet tables/trim
- *   CanvasSink (.canvases / .getCanvas)                   — decode → RGBA (honors rotation metadata)
+ *   VideoSampleSink (.samples / .getSample)               — decode → owned RGBA observations
  *   VideoSampleSink (.getSample)                          — seek to a precise frame
  *   Conversion (.init/.execute, video/audio/trim/fan-out) — remux/transcode/trim
  *   Output + <OutputFormat> + BufferTarget + Encoded*PacketSource — mux from encoded tracks
@@ -86,6 +85,8 @@ import type {
   BufferTarget,
   Target,
   StreamTargetChunk,
+  Conversion,
+  MetadataTags,
 } from 'mediabunny';
 
 /** The mediabunny module namespace, loaded lazily in init() (rule §0.7 — untimed). */
@@ -99,6 +100,8 @@ interface VideoTransformExtras {
 
 import type {
   CapabilitySet,
+  DecodeOptions,
+  DecodeTrackSelector,
   DecryptKey,
   DemuxResult,
   EncodedTracks,
@@ -106,6 +109,7 @@ import type {
   FrameDigest,
   FrameSink,
   MediaBytes,
+  MuxWriteTraceEvidence,
   MediaEngine,
   MediaInput,
   NormalizedMetadata,
@@ -114,7 +118,31 @@ import type {
   TrackType,
   TranscodeOptions,
   TranscodeVideoOptions,
+  ConcreteOperationRequest,
+  LifecycleContext,
+  OperationContext,
+  SerializableValue,
+  SupportDecision,
 } from '../../core/engine.ts';
+import type { StreamingRuntimeEvidence } from '../../features/streaming-output/runtime.ts';
+import type { StreamingRepresentation } from '../../features/streaming-output/contracts.ts';
+import type {
+  SinkTrace,
+  SinkTraceEvent,
+} from '../../features/streaming-output/types.ts';
+
+type WithoutSequence<T> = T extends unknown ? Omit<T, 'sequence'> : never;
+type UnsequencedSinkTraceEvent = WithoutSequence<SinkTraceEvent>;
+
+import {
+  DECODE_TRACK_SELECTOR_SCHEMA,
+  createBrowserNotSupportedError,
+  createMalformedInputError,
+  createNotApplicableError,
+  isBrowserNotSupportedError,
+  isNotApplicableError,
+} from '../../core/engine.ts';
+import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/index.ts';
 
 import {
   canonicalToMediabunnyAudio,
@@ -127,12 +155,35 @@ import {
   type OutputFormatOptions,
 } from './codecs.ts';
 import { digestImageData, sha256Hex } from './digest.ts';
+import {
+  MEDIABUNNY_REASON,
+  audioEncodePlanForRequest,
+  decideMediabunnySupport,
+  defaultAudioBitrate,
+  defaultVideoBitrate,
+  mediabunnyAudioEncoderConfig,
+  mediabunnyVideoEncoderConfig,
+  tupleSummary,
+  unsupportedRequestedMetadataTag,
+  videoEncodePlanForRequest,
+  type MediabunnyAudioEncodePlan,
+  type MediabunnyVideoEncodePlan,
+} from './support.ts';
+import {
+  PipelineStarvationSampler,
+  type PipelineStarvationSummary,
+} from './internal/encoder-starvation.ts';
 
 interface PreparedMuxTrackCandidate {
   inputIndex: number;
   type: 'video' | 'audio';
   typeOrdinal: number;
   track: EncodedTracks['tracks'][number];
+}
+
+interface MediabunnyPreparedTracks extends EncodedTracks {
+  metadataTags?: MetadataTags;
+  sourceTrackCount?: number;
 }
 
 type AlphaMode = 'discard' | 'keep';
@@ -144,20 +195,27 @@ type DecodeHardwareAccelerationMode = NonNullable<VideoDecoderConfig['hardwareAc
  * exposed via {@link MediabunnyEngine.configUsed} so the runner can record it per §8.5.
  */
 export const MEDIABUNNY_CONFIG = {
-  backend: 'webcodecs',
+  framework: 'mediabunny',
+  packageVersions: { mediabunny: '1.48.0' },
+  backend: 'webcodecs+typescript-container-codecs',
+  hardwareAcceleration: 'exact-config/no-preference-unless-requested',
+  workerCount: 0,
+  threadCount: 0,
+  readerMode: 'range-url; owned-buffer-for-mutation',
+  writerMode: 'Output encoded-packet or Conversion',
+  targetMode: 'BufferTarget or positioned StreamTarget with full-output spool',
+  codecConfigs: [] as SerializableValue[],
+  encoderNondeterministic: true,
   pixelBackend: 'VideoSample.copyTo(RGBA)>canvas',
-  hwAccel: 'prefer-hardware',
-  wasmThreads: 0,
-  pipeline: 'streaming-lockstep',
-  queueDepth: 'auto',
+  pipeline: 'framework-managed; cancellation and target waits observed',
+  queueTelemetry: 'operation-scoped measured samples only',
   coreBuild: 'pure-ts-esm',
   sharedArrayBuffer: false,
   coopCoep: 'not-required',
-  canvasPoolSize: 4,
 } as const;
 
-/** WebCodecs hardware-acceleration hint forced to the GPU engine (dossier §6). */
-const HW_ACCEL = MEDIABUNNY_CONFIG.hwAccel;
+/** Default WebCodecs acceleration policy; concrete requests may explicitly override it. */
+const HW_ACCEL: HardwareAccelerationMode = 'no-preference';
 /** seconds → integer microseconds (mediabunny exposes most times in seconds). */
 function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
@@ -242,8 +300,58 @@ async function durationFromInput(input: Input): Promise<number | null> {
  *  blob-resource memory/read errors; BufferSource consumes the already-owned bytes directly. HLS also
  *  requires a PathedSource because playlists resolve sibling segment/key URLs relative to the playlist
  *  path. */
-async function openInput(mb: MB, input: MediaInput, container?: string): Promise<Input> {
+export interface MediabunnyHlsReadTrace {
+  rootMode: 'url' | 'mutated-buffer' | 'caller-key-override';
+  rootDigest?: string;
+  reads: Array<{
+    path: string;
+    source: 'mutated-root' | 'caller-key' | 'network-sidecar';
+    disposition: 'read' | 'missing' | 'error';
+  }>;
+}
+
+interface OpenInputOptions {
+  hlsKeyBytes?: Uint8Array;
+  trace?: MediabunnyHlsReadTrace;
+  starvation?: PipelineStarvationSampler;
+}
+
+async function openInput(mb: MB, input: MediaInput, container?: string, options: OpenInputOptions = {}): Promise<Input> {
   if (isHlsAsset(input, container)) {
+    if (input.mutated || options.hlsKeyBytes || options.trace) {
+      // A CustomPathedSource keeps relative segment/key resolution while making the root playlist
+      // bytes authoritative. This is the only safe way to ensure a mutated root is not silently
+      // reread from its pristine URL.
+      const startedAt = nowMs();
+      const rootBytes = new Uint8Array(await input.arrayBuffer());
+      options.starvation?.noteSourceWait(nowMs() - startedAt);
+      const rootDigest = await sha256Hex(rootBytes);
+      const playlist = new TextDecoder().decode(rootBytes);
+      const keyUris = hlsKeyUrisFromPlaylist(playlist, input.url);
+      if (options.trace) {
+        options.trace.rootMode = input.mutated
+          ? 'mutated-buffer'
+          : options.hlsKeyBytes
+            ? 'caller-key-override'
+            : 'url';
+        options.trace.rootDigest = rootDigest;
+      }
+      const source = new mb.CustomPathedSource(input.url, (request) => {
+        const resolved = resolveHlsPath(request.path, input.url);
+        if (request.isRoot) {
+          options.trace?.reads.push({ path: resolved, source: 'mutated-root', disposition: 'read' });
+          return new mb.BufferSource(rootBytes);
+        }
+        if (options.hlsKeyBytes && keyUris.has(resolved)) {
+          options.trace?.reads.push({ path: resolved, source: 'caller-key', disposition: 'read' });
+          return new mb.BufferSource(options.hlsKeyBytes);
+        }
+        return new mb.UrlSource(resolved, options.trace
+          ? { fetchFn: traceHlsFetch(options.trace, resolved) }
+          : undefined);
+      });
+      return new mb.Input({ source, formats: mb.HLS_FORMATS });
+    }
     // PathedSource (UrlSource) is mandatory for HLS segment resolution. The library's HLS_FORMATS
     // keeps HLS first while also allowing child TS/MP4/AAC/MP3 segments to be recognized.
     return new mb.Input({
@@ -257,7 +365,9 @@ async function openInput(mb: MB, input: MediaInput, container?: string): Promise
     if (f) formats.push(f);
   }
   if (isBlobUrl(input.url)) {
+    const startedAt = nowMs();
     const buffer = await input.arrayBuffer();
+    options.starvation?.noteSourceWait(nowMs() - startedAt);
     return new mb.Input({
       source: new mb.BufferSource(buffer),
       formats: formats.length ? formats : mb.ALL_FORMATS,
@@ -269,11 +379,128 @@ async function openInput(mb: MB, input: MediaInput, container?: string): Promise
       formats: formats.length ? formats : mb.ALL_FORMATS,
     });
   }
+  const startedAt = nowMs();
   const blob = await input.blob();
+  options.starvation?.noteSourceWait(nowMs() - startedAt);
   return new mb.Input({
     source: new mb.BlobSource(blob),
     formats: formats.length ? formats : mb.ALL_FORMATS,
   });
+}
+
+function traceHlsFetch(trace: MediabunnyHlsReadTrace, fallbackPath: string): typeof fetch {
+  return async (resource, init) => {
+    const path = resource instanceof Request
+      ? resource.url
+      : resource instanceof URL
+        ? resource.href
+        : String(resource || fallbackPath);
+    let response: Response;
+    try {
+      response = await fetch(resource, init);
+    } catch (error) {
+      trace.reads.push({ path, source: 'network-sidecar', disposition: 'error' });
+      throw error;
+    }
+    if (!response.ok) {
+      trace.reads.push({
+        path,
+        source: 'network-sidecar',
+        disposition: response.status === 404 ? 'missing' : 'error',
+      });
+      return response;
+    }
+    if (!response.body) {
+      trace.reads.push({ path, source: 'network-sidecar', disposition: 'read' });
+      return response;
+    }
+
+    const reader = response.body.getReader();
+    let recordedRead = false;
+    const recordRead = (): void => {
+      if (recordedRead) return;
+      recordedRead = true;
+      trace.reads.push({ path, source: 'network-sidecar', disposition: 'read' });
+    };
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const next = await reader.read();
+          if (next.done) {
+            recordRead();
+            controller.close();
+            return;
+          }
+          if (next.value.byteLength > 0) recordRead();
+          controller.enqueue(next.value);
+        } catch (error) {
+          trace.reads.push({ path, source: 'network-sidecar', disposition: 'error' });
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        await reader.cancel(reason);
+      },
+    });
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
+export function hlsKeyUrisFromPlaylist(playlist: string, rootUrl: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of playlist.split(/\r?\n/)) {
+    if (!/^#EXT-X-KEY:/i.test(line)) continue;
+    const match = /(?:^|,)URI=(?:"([^"]+)"|'([^']+)'|([^,]+))/i.exec(line.slice(line.indexOf(':') + 1));
+    const uri = match?.[1] ?? match?.[2] ?? match?.[3];
+    if (uri) out.add(resolveHlsPath(uri.trim(), rootUrl));
+  }
+  return out;
+}
+
+export function hlsExplicitIvHexesFromPlaylist(playlist: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of playlist.split(/\r?\n/)) {
+    if (!/^#EXT-X-KEY:/i.test(line)) continue;
+    const match = /(?:^|,)IV=0x([0-9a-f]{32})(?:,|$)/i.exec(line.slice(line.indexOf(':') + 1));
+    if (match?.[1]) out.add(match[1].toLowerCase());
+  }
+  return out;
+}
+
+/** Single-key CENC resolver: a key is never reused for a different KID in a multi-key asset. */
+export function createCencKeyResolver(
+  keyBytes: Uint8Array,
+  normalizedKid?: string,
+  onResolve?: (keyId: string) => void,
+): (request: { keyId: string }) => Uint8Array {
+  return ({ keyId }) => {
+    onResolve?.(keyId);
+    if (normalizedKid !== undefined && keyId.toLowerCase() !== normalizedKid) {
+      // Wrong/missing keys are data correctness failures, not applicability.
+      throw new Error(`mediabunny decrypt key-id mismatch: requested ${keyId}, supplied ${normalizedKid}`);
+    }
+    return keyBytes;
+  };
+}
+
+function resolveHlsPath(path: string, rootUrl: string): string {
+  try {
+    return new URL(path, rootUrl).href;
+  } catch {
+    return path;
+  }
+}
+
+function bindAbortToInput(input: Input, signal?: AbortSignal): () => void {
+  if (!signal) return () => undefined;
+  const onAbort = () => input.dispose();
+  if (signal.aborted) onAbort();
+  else signal.addEventListener('abort', onAbort, { once: true });
+  return () => signal.removeEventListener('abort', onAbort);
 }
 
 function siblingContainerHint(input: MediaInput): 'mov' | 'mkv' | undefined {
@@ -306,6 +533,10 @@ function canonicalContainerFromFormat(name: string, source?: MediaInput): string
 async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
   const language = await track.getLanguageCode().catch(() => 'und');
   const bitrate = await track.getBitrate().catch(() => null);
+  const internalCodecId = await track.getInternalCodecId().catch(() => null);
+  const nativeCodecTag = typeof internalCodecId === 'string' || typeof internalCodecId === 'number'
+    ? String(internalCodecId)
+    : undefined;
 
   if (track.isVideoTrack()) {
     const v = track as InputVideoTrack;
@@ -317,10 +548,19 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
     ]);
     // FPS: estimate from a prefix of packets (averagePacketRate == frame rate for video).
     let fps: number | undefined;
+    let fpsProvenance: NormalizedTrack['fpsProvenance'];
     try {
       const stats = await v.computePacketStats(120);
       if (Number.isFinite(stats.averagePacketRate) && stats.averagePacketRate > 0) {
         fps = stats.averagePacketRate;
+        if (Number.isSafeInteger(stats.packetCount) && stats.packetCount > 0) {
+          fpsProvenance = {
+            source: 'average',
+            cadence: 'UNKNOWN',
+            sampleCount: stats.packetCount,
+            observedIntervalUs: stats.packetCount * 1e6 / stats.averagePacketRate,
+          };
+        }
       }
     } catch {
       fps = undefined;
@@ -328,6 +568,7 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
     const out: NormalizedTrack = {
       type: 'video',
       codec: mediabunnyToCanonicalVideo(mbCodec) ?? mbCodec ?? 'unknown',
+      ...(nativeCodecTag ? { nativeCodecTag } : {}),
       width: width || undefined,
       height: height || undefined,
       rotation: rotation || 0,
@@ -335,6 +576,7 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
       language: language === 'und' ? null : language,
     };
     if (fps !== undefined) out.fps = fps;
+    if (fpsProvenance !== undefined) out.fpsProvenance = fpsProvenance;
     return out;
   }
 
@@ -348,6 +590,7 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
     return {
       type: 'audio',
       codec: mediabunnyToCanonicalAudio(mbCodec) ?? mbCodec ?? 'unknown',
+      ...(nativeCodecTag ? { nativeCodecTag } : {}),
       sampleRate: sampleRate || undefined,
       channels: channels || undefined,
       bitrate: bitrate ?? null,
@@ -359,6 +602,7 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
   return {
     type: (track.type as TrackType) ?? 'other',
     codec: 'unknown',
+    ...(nativeCodecTag ? { nativeCodecTag } : {}),
     bitrate: bitrate ?? null,
     language: language === 'und' ? null : language,
   };
@@ -371,16 +615,133 @@ function copyBytes(source: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): 
   return new Uint8Array(view);
 }
 
+function selectDecodeTrack(
+  tracks: readonly InputTrack[],
+  selector: DecodeTrackSelector | undefined,
+): { track: InputTrack; trackIndex: number; typeOrdinal: number } | { reason: string } {
+  const candidates = tracks
+    .map((track, trackIndex) => ({ track, trackIndex }))
+    .filter(({ track }) => selector
+      ? selector.type === 'video' ? track.isVideoTrack() : track.isAudioTrack()
+      : track.isVideoTrack());
+  const fallback = candidates.length > 0
+    ? candidates
+    : selector ? [] : tracks.map((track, trackIndex) => ({ track, trackIndex })).filter(({ track }) => track.isAudioTrack());
+  if (selector?.trackId !== undefined) {
+    return { reason: 'mediabunny does not expose a stable string trackId for decode selection' };
+  }
+  const byIndex = selector?.trackIndex !== undefined
+    ? fallback.find((entry) => entry.trackIndex === selector.trackIndex)
+    : undefined;
+  const selected = byIndex ?? (selector?.typeOrdinal !== undefined ? fallback[selector.typeOrdinal] : fallback[0]);
+  if (!selected) return { reason: 'requested decode track does not exist' };
+  const typeOrdinal = fallback.findIndex((entry) => entry.trackIndex === selected.trackIndex);
+  if (selector?.trackIndex !== undefined && selected.trackIndex !== selector.trackIndex) {
+    return { reason: `requested decode track index ${selector.trackIndex} does not identify a ${selector.type} track` };
+  }
+  if (selector?.typeOrdinal !== undefined && typeOrdinal !== selector.typeOrdinal) {
+    return { reason: `requested ${selector.type} ordinal ${selector.typeOrdinal} does not exist` };
+  }
+  return { ...selected, typeOrdinal };
+}
+
+export function representationForCodec(
+  codec: string,
+  description?: Uint8Array,
+): Pick<EncodedTracks['tracks'][number], 'framing' | 'accessUnitGrouping' | 'parameterSetLocation' | 'descriptionRecord'> & { nalLengthSize?: number } {
+  if (codec === 'h264') {
+    return description
+      ? {
+          framing: 'avc',
+          accessUnitGrouping: 'one-access-unit-per-chunk',
+          parameterSetLocation: 'description',
+          descriptionRecord: 'avc-decoder-configuration-record',
+          nalLengthSize: description.byteLength > 4 ? (description[4]! & 0x03) + 1 : 4,
+        }
+      : {
+          framing: 'annexb',
+          accessUnitGrouping: 'one-access-unit-per-chunk',
+          parameterSetLocation: 'in-band',
+        };
+  }
+  if (codec === 'hevc') {
+    return description
+      ? {
+          framing: 'hevc',
+          accessUnitGrouping: 'one-access-unit-per-chunk',
+          parameterSetLocation: 'description',
+          descriptionRecord: 'hevc-decoder-configuration-record',
+          nalLengthSize: description.byteLength > 21 ? (description[21]! & 0x03) + 1 : 4,
+        }
+      : {
+          framing: 'annexb',
+          accessUnitGrouping: 'one-access-unit-per-chunk',
+          parameterSetLocation: 'in-band',
+        };
+  }
+  if (codec === 'aac') {
+    return {
+      framing: description ? 'raw' : 'adts',
+      accessUnitGrouping: 'one-packet-per-chunk',
+      parameterSetLocation: description ? 'description' : 'in-band',
+      ...(description ? { descriptionRecord: 'audio-specific-config' } : {}),
+    };
+  }
+  return {
+    framing: 'raw',
+    accessUnitGrouping: 'one-packet-per-chunk',
+    parameterSetLocation: description ? 'description' : 'not-applicable',
+    ...(description ? { descriptionRecord: 'codec-private' } : {}),
+  };
+}
+
 function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): void {
   let originUs = Infinity;
   for (const chunk of chunks) {
-    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs);
+    originUs = Math.min(originUs, chunk.ptsUs, ...(chunk.dtsUs === undefined ? [] : [chunk.dtsUs]));
   }
   if (!Number.isFinite(originUs) || originUs === 0) return;
   for (const chunk of chunks) {
     chunk.ptsUs -= originUs;
-    chunk.dtsUs -= originUs;
+    if (chunk.dtsUs !== undefined) chunk.dtsUs -= originUs;
   }
+}
+
+function applyObservedFrameRateEvidence(track: NormalizedTrack, packets: readonly PacketInfo[]): void {
+  if (track.type !== 'video' || packets.length === 0) return;
+  const ordered = [...packets].sort((a, b) => a.ptsUs - b.ptsUs);
+  const startUs = ordered[0]!.ptsUs;
+  const endUs = ordered.reduce(
+    (end, packet) => Math.max(end, packet.ptsUs + Math.max(0, packet.durationUs ?? 0)),
+    startUs,
+  );
+  const observedIntervalUs = endUs - startUs;
+  if (!(observedIntervalUs > 0)) return;
+
+  track.fps = packets.length * 1e6 / observedIntervalUs;
+  const intervals: number[] = [];
+  for (let index = 1; index < ordered.length; index++) {
+    const interval = ordered[index]!.ptsUs - ordered[index - 1]!.ptsUs;
+    if (interval > 0) intervals.push(interval);
+  }
+  let cadence: NonNullable<NormalizedTrack['fpsProvenance']>['cadence'] = 'UNKNOWN';
+  let envelope: { minFps: number; maxFps: number } | undefined;
+  if (intervals.length > 0) {
+    const minInterval = Math.min(...intervals);
+    const maxInterval = Math.max(...intervals);
+    const meanInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
+    // Integer timebases make NTSC-like CFR alternate by one tick. Treat <=0.1%/2us jitter as CFR,
+    // while preserving a real cadence envelope whenever packet timing varies materially.
+    cadence = maxInterval - minInterval <= Math.max(2, meanInterval * 0.001) ? 'CFR' : 'VFR';
+    envelope = { minFps: 1e6 / maxInterval, maxFps: 1e6 / minInterval };
+  }
+  track.fpsProvenance = {
+    source: 'observed',
+    cadence,
+    sampleCount: packets.length,
+    observedIntervalUs,
+    ...(envelope ? { envelope } : {}),
+  };
 }
 
 function selectPreparedMuxTracks(
@@ -420,6 +781,106 @@ function selectPreparedMuxTracks(
   const audioFromLater = candidates.filter((c) => c.inputIndex > 0 && c.type === 'audio');
   const selected = [...videoFromFirst, ...audioFromLater];
   return selected.length > 0 ? selected : candidates;
+}
+
+interface PreparedOpenedInput {
+  candidates: PreparedMuxTrackCandidate[];
+  metadataTags?: MetadataTags;
+  sourceTrackCount: number;
+  bytesRead: number;
+}
+
+/** Extract every supported track from an already-opened input without decode/encode. */
+async function prepareOpenedInput(
+  mb: MB,
+  input: Input,
+  inputIndex: number,
+  engineId: string,
+  context?: OperationContext,
+): Promise<PreparedOpenedInput> {
+  const tracks = await input.getTracks();
+  const metadataTags = await input.getMetadataTags().catch(() => undefined);
+  const candidates: PreparedMuxTrackCandidate[] = [];
+  const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
+  let bytesRead = 0;
+  const operation = context?.request.operation ?? 'prepareMuxTracks';
+
+  for (const track of tracks) {
+    if (!track.isVideoTrack() && !track.isAudioTrack()) {
+      throw createNotApplicableError(
+        engineId,
+        operation,
+        `strict mux preparation cannot silently discard '${track.type}' tracks`,
+        context ? tupleSummary(context.request) : {},
+        MEDIABUNNY_REASON.TRACK_TYPE,
+      );
+    }
+    const type: 'video' | 'audio' = track.isVideoTrack() ? 'video' : 'audio';
+    const typeOrdinal = typeCounts[type]++;
+    const normalized = await normalizeTrack(track);
+    const decoderConfig = await track.getDecoderConfig().catch(() => null);
+    const timescale = await track.getTimeResolution().catch(() => 1_000_000);
+    const sink = new mb.EncodedPacketSink(track);
+    const chunks: EncodedTracks['tracks'][number]['chunks'] = [];
+
+    for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+      if (context?.signal.aborted) throw abortError(context.signal.reason);
+      const data = copyBytes(pkt.data);
+      bytesRead += data.byteLength;
+      chunks.push({
+        data,
+        ptsUs: pkt.microsecondTimestamp,
+        decodeIndex: chunks.length,
+        durationUs: pkt.microsecondDuration,
+        keyframe: pkt.type === 'key',
+      });
+    }
+
+    if (chunks.length === 0) {
+      throw createNotApplicableError(
+        engineId,
+        operation,
+        `strict copy cannot author an empty ${type} track`,
+        context ? tupleSummary(context.request) : {},
+        MEDIABUNNY_REASON.COPY_REQUIRED,
+      );
+    }
+    rebaseChunksToZero(chunks);
+
+    const description = decoderConfig?.description ? copyBytes(decoderConfig.description) : undefined;
+    const representation = representationForCodec(normalized.codec, description);
+    const encodedTrack: EncodedTracks['tracks'][number] = {
+      type,
+      codec: normalized.codec,
+      ...(decoderConfig?.codec
+        ? { nativeCodecTag: decoderConfig.codec }
+        : normalized.nativeCodecTag
+          ? { nativeCodecTag: normalized.nativeCodecTag }
+          : {}),
+      timescale: Number.isFinite(timescale) && timescale > 0 ? timescale : 1_000_000,
+      packetOrdering: 'decode',
+      timebase: { numerator: 1, denominator: Number.isSafeInteger(timescale) && timescale > 0 ? timescale : 1_000_000 },
+      framing: representation.framing,
+      accessUnitGrouping: representation.accessUnitGrouping,
+      parameterSetLocation: representation.parameterSetLocation,
+      ...(normalized.width !== undefined ? { width: normalized.width } : {}),
+      ...(normalized.height !== undefined ? { height: normalized.height } : {}),
+      ...(normalized.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
+      ...(normalized.channels !== undefined ? { channels: normalized.channels } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(representation.descriptionRecord ? { descriptionRecord: representation.descriptionRecord } : {}),
+      chunks,
+    };
+
+    candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
+  }
+
+  return {
+    candidates,
+    ...(metadataTags ? { metadataTags } : {}),
+    sourceTrackCount: tracks.length,
+    bytesRead,
+  };
 }
 
 /** Probe an already-opened Input into NormalizedMetadata. */
@@ -482,6 +943,73 @@ async function metadataFromInput(input: Input, source?: MediaInput): Promise<Nor
   return meta;
 }
 
+function metadataTagsFromRecord(
+  original: MetadataTags | undefined,
+  requested: Record<string, string> | undefined,
+): MetadataTags | undefined {
+  if (!requested || Object.keys(requested).length === 0) return original;
+  const tags: MetadataTags = { ...(original ?? {}) };
+  for (const [key, value] of Object.entries(requested)) {
+    switch (key) {
+      case 'title':
+      case 'description':
+      case 'artist':
+      case 'album':
+      case 'albumArtist':
+      case 'genre':
+      case 'lyrics':
+      case 'comment':
+        tags[key] = value;
+        break;
+      case 'trackNumber':
+      case 'tracksTotal':
+      case 'discNumber':
+      case 'discsTotal': {
+        const number = Number(value);
+        if (!Number.isSafeInteger(number) || number < 0) throw new TypeError(`metadata tag '${key}' must be a non-negative integer`);
+        tags[key] = number;
+        break;
+      }
+      case 'date': {
+        const date = new Date(value);
+        if (!Number.isFinite(date.valueOf())) throw new TypeError("metadata tag 'date' must be an ISO-compatible date");
+        tags.date = date;
+        break;
+      }
+      default:
+        tags.raw = { ...(tags.raw ?? {}), [key]: value };
+    }
+  }
+  return tags;
+}
+
+async function verifyMetadataTags(
+  mb: MB,
+  bytes: Uint8Array,
+  container: string,
+  requested: Record<string, string> | undefined,
+): Promise<void> {
+  if (!requested || Object.keys(requested).length === 0) return;
+  const format = inputFormatForContainer(container);
+  const input = new mb.Input({
+    source: new mb.BufferSource(bytes),
+    formats: format ? [format] : mb.ALL_FORMATS,
+  });
+  try {
+    const actual = await input.getMetadataTags();
+    for (const [key, expected] of Object.entries(requested)) {
+      const raw = (actual as Record<string, unknown>)[key] ?? actual.raw?.[key];
+      const actualValue = raw instanceof Date ? raw.toISOString() : String(raw ?? '');
+      const expectedValue = key === 'date' ? new Date(expected).toISOString() : expected;
+      if (actualValue !== expectedValue && String(raw ?? '') !== expected) {
+        throw new Error(`mediabunny metadata round-trip mismatch for '${key}'`);
+      }
+    }
+  } finally {
+    input.dispose();
+  }
+}
+
 function isNoopTrim(
   meta: NormalizedMetadata,
   range: { startUs: number; endUs: number },
@@ -497,61 +1025,28 @@ function isNoopTrim(
   );
 }
 
-/**
- * Codecs whose WebCodecs encoders are routinely WGPU/hardware-poor and pixel-format/bitrate-picky:
- * VP9 and VP8 hardware encoders are scarce, and (when present) commonly REJECT small frames at a low
- * target bitrate. Forcing `hardwareAcceleration:'prefer-hardware'` on these is what made
- * convert-webm-resize-320x180 ERROR ("This specific encoder configuration (vp09.00.11.08, 120000
- * bps, 320x180, hardware...) is not supported"). For these codecs we DON'T force hardware — we let
- * the encodability probe below pick the working acceleration mode (software is the reliable path).
- */
-const SOFTWARE_PREFERRED_ENCODE: ReadonlySet<VideoCodec> = new Set<VideoCodec>(['vp9', 'vp8']);
-
-/**
- * A sensible default video bitrate (bits/sec) for a re-encode when the caller didn't pin one.
- * mediabunny's QUALITY_* presets scale bitrate by pixel count × codec-efficiency, so at small output
- * sizes the VP9 QUALITY_HIGH target collapses to ~120 kbps for 320×180 — a rate hardware VP9
- * encoders reject (the exact bug here). We therefore use a numeric, resolution-aware target with an
- * absolute floor so small renditions never get a starvation bitrate, and we DON'T hand WebCodecs a
- * `Quality` whose resolved value is unknowably low. Reference (the QUALITY_HIGH→120 kbps collapse):
- * node_modules/mediabunny .../encode.js `Quality._toVideoBitrate` (3 Mbps @1080p × (px/ref)^0.95 ×
- * codecEff × factor). For 320×180 our floor gives a healthy 300 kbps instead of the rejected 120 kbps.
- */
-function defaultVideoBitrate(codec: VideoCodec | undefined, width?: number, height?: number): number {
-  // Resolution-aware target (per-pixel coefficient × pixel count × codec efficiency) with an
-  // absolute floor so even tiny frames clear WebCodecs encoder minimums. The floor (300 kbps) sits
-  // far above the VP9 hardware-reject point (~120 kbps for 320×180) that caused the bug; the
-  // coefficient scales the rate cleanly upward for larger boxes (≈7.4 Mbps for VP9 720p, ≈16.6 Mbps
-  // for 1080p), and codec efficiency trims it for the more efficient codecs.
-  const MIN_BITRATE = 300_000;
-  const PER_PIXEL = 10; // bits/sec per output pixel (≈ 30fps × 0.33 bpp reference)
-  const px = (width && width > 0 ? width : 1280) * (height && height > 0 ? height : 720);
-  const efficiency: Record<string, number> = { avc: 1.0, hevc: 0.7, vp9: 0.8, av1: 0.6, vp8: 1.1 };
-  const eff = (codec && efficiency[codec]) || 1.0;
-  const target = Math.round(px * PER_PIXEL * eff);
-  return Math.max(MIN_BITRATE, target);
+interface RuntimeApplicability {
+  engineId: string;
+  request: ConcreteOperationRequest;
+  operation: 'transcode' | 'trim' | 'decodeFrames' | 'seek';
+  recordCodecConfig(config: VideoEncoderConfig | AudioEncoderConfig | VideoDecoderConfig | AudioDecoderConfig): void;
 }
 
 /**
  * Build mediabunny ConversionVideoOptions from a TranscodeVideoOptions block.
  *
- * Best path (dossier §6): for codecs with solid hardware encoders (H.264/HEVC/AV1) we still PREFER
- * the GPU engine. But the encode config is PROBED with `canEncodeVideo` (WebCodecs
- * isConfigSupported) before committing, so we never hand the Conversion a config the browser will
- * reject mid-transcode (which surfaces as a hard ERROR). For VP9/VP8 — whose hardware encoders are
- * scarce and reject small-frame/low-bitrate configs — we don't force hardware and let the probe
- * choose the working acceleration mode (software). We also use a sane numeric bitrate instead of the
- * QUALITY_HIGH preset (which collapses to ~120 kbps for VP9 @320×180 and gets rejected).
+ * The adapter resolves one concrete codec/profile/dimensions/bitrate/rate/acceleration plan and
+ * probes that exact plan through Mediabunny before constructing the Conversion. It does not retry a
+ * different mode after a positive support decision or infer availability from a broad warmup.
  *
- * If NO acceleration mode can encode the requested codec/size at all, we throw a clear
- * browser-limitation error. (In practice the runner's pre-flight NA(browser) gate — which probes
- * `VideoEncoder.isConfigSupported` for the codec — fires first, so a genuinely unencodable codec is
- * reported as NA(browser), not ERROR.)
+ * If the exact chosen configuration is unavailable, the shared typed browser-applicability error
+ * is thrown. Malformed configurations and failures after a positive support decision stay errors.
  */
 async function buildVideoOptions(
   mb: MB,
   v: TranscodeVideoOptions,
   extra?: VideoTransformExtras,
+  applicability?: RuntimeApplicability,
 ): Promise<ConversionVideoOptions> {
   const opts: ConversionVideoOptions = {};
   let codec: VideoCodec | undefined;
@@ -607,63 +1102,61 @@ async function buildVideoOptions(
   }
   if (extra?.alpha) opts.alpha = extra.alpha;
 
-  // No codec requested → this may end up a lossless copy (no encode); keep the best-path hint and
-  // return (the Conversion only applies hardwareAcceleration when it actually transcodes).
+  // No codec requested → this may end up a lossless copy. A transform caller that needs an encode
+  // supplies an explicit concrete plan after inspecting the source track.
   if (!codec) {
     opts.hardwareAcceleration = HW_ACCEL;
     return opts;
   }
 
-  // Choose the encode bitrate: honor an explicit caller bitrate, else a sane resolution-aware target
-  // (NOT the QUALITY_HIGH preset, which collapses to a hardware-rejected ~120 kbps for VP9@320×180).
-  const bitrate: number =
-    typeof v.bitrate === 'number' && v.bitrate > 0
-      ? v.bitrate
-      : defaultVideoBitrate(codec, v.width, v.height);
+  const plan = applicability
+    ? videoEncodePlanForRequest(applicability.request, v as unknown as Record<string, unknown>)
+    : undefined;
+  const width = plan?.width ?? (v.width && v.width > 0 ? v.width : 1280);
+  const height = plan?.height ?? (v.height && v.height > 0 ? v.height : 720);
+  const bitrate = plan?.bitrate ?? (v.bitrate && v.bitrate > 0 ? v.bitrate : defaultVideoBitrate(codec, width, height));
+  const hardwareAcceleration = plan?.hardwareAcceleration ?? HW_ACCEL;
+  opts.width = width;
+  opts.height = height;
+  opts.fit ??= 'fill';
   opts.bitrate = bitrate;
+  opts.hardwareAcceleration = hardwareAcceleration;
 
-  // Decide the acceleration mode by PROBING actual encodability (isConfigSupported), in preference
-  // order. For VP9/VP8 software is the reliable path (hardware is scarce + picky); for the others we
-  // try hardware first (best-path), then fall back so a missing hardware encoder still succeeds.
-  const probeW = v.width && v.width > 0 ? v.width : undefined;
-  const probeH = v.height && v.height > 0 ? v.height : undefined;
-  const highFrameRate = typeof v.fps === 'number' && v.fps >= 120;
-  const modes: HardwareAccelerationMode[] = SOFTWARE_PREFERRED_ENCODE.has(codec)
-    ? ['prefer-software', 'no-preference']
-    : highFrameRate
-      ? ['no-preference', 'prefer-software', HW_ACCEL]
-      : [HW_ACCEL, 'no-preference', 'prefer-software'];
-
-  let chosen: HardwareAccelerationMode | null = null;
-  for (const mode of modes) {
-    const probeOptions: Parameters<typeof mb.canEncodeVideo>[1] & { framerate?: number } = {
-      ...(probeW !== undefined ? { width: probeW } : {}),
-      ...(probeH !== undefined ? { height: probeH } : {}),
-      bitrate,
-      hardwareAcceleration: mode,
-    };
-    if (typeof v.fps === 'number') probeOptions.framerate = v.fps;
-    if (extra?.alpha) probeOptions.alpha = extra.alpha;
-    const ok = await mb
-      .canEncodeVideo(codec, probeOptions)
-      .catch(() => false);
-    if (ok) {
-      chosen = mode;
-      break;
-    }
+  const probeOptions: Parameters<typeof mb.canEncodeVideo>[1] & { framerate?: number } = {
+    width,
+    height,
+    bitrate,
+    hardwareAcceleration,
+    ...(typeof v.fps === 'number' ? { framerate: v.fps } : {}),
+    ...(extra?.alpha ? { alpha: extra.alpha } : {}),
+  };
+  let supported: boolean;
+  try {
+    supported = await mb.canEncodeVideo(codec, probeOptions);
+  } catch (error) {
+    if (error instanceof TypeError) throw error; // malformed config is a real request error.
+    supported = false;
   }
-
-  if (!chosen) {
-    // Genuinely unencodable in this browser. Surface a clear browser-limitation message; the runner
-    // normally short-circuits this codec to NA(browser) in pre-flight before we reach here.
-    throw new Error(
-      `mediabunny transcode: browser cannot encode ${codec} at ` +
-      `${probeW ?? '?'}x${probeH ?? '?'} @ ${bitrate} bps with any acceleration mode ` +
-      `(WebCodecs VideoEncoder.isConfigSupported=false) — NA(browser)`,
+  if (!supported) {
+    const config = plan?.config ?? mediabunnyVideoEncoderConfig(
+      codec,
+      width,
+      height,
+      bitrate,
+      typeof v.fps === 'number' ? v.fps : undefined,
+      hardwareAcceleration,
+      extra?.alpha ?? 'discard',
+    );
+    throw createBrowserNotSupportedError(
+      applicability?.engineId ?? 'mediabunny@1.48.0',
+      applicability?.operation ?? 'transcode',
+      `browser cannot encode the exact ${codec} ${width}x${height} configuration`,
+      applicability ? tupleSummary(applicability.request) : {},
+      MEDIABUNNY_REASON.BROWSER_VIDEO_ENCODE,
+      { role: 'video-encoder', config },
     );
   }
-
-  opts.hardwareAcceleration = chosen;
+  if (plan) applicability?.recordCodecConfig(plan.config);
   return opts;
 }
 
@@ -678,14 +1171,16 @@ async function buildVideoOptions(
  * loss); not setting it preserves the dossier's "copy whenever possible" path while still getting a
  * sensible bitrate when a re-encode is genuinely required.
  */
-function buildAudioOptions(
+async function buildAudioOptions(
   mb: MB,
   a: NonNullable<TranscodeOptions['audio']>,
   inputDurationSec?: number,
-): ConversionAudioOptions {
+  applicability?: RuntimeApplicability,
+): Promise<ConversionAudioOptions> {
   const opts: ConversionAudioOptions = {};
+  let codec: AudioCodec | undefined;
   if (a.codec) {
-    const codec = canonicalToMediabunnyAudio(a.codec);
+    codec = canonicalToMediabunnyAudio(a.codec) ?? undefined;
     if (codec) opts.codec = codec;
   }
   if (typeof a.sampleRate === 'number') opts.sampleRate = a.sampleRate;
@@ -696,6 +1191,38 @@ function buildAudioOptions(
     opts.forceTranscode = true;
     opts.sampleFormat = 'f32';
     opts.process = process;
+  }
+  if (codec) {
+    const plan = applicability ? audioEncodePlanForRequest(applicability.request) : undefined;
+    const sampleRate = plan?.sampleRate ?? a.sampleRate ?? 48_000;
+    const channels = plan?.channels ?? a.channels ?? 2;
+    const bitrate = plan?.bitrate ?? a.bitrate ?? defaultAudioBitrate(codec);
+    opts.sampleRate = sampleRate;
+    opts.numberOfChannels = channels;
+    if (bitrate !== undefined) opts.bitrate = bitrate;
+    let supported: boolean;
+    try {
+      supported = await mb.canEncodeAudio(codec, {
+        sampleRate,
+        numberOfChannels: channels,
+        ...(bitrate !== undefined ? { bitrate } : {}),
+      });
+    } catch (error) {
+      if (error instanceof TypeError) throw error;
+      supported = false;
+    }
+    if (!supported) {
+      const config = plan?.config ?? mediabunnyAudioEncoderConfig(codec, sampleRate, channels, bitrate);
+      throw createBrowserNotSupportedError(
+        applicability?.engineId ?? 'mediabunny@1.48.0',
+        applicability?.operation ?? 'transcode',
+        `browser cannot encode the exact ${codec} ${sampleRate} Hz/${channels} channel configuration`,
+        applicability ? tupleSummary(applicability.request) : {},
+        MEDIABUNNY_REASON.BROWSER_AUDIO_ENCODE,
+        { role: 'audio-encoder', config },
+      );
+    }
+    if (plan?.config) applicability?.recordCodecConfig(plan.config);
   }
   return opts;
 }
@@ -762,9 +1289,40 @@ function buildAudioProcess(
   };
 }
 
+export interface MediabunnyTargetTelemetry {
+  targetKind: 'buffer' | 'stream';
+  appendOnly: boolean;
+  firstNativeWriteMs?: number;
+  firstConsumerByteMs?: number;
+  writeCount: number;
+  nativeWriteBytes: number;
+  finalExtentBytes: number;
+  maxPosition: number;
+  overwriteCount: number;
+  peakQueuedBytes: number;
+  maximumOutstandingWritePromises: number;
+  retainedOutputBytes: number;
+  operationStartMs: number;
+  finalizeStartMs?: number;
+  finalizeCompleteMs?: number;
+  closeMs?: number;
+  reserveMaximumPacketCount?: number;
+  reserveTrackPacketCounts?: number[];
+  completed: boolean;
+}
+
+export type MediabunnyMediaBytes = MediaBytes & {
+  targetTelemetry?: MediabunnyTargetTelemetry;
+  streamingEvidence?: StreamingRuntimeEvidence;
+  starvation?: PipelineStarvationSummary;
+  variantSupport?: Array<{ index: number; status: 'SUPPORTED' | 'NA_ENGINE' | 'NA_BROWSER'; reasonCode?: string }>;
+};
+
 interface OutputTargetTelemetry {
   target: Target;
-  mediaBytes: (container: string) => Promise<MediaBytes>;
+  markFinalizeStart: () => void;
+  mediaBytes: (container: string) => Promise<MediabunnyMediaBytes>;
+  cancel: (reason?: unknown) => Promise<void>;
 }
 
 function nowMs(): number {
@@ -773,78 +1331,756 @@ function nowMs(): number {
     : Date.now();
 }
 
-function instrumentedOutputTarget(mb: MB, opts?: Record<string, unknown>): OutputTargetTelemetry {
-  const startMs = nowMs();
+/**
+ * A single-owned positioned spool: individual native chunk objects are released immediately, but
+ * the complete output allocation remains retained. This is not a bounded-memory benchmark sink.
+ */
+export class PositionedByteSpool {
+  private storage = new Uint8Array(0);
+  private extent = 0;
+  private ranges: Array<{ start: number; end: number }> = [];
+  overwriteCount = 0;
+
+  write(position: number, data: Uint8Array): void {
+    if (!Number.isSafeInteger(position) || position < 0) throw new TypeError('stream chunk position must be a non-negative safe integer');
+    const end = position + data.byteLength;
+    if (!Number.isSafeInteger(end)) throw new TypeError('stream chunk extent exceeds safe integer range');
+    if (this.ranges.some((range) => position < range.end && end > range.start)) this.overwriteCount++;
+    if (end > this.storage.byteLength) {
+      let capacity = Math.max(1024, this.storage.byteLength || 0);
+      while (capacity < end) capacity = Math.max(end, capacity * 2);
+      const grown = new Uint8Array(capacity);
+      grown.set(this.storage.subarray(0, this.extent));
+      this.storage = grown;
+    }
+    this.storage.set(data, position);
+    this.extent = Math.max(this.extent, end);
+    this.ranges.push({ start: position, end });
+    if (this.ranges.length > 256) this.ranges = coalesceRanges(this.ranges);
+  }
+
+  get byteLength(): number {
+    return this.extent;
+  }
+
+  /** Actual retained allocation, including geometric growth slack. */
+  get retainedCapacityBytes(): number {
+    return this.storage.byteLength;
+  }
+
+  bytes(): Uint8Array {
+    // Return a view over the one spool allocation. No all-chunks + final-buffer duplication.
+    return this.storage.subarray(0, this.extent);
+  }
+}
+
+function coalesceRanges(ranges: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start);
+  const out: Array<{ start: number; end: number }> = [];
+  for (const range of sorted) {
+    const previous = out[out.length - 1];
+    if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+    else out.push({ ...range });
+  }
+  return out;
+}
+
+function coveredByteLength(ranges: readonly { start: number; end: number }[]): number {
+  return ranges.reduce((total, range) => total + range.end - range.start, 0);
+}
+
+function fnv1a64Hex(bytes: Uint8Array): string {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, '0');
+}
+
+function updateFnv1a64(hash: bigint, bytes: Uint8Array): bigint {
+  let next = hash;
+  for (const byte of bytes) {
+    next ^= BigInt(byte);
+    next = BigInt.asUintN(64, next * 0x100000001b3n);
+  }
+  return next;
+}
+
+function streamingRepresentationFromOptions(
+  container: string,
+  opts: Readonly<Record<string, unknown>>,
+): StreamingRepresentation {
+  if (container === 'mp4' || container === 'mov') {
+    if (opts.fragmented === true || opts.fastStart === 'fragmented') return 'fragmented-mp4';
+    if (opts.fastStart === 'reserve') return 'faststart-reserve-mp4';
+    if (opts.fastStart === 'in-memory') return 'faststart-in-memory-mp4';
+    return 'progressive-mp4';
+  }
+  if (container === 'webm' || container === 'mkv') {
+    return opts.appendOnly === true ? 'live-webm' : 'finite-webm';
+  }
+  if (container === 'ts') return 'mpeg-ts';
+  return 'other';
+}
+
+function instrumentedOutputTarget(
+  mb: MB,
+  opts?: Record<string, unknown>,
+  context?: OperationContext,
+  starvation = new PipelineStarvationSampler(),
+): OutputTargetTelemetry {
+  const operationStartMs = context?.operationStartMs ?? nowMs();
+  const traceEnabled = context?.request.operation === 'remux';
+  const traceEvents: SinkTraceEvent[] = traceEnabled
+    ? [{ type: 'operation-start', sequence: 0, atMs: operationStartMs }]
+    : [];
   let targetWrites = 0;
-  let firstByteMs: number | undefined;
-  const markWrite = () => {
+  let nativeWriteBytes = 0;
+  let finalExtentBytes = 0;
+  let maxPosition = 0;
+  let firstNativeWriteMs: number | undefined;
+  let firstObservableByteMs: number | undefined;
+  let completed = false;
+  let overwriteCount = 0;
+  let writeRanges: Array<{ start: number; end: number }> = [];
+  let traceRanges: Array<{ start: number; end: number }> = [];
+  let traceNativeWriteBytes = 0;
+  let maximumOutstandingWritePromises = 0;
+  let queuedBytes = 0;
+  let peakQueuedBytes = 0;
+  let finalizeStartMs: number | undefined;
+  let finalizeCompleteMs: number | undefined;
+  let closeMs: number | undefined;
+  let reservationRecorded = false;
+  let incrementalRollingHash = 0xcbf29ce484222325n;
+  let incrementalHashEnd = 0;
+  let incrementalHashValid = true;
+  const captureMuxWriteTrace = context?.phase === 'functional' && context.request.operation === 'mux';
+  const observedMuxWrites: Array<{ atMs: number; position: number; bytes: Uint8Array }> = [];
+
+  const absoluteNow = (): number => {
+    const previous = traceEvents[traceEvents.length - 1]?.atMs ?? operationStartMs;
+    return Math.max(operationStartMs, previous, nowMs());
+  };
+  const relativeMs = (absoluteMs: number): number => Math.max(0, absoluteMs - operationStartMs);
+  const pushTraceEvent = (event: UnsequencedSinkTraceEvent): void => {
+    if (!traceEnabled) return;
+    traceEvents.push({ ...event, sequence: traceEvents.length } as SinkTraceEvent);
+  };
+  const markFinalizeStart = (): void => {
+    if (finalizeStartMs !== undefined) return;
+    finalizeStartMs = absoluteNow();
+    pushTraceEvent({ type: 'finalize-start', atMs: finalizeStartMs });
+  };
+  const markFinalizeComplete = (atMs: number): void => {
+    if (finalizeCompleteMs !== undefined) return;
+    finalizeCompleteMs = atMs;
+    pushTraceEvent({ type: 'finalize-complete', atMs });
+  };
+  const markClose = (atMs: number): void => {
+    if (closeMs !== undefined) return;
+    closeMs = atMs;
+    pushTraceEvent({ type: 'close', atMs });
+  };
+  const markAbort = (): void => {
+    if (!traceEnabled || traceEvents.some((event) => event.type === 'abort')) return;
+    pushTraceEvent({ type: 'abort', atMs: absoluteNow(), reasonCode: 'MEDIABUNNY_TARGET_ABORTED' });
+  };
+  const emitWrite = (
+    start: number,
+    end: number,
+    absoluteAtMs: number,
+    traceWrite: boolean,
+    outstandingWritePromises = 1,
+  ) => {
+    if (context?.signal.aborted) throw abortError(context.signal.reason);
+    if (end <= start) return;
+    if (writeRanges.some((range) => start < range.end && end > range.start)) overwriteCount++;
+    writeRanges = coalesceRanges([...writeRanges, { start, end }]);
     targetWrites++;
-    firstByteMs ??= Math.max(0, nowMs() - startMs);
+    nativeWriteBytes += end - start;
+    finalExtentBytes = Math.max(finalExtentBytes, end);
+    maxPosition = Math.max(maxPosition, start);
+    firstNativeWriteMs ??= relativeMs(absoluteAtMs);
+    if (traceWrite) {
+      traceRanges = coalesceRanges([...traceRanges, { start, end }]);
+      traceNativeWriteBytes += end - start;
+      pushTraceEvent({
+        type: 'write',
+        atMs: absoluteAtMs,
+        position: start,
+        length: end - start,
+        cumulativeUniqueBytes: coveredByteLength(traceRanges),
+        outstandingWritePromises,
+      });
+    }
+    if (context) {
+      const atMs = relativeMs(absoluteAtMs);
+      if (opts?.target === 'stream' && firstObservableByteMs === undefined) {
+        firstObservableByteMs = atMs;
+        context.emit({ type: 'first-byte', atMs });
+      }
+      context.emit({ type: 'bytes-written', atMs, bytes: finalExtentBytes });
+      context.emit({ type: 'write-count', atMs, count: targetWrites });
+    }
   };
 
-  if (opts?.target === 'stream') {
-    const chunks: Array<{ position: number; data: Uint8Array }> = [];
-    let maxEnd = 0;
+  const observeWritePayloadForHash = (position: number, bytes: Uint8Array): void => {
+    if (!incrementalHashValid) return;
+    if (position !== incrementalHashEnd) {
+      incrementalHashValid = false;
+      return;
+    }
+    incrementalRollingHash = updateFnv1a64(incrementalRollingHash, bytes);
+    incrementalHashEnd += bytes.byteLength;
+  };
+
+  const rollingHashFor = (bytes: Uint8Array): string =>
+    incrementalHashValid && incrementalHashEnd === bytes.byteLength
+      ? incrementalRollingHash.toString(16).padStart(16, '0')
+      : fnv1a64Hex(bytes);
+
+  const sinkTrace = (
+    target: 'buffer' | 'stream',
+    bytes: Uint8Array,
+    retainedOutputBytes: number,
+  ): SinkTrace => ({
+    schema: 'media-test/sink-trace@1',
+    target,
+    events: traceEvents.map((event) => ({ ...event })),
+    totalUniqueBytes: coveredByteLength(traceRanges),
+    nativeWriteBytes: traceNativeWriteBytes,
+    maximumOutstandingWritePromises,
+    maximumQueuedBytes: peakQueuedBytes,
+    retainedOutputBytes,
+    rollingHash: rollingHashFor(bytes),
+    rollingHashAlgorithm: 'fnv1a64',
+    validationPrefix: bytes.slice(0, 4096),
+    validationTail: bytes.slice(Math.max(0, bytes.byteLength - 4096)),
+  });
+
+  const streamingEvidence = (
+    target: 'buffer' | 'stream',
+    container: string,
+    bytes: Uint8Array,
+    retainedOutputBytes: number,
+  ): StreamingRuntimeEvidence | undefined => traceEnabled
+    ? {
+        schema: 'media-test/streaming-runtime-evidence@1',
+        sinkTrace: sinkTrace(target, bytes, retainedOutputBytes),
+        resolvedRepresentation: streamingRepresentationFromOptions(container, opts ?? {}),
+        observerPolicy: target === 'stream'
+          ? 'mediabunny-streamtarget-positioned-spool@1'
+          : 'mediabunny-buffertarget-finalized-buffer@1',
+        retainedOutputPolicy: target === 'stream'
+          ? 'full-output-positioned-spool'
+          : 'full-output-finalized-buffer',
+        measurementContract: 'media-test/streaming-output-measure@1',
+      }
+    : undefined;
+
+  // Preserve the package's real WritableStream coalescing for ordinary stream modes. In particular,
+  // in-memory/fragmented formats promise monotonic observer writes even though the muxer performs
+  // internal header patching before StreamTarget flushes a coalesced chunk.
+  if (opts?.target === 'stream' && opts.fastStart !== 'reserve') {
+    const streamOpts = opts;
+    const spool = new PositionedByteSpool();
+    let firstConsumerByteMs: number | undefined;
     let resolveClosed!: () => void;
     let rejectClosed!: (err: unknown) => void;
     const closed = new Promise<void>((resolve, reject) => {
       resolveClosed = resolve;
       rejectClosed = reject;
     });
-
     const writable = new WritableStream<StreamTargetChunk>({
-      write(chunk) {
-        markWrite();
+      async write(chunk) {
+        if (completed) throw new Error('mediabunny target received a write after completion');
+        if (context?.signal.aborted) throw abortError(context.signal.reason);
         const data = new Uint8Array(chunk.data);
-        chunks.push({ position: chunk.position, data });
-        maxEnd = Math.max(maxEnd, chunk.position + data.byteLength);
+        if (data.byteLength === 0) return;
+        const acceptedAtMs = absoluteNow();
+        queuedBytes += data.byteLength;
+        peakQueuedBytes = Math.max(peakQueuedBytes, queuedBytes);
+        maximumOutstandingWritePromises = Math.max(maximumOutstandingWritePromises, 1);
+        if (captureMuxWriteTrace) {
+          observedMuxWrites.push({
+            atMs: relativeMs(acceptedAtMs),
+            position: chunk.position,
+            bytes: data.slice(),
+          });
+        }
+        observeWritePayloadForHash(chunk.position, data);
+        emitWrite(chunk.position, chunk.position + data.byteLength, acceptedAtMs, true, 1);
+        const waitMs = typeof streamOpts.targetWriteDelayMs === 'number' && streamOpts.targetWriteDelayMs > 0
+          ? streamOpts.targetWriteDelayMs
+          : 0;
+        try {
+          if (waitMs) {
+            const before = nowMs();
+            await abortableDelay(waitMs, context?.signal);
+            starvation.noteOutputWait(nowMs() - before);
+          }
+          if (typeof streamOpts.targetAbortAfterWrites === 'number' && targetWrites > streamOpts.targetAbortAfterWrites) {
+            throw new DOMException('injected target abort', 'AbortError');
+          }
+          spool.write(chunk.position, data);
+          firstConsumerByteMs ??= relativeMs(absoluteNow());
+        } finally {
+          queuedBytes -= data.byteLength;
+        }
       },
       close() {
+        const atMs = absoluteNow();
+        completed = true;
+        markFinalizeComplete(atMs);
+        markClose(atMs);
         resolveClosed();
       },
       abort(reason) {
+        completed = true;
+        markAbort();
         rejectClosed(reason);
       },
     });
-
     const target = new mb.StreamTarget(writable);
     return {
       target,
+      markFinalizeStart,
       async mediaBytes(container) {
         await closed;
-        const bytes = new Uint8Array(maxEnd);
-        for (const chunk of chunks) bytes.set(chunk.data, chunk.position);
+        const bytes = spool.bytes();
+        const targetTelemetry: MediabunnyTargetTelemetry = {
+          targetKind: 'stream',
+          appendOnly: streamOpts.appendOnly === true || streamOpts.fastStart === 'fragmented' || streamOpts.fastStart === 'in-memory',
+          ...(firstNativeWriteMs !== undefined ? { firstNativeWriteMs } : {}),
+          ...(firstConsumerByteMs !== undefined ? { firstConsumerByteMs } : {}),
+          writeCount: targetWrites,
+          nativeWriteBytes,
+          finalExtentBytes: bytes.byteLength,
+          maxPosition,
+          overwriteCount: spool.overwriteCount,
+          peakQueuedBytes,
+          maximumOutstandingWritePromises,
+          retainedOutputBytes: spool.retainedCapacityBytes,
+          operationStartMs,
+          ...(finalizeStartMs !== undefined ? { finalizeStartMs } : {}),
+          ...(finalizeCompleteMs !== undefined ? { finalizeCompleteMs } : {}),
+          ...(closeMs !== undefined ? { closeMs } : {}),
+          completed,
+        };
+        const evidence = streamingEvidence('stream', container, bytes, spool.retainedCapacityBytes);
         return {
           bytes,
           mime: mimeForContainer(container),
           container,
           targetWrites,
-          ...(firstByteMs !== undefined ? { firstByteMs } : {}),
+          ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+          telemetry: {
+            bytesWritten: bytes.byteLength,
+            writeCount: targetWrites,
+            ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+          },
+          ...(captureMuxWriteTrace
+            ? {
+                muxWriteTrace: muxWriteTraceFromObservedWrites(
+                  observedMuxWrites,
+                  bytes.byteLength,
+                  peakQueuedBytes,
+                  false,
+                ),
+              }
+            : {}),
+          targetTelemetry,
+          ...(evidence ? { streamingEvidence: evidence } : {}),
+          starvation: starvation.finish(),
         };
+      },
+      async cancel(reason) {
+        completed = true;
+        markAbort();
+        await writable.abort(reason).catch(() => undefined);
+        starvation.finish();
       },
     };
   }
 
-  const target = new mb.BufferTarget();
-  target.on('write', () => {
-    targetWrites++;
+  if (opts?.target === 'stream') {
+    const streamOpts = opts;
+    const spool = new PositionedByteSpool();
+    let reserveMaximumExtent = 0;
+    let firstConsumerByteMs: number | undefined;
+    let resolveClosed!: () => void;
+    let rejectClosed!: (err: unknown) => void;
+    let closedSettled = false;
+    const closed = new Promise<void>((resolve, reject) => {
+      resolveClosed = resolve;
+      rejectClosed = reject;
+    });
+
+    interface PendingPositionedWrite {
+      position: number;
+      data: Uint8Array;
+    }
+
+    /**
+     * Keep `instanceof StreamTarget` semantics while observing the pre-coalescing positioned target
+     * boundary. The stock StreamTarget merges contiguous writes before its WritableStream, which
+     * erases the reserve placeholder/patch sequence. Writer awaits `_flush()`, so this is also the
+     * real backpressure boundary rather than reconstructed scalar telemetry.
+     */
+    class ObservedPositionedStreamTarget extends mb.StreamTarget {
+      private pending: PendingPositionedWrite[] = [];
+      private flushChain: Promise<void> = Promise.resolve();
+      private stopped = false;
+
+      constructor() {
+        // The inherited WritableStream is intentionally unused; the internal target methods below
+        // are the protocol Mediabunny's Writer invokes. Extending StreamTarget preserves format
+        // auto-selection behavior for target-sensitive output formats.
+        super(new WritableStream<StreamTargetChunk>());
+      }
+
+      _start(): void {
+        // No independent writer is acquired; Writer drives this target directly.
+      }
+
+      _write(data: Uint8Array, position: number): void {
+        if (this.stopped || completed) throw new Error('mediabunny target received a write after completion');
+        if (context?.signal.aborted) throw abortError(context.signal.reason);
+        if (data.byteLength === 0) return;
+        const owned = data.slice();
+        this.pending.push({ position, data: owned });
+        queuedBytes += owned.byteLength;
+        peakQueuedBytes = Math.max(peakQueuedBytes, queuedBytes);
+        (this as unknown as { _dispatchWrite(start: number, end: number): void })
+          ._dispatchWrite(position, position + owned.byteLength);
+      }
+
+      _flush(): Promise<void> {
+        const batch = this.pending.splice(0);
+        if (batch.length === 0) return this.flushChain;
+        const consume = async (): Promise<void> => {
+          for (const write of batch) {
+            if (this.stopped || context?.signal.aborted) throw abortError(context?.signal.reason);
+            if (typeof streamOpts.targetAbortAfterWrites === 'number' && targetWrites >= streamOpts.targetAbortAfterWrites) {
+              throw new DOMException('injected target abort', 'AbortError');
+            }
+            const acceptedAtMs = absoluteNow();
+            maximumOutstandingWritePromises = Math.max(maximumOutstandingWritePromises, 1);
+            const maximumPacketCount = streamOpts.fastStart === 'reserve' && Number.isSafeInteger(streamOpts.maximumPacketCount)
+              ? Number(streamOpts.maximumPacketCount)
+              : undefined;
+            if (
+              !reservationRecorded &&
+              maximumPacketCount &&
+              write.position > reserveMaximumExtent
+            ) {
+              pushTraceEvent({
+                type: 'reservation',
+                atMs: acceptedAtMs,
+                position: reserveMaximumExtent,
+                length: write.position - reserveMaximumExtent,
+                maximumPacketCount,
+              });
+              reservationRecorded = true;
+            }
+            if (captureMuxWriteTrace) {
+              observedMuxWrites.push({
+                atMs: relativeMs(acceptedAtMs),
+                position: write.position,
+                bytes: write.data.slice(),
+              });
+            }
+            observeWritePayloadForHash(write.position, write.data);
+            emitWrite(
+              write.position,
+              write.position + write.data.byteLength,
+              acceptedAtMs,
+              true,
+              1,
+            );
+            reserveMaximumExtent = Math.max(
+              reserveMaximumExtent,
+              write.position + write.data.byteLength,
+            );
+            const waitMs = typeof streamOpts.targetWriteDelayMs === 'number' && streamOpts.targetWriteDelayMs > 0
+              ? streamOpts.targetWriteDelayMs
+              : 0;
+            try {
+              if (waitMs) {
+                const before = nowMs();
+                await abortableDelay(waitMs, context?.signal);
+                starvation.noteOutputWait(nowMs() - before);
+              }
+              spool.write(write.position, write.data);
+              firstConsumerByteMs ??= relativeMs(absoluteNow());
+            } finally {
+              queuedBytes -= write.data.byteLength;
+            }
+          }
+        };
+        this.flushChain = this.flushChain.then(consume);
+        return this.flushChain;
+      }
+
+      async _finalize(): Promise<void> {
+        await this._flush();
+        this.stopped = true;
+        completed = true;
+        const atMs = absoluteNow();
+        markFinalizeComplete(atMs);
+        markClose(atMs);
+        if (!closedSettled) {
+          closedSettled = true;
+          resolveClosed();
+        }
+        (this as unknown as { _emit(type: 'finalized'): void })._emit('finalized');
+      }
+
+      async _close(): Promise<void> {
+        if (this.stopped) return;
+        this.stopped = true;
+        completed = true;
+        const pendingBytes = this.pending.reduce((total, write) => total + write.data.byteLength, 0);
+        this.pending = [];
+        queuedBytes = Math.max(0, queuedBytes - pendingBytes);
+        markAbort();
+        if (!closedSettled) {
+          closedSettled = true;
+          rejectClosed(abortError(context?.signal.reason));
+        }
+      }
+
+      async abortObserved(): Promise<void> {
+        await this._close();
+      }
+    }
+
+    const target = new ObservedPositionedStreamTarget();
+    return {
+      target,
+      markFinalizeStart,
+      async mediaBytes(container) {
+        await closed;
+        const bytes = spool.bytes();
+        const targetTelemetry: MediabunnyTargetTelemetry = {
+          targetKind: 'stream',
+          appendOnly: opts.appendOnly === true || opts.fastStart === 'fragmented' || opts.fastStart === 'in-memory',
+          ...(firstNativeWriteMs !== undefined ? { firstNativeWriteMs } : {}),
+          ...(firstConsumerByteMs !== undefined ? { firstConsumerByteMs } : {}),
+          writeCount: targetWrites,
+          nativeWriteBytes,
+          finalExtentBytes: bytes.byteLength,
+          maxPosition,
+          overwriteCount: spool.overwriteCount,
+          peakQueuedBytes,
+          maximumOutstandingWritePromises,
+          retainedOutputBytes: spool.retainedCapacityBytes,
+          operationStartMs,
+          ...(finalizeStartMs !== undefined ? { finalizeStartMs } : {}),
+          ...(finalizeCompleteMs !== undefined ? { finalizeCompleteMs } : {}),
+          ...(closeMs !== undefined ? { closeMs } : {}),
+          completed,
+        };
+        const evidence = streamingEvidence('stream', container, bytes, spool.retainedCapacityBytes);
+        return {
+          bytes,
+          mime: mimeForContainer(container),
+          container,
+          targetWrites,
+          ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+          telemetry: {
+            bytesWritten: bytes.byteLength,
+            writeCount: targetWrites,
+            ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+          },
+          ...(captureMuxWriteTrace
+            ? {
+                muxWriteTrace: muxWriteTraceFromObservedWrites(
+                  observedMuxWrites,
+                  bytes.byteLength,
+                  peakQueuedBytes,
+                  opts.fastStart === 'reserve',
+                ),
+              }
+            : {}),
+          targetTelemetry,
+          ...(evidence ? { streamingEvidence: evidence } : {}),
+          starvation: starvation.finish(),
+        };
+      },
+      async cancel(reason) {
+        completed = true;
+        markAbort();
+        await target.abortObserved().catch(() => undefined);
+        starvation.finish();
+      },
+    };
+  }
+
+  const target = new mb.BufferTarget({
+    onFinalize(buffer) {
+      const atMs = absoluteNow();
+      const length = buffer.byteLength;
+      queuedBytes += length;
+      peakQueuedBytes = Math.max(peakQueuedBytes, queuedBytes);
+      maximumOutstandingWritePromises = Math.max(maximumOutstandingWritePromises, 1);
+      traceRanges = length > 0 ? [{ start: 0, end: length }] : [];
+      traceNativeWriteBytes = length;
+      observeWritePayloadForHash(0, new Uint8Array(buffer));
+      if (length > 0) {
+        pushTraceEvent({
+          type: 'write',
+          atMs,
+          position: 0,
+          length,
+          cumulativeUniqueBytes: length,
+          outstandingWritePromises: 1,
+        });
+      }
+      firstObservableByteMs = relativeMs(atMs);
+      if (context && length > 0) context.emit({ type: 'first-byte', atMs: firstObservableByteMs });
+      pushTraceEvent({ type: 'buffer-observable', atMs, length });
+      markFinalizeComplete(atMs);
+      markClose(atMs);
+      queuedBytes -= length;
+      completed = true;
+    },
+  });
+  target.on('write', ({ start, end }) => {
+    emitWrite(start, end, absoluteNow(), false);
   });
 
   return {
     target,
+    markFinalizeStart,
     async mediaBytes(container) {
       const buffer = target.buffer;
       if (!buffer) throw new Error('mediabunny output target produced no output buffer');
-      firstByteMs ??= Math.max(0, nowMs() - startMs);
+      completed = true;
+      const bytes = new Uint8Array(buffer);
+      const evidence = streamingEvidence('buffer', container, bytes, buffer.byteLength);
       return {
-        bytes: new Uint8Array(buffer),
+        bytes,
         mime: mimeForContainer(container),
         container,
         targetWrites,
-        firstByteMs,
+        ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+        telemetry: {
+          bytesWritten: buffer.byteLength,
+          writeCount: targetWrites,
+          ...(firstObservableByteMs !== undefined ? { firstByteMs: firstObservableByteMs } : {}),
+        },
+        targetTelemetry: {
+          targetKind: 'buffer',
+          appendOnly: false,
+          ...(firstNativeWriteMs !== undefined ? { firstNativeWriteMs } : {}),
+          writeCount: targetWrites,
+          nativeWriteBytes,
+          finalExtentBytes: buffer.byteLength,
+          maxPosition,
+          overwriteCount,
+          peakQueuedBytes,
+          maximumOutstandingWritePromises,
+          retainedOutputBytes: buffer.byteLength,
+          operationStartMs,
+          ...(finalizeStartMs !== undefined ? { finalizeStartMs } : {}),
+          ...(finalizeCompleteMs !== undefined ? { finalizeCompleteMs } : {}),
+          ...(closeMs !== undefined ? { closeMs } : {}),
+          completed,
+        },
+        ...(evidence ? { streamingEvidence: evidence } : {}),
+        starvation: starvation.finish(),
       };
     },
+    async cancel() {
+      completed = true;
+      markAbort();
+      starvation.finish();
+    },
   };
+}
+
+function muxWriteTraceFromObservedWrites(
+  observed: readonly { atMs: number; position: number; bytes: Uint8Array }[],
+  finalByteLength: number,
+  peakBufferedBytes: number,
+  reserveMode: boolean,
+): MuxWriteTraceEvidence {
+  type Event =
+    | { order: number; kind: 'reservation'; position: number; length: number }
+    | { order: number; kind: 'write'; atMs: number; position: number; bytes: Uint8Array; writeKind: 'append' | 'patch' };
+  const events: Event[] = [];
+  let maximumExtent = 0;
+  for (let index = 0; index < observed.length; index++) {
+    const write = observed[index]!;
+    if (reserveMode && write.position > maximumExtent) {
+      events.push({
+        order: index * 3,
+        kind: 'reservation',
+        position: maximumExtent,
+        length: write.position - maximumExtent,
+      });
+    }
+    events.push({
+      order: index * 3 + 1,
+      kind: 'write',
+      atMs: write.atMs,
+      position: write.position,
+      bytes: write.bytes,
+      writeKind: reserveMode && write.position < maximumExtent ? 'patch' : 'append',
+    });
+    maximumExtent = Math.max(maximumExtent, write.position + write.bytes.byteLength);
+  }
+  events.sort((a, b) => a.order - b.order);
+  const writes: MuxWriteTraceEvidence['writes'] = [];
+  const reservations: MuxWriteTraceEvidence['reservations'] = [];
+  events.forEach((event, sequence) => {
+    if (event.kind === 'reservation') {
+      reservations.push({ sequence, position: event.position, length: event.length });
+    } else {
+      writes.push({
+        sequence,
+        atMs: event.atMs,
+        position: event.position,
+        bytes: event.bytes,
+        kind: event.writeKind,
+      });
+    }
+  });
+  return {
+    schema: 'media-test/mux-write-trace@1',
+    writes,
+    reservations,
+    finalByteLength,
+    peakBufferedBytes,
+  };
+}
+
+function abortError(reason?: unknown): DOMException {
+  return reason instanceof DOMException && reason.name === 'AbortError'
+    ? reason
+    : new DOMException(reason === undefined ? 'operation aborted' : String(reason), 'AbortError');
+}
+
+async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return;
+  }
+  if (signal.aborted) throw abortError(signal.reason);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal.reason));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** Run a Conversion to completion and return the resulting bytes. */
@@ -853,33 +2089,84 @@ async function runConversion(
   opts: ConversionOptions,
   container: string,
   targetInfo?: OutputTargetTelemetry,
-): Promise<MediaBytes> {
+  context?: OperationContext,
+  engineId = 'mediabunny@1.48.0',
+  activeConversions?: Set<Conversion>,
+): Promise<MediabunnyMediaBytes> {
+  if (context?.signal.aborted) throw abortError(context.signal.reason);
   const conversion = await mb.Conversion.init(opts);
-  if (!conversion.isValid) {
-    const reasons = conversion.discardedTracks.map((d) => d.reason).join(', ');
-    throw new Error(
-      `mediabunny Conversion invalid (no usable output tracks)${reasons ? `: ${reasons}` : ''}`,
+  if (!conversion.isValid || conversion.discardedTracks.length > 0) {
+    const reasons = conversion.discardedTracks.map((discarded) => discarded.reason);
+    await conversion.cancel().catch(() => undefined);
+    await targetInfo?.cancel('conversion tuple rejected').catch(() => undefined);
+    throw createNotApplicableError(
+      engineId,
+      context?.request.operation ?? 'transcode',
+      conversion.isValid
+        ? `conversion would discard ${conversion.discardedTracks.length} requested track(s): ${reasons.join(', ')}`
+        : `conversion has no usable output tracks: ${reasons.join(', ')}`,
+      context ? tupleSummary(context.request) : { outputContainer: container },
+      conversion.isValid ? 'MEDIABUNNY_CONVERSION_TRACK_DISCARD' : 'MEDIABUNNY_CONVERSION_INVALID',
     );
   }
-  await conversion.execute();
-  return (targetInfo ?? {
-    target: opts.output.target as Target,
-    async mediaBytes(fallbackContainer: string): Promise<MediaBytes> {
-      const target = opts.output.target as BufferTarget;
-      const buffer = target.buffer;
-      if (!buffer) throw new Error('mediabunny Conversion produced no output buffer');
-      return {
-        bytes: new Uint8Array(buffer),
-        mime: mimeForContainer(fallbackContainer),
-        container: fallbackContainer,
-      };
-    },
-  }).mediaBytes(container);
+  activeConversions?.add(conversion);
+  const startMs = nowMs();
+  if (context) {
+    conversion.onProgress = (progress) => {
+      if (context.signal.aborted) return;
+      context.emit({ type: 'progress', atMs: Math.max(0, nowMs() - startMs), determinate: true, value: progress });
+    };
+  }
+  let cancelPromise: Promise<void> | undefined;
+  const cancel = () => {
+    cancelPromise ??= Promise.allSettled([
+      conversion.cancel(),
+      targetInfo?.cancel(context?.signal.reason) ?? Promise.resolve(),
+    ]).then(() => undefined);
+  };
+  context?.signal.addEventListener('abort', cancel, { once: true });
+  if (context?.signal.aborted) cancel();
+  try {
+    await conversion.execute();
+    if (context?.signal.aborted) throw abortError(context.signal.reason);
+    return await (targetInfo ?? {
+      target: opts.output.target as Target,
+      async mediaBytes(fallbackContainer: string): Promise<MediabunnyMediaBytes> {
+        const target = opts.output.target as BufferTarget;
+        const buffer = target.buffer;
+        if (!buffer) throw new Error('mediabunny Conversion produced no output buffer');
+        return {
+          bytes: new Uint8Array(buffer),
+          mime: mimeForContainer(fallbackContainer),
+          container: fallbackContainer,
+          telemetry: { bytesWritten: buffer.byteLength },
+        };
+      },
+      async cancel() {
+        await opts.output.cancel().catch(() => undefined);
+      },
+    }).mediaBytes(container);
+  } catch (error) {
+    if (context?.signal.aborted) {
+      cancel();
+      await cancelPromise;
+      throw abortError(context.signal.reason);
+    }
+    cancel();
+    await cancelPromise;
+    throw error;
+  } finally {
+    context?.signal.removeEventListener('abort', cancel);
+    if (cancelPromise) await cancelPromise;
+    activeConversions?.delete(conversion);
+  }
 }
 
 /** A FrameSink backed by digests + cached ImageData for SSIM/PSNR pixel access. */
 class CapturedFrameSink implements FrameSink {
   frames: FrameDigest[] = [];
+  telemetry?: FrameSink['telemetry'];
+  selectedTrack?: FrameSink['selectedTrack'];
   private pixels: ImageData[] = [];
 
   push(img: ImageData, digest: FrameDigest): void {
@@ -897,109 +2184,205 @@ class CapturedFrameSink implements FrameSink {
 async function videoDecoderOptionsForTrack(
   mb: MB,
   track: InputVideoTrack,
+  applicability?: RuntimeApplicability,
 ): Promise<{ hardwareAcceleration: DecodeHardwareAccelerationMode }> {
   const codec = await track.getCodec().catch(() => null);
   if (!codec) return { hardwareAcceleration: HW_ACCEL };
 
   const config = await track.getDecoderConfig().catch(() => undefined);
   const softerFirst = codec === 'vp8' || codec === 'av1';
-  const modes: DecodeHardwareAccelerationMode[] = softerFirst
+  const modes = [...new Set<DecodeHardwareAccelerationMode>(softerFirst
     ? ['no-preference', 'prefer-software', HW_ACCEL]
-    : [HW_ACCEL, 'no-preference', 'prefer-software'];
+    : [HW_ACCEL, 'no-preference', 'prefer-software'])];
 
   for (const mode of modes) {
-    const ok = await mb.canDecodeVideo(codec, { ...(config ?? {}), hardwareAcceleration: mode }).catch(() => false);
-    if (ok) return { hardwareAcceleration: mode };
+    const exactConfig = { ...(config ?? { codec }), hardwareAcceleration: mode } as VideoDecoderConfig;
+    const ok = await mb.canDecodeVideo(codec, exactConfig).catch((error) => {
+      if (error instanceof TypeError) throw error;
+      return false;
+    });
+    if (ok) {
+      applicability?.recordCodecConfig(exactConfig);
+      return { hardwareAcceleration: mode };
+    }
   }
 
-  throw new Error(
-    `mediabunny decode: browser cannot decode ${codec} track with any acceleration mode ` +
-    '(WebCodecs VideoDecoder.isConfigSupported=false) - NA(browser)',
+  const exactConfig = { ...(config ?? { codec }), hardwareAcceleration: modes[0] ?? 'no-preference' } as VideoDecoderConfig;
+  throw createBrowserNotSupportedError(
+    applicability?.engineId ?? 'mediabunny@1.48.0',
+    applicability?.operation ?? 'decodeFrames',
+    `browser cannot decode the exact ${codec} track configuration`,
+    applicability ? tupleSummary(applicability.request) : {},
+    MEDIABUNNY_REASON.BROWSER_VIDEO_DECODE,
+    { role: 'video-decoder', config: exactConfig },
   );
 }
 
-async function tryAudioOnlyPacketCopyTrim(
-  mb: MB,
-  input: Input,
-  meta: NormalizedMetadata,
-  range: { startUs: number; endUs: number },
-  opts: { container: string; frameAccurate: boolean },
-): Promise<MediaBytes | null> {
-  if (opts.frameAccurate) return null;
-  if (meta.container !== opts.container) return null;
-  if (meta.tracks.some((t) => t.type === 'video')) return null;
-
-  const tracks = await input.getTracks();
-  const audioTracks = tracks.filter((t): t is InputAudioTrack => t.isAudioTrack());
-  if (audioTracks.length !== 1) return null;
-
-  const audioTrack = audioTracks[0];
-  if (!audioTrack) return null;
-  const codec = await audioTrack.getCodec().catch(() => null);
-  if (!codec) return null;
-
-  const format = makeOutputFormat(opts.container);
-  if (!format) return null;
-
-  const output = new mb.Output({ format, target: new mb.BufferTarget() });
-  const source = new mb.EncodedAudioPacketSource(codec);
-  output.addAudioTrack(source);
-  await output.start();
-
-  const decoderConfig = await audioTrack.getDecoderConfig().catch(() => undefined);
-  const sampleRate = await audioTrack.getSampleRate().catch(() => 48000);
-  const channels = await audioTrack.getNumberOfChannels().catch(() => 2);
-  const description = decoderConfig?.description ? bufferOf(copyBytes(decoderConfig.description)) : undefined;
-  const codecString = decoderConfig?.codec ?? codecParamForAudioCodec(codec);
-  const sink = new mb.EncodedPacketSink(audioTrack);
-  const startSec = range.startUs / 1e6;
-  const endSec = range.endUs / 1e6;
-  let originSec: number | null = null;
-  let added = 0;
-
+async function assertAudioTrackDecodable(
+  track: InputAudioTrack,
+  applicability?: RuntimeApplicability,
+): Promise<void> {
+  const codec = await track.getCodec().catch(() => null);
+  const config = await track.getDecoderConfig().catch(() => null);
+  let supported: boolean;
   try {
-    for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
-      const pktEnd = pkt.timestamp + pkt.duration;
-      if (pktEnd <= startSec) continue;
-      if (pkt.timestamp >= endSec) break;
-      originSec ??= pkt.timestamp;
-      const outPacket = new mb.EncodedPacket(
-        copyBytes(pkt.data),
-        pkt.type,
-        Math.max(0, pkt.timestamp - originSec),
-        pkt.duration,
-        added,
-      );
-      const packetMeta =
-        added === 0
-          ? ({
-            decoderConfig: {
-              codec: codecString,
-              sampleRate,
-              numberOfChannels: channels,
-              description,
-            },
-          } as EncodedAudioChunkMetadata)
-          : undefined;
-      await source.add(outPacket, packetMeta);
-      added++;
-    }
-  } finally {
-    source.close();
+    supported = await track.canDecode();
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    supported = false;
   }
-
-  if (added === 0) {
-    throw new Error('mediabunny trim: no audio packets fell inside requested trim range');
+  if (supported) {
+    if (config) applicability?.recordCodecConfig(config);
+    return;
   }
-
-  await output.finalize();
-  const buffer = (output.target as BufferTarget).buffer;
-  if (!buffer) throw new Error('mediabunny trim packet-copy produced no output buffer');
-  return {
-    bytes: new Uint8Array(buffer),
-    mime: mimeForContainer(opts.container),
-    container: opts.container,
+  const fallbackConfig: AudioDecoderConfig = config ?? {
+    codec: codecParamForAudioCodec(codec ?? 'aac'),
+    sampleRate: await track.getSampleRate().catch(() => 48_000),
+    numberOfChannels: await track.getNumberOfChannels().catch(() => 2),
   };
+  throw createBrowserNotSupportedError(
+    applicability?.engineId ?? 'mediabunny@1.48.0',
+    applicability?.operation ?? 'decodeFrames',
+    `browser cannot decode the exact ${codec ?? 'audio'} track configuration`,
+    applicability ? tupleSummary(applicability.request) : {},
+    MEDIABUNNY_REASON.BROWSER_AUDIO_DECODE,
+    { role: 'audio-decoder', config: fallbackConfig },
+  );
+}
+
+function assertMuxTrackTuple(
+  format: ReturnType<typeof makeOutputFormat> & {},
+  tracks: EncodedTracks,
+  engineId: string,
+  opts: { container: string } & Record<string, unknown>,
+  context?: OperationContext,
+): void {
+  const tuple = context ? tupleSummary(context.request) : { outputContainer: opts.container };
+  const deliberateNegative = context !== undefined &&
+    (ILLEGAL_MUX_SCENARIO_IDS as readonly string[]).includes(context.request.scenarioId);
+  const rejectDeliberateNegative = (reason: string): never => {
+    throw createMalformedInputError(
+      engineId,
+      'mux',
+      'validate',
+      reason,
+      'MEDIABUNNY_ILLEGAL_MUX_REJECTED',
+      context?.request.inputs[0]?.id,
+    );
+  };
+  if (tracks.tracks.length === 0) {
+    if (deliberateNegative) rejectDeliberateNegative('mux requires at least one track');
+    throw createNotApplicableError(engineId, 'mux', 'mux requires at least one track', tuple, MEDIABUNNY_REASON.TRACK_COUNT);
+  }
+  if (deliberateNegative && tracks.tracks.every((track) => track.chunks.length === 0)) {
+    rejectDeliberateNegative('mux requires at least one coded sample');
+  }
+  const counts = { video: 0, audio: 0, subtitle: 0, other: 0 };
+  for (const track of tracks.tracks) counts[track.type]++;
+  if (counts.subtitle || counts.other) {
+    throw createNotApplicableError(engineId, 'mux', 'subtitle/other tracks cannot be silently discarded', tuple, MEDIABUNNY_REASON.TRACK_TYPE);
+  }
+  const limits = format.getSupportedTrackCounts();
+  for (const type of ['video', 'audio', 'subtitle'] as const) {
+    const count = counts[type];
+    if (count < limits[type].min || count > limits[type].max) {
+      throw createNotApplicableError(engineId, 'mux', `${type} track count ${count} is unsupported`, tuple, MEDIABUNNY_REASON.TRACK_COUNT);
+    }
+  }
+  if (tracks.tracks.length < limits.total.min || tracks.tracks.length > limits.total.max) {
+    throw createNotApplicableError(engineId, 'mux', `total track count ${tracks.tracks.length} is unsupported`, tuple, MEDIABUNNY_REASON.TRACK_COUNT);
+  }
+  const videoCodecs = new Set(format.getSupportedVideoCodecs());
+  const audioCodecs = new Set(format.getSupportedAudioCodecs());
+  for (const track of tracks.tracks) {
+    const contained = track.type === 'video'
+      ? !!canonicalToMediabunnyVideo(track.codec) && videoCodecs.has(canonicalToMediabunnyVideo(track.codec)!)
+      : !!canonicalToMediabunnyAudio(track.codec) && audioCodecs.has(canonicalToMediabunnyAudio(track.codec)!);
+    if (!contained) {
+      if (deliberateNegative) rejectDeliberateNegative(`${track.codec} cannot be contained in ${opts.container}`);
+      throw createNotApplicableError(engineId, 'mux', `${track.codec} cannot be contained in ${opts.container}`, tuple, MEDIABUNNY_REASON.CONTAINER_CODEC);
+    }
+    if ((track.codec === 'h264' || track.codec === 'hevc') && !validFullCodecString(track.nativeCodecTag, track.codec)) {
+      throw createNotApplicableError(
+        engineId,
+        'mux',
+        `${track.codec} mux requires a validated full codec/profile string from the source configuration`,
+        tuple,
+        'MEDIABUNNY_CODEC_CONFIG_REQUIRED',
+      );
+    }
+    if (track.packetOrdering === 'presentation') {
+      throw createNotApplicableError(
+        engineId,
+        'mux',
+        'mux packet arrays must be supplied in decode order',
+        tuple,
+        MEDIABUNNY_REASON.COPY_REQUIRED,
+      );
+    }
+    for (let index = 0; index < track.chunks.length; index++) {
+      const decodeIndex = track.chunks[index]?.decodeIndex;
+      if (decodeIndex !== undefined && decodeIndex !== index) {
+        throw createNotApplicableError(
+          engineId,
+          'mux',
+          'explicit decodeIndex values must be unique, contiguous, and match decode-order array position',
+          tuple,
+          MEDIABUNNY_REASON.COPY_REQUIRED,
+        );
+      }
+    }
+    if (track.codec === 'h264' || track.codec === 'hevc') {
+      const expectedFraming = track.codec === 'h264' ? 'avc' : 'hevc';
+      const expectedRecord = track.codec === 'h264'
+        ? 'avc-decoder-configuration-record'
+        : 'hevc-decoder-configuration-record';
+      if (
+        !track.description ||
+        track.description.byteLength === 0 ||
+        track.framing !== expectedFraming ||
+        track.parameterSetLocation !== 'description' ||
+        track.descriptionRecord !== expectedRecord
+      ) {
+        throw createNotApplicableError(
+          engineId,
+          'mux',
+          `${track.codec} mux requires observed length-prefixed framing and its matching decoder configuration record`,
+          tuple,
+          'MEDIABUNNY_CODEC_CONFIG_REQUIRED',
+        );
+      }
+    }
+    if (!format.supportsTimestampedMediaData && !hasImplicitSequentialTiming(track)) {
+      throw createNotApplicableError(
+        engineId,
+        'mux',
+        `${opts.container} cannot preserve this track's explicit timing`,
+        tuple,
+        MEDIABUNNY_REASON.TIMESTAMP_MODE,
+      );
+    }
+  }
+  if (opts.tags && opts.container === 'ts') {
+    throw createNotApplicableError(engineId, 'mux', 'MPEG-TS metadata writing is unsupported', tuple, MEDIABUNNY_REASON.METADATA_FORMAT);
+  }
+}
+
+function validFullCodecString(value: string | undefined, codec: 'h264' | 'hevc'): boolean {
+  if (!value) return false;
+  return codec === 'h264'
+    ? /^(?:avc1|avc3)\.[0-9a-f]{6}$/i.test(value)
+    : /^(?:hev1|hvc1)\./i.test(value);
+}
+
+function hasImplicitSequentialTiming(track: EncodedTracks['tracks'][number]): boolean {
+  if (track.chunks.length === 0) return false;
+  let expected = 0;
+  for (const chunk of track.chunks) {
+    if (Math.abs(chunk.ptsUs - expected) > 2) return false;
+    expected += chunk.durationUs;
+  }
+  return true;
 }
 
 /**
@@ -1008,8 +2391,20 @@ async function tryAudioOnlyPacketCopyTrim(
 export class MediabunnyEngine implements MediaEngine {
   readonly id: string;
 
-  /** The dossier best-path config (§6), recorded by the runner per §8.5 / returned as configUsed. */
-  readonly configUsed = MEDIABUNNY_CONFIG;
+  private codecConfigEvidence: SerializableValue[] = [];
+  private activeConversions = new Set<Conversion>();
+  private lifecycleState: 'new' | 'ready' | 'disposed' = 'new';
+  private initPromise: Promise<void> | undefined;
+  private disposePromise: Promise<void> | undefined;
+
+  /** Immutable effective configuration snapshot; retained after cleanup for runner capture. */
+  get configUsed(): object {
+    return {
+      ...MEDIABUNNY_CONFIG,
+      packageVersions: { ...MEDIABUNNY_CONFIG.packageVersions },
+      codecConfigs: this.codecConfigEvidence.map((entry) => structuredClone(entry)),
+    };
+  }
 
   /** mediabunny namespace, loaded in init() (rule §0.7 — untimed). null until init() runs. */
   private mb: MB | null = null;
@@ -1024,6 +2419,56 @@ export class MediabunnyEngine implements MediaEngine {
       throw new Error(`${this.id}: init() must be awaited before any operation (mediabunny not loaded)`);
     }
     return this.mb;
+  }
+
+  supports(request: ConcreteOperationRequest, _context?: LifecycleContext): SupportDecision {
+    const decision = decideMediabunnySupport(request);
+    if (decision.browserConfigs) {
+      for (const entry of decision.browserConfigs) this.recordCodecConfig(entry.config);
+    }
+    return decision;
+  }
+
+  private assertRuntimeSupport(context?: OperationContext): void {
+    if (!context) return;
+    const decision = decideMediabunnySupport(context.request);
+    if (decision.supported) return;
+    if (decision.status === 'NA_BROWSER') {
+      throw createBrowserNotSupportedError(
+        this.id,
+        context.request.operation,
+        decision.reason,
+        tupleSummary(context.request),
+        decision.reasonCode,
+        decision.browserConfigs?.[0],
+      );
+    }
+    throw createNotApplicableError(
+      this.id,
+      context.request.operation,
+      decision.reason,
+      tupleSummary(context.request),
+      decision.reasonCode,
+    );
+  }
+
+  private recordCodecConfig(config: VideoEncoderConfig | AudioEncoderConfig | VideoDecoderConfig | AudioDecoderConfig): void {
+    const serialized = serializableCodecConfig(config);
+    if (!this.codecConfigEvidence.some((item) => JSON.stringify(item) === JSON.stringify(serialized))) {
+      this.codecConfigEvidence.push(serialized);
+    }
+  }
+
+  private runtimeApplicability(
+    request: ConcreteOperationRequest,
+    operation: RuntimeApplicability['operation'],
+  ): RuntimeApplicability {
+    return {
+      engineId: this.id,
+      request,
+      operation,
+      recordCodecConfig: (config) => this.recordCodecConfig(config),
+    };
   }
 
   capabilities(): CapabilitySet {
@@ -1048,9 +2493,10 @@ export class MediabunnyEngine implements MediaEngine {
       containersOut: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'wav', 'mp3', 'flac', 'ogg', 'adts'],
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be'],
-      // CENC (ctr/cbcs) decrypts at ISOBMFF read time via resolveKeyId. HLS AES-128 decrypts inside
-      // Mediabunny's HLS segmented reader by resolving #EXT-X-KEY URIs and decrypting segment bytes
-      // before demux/conversion, so both read and decrypt scenarios can honestly contest it.
+      // CENC-CBCS is attempted only when ISOBMFF actually exposes protected samples through
+      // resolveKeyId; otherwise decrypt() returns NA_ENGINE instead of copying ciphertext as clear
+      // media. CENC-CTR's known-aborting corpus form is guarded. HLS AES-128 decrypts inside
+      // Mediabunny's segmented reader by resolving #EXT-X-KEY URIs before packet copy.
       encryption: ['cenc-ctr', 'cenc-cbcs', 'hls-aes128'],
       features: [
         'fragmented', // fastStart: 'fragmented' (fMP4 / CMAF)
@@ -1060,7 +2506,7 @@ export class MediabunnyEngine implements MediaEngine {
         'trim:frame-accurate', // Conversion trim is frame-accurate
         'trim:frame-accurate-hevc', // HEVC re-encode trim is supported via WebCodecs where available
         'trim:massive-lazy-read', // normal corpus inputs use UrlSource, preserving lazy reads for massive trims
-        'metadata:write', // Output.setMetadataTags / Conversion tags
+        'metadata:write', // Output.setMetadataTags plus read-after-write verification
         'metadata:protected-tracks', // CENC track metadata is available without requiring decrypt()
         'resize', // Conversion video width/height
         'fps', // Conversion video frameRate
@@ -1077,6 +2523,7 @@ export class MediabunnyEngine implements MediaEngine {
         'decode:golden-rgba', // VideoSample.copyTo(RGBA) matches the baked WebCodecs golden path
         'audio-samples:gapless-priming', // full-range AAC trims preserve priming/padding-stripped decode length
         'hls:aes128', // read/probe/decrypt AES-128 HLS playlists via EXT-X-KEY segment decryption
+        'probe:resource-trace', // adapter-owned successful/missing/error HLS resource observations
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
@@ -1108,43 +2555,95 @@ export class MediabunnyEngine implements MediaEngine {
         // oracle. Unblocks audio-dsp/throughput_decode_s24 and throughput_decode_s16be.
         'decode:audio-pcm',
       ],
+      probeReadModes: ['whole-file'],
     };
   }
 
   /**
    * Load mediabunny + WARM WebCodecs (dossier §3, rule §0.7 — UNTIMED). Doing the dynamic import
    * here keeps module parse/instantiate out of the measured window; the getDecodable + getEncodable
-   * codec probes build mediabunny's memoized capability maps (canDecode/canEncode memos) and
-   * configure throw-away codecs, so the first measured op pays no isConfigSupported warm-up.
-   * Failures (e.g. WebCodecs absent) propagate so the runner records ERROR rather than a fake pass.
+   * codec probes build mediabunny's memoized capability maps (canDecode/canEncode memos). Broad
+   * warmup misses are expected and do not decide applicability; exact operation probes do that.
    */
-  async init(): Promise<void> {
-    const mb = await import('mediabunny');
-    this.mb = mb;
+  async init(context?: LifecycleContext): Promise<void> {
+    if (this.lifecycleState === 'ready') return;
+    if (this.lifecycleState === 'disposed') throw new Error(`${this.id}: init() cannot follow dispose()`);
+    if (context?.signal.aborted) throw abortError(context.signal.reason);
+    if (!this.initPromise) {
+      const signal = context?.signal;
+      this.initPromise = (async () => {
+        const mb = await import('mediabunny');
+        if (signal?.aborted) throw abortError(signal.reason);
+        this.mb = mb;
 
-    // Warm WebCodecs feature-detection caches (best-effort; never block init on probe failures).
-    const VIDEO: VideoCodec[] = ['avc', 'hevc', 'vp9', 'av1', 'vp8'];
-    const AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'vorbis', 'flac'];
-    await Promise.allSettled([
-      mb.getDecodableVideoCodecs(VIDEO),
-      mb.getDecodableAudioCodecs(AUDIO),
-      mb.getEncodableVideoCodecs(VIDEO, { width: 1280, height: 720, bitrate: mb.QUALITY_HIGH }),
-      mb.getEncodableAudioCodecs(AUDIO),
-    ]);
+        // Warm WebCodecs feature-detection caches (best-effort; never decide exact applicability).
+        const VIDEO: VideoCodec[] = ['avc', 'hevc', 'vp9', 'av1', 'vp8'];
+        const AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'vorbis', 'flac'];
+        await Promise.allSettled([
+          mb.getDecodableVideoCodecs(VIDEO),
+          mb.getDecodableAudioCodecs(AUDIO),
+          mb.getEncodableVideoCodecs(VIDEO, { width: 1280, height: 720, bitrate: mb.QUALITY_HIGH }),
+          mb.getEncodableAudioCodecs(AUDIO),
+        ]);
+        if (signal?.aborted) throw abortError(signal.reason);
+        this.lifecycleState = 'ready';
+      })();
+    }
+    try {
+      await this.initPromise;
+    } catch (error) {
+      this.mb = null;
+      this.initPromise = undefined;
+      throw error;
+    }
   }
 
   async dispose(): Promise<void> {
-    // Drop the namespace handle so a fresh per-Worker/per-iter engine starts from a clean slate.
-    // mediabunny holds no global state (no WASM, no worker) — per-op Inputs/Outputs already dispose.
-    this.mb = null;
+    if (this.lifecycleState === 'disposed') return;
+    this.disposePromise ??= (async () => {
+      if (this.initPromise) await this.initPromise.catch(() => undefined);
+      await Promise.allSettled([...this.activeConversions].map((conversion) => conversion.cancel()));
+      this.activeConversions.clear();
+      // Drop the namespace handle so a fresh per-Worker/per-iter engine starts from a clean slate.
+      // mediabunny holds no global state (no WASM, no worker) — per-op Inputs/Outputs already dispose.
+      this.mb = null;
+      this.lifecycleState = 'disposed';
+    })();
+    await this.disposePromise;
   }
 
   // ── probe ──────────────────────────────────────────────────────────────────────────────────
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    const mbInput = await openInput(this.lib, input);
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    this.assertRuntimeSupport(context);
+    if (context?.signal.aborted) throw abortError(context.signal.reason);
+    const trace: MediabunnyHlsReadTrace | undefined = isHlsAsset(input)
+      ? { rootMode: input.mutated ? 'mutated-buffer' : 'url', reads: [] }
+      : undefined;
+    const mbInput = await openInput(this.lib, input, undefined, { ...(trace ? { trace } : {}) });
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
-      return await metadataFromInput(mbInput, input);
+      const metadata = await metadataFromInput(mbInput, input);
+      metadata.probeEvidence = { readMode: 'whole-file' };
+      if (trace) {
+        (metadata as NormalizedMetadata & { sourceTrace: MediabunnyHlsReadTrace }).sourceTrace = trace;
+        const playlist = new TextDecoder().decode(new Uint8Array(await input.arrayBuffer()));
+        const keyUris = hlsKeyUrisFromPlaylist(playlist, input.url);
+        metadata.probeEvidence.resourceAccesses = trace.reads.map((read) => ({
+          role: read.source === 'mutated-root' && read.path === input.url
+            ? 'playlist'
+            : keyUris.has(read.path)
+              ? 'key'
+              : 'segment',
+          uri: read.path,
+          disposition: read.disposition,
+        }));
+        if (/^#EXT-X-KEY:.*METHOD=AES-128/im.test(playlist)) {
+          (metadata as NormalizedMetadata & { protectionScheme?: string }).protectionScheme = 'hls-aes128';
+        }
+      }
+      return metadata;
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
   }
@@ -1154,118 +2653,158 @@ export class MediabunnyEngine implements MediaEngine {
    * Emit a packet table. `EncodedPacketSink.packets()` yields packets in DECODE order; each
    * `EncodedPacket` carries only its PRESENTATION timestamp (`microsecondTimestamp`) — mediabunny
    * intentionally abstracts DTS away. We therefore emit a decode-ordered table with `ptsUs` from
-   * mediabunny and report `dtsUs === ptsUs` (we do not fabricate a decode timeline mediabunny does
-   * not expose). B-frame reordering remains observable through the decode-order sequence vs the
+   * mediabunny and leave `dtsUs` absent. B-frame reordering remains observable through the
+   * decode-order sequence vs the
    * non-monotonic ptsUs values. `keyframe` uses the packet's bitstream-verified type.
    */
-  async demux(input: MediaInput): Promise<DemuxResult> {
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    this.assertRuntimeSupport(context);
     const mbInput = await openInput(this.lib, input);
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
-      const metadata = await metadataFromInput(mbInput);
+      const metadata = await metadataFromInput(mbInput, input);
       const tracks = await mbInput.getTracks();
       const packets: PacketInfo[] = [];
+      const representations: NonNullable<DemuxResult['representations']> = [];
+      let bytesRead = 0;
+      const operationStart = nowMs();
 
       for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
         const track = tracks[trackIndex];
         if (!track) continue;
+        const normalized = metadata.tracks[trackIndex];
+        if (!normalized) continue;
+        const decoderConfig = track.isVideoTrack() || track.isAudioTrack()
+          ? await (track as InputVideoTrack | InputAudioTrack).getDecoderConfig().catch(() => null)
+          : null;
+        const description = decoderConfig?.description ? copyBytes(decoderConfig.description) : undefined;
+        const representation = representationForCodec(normalized.codec, description);
+        const timeResolution = await track.getTimeResolution().catch(() => 1_000_000);
+        representations.push({
+          trackIndex,
+          packetOrdering: 'decode',
+          timebase: { numerator: 1, denominator: Number.isSafeInteger(timeResolution) && timeResolution > 0 ? timeResolution : 1_000_000 },
+          framing: representation.framing!,
+          accessUnitGrouping: representation.accessUnitGrouping!,
+          parameterSetLocation: representation.parameterSetLocation!,
+          ...(decoderConfig?.codec
+            ? { nativeCodecTag: decoderConfig.codec }
+            : normalized.nativeCodecTag
+              ? { nativeCodecTag: normalized.nativeCodecTag }
+              : {}),
+          ...(description ? { description: copyBytes(description) } : {}),
+          ...(representation.descriptionRecord ? { descriptionRecord: representation.descriptionRecord } : {}),
+        });
         const sink = new this.lib.EncodedPacketSink(track);
+        const observedPackets: PacketInfo[] = [];
         // verifyKeyPackets gives accurate keyframe flags. NOTE: mediabunny rejects metadataOnly +
         // verifyKeyPackets together, and the packet table needs byteLength, so we load full packets.
         for await (const pkt of sink.packets(undefined, undefined, {
           verifyKeyPackets: true,
         })) {
           const ptsUs = pkt.microsecondTimestamp;
-          packets.push({
+          const payload = copyBytes(pkt.data);
+          bytesRead += payload.byteLength;
+          const packet: PacketInfo = {
             trackIndex,
             size: pkt.byteLength,
             ptsUs,
-            dtsUs: ptsUs,
+            // Mediabunny exposes decode ordering via sequenceNumber, not a decode timestamp.
+            // Absence is explicit; packetOrdering/accessUnitId retain the observed ordering.
             keyframe: pkt.type === 'key',
-          });
+            durationUs: pkt.microsecondDuration,
+            trackType: normalized.type,
+            codec: normalized.codec,
+            payload,
+            payloadDigest: await sha256Hex(payload),
+            accessUnitId: pkt.sequenceNumber >= 0 ? `${trackIndex}:${pkt.sequenceNumber}` : `${trackIndex}:unknown:${packets.length}`,
+            framing: representation.framing,
+            ...(representation.nalLengthSize ? { nalLengthSize: representation.nalLengthSize } : {}),
+            randomAccessKind: pkt.type === 'key' ? 'bitstream-verified-key' : 'dependent',
+          };
+          packets.push(packet);
+          observedPackets.push(packet);
+          if (context && !context.signal.aborted) {
+            context.emit({ type: 'bytes-read', atMs: Math.max(0, nowMs() - operationStart), bytes: bytesRead });
+          }
         }
+        applyObservedFrameRateEvidence(normalized, observedPackets);
       }
 
-      return { metadata, packets };
+      return {
+        metadata,
+        packets,
+        packetOrdering: 'decode',
+        representations,
+        telemetry: { bytesRead, packetCount: packets.length },
+      };
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
   }
 
-  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
+  async prepareMuxTracks(
+    inputs: MediaInput[],
+    options?: Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<EncodedTracks> {
     const candidates: PreparedMuxTrackCandidate[] = [];
+    let metadataTags: MetadataTags | undefined;
+    let sourceTrackCount = 0;
+    let bytesRead = 0;
 
     for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
+      if (context?.signal.aborted) throw abortError(context.signal.reason);
       const input = inputs[inputIndex];
       if (!input) continue;
       const mbInput = await openInput(this.lib, input);
+      const unbindAbort = bindAbortToInput(mbInput, context?.signal);
       try {
-        const tracks = await mbInput.getTracks();
-        const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
-
-        for (const track of tracks) {
-          if (!track.isVideoTrack() && !track.isAudioTrack()) continue;
-          const type: 'video' | 'audio' = track.isVideoTrack() ? 'video' : 'audio';
-          const typeOrdinal = typeCounts[type]++;
-          const normalized = await normalizeTrack(track);
-          const decoderConfig = await track.getDecoderConfig().catch(() => null);
-          const timescale = await track.getTimeResolution().catch(() => 1_000_000);
-          const sink = new this.lib.EncodedPacketSink(track);
-          const chunks: EncodedTracks['tracks'][number]['chunks'] = [];
-
-          for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
-            chunks.push({
-              data: copyBytes(pkt.data),
-              ptsUs: pkt.microsecondTimestamp,
-              dtsUs: pkt.microsecondTimestamp,
-              durationUs: pkt.microsecondDuration,
-              keyframe: pkt.type === 'key',
-            });
-          }
-
-          if (chunks.length === 0) continue;
-          rebaseChunksToZero(chunks);
-
-          const description = decoderConfig?.description ? copyBytes(decoderConfig.description) : undefined;
-          const encodedTrack: EncodedTracks['tracks'][number] = {
-            type,
-            codec: normalized.codec,
-            timescale: Number.isFinite(timescale) && timescale > 0 ? timescale : 1_000_000,
-            ...(normalized.width !== undefined ? { width: normalized.width } : {}),
-            ...(normalized.height !== undefined ? { height: normalized.height } : {}),
-            ...(normalized.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
-            ...(normalized.channels !== undefined ? { channels: normalized.channels } : {}),
-            ...(description !== undefined ? { description } : {}),
-            chunks,
-          };
-
-          candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
-        }
+        const prepared = await prepareOpenedInput(this.lib, mbInput, inputIndex, this.id, context);
+        candidates.push(...prepared.candidates);
+        sourceTrackCount += prepared.sourceTrackCount;
+        bytesRead += prepared.bytesRead;
+        if (inputIndex === 0) metadataTags = prepared.metadataTags;
       } finally {
+        unbindAbort();
         mbInput.dispose();
       }
     }
-
-    return { tracks: selectPreparedMuxTracks(candidates, inputs.length, options).map((c) => c.track) };
+    const selected = selectPreparedMuxTracks(candidates, inputs.length, options).map((candidate) => candidate.track);
+    if (selected.length === 0) {
+      throw createNotApplicableError(
+        this.id,
+        'prepareMuxTracks',
+        'track selection produced no supported media tracks',
+        context ? tupleSummary(context.request) : {},
+        MEDIABUNNY_REASON.TRACK_COUNT,
+      );
+    }
+    const result: MediabunnyPreparedTracks = {
+      tracks: selected,
+      telemetry: { bytesRead },
+      sourceTrackCount,
+      ...(metadataTags ? { metadataTags } : {}),
+    };
+    return result;
   }
 
   // ── remux ──────────────────────────────────────────────────────────────────────────────────
-  /** Lossless container change: Conversion with no codec/transform options copies encoded samples. */
-  async remux(input: MediaInput, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
-    if (opts.fastStart === 'reserve') {
-      const tracks = await this.prepareMuxTracks([input], opts);
-      return this.mux(tracks, opts);
+  /** Strict copy-only remux. No Conversion fallback is allowed to decode, encode, or discard. */
+  async remux(
+    input: MediaInput,
+    opts: { container: string } & Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    this.assertRuntimeSupport(context);
+    const prepared = await this.prepareMuxTracks([input], opts, context) as MediabunnyPreparedTracks;
+    if (!Array.isArray(opts.trackSelect) && prepared.sourceTrackCount !== prepared.tracks.length) {
+      throw new Error(
+        `mediabunny strict remux track-accounting violation: selected ${prepared.sourceTrackCount ?? '?'} but prepared ${prepared.tracks.length}`,
+      );
     }
-
-    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
-    if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
-    const mbInput = await openInput(this.lib, input);
-    try {
-      const targetInfo = instrumentedOutputTarget(this.lib, opts);
-      const output = new this.lib.Output({ format, target: targetInfo.target });
-      return await runConversion(this.lib, { input: mbInput, output }, opts.container, targetInfo);
-    } finally {
-      mbInput.dispose();
-    }
+    return this.mux(prepared, opts, context);
   }
 
   // ── transcode ──────────────────────────────────────────────────────────────────────────────
@@ -1277,54 +2816,110 @@ export class MediabunnyEngine implements MediaEngine {
    * first as the primary output. Each rung is produced with the same audio settings and its own
    * fresh Input/Output pair to avoid reusing a consumed media source.
    */
-  async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
+  async transcode(
+    input: MediaInput,
+    opts: TranscodeOptions,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
     const runtimeOpts = opts as TranscodeOptions & Record<string, unknown>;
     const variants = opts.variants?.length ? opts.variants : undefined;
+    if (!variants) this.assertRuntimeSupport(context);
     const videoSpecs = variants ?? (opts.video ? [opts.video] : []);
     for (const spec of videoSpecs) {
       if (
         (spec.width !== undefined && spec.width <= 0) ||
         (spec.height !== undefined && spec.height <= 0)
       ) {
-        throw new Error('mediabunny transcode rejected invalid video dimensions');
+        throw new TypeError('mediabunny transcode rejected invalid video dimensions');
       }
     }
 
-    const runSingle = async (videoSpec?: TranscodeVideoOptions): Promise<MediaBytes> => {
+    const runSingle = async (videoSpec?: TranscodeVideoOptions): Promise<MediabunnyMediaBytes> => {
+      const singleContext = context && videoSpec
+        ? { ...context, request: requestForVariant(context.request, videoSpec) }
+        : context;
+      this.assertRuntimeSupport(singleContext);
       const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
-      if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
-      const mbInput = await openInput(this.lib, input);
-      const targetInfo = instrumentedOutputTarget(this.lib, runtimeOpts);
+      if (!format) {
+        throw createNotApplicableError(this.id, 'transcode', `cannot author '${opts.container}'`, singleContext ? tupleSummary(singleContext.request) : {}, MEDIABUNNY_REASON.CONTAINER);
+      }
+      const starvation = new PipelineStarvationSampler();
+      const mbInput = await openInput(this.lib, input, undefined, { starvation });
+      const unbindAbort = bindAbortToInput(mbInput, singleContext?.signal);
+      const targetInfo = instrumentedOutputTarget(this.lib, runtimeOpts, singleContext, starvation);
       const output = new this.lib.Output({ format, target: targetInfo.target });
       const convOpts: ConversionOptions = { input: mbInput, output };
 
       try {
         const tracks = await mbInput.getTracks();
-        if (videoSpec && !tracks.some((track) => track.isVideoTrack())) {
-          throw new Error('mediabunny transcode: requested video output but input has no video track');
+        const videoTrack = tracks.find((track): track is InputVideoTrack => track.isVideoTrack());
+        const audioTrack = tracks.find((track): track is InputAudioTrack => track.isAudioTrack());
+        if (videoSpec && !videoTrack) {
+          throw createNotApplicableError(this.id, 'transcode', 'requested video output but input has no video track', singleContext ? tupleSummary(singleContext.request) : {}, MEDIABUNNY_REASON.MISSING_TRACK);
         }
-        if (opts.audio && !tracks.some((track) => track.isAudioTrack())) {
-          throw new Error('mediabunny transcode: requested audio output but input has no audio track');
+        if (opts.audio && !audioTrack) {
+          throw createNotApplicableError(this.id, 'transcode', 'requested audio output but input has no audio track', singleContext ? tupleSummary(singleContext.request) : {}, MEDIABUNNY_REASON.MISSING_TRACK);
         }
+        const applicability = singleContext
+          ? this.runtimeApplicability(singleContext.request, 'transcode')
+          : undefined;
+        if (videoTrack && videoSpec) await videoDecoderOptionsForTrack(this.lib, videoTrack, applicability);
+        if (audioTrack && opts.audio) await assertAudioTrackDecodable(audioTrack, applicability);
         const inputDuration = await durationFromInput(mbInput);
         const videoExtras = videoTransformExtrasFrom(runtimeOpts);
-        if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, videoExtras);
-        if (opts.audio) convOpts.audio = buildAudioOptions(this.lib, opts.audio, inputDuration ?? undefined);
+        if (videoSpec) convOpts.video = await buildVideoOptions(this.lib, videoSpec, videoExtras, applicability);
+        if (opts.audio) convOpts.audio = await buildAudioOptions(this.lib, opts.audio, inputDuration ?? undefined, applicability);
 
         if (inputDuration != null) convOpts.trim = { start: 0, end: inputDuration };
 
-        return await runConversion(this.lib, convOpts, opts.container, targetInfo);
+        return await runConversion(
+          this.lib,
+          convOpts,
+          opts.container,
+          targetInfo,
+          singleContext,
+          this.id,
+          this.activeConversions,
+        );
       } finally {
+        unbindAbort();
         mbInput.dispose();
       }
     };
 
     if (variants) {
-      const outputs: MediaBytes[] = [];
-      for (const variant of variants) outputs.push(await runSingle(variant));
+      const outputs: MediabunnyMediaBytes[] = [];
+      const variantSupport: NonNullable<MediabunnyMediaBytes['variantSupport']> = [];
+      let firstBlocker: unknown;
+      for (let index = 0; index < variants.length; index++) {
+        const variant = variants[index]!;
+        try {
+          outputs.push(await runSingle(variant));
+          variantSupport.push({ index, status: 'SUPPORTED' });
+        } catch (error) {
+          if (isBrowserNotSupportedError(error)) {
+            firstBlocker ??= error;
+            variantSupport.push({ index, status: 'NA_BROWSER', reasonCode: error.reasonCode });
+            continue;
+          }
+          if (isNotApplicableError(error)) {
+            firstBlocker ??= error;
+            variantSupport.push({ index, status: 'NA_ENGINE', reasonCode: error.reasonCode });
+            continue;
+          }
+          throw error;
+        }
+      }
       const primary = outputs[0];
-      if (!primary) throw new Error('mediabunny fanout produced no variants');
-      return { ...primary, variants: outputs };
+      if (!primary) throw firstBlocker ?? new Error('mediabunny fanout produced no variants');
+      const totalBytes = outputs.reduce((sum, output) => sum + output.bytes.byteLength, 0);
+      return {
+        ...primary,
+        bytes: primary.bytes.slice(),
+        variants: outputs,
+        telemetry: { bytesWritten: totalBytes },
+        variantSupport,
+      } as MediabunnyMediaBytes;
     }
 
     return await runSingle(opts.video);
@@ -1336,10 +2931,42 @@ export class MediabunnyEngine implements MediaEngine {
    * for untransformed frames so privacy-hardened canvas readback cannot perturb bit-exact digests;
    * fall back to VideoSample.draw for rotation/crop/pixel-aspect presentation cases.
    */
-  async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
+  async decodeFrames(
+    input: MediaInput,
+    opts?: DecodeOptions,
+    context?: OperationContext,
+  ): Promise<FrameSink> {
+    this.assertRuntimeSupport(context);
     const mbInput = await openInput(this.lib, input);
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
-      const videoTrack = await mbInput.getPrimaryVideoTrack();
+      const operationStart = nowMs();
+      let observedFirstFrameMs: number | undefined;
+      const applicability = context
+        ? this.runtimeApplicability(context.request, 'decodeFrames')
+        : undefined;
+      const tracks = await mbInput.getTracks();
+      const selected = selectDecodeTrack(tracks, opts?.track);
+      if ('reason' in selected) {
+        throw createNotApplicableError(
+          this.id,
+          'decodeFrames',
+          selected.reason,
+          context ? tupleSummary(context.request) : {},
+          MEDIABUNNY_REASON.TRACK_TYPE,
+        );
+      }
+      const normalizedSelected = await normalizeTrack(selected.track);
+      const selectedTrack = {
+        schema: DECODE_TRACK_SELECTOR_SCHEMA,
+        type: normalizedSelected.type === 'audio' ? 'audio' as const : 'video' as const,
+        trackIndex: selected.trackIndex,
+        typeOrdinal: selected.typeOrdinal,
+        codec: normalizedSelected.codec,
+        ...(normalizedSelected.width !== undefined ? { width: normalizedSelected.width } : {}),
+        ...(normalizedSelected.height !== undefined ? { height: normalizedSelected.height } : {}),
+      };
+      const videoTrack = selected.track.isVideoTrack() ? selected.track as InputVideoTrack : null;
       if (!videoTrack) {
         // No video track: decode the primary AUDIO track to per-sample-frame digests. This mirrors
         // the decoded-audio-pcm oracle (src/engines/ffmpeg-wasm/adapter.ts:2606-2631), which decodes
@@ -1348,8 +2975,11 @@ export class MediabunnyEngine implements MediaEngine {
         // that contract exactly, so we use the global index (NOT AudioSample.timestamp), extract
         // interleaved f32 (planeIndex 0, format 'f32' — non-planar), and sha256 over exactly
         // channels*4 raw little-endian f32 bytes per sample-frame (width=channels, height=1).
-        const audioTrack = await mbInput.getPrimaryAudioTrack();
-        if (!audioTrack) throw new Error('mediabunny decodeFrames: no decodable track in input');
+        const audioTrack = selected.track.isAudioTrack() ? selected.track as InputAudioTrack : null;
+        if (!audioTrack) {
+          throw createNotApplicableError(this.id, 'decodeFrames', 'input has no audio or video track', context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.MISSING_TRACK);
+        }
+        await assertAudioTrackDecodable(audioTrack, applicability);
 
         const sink = new this.lib.AudioSampleSink(audioTrack);
         const sampleRate = await audioTrack.getSampleRate().catch(() => 0);
@@ -1383,17 +3013,36 @@ export class MediabunnyEngine implements MediaEngine {
                 height: 1,
               });
               globalIndex++;
+              if (globalIndex === 1) opts?.onFirstFrame?.(nowMs());
+            }
+            if (context && globalIndex > 0 && !context.signal.aborted) {
+              const atMs = nowMs() - operationStart;
+              if (observedFirstFrameMs === undefined) {
+                observedFirstFrameMs = atMs;
+                context.emit({ type: 'first-frame', atMs });
+              }
+              context.emit({ type: 'decoded-frame-count', atMs, count: globalIndex });
             }
           } finally {
             sample.close();
           }
         }
-        return { frames };
+        return {
+          frames,
+          selectedTrack,
+          telemetry: {
+            decodedFrames: frames.length,
+            ...(observedFirstFrameMs !== undefined ? { firstFrameMs: observedFirstFrameMs } : {}),
+          },
+        };
       }
 
       // Best path (dossier §6): hardware-accelerated WebCodecs decode. Pull VideoSample objects so
       // ordinary frames can be copied directly to RGBA, avoiding canvas fingerprinting perturbations.
-      const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack));
+      const sink = new this.lib.VideoSampleSink(
+        videoTrack,
+        await videoDecoderOptionsForTrack(this.lib, videoTrack, applicability),
+      );
       const out = new CapturedFrameSink();
       const max = opts?.maxFrames ?? Infinity;
 
@@ -1407,13 +3056,28 @@ export class MediabunnyEngine implements MediaEngine {
           const img = await imageDataFromVideoSample(sample);
           const digest = await digestImageData(img, index, sample.microsecondTimestamp);
           out.push(img, digest);
+          if (index === 0) opts?.onFirstFrame?.(nowMs());
           index++;
+          if (context && !context.signal.aborted) {
+            const atMs = nowMs() - operationStart;
+            if (index === 1) {
+              observedFirstFrameMs = atMs;
+              context.emit({ type: 'first-frame', atMs });
+            }
+            context.emit({ type: 'decoded-frame-count', atMs, count: index });
+          }
         } finally {
           sample.close();
         }
       }
+      out.telemetry = {
+        decodedFrames: out.frames.length,
+        ...(observedFirstFrameMs !== undefined ? { firstFrameMs: observedFirstFrameMs } : {}),
+      };
+      out.selectedTrack = selectedTrack;
       return out;
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
   }
@@ -1421,13 +3085,22 @@ export class MediabunnyEngine implements MediaEngine {
   // ── seek ───────────────────────────────────────────────────────────────────────────────────
   /** Seek to tUs and return the landed frame's pts + digest. VideoSampleSink.getSample returns the
    *  last frame with start ≤ t (presentation order), i.e. the frame visible at that timestamp. */
-  async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
+  async seek(
+    input: MediaInput,
+    tUs: number,
+    context?: OperationContext,
+  ): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
+    this.assertRuntimeSupport(context);
     const mbInput = await openInput(this.lib, input);
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
       const videoTrack = await mbInput.getPrimaryVideoTrack();
-      if (!videoTrack) throw new Error('mediabunny seek: no video track in input');
+      if (!videoTrack) {
+        throw createNotApplicableError(this.id, 'seek', 'input has no video track', context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.MISSING_TRACK);
+      }
 
-      const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack));
+      const applicability = context ? this.runtimeApplicability(context.request, 'seek') : undefined;
+      const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack, applicability));
       const targetSec = Math.max(0, tUs / 1e6);
       const sample = await sink.getSample(targetSec);
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
@@ -1440,33 +3113,38 @@ export class MediabunnyEngine implements MediaEngine {
         sample.close();
       }
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
   }
 
   // ── trim ───────────────────────────────────────────────────────────────────────────────────
   /**
-   * Trim to [startUs, endUs). mediabunny's Conversion `trim` is frame-accurate (it re-times and, if
-   * needed, re-encodes the boundary GOP), so `frameAccurate` is honored. When frameAccurate is
-   * false we still pass the exact range — mediabunny will keep it lossless where the boundaries fall
-   * on key frames.
+   * Trim to [startUs, endUs). Non-frame-accurate mode is an explicit keyframe-expanded packet copy;
+   * it cannot fall through to Conversion. Frame-accurate mode uses Conversion and exact WebCodecs
+   * preflight for the boundary re-encode.
    */
   async trim(
     input: MediaInput,
     range: { startUs: number; endUs: number },
     opts: { container: string; frameAccurate: boolean },
+    context?: OperationContext,
   ): Promise<MediaBytes> {
     if (range.startUs < 0) {
-      throw new Error(`mediabunny trim rejected negative start ${range.startUs}us`);
+      throw new TypeError(`mediabunny trim rejected negative start ${range.startUs}us`);
     }
     if (range.endUs <= range.startUs) {
-      throw new Error(`mediabunny trim rejected invalid range ${range.startUs}..${range.endUs}us`);
+      throw new TypeError(`mediabunny trim rejected invalid range ${range.startUs}..${range.endUs}us`);
     }
+    this.assertRuntimeSupport(context);
 
     const format = makeOutputFormat(opts.container);
-    if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
+    if (!format) {
+      throw createNotApplicableError(this.id, 'trim', `cannot author '${opts.container}'`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.CONTAINER);
+    }
 
     const mbInput = await openInput(this.lib, input);
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
       let cachedMeta: NormalizedMetadata | null = null;
       const getMeta = async () => {
@@ -1486,11 +3164,35 @@ export class MediabunnyEngine implements MediaEngine {
       }
 
       if (!opts.frameAccurate) {
-        const packetCopy = await tryAudioOnlyPacketCopyTrim(this.lib, mbInput, await getMeta(), range, opts);
-        if (packetCopy) return packetCopy;
+        // Non-frame-accurate means packet copy, never a permissive Conversion fallback.
+        const prepared = await this.prepareMuxTracks([input], { ...opts }, context) as MediabunnyPreparedTracks;
+        for (const track of prepared.tracks) {
+          let selected = track.chunks.filter((chunk) =>
+            chunk.ptsUs + chunk.durationUs > range.startUs && chunk.ptsUs < range.endUs,
+          );
+          if (track.type === 'video') {
+            const first = selected[0];
+            if (first && !first.keyframe) {
+              const precedingKey = [...track.chunks]
+                .reverse()
+                .find((chunk) => chunk.keyframe && chunk.ptsUs <= first.ptsUs);
+              if (precedingKey) {
+                const start = track.chunks.indexOf(precedingKey);
+                selected = track.chunks.slice(start).filter((chunk) => chunk.ptsUs < range.endUs);
+              }
+            }
+          }
+          if (selected.length === 0) {
+            throw createNotApplicableError(this.id, 'trim', `copy trim selected no ${track.type} packets`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.COPY_REQUIRED);
+          }
+          track.chunks = selected.map((chunk, decodeIndex) => ({ ...chunk, data: chunk.data.slice(), decodeIndex }));
+          rebaseChunksToZero(track.chunks);
+        }
+        return this.mux(prepared, opts, context);
       }
 
-      const output = new this.lib.Output({ format, target: new this.lib.BufferTarget() });
+      const targetInfo = instrumentedOutputTarget(this.lib, opts as Record<string, unknown>, context);
+      const output = new this.lib.Output({ format, target: targetInfo.target });
       const convOpts: ConversionOptions = {
         input: mbInput,
         output,
@@ -1500,10 +3202,33 @@ export class MediabunnyEngine implements MediaEngine {
       // so the requested start/end are honored exactly rather than snapped to key frames. Carry the
       // best-path hardware-acceleration hint (dossier §6) into that re-encode.
       if (opts.frameAccurate) {
-        convOpts.video = { forceTranscode: true, hardwareAcceleration: HW_ACCEL };
+        const primaryVideo = await mbInput.getPrimaryVideoTrack();
+        if (primaryVideo) {
+          const normalized = await normalizeTrack(primaryVideo);
+          const applicability = context ? this.runtimeApplicability(context.request, 'trim') : undefined;
+          await videoDecoderOptionsForTrack(this.lib, primaryVideo, applicability);
+          const videoSpec: TranscodeVideoOptions = {
+            codec: normalized.codec,
+            ...(normalized.width ? { width: normalized.width } : {}),
+            ...(normalized.height ? { height: normalized.height } : {}),
+          };
+          convOpts.video = {
+            ...(await buildVideoOptions(this.lib, videoSpec, undefined, applicability)),
+            forceTranscode: true,
+          };
+        }
       }
-      return await runConversion(this.lib, convOpts, opts.container);
+      return await runConversion(
+        this.lib,
+        convOpts,
+        opts.container,
+        targetInfo,
+        context,
+        this.id,
+        this.activeConversions,
+      );
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
   }
@@ -1514,12 +3239,65 @@ export class MediabunnyEngine implements MediaEngine {
    * becomes an EncodedPacket (decode order; pts from ptsUs). The first packet of each track carries
    * a decoder config built from the track description so the muxer can write codec-private data.
    */
-  async mux(tracks: EncodedTracks, opts: { container: string } & Record<string, unknown>): Promise<MediaBytes> {
+  async mux(
+    tracks: EncodedTracks,
+    opts: { container: string } & Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    this.assertRuntimeSupport(context);
     const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
-    if (!format) throw new Error(`mediabunny cannot mux container '${opts.container}'`);
+    if (!format) {
+      throw createNotApplicableError(this.id, 'mux', `cannot author '${opts.container}'`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.CONTAINER);
+    }
+    assertMuxTrackTuple(format, tracks, this.id, opts, context);
+    if (opts.tags !== undefined && !isPlainObject(opts.tags)) {
+      throw new TypeError('mediabunny metadata tags must be an object');
+    }
+    const malformedTag = isPlainObject(opts.tags)
+      ? Object.entries(opts.tags).find((entry) => typeof entry[1] !== 'string')
+      : undefined;
+    if (malformedTag) throw new TypeError(`mediabunny metadata tag '${malformedTag[0]}' must be a string`);
+    const unsupportedTag = unsupportedRequestedMetadataTag(opts);
+    if (unsupportedTag) {
+      throw createNotApplicableError(
+        this.id,
+        'mux',
+        `normalized metadata tag '${unsupportedTag}' is not supported by this adapter`,
+        context ? tupleSummary(context.request) : { outputContainer: opts.container },
+        MEDIABUNNY_REASON.METADATA_FORMAT,
+      );
+    }
+    const requestedTags = isPlainObject(opts.tags)
+      ? Object.fromEntries(Object.entries(opts.tags) as Array<[string, string]>)
+      : undefined;
+    const reserveMaximumPacketCount = opts.fastStart === 'reserve'
+      ? Number.isSafeInteger(opts.maximumPacketCount) && Number(opts.maximumPacketCount) > 0
+        ? Number(opts.maximumPacketCount)
+        : undefined
+      : undefined;
+    if (opts.fastStart === 'reserve' && reserveMaximumPacketCount === undefined) {
+      throw createNotApplicableError(
+        this.id,
+        'mux',
+        'reserve fast-start requires a positive maximumPacketCount propagated to every output track',
+        context ? tupleSummary(context.request) : { outputContainer: opts.container },
+        MEDIABUNNY_REASON.RESERVE_PACKET_BOUND,
+      );
+    }
+    const observedPacketCount = tracks.tracks.reduce(
+      (maximum, track) => Math.max(maximum, track.chunks.length),
+      0,
+    );
+    if (reserveMaximumPacketCount !== undefined && observedPacketCount > reserveMaximumPacketCount) {
+      const error = new RangeError(
+        `MEDIABUNNY_RESERVE_PACKET_BOUND_EXCEEDED: observed ${observedPacketCount} packet(s) on one track, bound ${reserveMaximumPacketCount}`,
+      );
+      error.name = 'MediabunnyReserveOverflowError';
+      throw error;
+    }
 
     const mb = this.lib;
-    const targetInfo = instrumentedOutputTarget(mb, opts);
+    const targetInfo = instrumentedOutputTarget(mb, opts, context);
     const output = new mb.Output({ format, target: targetInfo.target });
 
     interface Pending {
@@ -1535,10 +3313,17 @@ export class MediabunnyEngine implements MediaEngine {
         const mbCodec = canonicalToMediabunnyVideo(t.codec) as VideoCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported video codec '${t.codec}'`);
         const source = new mb.EncodedVideoPacketSource(mbCodec);
-        output.addVideoTrack(source, { maximumPacketCount: t.chunks.length });
+        let sourceClosed = false;
+        output.addVideoTrack(source, {
+          maximumPacketCount: reserveMaximumPacketCount ?? t.chunks.length,
+        });
         pendings.push({
           add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata),
-          close: () => source.close(),
+          close: () => {
+            if (sourceClosed) return;
+            sourceClosed = true;
+            source.close();
+          },
           track: t,
           isVideo: true,
         });
@@ -1546,26 +3331,46 @@ export class MediabunnyEngine implements MediaEngine {
         const mbCodec = canonicalToMediabunnyAudio(t.codec) as AudioCodec | null;
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported audio codec '${t.codec}'`);
         const source = new mb.EncodedAudioPacketSource(mbCodec);
-        output.addAudioTrack(source, { maximumPacketCount: t.chunks.length });
+        let sourceClosed = false;
+        output.addAudioTrack(source, {
+          maximumPacketCount: reserveMaximumPacketCount ?? t.chunks.length,
+        });
         pendings.push({
           add: (p, m) => source.add(p, m as EncodedAudioChunkMetadata),
-          close: () => source.close(),
+          close: () => {
+            if (sourceClosed) return;
+            sourceClosed = true;
+            source.close();
+          },
           track: t,
           isVideo: false,
         });
       } else {
-        // subtitle/other not handled by the encoded-packet mux path.
-        continue;
+        throw createNotApplicableError(this.id, 'mux', `track type '${t.type}' is unsupported`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.TRACK_TYPE);
       }
     }
 
-    await output.start();
+    const prepared = tracks as MediabunnyPreparedTracks;
+    const tags = metadataTagsFromRecord(prepared.metadataTags, requestedTags);
+    if (tags) output.setMetadataTags(tags);
 
-    for (const p of pendings) {
-      const { track, isVideo, add } = p;
-      const description = track.description ? bufferOf(track.description) : undefined;
-      try {
+    let cancelPromise: Promise<void> | undefined;
+    const cancel = () => {
+      cancelPromise ??= Promise.allSettled([
+        output.cancel(),
+        targetInfo.cancel(context?.signal.reason),
+      ]).then(() => undefined);
+    };
+    context?.signal.addEventListener('abort', cancel, { once: true });
+
+    try {
+      if (context?.signal.aborted) throw abortError(context.signal.reason);
+      await output.start();
+      for (const p of pendings) {
+        const { track, isVideo, add } = p;
+        const description = track.description ? bufferOf(track.description) : undefined;
         for (let i = 0; i < track.chunks.length; i++) {
+          if (context?.signal.aborted) throw abortError(context.signal.reason);
           const c = track.chunks[i];
           if (!c) continue;
           const pkt = new mb.EncodedPacket(
@@ -1573,8 +3378,7 @@ export class MediabunnyEngine implements MediaEngine {
             c.keyframe ? 'key' : 'delta',
             c.ptsUs / 1e6,
             c.durationUs / 1e6,
-            // sequenceNumber: use decode index for stable ordering.
-            i,
+            c.decodeIndex ?? i,
           );
           // First packet carries the decoder config so the muxer can emit codec-private boxes.
           const meta =
@@ -1599,65 +3403,143 @@ export class MediabunnyEngine implements MediaEngine {
               : undefined;
           await add(pkt, meta);
         }
-      } finally {
         p.close();
       }
+      targetInfo.markFinalizeStart();
+      await output.finalize();
+      const media = await targetInfo.mediaBytes(opts.container);
+      if (reserveMaximumPacketCount !== undefined && media.streamingEvidence) {
+        media.streamingEvidence = {
+          ...media.streamingEvidence,
+          // The feature envelope has one scalar bound; because the bound is per track, the maximum
+          // observed per-track load is the correct aggregate for exact-fit/overflow assessment.
+          observedPacketCount,
+          reserveCompletion: 'COMPLETED',
+        };
+      }
+      if (reserveMaximumPacketCount !== undefined && media.targetTelemetry) {
+        media.targetTelemetry.reserveMaximumPacketCount = reserveMaximumPacketCount;
+        media.targetTelemetry.reserveTrackPacketCounts = tracks.tracks.map((track) => track.chunks.length);
+      }
+      await verifyMetadataTags(mb, media.bytes, opts.container, requestedTags);
+      return media;
+    } catch (error) {
+      cancel();
+      await cancelPromise;
+      if (context?.signal.aborted) throw abortError(context.signal.reason);
+      throw error;
+    } finally {
+      context?.signal.removeEventListener('abort', cancel);
+      for (const pending of pendings) {
+        try { pending.close(); } catch { /* close is idempotent or already closed */ }
+      }
     }
-
-    await output.finalize();
-    return targetInfo.mediaBytes(opts.container);
   }
 
   // ── decrypt ────────────────────────────────────────────────────────────────────────────────
   /**
    * Decrypt CENC (ctr/cbcs) protected ISOBMFF by supplying the key through mediabunny's
-   * `resolveKeyId` callback at read time, then re-muxing the now-decoded content into a clean MP4.
-   * mediabunny decrypts samples transparently during read; the conversion writes plaintext samples.
+   * `resolveKeyId` callback at read time, then packet-copying the decrypted encoded samples into a
+   * clean MP4. No WebCodecs decode/encode is involved in this representation-preserving path.
    */
   async decrypt(
     input: MediaInput,
     key: DecryptKey,
     opts: { scheme: EncryptionScheme },
+    context?: OperationContext,
   ): Promise<MediaBytes> {
+    this.assertRuntimeSupport(context);
+    const keyBytes = strictHexBytes(key.keyHex, 'keyHex', 16);
+    const normalizedKid = key.kid === undefined ? undefined : normalizeHex(key.kid, 'kid', 16);
+    const normalizedIv = key.ivHex === undefined ? undefined : normalizeHex(key.ivHex, 'ivHex', 16);
+    if (opts.scheme === 'cenc-ctr') {
+      throw createNotApplicableError(
+        this.id,
+        'decrypt',
+        'Mediabunny 1.48.0 CENC-CTR parsing is guarded because the committed protection form can abort below JavaScript',
+        context ? tupleSummary(context.request) : { encryption: 'cenc-ctr' },
+        MEDIABUNNY_REASON.PROTECTION_FORM,
+      );
+    }
     if (opts.scheme === 'hls-aes128') {
       const mb = this.lib;
-      const mbInput = await openInput(mb, input, 'hls');
+      if (normalizedIv !== undefined) {
+        const playlist = new TextDecoder().decode(await input.arrayBuffer());
+        const declaredIvs = hlsExplicitIvHexesFromPlaylist(playlist);
+        if ([...declaredIvs].some((iv) => iv !== normalizedIv)) {
+          // A wrong IV is supplied data, not a missing engine/browser capability.
+          throw new Error(`mediabunny HLS IV mismatch: playlist declares ${[...declaredIvs].join(', ')}, supplied ${normalizedIv}`);
+        }
+      }
+      const trace: MediabunnyHlsReadTrace = { rootMode: 'caller-key-override', reads: [] };
+      const mbInput = await openInput(mb, input, 'hls', { hlsKeyBytes: keyBytes, trace });
+      const unbindAbort = bindAbortToInput(mbInput, context?.signal);
       try {
-        const format = makeOutputFormat('mp4');
-        if (!format) throw new Error('mediabunny decrypt: mp4 output unavailable');
-        const output = new mb.Output({ format, target: new mb.BufferTarget() });
-        return await runConversion(mb, { input: mbInput, output }, 'mp4');
+        const media = await this.muxDecryptedInput(mbInput, context);
+        (media as MediabunnyMediaBytes & { sourceTrace: MediabunnyHlsReadTrace }).sourceTrace = trace;
+        return media;
       } finally {
+        unbindAbort();
         mbInput.dispose();
       }
     }
-    if (opts.scheme !== 'cenc-ctr' && opts.scheme !== 'cenc-cbcs') {
-      throw new Error(`mediabunny decrypt: unsupported scheme '${opts.scheme}'`);
+    if (opts.scheme !== 'cenc-cbcs') {
+      throw createNotApplicableError(this.id, 'decrypt', `unsupported protection scheme '${opts.scheme}'`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.PROTECTION_FORM);
     }
     const mb = this.lib;
-    const keyBytes = hexToBytes(key.keyHex);
     const buffer = await input.arrayBuffer();
+    const resolvedKeyIds: string[] = [];
     const mbInput = new mb.Input({
       source: new mb.BufferSource(buffer),
       formats: mb.ALL_FORMATS,
       formatOptions: {
         isobmff: {
-          // Resolve every requested key id to the supplied key. Fixtures here are single-key; if a
-          // kid is provided we still answer with the same key (a mismatch would mean the wrong key
-          // was passed, which mediabunny will surface as a decode failure downstream).
-          resolveKeyId: () => keyBytes,
+          resolveKeyId: createCencKeyResolver(keyBytes, normalizedKid, (keyId) => {
+            resolvedKeyIds.push(keyId);
+          }),
         },
       },
     });
+    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
-      const format = makeOutputFormat('mp4');
-      if (!format) throw new Error('mediabunny decrypt: mp4 output unavailable');
-      const output = new mb.Output({ format, target: new mb.BufferTarget() });
-      // No transform: copy decrypted (plaintext) samples straight through.
-      return await runConversion(mb, { input: mbInput, output }, 'mp4');
+      return await this.muxDecryptedInput(mbInput, context, () => resolvedKeyIds.length > 0);
     } finally {
+      unbindAbort();
       mbInput.dispose();
     }
+  }
+
+  private async muxDecryptedInput(
+    input: Input,
+    context?: OperationContext,
+    protectionWasResolved?: () => boolean,
+  ): Promise<MediaBytes> {
+    const prepared = await prepareOpenedInput(this.lib, input, 0, this.id, context);
+    if (protectionWasResolved !== undefined && !protectionWasResolved()) {
+      throw createNotApplicableError(
+        this.id,
+        'decrypt',
+        'Mediabunny did not expose this CENC-CBCS protection form through resolveKeyId; refusing to copy ciphertext as clear media',
+        context ? tupleSummary(context.request) : { encryption: 'cenc-cbcs' },
+        MEDIABUNNY_REASON.PROTECTION_FORM,
+      );
+    }
+    if (prepared.candidates.length === 0 || prepared.candidates.length !== prepared.sourceTrackCount) {
+      throw createNotApplicableError(
+        this.id,
+        'decrypt',
+        'decryption packet-copy path could not preserve every source track',
+        context ? tupleSummary(context.request) : { outputContainer: 'mp4' },
+        MEDIABUNNY_REASON.COPY_REQUIRED,
+      );
+    }
+    const tracks: MediabunnyPreparedTracks = {
+      tracks: prepared.candidates.map((candidate) => candidate.track),
+      sourceTrackCount: prepared.sourceTrackCount,
+      telemetry: { bytesRead: prepared.bytesRead },
+      ...(prepared.metadataTags ? { metadataTags: prepared.metadataTags } : {}),
+    };
+    return this.mux(tracks, { container: 'mp4' }, context);
   }
 }
 
@@ -1672,12 +3554,16 @@ function bufferOf(u8: Uint8Array): ArrayBuffer {
 
 /** Best-effort WebCodecs codec string for a mux track when only the canonical codec is known. */
 function codecParamForTrack(track: EncodedTracks['tracks'][number], isVideo: boolean): string {
+  if (track.nativeCodecTag) {
+    if (!isVideo || /^(?:avc1|avc3|hev1|hvc1|vp8|vp09|av01)/i.test(track.nativeCodecTag)) {
+      return track.nativeCodecTag;
+    }
+  }
   if (isVideo) {
     switch (track.codec) {
       case 'h264':
-        return 'avc1.640028';
       case 'hevc':
-        return 'hev1.1.6.L93.B0';
+        throw new Error(`mediabunny mux: ${track.codec} requires an observed full codec/profile string`);
       case 'vp8':
         return 'vp8';
       case 'vp9':
@@ -1788,12 +3674,64 @@ function make2dCanvas(width: number, height: number): {
   throw new Error('No canvas implementation available in this realm');
 }
 
-/** hex string → bytes (for decryption keys / ivs). */
-function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.replace(/[^0-9a-fA-F]/g, '');
-  const out = new Uint8Array(clean.length / 2);
+function normalizeHex(hex: string, field: string, expectedBytes: number): string {
+  const clean = hex.replace(/^0x/i, '').toLowerCase();
+  if (!/^[0-9a-f]+$/.test(clean) || clean.length !== expectedBytes * 2) {
+    throw new TypeError(`${field} must contain exactly ${expectedBytes} bytes of hexadecimal data`);
+  }
+  return clean;
+}
+
+/** Strict hex string → bytes (for decryption keys / IVs / KIDs). */
+function strictHexBytes(hex: string, field: string, expectedBytes: number): Uint8Array {
+  const clean = normalizeHex(hex, field, expectedBytes);
+  const out = new Uint8Array(expectedBytes);
   for (let i = 0; i < out.length; i++) {
     out[i] = parseInt(clean.substr(i * 2, 2), 16);
   }
   return out;
+}
+
+function serializableCodecConfig(
+  config: VideoEncoderConfig | AudioEncoderConfig | VideoDecoderConfig | AudioDecoderConfig,
+): SerializableValue {
+  const normalize = (value: unknown): SerializableValue => {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
+    if (ArrayBuffer.isView(value)) {
+      const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      return { byteLength: bytes.byteLength, hex: [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('') };
+    }
+    if (value instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(value);
+      return { byteLength: bytes.byteLength, hex: [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('') };
+    }
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === 'object') {
+      const out: Record<string, SerializableValue> = {};
+      for (const [key, item] of Object.entries(value)) {
+        if (item !== undefined) out[key] = normalize(item);
+      }
+      return out;
+    }
+    return String(value);
+  };
+  return normalize(config);
+}
+
+function requestForVariant(
+  request: ConcreteOperationRequest,
+  variant: TranscodeVideoOptions,
+): ConcreteOperationRequest {
+  return {
+    ...request,
+    output: {
+      ...(request.output ?? { container: '' }),
+      ...(variant.codec ? { videoCodec: variant.codec } : {}),
+      ...(variant.width ? { width: variant.width } : {}),
+      ...(variant.height ? { height: variant.height } : {}),
+      ...(variant.fps ? { frameRate: variant.fps } : {}),
+    },
+    options: { ...request.options, video: { ...variant }, variants: [] },
+  };
 }

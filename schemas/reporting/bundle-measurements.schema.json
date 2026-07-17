@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aibrush.dev/schemas/media-test/bundle-measurements/1.0.0",
+  "title": "media-test bundle measurements artifact",
+  "type": "object",
+  "required": ["schemaId", "schemaVersion", "artifactId", "measurementDefinition", "measurements"],
+  "properties": {
+    "schemaId": { "const": "https://aibrush.dev/schemas/media-test/bundle-measurements/1.0.0" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+(?:[-+].*)?$" },
+    "artifactId": { "type": "string", "minLength": 1 },
+    "contentHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "measurementDefinition": {
+      "type": "object",
+      "required": ["bundler", "runtime", "target", "treeShake", "minify", "byteUnit", "compression"],
+      "additionalProperties": true
+    },
+    "measurements": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["state", "engineId", "engineVersion", "source", "rawBytes", "compressedBytes", "includedFiles", "excludedRuntimeAssets"],
+            "properties": {
+              "state": { "const": "MEASURED" },
+              "rawBytes": { "type": "integer", "minimum": 0 },
+              "compressedBytes": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": ["state", "engineId", "engineVersion", "source", "reasonCode", "reason"],
+            "properties": { "state": { "const": "UNAVAILABLE" } },
+            "not": { "anyOf": [{ "required": ["rawBytes"] }, { "required": ["compressedBytes"] }] },
+            "additionalProperties": true
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": true
+}

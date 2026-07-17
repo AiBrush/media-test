@@ -72,6 +72,7 @@ import {
   IsAPdfError,
   IsAnUnsupportedFileTypeError,
   WEBCODECS_TIMESCALE,
+  mediaParserController,
   type MediaParserOnVideoTrack,
   type MediaParserOnAudioTrack,
   type MediaParserVideoSample,
@@ -80,24 +81,43 @@ import {
   type MediaParserVideoTrack,
   type MediaParserAudioTrack,
   type MediaParserContainer,
+  type MediaParserReaderInterface,
 } from '@remotion/media-parser';
 import { webReader } from '@remotion/media-parser/web';
 
 import type {
+  AdapterConfigProfile,
   CapabilitySet,
+  ConcreteOperationRequest,
+  DecodeOptions,
   DecryptKey,
+  DemuxTrackRepresentation,
   DemuxResult,
   EncodedTracks,
   EncryptionScheme,
   FrameDigest,
+  FrameRateProvenance,
   FrameSink,
+  LifecycleContext,
   MediaBytes,
   MediaEngine,
   MediaInput,
   NormalizedMetadata,
   NormalizedTrack,
+  OperationContext,
   PacketInfo,
+  SupportDecision,
   TranscodeOptions,
+} from '../../core/engine.ts';
+import {
+  AdapterLifecycleController,
+  CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  captureConfigUsedSnapshot,
+  createNotApplicableError,
+  validateAdapterResult,
+  validateCapabilitySet,
+  validateSupportDecision,
 } from '../../core/engine.ts';
 
 import {
@@ -105,6 +125,9 @@ import {
   mpContainerToCanonical,
   mpVideoToCanonical,
 } from './codecs.ts';
+import {
+  decideRemotionParserSupport,
+} from '../remotion/support.ts';
 
 const ENGINE_ID = 'remotion-media-parser@4.0.479';
 
@@ -120,8 +143,18 @@ const WEBM_HEADER_RANGE_BYTES = 64 * 1024;
 type ParsePath = 'worker' | 'main-thread';
 
 /** The config recorded per run (dossier §8.5 / §3) — exposed so the runner/report can record it. */
-export interface RemotionMediaParserConfig {
+export interface RemotionMediaParserConfig extends AdapterConfigProfile {
+  framework: '@remotion/media-parser';
+  packageVersions: { '@remotion/media-parser': '4.0.479' };
   backend: 'cpu-js';
+  hardwareAcceleration: 'not-applicable';
+  workerCount: number;
+  threadCount: 0;
+  readerMode: 'webReader' | 'blob' | 'not-selected';
+  writerMode: 'not-applicable';
+  targetMode: 'metadata-or-packet-callbacks';
+  codecConfigs: [];
+  encoderNondeterministic: false;
   hwAccel: false;
   wasmThreads: 0;
   pipeline: 'streaming';
@@ -136,6 +169,10 @@ export interface RemotionMediaParserConfig {
   fieldsTier: 'metadata-only' | 'full-parse(demux)' | 'full-parse(fps)';
   coreBuild: 'n/a';
   version: string;
+  operation: 'none' | 'probe' | 'demux';
+  parsePath: ParsePath;
+  activeControllers: number;
+  cleanupComplete: boolean;
 }
 
 /**
@@ -147,6 +184,10 @@ type ParseMediaFn = typeof parseMedia;
 export class RemotionMediaParserEngine implements MediaEngine {
   readonly id = ENGINE_ID;
 
+  private readonly lifecycle = new AdapterLifecycleController(ENGINE_ID);
+  private readonly fallbackAbort = new AbortController();
+  private readonly activeControllers = new Set<ReturnType<typeof mediaParserController>>();
+
   /** Resolved parse path; set in init(). Defaults to main-thread until init() proves the worker. */
   private parsePath: ParsePath = 'main-thread';
 
@@ -155,7 +196,17 @@ export class RemotionMediaParserEngine implements MediaEngine {
 
   /** The chosen config for the most recent operation (probe/demux), for §8.5 recording. */
   private config: RemotionMediaParserConfig = {
+    framework: '@remotion/media-parser',
+    packageVersions: { '@remotion/media-parser': '4.0.479' },
     backend: 'cpu-js',
+    hardwareAcceleration: 'not-applicable',
+    workerCount: 0,
+    threadCount: 0,
+    readerMode: 'not-selected',
+    writerMode: 'not-applicable',
+    targetMode: 'metadata-or-packet-callbacks',
+    codecConfigs: [],
+    encoderNondeterministic: false,
     hwAccel: false,
     wasmThreads: 0,
     pipeline: 'streaming',
@@ -164,6 +215,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
     fieldsTier: 'metadata-only',
     coreBuild: 'n/a',
     version: '4.0.479',
+    operation: 'none',
+    parsePath: 'main-thread',
+    activeControllers: 0,
+    cleanupComplete: true,
   };
 
   /**
@@ -173,11 +228,13 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * claim. Reflects the MOST RECENT op (probe = metadata-only; demux = full-parse).
    */
   get configUsed(): RemotionMediaParserConfig {
-    return { ...this.config };
+    return captureConfigUsedSnapshot(ENGINE_ID, this.config, {
+      requireProfile: true,
+    }) as unknown as RemotionMediaParserConfig;
   }
 
   capabilities(): CapabilitySet {
-    return {
+    const capabilities: CapabilitySet = {
       // READ-ONLY parser: probe + demux only. No decode/encode/remux/transcode/seek(pixel)/trim/
       // mux/decrypt — those genuinely cannot be done by this library, so they are absent (NA-engine).
       operations: {
@@ -185,8 +242,8 @@ export class RemotionMediaParserEngine implements MediaEngine {
         demux: true,
       },
       // Containers media-parser can READ. The library reports collapsed container families
-      // (ISO-BMFF as 'mp4', Matroska as 'webm'), so toNormalizedMetadata() restores mov/mkv from the
-      // fixture id/mime for suite-golden comparison.
+      // (ISO-BMFF as 'mp4', Matroska as 'webm'), so normalization restores mov/mkv from container
+      // signature bytes rather than source names.
       containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts', 'hls', 'mp3', 'wav', 'flac', 'adts'],
       // No muxer / no container writer.
       containersOut: [],
@@ -211,7 +268,13 @@ export class RemotionMediaParserEngine implements MediaEngine {
         'packets:dts', // sample.decodingTimestamp is surfaced separately from timestamp
         'webcodecs:samples', // emits EncodedVideoChunk/EncodedAudioChunk-compatible samples
       ],
+      probeReadModes: ['range', 'progressive'],
     };
+    return validateCapabilitySet(this, capabilities);
+  }
+
+  supports(request: ConcreteOperationRequest): SupportDecision {
+    return validateSupportDecision(ENGINE_ID, decideRemotionParserSupport(request));
   }
 
   /**
@@ -229,8 +292,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * (guard/construction/postMessage) drops us to main-thread. Either way the parse itself is correct;
    * only main-thread longtask offload differs.
    */
-  async init(): Promise<void> {
-    try {
+  async init(context?: LifecycleContext): Promise<void> {
+    const call = context ?? fallbackLifecycleContext(this.fallbackAbort.signal, 'support');
+    await this.lifecycle.init(call, async () => {
+      try {
       const { parseMediaOnWebWorker } = await import('@remotion/media-parser/worker');
       const workerParse = parseMediaOnWebWorker as unknown as ParseMediaFn;
       // Header-only warm parse on a tiny Blob: triggers the synchronous worker guard + Worker
@@ -250,24 +315,47 @@ export class RemotionMediaParserEngine implements MediaEngine {
       }
       this.workerParse = workerParse;
       this.parsePath = 'worker';
-    } catch {
+      this.config = {
+        ...this.config,
+        workerCount: 1,
+        parsePath: 'worker',
+      };
+      } catch {
       // Worker unavailable in this bundler/host (Vite pre-bundling guard, no Worker, construction
       // failure). Use the main-thread path; every op stays correct, only responsiveness differs.
       this.workerParse = null;
       this.parsePath = 'main-thread';
-    }
+      this.config = {
+        ...this.config,
+        workerCount: 0,
+        parsePath: 'main-thread',
+      };
+      }
+    });
   }
 
-  async dispose(): Promise<void> {
-    // No persistent worker handle is retained (parseMediaOnWebWorker manages its own per-call worker
-    // lifecycle). Drop references for clean peak-memory accounting.
-    this.workerParse = null;
-    this.parsePath = 'main-thread';
+  async dispose(context?: LifecycleContext): Promise<void> {
+    const call = context ?? fallbackLifecycleContext(this.fallbackAbort.signal, 'cleanup');
+    await this.lifecycle.dispose(call, async () => {
+      for (const controller of this.activeControllers) controller.abort('adapter disposed');
+      this.activeControllers.clear();
+      // No persistent worker handle is retained (parseMediaOnWebWorker manages its own per-call worker
+      // lifecycle). Drop references for clean peak-memory accounting.
+      this.workerParse = null;
+      this.parsePath = 'main-thread';
+      this.config = {
+        ...this.config,
+        workerCount: 0,
+        parsePath: 'main-thread',
+        activeControllers: 0,
+        cleanupComplete: true,
+      };
+    });
   }
 
   /** The config chosen for the most recent op (for the runner to record per §8.5). */
   lastConfigUsed(): RemotionMediaParserConfig {
-    return { ...this.config };
+    return this.configUsed;
   }
 
   /**
@@ -284,10 +372,11 @@ export class RemotionMediaParserEngine implements MediaEngine {
    */
   private async chooseSrcOptions(
     input: MediaInput,
-  ): Promise<{ src: string | Blob; reader?: typeof webReader }> {
+    reader: MediaParserReaderInterface = webReader,
+  ): Promise<{ src: string | Blob; reader?: MediaParserReaderInterface }> {
     if (isHlsInput(input) || !input.mutated) {
       this.config = { ...this.config, reader: 'webReader' };
-      return { src: input.url, reader: webReader };
+      return { src: input.url, reader };
     }
     this.config = { ...this.config, reader: 'blob' };
     return { src: await input.blob() };
@@ -302,29 +391,63 @@ export class RemotionMediaParserEngine implements MediaEngine {
   private async runParse<F>(
     options: Parameters<ParseMediaFn>[0],
     tier: RemotionMediaParserConfig['fieldsTier'],
+    context: OperationContext,
   ): Promise<F> {
     const requiresMainThreadReader = 'reader' in (options as { reader?: unknown });
+    const requiresWorkerIsolation = options.src instanceof Blob;
     this.config = {
       ...this.config,
       worker: this.parsePath === 'worker' && !requiresMainThreadReader,
+      workerCount: this.parsePath === 'worker' && !requiresMainThreadReader ? 1 : 0,
+      readerMode: requiresMainThreadReader ? 'webReader' : 'blob',
+      parsePath: this.parsePath === 'worker' && !requiresMainThreadReader ? 'worker' : 'main-thread',
       fieldsTier: tier,
+      activeControllers: this.activeControllers.size + 1,
+      cleanupComplete: false,
     };
-    if (!requiresMainThreadReader && this.parsePath === 'worker' && this.workerParse) {
-      try {
-        return (await this.workerParse(options)) as F;
-      } catch (err) {
-        // If the worker itself is broken (not a genuine parse error), fall back to main thread.
-        if (isFatalWorkerError(err)) {
-          this.parsePath = 'main-thread';
-          this.workerParse = null;
-          this.config = { ...this.config, worker: false };
-        } else {
-          throw err;
+    const controller = mediaParserController();
+    this.activeControllers.add(controller);
+    const abort = (): void => controller.abort(context.signal.reason);
+    if (context.signal.aborted) abort();
+    else context.signal.addEventListener('abort', abort, { once: true });
+    const controlledOptions = { ...options, controller };
+    try {
+      if (!requiresMainThreadReader && this.parsePath === 'worker' && this.workerParse) {
+        try {
+          return (await this.workerParse(controlledOptions)) as F;
+        } catch (err) {
+          if (context.signal.aborted) {
+            throw context.signal.reason ?? err;
+          }
+          // Corrupted/mutated bytes must never be retried on the main realm: the known corrupted-WebM
+          // parser defect is only safely preemptible while the parse owns a terminable Worker.
+          if (isFatalWorkerError(err)) {
+            this.parsePath = 'main-thread';
+            this.workerParse = null;
+            this.config = { ...this.config, worker: false, workerCount: 0 };
+            if (requiresWorkerIsolation) {
+              throw new Error('REMOTION_MUTATED_WORKER_ISOLATION_UNAVAILABLE', { cause: err });
+            }
+          } else {
+            throw err;
+          }
         }
       }
+      if (requiresWorkerIsolation) {
+        throw new Error('REMOTION_MUTATED_WORKER_ISOLATION_UNAVAILABLE');
+      }
+      // Main-thread parse with whatever src/reader the caller chose.
+      return (await parseMedia(controlledOptions)) as F;
+    } finally {
+      context.signal.removeEventListener('abort', abort);
+      controller.abort('parse settled');
+      this.activeControllers.delete(controller);
+      this.config = {
+        ...this.config,
+        activeControllers: this.activeControllers.size,
+        cleanupComplete: this.activeControllers.size === 0,
+      };
     }
-    // Main-thread parse with whatever src/reader the caller chose.
-    return (await parseMedia(options)) as F;
   }
 
   // ── probe ──────────────────────────────────────────────────────────────────────────────────
@@ -337,13 +460,44 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * graceful-failure PASS), or the URL + webReader for HLS playlists (so relative sibling .ts segments
    * resolve, and the HTTP-Range lazy-read path runs).
    */
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    const call = context ?? fallbackOperationContext('probe', this.fallbackAbort.signal);
+    return this.lifecycle.operation('probe', call, async () => {
+      this.config = { ...this.config, operation: 'probe', cleanupComplete: false };
+      try {
+        return validateAdapterResult(ENGINE_ID, 'probe', await this.probeImpl(input, call));
+      } finally {
+        this.config = { ...this.config, cleanupComplete: this.activeControllers.size === 0 };
+      }
+    });
+  }
+
+  private async probeImpl(input: MediaInput, context: OperationContext): Promise<NormalizedMetadata> {
     if (isHlsInput(input)) {
-      const { metadata, packets } = await this.demux(input);
+      rejectBoundedProbeFullScan(input, context, 'HLS metadata requires the parser full-demux path');
+      const { metadata, packets } = await this.demuxImpl(input, context);
       return withVideoFpsFromPackets(metadata, packets);
     }
 
-    const srcOptions = await this.chooseSrcOptions(input);
+    const startedAt = nowMs();
+    let bytesRead = 0;
+    const noteBytes = (bytes: number): void => {
+      if (!Number.isSafeInteger(bytes) || bytes <= 0) return;
+      bytesRead += bytes;
+    };
+    const emitProbeBytes = (): void => {
+      if (bytesRead > 0) {
+        context.emit({ type: 'bytes-read', atMs: Math.max(0, nowMs() - startedAt), bytes: bytesRead });
+      }
+    };
+    const headerMetadata = await webmHeaderMetadata(input, noteBytes);
+    if (shouldUseHeaderOnlyWebmProbe(input, headerMetadata)) {
+      headerMetadata.telemetry = { bytesRead };
+      headerMetadata.probeEvidence = { readMode: 'range' };
+      emitProbeBytes();
+      return headerMetadata;
+    }
+    const srcOptions = await this.chooseSrcOptions(input, countingReader(noteBytes));
     const result = await this.runParse<{
       durationInSeconds: number | null;
       container: MediaParserContainer;
@@ -365,20 +519,33 @@ export class RemotionMediaParserEngine implements MediaEngine {
         },
       },
       'metadata-only',
+      context,
     );
 
-    const metadata = this.toNormalizedMetadata(result, undefined, input);
+    const metadata = await this.toNormalizedMetadata(result, undefined, input, noteBytes);
+    metadata.telemetry = { bytesRead };
+    metadata.probeEvidence = { readMode: 'range' };
     if (needsTsPacketProbeFallback(metadata)) {
-      const { metadata: demuxMetadata, packets } = await this.demux(input);
-      return withTsProbeFieldsFromPackets(demuxMetadata, packets);
+      rejectBoundedProbeFullScan(input, context, 'TS duration/fps requires packet-complete fallback parsing');
+      const { metadata: demuxMetadata, packets } = await this.demuxImpl(input, context);
+      const fallback = withTsProbeFieldsFromPackets(demuxMetadata, packets);
+      fallback.probeEvidence = { readMode: 'whole-file' };
+      return fallback;
     }
 
     if (needsAdtsPacketDurationFallback(metadata)) {
-      const { packets } = await this.demux(input);
-      return withDurationFromPackets(metadata, packets);
+      rejectBoundedProbeFullScan(input, context, 'ADTS duration requires packet-complete fallback parsing');
+      const { packets } = await this.demuxImpl(input, context);
+      const fallback = withDurationFromPackets(metadata, packets);
+      fallback.probeEvidence = { readMode: 'whole-file' };
+      return fallback;
     }
 
-    if (!needsSingleVideoFpsFallback(metadata)) return metadata;
+    if (!needsSingleVideoFpsFallback(metadata)) {
+      emitProbeBytes();
+      return metadata;
+    }
+    rejectBoundedProbeFullScan(input, context, 'the requested fps field requires Remotion slowFps full-file scanning');
     const slow = await this.runParse<{ slowFps: number }>(
       {
         ...srcOptions,
@@ -386,9 +553,14 @@ export class RemotionMediaParserEngine implements MediaEngine {
         fields: { slowFps: true },
       },
       'full-parse(fps)',
+      context,
     );
 
-    return withSingleVideoFps(metadata, slow.slowFps);
+    const observed = withSingleVideoFps(metadata, slow.slowFps);
+    observed.telemetry = { bytesRead };
+    observed.probeEvidence = { readMode: 'range' };
+    emitProbeBytes();
+    return observed;
   }
 
   // ── demux ──────────────────────────────────────────────────────────────────────────────────
@@ -398,18 +570,27 @@ export class RemotionMediaParserEngine implements MediaEngine {
    * maps 1:1 to PacketInfo: size = data.byteLength, keyframe = type === 'key', ptsUs = timestamp,
    * dtsUs = decodingTimestamp (already MICROSECONDS — timescale is WEBCODECS_TIMESCALE = 1_000_000).
    *
-   * trackIndex assignment is anchored to the CONTAINER STREAM-INDEX convention the golden uses
-   * (ffprobe: video streams first, then audio, then other — verified across the golden corpus:
-   * h264_1080p_30s {0:video(900),1:audio(1408)}, h264_multitrack {0:video,1:audio,2:audio}). We do NOT
-   * key the index to callback-FIRE order: media-parser may fire the audio-track callback before video
-   * (the first-EMITTED sample is audio for these MP4/WebM goldens), which would have flipped video↔audio
-   * indices and tripped the goldenPackets sameLayout() check. Instead we tag each packet with the
-   * parser's stable trackId during the callback, then — once result.tracks is known — assign a canonical
-   * index by (type rank video<audio<other, then trackId ascending) and remap. NormalizedMetadata.tracks
-   * is ordered by the SAME canonical map so packet.trackIndex ↔ tracks[trackIndex] stay aligned.
+   * Callback order is sample-driven and need not match the parser's declared track order. Tag each
+   * packet with its stable parser trackId during collection, then resolve trackIndex from result.tracks
+   * after the parse. This preserves framework evidence rather than reordering it to match another
+   * engine; metadata and representation indices use the same map.
    */
-  async demux(input: MediaInput): Promise<DemuxResult> {
-    // Packets tagged with the parser's stable trackId; remapped to canonical stream-index after parse.
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    const call = context ?? fallbackOperationContext('demux', this.fallbackAbort.signal);
+    return this.lifecycle.operation('demux', call, async () => {
+      this.config = { ...this.config, operation: 'demux', cleanupComplete: false };
+      try {
+        return validateAdapterResult(ENGINE_ID, 'demux', await this.demuxImpl(input, call), {
+          requireExplicitCodedRepresentation: true,
+        });
+      } finally {
+        this.config = { ...this.config, cleanupComplete: this.activeControllers.size === 0 };
+      }
+    });
+  }
+
+  private async demuxImpl(input: MediaInput, context: OperationContext): Promise<DemuxResult> {
+    // Packets are tagged with the parser's stable trackId, then mapped to declared track order.
     const tagged: TaggedPacket[] = [];
 
     const onVideoTrack: MediaParserOnVideoTrack = ({ track }) => {
@@ -417,8 +598,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       return (sample: MediaParserVideoSample) => {
         tagged.push({
           trackId,
-          packet: sampleToPacket(sample, -1),
-          h264AudPrefixBytes: h264AudStartCodePrefixBytes(sample.data),
+          packet: remotionParserSampleEvidence(sample, -1, track),
         });
       };
     };
@@ -427,9 +607,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       return (sample: MediaParserAudioSample) => {
         tagged.push({
           trackId,
-          packet: sampleToPacket(sample, -1),
-          audioFrameSamples:
-            track.codecEnum === 'mp3' ? mp3SamplesPerFrame(sample.data) ?? undefined : undefined,
+          packet: remotionParserSampleEvidence(sample, -1, track),
         });
       };
     };
@@ -461,27 +639,20 @@ export class RemotionMediaParserEngine implements MediaEngine {
         onAudioTrack,
       },
       'full-parse(demux)',
+      context,
     );
 
-    // Canonical stream-index map: video(0) before audio(1) before other(2), ties broken by trackId.
-    const canonicalIndexById = canonicalTrackIndexMap(result.tracks);
-    const normalizedTagged = normalizeElementaryMp3PacketTimes(
-      result.container,
-      result.tracks,
-      normalizeTransportStreamH264PacketSizes(
-        result.container,
-        result.tracks,
-        normalizeTransportStreamAacPacketTimes(result.container, result.tracks, tagged),
-      ),
-    );
-    const packets: PacketInfo[] = normalizedTagged.map(({ trackId, packet }) => ({
+    // Preserve the parser's declared track order. Cross-engine comparison is semantic/by-type; this
+    // adapter must not reorder evidence merely to reproduce ffprobe stream indices.
+    const frameworkIndexById = frameworkTrackIndexMap(result.tracks);
+    const packets: PacketInfo[] = tagged.map(({ trackId, packet }) => ({
       ...packet,
       // A trackId with no entry in tracks[] (shouldn't happen) sorts last but stays deterministic.
-      trackIndex: canonicalIndexById.get(trackId) ?? canonicalIndexById.size,
+      trackIndex: frameworkIndexById.get(trackId) ?? frameworkIndexById.size,
     }));
 
-    // Build metadata ordered by the SAME canonical map so PacketInfo.trackIndex indexes tracks[].
-    const metadata = this.toNormalizedMetadata(
+    // Build metadata in the SAME declared order so PacketInfo.trackIndex indexes tracks[].
+    const metadata = await this.toNormalizedMetadata(
       {
         durationInSeconds: result.durationInSeconds,
         container: result.container,
@@ -490,11 +661,21 @@ export class RemotionMediaParserEngine implements MediaEngine {
         fps: result.fps,
         rotation: result.rotation,
       },
-      canonicalIndexById,
+      frameworkIndexById,
       input,
     );
 
-    return { metadata, packets };
+    const representations = result.tracks.map((track) =>
+      trackRepresentation(track, frameworkIndexById.get(track.trackId) ?? frameworkIndexById.size, result.container),
+    );
+
+    return {
+      metadata,
+      packets,
+      packetOrdering: 'decode',
+      representations,
+      telemetry: { packetCount: packets.length },
+    };
   }
 
   // ── unsupported operations (UNDECLARED → runner records NA(engine), never calls these) ─────────
@@ -508,7 +689,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
     throw new Error(`${ENGINE_ID}: transcode not supported (no encoder, no muxer)`);
   }
 
-  async decodeFrames(_input: MediaInput, _opts?: { maxFrames?: number }): Promise<FrameSink> {
+  async decodeFrames(_input: MediaInput, _opts?: DecodeOptions): Promise<FrameSink> {
     throw new Error(`${ENGINE_ID}: decodeFrames not supported (no decoder; emits encoded samples only)`);
   }
 
@@ -544,12 +725,10 @@ export class RemotionMediaParserEngine implements MediaEngine {
 
   // ── normalization ──────────────────────────────────────────────────────────────────────────
   /**
-   * Map media-parser fields to NormalizedMetadata. When `canonicalIndexById` is provided (demux path)
-   * the track order is forced to the canonical stream-index map (video<audio<other, trackId tiebreak)
-   * so NormalizedMetadata.tracks[i] corresponds to PacketInfo.trackIndex === i. Otherwise (probe) tracks
-   * are emitted in parser order — which for the probe corpus already matches the golden (video first).
+   * Map media-parser fields to NormalizedMetadata. The optional framework index map keeps demux
+   * metadata aligned with packet trackIndex; both paths preserve media-parser's declared track order.
    */
-  private toNormalizedMetadata(
+  private async toNormalizedMetadata(
     r: {
       durationInSeconds: number | null;
       container: MediaParserContainer;
@@ -558,16 +737,17 @@ export class RemotionMediaParserEngine implements MediaEngine {
       fps?: number | null;
       rotation: number | null;
     },
-    canonicalIndexById?: Map<number, number>,
+    frameworkIndexById?: Map<number, number>,
     input?: MediaInput,
-  ): NormalizedMetadata {
+    noteBytes?: (bytes: number) => void,
+  ): Promise<NormalizedMetadata> {
     let orderedTracks = r.tracks;
-    if (canonicalIndexById) {
+    if (frameworkIndexById) {
       orderedTracks = [...r.tracks].sort((a, b) => {
-        // Sort by the canonical stream-index assigned to each trackId; an unmapped track (shouldn't
+        // Sort by the framework-declared index assigned to each trackId; an unmapped track (shouldn't
         // happen) sorts last but stays deterministic.
-        const ka = canonicalIndexById.get(a.trackId) ?? Number.MAX_SAFE_INTEGER;
-        const kb = canonicalIndexById.get(b.trackId) ?? Number.MAX_SAFE_INTEGER;
+        const ka = frameworkIndexById.get(a.trackId) ?? Number.MAX_SAFE_INTEGER;
+        const kb = frameworkIndexById.get(b.trackId) ?? Number.MAX_SAFE_INTEGER;
         return ka - kb;
       });
     }
@@ -577,7 +757,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
     );
 
     const meta: NormalizedMetadata = {
-      container: canonicalContainerForInput(input, r.container),
+      container: await canonicalContainerForInput(input, r.container, noteBytes),
       durationSec:
         r.durationInSeconds != null && Number.isFinite(r.durationInSeconds)
           ? r.durationInSeconds
@@ -595,11 +775,13 @@ export class RemotionMediaParserEngine implements MediaEngine {
 function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketInfo[]): NormalizedMetadata {
   const tracks = metadata.tracks.map((track, trackIndex) => {
     if (track.type !== 'video' || track.fps != null) return track;
-    const fps = fpsFromTrackPackets(
+    const observation = fpsObservationFromTrackPackets(
       packets.filter((packet) => packet.trackIndex === trackIndex),
       metadata.durationSec,
     );
-    return fps == null ? track : { ...track, fps };
+    return observation == null
+      ? track
+      : { ...track, fps: observation.fps, fpsProvenance: observation.provenance };
   });
   return { ...metadata, tracks };
 }
@@ -628,11 +810,13 @@ function withTsProbeFieldsFromPackets(
   const durationSec = metadata.durationSec ?? durationFromPacketPts(packets);
   const tracks = metadata.tracks.map((track, trackIndex) => {
     if (track.type !== 'video' || track.fps != null) return track;
-    const fps = fpsFromTrackPackets(
+    const observation = fpsObservationFromTrackPackets(
       packets.filter((packet) => packet.trackIndex === trackIndex),
       null,
     );
-    return fps == null ? track : { ...track, fps };
+    return observation == null
+      ? track
+      : { ...track, fps: observation.fps, fpsProvenance: observation.provenance };
   });
   return { ...metadata, durationSec, tracks };
 }
@@ -649,18 +833,23 @@ function withSingleVideoFps(
 ): NormalizedMetadata {
   if (fps == null || !Number.isFinite(fps) || fps <= 0) return metadata;
   const tracks = metadata.tracks.map((track) =>
-    track.type === 'video' && (options.replace || track.fps == null) ? { ...track, fps } : track,
+    track.type === 'video' && (options.replace || track.fps == null)
+      ? { ...track, fps, fpsProvenance: { source: 'nominal' as const, cadence: 'UNKNOWN' as const } }
+      : track,
   );
   return { ...metadata, tracks };
 }
 
-async function webmHeaderMetadata(input: MediaInput): Promise<NormalizedMetadata | null> {
-  if (!looksLikeWebmFamilyInput(input)) return null;
+async function webmHeaderMetadata(
+  input: MediaInput,
+  noteBytes?: (bytes: number) => void,
+): Promise<NormalizedMetadata | null> {
   try {
     const prefix = await readInputPrefix(input, WEBM_HEADER_RANGE_BYTES);
-    const container = input.id.toLowerCase().endsWith('.mkv') || input.mime.toLowerCase().includes('matroska')
-      ? 'mkv'
-      : 'webm';
+    noteBytes?.(prefix.byteLength);
+    const docType = ebmlDocTypeFromPrefix(prefix);
+    if (docType !== 'matroska' && docType !== 'webm') return null;
+    const container = docType === 'matroska' ? 'mkv' : 'webm';
     return webmHeaderMetadataFromPrefix(prefix, container);
   } catch {
     return null;
@@ -680,28 +869,6 @@ function singleVideoFpsFromMetadata(metadata: NormalizedMetadata | null): number
   const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
   if (videoTracks.length !== 1) return null;
   return videoTracks[0]?.fps ?? null;
-}
-
-function looksLikeWebmFamilyInput(input: MediaInput): boolean {
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  return hint.includes('.webm') || hint.includes('.mkv') || hint.includes('webm') || hint.includes('matroska');
-}
-
-function looksLikeRecorderWebmInput(input: MediaInput): boolean {
-  if (!looksLikeWebmFamilyInput(input)) return false;
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  return hint.includes('recorder') || hint.includes('mediarecorder') || hint.includes('headerless');
-}
-
-function shouldPreferHeaderWebmFps(
-  input: MediaInput,
-  metadata: NormalizedMetadata,
-  headerFps: number | null,
-): headerFps is number {
-  if (headerFps == null || !Number.isFinite(headerFps) || headerFps <= 0) return false;
-  if (!looksLikeRecorderWebmInput(input)) return false;
-  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
-  return videoTracks.length === 1;
 }
 
 async function readInputPrefix(input: MediaInput, length: number): Promise<Uint8Array> {
@@ -952,14 +1119,55 @@ function readEbmlString(bytes: Uint8Array, start: number, end: number): string {
 }
 
 function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {
+  return fpsObservationFromTrackPackets(packets, durationSec)?.fps ?? null;
+}
+
+function fpsObservationFromTrackPackets(
+  packets: PacketInfo[],
+  durationSec: number | null,
+): { fps: number; provenance: FrameRateProvenance } | null {
   if (!packets.length) return null;
-  if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
-    return packets.length / durationSec;
-  }
-  if (packets.length < 2) return null;
   const pts = packets.map((packet) => packet.ptsUs).sort((a, b) => a - b);
-  const spanUs = pts[pts.length - 1]! - pts[0]!;
-  return spanUs > 0 ? ((pts.length - 1) * 1_000_000) / spanUs : null;
+  const deltas: number[] = [];
+  for (let i = 1; i < pts.length; i++) {
+    const delta = pts[i]! - pts[i - 1]!;
+    if (delta > 0) deltas.push(delta);
+  }
+  const cadence = deltas.length > 1 && Math.max(...deltas) - Math.min(...deltas) > 2
+    ? 'VFR' as const
+    : deltas.length
+      ? 'CFR' as const
+      : 'UNKNOWN' as const;
+  if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
+    const observedIntervalUs = durationSec * 1_000_000;
+    return {
+      fps: packets.length / durationSec,
+      provenance: {
+        source: 'average',
+        cadence,
+        sampleCount: packets.length,
+        observedIntervalUs,
+        ...(deltas.length
+          ? { envelope: { minFps: 1_000_000 / Math.max(...deltas), maxFps: 1_000_000 / Math.min(...deltas) } }
+          : {}),
+      },
+    };
+  }
+  if (pts.length < 2) return null;
+  const observedIntervalUs = pts[pts.length - 1]! - pts[0]!;
+  if (observedIntervalUs <= 0) return null;
+  return {
+    fps: ((pts.length - 1) * 1_000_000) / observedIntervalUs,
+    provenance: {
+      source: 'observed',
+      cadence,
+      sampleCount: pts.length - 1,
+      observedIntervalUs,
+      ...(deltas.length
+        ? { envelope: { minFps: 1_000_000 / Math.max(...deltas), maxFps: 1_000_000 / Math.min(...deltas) } }
+        : {}),
+    },
+  };
 }
 
 function durationFromPacketPts(packets: PacketInfo[]): number | null {
@@ -1021,23 +1229,155 @@ function isHlsInput(input: MediaInput): boolean {
   return u.endsWith('.m3u8');
 }
 
-function canonicalContainerForInput(
+function countingReader(noteBytes: (bytes: number) => void): MediaParserReaderInterface {
+  return {
+    ...webReader,
+    // A preload starts an unobservable parallel fetch in Remotion's internal cache. Disable it for
+    // budgeted/accounted reads so every delivered source byte crosses read() below exactly once.
+    preload() {},
+    async read(options) {
+      const result = await webReader.read(options);
+      const source = result.reader.reader;
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          const next = await source.read();
+          if (next.done) {
+            controller.close();
+            return;
+          }
+          noteBytes(next.value.byteLength);
+          controller.enqueue(next.value);
+        },
+        async cancel(reason) {
+          await source.cancel(reason);
+        },
+      });
+      return {
+        ...result,
+        reader: {
+          ...result.reader,
+          reader: stream.getReader(),
+        },
+      };
+    },
+    async readWholeAsText(src) {
+      const text = await webReader.readWholeAsText(src);
+      noteBytes(new TextEncoder().encode(text).byteLength);
+      return text;
+    },
+  };
+}
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+async function canonicalContainerForInput(
   input: MediaInput | undefined,
   detected: MediaParserContainer,
-): string {
+  noteBytes?: (bytes: number) => void,
+): Promise<string> {
   const collapsed = mpContainerToCanonical(detected);
   if (!input) return collapsed;
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  if (collapsed === 'mp4' && (hint.includes('.mov') || hint.includes('quicktime'))) return 'mov';
-  if (collapsed === 'webm' && (hint.includes('.mkv') || hint.includes('matroska'))) return 'mkv';
+  try {
+    if (collapsed === 'webm') {
+      const prefix = await readInputPrefix(input, 256);
+      noteBytes?.(prefix.byteLength);
+      const docType = ebmlDocTypeFromPrefix(prefix);
+      if (docType === 'matroska') return 'mkv';
+      if (docType === 'webm') return 'webm';
+    }
+    if (collapsed === 'mp4') {
+      const prefix = await readInputPrefix(input, 64);
+      noteBytes?.(prefix.byteLength);
+      const brands = isoBmffBrandsFromPrefix(prefix);
+      if (brands.some((brand) => brand === 'qt  ' || brand.trim() === 'qt')) return 'mov';
+    }
+  } catch {
+    // The parser's typed container remains valid evidence when a prefix cannot be re-read.
+  }
   return collapsed;
 }
 
+function rejectBoundedProbeFullScan(
+  input: MediaInput,
+  context: OperationContext,
+  reason: string,
+): void {
+  if (!hasBoundedProbeBudget(context.request.options)) return;
+  throw createNotApplicableError(
+    ENGINE_ID,
+    'probe',
+    `${reason}; bounded scale probes cannot enter a whole-file path`,
+    {
+      inputContainers: context.request.inputs.map((entry) => entry.container),
+      inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+      options: { inputId: input.id, practicalReadMode: 'whole-file' },
+    },
+    'PROBE_BOUNDED_FULL_SCAN_UNSUPPORTED',
+  );
+}
+
+function hasBoundedProbeBudget(options: Readonly<Record<string, unknown>>): boolean {
+  const direct = options.probeBudget;
+  const robustness = isPlainRecord(options.robustness) ? options.robustness : undefined;
+  const probe = isPlainRecord(robustness?.probe) ? robustness.probe : undefined;
+  const candidate = direct ?? probe?.probeBudget;
+  return isPlainRecord(candidate) && candidate.schema === 'media-test/probe-budget@1';
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isoBmffBrandsFromPrefix(prefix: Uint8Array): string[] {
+  if (prefix.byteLength < 16 || ascii(prefix, 4, 8) !== 'ftyp') return [];
+  const boxSize = readUint32Be(prefix, 0);
+  const end = Math.min(boxSize > 0 ? boxSize : prefix.byteLength, prefix.byteLength);
+  const brands = [ascii(prefix, 8, 12)];
+  for (let offset = 16; offset + 4 <= end; offset += 4) {
+    brands.push(ascii(prefix, offset, offset + 4));
+  }
+  return brands;
+}
+
+function readUint32Be(bytes: Uint8Array, offset: number): number {
+  return (
+    ((bytes[offset] ?? 0) * 0x1000000) +
+    ((bytes[offset + 1] ?? 0) << 16) +
+    ((bytes[offset + 2] ?? 0) << 8) +
+    (bytes[offset + 3] ?? 0)
+  );
+}
+
+function ascii(bytes: Uint8Array, start: number, end: number): string {
+  let value = '';
+  for (let offset = start; offset < end; offset++) {
+    value += String.fromCharCode(bytes[offset] ?? 0);
+  }
+  return value;
+}
+
+function ebmlDocTypeFromPrefix(prefix: Uint8Array): string | null {
+  for (let offset = 0; offset + 3 < prefix.byteLength; offset++) {
+    if (prefix[offset] !== 0x42 || prefix[offset + 1] !== 0x82) continue;
+    const size = readEbmlVint(prefix, offset + 2, false);
+    if (!size || size.value <= 0 || size.value > 32) continue;
+    const end = size.next + size.value;
+    if (end > prefix.byteLength) continue;
+    const docType = ascii(prefix, size.next, end).toLowerCase();
+    if (docType === 'matroska' || docType === 'webm') return docType;
+  }
+  return null;
+}
+
 /** Convert a media-parser sample to a suite PacketInfo. Timestamps are already in microseconds. */
-function sampleToPacket(
+export function remotionParserSampleEvidence(
   sample: MediaParserVideoSample | MediaParserAudioSample,
   trackIndex: number,
-  keyframeOverride?: boolean,
+  track: MediaParserVideoTrack | MediaParserAudioTrack,
 ): PacketInfo {
   // media-parser timestamps use WEBCODECS_TIMESCALE (1_000_000) → values are already microseconds.
   // (Reference the constant so the assumption is self-documenting and tied to the library.)
@@ -1045,196 +1385,114 @@ function sampleToPacket(
   return {
     trackIndex,
     size: sample.data.byteLength,
-    ptsUs: Math.round(sample.timestamp),
-    dtsUs: Math.round(sample.decodingTimestamp),
-    keyframe: keyframeOverride ?? sample.type === 'key',
+    ptsUs: sample.timestamp,
+    ...(typeof sample.decodingTimestamp === 'number' && Number.isFinite(sample.decodingTimestamp)
+      ? { dtsUs: sample.decodingTimestamp }
+      : {}),
+    ...(typeof sample.duration === 'number' && Number.isFinite(sample.duration)
+      ? { durationUs: sample.duration }
+      : {}),
+    keyframe: sample.type === 'key',
+    trackType: track.type,
+    codec: track.type === 'video'
+      ? mpVideoToCanonical(track.codecEnum)
+      : mpAudioToCanonical(track.codecEnum),
+    payload: sample.data.slice(),
+    framing: packetFraming(track),
+    ...(track.type === 'video' && nalLengthSize(track) !== undefined
+      ? { nalLengthSize: nalLengthSize(track) }
+      : {}),
+    ...(track.description ? { decoderConfig: track.description.slice() } : {}),
   };
-}
-
-function normalizeTransportStreamAacPacketTimes(
-  container: MediaParserContainer,
-  tracks: MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
-
-  const aacTracksById = new Map<number, MediaParserAudioTrack>();
-  for (const track of tracks) {
-    if (track.type === 'audio' && track.codecEnum === 'aac' && track.sampleRate > 0) {
-      aacTracksById.set(track.trackId, track);
-    }
-  }
-  if (!aacTracksById.size) return tagged;
-
-  const previousPtsByTrackId = new Map<number, number>();
-  const duplicatePtsTrackIds = new Set<number>();
-  for (const { trackId, packet } of tagged) {
-    if (!aacTracksById.has(trackId)) continue;
-    const previousPts = previousPtsByTrackId.get(trackId);
-    previousPtsByTrackId.set(trackId, packet.ptsUs);
-    if (previousPts === packet.ptsUs) duplicatePtsTrackIds.add(trackId);
-  }
-  if (!duplicatePtsTrackIds.size) return tagged;
-
-  const firstTimestampByTrackId = new Map<number, { ptsUs: number; dtsUs: number }>();
-  const indexByTrackId = new Map<number, number>();
-  return tagged.map((entry) => {
-    const track = aacTracksById.get(entry.trackId);
-    if (!track || !duplicatePtsTrackIds.has(entry.trackId)) return entry;
-
-    let first = firstTimestampByTrackId.get(entry.trackId);
-    if (!first) {
-      first = { ptsUs: entry.packet.ptsUs, dtsUs: entry.packet.dtsUs };
-      firstTimestampByTrackId.set(entry.trackId, first);
-    }
-
-    const index = indexByTrackId.get(entry.trackId) ?? 0;
-    indexByTrackId.set(entry.trackId, index + 1);
-    const offsetUs = Math.round((index * 1024 * WEBCODECS_TIMESCALE) / track.sampleRate);
-    return {
-      ...entry,
-      packet: {
-        ...entry.packet,
-        ptsUs: first.ptsUs + offsetUs,
-        dtsUs: first.dtsUs + offsetUs,
-      },
-    };
-  });
-}
-
-function normalizeTransportStreamH264PacketSizes(
-  container: MediaParserContainer,
-  tracks: MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
-
-  const h264TrackIds = new Set<number>();
-  for (const track of tracks) {
-    if (track.type === 'video' && track.codecEnum === 'h264') h264TrackIds.add(track.trackId);
-  }
-  if (!h264TrackIds.size) return tagged;
-
-  let normalized: TaggedPacket[] | null = null;
-  for (const trackId of h264TrackIds) {
-    const trackPackets = tagged
-      .map((entry, index) => ({ entry, index }))
-      .filter(({ entry }) => entry.trackId === trackId);
-    if (trackPackets.length < 2) continue;
-
-    const segmentStarts = trackPackets
-      .map((packet, trackPacketIndex) => ({ ...packet, trackPacketIndex }))
-      .filter(({ entry }) => entry.h264AudPrefixBytes === 4);
-
-    for (const segmentStart of segmentStarts) {
-      const nextStart = segmentStarts.find((candidate) => candidate.trackPacketIndex > segmentStart.trackPacketIndex);
-      const segmentEndIndex = (nextStart?.trackPacketIndex ?? trackPackets.length) - 1;
-      const segmentEnd = trackPackets[segmentEndIndex];
-      if (!segmentEnd || segmentEnd.entry.h264AudPrefixBytes !== 3) continue;
-      if (segmentStart.entry.packet.size < 1) continue;
-
-      // Remotion's TS/H.264 splitter keeps the leading zero of each segment-opening four-byte
-      // Annex B AUD start code on that segment's first packet, while ffprobe counts the AUD as the
-      // canonical three-byte start code and attributes the byte budget to the segment's final access
-      // unit. Normalize only those exact segment-boundary signatures; interior packet sizes still
-      // compare exactly and broad packet-size errors remain visible.
-      if (!normalized) normalized = tagged.slice();
-      normalized[segmentStart.index] = {
-        ...segmentStart.entry,
-        packet: { ...segmentStart.entry.packet, size: segmentStart.entry.packet.size - 1 },
-      };
-      normalized[segmentEnd.index] = {
-        ...segmentEnd.entry,
-        packet: { ...segmentEnd.entry.packet, size: segmentEnd.entry.packet.size + 1 },
-      };
-    }
-  }
-
-  return normalized ?? tagged;
-}
-
-function normalizeElementaryMp3PacketTimes(
-  container: MediaParserContainer,
-  tracks: MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'mp3') return tagged;
-
-  const mp3TracksById = new Map<number, MediaParserAudioTrack>();
-  for (const track of tracks) {
-    if (track.type === 'audio' && track.codecEnum === 'mp3' && track.sampleRate > 0) {
-      mp3TracksById.set(track.trackId, track);
-    }
-  }
-  if (!mp3TracksById.size) return tagged;
-
-  const sampleCursorByTrackId = new Map<number, number>();
-  return tagged.map((entry) => {
-    const track = mp3TracksById.get(entry.trackId);
-    if (!track || entry.audioFrameSamples == null) return entry;
-
-    const startSample = sampleCursorByTrackId.get(entry.trackId) ?? 0;
-    sampleCursorByTrackId.set(entry.trackId, startSample + entry.audioFrameSamples);
-    const timestampUs = Math.round((startSample * WEBCODECS_TIMESCALE) / track.sampleRate);
-    return {
-      ...entry,
-      packet: {
-        ...entry.packet,
-        ptsUs: timestampUs,
-        dtsUs: timestampUs,
-      },
-    };
-  });
-}
-
-function mp3SamplesPerFrame(data: Uint8Array): number | null {
-  if (data.length < 4) return null;
-
-  const b0 = data[0] as number;
-  const b1 = data[1] as number;
-  const b2 = data[2] as number;
-  if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) return null;
-
-  const versionBits = (b1 >> 3) & 0x03;
-  const layerBits = (b1 >> 1) & 0x03;
-  const bitrateIndex = (b2 >> 4) & 0x0f;
-  const sampleRateIndex = (b2 >> 2) & 0x03;
-  if (versionBits === 0x01 || layerBits === 0x00 || bitrateIndex === 0x00 || bitrateIndex === 0x0f) {
-    return null;
-  }
-  if (sampleRateIndex === 0x03) return null;
-
-  // MPEG frame duration is fixed by version + layer; Xing/Info TOCs are for byte seeking, not PTS.
-  if (layerBits === 0x03) return 384; // Layer I
-  if (layerBits === 0x02) return 1152; // Layer II
-  return versionBits === 0x03 ? 1152 : 576; // Layer III: MPEG-1 vs MPEG-2/2.5
 }
 
 interface TaggedPacket {
   trackId: number;
   packet: PacketInfo;
-  h264AudPrefixBytes?: 3 | 4;
-  audioFrameSamples?: number;
 }
 
-function h264AudStartCodePrefixBytes(data: Uint8Array): 3 | 4 | undefined {
-  if (data[0] === 0 && data[1] === 0 && data[2] === 1 && data[3] === 9) return 3;
-  if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data[4] === 9) return 4;
+function packetFraming(
+  track: MediaParserVideoTrack | MediaParserAudioTrack,
+): NonNullable<PacketInfo['framing']> {
+  if (track.type === 'video') {
+    if (track.codecEnum === 'h264') return track.description ? 'avc' : 'annexb';
+    if (track.codecEnum === 'h265') return track.description ? 'hevc' : 'annexb';
+    if (track.codecEnum === 'av1') return 'obu';
+    if (track.codecEnum === 'vp8' || track.codecEnum === 'vp9') return 'raw';
+    return 'codec-private';
+  }
+  if (track.codecEnum === 'aac') return track.description ? 'raw' : 'adts';
+  if (track.codecEnum === 'opus' || track.codecEnum === 'vorbis') return 'codec-private';
+  return 'raw';
+}
+
+function nalLengthSize(track: MediaParserVideoTrack): number | undefined {
+  const description = track.description;
+  if (!description) return undefined;
+  if (track.codecEnum === 'h264' && description.byteLength > 4) return (description[4]! & 0x03) + 1;
+  if (track.codecEnum === 'h265' && description.byteLength > 21) return (description[21]! & 0x03) + 1;
   return undefined;
 }
 
+function trackRepresentation(
+  track: MediaParserTrack,
+  trackIndex: number,
+  _container: MediaParserContainer,
+): DemuxTrackRepresentation {
+  if (track.type === 'video') {
+    const coded = track.codecEnum === 'h264' || track.codecEnum === 'h265';
+    return {
+      trackIndex,
+      packetOrdering: 'decode',
+      timebase: { numerator: 1, denominator: WEBCODECS_TIMESCALE },
+      framing: packetFraming(track),
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: coded ? (track.description ? 'description' : 'in-band') : 'not-applicable',
+      nativeCodecTag: track.codec,
+      ...(track.description ? { description: track.description.slice() } : {}),
+      ...(track.codecEnum === 'h264' && track.description
+        ? { descriptionRecord: 'avc-decoder-configuration-record' as const }
+        : {}),
+      ...(track.codecEnum === 'h265' && track.description
+        ? { descriptionRecord: 'hevc-decoder-configuration-record' as const }
+        : {}),
+    };
+  }
+  if (track.type === 'audio') {
+    return {
+      trackIndex,
+      packetOrdering: 'decode',
+      timebase: { numerator: 1, denominator: WEBCODECS_TIMESCALE },
+      framing: packetFraming(track),
+      accessUnitGrouping: 'one-frame-per-chunk',
+      parameterSetLocation: track.codecEnum === 'aac' && track.description ? 'description' : 'not-applicable',
+      nativeCodecTag: track.codec,
+      ...(track.description ? { description: track.description.slice() } : {}),
+      ...(track.codecEnum === 'aac' && track.description
+        ? { descriptionRecord: 'audio-specific-config' as const }
+        : track.description
+          ? { descriptionRecord: 'codec-private' as const }
+          : {}),
+    };
+  }
+  return {
+    trackIndex,
+    packetOrdering: 'decode',
+    timebase: { numerator: 1, denominator: WEBCODECS_TIMESCALE },
+    framing: 'codec-private',
+    accessUnitGrouping: 'one-packet-per-chunk',
+    parameterSetLocation: 'not-applicable',
+    nativeCodecTag: 'unknown',
+  };
+}
+
 /**
- * Build a canonical `trackId → 0-based index` map matching the container STREAM-INDEX convention the
- * golden uses: video tracks first, then audio, then 'other'; ties within a class broken by trackId
- * ascending (preserves the file's declaration order for same-type tracks, e.g. dual audio in
- * h264_multitrack). This makes PacketInfo.trackIndex deterministic and golden-aligned regardless of the
- * order media-parser fires onVideoTrack/onAudioTrack (which follows sample DTS, not stream index).
+ * Build a `trackId → 0-based index` map in media-parser's declared order. Callback firing order is
+ * sample-driven, so packets are resolved through this map only after the parser returns its tracks.
  */
-function canonicalTrackIndexMap(tracks: MediaParserTrack[]): Map<number, number> {
-  const rank = (t: MediaParserTrack): number => (t.type === 'video' ? 0 : t.type === 'audio' ? 1 : 2);
-  const ordered = [...tracks].sort((a, b) => rank(a) - rank(b) || a.trackId - b.trackId);
+function frameworkTrackIndexMap(tracks: MediaParserTrack[]): Map<number, number> {
   const map = new Map<number, number>();
-  ordered.forEach((t, i) => map.set(t.trackId, i));
+  tracks.forEach((t, i) => map.set(t.trackId, i));
   return map;
 }
 
@@ -1265,6 +1523,7 @@ function normalizeTrack(
     const out: NormalizedTrack = {
       type: 'video',
       codec: mpVideoToCanonical(v.codecEnum ?? v.codec),
+      nativeCodecTag: v.codec,
       width,
       height,
       rotation,
@@ -1272,7 +1531,10 @@ function normalizeTrack(
       language: null,
     };
     const fps = v.fps ?? containerFps;
-    if (fps != null && Number.isFinite(fps) && fps > 0) out.fps = fps;
+    if (fps != null && Number.isFinite(fps) && fps > 0) {
+      out.fps = fps;
+      out.fpsProvenance = { source: 'nominal', cadence: 'UNKNOWN' };
+    }
     return out;
   }
 
@@ -1281,6 +1543,7 @@ function normalizeTrack(
     return {
       type: 'audio',
       codec: mpAudioToCanonical(a.codecEnum ?? a.codec),
+      nativeCodecTag: a.codec,
       sampleRate: a.sampleRate || undefined,
       channels: a.numberOfChannels || undefined,
       bitrate: null,
@@ -1334,4 +1597,28 @@ function isFatalWorkerError(err: unknown): boolean {
     /failed to (fetch|construct|resolve)/i.test(msg) ||
     /Worker is not defined/i.test(msg)
   );
+}
+
+function fallbackLifecycleContext(
+  signal: AbortSignal,
+  phase: LifecycleContext['phase'] = 'functional',
+): LifecycleContext {
+  return { signal, emit: () => undefined, phase };
+}
+
+function fallbackOperationContext(
+  operation: 'probe' | 'demux',
+  signal: AbortSignal,
+): OperationContext {
+  return {
+    ...fallbackLifecycleContext(signal),
+    checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+    request: {
+      protocol: CONCRETE_OPERATION_PROTOCOL,
+      scenarioId: 'remotion-media-parser/direct',
+      operation,
+      inputs: [],
+      options: {},
+    },
+  };
 }

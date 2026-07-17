@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aibrush.dev/schemas/media-test/normalized-observations/1.0.0",
+  "title": "media-test normalized observations artifact",
+  "type": "object",
+  "required": ["schemaId", "schemaVersion", "observations"],
+  "properties": {
+    "schemaId": { "const": "https://aibrush.dev/schemas/media-test/normalized-observations/1.0.0" },
+    "schemaVersion": { "type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+(?:[-+].*)?$" },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "runId", "observationId", "contentHash", "engineId", "browser", "scenarioId",
+          "variants", "metrics", "environment", "engine", "evidence"
+        ],
+        "properties": {
+          "runId": { "type": "string", "minLength": 1 },
+          "observationId": { "type": "string", "minLength": 1 },
+          "contentHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "variants": { "type": "array", "items": { "$ref": "#/$defs/variant" } },
+          "metrics": { "type": "array", "items": { "$ref": "#/$defs/metric" } }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "variant": {
+      "type": "object",
+      "required": ["variantId", "file", "execution", "oracleOutcomes", "metrics", "evidence"],
+      "properties": {
+        "execution": {
+          "enum": ["EXECUTED", "NA_ENGINE", "NA_BROWSER", "NA_ASSET", "ERROR", "SKIPPED"]
+        },
+        "verdict": { "enum": ["PASS", "DIFF", "FAIL"] }
+      },
+      "additionalProperties": true
+    },
+    "metric": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state", "metric", "unit", "direction", "reasonCode"],
+          "properties": { "state": { "const": "UNAVAILABLE" } },
+          "not": { "anyOf": [{ "required": ["median"] }, { "required": ["samples"] }, { "required": ["rankedValue"] }] },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": [
+            "state", "metric", "unit", "direction", "sampleAxis", "aggregation", "n", "warmup",
+            "samples", "median", "p95", "mad", "rankedValue", "validVariantIds",
+            "empiricalNoisePct", "confidenceInterval"
+          ],
+          "properties": {
+            "state": { "const": "AVAILABLE" },
+            "n": { "type": "integer", "minimum": 1 },
+            "samples": { "type": "array", "minItems": 1, "items": { "type": "number" } },
+            "sampleAxis": { "enum": ["iteration", "file"] },
+            "aggregation": { "enum": ["median", "sum", "max", "ratio-of-sums"] }
+          },
+          "additionalProperties": true
+        }
+      ]
+    }
+  }
+}

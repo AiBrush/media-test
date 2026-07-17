@@ -23,8 +23,8 @@
  * leaderboard shows stream's first byte arriving earlier than buffer's. We do NOT invent a fake oracle
  * to assert it.
  *
- * CORRECTNESS STILL GATES (§0.1): both are progressive mp4 → reference-reimport (the default), so a
- * fast-but-wrong output FAILs and cannot win the ttfb crown.
+ * CORRECTNESS STILL GATES (§0.1): both use the same explicit fragmented-MP4 representation →
+ * reference-reimport + mp4-box-layout, so a fast-but-wrong output FAILs and cannot win the crown.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -38,12 +38,13 @@ const TTFB_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: false, target: 'buffer' },
+    // Same fragmented packaging work as the stream row; only external observability differs.
+    shape: { container: 'mp4', fragmented: true, target: 'buffer' },
     features: ['target:writes'],
     extraMetrics: ['timeToFirstByte'],
     primaryMetric: 'timeToFirstByte',
     notes:
-      'TIME-TO-FIRST-BYTE control (progressive buffer target): a BufferTarget emits its first byte only at ' +
+      'TIME-TO-FIRST-BYTE control (fragmented MP4, buffer target): a BufferTarget emits its first byte only at ' +
       'finalize(), so ttfb ≈ whole-op wall. The high-water baseline the streaming target is measured ' +
       'against (stream.ttfb should be markedly lower). Ranked on timeToFirstByte (lower-is-better).',
   },
@@ -54,7 +55,7 @@ const TTFB_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', fragmented: true, target: 'stream' },
     extraMetrics: ['timeToFirstByte'],
     primaryMetric: 'timeToFirstByte',
     notes:

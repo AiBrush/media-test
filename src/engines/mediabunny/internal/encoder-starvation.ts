@@ -1,10 +1,9 @@
 /**
  * src/engines/mediabunny/internal/encoder-starvation.ts — OPTIONAL per-engine annex (§10.4).
  *
- * THIS IS NOT PART OF THE CROSS-ENGINE COMPARISON. The suite judges only observable behavior; this
- * module is an engine-internal diagnostic that polls WebCodecs encoder/decoder queue sizes during a
- * mediabunny conversion to detect encoder starvation / backpressure. It lives strictly under
- * src/engines/mediabunny/internal/ and feeds only the per-engine annex, never the matrix (§0 / §10).
+ * This is adapter telemetry, never an oracle.  It records measured causes rather than inferring a
+ * scheduling implementation from a static config label.  Every operation owns a fresh sampler and
+ * calls stop(), which makes cross-operation leakage testable.
  *
  * It is a thin, clearly-separate helper: callers wire it into a Conversion's encoder config via the
  * `onEncoderConfig` hook plus their own polling loop. We expose a small sampler rather than driving
@@ -65,7 +64,15 @@ export class EncoderStarvationSampler {
       clearInterval(this.timer);
       this.timer = null;
     }
-    return this.samples;
+    return this.samples.map((sample) => ({ ...sample }));
+  }
+
+  /** Stop and clear all state. A subsequent start() begins a genuinely fresh observation. */
+  reset(): void {
+    if (this.timer !== null) clearInterval(this.timer);
+    this.timer = null;
+    this.startedAt = 0;
+    this.samples = [];
   }
 
   /** Summary stats for the annex (max/mean queue depths, fraction of time starved). */
@@ -100,4 +107,103 @@ export class EncoderStarvationSampler {
       starvedFraction: starved / n,
     };
   }
+}
+
+export type StarvationCause = 'none' | 'source' | 'transform' | 'encoder' | 'output' | 'mixed';
+
+export interface PipelineStarvationSummary {
+  cause: StarvationCause;
+  sourceWaitMs: number;
+  transformWaitMs: number;
+  outputWaitMs: number;
+  maxEncodeQueue: number;
+  maxDecodeQueue: number;
+  samples: number;
+}
+
+/**
+ * Operation-scoped measured wait/queue accumulator.  The adapter can observe source and target wait
+ * times even when Mediabunny does not expose its internal codec objects; tests may additionally feed
+ * the actual queue depths supplied by encoder callbacks.  `finish()` freezes a snapshot then clears
+ * the mutable accumulator, so every success/error/abort exit starts from zero.
+ */
+export class PipelineStarvationSampler {
+  private sourceWaitMs = 0;
+  private transformWaitMs = 0;
+  private outputWaitMs = 0;
+  private maxEncodeQueue = 0;
+  private maxDecodeQueue = 0;
+  private samples = 0;
+
+  noteSourceWait(ms: number): void {
+    this.sourceWaitMs += finiteDuration(ms);
+  }
+
+  noteTransformWait(ms: number): void {
+    this.transformWaitMs += finiteDuration(ms);
+  }
+
+  noteOutputWait(ms: number): void {
+    this.outputWaitMs += finiteDuration(ms);
+  }
+
+  noteQueues(encodeQueueSize?: number, decodeQueueSize?: number): void {
+    if (encodeQueueSize !== undefined) this.maxEncodeQueue = Math.max(this.maxEncodeQueue, finiteDepth(encodeQueueSize));
+    if (decodeQueueSize !== undefined) this.maxDecodeQueue = Math.max(this.maxDecodeQueue, finiteDepth(decodeQueueSize));
+    this.samples++;
+  }
+
+  snapshot(): PipelineStarvationSummary {
+    const waits = [
+      ['source', this.sourceWaitMs],
+      ['transform', this.transformWaitMs],
+      ['output', this.outputWaitMs],
+      ['encoder', this.maxEncodeQueue > 0 ? this.maxEncodeQueue : 0],
+    ] as const;
+    const positive = waits
+      .filter(([, value]) => value > 0)
+      .sort((a, b) => b[1] - a[1]);
+    const largest = positive[0];
+    const second = positive[1];
+    // Promise/callback bookkeeping produces tiny non-zero waits in adjacent stages. Attribute a
+    // deliberately slow stage when its observation dominates by at least 4x; reserve `mixed` for
+    // genuinely competing bottlenecks instead of treating nanosecond noise as causal evidence.
+    const cause: StarvationCause = !largest
+      ? 'none'
+      : !second || largest[1] >= second[1] * 4
+        ? largest[0]
+        : 'mixed';
+    return {
+      cause,
+      sourceWaitMs: this.sourceWaitMs,
+      transformWaitMs: this.transformWaitMs,
+      outputWaitMs: this.outputWaitMs,
+      maxEncodeQueue: this.maxEncodeQueue,
+      maxDecodeQueue: this.maxDecodeQueue,
+      samples: this.samples,
+    };
+  }
+
+  finish(): PipelineStarvationSummary {
+    const summary = this.snapshot();
+    this.reset();
+    return summary;
+  }
+
+  reset(): void {
+    this.sourceWaitMs = 0;
+    this.transformWaitMs = 0;
+    this.outputWaitMs = 0;
+    this.maxEncodeQueue = 0;
+    this.maxDecodeQueue = 0;
+    this.samples = 0;
+  }
+}
+
+function finiteDuration(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function finiteDepth(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }

@@ -1,7 +1,8 @@
 /**
  * src/scenarios/robustness/index.ts — Pillar 3, family "robustness" (BUILD_INSTRUCTIONS §11).
  *
- * Four sub-batteries, all Worker-isolated and timeout-guarded by the runner:
+ * Four sub-batteries. Their contracts require a terminable per-file boundary and an external
+ * timeout; the runner records whether that isolation was actually available for each execution:
  *  (a) EDGE cases — exercise the gnarly-but-valid assets (open-GOP/B-frames, VFR, rotated,
  *      multi-track, headerless WebM, big-endian/24-bit PCM, cbcs boundaries, fastStart:reserve,
  *      fragmented/CMAF, multi-hour, zero-length). These should PASS (or honest-NA), proving the
@@ -12,19 +13,61 @@
  *  (c) PROPERTY / METAMORPHIC — invariants computed in-browser: decode(remux(x))==decode(x),
  *      probe(remux(x)).dur≈probe(x).dur, trim(a..b)++trim(b..c)≈trim(a..c), probe(x).dur consistent
  *      across containers. Oracle: `property-invariant`.
- *  (d) IMAGE NEGATIVES — still images fed to a video/media op must produce a clean NA / graceful
- *      error, never a crash. Oracle: `graceful-failure`.
+ *  (d) IMAGE POSITIVES + NEGATIVES — positive probes must report image metadata; separate rows feed
+ *      images to moving-video operations and require a typed NA or clean negative rejection.
  *
  * The malformed fixtures are deterministic products of fixtures/bake.mjs, so a fuzz failure is
  * reproducible without mutating bytes at runtime.
  */
 
-import type { Scenario } from '../../core/scenario.ts';
+import type { OracleId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  defineRobustnessContract,
+  type RobustnessInputClass,
+  type RobustnessSurvivorCheck,
+} from './contracts.ts';
 
 const FUZZ_TIMEOUT_MS = 15_000;
 const TRANSCODE_PROPERTY_TIMEOUT_MS = 120_000;
 const COMPOSE_TIMEOUT_MS = 60_000;
+
+function survivorCheckFor(op: Scenario['op']): RobustnessSurvivorCheck {
+  switch (op) {
+    case 'probe':
+      return 'probe-structure';
+    case 'demux':
+      return 'packet-structure';
+    case 'decodeFrames':
+      return 'frame-coverage';
+    case 'seek':
+      return 'seek-clamp';
+    case 'remux':
+    case 'transcode':
+    case 'trim':
+    case 'mux':
+    case 'decrypt':
+      return 'media-structure';
+  }
+}
+
+function withRobustnessContract(
+  options: Record<string, unknown> | undefined,
+  inputClass: RobustnessInputClass,
+  op: Scenario['op'],
+  survivorOracles: readonly OracleId[],
+  timeoutMs: number,
+): Record<string, unknown> {
+  return {
+    ...(options ?? {}),
+    robustness: defineRobustnessContract(
+      inputClass,
+      survivorCheckFor(op),
+      survivorOracles,
+      timeoutMs,
+    ),
+  };
+}
 
 // ── (a) EDGE cases ──────────────────────────────────────────────────────────────────────────────
 
@@ -39,6 +82,7 @@ interface EdgeCase {
   features?: string[];
   encryption?: ('cenc-ctr' | 'cenc-cbcs' | 'hls-aes128')[];
   options?: Record<string, unknown>;
+  inputClass?: RobustnessInputClass;
   tolerances?: Scenario['tolerances'];
   oracles: Scenario['oracles'];
   notes?: string;
@@ -193,6 +237,7 @@ const EDGE_CASES: EdgeCase[] = [
     asset: 'zero_length.mp4',
     containersIn: ['mp4'],
     options: { gracefulAllowOutput: true },
+    inputClass: 'negative',
     oracles: ['graceful-failure'],
     // Note avoids the oracle's bad-token set (crash/hang/timeout/oom) too: the oracle substring-matches
     // those in notes and FAILs on a hit, so a prohibitive 'never crash' would force an unconditional
@@ -206,7 +251,13 @@ const edgeScenarios: Scenario[] = EDGE_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.asset,
-    ...(c.options ? { options: c.options } : {}),
+    options: withRobustnessContract(
+      c.options,
+      c.inputClass ?? 'hard-valid',
+      c.op,
+      c.oracles,
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -344,7 +395,13 @@ const fuzzScenarios: Scenario[] = FUZZ_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.asset,
-    ...(c.options ? { options: c.options } : {}),
+    options: withRobustnessContract(
+      c.options,
+      'negative',
+      c.op,
+      ['graceful-failure'],
+      c.timeoutMs ?? FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -448,13 +505,16 @@ const PROPERTY_CASES: PropertyCase[] = [
     id: 'prop_duration_consistent_across_containers',
     invariant: 'probe(x).dur consistent across containers',
     op: 'probe',
-    // Same underlying content delivered in three containers; durations must agree within tolerance.
-    input: ['h264_1080p_30s.mp4', 'h264_1080p_5s.mov', 'h264_in_mkv.mkv'],
-    containersIn: ['mp4', 'mov', 'mkv'],
-    videoCodecs: ['h264'],
-    audioCodecs: ['aac'],
+    // MDN publishes these two encodes of the same five-second flower program. Unlike the previous
+    // 30s/5s/10s synthetic trio, they are genuinely matched content and can be compared directly.
+    input: ['realworld_mdn_flower.mp4', 'realworld_mdn_flower.webm'],
+    containersIn: ['mp4', 'webm'],
+    videoCodecs: ['h264', 'vp8'],
+    audioCodecs: ['aac', 'vorbis'],
     options: { invariant: 'probe(x).dur consistent across containers' },
-    notes: 'Probed duration of equivalent content must be consistent regardless of wrapper.',
+    notes:
+      'Directly compare duration for matched MDN flower renditions in MP4/H.264/AAC and ' +
+      'WebM/VP8/Vorbis; individual golden agreement is not a substitute for the cross-input check.',
   },
 ];
 
@@ -463,7 +523,13 @@ const propertyScenarios: Scenario[] = PROPERTY_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.input,
-    ...(c.options ? { options: c.options } : {}),
+    options: withRobustnessContract(
+      c.options,
+      'hard-valid',
+      c.op,
+      ['property-invariant'],
+      c.timeoutMs ?? FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -502,6 +568,13 @@ const imageProbeScenarios: Scenario[] = IMAGE_PROBE_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: 'probe',
     input: c.asset,
+    options: withRobustnessContract(
+      undefined,
+      'hard-valid',
+      'probe',
+      ['golden-metadata'],
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: ['probe'],
       containersIn: [c.container],
@@ -515,15 +588,43 @@ const imageProbeScenarios: Scenario[] = IMAGE_PROBE_CASES.map((c) =>
   }),
 );
 
+/**
+ * These are the literal moving-video negatives that the old file header claimed but did not
+ * register.  A framework that cannot combine the concrete tuple returns typed NA_ENGINE; one that
+ * admits it must reject cleanly (or return evidence that passes the declared frame survivor).
+ */
+const imageNegativeScenarios: Scenario[] = IMAGE_PROBE_CASES.map((c) =>
+  defineScenario({
+    id: `robustness/${c.id.replace(/_probe$/, '_decode_video_negative')}`,
+    op: 'decodeFrames',
+    input: c.asset,
+    options: withRobustnessContract(
+      { maxFrames: 2 },
+      'negative',
+      'decodeFrames',
+      ['graceful-failure'],
+      FUZZ_TIMEOUT_MS,
+    ),
+    requires: {
+      operations: ['decodeFrames'],
+      containersIn: [c.container],
+    },
+    oracles: ['graceful-failure'],
+    metrics: ['wall'],
+    timeoutMs: FUZZ_TIMEOUT_MS,
+    notes:
+      `${c.format} still image passed to the moving-video decode contract: typed tuple ` +
+      'non-applicability or a clean negative rejection is expected; a returned sink must contain ' +
+      'structurally valid frames and may not pass from output presence alone.',
+  }),
+);
+
 // ── (e) SEEK EDGES (§A.16 seek-past-EOF / negative seek) ──────────────────────────────────────────
 //
 // EdgeCase.op already permits 'seek' but no edge case used it. These feed an out-of-range tUs to the
-// engine's seek() on the workhorse clip. The runner's robustness path plus the graceful-failure
-// oracle gives the correct verdict for the spec's "clamp to last/first frame OR fail cleanly":
-//   - a clean CLAMP-return populates ctx.seek (NOT ctx.output/metadata/demux/frames), and the
-//     graceful-failure output-absence inference treats that as a pass (clamped without faulting);
-//   - a clean THROW also passes (op produced nothing);
-//   - only a hang/timeout FAILs.
+// engine's seek() on the workhorse clip. A return is not accepted from mere presence/absence: the
+// survivor contract validates the landing against the first/last committed presentation timestamp.
+// A clean negative rejection is also permitted; timeout/crash/resource-limit remain findings.
 // This is the ROBUSTNESS framing (no golden needed, survives an unbaked frame golden) and is
 // deliberately complementary to decode-seek's seek_past_eof/seek_negative, which use seek-accuracy
 // (golden-anchored, asserts the exact clamp landing). NOTE: wording omits the graceful-failure
@@ -571,7 +672,20 @@ const seekEdgeScenarios: Scenario[] = SEEK_EDGE_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: 'seek',
     input: c.asset,
-    options: { tUs: c.tUs, seekEdge: c.edge },
+    options: withRobustnessContract(
+      {
+        tUs: c.tUs,
+        seekEdge: c.edge,
+        seekPolicy:
+          c.edge === 'negative'
+            ? 'first-frame-or-clean-reject'
+            : 'last-frame-or-clean-reject',
+      },
+      'boundary',
+      'seek',
+      ['graceful-failure'],
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: ['seek'],
       containersIn: c.containersIn,
@@ -602,12 +716,13 @@ const seekEdgeScenarios: Scenario[] = SEEK_EDGE_CASES.map((c) =>
 // directly; they no longer need an identity mutate just to be classified correctly.
 interface ShapeEdgeCase {
   id: string;
-  op: 'probe' | 'decodeFrames';
+  op: 'probe' | 'demux' | 'decodeFrames';
   asset: string;
   containersIn: string[];
   videoCodecs?: string[];
   audioCodecs?: string[];
   options?: Record<string, unknown>;
+  inputClass?: RobustnessInputClass;
   tolerances?: Scenario['tolerances'];
   oracles: Scenario['oracles'];
   notes: string;
@@ -736,6 +851,7 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     asset: 'mislabeled_h264.webm',
     containersIn: ['webm'],
     options: { gracefulAllowOutput: true },
+    inputClass: 'negative',
     oracles: ['graceful-failure'],
     notes:
       '§A.16 mismatched container/codec: bytes are MP4/H.264 but the extension/MIME claims .webm. ' +
@@ -745,16 +861,15 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
   // MPEG-TS timestamp wraparound + discontinuity — demux/probe must unwrap or handle.
   {
     id: 'edge_ts_pts_wraparound_demux',
-    op: 'probe',
+    op: 'demux',
     asset: 'ts_discontinuity.ts',
     containersIn: ['ts'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    oracles: ['golden-metadata'],
-    tolerances: { fpsTolerance: 30 },
+    oracles: ['golden-packets'],
     notes:
-      '§A.16 MPEG-TS discontinuity: a joined TS stream with a timestamp jump. Probe duration must be ' +
-      'derived safely without negative-duration or hang behavior.',
+      '§A.16 MPEG-TS discontinuity/wraparound: demux the joined stream and preserve packet timing ' +
+      'through the discontinuity. This is a substantive packet verdict, never a disabled or probe-only row.',
   },
 
   // gapless audio (encoder delay/padding) — reported duration must reflect priming/padding handling.
@@ -794,7 +909,13 @@ const shapeEdgeScenarios: Scenario[] = SHAPE_EDGE_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.asset,
-    ...(c.options ? { options: c.options } : {}),
+    options: withRobustnessContract(
+      c.options,
+      c.inputClass ?? 'hard-valid',
+      c.op,
+      c.oracles,
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -884,7 +1005,13 @@ const extraFuzzScenarios: Scenario[] = EXTRA_FUZZ_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.asset,
-    ...(c.options ? { options: c.options } : {}),
+    options: withRobustnessContract(
+      c.options,
+      'negative',
+      c.op,
+      ['graceful-failure'],
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -924,9 +1051,8 @@ const extraFuzzScenarios: Scenario[] = EXTRA_FUZZ_CASES.map((c) =>
 //     - remux(remux(x)) bit-stable : run a second remux and compare metadata plus packet tables.
 //     - trim additivity (proper compose) : trim(a..b)++trim(b..c) decode-compares to trim(a..c).
 //
-//   HONEST-FAIL / HONEST-N/A until dedicated audio/cross-asset oracle support exists:
-//     - FLAC seek ±SEEKTABLE land-identical : two-asset seek-equality.
-//     - gapless AAC decoded sample count : audio sample-count oracle, not RGBA frame digesting.
+//   The FLAC seek and gapless sample-count properties below now have dedicated multi-step oracle
+//   branches. They remain capability-gated and never pass from labels alone.
 
 // (h1) LIVE — transcode resize-to-same is perceptually identical (ssim-psnr reference path).
 const transcodeIdempotentScenarios: Scenario[] = [
@@ -935,7 +1061,13 @@ const transcodeIdempotentScenarios: Scenario[] = [
     op: 'transcode',
     input: 'h264_1080p_30s.mp4',
     // Target dims == source dims (1920×1080), same codec/container → a resize-to-same no-op.
-    options: { container: 'mp4', video: { codec: 'h264', width: 1920, height: 1080 } },
+    options: withRobustnessContract(
+      { container: 'mp4', video: { codec: 'h264', width: 1920, height: 1080 } },
+      'hard-valid',
+      'transcode',
+      ['ssim-psnr', 'playback-smoke'],
+      TRANSCODE_PROPERTY_TIMEOUT_MS,
+    ),
     requires: {
       operations: ['transcode'],
       containersIn: ['mp4'],
@@ -994,6 +1126,13 @@ const flacSeektableScenarios: Scenario[] = FLAC_SEEKTABLE_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: 'probe',
     input: c.asset,
+    options: withRobustnessContract(
+      undefined,
+      'hard-valid',
+      'probe',
+      ['golden-metadata'],
+      FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: ['probe'],
       containersIn: ['flac'],
@@ -1006,11 +1145,8 @@ const flacSeektableScenarios: Scenario[] = FLAC_SEEKTABLE_CASES.map((c) =>
   }),
 );
 
-// (h3) HONEST-FAIL — metamorphic invariants whose oracle token oracles.ts does not implement yet.
-// They carry the invariant token in options.invariant; propertyInvariant() returns an honest
-// "unknown property-invariant" FAIL until the token is added (tracked in dossier oracleGaps). This is
-// the decode-seek family's established pattern (meta_seek_vs_linear_decode etc.) — register the real
-// invariant, never fabricate a pass.
+// (h3) Multi-step metamorphic invariants. Each carries an executable invariant token; capability
+// preflight may return typed NA, but labels never substitute for executing the second leg.
 interface MetamorphicTodoCase {
   id: string;
   op: 'remux' | 'mux' | 'trim';
@@ -1138,7 +1274,13 @@ const metamorphicTodoScenarios: Scenario[] = METAMORPHIC_TODO_CASES.map((c) =>
     id: `robustness/${c.id}`,
     op: c.op,
     input: c.input,
-    options: c.options,
+    options: withRobustnessContract(
+      c.options,
+      'hard-valid',
+      c.op,
+      ['property-invariant'],
+      c.timeoutMs ?? FUZZ_TIMEOUT_MS,
+    ),
     requires: {
       operations: [c.op],
       containersIn: c.containersIn,
@@ -1160,6 +1302,7 @@ export const robustnessScenarios: Scenario[] = [
   ...fuzzScenarios,
   ...propertyScenarios,
   ...imageProbeScenarios,
+  ...imageNegativeScenarios,
   // ── new (this extension) ──
   ...seekEdgeScenarios,
   ...shapeEdgeScenarios,

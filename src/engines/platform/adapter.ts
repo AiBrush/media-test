@@ -58,6 +58,9 @@
 
 import type {
   CapabilitySet,
+  ConcreteOperationRequest,
+  DecodeOptions,
+  DecodeTrackSelector,
   DemuxResult,
   EncodedTracks,
   FrameDigest,
@@ -66,21 +69,23 @@ import type {
   MediaEngine,
   MediaInput,
   NormalizedMetadata,
+  Operation,
   PacketInfo,
+  SupportDecision,
   TranscodeOptions,
 } from '../../core/engine.ts';
+import { createNotApplicableError, DECODE_TRACK_SELECTOR_SCHEMA } from '../../core/engine.ts';
 import { registerEngine } from '../../core/registry.ts';
 import { decodeBytesToFrames, playbackSmoke } from './oracle-helpers.ts';
 import { decodeWithVideoElement, decodeWithWebCodecs, grabFrameAt } from './decode.ts';
 import type { DecodeInput } from './decode.ts';
 import {
   demuxMp4Tracks,
-  demuxMp4Video,
   hasMp4DisplayMatrixTransform,
   looksLikeMp4,
   UnsupportedMp4Error,
 } from './demux-mp4.ts';
-import { demuxWebmTracks, demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
+import { demuxWebmTracks, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 import { demuxWav, looksLikeWav, UnsupportedWavError } from './demux-wav.ts';
 import { probeInput } from './probe.ts';
 import { canMediaRecorderTranscode, recorderMimeFor, transcodeViaRecorder } from './transcode.ts';
@@ -118,14 +123,6 @@ export interface PlatformConfigUsed {
   encode: '<video>→canvas→MediaRecorder(out)';
 }
 
-/** Thrown for operations this engine honestly does not implement. The runner records NA_ENGINE. */
-class NotApplicableError extends Error {
-  constructor(op: string, why: string) {
-    super(`platform engine: ${op} is NA — ${why}`);
-    this.name = 'NotApplicableError';
-  }
-}
-
 interface FixtureManifestAsset {
   id?: string;
   codecs?: string[];
@@ -161,6 +158,64 @@ function fixtureHasAlpha(asset: FixtureManifestAsset | undefined): boolean {
     .join(' ')
     .toLowerCase();
   return text.includes('alpha');
+}
+
+interface PlatformSelectableVideoTrack {
+  readonly kind: 'video';
+  readonly config: {
+    readonly codec: string;
+    readonly codecString: string;
+    readonly codedWidth: number;
+    readonly codedHeight: number;
+    readonly description?: Uint8Array;
+  };
+  readonly samples: DecodeInput['samples'];
+}
+
+function selectPlatformVideoTrack(
+  engineId: string,
+  tracks: readonly { readonly kind: string }[],
+  selector?: DecodeTrackSelector,
+): { track: PlatformSelectableVideoTrack; trackIndex: number; typeOrdinal: number } {
+  const reject = (reason: string): never => {
+    throw createNotApplicableError(
+      engineId,
+      'decodeFrames',
+      reason,
+      undefined,
+      'PLATFORM_DECODE_TRACK_SELECTION_UNSUPPORTED',
+    );
+  };
+  if (selector && selector.schema !== DECODE_TRACK_SELECTOR_SCHEMA) {
+    return reject(`decode selector must use schema '${DECODE_TRACK_SELECTOR_SCHEMA}'`);
+  }
+  if (selector && selector.type !== 'video') {
+    return reject('the platform frame sink exposes video pixels only');
+  }
+  if (selector?.trackId !== undefined) {
+    return reject('the inline platform demuxers do not expose stable container track ids');
+  }
+  const videos = tracks.flatMap((track, trackIndex) =>
+    track.kind === 'video'
+      ? [{ track: track as PlatformSelectableVideoTrack, trackIndex }]
+      : [],
+  );
+  const byIndex = selector?.trackIndex === undefined
+    ? undefined
+    : videos.find((candidate) => candidate.trackIndex === selector.trackIndex);
+  const byOrdinal = selector?.typeOrdinal === undefined ? undefined : videos[selector.typeOrdinal];
+  const chosen = selector?.trackIndex !== undefined ? byIndex : byOrdinal ?? videos[0];
+  if (!chosen) {
+    return reject(
+      `requested video track does not exist (index=${String(selector?.trackIndex)}, ` +
+      `ordinal=${String(selector?.typeOrdinal)})`,
+    );
+  }
+  const typeOrdinal = videos.findIndex((candidate) => candidate.trackIndex === chosen.trackIndex);
+  if (selector?.typeOrdinal !== undefined && selector.typeOrdinal !== typeOrdinal) {
+    return reject(`video track ${chosen.trackIndex} is ordinal ${typeOrdinal}, not ${selector.typeOrdinal}`);
+  }
+  return { ...chosen, typeOrdinal };
 }
 
 /** Build a stable, navigator-derived engine id, e.g. 'platform@chrome-126' / 'platform@browser'. */
@@ -279,7 +334,30 @@ export class PlatformEngine implements MediaEngine {
         'metadata:protected-tracks',
         'decode:golden-rgba',
       ],
+      probeReadModes: ['whole-file'],
     };
+  }
+
+  /**
+   * Concrete tuple support boundary for raw platform APIs. This mirrors the honest per-operation
+   * declaration in `capabilities()`: operations the raw platform cannot perform (remux/trim/mux/
+   * decrypt) are NA_ENGINE, never collapsed into a false FAIL. Container/codec narrowing beyond the
+   * declared capability set is left to the runner's declared∧detected intersection and the Pass-2
+   * WebCodecs/MediaRecorder probes, which surface browser gaps as NA_BROWSER rather than NA_ENGINE.
+   */
+  supports(request: ConcreteOperationRequest): SupportDecision {
+    const declared = this.capabilities().operations;
+    // 'concat' is a composed presentation the transcode path drives; gate it on transcode.
+    const operation: Operation = request.operation === 'concat' ? 'transcode' : request.operation;
+    if (declared[operation] !== true) {
+      return {
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'PLATFORM_OPERATION_UNDECLARED',
+        reason: `raw platform APIs do not implement '${request.operation}'`,
+      };
+    }
+    return { supported: true };
   }
 
   /**
@@ -304,7 +382,9 @@ export class PlatformEngine implements MediaEngine {
   }
 
   async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    return probeInput(input);
+    const metadata = await probeInput(input);
+    metadata.probeEvidence = { readMode: 'whole-file' };
+    return metadata;
   }
 
   /**
@@ -345,15 +425,15 @@ export class PlatformEngine implements MediaEngine {
       }
     } catch (e) {
       if (e instanceof UnsupportedMp4Error || e instanceof UnsupportedWebmError || e instanceof UnsupportedWavError) {
-        throw new NotApplicableError('demux', e.message);
+        throw createNotApplicableError(this.id, 'demux', e.message);
       }
       throw e;
     }
-    throw new NotApplicableError('demux', 'raw platform demux only supports progressive MP4/MOV and WebM/MKV');
+    throw createNotApplicableError(this.id, 'demux', 'raw platform demux only supports progressive MP4/MOV and WebM/MKV');
   }
 
   async remux(_input: MediaInput, _opts: { container: string }): Promise<MediaBytes> {
-    throw new NotApplicableError('remux', 'raw platform APIs cannot losslessly rewrap encoded samples into a container');
+    throw createNotApplicableError(this.id, 'remux', 'raw platform APIs cannot losslessly rewrap encoded samples into a container');
   }
 
   /**
@@ -369,45 +449,45 @@ export class PlatformEngine implements MediaEngine {
    */
   async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     if (!canMediaRecorderTranscode()) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         'requires DOM + MediaRecorder + canvas.captureStream (unavailable in this realm)',
       );
     }
     if (opts.audio) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         'the MediaRecorder canvas-capture path is video-only and drops audio; cannot produce the requested audio track',
       );
     }
     if (opts.variants?.length) {
-      throw new NotApplicableError('transcode', 'MediaRecorder cannot produce multi-rendition/fanout outputs');
+      throw createNotApplicableError(this.id, 'transcode', 'MediaRecorder cannot produce multi-rendition/fanout outputs');
     }
     if (opts.video?.rotate && opts.video.rotate % 360 !== 0) {
-      throw new NotApplicableError('transcode', 'MediaRecorder canvas capture does not apply rotation transforms');
+      throw createNotApplicableError(this.id, 'transcode', 'MediaRecorder canvas capture does not apply rotation transforms');
     }
     const asset = await fixtureManifestAsset(input.id);
     if (fixtureHasAudio(asset)) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         'the source fixture carries audio and the MediaRecorder canvas-capture path cannot preserve or copy audio',
       );
     }
     if (fixtureHasAlpha(asset)) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         'the MediaRecorder canvas-capture path cannot preserve an input alpha plane',
       );
     }
     if (asset?.sizeBucket && LARGE_MEDIA_BUCKETS.has(asset.sizeBucket)) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         `the ${asset.sizeBucket} fixture would require whole-output Blob buffering in the MediaRecorder path`,
       );
     }
     const mime = recorderMimeFor(opts.container, opts.video?.codec);
     if (!mime) {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'transcode',
         `MediaRecorder cannot produce '${opts.container}' with video codec '${opts.video?.codec ?? 'default'}' here`,
       );
@@ -419,21 +499,30 @@ export class PlatformEngine implements MediaEngine {
    * Decode frames. Prefers inline-demux + WebCodecs (Worker-safe, exact); falls back to a <video>
    * element frame grab (page only) for containers the inline demuxer can't parse.
    */
-  async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
+  async decodeFrames(input: MediaInput, opts?: DecodeOptions): Promise<FrameSink> {
     const ab = await input.arrayBuffer();
     const bytes = new Uint8Array(ab);
+    const decodeInput = this.buildDecodeInput(bytes, opts?.track);
 
     if (looksLikeMp4(bytes) && hasMp4DisplayMatrixTransform(bytes)) {
       if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-        throw new NotApplicableError('decodeFrames', 'display-matrix decode requires DOM <video> presentation');
+        throw createNotApplicableError(this.id, 'decodeFrames', 'display-matrix decode requires DOM <video> presentation');
       }
       const blob = await input.blob();
-      const fallbackOpts: { maxFrames?: number } = {};
+      if (decodeInput?.selectedTrack && decodeInput.selectedTrack.typeOrdinal !== 0) {
+        throw createNotApplicableError(
+          this.id,
+          'decodeFrames',
+          'HTMLVideoElement display-matrix presentation cannot select an alternate video track',
+        );
+      }
+      const fallbackOpts: DecodeOptions & { selectedTrack?: FrameSink['selectedTrack'] } = {};
       if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+      if (opts?.onFirstFrame) fallbackOpts.onFirstFrame = opts.onFirstFrame;
+      if (decodeInput?.selectedTrack) fallbackOpts.selectedTrack = decodeInput.selectedTrack;
       return decodeWithVideoElement(blob, fallbackOpts);
     }
 
-    const decodeInput = this.buildDecodeInput(bytes);
     if (decodeInput && decodeInput.samples.length > 0) {
       try {
         return await decodeWithWebCodecs(decodeInput, opts);
@@ -444,21 +533,29 @@ export class PlatformEngine implements MediaEngine {
     }
 
     if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-      throw new NotApplicableError(
+      throw createNotApplicableError(this.id,
         'decodeFrames',
         'inline demux did not recognize the container and no DOM is available for the <video> fallback (Worker)',
       );
     }
     const blob = await input.blob();
-    const fallbackOpts: { maxFrames?: number } = {};
+    if (opts?.track) {
+      throw createNotApplicableError(
+        this.id,
+        'decodeFrames',
+        'HTMLVideoElement fallback cannot prove the requested normalized track identity',
+      );
+    }
+    const fallbackOpts: DecodeOptions = {};
     if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+    if (opts?.onFirstFrame) fallbackOpts.onFirstFrame = opts.onFirstFrame;
     return decodeWithVideoElement(blob, fallbackOpts);
   }
 
   /** Seek: HTMLVideoElement.currentTime + grab the landed frame. Page-only (needs a <video>). */
   async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
     if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
-      throw new NotApplicableError('seek', 'HTMLVideoElement seek requires a DOM (page main thread)');
+      throw createNotApplicableError(this.id, 'seek', 'HTMLVideoElement seek requires a DOM (page main thread)');
     }
     const blob = await input.blob();
     return grabFrameAt(blob, tUs);
@@ -469,33 +566,55 @@ export class PlatformEngine implements MediaEngine {
     _range: { startUs: number; endUs: number },
     _opts: { container: string; frameAccurate: boolean },
   ): Promise<MediaBytes> {
-    throw new NotApplicableError('trim', 'no frame-accurate cut/rewrap available with raw platform APIs');
+    throw createNotApplicableError(this.id, 'trim', 'no frame-accurate cut/rewrap available with raw platform APIs');
   }
 
   // mux + decrypt are intentionally NOT implemented (declared false in capabilities()). The runner
   // gates on capabilities() so these optional methods are never invoked; omitting them is correct.
 
   /** Build a WebCodecs DecodeInput from the inline demuxers; null if neither recognizes the bytes. */
-  private buildDecodeInput(bytes: Uint8Array): DecodeInput | null {
+  private buildDecodeInput(bytes: Uint8Array, selector?: DecodeTrackSelector): DecodeInput | null {
     try {
       if (looksLikeMp4(bytes)) {
-        const t = demuxMp4Video(bytes);
+        const tracks = demuxMp4Tracks(bytes);
+        const selected = selectPlatformVideoTrack(this.id, tracks, selector);
+        const t = selected.track;
         const di: DecodeInput = {
           codecString: t.config.codecString,
           codedWidth: t.config.codedWidth,
           codedHeight: t.config.codedHeight,
           samples: t.samples,
+          selectedTrack: {
+            schema: DECODE_TRACK_SELECTOR_SCHEMA,
+            type: 'video',
+            trackIndex: selected.trackIndex,
+            typeOrdinal: selected.typeOrdinal,
+            codec: t.config.codec,
+            width: t.config.codedWidth,
+            height: t.config.codedHeight,
+          },
         };
         if (t.config.description) di.description = t.config.description;
         return di;
       }
       if (looksLikeWebm(bytes)) {
-        const t = demuxWebmVideo(bytes);
+        const tracks = demuxWebmTracks(bytes);
+        const selected = selectPlatformVideoTrack(this.id, tracks, selector);
+        const t = selected.track;
         const di: DecodeInput = {
           codecString: t.config.codecString,
           codedWidth: t.config.codedWidth,
           codedHeight: t.config.codedHeight,
           samples: t.samples,
+          selectedTrack: {
+            schema: DECODE_TRACK_SELECTOR_SCHEMA,
+            type: 'video',
+            trackIndex: selected.trackIndex,
+            typeOrdinal: selected.typeOrdinal,
+            codec: t.config.codec,
+            width: t.config.codedWidth,
+            height: t.config.codedHeight,
+          },
         };
         if (t.config.description) di.description = t.config.description;
         return di;

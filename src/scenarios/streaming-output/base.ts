@@ -38,7 +38,8 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    // Representation is explicit so progressive and fragmented stream work never share a cohort.
+    shape: { container: 'mp4', target: 'stream', fragmented: false, fastStart: false },
     notes:
       'Incremental/streaming target; targetWrites should be many small writes, not one (becomes ' +
       'observable once the runner threads a CountingTarget through remux).',
@@ -50,7 +51,7 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fragmented: true },
+    shape: { container: 'mp4', fragmented: true, target: 'buffer' },
     features: ['fragmented'],
     // reference-reimport + mp4-box-layout: a bare fMP4 is not reliably plain-<video>-playable and the
     // platform inline demux is progressive-only — playback-smoke/decode-remux would risk a false FAIL.
@@ -67,7 +68,7 @@ const BASE_CASES: StreamCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096 },
+    shape: { container: 'mp4', fastStart: 'reserve', maximumPacketCount: 4096, target: 'stream' },
     features: ['fastStart:reserve'],
     notes:
       'fastStart with reserved forward moov (mediabunny fastStart:"reserve", needs maximumPacketCount). ' +
@@ -96,7 +97,7 @@ const BASE_CASES: StreamCase[] = [
     to: 'webm',
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
-    shape: { container: 'webm', target: 'stream' },
+    shape: { container: 'webm', target: 'stream', appendOnly: false },
     notes:
       'Streaming WebM (normal Segment Duration); reference re-import gates byte validity. The ' +
       'headerless/live Matroska profile is a separate case (see ./ts-webm-live.ts).',

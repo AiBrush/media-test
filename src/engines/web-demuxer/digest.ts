@@ -32,14 +32,20 @@ function toHex(buf: ArrayBuffer): string {
  * sha256 hex of a tight RGBA byte buffer. The buffer MUST already be normalized (tight, top-left,
  * straight alpha) — callers obtain such a buffer from {@link tightRgbaFromImageData}.
  */
-export async function sha256Hex(rgba: Uint8Array): Promise<string> {
+export function hasWebCryptoDigest(): boolean {
+  return typeof globalThis.crypto?.subtle?.digest === 'function';
+}
+
+export async function sha256Hex(rgba: Uint8Array, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
   if (typeof crypto === 'undefined' || !crypto.subtle) {
     throw new Error('crypto.subtle unavailable: cannot compute frame digest in this realm');
   }
   // Hash a tight copy so we never read beyond the region (offset/length safety) and always pass a
   // plain ArrayBuffer (not SharedArrayBuffer) to crypto.subtle.
   const tight = rgba.slice();
-  const hash = await crypto.subtle.digest('SHA-256', tight.buffer as ArrayBuffer);
+  const hash = await raceAbort(crypto.subtle.digest('SHA-256', tight.buffer as ArrayBuffer), signal);
+  throwIfAborted(signal);
   return toHex(hash);
 }
 
@@ -66,8 +72,42 @@ export async function digestImageData(
   img: ImageData,
   index: number,
   ptsUs: number,
+  signal?: AbortSignal,
 ): Promise<FrameDigest> {
+  throwIfAborted(signal);
   const rgba = tightRgbaFromImageData(img);
-  const sha256 = await sha256Hex(rgba);
+  const sha256 = await sha256Hex(rgba, signal);
   return { index, ptsUs, sha256, width: img.width, height: img.height };
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new DOMException('operation aborted', 'AbortError');
+}
+
+
+function raceAbort<T>(promise: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return Promise.resolve(promise);
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      callback();
+    };
+    const abort = (): void => finish(() => {
+      try {
+        throwIfAborted(signal);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }

@@ -24,7 +24,8 @@
  * frame; ffmpeg cannot produce them, see frame-bake.ts), so a red DECODE_MUX cell means an engine-decode
  * divergence or a stale harness run, NOT a missing golden — re-bake via `window.__FRAME_BAKE__` only if the
  * asset changes. PROBE_DUR is added as a second, immediately-active invariant where it adds signal.
- * reference-reimport is attached ONLY for faithful (mp4/mov) targets per _shared.ts.
+ * Neutral semantic re-import is attached for every target; representation-sensitive packet counts
+ * are not used across containers.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -63,11 +64,9 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['mux:vfr-timestamps'],
-    // mkv reframes (SimpleBlock lacing) → no source-keyed reference-reimport; decode invariant only.
     notes:
       'B-FRAME mux → mkv (§A.16): same coded samples re-laced as Matroska SimpleBlocks; the muxer must ' +
-      'preserve the reorder via block timestamps. decode(mux(x))==decode(x) gates it (mkv reframes, so ' +
-      'no source-keyed packet count).',
+      'preserve the reorder via block timestamps. Full timeline + decode + neutral semantic re-import gate it.',
   },
 
   // ── Rotation / display matrix preservation through mux ──
@@ -127,7 +126,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     features: ['mux:hevc-browser-decode-equality'],
     notes:
       'HEVC mux → mkv (§A.3): HEVC into Matroska (CodecPrivate = hvcC). decode(mux(x))==decode(x) gates ' +
-      'pixels through the Matroska writer; reframing target → no source-keyed packet count.',
+      'pixels through the Matroska writer; neutral re-import validates the reframed track.',
   },
 ];
 

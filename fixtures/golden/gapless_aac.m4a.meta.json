@@ -1,0 +1,456 @@
+{
+  "schema": "media-test/golden-artifact@1",
+  "schemaVersion": "1.0.0",
+  "artifactKind": "metadata",
+  "assetId": "gapless_aac.m4a",
+  "sourceMedia": {
+    "sha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+    "sizeBytes": 13504
+  },
+  "availability": {
+    "state": "ready"
+  },
+  "provenance": {
+    "schema": "media-test/golden-provenance@1",
+    "schemaVersion": "1.0.0",
+    "artifactKind": "metadata",
+    "assetId": "gapless_aac.m4a",
+    "sourceMedia": {
+      "sha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+      "sizeBytes": 13504
+    },
+    "buildDefinition": {
+      "recipe": "fixtures/bake.mjs#metadata",
+      "normalizedArguments": {
+        "assetId": "gapless_aac.m4a",
+        "artifactKind": "metadata",
+        "sourceSha256": "ec8b79914196d3ae937d023a6cafdc59851c42b985175793516970fe3dd892e2",
+        "normalizationVersion": "golden-normalization@1"
+      },
+      "normalizedArgumentsSha256": "6f467ed68746950dde04ac65b49db3af12150aa876f5dab05484876d1db01f8b",
+      "dependencies": []
+    },
+    "runDetails": {
+      "baker": "media-test/bake@1",
+      "perimeter": {
+        "schemaVersion": "tool-perimeter@1",
+        "tools": {
+          "bun": {
+            "state": "present",
+            "executable": "/Users/tarek/.bun/bin/bun",
+            "versionOutput": "1.3.14"
+          },
+          "ffmpeg": {
+            "state": "present",
+            "executable": "ffmpeg",
+            "versionOutput": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+            "exitStatus": 0
+          },
+          "ffprobe": {
+            "state": "present",
+            "executable": "ffprobe",
+            "versionOutput": "ffprobe version 8.1.2 Copyright (c) 2007-2026 the FFmpeg developers",
+            "exitStatus": 0
+          },
+          "bento4": {
+            "state": "present",
+            "executable": "mp4encrypt",
+            "versionOutput": "MP4 Encrypter - Version 1.7",
+            "exitStatus": 1
+          },
+          "bento4Hls": {
+            "state": "present",
+            "executable": "mp42hls",
+            "versionOutput": "MP4 To HLS File Converter - Version 1.2",
+            "exitStatus": 1
+          },
+          "shakaPackager": {
+            "state": "absent"
+          },
+          "playwright": {
+            "state": "not-applicable"
+          },
+          "browser": {
+            "state": "not-applicable"
+          }
+        },
+        "platform": {
+          "os": "darwin",
+          "release": "25.5.0",
+          "arch": "arm64",
+          "locale": "C.UTF-8",
+          "timezone": "unconfigured"
+        },
+        "environment": {
+          "SOURCE_DATE_EPOCH": "1784160000",
+          "LANG": "C.UTF-8",
+          "LC_ALL": "C.UTF-8",
+          "TZ": null,
+          "BRAVE_PATH": null,
+          "FFMPEG_PATH": null,
+          "FFPROBE_PATH": null
+        },
+        "declaredLock": {
+          "sha256": "278215645163fcb5a97cb0475fee9f7065a54f80e0e038b8bec7fa5cd86e7329",
+          "sourceDateEpoch": 1784160000,
+          "locale": "C.UTF-8",
+          "timezone": "UTC",
+          "required": {
+            "bun": "1.3.14",
+            "ffmpeg": "8.1.2",
+            "ffprobe": "8.1.2"
+          },
+          "optional": {
+            "bento4": "record-if-present",
+            "shakaPackager": "record-if-present",
+            "playwright": "1.48.x",
+            "browser": "record-executable-and-build"
+          }
+        }
+      },
+      "startedAtIso": "2026-07-16T00:00:00.000Z",
+      "finishedAtIso": "2026-07-16T00:00:00.000Z",
+      "timeMode": "source-date-epoch",
+      "browserQualified": false
+    },
+    "outputArtifact": {
+      "digestScope": "canonical-payload",
+      "sha256": "15e1707e5ec9075e25f12625465141a4cc9f776c69b0ca0d26799ba84e783a9f",
+      "sizeBytes": 2639
+    }
+  },
+  "payload": {
+    "schemaVersion": "golden-normalization@1",
+    "raw": {
+      "format": {
+        "formatName": "mov,mp4,m4a,3gp,3g2,mj2",
+        "formatLongName": "QuickTime / MOV",
+        "duration": "1.012993",
+        "startTime": "0.000000",
+        "bitRate": "106646",
+        "size": "13504",
+        "tags": {
+          "compatible_brands": "isomiso2mp41",
+          "major_brand": "isom",
+          "minor_version": "512"
+        }
+      },
+      "tracks": [
+        {
+          "streamIndex": 0,
+          "type": "audio",
+          "codecName": "aac",
+          "codecTag": "mp4a",
+          "codecRaw": "mp4a",
+          "codecCanonical": "aac",
+          "profile": "LC",
+          "cadenceMode": "UNKNOWN",
+          "frameTimestampsUs": [],
+          "sampleRate": 44100,
+          "sampleRateCore": 44100,
+          "sampleRateOutput": 44100,
+          "channels": 2,
+          "channelsCore": 2,
+          "channelsOutput": 2,
+          "channelLayout": "stereo",
+          "audioObjectType": 2,
+          "sbrPresent": false,
+          "psPresent": false,
+          "bitRate": 96767,
+          "language": "und",
+          "timeBase": "1/44100",
+          "timebaseTickUs": 22.675736961451246,
+          "mediaTimescale": 44100,
+          "startPts": 0,
+          "startTimeSec": 0,
+          "durationTs": 44673,
+          "mediaDurationSec": 1.012993,
+          "sampleSpanSec": 1.012993197,
+          "primingSamples": 0,
+          "disposition": {
+            "attached_pic": 0,
+            "captions": 0,
+            "clean_effects": 0,
+            "comment": 0,
+            "default": 1,
+            "dependent": 0,
+            "descriptions": 0,
+            "dub": 0,
+            "forced": 0,
+            "hearing_impaired": 0,
+            "karaoke": 0,
+            "lyrics": 0,
+            "metadata": 0,
+            "multilayer": 0,
+            "non_diegetic": 0,
+            "original": 0,
+            "still_image": 0,
+            "timed_thumbnails": 0,
+            "visual_impaired": 0
+          },
+          "tags": {
+            "handler_name": "SoundHandler",
+            "language": "und"
+          }
+        }
+      ]
+    },
+    "canonical": {
+      "container": "mp4",
+      "durationSec": 1.012993,
+      "presentationDurationSec": 1.012993,
+      "mediaDurationSec": 1.012993,
+      "sampleSpanSec": 1.012993197,
+      "timebaseTickUs": 22.675737,
+      "tracks": [
+        {
+          "type": "audio",
+          "codec": "aac",
+          "profile": "LC",
+          "cadenceMode": "UNKNOWN",
+          "sampleRate": 44100,
+          "sampleRateCore": 44100,
+          "sampleRateOutput": 44100,
+          "channels": 2,
+          "channelsCore": 2,
+          "channelsOutput": 2,
+          "channelLayout": "stereo",
+          "audioObjectType": 2,
+          "sbrPresent": false,
+          "psPresent": false,
+          "bitrate": 96767,
+          "language": "und",
+          "mediaDurationSec": 1.012993,
+          "sampleSpanSec": 1.012993197,
+          "presentationDurationSec": 1.012993,
+          "timebaseTickUs": 22.675736961451246,
+          "mediaTimescale": 44100,
+          "primingSamples": 0
+        }
+      ],
+      "tags": {
+        "major_brand": "isom"
+      }
+    },
+    "metadata": {
+      "container": "mp4",
+      "durationSec": 1.012993,
+      "presentationDurationSec": 1.012993,
+      "mediaDurationSec": 1.012993,
+      "sampleSpanSec": 1.012993197,
+      "timebaseTickUs": 22.675737,
+      "tracks": [
+        {
+          "type": "audio",
+          "codec": "aac",
+          "profile": "LC",
+          "cadenceMode": "UNKNOWN",
+          "sampleRate": 44100,
+          "sampleRateCore": 44100,
+          "sampleRateOutput": 44100,
+          "channels": 2,
+          "channelsCore": 2,
+          "channelsOutput": 2,
+          "channelLayout": "stereo",
+          "audioObjectType": 2,
+          "sbrPresent": false,
+          "psPresent": false,
+          "bitrate": 96767,
+          "language": "und",
+          "mediaDurationSec": 1.012993,
+          "sampleSpanSec": 1.012993197,
+          "presentationDurationSec": 1.012993,
+          "timebaseTickUs": 22.675736961451246,
+          "mediaTimescale": 44100,
+          "primingSamples": 0
+        }
+      ],
+      "tags": {
+        "major_brand": "isom"
+      }
+    }
+  },
+  "container": "mp4",
+  "durationSec": 1.012993,
+  "presentationDurationSec": 1.012993,
+  "mediaDurationSec": 1.012993,
+  "sampleSpanSec": 1.012993197,
+  "timebaseTickUs": 22.675737,
+  "tracks": [
+    {
+      "type": "audio",
+      "codec": "aac",
+      "profile": "LC",
+      "cadenceMode": "UNKNOWN",
+      "sampleRate": 44100,
+      "sampleRateCore": 44100,
+      "sampleRateOutput": 44100,
+      "channels": 2,
+      "channelsCore": 2,
+      "channelsOutput": 2,
+      "channelLayout": "stereo",
+      "audioObjectType": 2,
+      "sbrPresent": false,
+      "psPresent": false,
+      "bitrate": 96767,
+      "language": "und",
+      "mediaDurationSec": 1.012993,
+      "sampleSpanSec": 1.012993197,
+      "presentationDurationSec": 1.012993,
+      "timebaseTickUs": 22.675736961451246,
+      "mediaTimescale": 44100,
+      "primingSamples": 0
+    }
+  ],
+  "tags": {
+    "major_brand": "isom"
+  },
+  "metadata": {
+    "container": "mp4",
+    "durationSec": 1.012993,
+    "presentationDurationSec": 1.012993,
+    "mediaDurationSec": 1.012993,
+    "sampleSpanSec": 1.012993197,
+    "timebaseTickUs": 22.675737,
+    "tracks": [
+      {
+        "type": "audio",
+        "codec": "aac",
+        "profile": "LC",
+        "cadenceMode": "UNKNOWN",
+        "sampleRate": 44100,
+        "sampleRateCore": 44100,
+        "sampleRateOutput": 44100,
+        "channels": 2,
+        "channelsCore": 2,
+        "channelsOutput": 2,
+        "channelLayout": "stereo",
+        "audioObjectType": 2,
+        "sbrPresent": false,
+        "psPresent": false,
+        "bitrate": 96767,
+        "language": "und",
+        "mediaDurationSec": 1.012993,
+        "sampleSpanSec": 1.012993197,
+        "presentationDurationSec": 1.012993,
+        "timebaseTickUs": 22.675736961451246,
+        "mediaTimescale": 44100,
+        "primingSamples": 0
+      }
+    ],
+    "tags": {
+      "major_brand": "isom"
+    }
+  },
+  "raw": {
+    "format": {
+      "formatName": "mov,mp4,m4a,3gp,3g2,mj2",
+      "formatLongName": "QuickTime / MOV",
+      "duration": "1.012993",
+      "startTime": "0.000000",
+      "bitRate": "106646",
+      "size": "13504",
+      "tags": {
+        "compatible_brands": "isomiso2mp41",
+        "major_brand": "isom",
+        "minor_version": "512"
+      }
+    },
+    "tracks": [
+      {
+        "streamIndex": 0,
+        "type": "audio",
+        "codecName": "aac",
+        "codecTag": "mp4a",
+        "codecRaw": "mp4a",
+        "codecCanonical": "aac",
+        "profile": "LC",
+        "cadenceMode": "UNKNOWN",
+        "frameTimestampsUs": [],
+        "sampleRate": 44100,
+        "sampleRateCore": 44100,
+        "sampleRateOutput": 44100,
+        "channels": 2,
+        "channelsCore": 2,
+        "channelsOutput": 2,
+        "channelLayout": "stereo",
+        "audioObjectType": 2,
+        "sbrPresent": false,
+        "psPresent": false,
+        "bitRate": 96767,
+        "language": "und",
+        "timeBase": "1/44100",
+        "timebaseTickUs": 22.675736961451246,
+        "mediaTimescale": 44100,
+        "startPts": 0,
+        "startTimeSec": 0,
+        "durationTs": 44673,
+        "mediaDurationSec": 1.012993,
+        "sampleSpanSec": 1.012993197,
+        "primingSamples": 0,
+        "disposition": {
+          "attached_pic": 0,
+          "captions": 0,
+          "clean_effects": 0,
+          "comment": 0,
+          "default": 1,
+          "dependent": 0,
+          "descriptions": 0,
+          "dub": 0,
+          "forced": 0,
+          "hearing_impaired": 0,
+          "karaoke": 0,
+          "lyrics": 0,
+          "metadata": 0,
+          "multilayer": 0,
+          "non_diegetic": 0,
+          "original": 0,
+          "still_image": 0,
+          "timed_thumbnails": 0,
+          "visual_impaired": 0
+        },
+        "tags": {
+          "handler_name": "SoundHandler",
+          "language": "und"
+        }
+      }
+    ]
+  },
+  "canonical": {
+    "container": "mp4",
+    "durationSec": 1.012993,
+    "presentationDurationSec": 1.012993,
+    "mediaDurationSec": 1.012993,
+    "sampleSpanSec": 1.012993197,
+    "timebaseTickUs": 22.675737,
+    "tracks": [
+      {
+        "type": "audio",
+        "codec": "aac",
+        "profile": "LC",
+        "cadenceMode": "UNKNOWN",
+        "sampleRate": 44100,
+        "sampleRateCore": 44100,
+        "sampleRateOutput": 44100,
+        "channels": 2,
+        "channelsCore": 2,
+        "channelsOutput": 2,
+        "channelLayout": "stereo",
+        "audioObjectType": 2,
+        "sbrPresent": false,
+        "psPresent": false,
+        "bitrate": 96767,
+        "language": "und",
+        "mediaDurationSec": 1.012993,
+        "sampleSpanSec": 1.012993197,
+        "presentationDurationSec": 1.012993,
+        "timebaseTickUs": 22.675736961451246,
+        "mediaTimescale": 44100,
+        "primingSamples": 0
+      }
+    ],
+    "tags": {
+      "major_brand": "isom"
+    }
+  }
+}

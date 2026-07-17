@@ -18,7 +18,8 @@
 #                        reuse a foreign server).
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 1800000 = 30 min).
-#   --headed             show the browser window (debugging).
+#   --random-seed <text> deterministic execution/media-selection seed for exact replay.
+#   --exhaustive         run every eligible catalog input for each selected scenario.
 #   --no-reuse           force every selected executable cell to run instead of reusing stored
 #                        results from prior runs.
 #   --no-serve           do not start a server; assume one is already up at --base-url.
@@ -45,14 +46,28 @@ PORT_EXPLICIT=0   # set when the user pins --port (we then refuse to reuse a for
 WARMUP=""
 ITERS=""
 TIMEOUT_MS="1800000"
-HEADED=0
 NO_SERVE=0
 KEEP_SERVING=0
 BASE_URL=""
 NO_REUSE=0
+RANDOM_SEED=""
+EXHAUSTIVE=0
 
 # bash 3.2-compatible CSV-append into a named array (macOS ships bash 3.2 — no `local -n` namerefs).
 append_csv() { local _name="$1" _val="$2" _p; IFS=',' read -ra _parts <<< "$_val"; for _p in "${_parts[@]}"; do [[ -n "$_p" ]] && eval "${_name}+=(\"\$_p\")"; done; }
+
+print_help() {
+  echo "bash scripts/run.sh [wrapper options] [canonical run options]"
+  echo "The wrapper opens each requested browser in a visible window."
+  echo "Canonical options (generated from src/app/options.ts):"
+  bun "${SCRIPT_DIR}/launch.mjs" --help-canonical
+  printf '%s\n' \
+    "Wrapper options:" \
+    "  --port <n>         pin the suite server port (default: choose a free port)" \
+    "  --no-serve         use an already-running suite server" \
+    "  --base-url <URL>   server URL; implies --no-serve" \
+    "  --keep-serving     leave a server started by this wrapper running"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,18 +81,18 @@ while [[ $# -gt 0 ]]; do
     --warmup) WARMUP="$2"; shift 2 ;;
     --iters) ITERS="$2"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
-    --headed) HEADED=1; shift ;;
+    --random-seed) RANDOM_SEED="$2"; shift 2 ;;
+    --exhaustive) EXHAUSTIVE=1; shift ;;
     --no-reuse) NO_REUSE=1; shift ;;
     --no-serve) NO_SERVE=1; shift ;;
     --keep-serving) KEEP_SERVING=1; shift ;;
     --base-url) BASE_URL="$2"; NO_SERVE=1; shift 2 ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) print_help; exit 0 ;;
     *) echo "run.sh: unknown arg '$1'" >&2; exit 2 ;;
   esac
 done
 
-# Default to Brave (a REAL, non-headless browser) — user mandate: no headless testing. Other
-# browsers (chromium/webkit/firefox) remain selectable via --browser and also run non-headless.
+# Default to Brave in a visible browser window. Other browsers remain selectable via --browser.
 if [[ ${#BROWSERS[@]} -eq 0 ]]; then BROWSERS=(brave); fi
 
 if ! command -v bun >/dev/null 2>&1; then echo "error: bun required for the launcher (node/npm/npx are unavailable here)." >&2; exit 2; fi
@@ -133,7 +148,7 @@ fi
 
 # Default port for the --no-serve display case (server is foreign / already up).
 if [[ -z "${PORT}" ]]; then PORT="5173"; fi
-if [[ -z "${BASE_URL}" ]]; then BASE_URL="http://localhost:${PORT}"; fi
+if [[ -z "${BASE_URL}" ]]; then BASE_URL="http://127.0.0.1:${PORT}"; fi
 
 # ── start the static server (unless told not to) ─────────────────────────────────────────────
 SERVER_PID=""
@@ -216,8 +231,9 @@ fi
 mkdir -p results/raw
 
 LAUNCH_COMMON=(--base-url "${BASE_URL}" --pillar "${PILLAR}" --out "results/raw" --timeout-ms "${TIMEOUT_MS}")
-[[ "${HEADED}" -eq 1 ]] && LAUNCH_COMMON+=(--headed)
 [[ "${NO_REUSE}" -eq 1 ]] && LAUNCH_COMMON+=(--no-reuse)
+[[ "${EXHAUSTIVE}" -eq 1 ]] && LAUNCH_COMMON+=(--exhaustive)
+[[ -n "${RANDOM_SEED}" ]] && LAUNCH_COMMON+=(--random-seed "${RANDOM_SEED}")
 [[ -n "${WARMUP}" ]] && LAUNCH_COMMON+=(--warmup "${WARMUP}")
 [[ -n "${ITERS}" ]] && LAUNCH_COMMON+=(--iters "${ITERS}")
 # bash 3.2 + set -u: expanding an EMPTY array as "${arr[@]}" raises 'unbound variable', so guard on

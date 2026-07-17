@@ -1,0 +1,5339 @@
+{
+  "schema": "media-test/scenario-expansion@1",
+  "scenarios": [
+    {
+      "id": "probe/aac_adts",
+      "revision": 1,
+      "definitionHash": "f4b2c8ec2a5170cafb894d0a4f1fc191d9060270f711da297144c1f497a50501",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/av1_720p_5s",
+      "revision": 1,
+      "definitionHash": "69f14e99c37c7e41fa074dac356dccea1b04d26388d2b6bed66c3d7d1198655a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/big_buck_bunny_1080p_h264",
+      "revision": 1,
+      "definitionHash": "e865c20708cd2ecf907717dac92eb409019fb2d7daa45ca859eb232add104fc3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/cenc_cbcs",
+      "revision": 1,
+      "definitionHash": "fd9fc3812b95a88f1d61b959513335edf813a4eece0d3119d5acde6ebeaa41b2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/cenc_ctr",
+      "revision": 1,
+      "definitionHash": "72b07de021657136babc389df0fc10c9d2057ffb901be873c0e7f2c564d14495",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/empty-audio-wav",
+      "revision": 1,
+      "definitionHash": "086ea58f9c64c61997c5755879313d8825de6c4a5c3e80a48d0b90d0f1910b21",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/flac_noseektable",
+      "revision": 1,
+      "definitionHash": "c7ef702a6b877e150b8cd2a7ecadb02e5878e2a5ef68c778d7d8bfb94961cd97",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/flac_seektable",
+      "revision": 1,
+      "definitionHash": "acf476f46565a97eb4a0a3796e834d5529ec1af3c2b459f9c5751f2ba8681756",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/fragmented_cmaf",
+      "revision": 1,
+      "definitionHash": "30a194e05ab75c8ac48f7478f34ee86f4e59371c2378c2e8d9ae806a0ea51e88",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_1080p_30s",
+      "revision": 1,
+      "definitionHash": "061605f043034554e0bf53488f2afdeecbf31b7979744d16f9fb430ffd509156",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_1080p_5s",
+      "revision": 1,
+      "definitionHash": "b165d1c884c5040cfedf4d9b5f55895cc17e47a112d2617804aa46b4df90a853",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_1fps_30s",
+      "revision": 1,
+      "definitionHash": "60aa304ec38068176d7f33051c3e6403ee709d144f5fa7f55c175ff8172b4948",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_4k_10s",
+      "revision": 1,
+      "definitionHash": "0aba0a196f30d5018282fb7d60fec02092ee3a5a8518bcf651abd0a80f92dcde",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_bframes_1080p",
+      "revision": 1,
+      "definitionHash": "cafd226f32aa852a2d16d1ff78133f35848ef45d9b1331867d44dac00537c52f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_in_mkv",
+      "revision": 1,
+      "definitionHash": "0163114989b8c01f6b1d8f3a4bd827bddbe7b501d3eb13cb20ca8d5ffaed33a9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_multitrack",
+      "revision": 1,
+      "definitionHash": "7498fd47659a83e3347cd42b0fd9b5c3323f47b6def9962926439e3da6ce3ac8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_rotated90",
+      "revision": 1,
+      "definitionHash": "18057e2ee704d414ea426d4fbbe5b3b14e31037d937142b4def6f54c265e9195",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_ts",
+      "revision": 1,
+      "definitionHash": "3b30491097d481ec6ef14f3a04485e666318d0c78dd2d5d55de69ab9911cb7bc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/h264_vfr",
+      "revision": 1,
+      "definitionHash": "7690d814fca614a1ba9bb34295056ad507b191034cdf0c562dca121d62fff5e6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/hevc_1080p_10s",
+      "revision": 1,
+      "definitionHash": "e50c6b86037a24c1d49f87856e8bebcbbd10766943d3383c2b38033ac98db9f5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/hls_aes128",
+      "revision": 1,
+      "definitionHash": "bcef4c152868ffe7518c5770e7f9bbbecb29e8e75a043d44ad1c1ec29565a9e3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/hls_aes128_playlist_key_free",
+      "revision": 1,
+      "definitionHash": "04a9f73cbbb38d26cb814ce13b16a20e84907b3457bef86dbca31db21fdc3498",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/hls_vod",
+      "revision": 1,
+      "definitionHash": "10ff6384e5a94e77c6cef0c1eec42e5b324856233440b46bacdf4ea939344499",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/huge_h264_1080p_600s",
+      "revision": 1,
+      "definitionHash": "9cdf7e4b442240a4b4ba7afb29401ff9a8ecbb3246772386583ce3d074c2b3da",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/huge_vp9_1080p_240s",
+      "revision": 1,
+      "definitionHash": "3d80fd8cf01eb8384133cea01976127be6b96f8b48cf6730e1cc4c7efbd9ef72",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/large_h264_1080p_120s",
+      "revision": 1,
+      "definitionHash": "fd12c88885708a7d5e3f57ac3997fa6d1161c130eb37e265e74bcf0813ed0e45",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/large_vp9_1080p_120s",
+      "revision": 1,
+      "definitionHash": "1b7eb7feb86edcbf43a446bd7ef00fde00970277793acf8584242c98e221f23c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/longform_1h_audio",
+      "revision": 1,
+      "definitionHash": "76ea172259535936b8a2719e176b3b1acc83972110af1e4250f8372bdbfdd93c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/massive_h264_1080p_2h",
+      "revision": 1,
+      "definitionHash": "ed7dbcdab0744df0dbe6f5f7c01fd2188be6780f1e7768dd89e12b9c76c36fb9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/massive_vp9_1080p_2h",
+      "revision": 1,
+      "definitionHash": "a8e57014e440d6fc7204faf12d8d7417bc6b73330504ed9a5e570ec8861872cd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/metamorphic-duration-across-containers",
+      "revision": 1,
+      "definitionHash": "9168e2801da9f281a90b5f979009d2156de1beab4a325937ad94888486f325d3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/metamorphic-recorder-headerless-sane-duration",
+      "revision": 1,
+      "definitionHash": "36c0d5c0d2c115062a39796134cfd1cd94fd64097303e1ba1bf35c515569bd75",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/micro_audio_short",
+      "revision": 1,
+      "definitionHash": "7502fd9ef580161a5cb94b2133badbb9fae8a2c3c7497db65ef54b943a04d61b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/micro_h264_1frame",
+      "revision": 1,
+      "definitionHash": "1bac6779f4a2dfbb01642c677e3f086239c4b028605dd5a4f6f3f59a3785d015",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/mislabeled_h264_content",
+      "revision": 1,
+      "definitionHash": "c9e93211b186abd093b28d992fb3cbc93ec680183c472ce8957ea081060b4bfd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/mp3_cbr_notoc",
+      "revision": 1,
+      "definitionHash": "dfdb20873623d36cbd9b3a4fc265de8d1d8f24455228552ca380291663445cf1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/mp3_xing",
+      "revision": 1,
+      "definitionHash": "9aa95521851b2a632e03fbb671ffa3aed7e75ac17364b4c9442ce8eac60ad5cb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/opus",
+      "revision": 1,
+      "definitionHash": "85b369a716ff9120c642e14449d2cbc9458e6dbf933eadae9f128b16c552dc46",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/pcm_s16_caf",
+      "revision": 1,
+      "definitionHash": "7f941a1fae0e575371b4163fd4b27a942310d9f0c29ea6992afa274f0cd4088c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/pcm_s16be",
+      "revision": 1,
+      "definitionHash": "fc56f41b78afb156bad75d5298f9d562477e57685e32504ebd3102f1b291fd4f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/perf-extract-metadata-huge",
+      "revision": 1,
+      "definitionHash": "80e1e60284f69f922f94649e58f0d3d37b872b2ef39b5a1a5ddfd774f2821ae3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/perf-extract-metadata-large",
+      "revision": 1,
+      "definitionHash": "e404b4980eb1bef9b7e97789542dd19de308cc27cf4d4a459583c4e8e4a44f43",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/perf-extract-metadata-massive",
+      "revision": 1,
+      "definitionHash": "07ade34d5edf11796640671bb30d0a61f831eeff836bf7bee742eef055215dc2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/realworld_mdn_flower_mp4",
+      "revision": 1,
+      "definitionHash": "d4c726e46a78a4534c2fe24270119c3d423d566db7590a09bddcd78f3e0a16b3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/realworld_mdn_flower_webm",
+      "revision": 1,
+      "definitionHash": "e691e97774aeb15822cca366503b3efeeff7effc842f49d647794b05be50040e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/realworld_mdn_trex_mp3",
+      "revision": 1,
+      "definitionHash": "682d762f2befce8d5edb49d9d0f1a671534c466140e79a30a5048b7ab74440a6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/recorder_headerless",
+      "revision": 1,
+      "definitionHash": "d3f71a5080e639f4bc60fe58aabb46b5c8a7b30fdffeb7e2d3fbe787c419c719",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/tiny_h264_360p_2s",
+      "revision": 1,
+      "definitionHash": "fad170a4064e5a66f588b05d4b864c08edd0ea9a67b225624a256abb949d54ed",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/tiny_vp9_360p_2s",
+      "revision": 1,
+      "definitionHash": "3d5c05be32ec1fd0fd016c50912f74e2aa9635e6562ba8a39f7d7ffacbe25973",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/truncated-header-graceful",
+      "revision": 1,
+      "definitionHash": "a1b70676ecfad954c882745b3578758a7d2aca4a6abf15ab648d818b98443a50",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/ts_discontinuity",
+      "revision": 1,
+      "definitionHash": "e7704567c2a65528d67f310438a774e329b80b73486196df51c70fcbd2d4158c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/video_1x1",
+      "revision": 1,
+      "definitionHash": "dd3e3e00e3603b3730ad5dc0a0cd2ad8d18a9139b76fee487367e0b1d721840e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/video_240fps",
+      "revision": 1,
+      "definitionHash": "213900bc9aaff4976553511e652fd65c772e7813d1ff5e21fdaa28b8cecd389c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/vp8_720p_10s",
+      "revision": 1,
+      "definitionHash": "e66e111087c74f6ee6a306dedc8f8f53c3e8547f7af8ae77ac2a1a5a92c19acd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/vp9_1080p_10s",
+      "revision": 1,
+      "definitionHash": "6d308064efcf57f280941fde7a0b70271059bf49d9029a7353fc92544f5ee6e3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/vp9_alpha",
+      "revision": 1,
+      "definitionHash": "0d72fdba34e17164565bbcf738dc99a55c91e1a789638db267ef0f8a52345e49",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/wav_5_1",
+      "revision": 1,
+      "definitionHash": "a308d392526407471d03058c3c5457e11f6caafdec075a98f48c82a45bcfc128",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/wav_f32",
+      "revision": 1,
+      "definitionHash": "41db38e8b9a3e467f8f7a6241275428badc7492c34b5f5ab4f9e9440b19d59c3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/wav_s16",
+      "revision": 1,
+      "definitionHash": "941f25f6ad960aece4312d0941eea99f72ff5280c0abcafc0f3eb020e31607da",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "probe/wav_s24",
+      "revision": 1,
+      "definitionHash": "2c1393b0b26abf3d65bc0f1c72792be753f9896b058d657e31f9f741dcab7635",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/aac_adts",
+      "revision": 1,
+      "definitionHash": "59ed6d36493812355708d2bfad08c366ba58d55bae8d9f31bb5b16be795c9558",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/aac_audio_only",
+      "revision": 1,
+      "definitionHash": "64ded0accee5109cba5e3d890027d8953b6a74e38d18d048747c858188360e64",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/av1_720p_5s",
+      "revision": 1,
+      "definitionHash": "b6c29820a08a9f05fd45b58d017c8a5a2677c1ca344040c482f95799fec1e621",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/empty_audio_zero_packets",
+      "revision": 1,
+      "definitionHash": "572c7164e24b2d60f33788c81f32ba265bba621265623c6792a545e0d767e1b4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/flac_noseektable",
+      "revision": 1,
+      "definitionHash": "d7bf1b7a2238a2e40cd56159f3e9d4076fa222f619ac3b24e939ea8a2ecd8176",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/flac_seektable",
+      "revision": 1,
+      "definitionHash": "9cb142c6fbc564356d555a6ac208d51e29c344718cdb137dff711dfe664dc7cd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/fragmented_cmaf",
+      "revision": 1,
+      "definitionHash": "ec94b4b21c254ea9c137c8f02526f200c974a5219a0cd99ac6aa4fd7bf69bcb1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/gapless_aac",
+      "revision": 1,
+      "definitionHash": "b8becaf09c7755c260ff4d25cb1bed4cc96083df5f6b2659423dee490c2146e5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/graceful_mp4_header_destroyed",
+      "revision": 1,
+      "definitionHash": "48de90a71e8574b054c17ea7eeed6f55b31062d34aadf2b121cdc59c922093b0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/graceful_truncated_h264",
+      "revision": 1,
+      "definitionHash": "05eed7ea0ef3ed38bce3a17a4c39e75ee3d07d379439fa1cdad41209977461b2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/graceful_webm_header_destroyed",
+      "revision": 1,
+      "definitionHash": "849eedd9fe732c2c090f6182f4339959fbc70045660741fef02ea12b065c7c5e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/graceful_zero_length",
+      "revision": 1,
+      "definitionHash": "ad1d1a736a5708366abf84c42dca79f428a9d08cb14f490b9d0ef7acf1fddfe6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_1080p_30s",
+      "revision": 1,
+      "definitionHash": "1e96f9010ae6250b8d3a60519473d309a0aa10ed9be53106b602e39978d3297b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_1080p_5s",
+      "revision": 1,
+      "definitionHash": "fc5e238a209656c585fa2a1f0ad4cde3208071f86013c3c3e3ac9251100136ad",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_4k_10s",
+      "revision": 1,
+      "definitionHash": "017cbec9b1d036a0abd84cdff2130ccfcbc27503ca4b73c0115940c32d1b9106",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_bframes_1080p",
+      "revision": 1,
+      "definitionHash": "58ed5807172ea8c9c37a0985f5014dcd797c8471d9d03f2401ef3468ad4759b2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_in_mkv",
+      "revision": 1,
+      "definitionHash": "f627b0117a0090e1d8bc9b23ccd8422cca064efa03bc0c4484bd1f3ecf8de86d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_multitrack",
+      "revision": 1,
+      "definitionHash": "6042def8ee30b2fa99ddce1f6a2882d6b0cbdea7af0e64a6554e094986ec6dcc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_rotated90",
+      "revision": 1,
+      "definitionHash": "dc8deb0888f77b85d7d1315c92091ff234879596938214c6ec8dee1faff1d095",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_ts",
+      "revision": 1,
+      "definitionHash": "4cbba4f46a640c24328bcdd06a4b9aa71a244103279094737e8eab4407e3ec09",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/h264_vfr",
+      "revision": 1,
+      "definitionHash": "46b1ce16b037c94305271d0587af224de003efec5f0c2801d0e26c3e449b5f07",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/hevc_1080p_10s",
+      "revision": 1,
+      "definitionHash": "b9274257a128c06fcca2ce5bdc353a0b696e39edab698ff25a1d307f58edaea8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/hls_aes128",
+      "revision": 1,
+      "definitionHash": "084354574badfaf230478ae124ea2a429f379384d57fa1fe0f1940577dbdc181",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/hls_vod",
+      "revision": 1,
+      "definitionHash": "82145cbdff8725a1b4db3e68fac47f5d28ed33dc6c60b906c2a01c08c04eb04d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/metamorphic_flac_seektable_invariance",
+      "revision": 1,
+      "definitionHash": "6654cbf4232cc3ab7ad1442e1c97bfa15bbd9d77feface50941b0051384bfb9c",
+      "inputVariantIds": [
+        "with-seektable",
+        "without-seektable"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/mislabeled_h264",
+      "revision": 1,
+      "definitionHash": "3c88eca65b75cf585040fac5e674a671ccc36b33724483eaa2c54d649ccdc988",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/mp3_cbr_notoc",
+      "revision": 1,
+      "definitionHash": "0e2a6333723503f9ce1f2a3f7451cc5a73e8d54f00dc9d5e98c034d5956432e3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/mp3_xing",
+      "revision": 1,
+      "definitionHash": "5331cc5529a371d255d0749a19cd427a160afd6bc7eefc056568bdf4ff6cc91c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/opus",
+      "revision": 1,
+      "definitionHash": "ea13d0a62aee71ec96e03a3b228d0ebfc52cebb35c3f21c435228e5fed8cba72",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/pcm_s16_caf",
+      "revision": 1,
+      "definitionHash": "aaa486cf007030b344782d20417b1ca67160ed959c0532a34a11c7182bf18117",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/pcm_s16be",
+      "revision": 1,
+      "definitionHash": "b06e7d9e110f3fb05a8ccef32c4c8dcee9304b669102bae8663c0c7db94f37fc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/realworld_mdn_flower_mp4",
+      "revision": 1,
+      "definitionHash": "c480b72d6d69027261d3dfdf43fb58db2f35b374fc4d2ae79d247b7407b4040a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/realworld_mdn_flower_webm",
+      "revision": 1,
+      "definitionHash": "d3645e01eefd19322b3ca43940fb723853b319ca586fbb260b1ef9f0817dcd21",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/realworld_mdn_trex_mp3",
+      "revision": 1,
+      "definitionHash": "1612bff46973684d3db83b99d915d06aa97e025bb802d90e947dabe71cf61b68",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_huge_huge_h264_1080p_600s",
+      "revision": 1,
+      "definitionHash": "609f13c48451709ff3979d183bcd4c49ab033769297fad743ac6469368be4101",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_large_large_h264_1080p_120s",
+      "revision": 1,
+      "definitionHash": "e34eb9bd6c967ff70c3cf4afa1374b2fbaa0ea6cbdaa9fb8ca6d62bf19bd2f6f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_large_large_vp9_1080p_120s",
+      "revision": 1,
+      "definitionHash": "4bcb1b239225d6ce3e29ac63b91d4949a35b6f6d19c011806a5d935061935da5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_massive_massive_h264_1080p_2h",
+      "revision": 1,
+      "definitionHash": "1faec0838c678ea3303bc212592833cae16300c272094bd1f644148456356a0f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_micro_micro_audio_short",
+      "revision": 1,
+      "definitionHash": "f2f74073891a34e4197b7122d51b624559b2a67adc28e4bc8e855e129c95bdf9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_micro_micro_h264_1frame",
+      "revision": 1,
+      "definitionHash": "5da3c37e1f078172b5e5c46a84e2a6e38066aa456aef9e1b15bbcbc45b0909bb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_tiny_tiny_h264_360p_2s",
+      "revision": 1,
+      "definitionHash": "dbf11b1b4e7d5eb3378759818bd4f145185d587a321810761ff1f7bbbbb42a7d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/size_tiny_tiny_vp9_360p_2s",
+      "revision": 1,
+      "definitionHash": "0246a65f999c628b9f9dee4979612f497b703e3c10e7710311df4d107aecb506",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/ts_discontinuity",
+      "revision": 1,
+      "definitionHash": "ab56dca395a0ae5102fbe5d11e692a0b1d114e7766d525802bf582ab4da00ffe",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/vp8_720p_10s",
+      "revision": 1,
+      "definitionHash": "5f9677206d695348d2f4c04509f54db49be3ea8cd646cfd8ec7feedbec769497",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/vp9_1080p_10s",
+      "revision": 1,
+      "definitionHash": "69d07e5b623cc109796a4a5384c4654ecc3458b4db5d625ffdf2bfb77670b068",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/vp9_alpha",
+      "revision": 1,
+      "definitionHash": "ad287cb554ea0b6a7505f7122c43f856be1e34eadded7a2248e627a90ae00aeb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/wav_f32",
+      "revision": 1,
+      "definitionHash": "a44593c6839da8b62d2ede780fea40562b56ff6ccb80af292c00579afd90b2f1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/wav_s16",
+      "revision": 1,
+      "definitionHash": "a8dd24b531d2484e4f081b575f2e8982ba0637498110f971a62d20e89bea97fa",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "demux/wav_s24",
+      "revision": 1,
+      "definitionHash": "3f910a72b3797a18dca0c1fb55afe4348a0e73360f41946c023328352b6a1c61",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/aac_adts_adts_to_mp4",
+      "revision": 1,
+      "definitionHash": "930a5da10c31323ef20046115509f0daa19f897070412ad36158cd1af6cfd02f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/aac_adts_adts_to_ts",
+      "revision": 1,
+      "definitionHash": "86f7a29be623a2aa7a76d8550a3ee7f9d198a844d857a8932b9904c44561ae77",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/av1_720p_5s_webm_to_mkv",
+      "revision": 1,
+      "definitionHash": "5311ab2cce7285ad57985836b7ee66e70d3f3f38a5fe946668028891698213b3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/av1_720p_5s_webm_to_mp4",
+      "revision": 1,
+      "definitionHash": "af8cda4383d7f9ba6891baea54ef70e8605512b2d517eb5522630328660889a4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/av1_720p_5s_webm_to_webm",
+      "revision": 1,
+      "definitionHash": "a789d8659e2d06afba2bf09f241e8e06bbfc57317e4dc7ecd51ecafb20ef3165",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/flac_seektable_flac_to_mkv",
+      "revision": 1,
+      "definitionHash": "e720597847f4c7c87759cff3e7602b0771a0a5f51b8c11ba47cdef6d6c07c307",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/flac_seektable_flac_to_ogg",
+      "revision": 1,
+      "definitionHash": "eb9c2d35f70983b0a2022c42e4ecac97f92de84ec73e51d2bba6b1eaa3239a6b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_30s_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "a9310fafd95b257c1dc56908b3fe388cb11a5a152fc5b6aaae743a716943179c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_30s_mp4_to_mov",
+      "revision": 1,
+      "definitionHash": "6b20a37f8ad032536023996bc7e7299609e1f3feafb6f61a5c52fd9564a6078b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_30s_mp4_to_ts",
+      "revision": 1,
+      "definitionHash": "252cc7b883b01ba13cdf20681951ae59fed9f73865177711e63bb62bf9ee7310",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_5s_mov_to_mkv",
+      "revision": 1,
+      "definitionHash": "cc04c2e2900dd8f5d42297aae8073f1ea318080c71f1aea5eb0d8810073de0d5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_5s_mov_to_mp4",
+      "revision": 1,
+      "definitionHash": "880719e78f88489e86de97dcdf8d2a3319d3d4f38bd8695d8c5f5e9451fade50",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_1080p_5s_mov_to_ts",
+      "revision": 1,
+      "definitionHash": "37f8ad50c40b7040d5bbe1b9a8656d628aa1504a944295732f7a0bee14775f91",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_bframes_1080p_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "d8a289b8ac1799ef833b9566ceb62cd3eab681434f5f10967b29af62c633fb53",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_in_mkv_mkv_to_mov",
+      "revision": 1,
+      "definitionHash": "b178e90c6bf4b6acdc0adddd2f652bf9abd82ab633c72a3033940d154b035fa2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_in_mkv_mkv_to_mp4",
+      "revision": 1,
+      "definitionHash": "3b76eadd55019ee3daa54a970050662e14648a38caf1c90fa3df8a8df36ac259",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_in_mkv_mkv_to_ts",
+      "revision": 1,
+      "definitionHash": "97a30487638f7b44342a27a79f0c247d5dae1e74dc5b318adf0344c4cb27c615",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_multitrack_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "1020cf67417da424409f15bf8e6827cbf986b479accc4e081d3dbfc728a42fde",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_rotated90_mp4_to_mov",
+      "revision": 1,
+      "definitionHash": "067382bc03f2c8b78a44bf2ef8ca4ccce58875403022adbce763af529e775841",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_ts_ts_to_mkv",
+      "revision": 1,
+      "definitionHash": "34f05b7e00d81f7431aa161810a237c61635fdcb8502318cc69cbc867c0a7659",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_ts_ts_to_mov",
+      "revision": 1,
+      "definitionHash": "24c74a44d5a6495426b0207e6fecc6865c7c13f0c109111eba9be6d98558cba4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/h264_ts_ts_to_mp4",
+      "revision": 1,
+      "definitionHash": "0ff1c4cadc405b636726bf4dfb0f66d99423e97da2a077298219cec4c4e928b0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/hevc_1080p_10s_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "8fedaa451198a85eb7394c569d69e87f90644697b12cddfdc053201e397769bb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/hevc_1080p_10s_mp4_to_mov",
+      "revision": 1,
+      "definitionHash": "8a98a14cbd6da17d9e26a19b8bc31d5fe3eddf5b3ade78765b822f4fd5a33d3c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/huge_h264_1080p_600s_mov_to_mp4",
+      "revision": 1,
+      "definitionHash": "e5136b618aab2d603917ede886df88cd834d3d4a7833b146a4a864edf6f525df",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/large_h264_1080p_120s_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "1bce2403298ca5d83df804a823a518340153c3372d10292e54b94d0c064f49b3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/large_vp9_1080p_120s_webm_to_mkv",
+      "revision": 1,
+      "definitionHash": "28a62cdc4dd555caba9ba14175212149a2ce26525888aee07320419046ee4854",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/massive_h264_1080p_2h_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "9cda2745bd062dced8b2db58cdf7a56940e9d459ac29bb5c39656dfb1b78fed5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/micro_audio_short_mp4_to_adts",
+      "revision": 1,
+      "definitionHash": "e1f28b52f9ce59cb41a6d7f3870717de4fe59de474fd26d0a19b43744fefe332",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/mp3_xing_mp3_to_mkv",
+      "revision": 1,
+      "definitionHash": "92221f9990229dfa5350c0b66c0b7457cca77349bde9111d0839748a0501853f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/mp3_xing_mp3_to_mp4",
+      "revision": 1,
+      "definitionHash": "0ae34e7bf36efedd6ecad6486a482c06907357742b99a42b8f76c07bd672e3cf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/neg_headerless_webm_to_mkv",
+      "revision": 1,
+      "definitionHash": "0c4d644d42887d69df972c66e148abd5d16044034e27f5da0d05af79223b4ae8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/neg_truncated_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "6fc7c71edad2a0e36b865d8630ea8ff5bac399ffeba2c5dad7ad6a334566fe9e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/neg_zeroed_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "ce2de17cc134e244c2ed9920e086a256c0cd998e25fd9beaf8506710e7f28266",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/opus_ogg_to_mkv",
+      "revision": 1,
+      "definitionHash": "ff2a343f716787a091b61b4155626f06655ccbb2e485594f441efb8e4f353552",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/opus_ogg_to_webm",
+      "revision": 1,
+      "definitionHash": "73145c136fe6c32db0fc002d64479d0d7ffeb96f9bef87a2ed127f13961f150a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_adts_to_mp4_duration_invariant",
+      "revision": 1,
+      "definitionHash": "9bcba0bd85ffda62aa3d0a7fdc0d158214d545725bb379ec61db5c7648798dca",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_bframes_decode_remux_mp4_mkv",
+      "revision": 1,
+      "definitionHash": "9578bd78aaefd42446bf602d9fb3cd94d1dc7a5e02c765871a6448ad4b99afd3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_bframes_decode_remux_mp4_mov",
+      "revision": 1,
+      "definitionHash": "d6374076e8770e8fe912f5a7a1d5fef02ebc8101a8a1c3efdf40f05edab922c1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_mp3_to_mp4_duration_invariant",
+      "revision": 1,
+      "definitionHash": "07e936f0124e1fca07590210e888926d6919df7c6ccce023b4144ff8ac4e060f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_multitrack_survives_mp4_mkv",
+      "revision": 1,
+      "definitionHash": "2fd4b074a6640e0e915f0efd67ae3022ee376fd92e5fc828f491e31fc5deb179",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_recorder_headerless_duration_materialized",
+      "revision": 1,
+      "definitionHash": "776df26d9aaf02f11d10a1318353e40c92164abd304591b1c07287082145c959",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_rotation_survives_mp4_mov",
+      "revision": 1,
+      "definitionHash": "34fa816adaf448c4ae43218c3ac7d4b0bca8ac03e4f74d929a7862a1f3efa217",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_roundtrip_mp4_mkv_mp4",
+      "revision": 1,
+      "definitionHash": "e646a0b8db5dae0c3a9248d8a84d004de3a16ea5006810d7c6cadfd0e3effe8d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/prop_ts_to_mp4_duration_materialized",
+      "revision": 1,
+      "definitionHash": "4f80724f0473e900b7125f4b4c9dc307002a6fff311494ca476feaa3ea93a87e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/vp8_720p_10s_webm_to_mkv",
+      "revision": 1,
+      "definitionHash": "29d920f03603c032584176148fd7167d71e543d985d1afbb92d8c2cd0915d6f0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/vp9_1080p_10s_webm_to_mkv",
+      "revision": 1,
+      "definitionHash": "44530fdf87055081fcb0e106b67eadc50ad952d825ea5a19d5731e86706c3b36",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/vp9_1080p_10s_webm_to_mp4",
+      "revision": 1,
+      "definitionHash": "9eddd5c8aa60c9966bd8d59dcd9c43bd0cb5576190b3e151ff5d43790cc03367",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "remux/vp9_1080p_10s_webm_to_webm",
+      "revision": 1,
+      "definitionHash": "13e19d8f435236425060e5b4a8c9234e677d9f5d6a1f56cdb49b8bfd22530d49",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/aac_to_mp3_mp4",
+      "revision": 1,
+      "definitionHash": "19ce74231c8b6ef6557c9135ba223438862c0498958827b252de37e4749afa11",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/aac_to_opus_webm",
+      "revision": 1,
+      "definitionHash": "2fed3816423377ff87264c6fae106031f38f20c960f70a49b2deae12e69ba87b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/aac_to_pcm_wav_extract",
+      "revision": 1,
+      "definitionHash": "29750c69db2112cf93bec8a0bc8f6e2b7158d03fd38fcee4e4456a4668210584",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/av_downmix_stereo_to_mono",
+      "revision": 1,
+      "definitionHash": "aacbdaf79edda8e69d6141ba05f24cb56030853b73ae58fd9c58a85af8586ed2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/av1_to_h264_mp4",
+      "revision": 1,
+      "definitionHash": "53eb78a0fd399360c1df0a93201c4159851e7f37eede22d3dd4e9ab0cca2e811",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/av1_to_vp9_webm",
+      "revision": 1,
+      "definitionHash": "0a5b810858ac0d00700d8714bf47fd5ea8cda1c9bff8ed3b4b10c7a38e30fe09",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/bframe_reorder_h264_to_h264",
+      "revision": 1,
+      "definitionHash": "561a9e4fea4162fcf28086a142aa98d2b958da60ec38d22070edb56d9da6dbea",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/bframe_reorder_h264_to_vp9",
+      "revision": 1,
+      "definitionHash": "5bbe0a2c6df4d153c55091918f6890bb351c9793fe6059d3f5b33d3d0865c73f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/extreme_fps_1",
+      "revision": 1,
+      "definitionHash": "63829b1fd6e32aadb1428a498d94bd6245cdd9f97051426a92358c36532945c3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/extreme_fps_240",
+      "revision": 1,
+      "definitionHash": "09bfb2b1e2da69a410b1b0585d6f3460086280a3096a615bcc262dfba35b2308",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/extreme_resize_0x0",
+      "revision": 1,
+      "definitionHash": "81226731b7fc9716f7cce77cdbbdedac06986b2499b8d0cc03664afdd98e87b4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/extreme_resize_1x1",
+      "revision": 1,
+      "definitionHash": "35a26f541035c5854a6d39816afc5db5726709523af75a3868388e5d481d654d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/fanout_h264_abr_ladder",
+      "revision": 1,
+      "definitionHash": "2d01c6a9e6d4901f420087674fc0a31fe6dcb84c99d14ae59b41f4c3aa8fd1dd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": [
+        "1080p",
+        "720p",
+        "480p",
+        "360p"
+      ]
+    },
+    {
+      "id": "transcode/flac_to_aac_mp4",
+      "revision": 1,
+      "definitionHash": "b284d806a8f0704264e64478388e9edb12bbc4a38df07444cb86274bf1bd5f1c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/flac_to_opus_webm",
+      "revision": 1,
+      "definitionHash": "38d220a72f9a00c63067077b9b8697a41636511e79cc394e6d6ac471a04a6192",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/gapless_pcm_to_aac_priming",
+      "revision": 1,
+      "definitionHash": "d23e2f5226a26b558a2f7d22943d3951623d51ff6c7a7f0f78010fa6eb8318c6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/gapless_pcm_to_opus_priming",
+      "revision": 1,
+      "definitionHash": "5a5f651b0c0a7dd992fd42ab3660b6e4be691faad37b1b25b65562d91ee03fda",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_10bit_to_h264_8bit",
+      "revision": 1,
+      "definitionHash": "d11b38be6985d97529304c995b69d69b6fae9c22937986e6b3359489a4ee71b6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_8bit_to_hevc_10bit",
+      "revision": 1,
+      "definitionHash": "ec9ffe0afc39c23aa7e4fa4903c89b3fc7fcac2244f310c7a44b1b0fba591167",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_bitrate_2mbps",
+      "revision": 1,
+      "definitionHash": "81299406955ea9c7f71d5fa3c719eb2c9349be8c46fc27956c08bb978e995fa3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_colorspace_709_to_2020",
+      "revision": 1,
+      "definitionHash": "e9667f807c68c1227f3e91486a2a70bffd8031968d448ebe3be2fd3be243aba8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_crf_quality_mode",
+      "revision": 1,
+      "definitionHash": "4ab8cafe78865c65b8bc1a18146f23f0efe9a81ca13f98110b21c0c0788c3c4e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_crop_center",
+      "revision": 1,
+      "definitionHash": "b6972710d17d20c5c0475e35bb0a3e547a3058b506636e85195ad2f8b64637d0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_flip_horizontal",
+      "revision": 1,
+      "definitionHash": "d1e0d545dc6093774663c6e53d09b33c54f2ac0a0f66d01218d388f66a0bc332",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_flip_vertical",
+      "revision": 1,
+      "definitionHash": "e5283bc2c7de2f484d28efc71abf242cf99a1cf19c49c71faf73be90c0a87660",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_fps_15_to_30",
+      "revision": 1,
+      "definitionHash": "1c72486100881cd71d94f96d67b420a0c6897e3cbe110b0d3770e58cf459ba6e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_fps_30_to_15",
+      "revision": 1,
+      "definitionHash": "1137b582d81edbe31e3eb3b21fa047d15abcc2b33c4e0a5a8a43bd3d86c49b2e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_fps_30_to_60",
+      "revision": 1,
+      "definitionHash": "d6b0074abfb8773eff41e83405c5a70864afa6681ddd582cbd57a81febdc2424",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_pad_letterbox_4x3_to_16x9",
+      "revision": 1,
+      "definitionHash": "7cdf2e094a5d5e1555855dc9688c3803503c5cf3be1824fdda8315b2499cdf7d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_resize_4k_to_1080p",
+      "revision": 1,
+      "definitionHash": "3ba87bf8f56af0f2a49b3476f02dbb608085632b58e0ee86ed6c51fc38a9773f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_resize_720p",
+      "revision": 1,
+      "definitionHash": "76ad466a41fb65545c18ae194246fcc3fed30829a108661169041784ff522e06",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_rotate_180",
+      "revision": 1,
+      "definitionHash": "4b6917f3e85892b727cb044c6c8118085a373656b8f259b1de25794da332b0cf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_rotate_270_dimswap",
+      "revision": 1,
+      "definitionHash": "a9701c3e4dfac0d659483eca0585b9f334d9d8ab4a232c7b3541b82bc37a73f4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_rotate_90_dimswap",
+      "revision": 1,
+      "definitionHash": "0d8ae3fc91634daa9ac781b2d38d8ddca8f26533411a43bf4966ace737ffde09",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_rotate_normalize",
+      "revision": 1,
+      "definitionHash": "e8368eab4629c9983f322761b77fffe6ec363ba02075fb5b445ee9eefed29115",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_av1_mp4",
+      "revision": 1,
+      "definitionHash": "b766c511ad9e21a1851319e7a341d2b7ba73d44e371db9ce56d8dc2187e3bdf2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_fragmented_mp4",
+      "revision": 1,
+      "definitionHash": "1eeeb2855e6a54f27e4f3feeec8909afd10dca14e6524a24051a14910208c34e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_hevc_mp4",
+      "revision": 1,
+      "definitionHash": "432984d3617bde72f0b9b82abe4e027b9ef758d4b7550cb09ed4d30f0130c281",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_mkv",
+      "revision": 1,
+      "definitionHash": "14d1b297ca472c302203763618cc7deaab80c735bdd00659ba92dad4665a13d7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_mov",
+      "revision": 1,
+      "definitionHash": "84e307249a08cc365794e84142fbd73ceeade9d557809088d902c53b903a6ded",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_ts",
+      "revision": 1,
+      "definitionHash": "940acb16beac33d4e0ff6f0a914376b5b439119d0f4d49b4fd58c6470b22b95b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_vp8_webm",
+      "revision": 1,
+      "definitionHash": "18325aa9310e4576f31ef7b5bd4cb77595ac7e5ad8c89a640e44ec835a69422c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_to_vp9_webm",
+      "revision": 1,
+      "definitionHash": "c663d54250740e01f824ed9504819b34939fa4f1f24ab51e27a10f8e01a965cd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_two_pass_bitrate",
+      "revision": 1,
+      "definitionHash": "49d1e594e8bae57c15d74f1f467eca961ccc3c5a77e658e309336282f07ca39d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/h264_vfr_to_cfr_30",
+      "revision": 1,
+      "definitionHash": "98501dc7422a17a18430b1452d0ec676c37a68e469c55b23fe29cc24e65fea2d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/hdr10_to_sdr_tonemap",
+      "revision": 1,
+      "definitionHash": "45a52d4915bb743bfd7b117de6621518e306f787886c6e1329a0774097a30792",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/hevc_to_av1_webm",
+      "revision": 1,
+      "definitionHash": "c8a64c49a6363e1b984a364c8f5a11ca19268d6201d34de8f6c623805d84cc06",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/hevc_to_h264_mp4",
+      "revision": 1,
+      "definitionHash": "b9ae95d1fec815919c56937ad33ace968d6be000f931aaaa83ed60458db25271",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/hevc_to_vp8_webm",
+      "revision": 1,
+      "definitionHash": "226484e05e79a0f09baaa8d6fee2283ec1dec21a7abf70d4a985a98653ba65fe",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/hevc_to_vp9_webm",
+      "revision": 1,
+      "definitionHash": "89ce84decf878b33b01efcb7df61f2b7d712ee0fe73e9f5a596ec60661886d2f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/ladder_large_h264_1080p_120s_resize_720p",
+      "revision": 1,
+      "definitionHash": "dc0a8cf4e55bf55ad9a3980f408be88d8422ce0d512a6b5f3096c740807e6a8d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/ladder_large_vp9_1080p_120s_to_h264_720p",
+      "revision": 1,
+      "definitionHash": "5c88d6cfd41376524429f1e5d79469460725f1ef54d19cda32459ad24ec3d11d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/ladder_tiny_h264_360p_resize_180p",
+      "revision": 1,
+      "definitionHash": "a45aa73308136fd528dbb21f26315e3ec69cab8a88b8f64f3127241533769e81",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/ladder_tiny_vp9_360p_to_h264_180p",
+      "revision": 1,
+      "definitionHash": "f7d78d9426c344d5c84ce2a1a38bfb968a8165065033cc255d1bf75c5a7c8b94",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/malformed_truncated_h264_transcode",
+      "revision": 1,
+      "definitionHash": "4e3022ecd84e6363b68ad8fd0a8e5fcae007af029b45c9ce03be12c52fa6c4a1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/malformed_zero_length_transcode",
+      "revision": 1,
+      "definitionHash": "55f0b5262d3b4045ac1c1b42735dd6d076820cefd694619be1e0bc3149138429",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/metamorphic_duration_preserved_h264_to_vp9",
+      "revision": 1,
+      "definitionHash": "765d6d2b93c9c18d32320057297878f7a4af40f9cb19295d7fa54d208866a69b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/metamorphic_resize_same_1080p_idempotent",
+      "revision": 1,
+      "definitionHash": "68c49015b2475bc3966c02348c20b842e9acfce320eb38b312f0137882c191ad",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/mismatch_audio_only_to_video_target",
+      "revision": 1,
+      "definitionHash": "402208279481601761dc5e4938a75d5d90c2c0d2d2b219e9111939d9f9009ce7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/mismatch_mislabeled_container_transcode",
+      "revision": 1,
+      "definitionHash": "3eb90f63057266b84e3ca9e4f89a1f60c130d650ea90fef0375f27422f4b679c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/mismatch_video_only_to_audio_target",
+      "revision": 1,
+      "definitionHash": "2897a41bff0de188ad636153f21766d4a1fb4f922ddd434913c2c7e40d869a3e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/mp3_to_aac_mp4",
+      "revision": 1,
+      "definitionHash": "3cfada0b1257e0d9b63d99d612e5487ac1e8aa0f26d3578b2661d02f349a4799",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/mp3_to_opus_webm",
+      "revision": 1,
+      "definitionHash": "429cbb4db88b138049e37cf60d654c352d29195814f0b3f13d1ecf8cf8ec4154",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/multitrack_select_default_audio",
+      "revision": 1,
+      "definitionHash": "851ab1c23b591d1310e00c669e0e712f630cafc2cd39c1351bd112f21d7116bd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/negative_jpeg_to_video",
+      "revision": 1,
+      "definitionHash": "ba786c37a1aae62a780538cdf88d4b35cf62dcca129e2a6b0e7082731a0f2229",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/negative_png_to_video",
+      "revision": 1,
+      "definitionHash": "800210188a7d11213b9e1a9c78855d4f0b30fe6fdaf749787e8f5df451877676",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/negative_webp_to_video",
+      "revision": 1,
+      "definitionHash": "0df3ab69fb4cec4663788a8db13282f36a6a2f4ca48b673085d1323b4ff08169",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/opus_to_aac_mp4",
+      "revision": 1,
+      "definitionHash": "e1ad3d7b5c2ee8c0fbfe8dc184ddf01f5136a684add65c2d4d118d0c420f61b7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/roundtrip_leg1_h264_to_vp9",
+      "revision": 1,
+      "definitionHash": "d1d68937abd2b475d1e2a52b0cef722e08f9815b6919ae53f18ee427865907a8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/roundtrip_leg2_vp9_to_h264",
+      "revision": 1,
+      "definitionHash": "d8f0047b26b06f1172d1c4e26ea5e5d45a4d830a5e78f8d28a1d94c38e73f4f9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/selfcheck_h264_resize_720p_tie",
+      "revision": 1,
+      "definitionHash": "e5253c4a4e92f9d91aca569e0a05a4eb301cce3f1a836815d19cb9574a32d47a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/video_only_h264_resize_360p_to_vp9_webm",
+      "revision": 1,
+      "definitionHash": "834aa7953b46b06b3210fc6898ab52745fe6d9d1c70ee280bc7d7421755b23f9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp8_to_h264_mp4",
+      "revision": 1,
+      "definitionHash": "a4f2e7bbfd7ed5627b7d110b96e5e537d856905f35539204cfbb46f9d0989642",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp8_to_vp9_webm",
+      "revision": 1,
+      "definitionHash": "ef7006102322918983b4f91c6e8acc7c9dd992f9b375614a9331c7afd0fd2e08",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp9_alpha_to_vp8_keepalpha",
+      "revision": 1,
+      "definitionHash": "cdd2bd8acbab053025cac0e44040d646f915efd494eff93e86fa5cc78c3002bb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp9_alpha_to_vp9_keepalpha",
+      "revision": 1,
+      "definitionHash": "a6f500709fe6ecfb93f3d717602436891ea348bce75f0dd4824f6815d604c002",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp9_to_av1_webm",
+      "revision": 1,
+      "definitionHash": "2e496b2140070d4a8e0adf392cfe6909307f9995d16c7f606adfe82d38542d48",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp9_to_h264_mp4",
+      "revision": 1,
+      "definitionHash": "f49855d32d1c90ffc0a3f4a5290d9d543a7ad77e8d969ccfeaff33c7e4ed234e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/vp9_to_vp8_webm",
+      "revision": 1,
+      "definitionHash": "f37b2f3878ff3a1b404bb717fb4444bc79fd6b742ab48942ea8eac0b4dd4c9cb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/wav_to_aac_mp4",
+      "revision": 1,
+      "definitionHash": "f85c351e8ce7b3c3944c61821eb3cc3b96f411cf48d5520ede9d4d84006f6129",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/wav_to_flac",
+      "revision": 1,
+      "definitionHash": "ff769f179179993530a064109f273440a2c6da91c1031b5d197613956525a4a5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/wav_to_mp3_mp4",
+      "revision": 1,
+      "definitionHash": "d1766232b10ef7b311bf70a6cb3803569fc79acfe8ad628a42c0fab25fed9daf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/wav_to_opus_ogg",
+      "revision": 1,
+      "definitionHash": "ae765e5142fe5e3426fab7f8fd890e65ac47b6cabc464c1582359f6dfb9f01e2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "transcode/wav_to_vorbis_ogg",
+      "revision": 1,
+      "definitionHash": "001aba289490b3a0a7b9cd2aa3e8d34144a18fa81bf14a597ad1d909dde18b44",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_av1",
+      "revision": 1,
+      "definitionHash": "9c28e4d119b0d1fa87a854ad3585e11789b309d22d77271b75d80941c13ba97e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_bframes_reorder",
+      "revision": 1,
+      "definitionHash": "5ded79542d776a0c026c952abd2034842de437bc545593b85b8099972d01d863",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_extreme_fps_1",
+      "revision": 1,
+      "definitionHash": "a59b5862b1b5c8e14f8d42b1a1d71d6b24160d73718642c70e76111806798827",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_extreme_fps_240",
+      "revision": 1,
+      "definitionHash": "c5f9dd6aaf726a6c79b8a9ac5540b36a2a8164ce1e202d1ec9699b37c2a24289",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_h264_10bit",
+      "revision": 1,
+      "definitionHash": "620c620c8c90dbc00dcc78b1506f37a5aaa47a0a33b6d8c3309119e6a87f5765",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_h264_4k",
+      "revision": 1,
+      "definitionHash": "1d189a1430d7fd495b77afa53568ee5c4c0a5169da7d05034e3d700572bb06de",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_h264_first_frames",
+      "revision": 1,
+      "definitionHash": "f528283aa1560dd1ab3b72bba1f61594247ac795deac3708ee958f37a965c7c1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_hevc",
+      "revision": 1,
+      "definitionHash": "bb25389ceb56b93384dfded96c490f6dcc1d2c22f9f366e35125492a101eea10",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_image_jpeg",
+      "revision": 1,
+      "definitionHash": "9f2c1347d4633751a83adc794f90205437ba8a9705693d791705d97b7dcf79ea",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_image_png",
+      "revision": 1,
+      "definitionHash": "ccf7aac3f49940d2cee1602648e29a87075d5a23936851819a8878a7e5664d7e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_image_webp",
+      "revision": 1,
+      "definitionHash": "a27386ae002f27202270124ca1f3a7a12da82eee32d9df74706726da8af6bfbd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_mkv_h264",
+      "revision": 1,
+      "definitionHash": "b6618729093e103e0aafa32e57d86b716388ddb161517807c8172d5bc81e0f68",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_mov_h264",
+      "revision": 1,
+      "definitionHash": "7a73bbbf62a8f74839b68f5bddf235717683463969fb9bf195b60a5ec171ee1d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_multitrack_select_video",
+      "revision": 1,
+      "definitionHash": "431c73f69355d4b35023e068665e885b9090fee778a1239c96cac78601525aef",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_open_gop_first_frame",
+      "revision": 1,
+      "definitionHash": "857a805b49f8c9981a278cea90300b3ef65ad4fe1339c9da2ed4a0ba8ba531db",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_rotated_display_matrix",
+      "revision": 1,
+      "definitionHash": "c35a77795364e593fc217d00e64b6732f5bb96568f657da64368bf4c5590b92e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_huge_h264_600s",
+      "revision": 1,
+      "definitionHash": "4384d13019b22d0e635ea7388ef79541c9e89e5be127561fb5686d3f7b64ffff",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_large_h264_120s",
+      "revision": 1,
+      "definitionHash": "736ee976f251640b224c5b8644fc661ffad0dd1cf065299befb8d943b924ef65",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_large_vp9_120s",
+      "revision": 1,
+      "definitionHash": "711b873242e7aef05d64de81a841cafca61430735ca6106f66d56d69cab96537",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_micro_h264_1frame",
+      "revision": 1,
+      "definitionHash": "fc93964bf0ffcdee2a796a522d064588737acb0734ef804cfd53bf92c971928d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_tiny_h264_360p",
+      "revision": 1,
+      "definitionHash": "6d613c8974adfe39e7b237c7da09e4472dfaa2a57033e7a4bc85fb79aa4f5537",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_size_tiny_vp9_360p",
+      "revision": 1,
+      "definitionHash": "66e9f5879f864fd491f137b05d6babd3b62216374bf3c6f383f207e53caccddd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_tiny_dims_1x1",
+      "revision": 1,
+      "definitionHash": "ef1b27610d2bec414d421dfa6b9707749ebef66e340e0c752f595a115c723aaf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_tiny_dims_2x2_h264",
+      "revision": 1,
+      "definitionHash": "487bf2b20effbc05f9de0838d3af13b79a92b181a26f335611014a0069820f19",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_vfr_timing",
+      "revision": 1,
+      "definitionHash": "cdf9ff4da29c7ce6e412d9d365b5325d8f5083dcdad8c84068633a0f7285e525",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_vp8",
+      "revision": 1,
+      "definitionHash": "456916e00acc8fbb795ac922f6602797df9924cb29bdcc594826b44dc4b4c8ba",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_vp9",
+      "revision": 1,
+      "definitionHash": "e02d3aac49b2f72df2a7c7770a372ba7d66c897268c8333b4277a9c82a8c28b1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/decode_vp9_alpha",
+      "revision": 1,
+      "definitionHash": "4d7927a0e9e1baa9b9e42c16b1d7b00925d8107b9371f65084bd8986d4ac8f67",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/meta_decode_remux_eq_decode_anchored",
+      "revision": 1,
+      "definitionHash": "3853cae38148f18ff5ecb6ddd4744602dddb02f3faacf4b46fc1bf5bbd7618ba",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/meta_pts_monotonic_after_reorder",
+      "revision": 1,
+      "definitionHash": "31f42e8efed12a0177ac8698fae1231e31579fc62a1c1afb5a5001370cfef8e5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/meta_seek_vs_linear_decode",
+      "revision": 1,
+      "definitionHash": "db94291dc81d87f58365d4c32947a216177abc5c74e47113d996c467dda04b38",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/meta_vfr_seek_lands_on_true_pts",
+      "revision": 1,
+      "definitionHash": "edff3af8a8202240f44947bcc070b84c03a84df34d33833a3ce485a98beef001",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_av1_keyframe",
+      "revision": 1,
+      "definitionHash": "5e1970cbc17b8be32e0c70725725d91c89ce38a5ebb101cffc8abe5b7eb006b5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_backward_then_forward",
+      "revision": 1,
+      "definitionHash": "9b41cc71291622fe288e160af6a15b042768db9f4613e25c4464297880b513f2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_bframes_midgop",
+      "revision": 1,
+      "definitionHash": "d0c3b2c193cb8263c6c5a1208bd9c79d67408addd1544e828fa305c858431acf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_h264_keyframe",
+      "revision": 1,
+      "definitionHash": "b148487ecf64fd738f99ab9d044297e77873deba397263abadab7d1ee85a1de1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_h264_nonkeyframe",
+      "revision": 1,
+      "definitionHash": "b9dafd71ce7ee6c431c5f29c1ffd2753299b0dda40ae6a0ca7b3e2187ee89a05",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_hevc_keyframe",
+      "revision": 1,
+      "definitionHash": "3adde4ba71ead73becd6c162d54caa616ac7734c52ff8e55c4dc25348b0cd28f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_mkv_h264_keyframe",
+      "revision": 1,
+      "definitionHash": "fcf964fc995c6ae96057d5bb59df8efb4051d35a8fed19f6ba5d78a4ded423c7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_negative",
+      "revision": 1,
+      "definitionHash": "46c156ac9d70a2758e60a6d59381af84225fd8840ced14403cac6f5beab3b6d0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_past_eof",
+      "revision": 1,
+      "definitionHash": "d8b5ec066a405df6ef8fbdde67dc97181114530f136d81dda68d2343babacf69",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_repeated_same_target",
+      "revision": 1,
+      "definitionHash": "29fa013805a1ce43e3627cb906c0ce4dd45cd04e09819dd245777958f4f558ee",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_vfr_arbitrary",
+      "revision": 1,
+      "definitionHash": "c263435f5994901d56619a72042c8c032c49c45c997ed6920b7927d981ae05d5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_vp8_keyframe",
+      "revision": 1,
+      "definitionHash": "9e3d969d9b0d895648d148d6ca90a18347adfc67599e68b5770c23d79f38f143",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_vp9_keyframe",
+      "revision": 1,
+      "definitionHash": "3e33e05efb71e1a580691cbac9adb20994e41ca62623287ae68eff9af81dc38d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "decode-seek/seek_zero",
+      "revision": 1,
+      "definitionHash": "0b8f8b905006d2d5b180b8fb4ec928e89eb68f88cda8f83ef439938903828425",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_aac_adts_copy",
+      "revision": 1,
+      "definitionHash": "e4ce4073eba642b9942319bcb635c57940f2f220ce88111a0cb36d365a64108d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_aiff_pcm_be_copy",
+      "revision": 1,
+      "definitionHash": "1a585076bda29edab55acb023a3596bd7aeae59e1f14110a581ff93d2cc759c0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_flac_noseektable_copy",
+      "revision": 1,
+      "definitionHash": "0566758ac9ebcd3d910a212a55f6f593a422a953cffb3144cfbfd0a6d5c2d7ff",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_flac_seektable_copy",
+      "revision": 1,
+      "definitionHash": "8824125c77b63bb3ff5a1ae55b8b8aef6a6e24e87d9f942d06980ea6055a800e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_mp3_copy",
+      "revision": 1,
+      "definitionHash": "9336b333526bf026f611851a58b7d1a3a3dc68d559efcda6410fd3001e1d622a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_opus_ogg_copy",
+      "revision": 1,
+      "definitionHash": "9cf14d2f93b09b2003d06078a48917fabb5eb5969d015ff0366b55601a4f4bcf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/audio_wav_pcm_copy",
+      "revision": 1,
+      "definitionHash": "d9baa26e39f72d28874e7c72c366e349ba4bde9c7b1f7f4a1224a706f0480e89",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/av1_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "c7fcc05705ed1cea5a39336ee9253bf901de1d8a9cbddd5f4468a6f416a23e01",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/fmp4_fragment_boundary_copy",
+      "revision": 1,
+      "definitionHash": "66f04f53a6ccea88eec7f63a5f609554938b0e748108f8cc60608800cca48f72",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_adjacent_concat_equivalence",
+      "revision": 1,
+      "definitionHash": "90796ca6c3a4bd2d724b049873f2cca1ad74e910778b155151b18ddc1e3ef37d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_bframes_frame_accurate",
+      "revision": 1,
+      "definitionHash": "e32aefda9d9958d465f64649860c48993ca1c1b4aa5ffbe331ddc59180ebf40d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_frame_accurate",
+      "revision": 1,
+      "definitionHash": "c4896cb15b3821d7736be731cdf79df47cd57f179958a79ab8a6935d31bc3baf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "82123e3cb6f10c2d2a965358ea0163d2ceecb16d7a1fd8d3b5ab35cbc0303e54",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_keyframe_aligned_short",
+      "revision": 1,
+      "definitionHash": "a48e93b136cacca64e10a90782491bee13e2f5dd7f772c75f174c6f3eb7d1745",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_multitrack_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "6b80b17a7925b376a8567289b46474f47803c2a70de232bb111f494ba2351ab6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_noop_full_range_idempotent",
+      "revision": 1,
+      "definitionHash": "dfe615030adc752bbdd284581fcd2ede1b886c915ec2cf420682bcad4d5fa95b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_open_gop_frame_accurate",
+      "revision": 1,
+      "definitionHash": "4f1f7b1eb16e546d809663f69570b515069d0c751b8e514da563185469497c63",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_rotated_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "b205e8e334ea6d000d8b2a17fa2ec36138507f96cfeb410423dc87b55451717b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_single_gop_frame_accurate",
+      "revision": 1,
+      "definitionHash": "e0e241948cd0559c4a684bcbc4e00f025225adc16cb321218cfacd33fb43f64c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_start_zero_copy",
+      "revision": 1,
+      "definitionHash": "60f7268ddfa630256a98ce7ca3ae5dae7a488b992f572a6b31b6bfb114855253",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_subframe_range_frame_accurate",
+      "revision": 1,
+      "definitionHash": "d6e4fe08077b16420683771aa5e0abb157d7851b6dff470d28354291f56a2358",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_to_eof_copy",
+      "revision": 1,
+      "definitionHash": "6784cd6437a9a91d6d0227c5cc5e8540b7888d8bba9264392cd83223bf42b53a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/h264_vfr_frame_accurate",
+      "revision": 1,
+      "definitionHash": "ab821a3ad7bf97457a1bee123b3a3c5ee401067e6de452983e855d587fc9918a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/hevc_frame_accurate",
+      "revision": 1,
+      "definitionHash": "9bcd2232307942cbc397e936b63859cd9f6d11b9164ed652850dbf806e16263f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/hevc_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "0686808f49db92887cc87f0e64e97f8e0d093f9863c546d56d51cde69c7b7f03",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/huge_h264_mov_copy_peakmem",
+      "revision": 1,
+      "definitionHash": "4d9daeba4e98c4a0ac2d5c7437c0ac31369962cc7910fd26e6e38041eff3ce11",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/large_h264_copy_lazyread",
+      "revision": 1,
+      "definitionHash": "88ec630dc615ea3db91e5a2dead914c0dc0e0a4f09e5f924fb9c02ee3024f448",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/large_h264_frame_accurate_throughput",
+      "revision": 1,
+      "definitionHash": "cab5c2e2d38eabcba21a7e4489cf74af130a6e7c8a5ddb55724ffeed9d223140",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/massive_h264_copy_sustained",
+      "revision": 1,
+      "definitionHash": "1342281987c7d7acd7d2dd2c51dd73339dcc653900075fe4d0f6d8d89347b426",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/mkv_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "968a54f61bf86bfaa515b194997cc7d8e1504f14bbe17a4195d10c42b41a824e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/mov_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "fefef4c743ae0950f5377a249d2d9ebc9b92e677952c35cd8a3d17f95c907099",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_bitflipped_source",
+      "revision": 1,
+      "definitionHash": "75955809192e019df4c30e8f79e8c4b9c1b832e133c03a3a5d474f7e354f84cd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_end_far_past_eof",
+      "revision": 1,
+      "definitionHash": "0b8174e556ded9e1064b932c6f389470b1bde5e3eaf8b4efdf6fcee7a8701667",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_inverted_range",
+      "revision": 1,
+      "definitionHash": "226f6ec717c9d49334cd24e835a67a105d2e247a8d002b58f0dcd34768246d35",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_negative_start",
+      "revision": 1,
+      "definitionHash": "6a2e8dee7ce421e2a75a7f3fc6ae4c2da78c78b4d7a741be7ce877cd4d7374da",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_start_past_eof",
+      "revision": 1,
+      "definitionHash": "e33d404cc4480f25d059a267f7dc83da6c88c4517ad7dc82d97fc74c8fe09fc1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_truncated_source",
+      "revision": 1,
+      "definitionHash": "0b913e35b4a3db9415e06d1e96651d03d83643bcb41b31ba3ae1c2571cd0bacc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/robust_zero_length_range",
+      "revision": 1,
+      "definitionHash": "bad51378f9be63fe75ed9844fd9ec65d531cd0fe1eeaf7b9790ff0e6d16bd59b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/ts_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "2b9c0ad58ac514338d109ea4766ad17b878d8d0d02044306433d451a8d338e63",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/vp8_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "bb6f8c499c1c42c9a7c541978afdee0300456b85530dfb35cc0f49c22177a5d9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/vp9_alpha_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "255c549e55c651c4b8156cc87d48eeb221a36f3f843a1618e8539ffb0c954f65",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/vp9_keyframe_aligned",
+      "revision": 1,
+      "definitionHash": "2ae6fed058dd932052a516b121489f6e76768188615c7c74ae872e1b9968b2e9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "trim/vp9_noop_full_range_idempotent",
+      "revision": 1,
+      "definitionHash": "f3a75a10018e783bf157ba4e0bff78e1e885f93c1f1c570601b776c0549004ea",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/aac_to_adts",
+      "revision": 1,
+      "definitionHash": "b4edd46a2f4cd4e5fe52a1354b125d1660d5aea7b60b8cd78685ef484d4b8d1a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/audio_only_aac_to_mp4",
+      "revision": 1,
+      "definitionHash": "18abc5c37287a6ff21e4e6abc3d02a952f52c68d2577f7d8daa3f1da1adaf052",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/av1_opus_to_mp4",
+      "revision": 1,
+      "definitionHash": "ebf9af40ae115173fe3ba88f37bef82947f7c84ec4f48fe6d81641d8ed35c14b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/drop_audio_track_subset_to_mp4",
+      "revision": 1,
+      "definitionHash": "b9052f73913da42a2cd863877c4d39c7f5f74549a741ea412172720a87e0a713",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_bframes_decode_mux_mkv",
+      "revision": 1,
+      "definitionHash": "c83551517728ee65c0e51a8e8ce7cbac9208e3f41cbcd89511c3b263ee55ace4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_bframes_decode_mux_mp4",
+      "revision": 1,
+      "definitionHash": "5996536fa9042e05a872ac37ae21eeb4eee4f09766716ffaf7034c35f512798a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_hevc_decode_mux_mkv",
+      "revision": 1,
+      "definitionHash": "b75fe20063d0c733f74971fa9228a288a81d77e93a2f3477571070dfd0ff7aa1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_hevc_decode_mux_mp4",
+      "revision": 1,
+      "definitionHash": "a834d930a2f9f466424b4c23428cb04d38a0fad7f6d03d586ea589ebdf0baee2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_multitrack_keep_all_to_mp4",
+      "revision": 1,
+      "definitionHash": "768ae002d8294408c959836089f8e04872c888c6f88f6322b880c37b7dc9558e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_rotation_decode_mux_mkv",
+      "revision": 1,
+      "definitionHash": "237a1d9c48500ae840e3fb17341e36559040a879989533ea019d1dbd73eb70db",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/edge_rotation_decode_mux_mov",
+      "revision": 1,
+      "definitionHash": "6878ea2f4bbdf0dd3f3ac9c1ca95f0398c11a18499c3076ef35c5fbffe6f6e37",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/flac_to_mkv_audio",
+      "revision": 1,
+      "definitionHash": "4a806cd8f6e0689eff6019437f57756977b2f1c0f8780b1528eb134e4b7d78c2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/h264_aac_to_mkv",
+      "revision": 1,
+      "definitionHash": "d3198613873633ceb62ae3a328e6b0a00141f4cc0cda12ea9e2fef9785e07c4f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/h264_aac_to_mov",
+      "revision": 1,
+      "definitionHash": "3a850cbe7f119df7d08156501792b072b7f919d354cc37c69b28a1af3487320d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/h264_aac_to_mp4",
+      "revision": 1,
+      "definitionHash": "3f463d07cf600531bde3b853dc505f8c8263193b955ac30341c816d8a12d5b92",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/h264_aac_to_ts",
+      "revision": 1,
+      "definitionHash": "9a9994ba7df0549c269ce5bbf9085c35839f6e399739db52cd9521f9013a97f9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp3_to_mp3",
+      "revision": 1,
+      "definitionHash": "c7a8130554c475c6db075a5aa86828ad5d9b49f4295487bfea59b4b6337be5d7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp3_to_mp4_audio",
+      "revision": 1,
+      "definitionHash": "046b011459d736a36c9e97449d57fa617c574be30b04a43fadf34297f6a14a1d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp4_faststart_reserve",
+      "revision": 1,
+      "definitionHash": "bf0c77563654bbe0ca821a95bfb4a94892414941f8add65a8c79f80e68aff9a5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp4_fragmented",
+      "revision": 1,
+      "definitionHash": "17b8dea758dc626d8f10232e55bdbfc849b49c40416f536d07034464e83eac5e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp4_progressive_buffer",
+      "revision": 1,
+      "definitionHash": "4241a2912a5d60718b1e6953ad1ea3e472296f480e063970378507fabaa81c41",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/mp4_streaming_target",
+      "revision": 1,
+      "definitionHash": "c7f584bce9f8c7d785bdea14bc1484c41732b99cbdb892afe19246257c9dd752",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/neg_h264_into_ogg_illegal",
+      "revision": 1,
+      "definitionHash": "5a88540f3c96e5d1d5f729999221e569ddb075818b6f4ac7c4f7e41ceda9153a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/neg_h264_into_wav_illegal",
+      "revision": 1,
+      "definitionHash": "a7e2daa04ad6d1118594d19bb910a28ce6ba8d08eb6271605b1dbd53b7a3f063",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/neg_vp9_into_adts_illegal",
+      "revision": 1,
+      "definitionHash": "d8aac805fdf821e758a670d0965c0b4fe989411401d414609265e748925d4183",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/neg_zero_tracks_empty_audio_to_mp4",
+      "revision": 1,
+      "definitionHash": "e83a064c6a9f884d29b49c87e925a2dd6259a3c5dd5e9e8d4c5301116337064b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/opus_to_ogg",
+      "revision": 1,
+      "definitionHash": "df1ae4eb07ea345e85ac4f6fafc5c7ac01d8177ceb90a6dc405e2042b153fca4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/opus_to_webm_audio",
+      "revision": 1,
+      "definitionHash": "4a8e2f58dda3c63e751ec8b2bd4d7bac11fdf2f1b6ec5161c5a409244876dd29",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/pcm_f32_to_wav",
+      "revision": 1,
+      "definitionHash": "3847cb85befeb49be1ce2f2c32a34e41121faf9cd28719ab24a0daf482c2d1c7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/pcm_s16_to_wav",
+      "revision": 1,
+      "definitionHash": "c39d388950d5320d95fb8029535ea21879315896adf3e57e302b12323e43d330",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/pcm_s24_to_wav",
+      "revision": 1,
+      "definitionHash": "cee8f9fdc552f9e2f1800629b84d674c665718318bc9c259aa24ac436b6c7f24",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_av1_mux_duration_webm_to_mp4",
+      "revision": 1,
+      "definitionHash": "ff2e8aa3b751b440b91f855047ddde47d2fed467c02b061e064b123361c14388",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_h264_decode_mux_mp4_to_mp4",
+      "revision": 1,
+      "definitionHash": "ebc0743ef221ddc81c185379c01f0665fbeda359bd5306617cc19daab44babf1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_h264_mux_duration_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "569b09d7d78a5807640d2e5ecb96164277820263aaf6e76b7af1d629db66dc28",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_h264_mux_duration_mp4_to_ts",
+      "revision": 1,
+      "definitionHash": "c7c3d9c93f3929e613a2837c1411fcdfdd6aa43ee281fa3d51c7f42d590db777",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_vfr_mux_duration_mp4_to_mkv",
+      "revision": 1,
+      "definitionHash": "f4deee7553af4afb5b874faba2afc96f259b6d46cde416bb9098f29ca38733ad",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_vfr_mux_duration_mp4_to_mp4",
+      "revision": 1,
+      "definitionHash": "e3bf6ec6c09c2bfbd446940171011b03610b4e7a857f39449a71e6d78629ba2d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_vp9_decode_mux_webm_to_webm",
+      "revision": 1,
+      "definitionHash": "595c04d5966aed98c8b7b9dae29bac530ce5252b4301d80f7d8d22a0d8cb3392",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/prop_vp9_mux_duration_webm_to_webm",
+      "revision": 1,
+      "definitionHash": "34252a05bd169c3129d8e024f99adf96f9d5e743aa2ebc550da4a8c9f211e44d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_large_1080p_to_mkv",
+      "revision": 1,
+      "definitionHash": "d710987c3e32f5add85c9d00bec46f0ad4e563afe69dc942f1ac100a87936c60",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_large_1080p_to_mp4",
+      "revision": 1,
+      "definitionHash": "97d58fd15a4ca5e67f3a5b9f4d2cda5ef8a3745e5c465df24e592042f62dff6f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_longform_audio_to_mp4",
+      "revision": 1,
+      "definitionHash": "d159091194dc9f1ca7206d73803c481c33825282bf78194b74ede353a496d523",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_micro_1frame_to_mkv",
+      "revision": 1,
+      "definitionHash": "b4f5fbcb886437e35a783690c12af4e416dd4238a60a7bf05d88efc9017887ce",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_micro_1frame_to_mp4",
+      "revision": 1,
+      "definitionHash": "8879612d89bd756fd6df250f4b378b930ab7b9193f506f656595373214c864e5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_sparse_gt4gib_co64",
+      "revision": 1,
+      "definitionHash": "b91a24245868258d0726a315b109b25170fab359676abc03164cb4b7f25a296b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/size_tiny_360p_to_mp4",
+      "revision": 1,
+      "definitionHash": "7598ebb2da2e400aa4ed2e6f17a37fa06a566805591d85ed5ea4ca2f3450f156",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/swap_audio_video_with_opus_to_mkv",
+      "revision": 1,
+      "definitionHash": "12e7f4d5c953228bde14605e68fee31deeaf4498a9b16a767b7f7a582709ded0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/three_track_assembly_to_mkv",
+      "revision": 1,
+      "definitionHash": "f4762c2fb98529cfda5684be6615e9dfc2f97038abd94da162141eaf6f3ff9ea",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/video_a_plus_audio_b_to_mkv",
+      "revision": 1,
+      "definitionHash": "39c603f5c0acb5ca3d346e654f01180e88929b60f68498653b3cc19698b58f15",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/video_plus_audio_to_mp4",
+      "revision": 1,
+      "definitionHash": "c98f6c9d38080d3f6073d5c6f7232924a8c3465d06e0bd23c788d42d1e198e89",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/vorbis_to_ogg",
+      "revision": 1,
+      "definitionHash": "953613541cf17dc4a9f7b5b683fe11de5cb9b3db542025dd150d7f064a7c6c11",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/vp9_opus_to_webm",
+      "revision": 1,
+      "definitionHash": "982a720f68789798bc3b90b2f654687abb7191a871f6282caa804b521b6bf816",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "mux/vp9_video_plus_opus_audio_to_webm",
+      "revision": 1,
+      "definitionHash": "bdeec4997024cb72dc0e2bb1ed08576317cfe1c75c5d619aed4960e1fa38dca4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_cbcs_decrypt",
+      "revision": 1,
+      "definitionHash": "fb1a6ff67796ed358853bbad10b4684e3217459cbf399f802ffa13f958b60af3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_cens_decrypt",
+      "revision": 1,
+      "definitionHash": "25ca36050f68027c88e45c3aaeee59a046cab059fda277fca182b02b9991a3b9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_decrypt",
+      "revision": 1,
+      "definitionHash": "036ea7e07f7417295a9a46be4dcfa71346425aafd28fadaa121c4996d5fc7f0f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_decrypt_eq_cleartext",
+      "revision": 1,
+      "definitionHash": "750d555cbebdfbce31852901485baea316f8567f26b30a30bf7f4ac92a0119a3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_missing_key_negative",
+      "revision": 1,
+      "definitionHash": "533b7f91d4e1445151440e9c9b741b3607986e412f9255f36255ffad0cef8b5b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_protection_zeroed_graceful",
+      "revision": 1,
+      "definitionHash": "ae03a6db3cff943d1f4d76c22790070559d1d6815a55cba492c331c335f8ed8c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_requested_as_cens_negative",
+      "revision": 1,
+      "definitionHash": "86470a3d1e6b1c6f463dbb9e09341450392ea00dd53fbb59011f042a3afabbcd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_senc_bitflip_graceful",
+      "revision": 1,
+      "definitionHash": "673dabb07f105ed812be6ce932ea7865d5f18da33e28124be509b245f008d9d6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_truncated_mdat_graceful",
+      "revision": 1,
+      "definitionHash": "97d67d935fc211e82a6c401d643a53ffba8880a8943e4ec28beb9c4c3ca712aa",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_wrong_key_negative",
+      "revision": 1,
+      "definitionHash": "2bacd186939f827e49268d1d344c0ee3c1e8b22a9b4b36111daba46434f33bd0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/cenc_ctr_wrong_kid_negative",
+      "revision": 1,
+      "definitionHash": "c33a68d0b20a52a9b4f07604e715857872d402dba5101cae8e7ef4a899a9f5dd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/clearkey_eme_not_raw_decrypt_negative",
+      "revision": 1,
+      "definitionHash": "5b3e0531a4d45abd38052472c835a093db716f10965e6819a7600371b092c128",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_decrypt",
+      "revision": 1,
+      "definitionHash": "32252eb91d68e757d80b20d38a59e062293f3d51acfd24e660a709f69e7bf7ad",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_decrypt_eq_cleartext",
+      "revision": 1,
+      "definitionHash": "9f988727401027e5c0027d02c7cec3f64f8626976742475c56f3b6d97d193c88",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_key_rotation_decrypt",
+      "revision": 1,
+      "definitionHash": "2bc0e68f6120de19d5ba392d177f0a426f27e3eba16a808eaa6d1b590416da8d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_method_none_transition_decrypt",
+      "revision": 1,
+      "definitionHash": "30b3e6f50702763576fee7917dcd968d2dfbbcb5f47151a241991b3cd39e54d6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_requested_as_sample_aes_negative",
+      "revision": 1,
+      "definitionHash": "97a8e13feee4abd67bc426cb3e106d767db2a1a1fe4702dde12ba0d8d6126ee9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_sequence_nonzero_iv_decrypt",
+      "revision": 1,
+      "definitionHash": "c1b15593157c76b97222a2d9d6b934a6c3ba27b2df89ff2bc72dd576a4047d37",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_sequence_zero_iv_decrypt",
+      "revision": 1,
+      "definitionHash": "fbf64d7b503ce7c45de8cc6e240c683b81f28023eeec92879bfc3d4cd4df0e90",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_aes128_wrong_iv_negative",
+      "revision": 1,
+      "definitionHash": "1e83b32eaaab78ec2b1c62a3320086123cd5edad43edc1992298cce9ef6988e9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_sample_aes_decrypt",
+      "revision": 1,
+      "definitionHash": "41448615c3c9783818bc6b99e2d1dce0ee8bd94022e341d8368478615470ac80",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/hls_sample_aes_requested_as_aes128_negative",
+      "revision": 1,
+      "definitionHash": "a62a71eedc80bf0992113a7e445c221ff86ba24271d4faaf1fe4dcb0a3a7b571",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/perf_cenc_ctr_decrypt_throughput",
+      "revision": 1,
+      "definitionHash": "53ea000a5be075cbea876d0f12edcdde3d525aff31504f7e35c617d09041c2a0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "encryption/unencrypted_left_untouched_noop",
+      "revision": 1,
+      "definitionHash": "d6e805ef0a4454cd7422148346547418635a04b827caaec816820ae1d166d246",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/meta_consistent_mp4_to_mkv",
+      "revision": 2,
+      "definitionHash": "1de240a2c5dc26536a5ff3804070305e84095343b58f4125b088a3cd375be943",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/neg_garbled_id3_mp3_probe",
+      "revision": 2,
+      "definitionHash": "a9807868d30d6fbb71633d4a93571a9a24429104ab78d16f2cb653a304242ca0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/neg_garbled_ilst_mp4_probe",
+      "revision": 2,
+      "definitionHash": "01ab24d305d3dcf74b453266c3b89420f1c20fd9803bd2a94849f0fd21a1971d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_flac_seektable",
+      "revision": 1,
+      "definitionHash": "0efb14b327ed95ad168b7932b570d48e81cbed0dbb135fdb821c48fb7e69563f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_h264_1080p_30s",
+      "revision": 1,
+      "definitionHash": "934e8089abfaa72cbe04e6f39cfcaaf7a8afca05ac4db44cb634029d89e3b805",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_h264_1080p_5s",
+      "revision": 1,
+      "definitionHash": "aa5251b634f44abfddb4a77f9ce39b579a67d1130fb84a07f79ed21775cef8ba",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_h264_in_mkv",
+      "revision": 1,
+      "definitionHash": "e10270e5267eb87162def158e62ff4a78f86cb653d815c5ee698c586d6b5df45",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_h264_multitrack",
+      "revision": 1,
+      "definitionHash": "1aacb3b6e5b24fa3934fb0e8eaf5e492d922b0b0b2b69d5527abb684821492ff",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_mp3_xing",
+      "revision": 1,
+      "definitionHash": "5c8deece12865bdc80329d605786d373f9ad9ece35ae50c89c71b320ef46b1af",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_no_tags_recorder_webm",
+      "revision": 2,
+      "definitionHash": "a2c053466de15bf30f7cbf2fbc0965d8c7336a2dae39d5ab50e281a546a1b206",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_no_tags_wav",
+      "revision": 2,
+      "definitionHash": "08f33c1f8b2c4a67ce0c728e10310cb2c546ca7f441812c15832d03cefaab2c6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_opus",
+      "revision": 1,
+      "definitionHash": "a6f57dd8c246a3c08f6ee6a4f12e5c3e5fd5479e239edec1b656bb9cbbab39d4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_pcm_s16be",
+      "revision": 1,
+      "definitionHash": "a9edec6170534d845ea41772b23cab26cbd848b8476ad0909034309d4513a354",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/read_vp9_1080p_10s",
+      "revision": 1,
+      "definitionHash": "6b8b5cf6794efc5bac5863b35ff93e1840eb59d6a99da10baa289f9f77838d8c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/rotation_decode_read_h264_rotated90",
+      "revision": 1,
+      "definitionHash": "36765c6e2929dc82d04dadd4f111bd490d3937a95c1fcbd7052e0dee4679fea8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/rotation_survives_mp4_mkv",
+      "revision": 1,
+      "definitionHash": "df22228728ed6b173835cab7ffed8d38931dc60b8b773641c27c008c61bc7301",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/tagedit_no_corrupt_audio_flac",
+      "revision": 1,
+      "definitionHash": "1d1f824e2b2518fb6fe07280155b21a94b156f2fd61b50455d7afdc0f9505204",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/tagedit_no_corrupt_video_mp4_mkv",
+      "revision": 2,
+      "definitionHash": "4c7bd45b52282add0562bf4f7753574a1e2b8a37ba343068977905291ef504c9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/tracks_attribution_multitrack",
+      "revision": 1,
+      "definitionHash": "98d07306830072b292a7df831370b68fff5bff3e78875db80e44c09481778015",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/tracks_packet_attribution_multitrack",
+      "revision": 1,
+      "definitionHash": "f80eb955e75c543611493df84a12027619b7bfd3c93948c72f77111076b806c6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/write_flac_vorbiscomment",
+      "revision": 2,
+      "definitionHash": "b943c3d1eb80cbe8f82782e169c63ffb0118f00e7f354eb739e83361332f9aa0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/write_mkv_tags",
+      "revision": 2,
+      "definitionHash": "1ad13479b5a0192627ab2da8d354adb12cd98ce625bc1f296072e8b00e26dbe3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/write_mp3_id3",
+      "revision": 2,
+      "definitionHash": "25a177f74503d61edafb6d12fd4e614ecdcf44fe4cd0e39c25e81fe4afa081a6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/write_mp4_tags",
+      "revision": 2,
+      "definitionHash": "962ebabdca5cde3fafa013ce48744ffa824d51ad875d1e95f33432a96ae336a3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "metadata/write_ogg_vorbiscomment",
+      "revision": 2,
+      "definitionHash": "78172fdc0d59a8a551220af50c280b893d30da1ee630b788a12e550b0a51e56f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/buffer_massive_h264_mp4",
+      "revision": 1,
+      "definitionHash": "c444ce4fd853d81290ef28de64426c1e3195dd213529008637b90198f05c55cf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_buffer_target",
+      "revision": 1,
+      "definitionHash": "b06d084daebfd02a4a6bf21ed21630f16ae89b79708fd51fedcd0955bc582cc4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_faststart_in_memory",
+      "revision": 1,
+      "definitionHash": "cb9af7815a85c45489230cf93b270453029c07bb203f1116bccf3935f21df5ee",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_faststart_none_control",
+      "revision": 1,
+      "definitionHash": "c3634ed1986e2765394f5dd9fcce911f56562bf646f00bf99c641ba0c6f02a72",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_faststart_reserve",
+      "revision": 1,
+      "definitionHash": "c509ca474e14fd560f91fa6817efc626ea8f914050ea9889be0d8fc35ff58745",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_fragmented_cmaf",
+      "revision": 1,
+      "definitionHash": "238d4bbdce3e07a680b162dedfbdbb21fa900e243998d1664342c62ec71e8560",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_streaming_target",
+      "revision": 1,
+      "definitionHash": "b3364fea833408299beef2b96696639e00a4b828f00ce544fd17928fdce8569b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_ttfb_buffer_target",
+      "revision": 1,
+      "definitionHash": "56cdf21b6bf83da5c24d06d41a5f9d2df005fcea1169bf915d8995e873295ad5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/mp4_ttfb_streaming_target",
+      "revision": 1,
+      "definitionHash": "57fc62dde589a48e1b01ab1ee38dcd6f3f99cf8d4aad45c29fd729f66b360411",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_decode_equals_buffer_shape",
+      "revision": 1,
+      "definitionHash": "d65ff6fee2d9fe1371412849ded71a4bb4fbf95ad2391fb4b8941b08fca19b93",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_decode_equals_stream_shape",
+      "revision": 1,
+      "definitionHash": "639c3c7b027aac3cf6511263a5712f7287e4882ca20b2d0fb9e5d49b1978cb4e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_faststart_in_memory_duration_invariant",
+      "revision": 1,
+      "definitionHash": "83cf29dd2c3fbe539e5ab07fcb133bf8378e42e0317877710e4bffbb2b8b0cef",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_faststart_reserve_duration_invariant",
+      "revision": 1,
+      "definitionHash": "784ed38d45072a4af25f44ee64703edd5010218dfa31308a0fb16662bd7922af",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_frag_premise_decode_equality_mp4",
+      "revision": 1,
+      "definitionHash": "a048eeefc9736ec340b2ba55466e188cf6f7ceb872e8ff386ea740ac3707a76d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_probe_dur_buffer_shape",
+      "revision": 1,
+      "definitionHash": "13f21f8594a45bda8473a0798c73a9575bafda155e1ac2aec9c4e4993a7cf74c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_probe_dur_fragmented_shape",
+      "revision": 1,
+      "definitionHash": "af02104b9b22e5ba6ed9d1f2888bc456f95a1edbd2eeaee44d8aa1a485d8f922",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_probe_dur_stream_shape",
+      "revision": 1,
+      "definitionHash": "aa8e1e7dc581bb113396725853ce9678adbd8ad5195208e2ccf7b98d3ee932f8",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_ts_stream_duration_materialized",
+      "revision": 1,
+      "definitionHash": "62419cfa4f805c3b461fa5f045a16b92a44c165f148184cee125c1c25b89bfca",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/prop_webm_headerless_duration_materialized",
+      "revision": 1,
+      "definitionHash": "ebda1d23957236883189dd75670ece9cf4413db485e29bed354a16498b26e2a0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/stream_huge_h264_mov_to_mp4",
+      "revision": 1,
+      "definitionHash": "ad53e0b310bc5b9db7a9b07d1d478373c1cb662c565172f5f8208d08360d5c82",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/stream_large_h264_mp4",
+      "revision": 1,
+      "definitionHash": "42b250244da28084ef3991d127a6e08505b7450e279ca22c39eb526458f319c6",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/stream_large_vp9_webm",
+      "revision": 1,
+      "definitionHash": "4bebc6883a45fa6f747e2dc5f563ad27bc79c71fa391a4de019812ca2216ff02",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/stream_massive_h264_mp4",
+      "revision": 1,
+      "definitionHash": "45a30bb37beff54f0315be64d0669fa0127f02338196afc7f37d4c3b6ca5d1c5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/ts_continuity_many_writes",
+      "revision": 1,
+      "definitionHash": "2ff19ef7a73ae75ad588427153eb56aa24a4669455a922ffb978d7c0fc3dd8d3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/ts_tiny_writes",
+      "revision": 1,
+      "definitionHash": "1a02a52983934b4cccad08493aa48164136265a5ba11da9e016135e5586d65bf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/webm_headerless_live_stream",
+      "revision": 1,
+      "definitionHash": "81ae5bae58b9b2f85b37469d9e29fc96cf36cb1d397bfd8488e06184b121f468",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "streaming-output/webm_streaming_target",
+      "revision": 1,
+      "definitionHash": "093b8d481ad13c4f85c4555f4f155111d666b51b79222511173409ed0499debf",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/aiff_container_probe",
+      "revision": 1,
+      "definitionHash": "c3ccc3a04c8263083311a556d5d5f56814535631b3995b63be68954d8b3d7715",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/caf_container_probe",
+      "revision": 1,
+      "definitionHash": "9a4c8c8b272057bc831fbce8ebd07bf7ada36964e4fb734ef7737614fe7da0cd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/downmix_5_1_to_stereo",
+      "revision": 1,
+      "definitionHash": "dfb9113aa32c6aeaf87c7f5ce2f4d28174fe8a3e5d226475d68a0c52cdcbd84f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/downmix_stereo_to_mono",
+      "revision": 1,
+      "definitionHash": "44496873c53c7cc260823a657ca25117a7ec2152282cc06a1a629446a2290560",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/edge_empty_audio_transcode",
+      "revision": 1,
+      "definitionHash": "253e8f6f4686159e8360aae723d799dc4033a27d908995cc5e252a0873de66c1",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/edge_gapless_aac_decode",
+      "revision": 1,
+      "definitionHash": "af16015dcedcf066e73e2e299daf34d16913d61d098bb7725a5e7aa352fca55f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/edge_longform_audio_probe",
+      "revision": 1,
+      "definitionHash": "8fc0b5f3d89ae2e65ffdcbf9cc8b0756e2317bd259afd5885a9a1b19e0198061",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/edge_longform_audio_resample_16k",
+      "revision": 1,
+      "definitionHash": "05db7a6422c349c1ae91257636b6a5b713e814acac1b554e3ef314a947c56f2c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/edge_variable_channel_count_downmix",
+      "revision": 1,
+      "definitionHash": "1ea3471e92b195bd6cdc796e809af07281dd9e052d8fed26909b69f94e932ca9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/fade_in_out_f32",
+      "revision": 1,
+      "definitionHash": "152d0d826813474fc9e422695367330367bd31cf011d6b79acb654fa3cbcb71a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/fuzz_aiff_header_truncated_probe",
+      "revision": 1,
+      "definitionHash": "1773ba40884b0b6ac50990b11f4031e4d22026f0ba1e9af9fa86a0405ace7f62",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/fuzz_wav_bitflip_decode",
+      "revision": 1,
+      "definitionHash": "f558959aad92eebd5ec846a1392617b80e2301f10ce47769bef76a848e8f7722",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/fuzz_wav_fmt_corrupt_transcode",
+      "revision": 1,
+      "definitionHash": "7feb139653d0b80dcf8b305a6cf2fa43db3f5069b3a3043e0aa15dfa7e0b13fc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/fuzz_wav_header_truncated_probe",
+      "revision": 1,
+      "definitionHash": "e3ffe8173492ea8ee25dd4be4c98ed2b179219b0d9bee7bf09b88f332fd3298b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/gain_half_f32",
+      "revision": 1,
+      "definitionHash": "65f8e6171e5818361367f6a5f909ae7fea3b90d26929800d50f7766b8955039f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/gain_minus6db_s16",
+      "revision": 1,
+      "definitionHash": "11a3e57d8aef4d70ec31d3b84302705e38cd6bcf3d37b0d3c583e34f86d5213b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/meta_idempotent_resample_same_rate",
+      "revision": 1,
+      "definitionHash": "23aa5fe22676807c5a556109bb1d0c40f560b651742fc179fcf31717b319d2b3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/meta_probe_duration_across_wav_aiff",
+      "revision": 1,
+      "definitionHash": "d72301b62f790930ded59f060542fa6ae516f175d17b38c77e2e69a17b93a4ce",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/meta_roundtrip_endianness_s16",
+      "revision": 1,
+      "definitionHash": "7b428616b8fbec0469d175a461ac51c2c3c6c3d46620fa552ad9956642e1a92c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/negative_image_into_audio_transcode",
+      "revision": 1,
+      "definitionHash": "4a44f2dadfebb3a3e49c5fd215c8aece08feae74631c7eb591988173ca5a1249",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_f32_to_s16",
+      "revision": 1,
+      "definitionHash": "af24afb79c8a9bd129bdcd2f8a91e7a31ee42c0e7e19926d88f2d1e6a180180d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s16_to_f32",
+      "revision": 1,
+      "definitionHash": "248d76b8fc3d7ca159a86b98fb1a68c700493ccdae028f32192f544e97e4d7f3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s16be_to_s16le",
+      "revision": 1,
+      "definitionHash": "141460284585d4ff7246c5e9c089016eb25b57e3bb1749ab119f69835845293a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s16le_to_s16be",
+      "revision": 1,
+      "definitionHash": "d9940aba96755b7d1a69f8ca3ae0a184aa77ac6981dd041ea22134cf03ad6c89",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s24_to_f32",
+      "revision": 1,
+      "definitionHash": "cd7b44375a96b2f1871858c172fa68b60a1f6a41a3827d95406dabd10782f097",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s24_to_s16",
+      "revision": 1,
+      "definitionHash": "8baf5880917ed48fb41d3edb1c693fd6b0810189c94200ca721294ec6765eb0b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/pcm_s24be_to_s16le",
+      "revision": 1,
+      "definitionHash": "c2aacafed139025ad7fd27ee1b16fa97c98c5c4a0e281d6f27f28266c65a1e13",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/resample_44k1_to_48k",
+      "revision": 1,
+      "definitionHash": "380f71bd8359d129c601b716990a3b1b411a868ade0c54304f5647206ed8c16e",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/resample_48k_to_16k",
+      "revision": 1,
+      "definitionHash": "5f601cfab001b0c3f14a519ecd1ef96e7b7ed9588c39b0cfcc7832543d384a4f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/resample_48k_to_44k1",
+      "revision": 1,
+      "definitionHash": "a8042159b1c7875bd6985987cadcab3e7eef518724ac3cf4745f21cd81284792",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/throughput_decode_s16be",
+      "revision": 1,
+      "definitionHash": "6c4e7289e4571b12307bd69399a263d32cd1d332cc1407513f497a142b391312",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/throughput_decode_s24",
+      "revision": 1,
+      "definitionHash": "5438a4429a5509359ecd979cefc26c3d25cb4573ea23e0c3e3942bea46c10b71",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/throughput_encode_s16be",
+      "revision": 1,
+      "definitionHash": "a6a08b30dc6e6b1320eababe8545207068351d60fe4a509d7cbf7fe3a701f754",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/throughput_encode_s24",
+      "revision": 1,
+      "definitionHash": "e45b7cebe5a0a6276c0ed5bddb6e693f566dedd1baeac727662def0861493b1a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/upmix_mono_to_stereo",
+      "revision": 1,
+      "definitionHash": "6c1d709327e642d2e5ef10c1dbfdc2f9ca2cb3559ab68fe72813855048bf4c01",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "audio-dsp/upmix_stereo_to_5_1",
+      "revision": 1,
+      "definitionHash": "f7a1cbcfe4f8056c92d7ac45805a5521ef9a54b5f74ae981dfff514ee5cc1315",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_5_1_channels_probe",
+      "revision": 1,
+      "definitionHash": "ca6e5268b51feda1a91eefba02bda42af5e8f636d3b0bb8a9cd2c15e2980114c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_audio_only_micro_probe",
+      "revision": 1,
+      "definitionHash": "4cd5bee0845a859ebbd29beb2235a68709ab450fd8be5bfb445ebe65d7828922",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_audio_only_probe",
+      "revision": 1,
+      "definitionHash": "ebe0aae1ad50e7736768c8b19d3b74826577ae19cb69568e84339c211d43b777",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_cbcs_boundary_decrypt",
+      "revision": 1,
+      "definitionHash": "4d05806b651fc10d4c9908a7f3ff939b200ec189a4d799d5206788e86fe4dc0b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_dims_1x1_decode",
+      "revision": 1,
+      "definitionHash": "664e5b2b20e5c998f5b74b9cf71fbefb337746559a444baa4dc570a7fe14bb99",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_dims_1x1_probe",
+      "revision": 1,
+      "definitionHash": "7b5d335e3e3967f5a8edf2d21cd55fdbe82564fb48a7356bc36891e81853a46b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_dims_2x2_h264_probe",
+      "revision": 1,
+      "definitionHash": "9cee244635801ea154006430410c4cfeaa7231bd2efe0b0ebe7a0c8d98ba4c53",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_extreme_fps_1_probe",
+      "revision": 1,
+      "definitionHash": "630f053b550f4d870d2318d4e258fad7926223958923164ffd6aec04058d526f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_extreme_fps_240_probe",
+      "revision": 1,
+      "definitionHash": "9876db17028c469c040073644bd25e452cbd760b238493753b5a618d66b61043",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_faststart_reserve_remux",
+      "revision": 1,
+      "definitionHash": "2cf93e3bb492d5e20ceb43e75b79923f15150f1b334d58d51fd48e92d3f72085",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_flac_with_seektable_probe",
+      "revision": 1,
+      "definitionHash": "f2d935c5c42787e39f568eacad4bbefd92ed1f3a8e9803e64e9802bffcbd7733",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_flac_without_seektable_probe",
+      "revision": 1,
+      "definitionHash": "4a5f05e89c36be33b91dc69ce3a22ce12c16f76349495523d890c1c2c17fee5a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_fragmented_remux",
+      "revision": 1,
+      "definitionHash": "4854384516fd71ad4ae38df9de54976564e5f6422e7b54f51eebce6a61b7dcd2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_gapless_priming_probe",
+      "revision": 1,
+      "definitionHash": "ee696a6621d2bde79190f2ec4627a722a59f610e16efb073d1199953983cfeff",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_headerless_recorder_probe",
+      "revision": 1,
+      "definitionHash": "3ab773c56bb556ad9af11e17cdce68bbaf1d3bcd9f4ff107e6f379f79fce51a2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_headerless_recorder_remux",
+      "revision": 1,
+      "definitionHash": "c286ccf81ccd2ed51e731ae407090e8749d84057247601ee01fc73ddac108166",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_longform_probe",
+      "revision": 1,
+      "definitionHash": "53215d354154aa73068858be6a707bbf6eaeb3732819792baf0354a25ea0cb5d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_mislabeled_container_probe",
+      "revision": 1,
+      "definitionHash": "f443e9094ca4cf94ccc67205c4334e6f5a5759993337ac9a679461f2d632de1f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_multitrack_demux",
+      "revision": 1,
+      "definitionHash": "940361413b13e22227053cea27c765a7b0690376946b63d88fa296d11228c96d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_no_media_tracks_probe",
+      "revision": 1,
+      "definitionHash": "251b110e45822c859176eb62707de0d09395520e6caa7c5a66a429627c98edb4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_open_gop_bframes_decode",
+      "revision": 1,
+      "definitionHash": "8e5bb60a09cb6a9e56c47349e1cdb23b134a8d507bb6865b565c1c2893433cde",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_pcm_s16be_probe",
+      "revision": 1,
+      "definitionHash": "3534b884358f59fe08e59f8f06ba8c9dd79ba6c442fdc58ef57cbddebeec282f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_pcm_s24_decode",
+      "revision": 1,
+      "definitionHash": "c403414c4aa560960af02eb22ae307e9f23a2e7459cd2cbf146f12638ab25c56",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_rotated_remux",
+      "revision": 1,
+      "definitionHash": "9cee75bec613499b3c6cd8aa7d01f42200495c12f54b1259e9702ba22c077b55",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_seek_negative",
+      "revision": 1,
+      "definitionHash": "c909df14c0932c768ac6db31887613dc6c4f2d81344a9da772d3081fea9544d7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_seek_past_eof",
+      "revision": 1,
+      "definitionHash": "7fcb425d9ed5639d3a3a8201925ec24ce99c40a5082e5ea1d611d1682fc90556",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_ts_pts_wraparound_demux",
+      "revision": 1,
+      "definitionHash": "54f967cd18d44b55ac40804bd589a2a6b5e56643d96209c65bf5db3348ff3279",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_vfr_probe",
+      "revision": 1,
+      "definitionHash": "752e3b5b1084753062cac6d092a578ea8611c8005a4ed2ef52377af83cadad29",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_video_only_micro_probe",
+      "revision": 1,
+      "definitionHash": "41883368a97d1c98a169d548f4a4e8f91eff450ac184623505d9541c6c768f1b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_video_only_probe",
+      "revision": 1,
+      "definitionHash": "964bc753ab709c87fad753b178c2a973afa785ecbd8ae12dd1b14541f0546b56",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/edge_zero_length_probe",
+      "revision": 1,
+      "definitionHash": "13b32064887da880e9f1a5906774528f2c409529b2293306296af189250ef1c4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_adts_aac_bitflip_probe",
+      "revision": 1,
+      "definitionHash": "4d499dc940868739c035f6b101fad6f3db28b36abb880f529dd3254e1858c08a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_encrypted_mp4_ciphertext_decode",
+      "revision": 1,
+      "definitionHash": "c77f4740d1e6611e0858458c20501d928986a895b433083e453350f862918702",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_flac_bitflip_probe",
+      "revision": 1,
+      "definitionHash": "333fd13cbc142fe7324fad77919f226fe4ceaf2bf0a56e049738d4bf8f11c160",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mp3_header_truncated_probe",
+      "revision": 1,
+      "definitionHash": "4770bae64aa23b1b896976480a597d8c285c209040c7e5a6e8f4eb44b76fc7d0",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mp4_bitflip_probe",
+      "revision": 1,
+      "definitionHash": "5199c240f8d70c2bfd5ee5fe8178a8bde26d60318787f79c475b2b1210bc3f1f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mp4_header_truncated_demux",
+      "revision": 1,
+      "definitionHash": "f064f50d008ea70d54ca7f400a7b598ca2762d62486d675d08990af7742c7198",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mp4_tail_truncated_demux",
+      "revision": 1,
+      "definitionHash": "6cd018e2f7efb21bbce0ca93b7ada779ed8d3cd423518f8db53962dfafd385bd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mp4_zeroed_spans_decode",
+      "revision": 1,
+      "definitionHash": "aaae854e1c1dc3655ee11100ecbaefb56c5f3e8efff8041f5ddbb52416b81a64",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_mux_target_corrupt_remux",
+      "revision": 1,
+      "definitionHash": "1c2de940f8535f248b6005ef3e6a99e8ad3abb5fa748283e6d5f44ff5cc0a7ef",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_ogg_opus_header_truncated_probe",
+      "revision": 1,
+      "definitionHash": "342172b8a3506b69271be54d07b758576bf120857f4fc112deaee8f9dfb003e4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_remux_zeroed_spans",
+      "revision": 1,
+      "definitionHash": "9b5723e37b56dcc1578cb1b08b86f98e3b0f744353e37614acf384a3225a1e9a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_truncated_h264_asset_demux",
+      "revision": 1,
+      "definitionHash": "987475f08f507a7300cccf6f059257424076e67bd584a6f928d809e0ad172381",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_ts_zeroed_spans_demux",
+      "revision": 1,
+      "definitionHash": "cf35e6c69435034623d8a95b6104724db0e7407194b9224ee455eb82c4fc0c77",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_webm_bitflip_probe",
+      "revision": 1,
+      "definitionHash": "1598c98773e2b7c868e2e28db6153cf98310fcc65b4a0d1a8b842f203038830f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/fuzz_webm_header_truncated_demux",
+      "revision": 1,
+      "definitionHash": "452240648d6a01d49ef825cebf04c6a7585c64c68881fe846fa274ce4545ff5f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_jpeg_decode_video_negative",
+      "revision": 1,
+      "definitionHash": "7d63ba8cfd404e7e718860652581af4f3d442d7798a277a30bb10c41561cce78",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_jpeg_probe",
+      "revision": 1,
+      "definitionHash": "f4b007e94cac8e8eb2748b3c7810a9e6c629cc25377e5a40a1223a946b4ac090",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_png_decode_video_negative",
+      "revision": 1,
+      "definitionHash": "e860048497d82d1892dc583ae918b47cb8cf5141678a667696babf3b12253fcd",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_png_probe",
+      "revision": 1,
+      "definitionHash": "0518a6a92b0ad815c9f18cb2fd882f18d79c586f2c8cc89bdb7ca0278bd1331a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_webp_decode_video_negative",
+      "revision": 1,
+      "definitionHash": "84c2340e96ac8b60d7e3329d38fb56bd9a8bd942c0ed7789b68fe32030130fbc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/image_webp_probe",
+      "revision": 1,
+      "definitionHash": "5240667e38423b023e5e112fe171e51cda8fd487d970d766746dd4330b658e45",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_decode_remux_eq_decode_mp4_mkv",
+      "revision": 1,
+      "definitionHash": "e4b975ca31054f0a998563069a8c791b7d8a27b90a9e582ff1beec26420fa61f",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_decode_remux_eq_decode_webm_mkv",
+      "revision": 1,
+      "definitionHash": "6c03e0c721ce60c4986fe71433e4096c871ff835e79cec889fdbedbd5288c5c9",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_demux_mux_roundtrip_eq",
+      "revision": 1,
+      "definitionHash": "5cf3783410ca215e1951e5082c67c8d54ea0cba08da71fc8c0aee7a7cb3147f5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_double_remux_stable",
+      "revision": 1,
+      "definitionHash": "564ebba806be1cf098eb92360daf90685475431824b85c702465f9d52e90a6bc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_duration_consistent_across_containers",
+      "revision": 1,
+      "definitionHash": "64d6da2497b7a88347dba1525709f8cfaf3a07efe6e9d75aa9191e4d50d2759b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_flac_seek_seektable_equiv",
+      "revision": 1,
+      "definitionHash": "f95728a2fbcca0e4f4e5880ed5b5ec94ada1e68de1729032fdd81a8e0fda5fb4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_gapless_sample_count_priming",
+      "revision": 1,
+      "definitionHash": "56d8922dd4027bfe6c0ea4f6c29238f3d00f2b7184da43c5451c6bc04478682b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_remux_duration_preserved",
+      "revision": 1,
+      "definitionHash": "8a956a8cf847adcec664caa2cbc2ce49f811e2c8abb525d9258ef9299600842b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_transcode_idempotent_dims_h264",
+      "revision": 1,
+      "definitionHash": "7694015ecc5c34bf017acbf31c45719770c6a2e9b2ff41c55c2b61fcc402f05c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_trim_additivity_compose",
+      "revision": 1,
+      "definitionHash": "31866577f0e2085e9da887428a1a487ca5724a5db6c08ecf644928eb53a78a19",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "robustness/prop_trim_concatenation",
+      "revision": 1,
+      "definitionHash": "4f3042d2dc7fd5e32a91c05adce255071690bbd167e19629e95c81af9897ea3a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/bundle-size",
+      "revision": 1,
+      "definitionHash": "42734d88d77f88bb6a6d6249fe5aafa27459fc30f0a5cfc6cc0f51f24ead0a17",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/convert-longtasks",
+      "revision": 1,
+      "definitionHash": "b0000a518804fbea602527de7d57bb3e9c1ec21f3bda8ba09c86eabc88f886e3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/convert-peak-memory",
+      "revision": 1,
+      "definitionHash": "795c68ed6eb658165e289948514a89dd7d060993ac8167bfddcac0b54db41489",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/convert-webm-resize-320x180",
+      "revision": 1,
+      "definitionHash": "58a3b58eae793825ecaf1e112848e384ea679ff0818ad3c4b8b6eaf59a57e647",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/decode-fps",
+      "revision": 1,
+      "definitionHash": "96db48c5dc04baa602e0916c09b4a0028c4a6dc96672a744c3c36e3c8a907f26",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/encode-fps",
+      "revision": 1,
+      "definitionHash": "9ccd97962242c4ac3a827cdcc9a7cb722a0d8e47296d49d27b81dbea3c6355cc",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/extract-metadata",
+      "revision": 1,
+      "definitionHash": "cbb9b723d7df17ea2475fdbe344beb470afba4227f06597ad9d0b0f6136db299",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/iterate-video-packets",
+      "revision": 1,
+      "definitionHash": "e576867f8a958b6598699ab46b5ed5930294855e6e68b8f72d77f752435782aa",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/metamorphic-decode-remux",
+      "revision": 1,
+      "definitionHash": "bcf78248853bb762170e7464ca4083731f436329160f27c3af7e6d74e4836c3d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/metamorphic-probe-duration-cross-container",
+      "revision": 1,
+      "definitionHash": "7e5ee59f4f0c4c05d108e5a43fcba466a957309756f5ec112681fe93713a4015",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/metamorphic-transcode-idempotent-source-res",
+      "revision": 1,
+      "definitionHash": "e3c172a71e0bc313f6b26eb4c97a73d53a8ba0e1d937cd753f216f34338b683c",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/metamorphic-vfr-iterate-packets",
+      "revision": 1,
+      "definitionHash": "9d41bf5e53346a983cf4745c170d72921b2da54c900df2031cb1c61786279165",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/metamorphic-vfr-probe-duration",
+      "revision": 1,
+      "definitionHash": "c531d9f0829fe63d140c687b5fb262c11bd63eb9c2bf263e1581cbfdab778dc3",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/op-sweep-demux",
+      "revision": 1,
+      "definitionHash": "0d22fd79563a8504e4939d88636d9de7043cd67033f5398b3cd8b73d497c24a5",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/op-sweep-probe",
+      "revision": 1,
+      "definitionHash": "b4b31319355e5ad83f6d50e249504defecde922adb60c037cae653d796930e68",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/op-sweep-remux-mp4-to-mkv",
+      "revision": 1,
+      "definitionHash": "1d64c3c1002eb23443399d9ce1531d02fe48b5226001feea8fd2daa4229ab098",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/op-sweep-transcode-webm",
+      "revision": 1,
+      "definitionHash": "7e3d35e1032f5e97b95fa285c213ae3c18e7248e275d71b2d2daadd56f3013b2",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/seek-ms",
+      "revision": 1,
+      "definitionHash": "78be865ab80f63d87600ac53c0d3795462460a6ac1be16103eea78e3bd19beb4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-demux-peak-memory-huge",
+      "revision": 1,
+      "definitionHash": "ea01126b31fa28e05c86b4a9ad27b12c589bf516e1b7f2ff4642be2bc3a527f4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-demux-peak-memory-large",
+      "revision": 1,
+      "definitionHash": "7535d3b6bd0db7f1a8055289ed64b3e5c548b0acc1285f859cbad0ec2734f746",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-demux-peak-memory-large4k",
+      "revision": 1,
+      "definitionHash": "7ffe3e10cf8e8ce4802d51591ef70e9b9297fd5bd33330440ea036d372aacdb4",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-huge",
+      "revision": 1,
+      "definitionHash": "f38b001c711004a2049ba2c6fa3fdd7439d1b44cab2068b3fa6d88e76000bf1d",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-large",
+      "revision": 1,
+      "definitionHash": "a3dab5c150ca6a512eaa9102fd966dbd4ed28b3d3fea6d7be8d29ac168f4e8f7",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-large4k",
+      "revision": 1,
+      "definitionHash": "225e75d3322fd029eb4a50b5753c329d87cf1afb0903d22d989aa117ec50de70",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-massive",
+      "revision": 1,
+      "definitionHash": "ca6a4ba7cf8df1adb8bfbcfe50df06f88fc4c79ec216400327e1fcd01da80d60",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-medium",
+      "revision": 1,
+      "definitionHash": "fb6cb902901f8f79d51e3718730bc33c1c1f91e016ab9fb909eff6f39c0c3342",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-extract-metadata-tiny",
+      "revision": 1,
+      "definitionHash": "a534589738b0fbfc0a8ac9097244374bb59666c2e55a63ae033fb9e385aab10a",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-huge",
+      "revision": 1,
+      "definitionHash": "b313895c6156d854dbf72a8b658ef580c544eee1cad7c14dbcae41e0afbbdffb",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-large",
+      "revision": 1,
+      "definitionHash": "aabe0a25d5e204ef3c0045374dbc5ce9a34b65184fc3fd5afbd9c147a87fe43b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-large4k",
+      "revision": 1,
+      "definitionHash": "97ecadb055180f2a75c1d080396758a096293d90a6c6ce7e2c9e47a9f831b1ea",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-massive",
+      "revision": 1,
+      "definitionHash": "eaf6b7c6df0029f5ae940c949752f6e920ba18ef708449ea03a093f814f7fa12",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-medium",
+      "revision": 1,
+      "definitionHash": "a0e1f5a184a3d7eb9340b5888d1f6adf744f347f2e7769cab93cc4ca4fa93009",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    },
+    {
+      "id": "performance/size-ladder-iterate-packets-tiny",
+      "revision": 1,
+      "definitionHash": "e7482cfb5d955b5390dbdad32c572a14c7c6081622a0ada3304b16aab40f8c7b",
+      "inputVariantIds": [
+        "baked"
+      ],
+      "renditionIds": []
+    }
+  ]
+}

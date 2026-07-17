@@ -1,0 +1,12 @@
+{
+  "schema": "media-test/mux-sparse-mp4@1",
+  "fileSize": "4294975488",
+  "sampleOffsets": [
+    "4096",
+    "4294967552"
+  ],
+  "samplePrefixesHex": [
+    "00000165a1b2c3d4",
+    "00000141d4c3b2a1"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "$schema": "./schemas/fixture-seed-v1.schema.json",
+  "schemaVersion": "media-test/fixture-seed@1",
+  "seedId": "fixture-crypto-v1",
+  "seedHex": "f4058c3fd18ec048150937a1af98f8badf61293c9ee6024dc3274a1764eca864",
+  "purpose": "Deterministic test-only key, KID, IV, and mutation material. Never use for production secrets."
+}

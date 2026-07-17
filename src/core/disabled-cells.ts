@@ -1,231 +1,279 @@
 /**
- * Exact engine/scenario cells intentionally disabled by suite policy.
+ * Reviewed matrix suppressions.
  *
- * Keep this outside scenario definitions so scenarios stay engine-independent: a disabled cell is a
- * runner decision about one engine's practicality for one case, not a change to the case itself.
+ * Applicability does not belong in this table. A concrete engine inability is expressed through the
+ * shared tuple-support protocol and becomes NA_ENGINE. A browser configuration miss becomes
+ * NA_BROWSER, and an applicable defect runs to FAIL/ERROR. The only entries allowed here are narrow
+ * safety or run-budget policy decisions with enough evidence to be audited and retired.
  */
 
-export interface DisabledCell {
+export type DisabledPolicyMode = 'enforce' | 'audit';
+
+export interface ReviewedSuppressionMetadata {
+  /** Team/person accountable for reviewing and retiring the suppression. */
+  owner: string;
+  /** Stable issue or backlog reference. */
+  issue: string;
+  /** Reproduction or measured run evidence, not an unsupported-tuple claim. */
+  evidence: string;
+  /** ISO instant after which CI rejects the entry until it is reviewed again. */
+  expiresAtIso: string;
+  /** Concrete condition that triggers an earlier retest/removal. */
+  retestCondition: string;
+  /** Why ordinary Worker isolation cannot currently make this cell safe/affordable. */
+  workerIsolationReason: string;
+  /** Empty means every browser; otherwise policy applies only to the named browser families. */
+  browsers: readonly string[];
+}
+
+export interface DisabledCell extends ReviewedSuppressionMetadata {
+  kind: 'budget' | 'safety';
   engineId: string;
   scenarioId: string;
   reason: string;
 }
 
 /**
- * A known operation that cannot be safely entered because it blocks the browser event loop before
- * Promise.race's timer can run. Unlike DisabledCell, this is an applicable FAIL: the runner emits a
- * timeout outcome immediately instead of reporting SKIPPED or invoking the non-preemptible call.
+ * A known synchronous reproduction that cannot yet be entered safely. It remains an applicable
+ * timeout FAIL (never SKIPPED or NA) until the real corrupted-file Worker reproduction is proven.
  */
-export interface ForcedTimeoutCell {
+export interface ForcedTimeoutCell extends ReviewedSuppressionMetadata {
+  kind: 'forced-timeout';
   engineId: string;
   scenarioId: string;
   timeoutMs: number;
   reason: string;
 }
 
-const FORCED_TIMEOUT_CELLS: ForcedTimeoutCell[] = [
-  {
+const OWNER = 'media-test runner maintainers';
+const REVIEW_EXPIRY = '2027-01-31T00:00:00.000Z';
+
+function budget(
+  scenarioId: string,
+  evidence: string,
+  retestCondition: string,
+): DisabledCell {
+  return {
+    kind: 'budget',
     engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/graceful_webm_header_destroyed',
-    timeoutMs: 15_000,
-    reason:
-      'Remotion media-parser blocks the main thread while walking the corrupted WebM, so the normal timer cannot preempt the operation',
-  },
+    scenarioId,
+    owner: OWNER,
+    issue: 'REQ-RUN-07/remotion-long-form-budget',
+    evidence,
+    expiresAtIso: REVIEW_EXPIRY,
+    retestCondition,
+    workerIsolationReason:
+      'Worker termination bounds UI blocking but does not make repeated full-file parsing/encoding fit the shared matrix CPU and memory budget.',
+    browsers: [],
+    reason: `reviewed budget suppression: ${evidence}`,
+  };
+}
+
+// Real per-file Worker isolation makes static timeout fabrication unnecessary. Kept as an empty
+// compatibility surface so older audit consumers can prove that every former entry was retired.
+const FORCED_TIMEOUT_CELLS: readonly ForcedTimeoutCell[] = [];
+
+/**
+ * This is intentionally much smaller than the former table: tuple limitations and applicable
+ * defects were removed. What remains is long-form work with measured, multiplicative suite cost or
+ * one narrow main-thread safety quarantine.
+ */
+const DISABLED_CELLS: readonly DisabledCell[] = [
+  budget(
+    'demux/size_huge_huge_h264_1080p_600s',
+    'Full packet callbacks over the 600-second H.264 file exceed the practical shared-run budget.',
+    'Retest after a Remotion parser release adds bounded/random-access packet iteration.',
+  ),
+  budget(
+    'demux/size_massive_massive_h264_1080p_2h',
+    'The two-hour H.264 full demux does not complete within the matrix operation budget.',
+    'Retest after streaming packet iteration avoids a full-file scan.',
+  ),
+  budget(
+    'performance/size-ladder-iterate-packets-huge',
+    'Repeated full packet iteration of the huge file exceeded the 300-second benchmark watchdog.',
+    'Retest when benchmark work can reuse a validated packet walk or parser throughput materially improves.',
+  ),
+  budget(
+    'performance/size-ladder-demux-peak-memory-huge',
+    'A measured browser run took more than four minutes before peak-memory aggregation.',
+    'Retest after a streaming parser path no longer retains the complete packet walk.',
+  ),
+  budget(
+    'decode-seek/decode_size_huge_h264_600s',
+    'Decode setup performs the same full-file scan as the 600-second demux rung and exceeds 120 seconds.',
+    'Retest after decoder setup becomes incremental/random-access.',
+  ),
+  budget(
+    'streaming-output/buffer_massive_h264_mp4',
+    'A no-reuse Chromium run timed out buffering the two-hour MP4 through bufferWriter.',
+    'Retest when the adapter exposes a bounded streaming target for this operation.',
+  ),
+  budget(
+    'demux/size_large_large_h264_1080p_120s',
+    'Correctness plus benchmark repetitions multiply a complete 120-second sample-callback walk.',
+    'Retest when the parser can expose packet tables incrementally or benchmark reuse is validated.',
+  ),
+  budget(
+    'demux/size_large_large_vp9_1080p_120s',
+    'Correctness plus benchmark repetitions multiply a complete 120-second sample-callback walk.',
+    'Retest when the parser can expose packet tables incrementally or benchmark reuse is validated.',
+  ),
+  budget(
+    'performance/size-ladder-iterate-packets-large',
+    'Repeated packet iteration of the 120-second rung exceeds the shared performance-run allocation.',
+    'Retest after parser throughput or benchmark reuse materially improves.',
+  ),
+  budget(
+    'performance/size-ladder-iterate-packets-massive',
+    'Repeated packet iteration of the two-hour rung exceeds the shared performance-run allocation.',
+    'Retest after parser throughput or benchmark reuse materially improves.',
+  ),
+  budget(
+    'performance/size-ladder-demux-peak-memory-large',
+    'Repeated full demux of the 120-second rung exceeds the shared measurement allocation.',
+    'Retest after memory measurement can observe one validated packet walk.',
+  ),
+  budget(
+    'remux/huge_h264_1080p_600s_mov_to_mp4',
+    'The official conversion path parses and buffers the complete 600-second MOV output.',
+    'Retest when the official path supports bounded copy/remux streaming.',
+  ),
+  budget(
+    'transcode/ladder_large_h264_1080p_120s_resize_720p',
+    'Full 120-second decode, resize, and encode repeats for correctness and performance.',
+    'Retest after hardware/backend throughput keeps the complete cell below the run budget.',
+  ),
+  budget(
+    'transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
+    'Full 120-second VP9 decode and H.264 encode repeats for correctness and performance.',
+    'Retest after hardware/backend throughput keeps the complete cell below the run budget.',
+  ),
+  budget(
+    'decode-seek/decode_size_large_h264_120s',
+    'Decode setup/sample traversal of the 120-second rung exceeds the shared operation allocation.',
+    'Retest after decoder setup becomes incremental/random-access.',
+  ),
+  budget(
+    'decode-seek/decode_size_large_vp9_120s',
+    'Decode setup/sample traversal of the 120-second rung exceeds the shared operation allocation.',
+    'Retest after decoder setup becomes incremental/random-access.',
+  ),
+  budget(
+    'audio-dsp/edge_longform_audio_resample_16k',
+    'Resampling the complete one-hour PCM fixture through conversion exceeds the shared run budget.',
+    'Retest after chunked audio conversion avoids whole-file buffering/repetition.',
+  ),
 ];
 
-const DISABLED_CELLS: DisabledCell[] = [
-  {
-    engineId: 'ffmpeg.wasm@0.12.15',
-    scenarioId: 'transcode/h264_to_hevc_mp4',
-    reason:
-      'disabled: H.264 to HEVC/MP4 re-encode exceeds the browser-wasm suite budget for ffmpeg.wasm@0.12.15',
-  },
-  {
-    engineId: 'ffmpeg.wasm@0.12.15',
-    scenarioId: 'transcode/h264_resize_720p',
-    reason:
-      'disabled: H.264 720p resize re-encode is disabled for ffmpeg.wasm@0.12.15',
-  },
-  {
-    engineId: 'ffmpeg.wasm@0.12.15',
-    scenarioId: 'transcode/av1_to_h264_mp4',
-    reason:
-      'disabled: AV1 to H.264/MP4 re-encode is disabled for ffmpeg.wasm@0.12.15',
-  },
-  {
-    engineId: 'ffmpeg.wasm@0.12.15',
-    scenarioId: 'transcode/vp9_to_h264_mp4',
-    reason:
-      'disabled: VP9 to H.264/MP4 re-encode is disabled for ffmpeg.wasm@0.12.15',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'transcode/h264_to_hevc_mp4',
-    reason:
-      'disabled: H.264 to HEVC/MP4 re-encode is disabled for remotion@4.0.479',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/size_huge_huge_h264_1080p_600s',
-    reason:
-      'disabled: Remotion packet callbacks walk the complete 600-second file and exceed the practical browser-run budget',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/size_massive_massive_h264_1080p_2h',
-    reason: 'disabled: demuxing the 2-hour massive H.264 fixture takes too long',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'performance/size-ladder-iterate-packets-huge',
-    reason:
-      'disabled: iterating packets for the huge H.264 fixture exceeded the 300-second operation budget',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'performance/size-ladder-demux-peak-memory-huge',
-    reason: 'disabled: the huge H.264 peak-memory demux took more than four minutes',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/graceful_mp4_header_destroyed',
-    reason: 'disabled: it takes forever',
-  },
-  {
-    engineId: 'web-demuxer@4.0.0',
-    scenarioId: 'robustness/edge_ts_pts_wraparound_demux',
-    reason:
-      'web-demuxer probes normal MPEG-TS correctly (probe/h264_ts PASSes) but mis-derives the video ' +
-      'frame rate (reports 240 fps vs the golden 30) on this PTS-WRAPAROUND TS fixture: the 33-bit PTS ' +
-      'rollover corrupts its inter-frame-interval fps estimate. The container is supported; the ' +
-      'wraparound edge fps derivation is a tracked engine limitation, so this one cell is skipped.',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'decode-seek/decode_size_huge_h264_600s',
-    reason:
-      'decode of the 600s huge h264 fixture exceeds the 120s op budget: the unified Remotion stack ' +
-      'parses via @remotion/media-parser, whose full-file scan on this 600s asset is the same slowness ' +
-      'already tracked for Remotion demux/size_huge_huge_h264_1080p_600s. platform and ' +
-      'mediabunny decode it within budget; ffmpeg.wasm honestly NAs it — this is a per-engine scale limit.',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'streaming-output/buffer_massive_h264_mp4',
-    reason:
-      'real Chromium no-reuse run on 2026-06-22 timed out after the 120s op budget while buffering the ' +
-      '2h massive H.264 MP4 fixture through @remotion/webcodecs bufferWriter. The paired massive stream ' +
-      'row is already NA because this adapter does not declare target:writes, so this exact buffer rung ' +
-      'is a tracked per-engine scale limit rather than a conformance path to rerun in every full matrix.',
-  },
-  // @remotion/media-parser must scan WebM clusters to derive full metadata such as FPS. Keep the
-  // smaller WebM probes, but do not let the scale rungs monopolize an otherwise multi-engine run.
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'probe/large_vp9_1080p_120s',
-    reason:
-      'disabled: Remotion WebM metadata/FPS extraction scans the 120-second file and is too slow for the shared matrix',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'probe/huge_vp9_1080p_240s',
-    reason:
-      'disabled: Remotion WebM metadata/FPS extraction scans the 240-second file and is too slow for the shared matrix',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'probe/massive_vp9_1080p_2h',
-    reason:
-      'disabled: Remotion WebM metadata/FPS extraction scans the two-hour fixture and does not finish in a practical time',
-  },
-  // Full packet iteration, decode, transcode, and buffer-all conversion are linear in the media
-  // length. These retain smaller coverage rungs; the skipped cells are honest scale-limit N/As.
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/size_large_large_h264_1080p_120s',
-    reason:
-      'disabled: full Remotion sample-callback demux of the 120-second H.264 fixture is too slow when correctness and benchmark passes repeat it',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'demux/size_large_large_vp9_1080p_120s',
-    reason:
-      'disabled: full Remotion sample-callback demux of the 120-second VP9 fixture is too slow when correctness and benchmark passes repeat it',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'performance/size-ladder-iterate-packets-large',
-    reason:
-      'disabled: repeated full packet iteration of the 120-second fixture takes too long with Remotion',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'performance/size-ladder-iterate-packets-massive',
-    reason:
-      'disabled: repeated full packet iteration of the two-hour fixture exceeds the practical run budget with Remotion',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'performance/size-ladder-demux-peak-memory-large',
-    reason:
-      'disabled: repeated full demux of the 120-second fixture for memory measurement takes too long with Remotion',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'remux/huge_h264_1080p_600s_mov_to_mp4',
-    reason:
-      'disabled: official convertMedia must parse and buffer the 600-second MOV output; the removed header-rewrite shortcut is not an admissible framework path',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'transcode/ladder_large_h264_1080p_120s_resize_720p',
-    reason:
-      'disabled: decoding, resizing, and re-encoding the complete 120-second H.264 fixture takes too long with Remotion',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
-    reason:
-      'disabled: decoding and re-encoding the complete 120-second VP9 fixture takes too long with Remotion',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'decode-seek/decode_size_large_h264_120s',
-    reason:
-      'disabled: Remotion decode setup/sample traversal on the 120-second H.264 scale rung takes too long',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'decode-seek/decode_size_large_vp9_120s',
-    reason:
-      'disabled: Remotion decode setup/sample traversal on the 120-second VP9 scale rung takes too long',
-  },
-  {
-    engineId: 'remotion@4.0.479',
-    scenarioId: 'audio-dsp/edge_longform_audio_resample_16k',
-    reason:
-      'disabled: resampling the complete one-hour PCM fixture through Remotion WebCodecs/WAV conversion exceeds the practical run budget',
-  },
-  {
-    engineId: 'mediabunny@1.48.0',
-    scenarioId: 'probe/cenc_ctr',
-    reason:
-      'mediabunny@1.48.0 WASM-aborts ("Assertion failed.") while parsing this CENC-CTR fixture ' +
-      '(cenc_ctr.mp4); it probes cenc_cbcs.mp4 and every other corpus file fine, and ffmpeg.wasm ' +
-      'reads/decrypts cenc_ctr.mp4 correctly, so the fixture is valid — this is a tracked engine ' +
-      'limitation on the cenc-ctr container, not a suite/fixture defect.',
-  },
-];
+export interface DisabledCellAuditInput {
+  engineIds: readonly string[];
+  scenarioIds: readonly string[];
+  now?: Date;
+}
 
-export function disabledCellReason(engineId: string, scenarioId: string): string | undefined {
-  return DISABLED_CELLS.find((cell) => cell.engineId === engineId && cell.scenarioId === scenarioId)?.reason;
+export interface DisabledCellAuditIssue {
+  code:
+    | 'DUPLICATE_RULE'
+    | 'EXPIRED_RULE'
+    | 'ORPHAN_ENGINE'
+    | 'ORPHAN_SCENARIO'
+    | 'INVALID_METADATA';
+  engineId: string;
+  scenarioId: string;
+  detail: string;
+}
+
+export function reviewedDisabledCells(): readonly DisabledCell[] {
+  return DISABLED_CELLS;
+}
+
+export function reviewedForcedTimeoutCells(): readonly ForcedTimeoutCell[] {
+  return FORCED_TIMEOUT_CELLS;
+}
+
+/** CI-facing structural/orphan/expiry audit. An empty array is the only passing result. */
+export function auditDisabledCells(input: DisabledCellAuditInput): DisabledCellAuditIssue[] {
+  const now = input.now ?? new Date();
+  const issues: DisabledCellAuditIssue[] = [];
+  const seen = new Set<string>();
+  for (const cell of [...DISABLED_CELLS, ...FORCED_TIMEOUT_CELLS]) {
+    const key = `${cell.engineId}\u0000${cell.scenarioId}`;
+    if (seen.has(key)) {
+      issues.push(issue('DUPLICATE_RULE', cell, 'more than one reviewed rule targets this cell'));
+    }
+    seen.add(key);
+    const expiry = Date.parse(cell.expiresAtIso);
+    if (!Number.isFinite(expiry) || expiry <= now.getTime()) {
+      issues.push(issue('EXPIRED_RULE', cell, `expiry '${cell.expiresAtIso}' is invalid or elapsed`));
+    }
+    if (!input.engineIds.some((id) => engineIdsMatch(id, cell.engineId))) {
+      issues.push(issue('ORPHAN_ENGINE', cell, `engine '${cell.engineId}' is not registered`));
+    }
+    if (!input.scenarioIds.includes(cell.scenarioId)) {
+      issues.push(issue('ORPHAN_SCENARIO', cell, `scenario '${cell.scenarioId}' is not registered`));
+    }
+    for (const [field, value] of [
+      ['owner', cell.owner],
+      ['issue', cell.issue],
+      ['evidence', cell.evidence],
+      ['retestCondition', cell.retestCondition],
+      ['workerIsolationReason', cell.workerIsolationReason],
+      ['reason', cell.reason],
+    ] as const) {
+      if (!value.trim()) issues.push(issue('INVALID_METADATA', cell, `${field} must be non-empty`));
+    }
+  }
+  return issues.sort(
+    (a, b) =>
+      a.engineId.localeCompare(b.engineId) ||
+      a.scenarioId.localeCompare(b.scenarioId) ||
+      a.code.localeCompare(b.code),
+  );
+}
+
+function issue(
+  code: DisabledCellAuditIssue['code'],
+  cell: Pick<DisabledCell, 'engineId' | 'scenarioId'>,
+  detail: string,
+): DisabledCellAuditIssue {
+  return { code, engineId: cell.engineId, scenarioId: cell.scenarioId, detail };
+}
+
+function engineIdsMatch(registered: string, reviewed: string): boolean {
+  return (
+    registered === reviewed ||
+    reviewed.startsWith(`${registered}@`) ||
+    registered.startsWith(`${reviewed}@`)
+  );
+}
+
+export function disabledCellReason(
+  engineId: string,
+  scenarioId: string,
+  mode: DisabledPolicyMode = 'enforce',
+  browser?: string,
+): string | undefined {
+  if (mode === 'audit') return undefined;
+  const cell = DISABLED_CELLS.find(
+    (candidate) =>
+      candidate.engineId === engineId &&
+      candidate.scenarioId === scenarioId &&
+      (candidate.browsers.length === 0 || (browser !== undefined && candidate.browsers.includes(browser))),
+  );
+  if (!cell) return undefined;
+  return `[${cell.issue}] ${cell.reason}; owner=${cell.owner}; expires=${cell.expiresAtIso}; retest=${cell.retestCondition}`;
 }
 
 export function forcedTimeoutCell(
   engineId: string,
   scenarioId: string,
+  browser?: string,
 ): ForcedTimeoutCell | undefined {
   return FORCED_TIMEOUT_CELLS.find(
-    (cell) => cell.engineId === engineId && cell.scenarioId === scenarioId,
+    (cell) =>
+      cell.engineId === engineId &&
+      cell.scenarioId === scenarioId &&
+      (cell.browsers.length === 0 || (browser !== undefined && cell.browsers.includes(browser))),
   );
 }

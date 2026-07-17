@@ -1,55 +1,214 @@
 #!/usr/bin/env bash
 #
-# sync-aibrush-vendor.sh — refresh node_modules/@aibrush/media from the latest build of ../../media.
+# Refresh the local @aibrush/media build and atomically persist the exact source/build/WASM tuple that
+# the browser adapter reports. The generated artifact contains no timestamps or host paths, so the same
+# clean revision and artifacts always produce byte-identical metadata.
 #
-# WHY THIS EXISTS. The suite runs the aibrush-media engine as a normal dependency:
-#   package.json  ->  "@aibrush/media": "file:../media"
-#   adapter.ts    ->  await import('@aibrush/media')  +  '@aibrush/media/core'
-# Because it is a `file:` dependency, `bun install` COPIES ../media/dist into
-# node_modules/@aibrush/media — it does not symlink. So the installed copy silently DRIFTS behind
-# ../../media as that package is edited. Run this before a suite run to test the LATEST engine.
+# Usage:
+#   bun run sync-vendor
+#   bash scripts/sync-aibrush-vendor.sh --reproducible
 #
-# WHAT IT DOES.
-#   1. build @aibrush/media (tsup) so dist/ is current, then `vendor-wasm` to copy every codec tail's
-#      *.wasm + glue INTO dist/ (a bare tsup dist has NO .wasm — the eager kernel stays wasm-free by
-#      design; the codec tier needs the wasm or decode/transcode break).
-#   2. `bun install` here, which re-copies the freshly-built dist/ into node_modules/@aibrush/media.
-#
-# Usage:  bun run sync-vendor        (from media-test/)   — or —   bash scripts/sync-aibrush-vendor.sh
+# --reproducible (and any truthy CI value) refuses dirty or unlabeled source before building. The default
+# development mode permits a dirty sibling, but the generated artifact labels it dirty-dev and adapter
+# reproducible requests fail closed.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # media-test/
-MEDIA="$(cd "$HERE/../media" && pwd)"                     # aibrush.lib/media/
-INSTALLED="$HERE/node_modules/@aibrush/media"
+REPRODUCIBLE=false
+case "${1:-}" in
+  '') ;;
+  --reproducible) REPRODUCIBLE=true ;;
+  -h|--help)
+    sed -n '2,14p' "$0"
+    exit 0
+    ;;
+  *)
+    echo "[sync-vendor] ERROR: unknown argument '$1'" >&2
+    exit 2
+    ;;
+esac
+[ "$#" -le 1 ] || { echo "[sync-vendor] ERROR: expected at most one argument" >&2; exit 2; }
 
-echo "[sync-vendor] media source: $MEDIA"
-if command -v git >/dev/null 2>&1; then
-  REV="$(git -C "$MEDIA" rev-parse --short HEAD 2>/dev/null || echo '?')"
-  DIRTY="$(git -C "$MEDIA" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
-  echo "[sync-vendor] media @ $REV (${DIRTY} uncommitted change(s) — this build reflects the WORKING TREE)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MEDIA="$(cd "$HERE/../media" && pwd)"
+INSTALLED="$HERE/node_modules/@aibrush/media"
+PROVENANCE_OUT="$HERE/src/engines/aibrush-media/vendor-provenance.generated.ts"
+BUILD_FLAGS=("bun run build" "bun run vendor-wasm")
+
+is_truthy() {
+  case "${1:-}" in
+    ''|0|false|FALSE|False|no|NO|No) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "[sync-vendor] ERROR: shasum or sha256sum is required" >&2
+    return 1
+  fi
+}
+
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    echo "[sync-vendor] ERROR: shasum or sha256sum is required" >&2
+    return 1
+  fi
+}
+
+compute_source_tree_digest() {
+  {
+    printf 'revision\0%s\0' "$SOURCE_REVISION"
+    # A binary Git diff captures every tracked working-tree deviation without persisting its contents.
+    git -C "$MEDIA" diff --binary --no-ext-diff HEAD --
+    # Include untracked files that can affect package construction; exclude unrelated worktree/tool state.
+    while IFS= read -r -d '' relative; do
+      printf 'untracked\0%s\0%s\0' "$relative" "$(sha256_file "$MEDIA/$relative")"
+    done < <(
+      git -C "$MEDIA" ls-files --others --exclude-standard -z -- \
+        package.json bun.lock tsconfig.json tsconfig.test.json tsconfig.scripts.json tsup.config.ts \
+        src scripts/vendor-wasm.ts
+    )
+  } | sha256_stream
+}
+
+capture_source_state() {
+  if command -v git >/dev/null 2>&1 && git -C "$MEDIA" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    SOURCE_REVISION="$(git -C "$MEDIA" rev-parse HEAD)"
+    if [ -z "$(git -C "$MEDIA" status --porcelain=v1 --untracked-files=all)" ]; then
+      DIRTY_STATE=clean
+    else
+      DIRTY_STATE=dirty
+    fi
+    SOURCE_TREE_DIGEST="$(compute_source_tree_digest)"
+  else
+    SOURCE_REVISION=UNLABELED_LOCAL_SOURCE
+    SOURCE_TREE_DIGEST=UNLABELED_SOURCE_TREE
+    DIRTY_STATE=unknown
+  fi
+}
+
+package_version() {
+  bun -e \
+    'const p = await Bun.file(process.argv[1]).json(); process.stdout.write(String(p.version));' \
+    "$1"
+}
+
+write_provenance_atomically() {
+  local temp
+  temp="$(mktemp "${PROVENANCE_OUT}.tmp.XXXXXX")"
+  trap 'rm -f "${temp:-}"' RETURN
+  {
+    printf '%s\n' '// Generated atomically by scripts/sync-aibrush-vendor.sh. Do not edit by hand.'
+    printf '%s\n' '// Stable inputs only: deliberately no timestamp, origin URL, or absolute host path.'
+    printf '%s\n' 'export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {'
+    printf '%s\n' '  formatVersion: 1,'
+    printf "  dependency: 'file:../media',\n"
+    printf "  packageVersion: '%s',\n" "$PACKAGE_VERSION"
+    printf "  sourceRevision: '%s',\n" "$SOURCE_REVISION"
+    printf "  sourceTreeDigest: '%s',\n" "$SOURCE_TREE_DIGEST"
+    printf "  dirtyState: '%s',\n" "$DIRTY_STATE"
+    printf '%s\n' '  buildFlags: ['
+    local flag
+    for flag in "${BUILD_FLAGS[@]}"; do printf "    '%s',\n" "$flag"; done
+    printf '%s\n' '  ],'
+    printf '%s\n' '  bundledWasmArtifacts: ['
+    local row
+    for row in "${WASM_ROWS[@]}"; do printf '%s\n' "$row"; done
+    printf '%s\n' '  ],'
+    printf '%s\n' '} as const;'
+  } > "$temp"
+  chmod 0644 "$temp"
+  mv -f "$temp" "$PROVENANCE_OUT"
+  trap - RETURN
+}
+
+capture_source_state
+SOURCE_REVISION_BEFORE="$SOURCE_REVISION"
+SOURCE_TREE_DIGEST_BEFORE="$SOURCE_TREE_DIGEST"
+DIRTY_STATE_BEFORE="$DIRTY_STATE"
+
+echo "[sync-vendor] source revision: $SOURCE_REVISION_BEFORE ($DIRTY_STATE_BEFORE)"
+if [ "$REPRODUCIBLE" = true ] || is_truthy "${CI:-}"; then
+  if [ "$DIRTY_STATE_BEFORE" != clean ] || [[ ! "$SOURCE_REVISION_BEFORE" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "[sync-vendor] ERROR: reproducible/CI sync requires a clean, labeled Git revision" >&2
+    exit 1
+  fi
 fi
 
-echo "[sync-vendor] building @aibrush/media (tsup) + vendoring wasm into dist/ …"
+echo "[sync-vendor] building @aibrush/media and vendoring its external WASM artifacts"
 ( cd "$MEDIA" && bun run build && bun run vendor-wasm )
 
-# A complete dist MUST carry the codec .wasm (else the install would ship a broken codec tier).
-if [ "$(find "$MEDIA/dist" -name '*.wasm' | wc -l | tr -d ' ')" -eq 0 ]; then
-  echo "[sync-vendor] ERROR: $MEDIA/dist has no *.wasm after build+vendor-wasm — refusing to install an incomplete runtime" >&2
+if [ "$(find -L "$MEDIA/dist" -type f -name '*.wasm' | wc -l | tr -d ' ')" -eq 0 ]; then
+  echo "[sync-vendor] ERROR: built package contains no external *.wasm artifacts" >&2
   exit 1
 fi
 
-echo "[sync-vendor] installing into node_modules/@aibrush/media (bun copies the file: dep's dist) …"
-( cd "$HERE" && bun install )
+# Bun currently installs this file dependency as per-file symlinks. If that link already targets the
+# freshly-built sibling, avoid an unnecessary package-manager pass. A copied/absent install is refreshed
+# with a frozen lockfile and a loopback-only registry so this local sync cannot contact the network.
+INDEX_LINK="$(readlink "$INSTALLED/dist/index.js" 2>/dev/null || true)"
+case "$INDEX_LINK" in
+  "$MEDIA/dist/"*) echo "[sync-vendor] installed file dependency already follows the local dist" ;;
+  *)
+    echo "[sync-vendor] refreshing the local file dependency with the frozen lockfile"
+    ( cd "$HERE" && bun install --frozen-lockfile --ignore-scripts --registry=http://127.0.0.1:9 )
+    ;;
+esac
 
-# The two entrypoints adapter.ts imports must exist, and the codec wasm must have come across.
-for f in index.js core.js; do
-  [ -f "$INSTALLED/dist/$f" ] || { echo "[sync-vendor] ERROR: $INSTALLED/dist/$f missing after install" >&2; exit 1; }
+for entry in index.js core.js; do
+  [ -f "$INSTALLED/dist/$entry" ] || {
+    echo "[sync-vendor] ERROR: installed dist/$entry is missing" >&2
+    exit 1
+  }
 done
-WASM_N="$(find "$INSTALLED/dist" -name '*.wasm' | wc -l | tr -d ' ')"
-[ "$WASM_N" -gt 0 ] || { echo "[sync-vendor] ERROR: no *.wasm landed in node_modules/@aibrush/media/dist/" >&2; exit 1; }
 
-# bun may either copy the file: dep's dist or symlink each entry back to $MEDIA/dist — both work with
-# vite (it serves the symlink realpath). Count files+symlinks so the tally is right either way.
-FILE_N="$(find "$INSTALLED/dist" \( -type f -o -type l \) | wc -l | tr -d ' ')"
-echo "[sync-vendor] done — node_modules/@aibrush/media mirrors $MEDIA/dist (${FILE_N} files, ${WASM_N} wasm)."
-echo "[sync-vendor] Restart the dev server / hard-reload the page so vite serves the fresh engine."
+PACKAGE_VERSION="$(package_version "$MEDIA/package.json")"
+INSTALLED_VERSION="$(package_version "$INSTALLED/package.json")"
+[[ "$PACKAGE_VERSION" =~ ^[0-9A-Za-z.+-]+$ ]] || {
+  echo "[sync-vendor] ERROR: package version is not safe to persist" >&2
+  exit 1
+}
+[ "$PACKAGE_VERSION" = "$INSTALLED_VERSION" ] || {
+  echo "[sync-vendor] ERROR: source package $PACKAGE_VERSION != installed package $INSTALLED_VERSION" >&2
+  exit 1
+}
+
+WASM_ROWS=()
+while IFS= read -r artifact; do
+  relative="${artifact#"$INSTALLED/"}"
+  digest="$(sha256_file "$artifact")"
+  [[ "$relative" =~ ^dist/[A-Za-z0-9._/-]+\.wasm$ ]] || {
+    echo "[sync-vendor] ERROR: unsafe package-relative WASM path" >&2
+    exit 1
+  }
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "[sync-vendor] ERROR: invalid SHA-256 for $relative" >&2
+    exit 1
+  }
+  WASM_ROWS+=("    { path: '$relative', sha256: '$digest' },")
+done < <(find -L "$INSTALLED/dist" -type f -name '*.wasm' -print | LC_ALL=C sort)
+[ "${#WASM_ROWS[@]}" -gt 0 ] || {
+  echo "[sync-vendor] ERROR: installed package contains no external *.wasm artifacts" >&2
+  exit 1
+}
+
+# Refuse to label artifacts if source changed concurrently while the build/install was running.
+capture_source_state
+if [ "$SOURCE_REVISION" != "$SOURCE_REVISION_BEFORE" ] || \
+   [ "$SOURCE_TREE_DIGEST" != "$SOURCE_TREE_DIGEST_BEFORE" ] || \
+   [ "$DIRTY_STATE" != "$DIRTY_STATE_BEFORE" ]; then
+  echo "[sync-vendor] ERROR: media source changed during sync; rerun against a stable working tree" >&2
+  exit 1
+fi
+
+write_provenance_atomically
+echo "[sync-vendor] persisted deterministic provenance (${#WASM_ROWS[@]} external WASM artifacts)"
+echo "[sync-vendor] done; restart the dev server or rebuild before running the matrix"

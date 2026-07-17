@@ -15,17 +15,16 @@
  *   loadGolden    → GET fixtures/golden/scenarios/<family>/<name>/NN.ext.meta.json  (Vite serves it)
  * so NO runner/oracle change is needed — the goldens just have to exist.
  *
- * The normalization helpers below are COPIED VERBATIM from fixtures/bake.mjs so the output is
- * byte-for-byte the same shape the baked-fixture goldens use (and `golden-metadata` expects). If you
- * change canonicalization in bake.mjs, mirror it here.
+ * Metadata, packet, and presentation-order placeholder normalization are imported from the same
+ * versioned fixture-location-independent module as fixtures/bake.mjs. Identical probe observations
+ * therefore produce byte-identical evidence on both bake paths without manual mirroring.
  *
  * FRAME/SSIM DIGESTS are the browser's normalized-RGBA sha256 — ffmpeg CANNOT produce them, so the
  * `--frames` mode here only emits the ffprobe-derived PLACEHOLDER (`<id>.frames.json` with sha256:null,
  * pending:true) that the in-browser WebCodecs pass (scripts/frame-bake.mjs → src/core/frame-bake.ts)
- * later fills. The placeholder shape is COPIED VERBATIM from fixtures/bake.mjs `frameHookFor` (the flat
- * corpus's producer) so the browser pass + the decoded-frames-bitexact / ssim-psnr / seek-accuracy
- * oracles read a nested real-file golden byte-identically to a flat one. The final digest is still
- * baked ONLY by the platform instrument, never by a scored candidate engine.
+ * later fills. Both entry points call the same shared presentation-order selector, so the browser pass
+ * and frame oracles read a nested real-file placeholder byte-identically to a flat one. The final
+ * digest is still baked ONLY by the platform instrument, never by a scored candidate engine.
  *
  * Usage:
  *   bun fixtures/bake-scenario-goldens.mjs [--force] [--packets] [--frames] [--family <fam>] [<id-substring> ...]
@@ -43,13 +42,52 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  DEFAULT_FRAME_READ_COUNT,
+  buildGoldenPacketProbeArgs,
+  buildGoldenSemanticDecodeArgs,
+  buildFramePlaceholder,
+  canonicalSha256,
+  goldenInputOptions,
+  normalizeGoldenPacketEvidence,
+  normalizeProbeMetadata,
+  parseMappedFrameMd5,
+} from './lib/golden-normalization.mjs';
+import {
+  collectToolPerimeter,
+  createGoldenEnvelope,
+  createGoldenProvenance,
+} from './lib/golden-contract.mjs';
+import {
+  activeArtifactsForMerge,
+  activeAvailabilityForMerge,
+  publishGeneration,
+  readActiveGenerationIndex,
+  stageReadyPublicationRecord,
+  stageUnavailablePublicationRecord,
+} from './lib/generation-publication.mjs';
+import { validatePinnedHlsResourceClosure } from './lib/hls-resource-fixtures.mjs';
 
 const ROOT = join(dirname(new URL(import.meta.url).pathname), '..');
 const SOURCES = join(ROOT, 'fixtures/media/scenarios/_sources.ndjson');
 const MEDIA_SCENARIOS = join(ROOT, 'fixtures/media/scenarios');
 const GOLDEN_DIR = join(ROOT, 'fixtures/golden');
+const TOOLCHAIN_LOCK_PATH = join(ROOT, 'fixtures/toolchain.lock.json');
+const TOOLCHAIN_LOCK = JSON.parse(readFileSync(TOOLCHAIN_LOCK_PATH, 'utf8'));
+const FIXTURE_SOURCE_DATE_EPOCH = process.env.SOURCE_DATE_EPOCH ?? TOOLCHAIN_LOCK.sourceDateEpoch;
+const TOOL_PERIMETER = collectToolPerimeter();
+TOOL_PERIMETER.declaredLock = {
+  sha256: createHash('sha256').update(readFileSync(TOOLCHAIN_LOCK_PATH)).digest('hex'),
+  sourceDateEpoch: TOOLCHAIN_LOCK.sourceDateEpoch,
+  locale: TOOLCHAIN_LOCK.locale,
+  timezone: TOOLCHAIN_LOCK.timezone,
+  required: TOOLCHAIN_LOCK.required,
+  optional: TOOLCHAIN_LOCK.optional,
+};
+TOOL_PERIMETER.environment.SOURCE_DATE_EPOCH = String(FIXTURE_SOURCE_DATE_EPOCH);
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -65,7 +103,7 @@ for (let i = 0; i < argv.length; i++) {
   else opts.terms.push(a.trim());
 }
 
-// ── ffprobe + normalization (VERBATIM from fixtures/bake.mjs) ─────────────────────────────────────
+// ── ffprobe + shared versioned normalization ─────────────────────────────────────────────────────
 function ffprobeJson(args, label) {
   const full = ['-hide_banner', '-loglevel', 'error', '-of', 'json', ...args];
   const res = spawnSync('ffprobe', full, { encoding: 'utf8', maxBuffer: 1 << 28 });
@@ -79,107 +117,63 @@ function ffprobeJson(args, label) {
   }
 }
 
-function canonicalCodec(name) {
-  const n = (name || '').toLowerCase();
-  const map = {
-    h264: 'h264', hevc: 'hevc', h265: 'hevc', vp8: 'vp8', vp9: 'vp9', av1: 'av1',
-    aac: 'aac', opus: 'opus', mp3: 'mp3', flac: 'flac', vorbis: 'vorbis',
-    pcm_s16le: 'pcm-s16', pcm_s24le: 'pcm-s24', pcm_f32le: 'pcm-f32',
-    pcm_s16be: 'pcm-s16be', pcm_s24be: 'pcm-s24be',
-    mjpeg: 'mjpeg', png: 'png', webp: 'webp',
-  };
-  return map[n] ?? n;
-}
-
-function canonicalContainer(formatName, assetId) {
-  const lower = assetId.toLowerCase();
-  if (lower === 'mislabeled_h264.webm') return 'mp4';
-  if (lower.endsWith('.mov')) return 'mov';
-  if (lower.endsWith('.mp4') || lower.endsWith('.m4a') || lower.endsWith('.m4v')) return 'mp4';
-  if (lower.endsWith('.mkv')) return 'mkv';
-  if (lower.endsWith('.webm')) return 'webm';
-  if (lower.endsWith('.ts')) return 'ts';
-  if (lower.endsWith('.m3u8')) return 'hls';
-  if (lower.endsWith('.wav')) return 'wav';
-  if (lower.endsWith('.aiff') || lower.endsWith('.aif')) return 'aiff';
-  if (lower.endsWith('.mp3')) return 'mp3';
-  if (lower.endsWith('.flac')) return 'flac';
-  if (lower.endsWith('.ogg') || lower.endsWith('.opus')) return 'ogg';
-  if (lower.endsWith('.aac')) return 'adts';
-  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'jpeg';
-  if (lower.endsWith('.png')) return 'png';
-  if (lower.endsWith('.webp')) return 'webp';
-  return (formatName || '').split(',')[0] || 'unknown';
-}
-
-function parseFps(stream) {
-  const r = stream.avg_frame_rate && stream.avg_frame_rate !== '0/0' ? stream.avg_frame_rate : stream.r_frame_rate;
-  if (!r || r === '0/0') return undefined;
-  const [num, den] = r.split('/').map(Number);
-  if (!den) return undefined;
-  const fps = num / den;
-  return Number.isFinite(fps) ? Math.round(fps * 1000) / 1000 : undefined;
-}
-
-function rotationOf(stream) {
-  const sd = (stream.side_data_list || []).find((s) => typeof s.rotation === 'number');
-  if (sd) return ((Math.round(sd.rotation) % 360) + 360) % 360;
-  const tagRot = stream.tags?.rotate;
-  if (tagRot != null) return ((parseInt(tagRot, 10) % 360) + 360) % 360;
-  return undefined;
-}
-
 function goldenInputOpts(assetId) {
-  if (assetId.toLowerCase().endsWith('.m3u8')) {
-    return ['-allowed_extensions', 'ALL', '-protocol_whitelist', 'file,crypto,data,http,https,tcp,tls'];
-  }
-  return [];
+  return goldenInputOptions(assetId);
 }
 
 function normalizedMetadataFor(assetId, mediaPath) {
   const inOpts = goldenInputOpts(assetId);
   const probe = ffprobeJson([...inOpts, '-show_format', '-show_streams', mediaPath], `${assetId} meta`);
-  const fmt = probe.format || {};
-  const streams = probe.streams || [];
-  const tracks = streams.map((s) => {
-    const type = s.codec_type === 'video' ? 'video' : s.codec_type === 'audio' ? 'audio' : s.codec_type === 'subtitle' ? 'subtitle' : 'other';
-    const track = { type, codec: canonicalCodec(s.codec_name) };
-    if (s.width) track.width = s.width;
-    if (s.height) track.height = s.height;
-    const fps = parseFps(s);
-    if (type === 'video' && fps !== undefined) track.fps = fps;
-    const rot = rotationOf(s);
-    if (rot !== undefined && rot !== 0) track.rotation = rot;
-    if (s.sample_rate) track.sampleRate = Number(s.sample_rate);
-    if (s.channels) track.channels = s.channels;
-    const br = s.bit_rate ? Number(s.bit_rate) : fmt.bit_rate ? Number(fmt.bit_rate) : null;
-    track.bitrate = Number.isFinite(br) ? br : null;
-    track.language = s.tags?.language ?? null;
-    return track;
-  });
-  const durRaw = fmt.duration != null ? Number(fmt.duration) : NaN;
-  const durationSec = Number.isFinite(durRaw) ? Math.round(durRaw * 1000) / 1000 : null;
-  const meta = { container: canonicalContainer(fmt.format_name, assetId), durationSec, tracks };
-  const tagKeys = ['title', 'artist', 'album', 'comment', 'encoder', 'major_brand'];
-  const tags = {};
-  for (const k of tagKeys) if (fmt.tags?.[k]) tags[k] = String(fmt.tags[k]);
-  if (Object.keys(tags).length) meta.tags = tags;
-  return meta;
+  const frameProbe = ffprobeJson(
+    [...inOpts, '-select_streams', 'v', '-show_frames', '-show_entries', 'frame=stream_index,pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${DEFAULT_FRAME_READ_COUNT}`, mediaPath],
+    `${assetId} cadence`,
+  );
+  return normalizeScenarioProbeForGolden(probe, frameProbe, assetId);
+}
+
+export function normalizeScenarioProbeForGolden(probe, frameProbe, assetId = 'fixture.bin') {
+  return normalizeProbeMetadata(probe, { assetId, frameProbe });
+}
+
+export function scenarioFramePlaceholderForGolden(assetId, sourceMedia, frameProbe) {
+  return buildFramePlaceholder(assetId, sourceMedia, frameProbe);
 }
 
 function packetsFor(assetId, mediaPath) {
   const inOpts = goldenInputOpts(assetId);
-  const probe = ffprobeJson([...inOpts, '-show_packets', '-show_entries', 'packet=stream_index,size,pts_time,dts_time,flags', mediaPath], `${assetId} packets`);
-  const pkts = probe.packets || [];
-  return pkts.map((p) => {
-    const ptsUs = p.pts_time != null && p.pts_time !== 'N/A' ? Math.round(Number(p.pts_time) * 1e6) : 0;
-    const dtsUs = p.dts_time != null && p.dts_time !== 'N/A' ? Math.round(Number(p.dts_time) * 1e6) : ptsUs;
-    const keyframe = typeof p.flags === 'string' ? p.flags.includes('K') : false;
-    return { trackIndex: Number(p.stream_index) || 0, size: Number(p.size) || 0, ptsUs, dtsUs, keyframe };
+  const probe = ffprobeJson(buildGoldenPacketProbeArgs(inOpts, mediaPath), `${assetId} packets`);
+  const decoded = decodedFrameHashes(assetId, mediaPath, inOpts, probe.streams ?? []);
+  return normalizeGoldenPacketEvidence(probe, {
+    assetId,
+    decodedUnits: decoded.units,
+    decoderObservation: decoded.observation,
   });
 }
 
-// ── Frame-digest PLACEHOLDER (browser-filled) ─────────────────────────────────────────────────────
+function decodedFrameHashes(assetId, mediaPath, inOpts, inputStreams) {
+  const result = spawnSync(
+    'ffmpeg',
+    buildGoldenSemanticDecodeArgs(inOpts, mediaPath),
+    { encoding: 'utf8', maxBuffer: 1 << 28 },
+  );
+  if (result.status !== 0) {
+    if (assetId.endsWith('hls_sample_aes.m3u8')) {
+      validatePinnedHlsResourceClosure({ assetId, mediaPath, goldenDir: GOLDEN_DIR });
+      return {
+        units: [],
+        observation: {
+          state: 'reference-unavailable',
+          reasonCode: 'REFERENCE_DECODER_SAMPLE_AES_UNAVAILABLE',
+          detail: 'independent ffmpeg reference decode unavailable for source-bound SAMPLE-AES fixture',
+        },
+      };
+    }
+    throw new Error(`ffmpeg semantic decode failed for ${assetId}: ${result.stderr || result.error?.message || `exit ${result.status}`}`);
+  }
+  return { units: parseMappedFrameMd5(result.stdout, inputStreams), observation: { state: 'validated' } };
+}
+
+// ── Frame-digest PLACEHOLDER (browser-filled through the shared selector) ──────────────────────────
 //
 // Families whose ROTATED real files are scored by a frame-digest golden (decoded-frames-bitexact /
 // ssim-psnr) or by seek-accuracy (which resolves its expected PTS from golden frames when no packet
@@ -203,77 +197,196 @@ function hasVideoStream(assetId, mediaPath) {
   return (probe.streams || []).some((s) => s.codec_type === 'video');
 }
 
-/** Resolve a frame's presentation time in seconds: best_effort_timestamp_time, else pts_time; null if neither. */
-function frameTimeSec(f) {
-  for (const k of ['best_effort_timestamp_time', 'pts_time']) {
-    const v = f[k];
-    if (v != null && v !== 'N/A') {
-      const n = Number(v);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return null;
-}
-
-/** How many presentation frames the golden lists (matches the flat corpus's 12-frame convention). */
-const FRAME_COUNT = 12;
-/**
- * How many DECODE-order frames to read before selecting. `-read_intervals %+#N` reads the first N frames
- * in DECODE (coded) order; for B-frame content the first FRAME_COUNT *presentation* frames can be spread
- * across MORE than FRAME_COUNT decoded frames (a later-decoded B-frame carries an earlier PTS). Reading a
- * generous multiple (past any realistic reorder depth), sorting by PTS, and taking the first FRAME_COUNT
- * yields the true CONTIGUOUS first-FRAME_COUNT presentation frames — so golden[i].ptsUs === presentation
- * frame i, which is REQUIRED: the browser pass fills golden[i] from the decoded frame AT golden[i].ptsUs
- * and the oracle matches by that index. (The old `%+#12` grabbed 12 DECODE frames and, after sorting,
- * DROPPED the reordered B-frame at the tail while KEEPING a later P-frame — a non-contiguous gap, e.g.
- * [0…166667,200000] missing 183333 — which mislabels the tail golden entry.)
- */
-const FRAME_READ_COUNT = 60;
-
 /**
  * Build the `<id>.frames.json` PLACEHOLDER for a video-bearing real file — the SAME $todo/pending shape
- * fixtures/bake.mjs `frameHookFor` emits for the flat corpus (so the browser pass + oracles read it
- * byte-identically), with robustness refinements the nested corpus needs: (1) resolve each frame's time
- * from best_effort_timestamp_time (falling back to pts_time) so VFR/edge frames that carry only a
- * best-effort stamp are not dropped; (2) read FRAME_READ_COUNT decoded frames, sort into presentation
- * (PTS) order, and take the first CONTIGUOUS FRAME_COUNT — never a decode-order gap (see FRAME_READ_COUNT).
+ * shared by fixtures/bake.mjs: resolve best-effort/PTS time, read a bounded decode-order window, sort
+ * into presentation order, deduplicate timestamps, and retain the first 12 contiguous observations.
  * Never invents a digest: every sha256 is null and pending stays true until the platform pass.
  */
 function framePlaceholderFor(assetId, mediaPath) {
-  let entries = [];
+  const source = sourceIdentity(mediaPath);
+  const inOpts = goldenInputOpts(assetId);
+  let probe = { frames: [] };
   try {
-    const inOpts = goldenInputOpts(assetId);
-    const probe = ffprobeJson(
-      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${FRAME_READ_COUNT}`, mediaPath],
+    probe = ffprobeJson(
+      [...inOpts, '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=stream_index,pts_time,best_effort_timestamp_time,key_frame', '-read_intervals', `%+#${DEFAULT_FRAME_READ_COUNT}`, mediaPath],
       `${assetId} frames-hook`,
     );
-    entries = (probe.frames || [])
-      .map((f) => {
-        const t = frameTimeSec(f);
-        return t == null ? null : { ptsUs: Math.round(t * 1e6), keyframe: f.key_frame === 1 || f.key_frame === '1' };
-      })
-      .filter((e) => e !== null)
-      .sort((a, b) => a.ptsUs - b.ptsUs)
-      .slice(0, FRAME_COUNT); // first CONTIGUOUS presentation frames (0..FRAME_COUNT-1)
   } catch {
-    entries = [];
+    // The shared placeholder turns the empty observation into an explicit producer-failed state.
   }
-  return {
-    $todo:
-      'BROWSER-PRODUCED GOLDEN. These frame digests are sha256 of the normalized RGBA buffer ' +
-      '(src/engines/platform/digest.ts) decoded in a real browser — ffmpeg cannot produce them. ' +
-      'Run the suite frame-bake pass (decode this asset with the platform engine, digestFrame each ' +
-      'listed pts, and write the sha256 into `frames[].sha256`) then commit. Until then `frames` is ' +
-      'a placeholder and the decoded-frames-bitexact oracle for this asset should report NA/skip.',
-    pending: true,
-    assetId,
-    frames: entries.map((p, index) => ({ index, ptsUs: p.ptsUs, keyframe: p.keyframe, sha256: null })),
-  };
+  return scenarioFramePlaceholderForGolden(assetId, source, probe);
 }
 
 function writeJson(path, obj) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(obj, null, 2) + '\n');
+}
+
+function sourceIdentity(path) {
+  const bytes = readFileSync(path);
+  return {
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    sizeBytes: bytes.byteLength,
+  };
+}
+
+/** Reject local contamination before ffprobe or any publication staging can consume the bytes. */
+export function verifyScenarioSourceIdentity(catalogFile, mediaPath, assetId = catalogFile?.file ?? 'unknown') {
+  if (!catalogFile || !Number.isSafeInteger(catalogFile.sizeBytes) || catalogFile.sizeBytes < 0 ||
+      typeof catalogFile.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(catalogFile.sha256)) {
+    throw new TypeError(`${assetId}: SCENARIO_SOURCE_CATALOG_IDENTITY_INVALID`);
+  }
+  const actualSizeBytes = statSync(mediaPath).size;
+  if (actualSizeBytes !== catalogFile.sizeBytes) {
+    throw new Error(
+      `${assetId}: SCENARIO_SOURCE_SIZE_MISMATCH expected ${catalogFile.sizeBytes}, got ${actualSizeBytes}`,
+    );
+  }
+  const identity = sourceIdentity(mediaPath);
+  if (identity.sha256 !== catalogFile.sha256) {
+    throw new Error(
+      `${assetId}: SCENARIO_SOURCE_DIGEST_MISMATCH expected ${catalogFile.sha256}, got ${identity.sha256}`,
+    );
+  }
+  return identity;
+}
+
+function artifactEnvelope(artifactKind, assetId, mediaPath, payload, availability = { state: 'ready' }) {
+  const sourceMedia = sourceIdentity(mediaPath);
+  const provenance = createGoldenProvenance({
+    artifactKind,
+    assetId,
+    sourceMedia,
+    recipe: `fixtures/bake-scenario-goldens.mjs#${artifactKind}`,
+    normalizedArguments: {
+      assetId,
+      sourceSha256: sourceMedia.sha256,
+      artifactKind,
+      normalizationVersion: payload.schemaVersion ?? null,
+    },
+    baker: 'media-test/bake-scenario-goldens@1',
+    perimeter: TOOL_PERIMETER,
+    payload,
+    sourceDateEpoch: FIXTURE_SOURCE_DATE_EPOCH,
+    browserQualified: false,
+  });
+  let legacy;
+  if (artifactKind === 'metadata') {
+    legacy = { ...payload.metadata, metadata: payload.metadata, raw: payload.raw, canonical: payload.canonical };
+  } else if (artifactKind === 'packets') {
+    legacy = { packets: payload.packets, raw: payload.raw, semantic: payload.semantic, representation: payload.representation };
+  } else {
+    legacy = {
+      $todo:
+        'BROWSER-PRODUCED GOLDEN. Real normalized RGBA pixels and timestamp identity are required; ' +
+        'run scripts/frame-bake.mjs. Until then frame evidence is pending and routes to NA_ASSET.',
+      pending: true,
+      pixelNormalizationVersion: payload.pixelNormalizationVersion,
+      evidenceState: payload.evidenceState,
+      ...(payload.producerFailure ? { producerFailure: payload.producerFailure } : {}),
+      frames: payload.frames,
+    };
+  }
+  return createGoldenEnvelope({ artifactKind, assetId, sourceMedia, payload, legacy, provenance, availability });
+}
+
+const staged = new Map();
+const stagedAvailability = new Map();
+const staleDirectRemovals = new Set();
+// Scenario files are the selected roots; resources nested below one root are never added here.
+const stagedRootAssetIds = new Set();
+
+function stageEnvelope(relativeGoldenPath, document) {
+  stagedRootAssetIds.add(document.assetId);
+  const logicalPath = `golden/${relativeGoldenPath}`;
+  const bytes = `${JSON.stringify(document, null, 2)}\n`;
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    artifactKind: document.artifactKind,
+    bytes,
+    sourceMediaSha256: document.sourceMedia.sha256,
+    provenanceSha256: canonicalSha256(document.provenance),
+    directPath: join(ROOT, 'fixtures', logicalPath),
+    document,
+  });
+}
+
+function stageMedia(assetId, mediaPath, sourceMedia) {
+  stagedRootAssetIds.add(assetId);
+  const logicalPath = `media/${assetId}`;
+  const provenance = {
+    schema: 'media-test/media-provenance@1',
+    assetId,
+    sourceMedia,
+    catalog: 'fixtures/media/scenarios/_sources.ndjson',
+    recipe: 'fixtures/bake-scenario-goldens.mjs#media',
+    baker: 'media-test/bake-scenario-goldens@1',
+  };
+  stageReadyPublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    artifactKind: 'media',
+    sourcePath: mediaPath,
+    sourceMediaSha256: sourceMedia.sha256,
+    provenanceSha256: canonicalSha256(provenance),
+    audit: {
+      recipe: provenance.recipe,
+      bakerVersion: provenance.baker,
+      outputArtifactSha256: sourceMedia.sha256,
+    },
+  });
+}
+
+function stageExpectedAbsence(logicalPath, reasonCode, detail) {
+  if (logicalPath.startsWith('media/')) stagedRootAssetIds.add(logicalPath.slice('media/'.length));
+  stageUnavailablePublicationRecord(staged, stagedAvailability, {
+    logicalPath,
+    state: 'absent-expected',
+    reasonCode,
+    detail,
+  });
+}
+
+function publishStaged() {
+  const fixtureRoot = join(ROOT, 'fixtures');
+  const replacements = [...new Set([...staged.keys(), ...stagedAvailability.keys()])];
+  if (replacements.length === 0) return undefined;
+  const additions = [...staged.values()].map(({ directPath: _directPath, document: _document, ...artifact }) => artifact);
+  const artifacts = [...activeArtifactsForMerge(fixtureRoot, replacements), ...additions];
+  const availability = [
+    ...activeAvailabilityForMerge(fixtureRoot, replacements),
+    ...stagedAvailability.values(),
+  ];
+  const activeScope = readActiveGenerationIndex(fixtureRoot)?.publicationScope;
+  const publicationScope = activeScope?.mode === 'complete-corpus'
+    ? { mode: 'complete-corpus' }
+    : {
+        mode: 'selected-assets',
+        assetIds: [
+          ...(activeScope?.mode === 'selected-assets' ? activeScope.assetIds : []),
+          ...stagedRootAssetIds,
+        ].filter((assetId, index, all) => all.indexOf(assetId) === index).sort(compareCodepoint),
+      };
+  const published = publishGeneration({
+    rootDir: fixtureRoot,
+    artifacts,
+    availability,
+    publicationScope,
+    sourceDateEpoch: FIXTURE_SOURCE_DATE_EPOCH,
+  });
+
+  // Compatibility mirror. The generation index is authoritative and was renamed last; legacy
+  // readers can continue using the familiar path while migration to indexed resolution completes.
+  for (const artifact of staged.values()) {
+    if (!artifact.directPath || !artifact.document) continue;
+    writeJson(artifact.directPath, artifact.document);
+  }
+  for (const path of staleDirectRemovals) rmSync(path, { force: true });
+  return published;
+}
+
+function compareCodepoint(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────────────────────────
@@ -314,7 +427,20 @@ function bakeFramesMode(rows) {
     for (const file of row.files) {
       const assetId = `scenarios/${row.scenarioId}/${file.file}`;
       const mediaPath = join(MEDIA_SCENARIOS, row.scenarioId, file.file);
-      if (!existsSync(mediaPath)) { missing++; continue; }
+      if (!existsSync(mediaPath)) {
+        missing++;
+        stageExpectedAbsence(`media/${assetId}`, 'SCENARIO_SOURCE_NOT_ACQUIRED', 'catalogued real/derived source is not present in this checkout');
+        continue;
+      }
+      let sourceMedia;
+      try {
+        sourceMedia = verifyScenarioSourceIdentity(file, mediaPath, assetId);
+      } catch (error) {
+        failed++;
+        failures.push(`${assetId} source-integrity: ${error.message}`);
+        continue;
+      }
+      stageMedia(assetId, mediaPath, sourceMedia);
 
       const framesPath = join(GOLDEN_DIR, `${assetId}.frames.json`);
       const ssimPath = join(GOLDEN_DIR, `${assetId}.ssim.json`);
@@ -339,12 +465,18 @@ function bakeFramesMode(rows) {
       if (!hasVideo) { audioSkipped++; continue; }
 
       try {
-        writeJson(framesPath, framePlaceholderFor(assetId, mediaPath));
+        const placeholder = framePlaceholderFor(assetId, mediaPath);
+        const availability = placeholder.evidenceState === 'producer-failed'
+          ? { state: 'producer-failed', reasonCode: placeholder.producerFailure?.reasonCode ?? 'FRAME_PLACEHOLDER_EMPTY', detail: placeholder.producerFailure?.detail }
+          : { state: 'pending', reasonCode: 'FRAME_PIXELS_NOT_BAKED', detail: 'browser-qualified pixels have not been produced' };
+        const envelope = artifactEnvelope('frames', assetId, mediaPath, placeholder, availability);
+        stageEnvelope(`${assetId}.frames.json`, envelope);
         // A fresh PENDING placeholder means "not yet baked" → any prior luma-signature side-file is now
         // stale and MUST go: loadGolden reads ssim.json independently of the frames `pending` flag, so a
         // lingering ssim.json would keep ssim-psnr scoring (a FAIL) instead of the honest NA the pending
         // frames golden intends. Removing it makes decodeFrameGoldenGap (runner.ts) resolve to NA_ASSET.
-        rmSync(ssimPath, { force: true });
+        stageExpectedAbsence(`golden/${assetId}.ssim.json`, 'FRAME_PIXELS_NOT_BAKED', 'SSIM evidence is absent until every expected frame has real pixels');
+        staleDirectRemovals.add(ssimPath);
         framesWritten++;
         perFamily[fam] = (perFamily[fam] ?? 0) + 1;
       } catch (e) { failed++; failures.push(`${assetId} frames: ${e.message}`); }
@@ -365,6 +497,8 @@ function bakeFramesMode(rows) {
   if (failures.length > 20) console.log(`    … and ${failures.length - 20} more`);
   console.log(`  NEXT: bun scripts/frame-bake.mjs --scenario-frames --browser chromium --headless --base-url http://localhost:5173`);
   console.log(`═══════════════════════════════════`);
+  if (failed > 0) throw new Error(`scenario frame bake had ${failed} unexpected selected failure(s); active generation was not changed`);
+  publishStaged();
 }
 
 function main() {
@@ -380,12 +514,26 @@ function main() {
     for (const file of row.files) {
       const assetId = `scenarios/${row.scenarioId}/${file.file}`;
       const mediaPath = join(MEDIA_SCENARIOS, row.scenarioId, file.file);
-      if (!existsSync(mediaPath)) { missing++; continue; }
+      if (!existsSync(mediaPath)) {
+        missing++;
+        stageExpectedAbsence(`media/${assetId}`, 'SCENARIO_SOURCE_NOT_ACQUIRED', 'catalogued real/derived source is not present in this checkout');
+        continue;
+      }
+      let sourceMedia;
+      try {
+        sourceMedia = verifyScenarioSourceIdentity(file, mediaPath, assetId);
+      } catch (error) {
+        failed++;
+        failures.push(`${assetId} source-integrity: ${error.message}`);
+        continue;
+      }
+      stageMedia(assetId, mediaPath, sourceMedia);
 
       const metaPath = join(GOLDEN_DIR, `${assetId}.meta.json`);
       if (opts.force || !existsSync(metaPath)) {
         try {
-          writeJson(metaPath, normalizedMetadataFor(assetId, mediaPath));
+          const payload = normalizedMetadataFor(assetId, mediaPath);
+          stageEnvelope(`${assetId}.meta.json`, artifactEnvelope('metadata', assetId, mediaPath, payload));
           metaWritten++;
         } catch (e) { failed++; failures.push(`${assetId} meta: ${e.message}`); continue; }
       } else skipped++;
@@ -393,7 +541,11 @@ function main() {
       if (bakePackets) {
         const pktPath = join(GOLDEN_DIR, `${assetId}.packets.json`);
         if (opts.force || !existsSync(pktPath)) {
-          try { writeJson(pktPath, packetsFor(assetId, mediaPath)); packetsWritten++; }
+          try {
+            const payload = packetsFor(assetId, mediaPath);
+            stageEnvelope(`${assetId}.packets.json`, artifactEnvelope('packets', assetId, mediaPath, payload));
+            packetsWritten++;
+          }
           catch (e) { failed++; failures.push(`${assetId} packets: ${e.message}`); }
         }
       }
@@ -410,6 +562,8 @@ function main() {
   for (const f of failures.slice(0, 20)) console.log(`    ✗ ${f}`);
   if (failures.length > 20) console.log(`    … and ${failures.length - 20} more`);
   console.log(`═══════════════════════════════════`);
+  if (failed > 0) throw new Error(`scenario golden bake had ${failed} unexpected selected failure(s); active generation was not changed`);
+  publishStaged();
 }
 
-main();
+if (import.meta.main) main();

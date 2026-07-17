@@ -28,19 +28,17 @@
  * MULTI-TRACK + TRACK ATTRIBUTION (closes oracleGap "no case SELECTS/attributes a specific track"):
  * `h264_multitrack.mp4` has 3 tracks (video + 2 audio). True per-track SELECTION (probe a specific
  * non-default track and assert THAT track's metadata) is not an operation the engine contract exposes
- * — probe returns ALL tracks. What IS verifiable, and what `golden-metadata`/`golden-packets`
- * actually check, is POSITIONAL track attribution: tracks must be reported in the correct order with
- * the correct per-track {type, codec, dims/sr/ch}, and every packet must carry the correct
- * trackIndex. So:
- *   - `metadata/tracks_attribution_multitrack` (probe + golden-metadata) gates that the 3 tracks land
- *     in the right order with the right codec/type/sr/ch per index — i.e. track 0 is the video, tracks
- *     1 and 2 are the two AAC audio tracks, each attributed to its own index (not merged/duplicated).
+ * — probe returns ALL tracks. What is verifiable is LOGICAL attribution: golden-metadata partitions
+ * by type and deterministically matches codec/dimensions/rate/language/default/id evidence, while
+ * golden-packets joins through the logical mapping before evaluating representation. So:
+ *   - `metadata/tracks_attribution_multitrack` gates that all three logical tracks are present and
+ *     distinct, independent of array order.
  *   - `metadata/tracks_packet_attribution_multitrack` (demux + golden-packets) gates that EVERY packet
  *     is stamped with the correct trackIndex (the order-independent per-track layout check), catching a
  *     demuxer that mis-attributes a packet to the wrong track.
- * DISTINCT per-track LANGUAGE values (eng/fra/jpn) are NOT asserted: `compareTrack` never compares
- * `language`, the golden has every track 'und'/null, and no distinct-language asset exists — all three
- * out of scope. Recorded as an oracleGap in index.ts.
+ * DISTINCT per-track LANGUAGE values (eng/fra/jpn) are not asserted because this source/golden has
+ * every track 'und'/null. The semantic comparator can match language when the fixture exposes it;
+ * the paired equivalence matrix covers that distinction until a tagged media source is baked.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -106,9 +104,8 @@ const ROTATION_PROPERTY: MetaPropertyCase[] = [
 // ── Multi-track positional attribution (probe + demux) ────────────────────────────────────────────
 
 /**
- * Probe-side attribution: golden-metadata matches tracks POSITIONALLY, so this gates that the 3
- * tracks of h264_multitrack.mp4 are reported in the correct order with the correct per-track
- * type/codec/dims/sr/ch — i.e. each track is attributed to its own index, not merged or duplicated.
+ * Probe-side attribution: semantic golden metadata matches logical tracks by type/evidence, so this
+ * gates that all three tracks remain distinct even if an API reports a different array order.
  */
 const multitrackAttribution: Scenario = defineScenario({
   id: 'metadata/tracks_attribution_multitrack',
@@ -124,11 +121,12 @@ const multitrackAttribution: Scenario = defineScenario({
   metrics: ['wall'],
   notes:
     'Multi-track positional attribution (A.11/A.16 multi-track): h264_multitrack.mp4 has 3 tracks ' +
-    '(video + 2 AAC). golden-metadata matches tracks by golden order, so this asserts track 0 is the ' +
-    'video and tracks 1/2 are the two audio tracks, each attributed to its own index with the right ' +
-    'codec/type/sampleRate/channels (catches a probe that merges/drops/duplicates a track). True ' +
-    'non-default track SELECTION and DISTINCT per-track language values are not gatable here — probe ' +
-    'returns all tracks and compareTrack never compares language (see index.ts oracleGaps).',
+    '(video + 2 AAC). semantic golden-metadata performs deterministic logical matching, asserting one ' +
+    'video and two distinct audio tracks with the right codec/type/sampleRate/channels while allowing ' +
+    'array reorder (catches a probe that merges/drops/duplicates a track). True ' +
+    'non-default track SELECTION is not part of probe (probe returns all tracks). This asset has no ' +
+    'distinct language values; logical language/default/id matching is covered by the metadata ' +
+    'equivalence matrix.',
 });
 
 /**

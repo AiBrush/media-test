@@ -2,7 +2,7 @@
  * src/scenarios/transcode/index.ts — Pillar 1, family "transcode".
  *
  * Lossy re-encode. Pixels change, so correctness is judged by perceptual similarity to the
- * reference frames: `ssim-psnr` with floors {ssimMin: 0.99, psnrMinDb: 40} (tunable per scenario),
+ * reference frames: `ssim-psnr` with floors {ssimMin: 0.99} (tunable per scenario),
  * plus a `playback-smoke`. Coverage is the codec matrix (h264/hevc/vp8/vp9/av1 video;
  * aac/opus/mp3/flac/pcm audio), plus the spatial/temporal/bitrate/rotate transforms, plus a
  * fan-out/ABR ladder (one input → N renditions, each SSIM-validated).
@@ -15,8 +15,8 @@ import type { TranscodeOptions } from '../../core/engine.ts';
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
-/** SSIM/PSNR floors shared by every (non-overridden) transcode scenario. */
-const TC_TOL: OracleTolerances = { ssimMin: 0.99, psnrMinDb: 40 };
+/** SSIM is the gate. PSNR remains advisory until both decoded pixel planes are observable. */
+const TC_TOL: OracleTolerances = { ssimMin: 0.99 };
 
 /**
  * Browser/WebCodecs transcodes routinely quantize encoded duration by a few frames when changing FPS
@@ -27,7 +27,7 @@ const TC_REENCODE_DURATION_TOLERANCE_SEC = 0.15;
 /** AAC/Opus/MP3 encoder-delay + padding allowance for lossy audio targets. */
 const TC_AUDIO_PRIMING_TOLERANCE_SEC = 0.12;
 
-const TC_METRICS = ['wall', 'throughputRealtime', 'peakMemory', 'decodeFps', 'encodeFps', 'longtasks'] as const;
+const TC_METRICS = ['wall', 'throughputRealtime', 'peakMemory', 'longtasks'] as const;
 
 /** Tight wall-clock cap (ms) for edge/negative cases that must fail fast (no crash/hang/OOM). */
 const TC_EDGE_TIMEOUT_MS = 20_000;
@@ -43,6 +43,11 @@ type TranscodeOpts = TranscodeOptions & Record<string, unknown>;
 const withOutputMetadataInvariant = (opts: TranscodeOptions | TranscodeOpts): TranscodeOpts => ({
   ...opts,
   invariant: 'transcode-output-metadata',
+});
+
+const withAudioContentInvariant = (opts: TranscodeOptions | TranscodeOpts): TranscodeOpts => ({
+  ...opts,
+  invariant: 'transcode-audio-content',
 });
 
 // ── Video codec transcode matrix ────────────────────────────────────────────────────────────────
@@ -82,7 +87,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toContainer: 'mp4',
     toVideo: 'hevc',
     opts: { container: 'mp4', video: { codec: 'hevc' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
   },
   {
     id: 'h264_to_vp9_webm',
@@ -106,7 +111,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp8',
     toAudio: 'vorbis',
     opts: { container: 'webm', video: { codec: 'vp8' }, audio: { codec: 'vorbis' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'Tiny MP4/H.264/AAC → WebM/VP8/Vorbis: keeps the VP8/Vorbis output row inside the browser-wasm budget.',
   },
   {
@@ -118,7 +123,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toContainer: 'mp4',
     toVideo: 'av1',
     opts: { container: 'mp4', video: { codec: 'av1' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'AV1 encode is slow/SW on most browsers; expect NA where no AV1 encoder is configurable.',
   },
 
@@ -132,7 +137,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toContainer: 'mp4',
     toVideo: 'h264',
     opts: { container: 'mp4', video: { codec: 'h264' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
   },
   {
     id: 'vp9_to_h264_mp4',
@@ -144,7 +149,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     toAudio: 'aac',
     opts: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
   },
   {
     id: 'vp8_to_h264_mp4',
@@ -156,7 +161,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     toAudio: 'aac',
     opts: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
   },
   {
     id: 'av1_to_h264_mp4',
@@ -168,7 +173,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     toAudio: 'aac',
     opts: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
   },
 
   // ── Resize (downscale + upscale) ──
@@ -183,7 +188,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     features: ['resize'],
     opts: { container: 'mp4', video: { codec: 'h264', width: 1280, height: 720 } },
     // Reference frames for SSIM are the same content scaled to 720p; keep floors but slightly relaxed.
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'Downscale 1080p→720p; SSIM computed against reference 720p frames.',
   },
   {
@@ -196,7 +201,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['resize'],
     opts: { container: 'mp4', video: { codec: 'h264', width: 1920, height: 1080 } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
     notes: '4K→1080p downscale.',
   },
   {
@@ -208,7 +213,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp9',
     features: ['resize', 'mediarecorder:video-only'],
     opts: { container: 'webm', video: { codec: 'vp9', width: 640, height: 360, bitrate: 4_000_000 } },
-    tolerances: { ssimMin: 0.93, psnrMinDb: 30 },
+    tolerances: { ssimMin: 0.93 },
     notes:
       'Video-only browser-native transcode coverage: uses the corpus h264_video_only.mp4 fixture so ' +
       'platform can exercise its real canvas→MediaRecorder path without falsely claiming audio preservation.',
@@ -261,7 +266,7 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     opts: { container: 'mp4', video: { codec: 'h264', bitrate: 2_000_000 } },
     // Aggressive bitrate cut lowers fidelity; floors loosened to reflect a real ABR rung.
-    tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
+    tolerances: { ssimMin: 0.95 },
     notes: 'Re-encode at 2 Mbps; lower floors acknowledge intended quality loss.',
   },
 
@@ -276,8 +281,12 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 0 } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
-    notes: 'Bake the 90° display rotation into pixels (rotate→0); SSIM vs upright reference frames.',
+    extraOracles: ['property-invariant'],
+    optsInvariant: 'transcode-effect-aware',
+    tolerances: { ssimMin: 0.98 },
+    notes:
+      'Bake the 90° display rotation into pixels (rotate→0); effect-aware pixels and authored ' +
+      'rotation signaling are mandatory in addition to the perceptual reference.',
   },
 ];
 
@@ -322,10 +331,10 @@ const videoScenarios: Scenario[] = VIDEO_CASES.map(buildVideoScenario);
 // ── Audio-only transcode matrix ─────────────────────────────────────────────────────────────────
 
 /**
- * Audio re-encode. SSIM/PSNR are video-only and transcode does not populate ctx.metadata, so these
- * rows use the transcode output-metadata invariant: reference-probe the produced bytes, assert the
- * requested container/codec/channel shape, and keep duration within a small priming band for lossy
- * targets. Browser-playable containers also get a playback smoke check.
+ * Audio re-encode. SSIM/PSNR are video-only, so these rows use the transcode audio-content
+ * invariant: a neutral reader gates container/codec/channel/rate, decoded PCM gates content, and
+ * AAC/Opus delay is trimmed only from authored timing evidence. Browser-playable containers also
+ * get a playback smoke check.
  */
 interface AudioTranscodeCase {
   id: string;
@@ -368,8 +377,7 @@ const AUDIO_CASES: AudioTranscodeCase[] = [
     opts: { container: 'flac', audio: { codec: 'flac' } },
     lossless: true,
     notes:
-      'Lossless target. Output metadata gates the FLAC container/codec and duration; PCM bit-exactness ' +
-      'needs a dedicated audio decode oracle before it can be asserted here.',
+      'Lossless target: neutral FLAC structure plus decoded PCM equality after the declared program window.',
   },
   {
     id: 'mp3_to_aac_mp4',
@@ -408,7 +416,7 @@ const audioScenarios: Scenario[] = AUDIO_CASES.map((c) => {
     id: `transcode/${c.id}`,
     op: 'transcode',
     input: c.asset,
-    options: withOutputMetadataInvariant(c.opts),
+    options: withAudioContentInvariant(c.opts),
     requires: {
       operations: ['transcode'],
       containersIn: [c.fromContainer],
@@ -417,7 +425,6 @@ const audioScenarios: Scenario[] = AUDIO_CASES.map((c) => {
     },
     oracles,
     metrics: ['wall', 'throughputRealtime', 'peakMemory', 'longtasks'],
-    ...(c.lossless ? {} : { tolerances: { durationToleranceSec: TC_AUDIO_PRIMING_TOLERANCE_SEC } }),
     ...(c.notes ? { notes: c.notes } : {}),
   });
 });
@@ -426,8 +433,9 @@ const audioScenarios: Scenario[] = AUDIO_CASES.map((c) => {
 
 /**
  * ABR fan-out via TranscodeOptions.variants: the engine must surface every requested quality rung.
- * The fanout-renditions oracle validates count, dimensions, codec, playback, and SSIM/PSNR for each
- * rendition. Requires the 'fanout' feature so engines without multi-rendition output negotiate NA.
+ * The fanout-renditions oracle validates every rendition independently and then validates the set's
+ * authored bitrate bands, timebase/duration, random-access alignment, and decoded adjacent switches.
+ * Requires the 'fanout' feature so engines without multi-rendition output negotiate NA.
  */
 const ABR_OPTS: TranscodeOptions = {
   container: 'mp4',
@@ -456,8 +464,11 @@ const fanoutScenarios: Scenario[] = [
     },
     oracles: ['fanout-renditions'],
     metrics: [...TC_METRICS],
-    tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
-    notes: '1→4 H.264 ABR renditions (1080/720/480/360); every surfaced rendition is playback + SSIM/PSNR validated.',
+    tolerances: { ssimMin: 0.95 },
+    renditionIds: ['1080p', '720p', '480p', '360p'],
+    notes:
+      'Explicit H.264 ABR set (1080/720/480/360): every rendition must satisfy validity, quality, ' +
+      'bitrate, common-timebase, aligned random-access, and cross-rendition switching contracts.',
   }),
 ];
 
@@ -504,7 +515,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp9',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'vp9' }, audio: { codec: 'opus' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'HEVC→VP9 (WebM forces AAC→Opus). NA(browser) where HEVC decode is unavailable.',
   },
   {
@@ -517,7 +528,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toVideo: 'av1',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'av1' }, audio: { codec: 'opus' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'HEVC→AV1: both ends are browser/HW-gated; expect NA on engines/browsers lacking either.',
   },
   {
@@ -530,7 +541,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp8',
     toAudio: 'vorbis',
     opts: { container: 'webm', video: { codec: 'vp8' }, audio: { codec: 'vorbis' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'HEVC→VP8 (oldest WebM video codec) + Vorbis audio.',
   },
   {
@@ -542,7 +553,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toContainer: 'webm',
     toVideo: 'av1',
     opts: { container: 'webm', video: { codec: 'av1' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'VP9→AV1, audio copied (Opus→Opus). AV1 encode is SW/slow → NA where no encoder.',
   },
   {
@@ -555,7 +566,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp8',
     toAudio: 'vorbis',
     opts: { container: 'webm', video: { codec: 'vp8' }, audio: { codec: 'vorbis' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'VP9→VP8 down-generation within WebM; Opus→Vorbis.',
   },
   {
@@ -568,7 +579,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toVideo: 'vp9',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'vp9' }, audio: { codec: 'opus' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes:
       'VP8→VP9 up-generation from the captured VP8/Opus WebM fixture. The older VP8/Vorbis corpus ' +
       'assets remain parser coverage, but Chromium exposes no WebCodecs Vorbis decode path for transcode.',
@@ -582,7 +593,7 @@ const CROSS_CODEC_CASES: VideoTranscodeCase[] = [
     toContainer: 'webm',
     toVideo: 'vp9',
     opts: { container: 'webm', video: { codec: 'vp9' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'AV1→VP9 within WebM, audio copied. NA(browser) where AV1 decode is absent.',
   },
 ];
@@ -643,12 +654,11 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 180 } },
-    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
-    optsInvariant: 'transcode-output-metadata',
+    optsInvariant: 'transcode-effect-aware',
     notes:
-      'Apply 180° rotation (A.8 rotate 90/180/270). Gated by output container/codec/duration; ' +
-      'ssim-psnr is omitted because the reference frames are not counter-rotated.',
+      'Apply 180° rotation. The effect-aware oracle rotates source pixels and checks authored ' +
+      'rotation signaling; playback/codec alone cannot satisfy the row.',
   },
   {
     id: 'h264_rotate_90_dimswap',
@@ -661,13 +671,10 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 90 } },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
-    optsInvariant: 'transcode-output-metadata',
-    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    optsInvariant: 'transcode-effect-aware',
     notes:
-      'Apply 90° rotation: W↔H SWAP (A.16 "rotated (matrix not w/h swap)"). The reference SSIM oracle ' +
-      'is not rotation-aware and would score a CORRECT rotation near-zero, so ssim-psnr is deliberately ' +
-      'OMITTED; correctness is gated by output container/codec/duration + playback (a rotate-aware golden bake is ' +
-      'required to gate rotated pixels).',
+      'Apply 90° rotation with W↔H swap. Timestamp-paired transformed pixels and authored rotation ' +
+      'signaling are the gate; a dimension-only or playback-only implementation fails.',
   },
   {
     id: 'h264_rotate_270_dimswap',
@@ -680,11 +687,10 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 270 } },
     oraclesOverride: ['property-invariant', 'playback-smoke'],
-    optsInvariant: 'transcode-output-metadata',
-    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    optsInvariant: 'transcode-effect-aware',
     notes:
-      'Apply 270° rotation to the pre-rotated asset (compounded display matrix), W↔H swap. ssim-psnr ' +
-      'omitted (no rotation-aware reference); gated by output container/codec/duration + playback.',
+      'Apply 270° rotation to the pre-rotated asset. The effect-aware reference validates the ' +
+      'compounded display pixels and normalized authored matrix independently of playback.',
   },
 ];
 
@@ -708,20 +714,28 @@ interface TransformFeatureCase {
   tolerances?: OracleTolerances;
   timeoutMs?: number;
   notes: string;
+  asset?: string;
+  fromContainer?: string;
+  fromVideo?: string;
+  fromAudio?: string;
+  toContainer?: string;
+  toVideo?: string;
 }
 
 const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
   {
     id: 'h264_flip_horizontal',
     feature: 'flip',
-    extraOpts: { flip: 'h' },
-    notes: 'Horizontal flip (A.8 flip h/v). Requires a declared "flip" feature.',
+    extraOpts: { flip: 'h', invariant: 'transcode-effect-aware' },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
+    notes: 'Horizontal flip: transformed pixels are the gate; a no-op adapter fails.',
   },
   {
     id: 'h264_flip_vertical',
     feature: 'flip',
-    extraOpts: { flip: 'v' },
-    notes: 'Vertical flip (A.8 flip h/v). Requires a declared "flip" feature.',
+    extraOpts: { flip: 'v', invariant: 'transcode-effect-aware' },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
+    notes: 'Vertical flip: transformed pixels are the gate; a no-op adapter fails.',
   },
   {
     id: 'h264_crop_center',
@@ -729,12 +743,11 @@ const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
     extraOpts: {
       video: { codec: 'h264', width: 1440, height: 810 },
       crop: { x: 240, y: 135, width: 1440, height: 810 },
-      invariant: 'transcode-output-metadata',
+      invariant: 'transcode-effect-aware',
     },
     oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     tolerances: {
       ssimMin: 0.93,
-      psnrMinDb: 29,
       durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC,
     },
     notes:
@@ -744,19 +757,30 @@ const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
   {
     id: 'h264_pad_letterbox_4x3_to_16x9',
     feature: 'pad',
-    extraOpts: { pad: { width: 1920, height: 1080, color: 'black' } },
-    notes: 'Pad/letterbox to 16:9 (A.8 crop/pad/letterbox). Requires a declared "pad" feature.',
+    asset: 'vp9_alpha.webm',
+    fromContainer: 'webm',
+    fromVideo: 'vp9',
+    fromAudio: '',
+    toContainer: 'mp4',
+    toVideo: 'h264',
+    extraOpts: {
+      video: { codec: 'h264', width: 1280, height: 720 },
+      pad: { width: 1280, height: 720, color: 'black' },
+      invariant: 'transcode-effect-aware',
+    },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
+    notes:
+      'Pad the real 640x480 (4:3) fixture into 1280x720 (16:9); black bars and retained source ' +
+      'pixels are both observed, so a no-op cannot pass.',
   },
   {
     id: 'h264_colorspace_709_to_2020',
     feature: 'colorspace',
-    extraOpts: { colorspace: { from: 'bt709', to: 'bt2020' }, invariant: 'transcode-output-metadata' },
+    extraOpts: { colorspace: { from: 'bt709', to: 'bt2020' }, invariant: 'transcode-effect-aware' },
     oracles: ['property-invariant', 'playback-smoke'],
-    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
-      'Colour-space convert 709→2020 (A.8 colour-space 601/709/2020). Gated by output ' +
-      'container/codec/duration + playback; ssim-psnr is omitted until the oracle can model ' +
-      'colour-space transformed reference frames.',
+      'BT.709→BT.2020 conversion requires transformed pixels plus primaries/transfer/matrix/range ' +
+      'signaling. A codec-correct no-op fails; a valid alternate mapping is a PASS with a recorded representation difference.',
   },
   {
     id: 'h264_crf_quality_mode',
@@ -772,7 +796,7 @@ const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
     id: 'h264_two_pass_bitrate',
     feature: 'two-pass',
     extraOpts: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
-    tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
+    tolerances: { ssimMin: 0.95 },
     timeoutMs: 300_000,
     notes:
       'Two-pass average-bitrate control (A.8 two-pass). Requires a declared "two-pass" feature; ' +
@@ -784,20 +808,24 @@ const transformFeatureScenarios: Scenario[] = TRANSFORM_FEATURE_CASES.map((c) =>
   defineScenario({
     id: `transcode/${c.id}`,
     op: 'transcode',
-    input: 'h264_1080p_30s.mp4',
-    options: { container: 'mp4', video: { codec: 'h264' }, ...(c.extraOpts ?? {}) },
+    input: c.asset ?? 'h264_1080p_30s.mp4',
+    options: {
+      container: c.toContainer ?? 'mp4',
+      video: { codec: c.toVideo ?? 'h264' },
+      ...(c.extraOpts ?? {}),
+    },
     requires: {
       operations: ['transcode'],
-      containersIn: ['mp4'],
-      containersOut: ['mp4'],
-      videoCodecs: ['h264'],
-      audioCodecs: ['aac'],
+      containersIn: [c.fromContainer ?? 'mp4'],
+      containersOut: [c.toContainer ?? 'mp4'],
+      videoCodecs: [...new Set([c.fromVideo ?? 'h264', c.toVideo ?? 'h264'])],
+      ...(c.fromAudio === '' ? {} : { audioCodecs: [c.fromAudio ?? 'aac'] }),
       features: [c.feature],
     },
     // Spatial transforms gate on a transform-aware SSIM reference; rate-control rows can override.
     oracles: c.oracles ?? ['ssim-psnr', 'playback-smoke'],
     metrics: [...TC_METRICS],
-    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97 },
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
@@ -833,7 +861,8 @@ const DEPTH_HDR_CASES: DepthHdrCase[] = [
     toContainer: 'mp4',
     toVideo: 'hevc',
     feature: 'depth:10bit-output',
-    extraOpts: { video: { codec: 'hevc', bitDepth: 10 } },
+    extraOpts: { video: { codec: 'hevc', bitDepth: 10 }, invariant: 'transcode-effect-aware' },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     notes:
       '8-bit→10-bit HEVC encode (A.5/A.4 8↔10-bit). Uses the browser-baked 320×240 one-frame H.264 ' +
       'fixture for future coverage, but remains N/A until an engine can emit HEVC-10 inside suite budgets.',
@@ -846,7 +875,8 @@ const DEPTH_HDR_CASES: DepthHdrCase[] = [
     toContainer: 'mp4',
     toVideo: 'h264',
     feature: 'depth:10bit-to-8bit',
-    extraOpts: { video: { codec: 'h264', bitDepth: 8 } },
+    extraOpts: { video: { codec: 'h264', bitDepth: 8 }, invariant: 'transcode-effect-aware' },
+    oracles: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     notes:
       '10-bit→8-bit down-convert (A.4). Uses the corpus 10-bit H.264 fixture and encodes an 8-bit ' +
       'H.264 output, so the row tests the actual available 10-bit source instead of a mislabeled HEVC fixture.',
@@ -862,14 +892,12 @@ const DEPTH_HDR_CASES: DepthHdrCase[] = [
     extraOpts: {
       video: { codec: 'h264' },
       tonemap: { from: 'pq', to: 'sdr' },
-      invariant: 'transcode-output-metadata',
+      invariant: 'transcode-effect-aware',
     },
     oracles: ['property-invariant', 'playback-smoke'],
-    tolerances: { durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
-      'HDR10→SDR tone-map (A.8 HDR→SDR). Uses a tiny real HEVC Main10-style BT.2020/PQ source and gates ' +
-      'the output container/codec/duration plus browser playback; SSIM is omitted because the SDR output ' +
-      'is deliberately colour transformed from the HDR source frames.',
+      'HDR10→SDR tone-map uses a real BT.2020/PQ source and requires transformed luminance/color ' +
+      'pixels plus BT.709 transfer/primaries/matrix/range signaling. A codec-only no-op fails.',
   },
 ];
 
@@ -888,7 +916,7 @@ const depthHdrScenarios: Scenario[] = DEPTH_HDR_CASES.map((c) =>
     },
     oracles: c.oracles ?? ['ssim-psnr', 'playback-smoke'],
     metrics: [...TC_METRICS],
-    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97 },
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
@@ -909,8 +937,11 @@ const ALPHA_CASES: VideoTranscodeCase[] = [
     toContainer: 'webm',
     toVideo: 'vp9',
     features: ['alpha', 'alpha:transcode', 'resize'],
-    opts: { container: 'webm', video: { codec: 'vp9', width: 320, height: 240 }, alpha: 'keep' },
-    oraclesOverride: ['alpha-plane', 'playback-smoke'],
+    opts: {
+      container: 'webm', video: { codec: 'vp9', width: 320, height: 240 },
+      alpha: 'keep', invariant: 'transcode-effect-aware',
+    },
+    oraclesOverride: ['alpha-plane', 'property-invariant', 'playback-smoke'],
     notes:
       'VP9→VP9 re-encode with resize, alpha PRESERVED (alpha:"keep"). alpha-plane oracle validates the ' +
       'alpha channel. SSIM is omitted because colour-plane drift on this tiny alpha-side-data clip is ' +
@@ -925,8 +956,10 @@ const ALPHA_CASES: VideoTranscodeCase[] = [
     toContainer: 'webm',
     toVideo: 'vp8',
     features: ['alpha', 'alpha:transcode'],
-    opts: { container: 'webm', video: { codec: 'vp8' }, alpha: 'keep' },
-    oraclesOverride: ['alpha-plane', 'playback-smoke'],
+    opts: {
+      container: 'webm', video: { codec: 'vp8' }, alpha: 'keep', invariant: 'transcode-effect-aware',
+    },
+    oraclesOverride: ['alpha-plane', 'property-invariant', 'playback-smoke'],
     notes:
       'VP9-alpha→VP8 alpha round-trip (VP8 also supports a YUVA alpha plane in WebM). alpha-plane oracle ' +
       'gates once alpha-preserving transcode is explicitly implemented; SSIM omitted (cross-codec colour ' +
@@ -947,7 +980,7 @@ const bframeScenarios: Scenario[] = [
     toContainer: 'mp4',
     toVideo: 'h264',
     opts: { container: 'mp4', video: { codec: 'h264' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
     notes:
       'Re-encode an open-GOP / B-frame source (pts≠dts reorder, A.16). ssim-psnr in presentation order ' +
       'catches an engine that mishandles the decode reorder (frames would land out of order → low SSIM).',
@@ -962,7 +995,7 @@ const bframeScenarios: Scenario[] = [
     toVideo: 'vp9',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'vp9' }, audio: { codec: 'opus' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'B-frame/open-GOP H.264 → VP9: reorder correctness across a codec change.',
   }),
 ];
@@ -979,7 +1012,7 @@ const multitrackScenarios: Scenario[] = [
     toVideo: 'h264',
     toAudio: 'aac',
     opts: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    tolerances: { ssimMin: 0.98, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
       'Re-encode a 2-audio-track MP4 (A.16 multi-track). Video gated by ssim-psnr; output metadata ' +
       'asserts the produced container/codecs because transcode does not populate ctx.metadata.',
@@ -990,13 +1023,9 @@ const multitrackScenarios: Scenario[] = [
 
 // ── A.6 — audio ENCODE matrix gaps (lossy-to-lossy & lossless-to-lossy the base set omits) ────────
 //
-// CRITICAL ORACLE CORRECTION: lossy targets (aac/opus/mp3/vorbis) can NEVER decode bit-exact vs the
-// source, so `decoded-frames-bitexact` is the WRONG gate for them. These cases gate on the transcode
-// output-metadata invariant (reference-probe the produced bytes, then assert requested
-// container/codec/duration) and use a RELAXED duration tolerance for AAC/Opus/MP3 encoder
-// delay+padding. playback-smoke is attached ONLY for browser-playable containers (mp4/webm); raw/
-// uncommon containers (adts/ogg/flac/wav) are excluded because a smoke FAIL there reflects the
-// BROWSER, not the engine output.
+// Lossy targets (AAC/Opus/MP3/Vorbis) use decoded error/SNR/channel-correlation contracts rather than
+// bit-exactness. AAC edit-list timing and Opus Ogg/WebM delay+trim evidence select the exact program
+// interval; fixed duration allowances are not used. playback-smoke remains browser-container-only.
 interface AudioEncodeCase {
   id: string;
   asset: string;
@@ -1019,7 +1048,7 @@ const AUDIO_ENCODE_CASES: AudioEncodeCase[] = [
     toContainer: 'mp4',
     toAudio: 'mp3',
     opts: { container: 'mp4', audio: { codec: 'mp3', bitrate: 192_000 } },
-    notes: 'AAC→MP3 (A.6 gap). Lossy→lossy: gated on output format, not bit-exactness.',
+    notes: 'AAC→MP3 (A.6 gap). Lossy→lossy decoded content is gated by the documented error contract.',
   },
   {
     id: 'opus_to_aac_mp4',
@@ -1029,7 +1058,7 @@ const AUDIO_ENCODE_CASES: AudioEncodeCase[] = [
     toContainer: 'mp4',
     toAudio: 'aac',
     opts: { container: 'mp4', audio: { codec: 'aac', bitrate: 192_000 } },
-    notes: 'Opus→AAC (A.6 gap). Relaxed duration band for AAC encoder delay/padding (gapless).',
+    notes: 'Opus→AAC (A.6 gap). AAC priming/remainder is taken from authored ISO-BMFF timing.',
   },
   {
     id: 'flac_to_opus_webm',
@@ -1039,7 +1068,7 @@ const AUDIO_ENCODE_CASES: AudioEncodeCase[] = [
     toContainer: 'webm',
     toAudio: 'opus',
     opts: { container: 'webm', audio: { codec: 'opus', bitrate: 128_000 } },
-    notes: 'FLAC(lossless)→Opus(lossy) (A.6 gap). Output-format gate; playback-smoke ok (WebM).',
+    notes: 'FLAC(lossless)→Opus(lossy) (A.6 gap). WebM CodecDelay/DiscardPadding selects the program interval.',
   },
   {
     id: 'mp3_to_opus_webm',
@@ -1081,8 +1110,7 @@ const AUDIO_ENCODE_CASES: AudioEncodeCase[] = [
     opts: { container: 'wav', audio: { codec: 'pcm-s16' } },
     lossless: true,
     notes:
-      'AAC→PCM(WAV) extract (A.7/A.6 PCM-as-target). Output metadata asserts WAV/PCM shape; PCM ' +
-      'bit-exactness needs a dedicated audio decode oracle before it can be asserted here.',
+      'AAC→PCM(WAV) extract (A.7/A.6 PCM-as-target). WAV structure and decoded sample preservation gate.',
   },
 ];
 
@@ -1094,7 +1122,7 @@ const audioEncodeScenarios: Scenario[] = AUDIO_ENCODE_CASES.map((c) => {
     id: `transcode/${c.id}`,
     op: 'transcode',
     input: c.asset,
-    options: withOutputMetadataInvariant(c.opts),
+    options: withAudioContentInvariant(c.opts),
     requires: {
       operations: ['transcode'],
       containersIn: [c.fromContainer],
@@ -1103,9 +1131,6 @@ const audioEncodeScenarios: Scenario[] = AUDIO_ENCODE_CASES.map((c) => {
     },
     oracles,
     metrics: ['wall', 'throughputRealtime', 'peakMemory', 'longtasks'],
-    // Lossy AAC/Opus/MP3 carry encoder delay+padding (gapless priming, A.16) → loosen the duration
-    // band so a correct gapless encode is not failed by the strict per-frame tolerance.
-    ...(c.lossless ? {} : { tolerances: { durationToleranceSec: TC_AUDIO_PRIMING_TOLERANCE_SEC } }),
     ...(c.notes ? { notes: c.notes } : {}),
   });
 });
@@ -1144,7 +1169,7 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
     toVideo: 'h264',
     width: 320,
     height: 180,
-    tolerances: { ssimMin: 0.95, psnrMinDb: 22 },
+    tolerances: { ssimMin: 0.95 },
     notes: 'TINY rung (~100 KB) transcode+resize → frames/sec. Init-overhead-dominated end of the curve.',
   },
   {
@@ -1210,9 +1235,9 @@ const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
       features: ['resize'],
     },
     oracles: ['ssim-psnr'],
-    metrics: ['framesPerSec', 'wall', 'encodeFps', 'peakMemory'],
+    metrics: ['framesPerSec', 'wall', 'peakMemory'],
     primaryMetric: 'framesPerSec',
-    tolerances: c.tolerances ?? { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: c.tolerances ?? { ssimMin: 0.97 },
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     notes: c.notes,
   }),
@@ -1259,7 +1284,7 @@ const CONTAINER_WRITE_CASES: ContainerWriteCase[] = [
     id: 'h264_to_fragmented_mp4',
     toContainer: 'mp4',
     feature: 'fragmented',
-    tolerances: { ssimMin: 0.96, psnrMinDb: 34, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    tolerances: { ssimMin: 0.96, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     browserPlayable: true,
     notes:
       'Transcode → fragmented MP4 / CMAF (A.3, fastStart:"fragmented"). Requires the declared ' +
@@ -1290,7 +1315,7 @@ const containerWriteScenarios: Scenario[] = CONTAINER_WRITE_CASES.map((c) => {
     },
     oracles,
     metrics: [...TC_METRICS],
-    tolerances: c.tolerances ?? { ssimMin: 0.98, psnrMinDb: 38, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    tolerances: c.tolerances ?? { ssimMin: 0.98, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes: c.notes,
   });
 });
@@ -1337,7 +1362,7 @@ const TRANSCODE_PROPERTY_CASES: TranscodePropertyCase[] = [
       invariant: 'transcode-output-metadata',
     },
     oracles: ['ssim-psnr', 'property-invariant'],
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
+    tolerances: { ssimMin: 0.97, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
       'Metamorphic idempotent-in-dimensions (A.16): resize 1080p→1080p is ~no-op. ssim-psnr (same-dims ' +
       'reference path is sound) gates high similarity; output metadata confirms unchanged dimensions, ' +
@@ -1383,11 +1408,9 @@ const transcodePropertyScenarios: Scenario[] = TRANSCODE_PROPERTY_CASES.map((c) 
 
 // ── A.16 — double-transcode round-trip A→B→A (generational-loss bound) ────────────────────────────
 //
-// Two-leg metamorphic: h264 → vp9 → h264. Modeled as TWO chained scenarios sharing an id stem so the
-// runner can run them in sequence; the SECOND leg's ssim-psnr (vs the in-browser reference decode of
-// the ORIGINAL source, which the no-golden path uses) bounds the cumulative generational loss. A
-// correct pipeline stays above a loosened SSIM floor; an engine that corrupts on re-encode falls below.
-// (Leg 1 also stands alone as a normal cross-codec encode with its own SSIM gate.)
+// Two-leg metamorphic: H.264 → VP9 → H.264. The composition binding passes leg one's exact bytes to
+// leg two and retains the immutable original as the final quality reference. Digests at both adapter
+// boundaries prove the chain; leg one also remains independently scoreable.
 const roundTripScenarios: Scenario[] = [
   buildVideoScenario({
     id: 'roundtrip_leg1_h264_to_vp9',
@@ -1399,24 +1422,30 @@ const roundTripScenarios: Scenario[] = [
     toVideo: 'vp9',
     toAudio: 'opus',
     opts: { container: 'webm', video: { codec: 'vp9' }, audio: { codec: 'opus' } },
-    tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
+    tolerances: { ssimMin: 0.97 },
     notes: 'Round-trip leg 1/2 (A.16 double-transcode): H.264→VP9. SSIM gates leg-1 fidelity.',
   }),
   buildVideoScenario({
     id: 'roundtrip_leg2_vp9_to_h264',
-    asset: 'vp9_1080p_10s.webm',
-    fromContainer: 'webm',
-    fromVideo: 'vp9',
-    fromAudio: 'opus',
+    // This is the composed A->B->A cell. The runner begins from the immutable original and obtains
+    // the VP9/Opus input to leg two exclusively from leg one's exact output binding.
+    asset: 'h264_1080p_30s.mp4',
+    fromContainer: 'mp4',
+    fromVideo: 'h264',
+    fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
     toAudio: 'aac',
-    opts: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    opts: {
+      container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' },
+      invariant: 'transcode-roundtrip-composed',
+    },
+    extraOracles: ['property-invariant'],
     // Generational-loss floor: looser than a single encode to absorb two lossy generations.
-    tolerances: { ssimMin: 0.95, psnrMinDb: 34 },
+    tolerances: { ssimMin: 0.95 },
     notes:
-      'Round-trip leg 2/2 (A.16 double-transcode A→B→A): VP9→H.264. Uses the VP9 corpus asset as the ' +
-      'B-leg stand-in; the loosened SSIM floor bounds cumulative generational loss (catches corruption).',
+      'Round-trip leg 2/2 consumes leg one through an exact-byte output binding. Provenance proves ' +
+      'the bound digest and the final perceptual comparison retains the immutable original source.',
   }),
 ];
 
@@ -1621,15 +1650,14 @@ const negativeScenarios: Scenario[] = NEGATIVE_CASES.map((c) =>
 
 // ── A.16 — gapless audio (encoder delay/padding) round-trip through AAC/Opus ──────────────────────
 //
-// AAC/Opus add priming (encoder delay) + trailing padding, shifting decoded duration. The
-// output-metadata invariant with a RELAXED duration band asserts the format is correct without failing
-// a legitimately-correct gapless encode on the strict per-frame duration tolerance.
+// AAC/Opus add priming and trailing padding. These rows use authored edit-list or granule evidence to
+// isolate the exact presentation interval; legitimate delay passes and undeclared excess/loss fails.
 const gaplessScenarios: Scenario[] = [
   defineScenario({
     id: 'transcode/gapless_pcm_to_aac_priming',
     op: 'transcode',
     input: 'wav_s16.wav',
-    options: withOutputMetadataInvariant({ container: 'mp4', audio: { codec: 'aac', bitrate: 192_000 } }),
+    options: withAudioContentInvariant({ container: 'mp4', audio: { codec: 'aac', bitrate: 192_000 } }),
     requires: {
       operations: ['transcode'],
       containersIn: ['wav'],
@@ -1638,41 +1666,41 @@ const gaplessScenarios: Scenario[] = [
     },
     oracles: ['property-invariant', 'playback-smoke'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
-    tolerances: { durationToleranceSec: TC_AUDIO_PRIMING_TOLERANCE_SEC },
     notes:
-      'Gapless AAC encode (A.16 encoder delay/padding). Relaxed duration band tolerates priming samples; ' +
-      'container/codec/duration are asserted. A strict band would falsely fail a correct gapless encode.',
+      'Gapless AAC encode: decoded content is compared only over the edit-list presentation interval; ' +
+      'explicit AAC priming and remainder samples are modeled and any undeclared excess/loss fails.',
   }),
   defineScenario({
     id: 'transcode/gapless_pcm_to_opus_priming',
     op: 'transcode',
     input: 'wav_s16.wav',
-    options: withOutputMetadataInvariant({ container: 'webm', audio: { codec: 'opus', bitrate: 128_000 } }),
+    options: withAudioContentInvariant({ container: 'ogg', audio: { codec: 'opus', bitrate: 128_000 } }),
     requires: {
       operations: ['transcode'],
       containersIn: ['wav'],
-      containersOut: ['webm'],
+      containersOut: ['ogg'],
       audioCodecs: ['pcm-s16', 'opus'],
     },
-    oracles: ['property-invariant', 'playback-smoke'],
+    oracles: ['property-invariant'],
     metrics: ['wall', 'peakMemory', 'longtasks'],
-    tolerances: { durationToleranceSec: TC_AUDIO_PRIMING_TOLERANCE_SEC },
-    notes: 'Gapless Opus encode (A.16). Opus has a fixed 6.5ms pre-skip; relaxed duration band absorbs it.',
+    notes:
+      'Gapless Ogg Opus encode: OpusHead pre-skip and the final granule position define the exact ' +
+      'program interval and end trimming; no fixed-delay estimate is accepted.',
   }),
 ];
 
 // ── A.16 — variable / unusual channel count on a MUXED A/V transcode (beyond audio-dsp downmix) ────
 //
 // audio-dsp covers stereo↔mono on audio-only WAV; this exercises a channel-layout change DURING a
-// video+audio re-encode (the muxed path), asserting the output audio layout via output metadata while
-// ssim-psnr gates the video. (Source is stereo; downmix-to-mono is the defined, assert-able change. A
-// true muxed A/V 5.1 source is still not in the corpus; the audio-only 5.1 WAV is covered by audio-dsp.)
+// video+audio re-encode (the muxed path). The audio-content invariant scores decoded mono against the
+// declared stereo average after AAC timing trim, while ssim-psnr gates video. A true muxed A/V 5.1
+// source is still not in the corpus; the audio-only 5.1 WAV is covered by audio-dsp.
 const channelScenarios: Scenario[] = [
   defineScenario({
     id: 'transcode/av_downmix_stereo_to_mono',
     op: 'transcode',
     input: 'h264_1080p_30s.mp4',
-    options: withOutputMetadataInvariant({
+    options: withAudioContentInvariant({
       container: 'mp4',
       video: { codec: 'h264' },
       audio: { codec: 'aac', channels: 1 },
@@ -1686,10 +1714,11 @@ const channelScenarios: Scenario[] = [
     },
     oracles: ['ssim-psnr', 'property-invariant'],
     metrics: [...TC_METRICS],
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38, durationToleranceSec: TC_AUDIO_PRIMING_TOLERANCE_SEC },
+    tolerances: { ssimMin: 0.98 },
     notes:
       'Channel-layout change on a MUXED A/V transcode (A.16 variable channel count): stereo→mono during ' +
-      'video+audio re-encode. Output metadata asserts the 1-channel output; ssim-psnr gates the video. ' +
+      'video+audio re-encode. Decoded mono content is compared to the declared stereo average after ' +
+      'AAC edit-list trimming; ssim-psnr gates the video. ' +
       '(A muxed A/V 5.1 source is still a corpus gap; audio-only 5.1 is covered by audio-dsp.)',
   }),
 ];
@@ -1714,9 +1743,9 @@ const selfConsistencyScenarios: Scenario[] = [
       features: ['resize'],
     },
     oracles: ['ssim-psnr'],
-    metrics: ['framesPerSec', 'wall', 'encodeFps'],
+    metrics: ['framesPerSec', 'wall'],
     primaryMetric: 'framesPerSec',
-    tolerances: { ssimMin: 0.98, psnrMinDb: 38 },
+    tolerances: { ssimMin: 0.98 },
     notes:
       'Self-consistency representative (DoD §13): the same engine registered twice must tie within noise ' +
       'on this transcode (frames/sec). Deterministic resize→720p; correctness (ssim-psnr) gates the number.',

@@ -23,53 +23,32 @@
  *   - resource.ts          §A.14 peakMemory↓ and longtasks↓ ranked on the heavy convert workload.
  *   - metamorphic.ts       §A.16 transcode-idempotent / probe-duration / decode(remux(x)) / VFR.
  *
- * HONESTY BOUNDARY — §A.14 metrics deliberately NOT given a standalone case (see _shared.ts header for
- * the full mechanism): loadInit (cold+warm, §8.4/§0.7), timeToFirstFrame/timeToFirstByte (§A.14 'ms↓'),
- * sourceReads (§A.14 'count↓ = lazier'), and per-FEATURE bundle-size (§8.1 asks per-feature + total).
- * The runner produces NO sample for any of these (it never times init() into loadInitMs, never records
- * first-byte/first-frame markers, never wraps the source in CountingSource, and the bundleSizeKb
- * injection does not exist), and adding that wiring lives in runner/app/engine — OUTSIDE this writer's
- * scope. A scenario whose primaryMetric can never receive a sample is a permanently-blank leaderboard
- * cell that READS as measured (the silent-hole anti-pattern the spec calls worse than an honest
- * omission). So these are documented as known gaps + the exact one-line wiring each needs, rather than
- * shipped as dead cases that fabricate the appearance of coverage. The existing bundle-size case below
- * is itself NA until that injection lands (see its comment); we do not multiply that hole.
+ * Honest measurement hooks live in src/features/performance: event latency accepts only adapter events,
+ * source-read counts require a counting random-access source at the adapter boundary, and complete
+ * bundle components are joined before report construction. Missing evidence stays typed unavailable.
  *
  * BIG-READ ASSET (§8.1): the throughput cases run against the largest 1080p H.264 file with FULL golden
  * so throughput is dominated by real work, not per-call overhead — exactly the "big read" Mediabunny
  * benchmarks against. The corpus's largest fully-golden 1080p H.264 asset is `h264_1080p_30s.mp4`
  * (~31 MB, 30 s). A dedicated, much larger big-read asset (`BIG_READ_ASSET` below) is the INTENDED
- * headline input; the size-ladder file additionally wires the manifest's large/huge/massive rungs by
- * their canonical ids so the runner + golden filenames line up the moment the bake produces them (until
- * then those rungs resolve to a clean golden-absent FAIL / NA — never a fabricated number). See BAKE NOTE.
+ * headline input; the size-ladder additionally covers committed large/huge/massive identities and lets
+ * the manifest plus typed golden reader decide runtime availability.
  */
 
 import type { TranscodeOptions } from '../../core/engine.ts';
 import type { MetricId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  aggregatePerformanceQuestionIds,
+  validatePerformanceQuestionCatalog,
+} from '../../features/performance/catalog.ts';
 import { opSweepScenarios } from './op-sweep.ts';
 import { decodeEncodeSeekScenarios } from './decode-encode-seek.ts';
 import { sizeLadderScenarios } from './size-ladder.ts';
 import { resourceScenarios } from './resource.ts';
 import { metamorphicScenarios } from './metamorphic.ts';
 
-/**
- * BAKE NOTE — big-read asset.
- *
- * The headline throughput battery wants a *large* 1080p H.264/AAC progressive MP4 (faststart moov so
- * probe is a cheap front-of-file read; long enough that demux/transcode throughput is steady-state).
- * The intended asset id is below. It is NOT yet present in fixtures/manifest.json; the bake should
- * add it (e.g. ffmpeg testsrc2 1920x1080@30 ~120 s, libx264 yuv420p CRF20 -g 60 closed GOP, AAC
- * 128k, +faststart, -fflags +bitexact — same recipe as h264_1080p_30s.mp4, just longer) and emit the
- * matching golden (golden/<id>.meta.json + golden/<id>.packets.json). If the bake declines to add a
- * new asset, point BIG_READ_ASSET at 'h264_1080p_30s.mp4' (the current largest 1080p H.264 file) and
- * the battery runs unchanged against existing golden.
- */
-// Resolves to a real, golden-backed corpus asset so the headline cases run today. The dedicated
-// dossier-intended big-read fixture id ('h264_1080p_bigread.mp4') is NOT produced by the bake, and
-// the larger synthetic rung ('large_h264_1080p_120s.mp4') is gated behind a non-skip-longform bake.
-// For closer Mediabunny parity, drop in the provided BBB asset (see fixtures MISSING ASSETS) and
-// repoint this const. h264_1080p_30s.mp4 is a 31 MB / 30 s 1080p H.264/AAC file with full golden.
+// The stable headline input is a content-addressed 31 MB / 30 s 1080p H.264/AAC fixture.
 const BIG_READ_ASSET = 'h264_1080p_30s.mp4';
 
 /** Fallback the bake may substitute if it chooses not to add a dedicated big-read fixture. */
@@ -160,7 +139,8 @@ const convertWebmResize: Scenario = defineScenario({
   tolerances: { ssimMin: 0.97, psnrMinDb: 36 },
   notes:
     `Headline §8.1: convert ${BIG_READ_ASSET} (bake fallback ${BIG_READ_FALLBACK}) → WebM/VP9/Opus, ` +
-    `resize 320×180. Score = encoded frames/sec; correctness gated by ssim-psnr at 320×180.`,
+    `resize 320×180. Score = actual output presentation units/sec from the adapter final counter or ` +
+    `neutral output reader; unavailable counts emit no rate. Correctness gated by ssim-psnr at 320×180.`,
 });
 
 // ── 4) bundle-size — offline per-engine min+gzip build → kB ──────────────────────────────────────
@@ -172,14 +152,11 @@ const convertWebmResize: Scenario = defineScenario({
  * primaryMetric is 'bundleSize' (kB, lower-is-better) — keeping it in the same table/leaderboard
  * machinery as every other headline case instead of a bolted-on special path.
  *
- * HOW THE NUMBER IS FED (least-hacky path consistent with scenario.ts):
- *  - An OFFLINE, per-engine build step (a small bundler entry per adapter, tree-shaken + minified +
- *    gzipped) computes each engine's shipped byte cost and writes it out (a sizes JSON keyed by
- *    engineId). This is exactly the offline build the spec calls for; no run-time bundling happens.
- *  - The suite/runner READS those offline sizes and populates `MetricSample.bundleSizeKb` for this
- *    scenario's (engine) cell — the field scenario.ts already reserves for "set from the offline
- *    per-engine build, not measured at run time". The runner then surfaces it as the
- *    `bundleSize` BenchSummary so the report ranks engines by it like any other primaryMetric.
+ * HOW THE NUMBER IS FED:
+ *  - A versioned offline artifact records exact engine/source/toolchain provenance and separate
+ *    minified+gzipped JavaScript, runtime WASM, worker, and codec/core transfer components.
+ *  - The same validated artifact is joined before live or offline report construction. The score is
+ *    the component sum in bytes; a missing/stale/failed map is typed NA_ASSET, never numeric zero.
  *  - Because there is nothing to read from media, the input is the smallest fully-golden VALID MEDIA
  *    asset (tiny_h264_360p_2s.mp4 — NOT an image, which probe correctly rejects) and the op is the
  *    cheapest universally-supported op (probe). The op is never actually timed for the score; the
@@ -192,28 +169,8 @@ const convertWebmResize: Scenario = defineScenario({
  *    probe NEVER sets ctx.output (it sets ctx.metadata), so that oracle FAILed on every engine with
  *    "[probe-duration] no ctx.output to probe". golden-metadata reads ctx.metadata and PASSes.)
  *
- * WHERE THE OFFLINE SIZES COME FROM: scripts/measure-bundles.mjs (bun-only) bundles+minifies+gzips
- * each engine entrypoint OFFLINE and writes results/bundle-sizes.json as { engineId: kBytes } (plus a
- * bare-alias key per engine, e.g. "mediabunny"). See the header of scripts/measure-bundles.mjs for
- * the exact contract.
- *
- * EXACT RUN-TIME WIRING (how results/bundle-sizes.json becomes MetricSample.bundleSizeKb):
- *   1. (APP, page boot) The page fetches results/bundle-sizes.json once at boot and stashes the map on
- *      a global the runner can read without importing Node:  window.__BUNDLE_SIZES__ : Record<id,kB>.
- *      It is a static asset served alongside fixtures/, so a plain `fetch('results/bundle-sizes.json')`
- *      works in the browser (no CDN, no run-time bundling — the numbers were produced OFFLINE).
- *   2. (RUNNER, runBench sample closure) For THIS scenario (id === 'performance/bundle-size') and the
- *      'bundleSize' metric, instead of (or in addition to) the Meter sample, the runner looks the
- *      engine up in window.__BUNDLE_SIZES__ — keyed by engine.id, falling back to the bare registry id
- *      — and sets sample.bundleSizeKb to that value. A present finite number flows through
- *      bench()→BenchSummary.bundleSize.median→report engineBundleSizeKb(); a MISSING/zero entry yields
- *      NaN→n=0→no number, surfaced as an honest FAIL/NA for that cell — never a fabricated value.
- *   This scenario owns the SEMANTICS (op/input/oracle/metric/primaryMetric) and the offline producer;
- *   the two-line read+inject (steps 1–2) lives in app/main.ts + core/runner.ts, which this file may not
- *   edit — see the precise TODO in scripts/measure-bundles.mjs's header and below.
- *
- * If the report adds a dedicated build-only lane later, this scenario is the seam to retarget; today
- * it rides the standard scenario pipeline with zero special-casing in scenario.ts.
+ * `bundle-components.ts` owns the complete component and early-join contract; REP-17 owns the shared
+ * provenance artifact and report ingestion seam.
  */
 const BUNDLE_PRIMARY: MetricId = 'bundleSize';
 
@@ -240,11 +197,10 @@ const bundleSize: Scenario = defineScenario({
   metrics: [BUNDLE_PRIMARY],
   primaryMetric: BUNDLE_PRIMARY,
   notes:
-    'Headline §8.1 build-time metric: per-engine shipped JS cost (kB, min+gzip), lower-is-better. ' +
-    'Nominal op is a probe gated by golden-metadata (correct oracle for a probe). An offline build ' +
-    '(scripts/measure-bundles.mjs → results/bundle-sizes.json) writes each engineId→kB; the page ' +
-    'loads it into window.__BUNDLE_SIZES__ and the runner injects MetricSample.bundleSizeKb for this ' +
-    'cell, so the report ranks by primaryMetric=bundleSize. Not run-time measured.',
+    'Headline build-time metric: complete transfer bytes, lower-is-better, with separate minified+gzip ' +
+    'JavaScript, runtime WASM, worker, and codec/core components. Versioned evidence is joined before ' +
+    'both live and offline reports; missing or stale evidence is NA_ASSET. Nominal probe correctness is ' +
+    'gated by golden-metadata.',
 });
 
 // ── battery ──────────────────────────────────────────────────────────────────────────────────────
@@ -262,5 +218,15 @@ export const performanceScenarios: Scenario[] = [
   ...resourceScenarios,
   ...metamorphicScenarios,
 ];
+
+const questionDiagnostics = validatePerformanceQuestionCatalog(performanceScenarios.map((scenario) => scenario.id));
+if (questionDiagnostics.length > 0) {
+  throw new Error(`invalid performance question catalog: ${questionDiagnostics.join('; ')}`);
+}
+
+/** Alias rows remain visible but are excluded from aggregate win weighting. */
+export const performanceAggregateScenarioIds = Object.freeze(
+  aggregatePerformanceQuestionIds(performanceScenarios.map((scenario) => scenario.id)),
+);
 
 export default performanceScenarios;

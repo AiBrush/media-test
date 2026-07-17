@@ -14,6 +14,7 @@
 
 import { listEngines, listScenarios, registerScenarios } from '../core/registry.ts';
 import type { Scenario } from '../core/scenario.ts';
+import { SCENARIO_FAMILY_MANIFEST } from '../core/scenario-manifest.ts';
 
 export interface RegistrationReport {
   engines: { id: string; ok: boolean; reason?: string }[];
@@ -31,8 +32,8 @@ interface EngineWiring {
 
 /**
  * Engine wirings. Dynamic imports keep a single broken adapter from breaking module evaluation of
- * the others (a static `import { x } from` would fail the whole bundle if `x` is missing). Every
- * engine here is a plain scored candidate; mediabunny is wired via its own register helper.
+ * the others (a static `import { x } from` would fail the whole bundle if `x` is missing). Candidate
+ * engines are scored; the separately-labelled platform adapter is instrumentation only.
  */
 const ENGINE_WIRINGS: EngineWiring[] = [
   {
@@ -81,7 +82,6 @@ const ENGINE_WIRINGS: EngineWiring[] = [
   {
     label: 'aibrush-media',
     register: async () => {
-      // Placeholder candidate adapter — may not exist yet; tolerate its absence.
       const mod = (await import('../engines/aibrush-media/adapter.ts')) as {
         registerAibrushMedia?: () => void;
       };
@@ -97,54 +97,12 @@ interface ScenarioWiring {
   load: () => Promise<Scenario[]>;
 }
 
-const SCENARIO_WIRINGS: ScenarioWiring[] = [
-  { family: 'probe', load: async () => (await import('../scenarios/probe/index.ts')).probeScenarios },
-  { family: 'demux', load: async () => (await import('../scenarios/demux/index.ts')).demuxScenarios },
-  { family: 'remux', load: async () => (await import('../scenarios/remux/index.ts')).remuxScenarios },
-  {
-    family: 'transcode',
-    load: async () => (await import('../scenarios/transcode/index.ts')).transcodeScenarios,
-  },
-  {
-    family: 'decode-seek',
-    load: async () => (await import('../scenarios/decode-seek/index.ts')).decodeSeekScenarios,
-  },
-  { family: 'trim', load: async () => (await import('../scenarios/trim/index.ts')).trimScenarios },
-  { family: 'mux', load: async () => (await import('../scenarios/mux/index.ts')).muxScenarios },
-  {
-    family: 'encryption',
-    load: async () => (await import('../scenarios/encryption/index.ts')).encryptionScenarios,
-  },
-  {
-    family: 'metadata',
-    load: async () => (await import('../scenarios/metadata/index.ts')).metadataScenarios,
-  },
-  {
-    family: 'streaming-output',
-    load: async () =>
-      (await import('../scenarios/streaming-output/index.ts')).streamingOutputScenarios,
-  },
-  {
-    family: 'audio-dsp',
-    load: async () => (await import('../scenarios/audio-dsp/index.ts')).audioDspScenarios,
-  },
-  {
-    family: 'performance',
-    load: async () => (await import('../scenarios/performance/index.ts')).performanceScenarios,
-  },
-  {
-    // Robustness family is appended last; its index export name is tolerated flexibly below.
-    family: 'robustness',
-    load: async () => {
-      const mod = (await import('../scenarios/robustness/index.ts')) as Record<string, unknown>;
-      const arr =
-        (mod.robustnessScenarios as Scenario[] | undefined) ??
-        (mod.default as Scenario[] | undefined);
-      if (!Array.isArray(arr)) throw new Error('robustness/index.ts exports no robustnessScenarios[]');
-      return arr;
-    },
-  },
-];
+// Consume the same frozen manifest as the DSL registry and reports. The UI never carries a second
+// hand-maintained family list whose order or membership can drift.
+const SCENARIO_WIRINGS: ScenarioWiring[] = SCENARIO_FAMILY_MANIFEST.map((entry) => ({
+  family: entry.family,
+  load: entry.load as () => Promise<Scenario[]>,
+}));
 
 /**
  * Register every engine and scenario family, tolerating individual failures. Idempotent-ish: the

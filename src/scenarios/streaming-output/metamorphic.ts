@@ -53,7 +53,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['streaming:decode-equality'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', target: 'stream', fragmented: false, fastStart: false },
     notes:
       'decode(remux_stream(x))==decode(x): the StreamTarget output must decode IDENTICALLY to the buffer ' +
       'output and the source — proving the streaming write path is the same lossless sample copy, only the ' +
@@ -82,7 +82,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', target: 'stream' },
+    shape: { container: 'mp4', target: 'stream', fragmented: false, fastStart: false },
     tolerances: { durationToleranceSec: 0.125 },
     notes:
       'probe(remux_stream(x)).dur≈probe(x).dur: streaming the output incrementally must not change the ' +
@@ -96,7 +96,7 @@ const PROPERTY_CASES: StreamPropertyCase[] = [
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    shape: { container: 'mp4', fragmented: true },
+    shape: { container: 'mp4', fragmented: true, target: 'buffer' },
     features: ['fragmented'],
     tolerances: { durationToleranceSec: 0.125 },
     notes:

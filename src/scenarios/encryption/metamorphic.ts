@@ -13,33 +13,25 @@
  * with the platform engine and compares to golden.frames. The human phrasing
  * "decrypt(x)==decode(cleartext)" lives in notes; the routing token is `decode-cleartext-baseline`.
  *
- * WHY ALSO reference-reimport: CENC decrypt only rewrites sample PAYLOADS — an engine could leave the
- * protection signalling (sinf/schm/tenc/senc/saiz/saio/pssh) in place and still decode bit-exact.
- * decode-frame digests cannot see that. reference-reimport re-parses ctx.output with the reference
- * engine; a genuinely de-protected output re-imports as a normal clear container with the expected
- * packet/keyframe table, whereas leftover protection boxes or a mangled track surface as a re-import
- * divergence. (The strongest possible check — "the reference reports encryptionInfo===null on the
- * output", dossier §4.10 "encryption info is null for clear tracks" — is a STRUCTURAL de-protection
- * assertion that needs a new oracle in oracles.ts to read encryptionInfo off a re-probe; that is
- * outside scenario scope and is recorded in the family notes as a core-level oracle gap.)
- *
- * NO-OP IDEMPOTENCE (§A.16 "unencrypted input must be left untouched"): feeding a CLEAR asset through
- * decrypt() must reproduce the source. We gate it with the same decode-cleartext-baseline invariant
- * (output frames == the clear asset's own golden frames) PLUS reference-reimport + playback-smoke.
- * A TRUE byte-identity assertion (output bytes === input bytes) is the spec's literal property but is
- * NOT expressible from scenario scope: nothing in the frozen runner/oracles compares output to input
- * bytes (the dead `expectNoop` option was never read). That byte-equality oracle is a core-level gap,
- * recorded in the family notes; the frame-exact + structural + playback gates are the strongest
- * browser-pure no-op evidence available without editing oracles.ts.
+ * `reference-reimport` independently rejects active CENC signaling and missing tracks after a
+ * frame-correct decrypt. The clear-input row uses a distinct byte-identity invariant: any rewrap,
+ * truncation, or payload change is FAIL, with neutral decode/re-import/playback left as diagnostics.
  */
 
 import type { OracleId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import type { EncryptionScheme } from '../../core/engine.ts';
 import { decryptKeyFor, type GOLDEN_KEYS } from './_shared.ts';
+import {
+  defineEncryptionKeyProvenance,
+  defineHlsEncryptionContract,
+  defineScenarioDecryptKey,
+  type HlsEncryptionContract,
+} from '../../features/encryption/contracts.ts';
 
 // Routes to the oracle's decode branch (contains "decode"); does NOT contain "duration"/"probe".
 const DECODE_CLEARTEXT = 'decode-cleartext-baseline';
+export const DECRYPT_BYTE_IDENTITY_NOOP = 'decrypt-byte-identity-noop';
 
 interface DecryptMetamorphicCase {
   id: string;
@@ -55,6 +47,7 @@ interface DecryptMetamorphicCase {
   audioCodecs?: string[];
   features?: string[];
   cleartextAsset?: string;
+  hls?: HlsEncryptionContract;
   oracles?: OracleId[];
   notes: string;
 }
@@ -91,6 +84,19 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     // invariant + playback-smoke (decryptable, playable) and drop reference-reimport to avoid an
     // unsound structural gate on a segmented-HLS output the reference may not re-demux as one blob.
     oracles: ['property-invariant', 'playback-smoke'],
+    hls: defineHlsEncryptionContract({
+      case: 'aes128-explicit-iv',
+      mediaSequence: 0,
+      transitions: [{
+        firstSequence: 0,
+        method: 'AES-128',
+        keyRef: 'hls_aes128.key',
+        ivMode: 'explicit',
+        explicitIvHex: 'c0643a1737869dcf50b7d5daa37b466b',
+      }],
+      cleartextAsset: 'hls_aes128_clear.mp4',
+      resourceIndex: '/fixtures/golden/hls_aes128.m3u8.resources.json',
+    }),
     notes:
       'METAMORPHIC: decrypt(hls_aes128) full-segment AES-128 decodes bit-exact to the cleartext ' +
       'MP4 reference hls_aes128_clear.mp4. property-invariant[decode-cleartext-baseline] + playback-smoke. ' +
@@ -107,19 +113,27 @@ const METAMORPHIC_CASES: DecryptMetamorphicCase[] = [
     audioCodecs: ['aac'],
     notes:
       'METAMORPHIC NO-OP (§A.16 leave-unencrypted-untouched): a CLEAR MP4 through decrypt() must ' +
-      'reproduce the source. property-invariant[decode-cleartext-baseline] (output frames == the ' +
-      'clear asset golden) + reference-reimport + playback-smoke. NOTE: a TRUE byte-identity oracle ' +
-      '(output bytes === input bytes) is the spec letter but is NOT expressible from scenario scope ' +
-      '(the frozen runner/oracles never compare output-to-input bytes; the old expectNoop option was ' +
-      'dead). That byte-equality oracle is a core-level gap; this is the strongest browser-pure no-op ' +
-      'evidence without editing oracles.ts.',
+      'reproduce the exact selected source bytes. property-invariant[decrypt-byte-identity-noop] is ' +
+      'decisive: metadata-only rewrap, frame loss, or playable wrong content is FAIL. Neutral decode, ' +
+      'reference-reimport, and playback remain secondary diagnostics.',
   },
 ];
 
 const metamorphicScenarios: Scenario[] = METAMORPHIC_CASES.map((c) => {
   const key = c.keyName
-    ? decryptKeyFor(c.keyName)
-    : { keyHex: c.rawKeyHex ?? '00000000000000000000000000000000' };
+    ? decryptKeyFor(c.keyName, {
+        use: 'authoritative-positive',
+        ...(c.hls ? { hls: c.hls } : {}),
+      })
+    : defineScenarioDecryptKey(
+        { keyHex: c.rawKeyHex ?? '00000000000000000000000000000000' },
+        defineEncryptionKeyProvenance({
+          assetId: c.asset,
+          scheme: c.scheme,
+          use: 'clear-input-sentinel',
+          rotationPolicy: 'fixed-scenario-semantics',
+        }),
+      );
   return defineScenario({
     id: `encryption/${c.id}`,
     op: 'decrypt',
@@ -127,7 +141,9 @@ const metamorphicScenarios: Scenario[] = METAMORPHIC_CASES.map((c) => {
     options: {
       scheme: c.scheme,
       key,
-      invariant: DECODE_CLEARTEXT,
+      invariant: c.id === 'unencrypted_left_untouched_noop'
+        ? DECRYPT_BYTE_IDENTITY_NOOP
+        : DECODE_CLEARTEXT,
       ...(c.cleartextAsset ? { cleartextAsset: c.cleartextAsset } : {}),
     },
     requires: {

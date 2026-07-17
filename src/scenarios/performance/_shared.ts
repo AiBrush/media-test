@@ -17,7 +17,7 @@
  *   • ctx.packets = demux.packets.length  → packetsPerSec    (demux op)
  *   • ctx.seeks = 1                       → seekMs           (seek op; seekMs = wall/seeks)
  *   • ctx.decodedFrames / ctx.frames      → decodeFps / framesPerSec (decodeFrames op, real FrameSink)
- *   • estimated frames (golden fps×dur)   → encodeFps / framesPerSec (transcode/remux/trim, encoded bytes)
+ *   • adapter final counters or neutral output presentation units → encodeFps / framesPerSec
  *   • ctx.bytesOut                        → bytesOut
  *   • ctx.mediaSec (golden duration)      → throughputRealtime
  *   • Meter, every sample                 → peakMemory (peakMemoryBytes), and longtasks when the metric is 'longtasks'
@@ -42,18 +42,8 @@
  *   • metamorphic.ts       — §A.16 transcode-idempotent / probe-duration / decode(remux(x)) / VFR real-fps
  * ──────────────────────────────────────────────────────────────────────────────────────────────────
  *
- * GOLDEN-GATING / BAKE NOTE (mirrors remux/size-ladder.ts, the sanctioned precedent): several cases
- * reference the large/huge/massive rungs (large_h264_1080p_120s.mp4, huge_h264_1080p_600s.mov,
- * big_buck_bunny_1080p_h264.mov, massive_h264_1080p_2h.mp4). The manifest DEFINES these ids but their
- * golden is NOT yet baked (verified: only h264_1080p_30s.mp4 + tiny_h264_360p_2s.mp4 etc. have meta/
- * packets golden; all frame goldens are `pending:true` placeholders the in-browser frame-bake has not
- * filled). loadGolden() drops absent/pending golden, so those cases resolve to a CLEAN golden-absent
- * FAIL / NA — never a fabricated number — and light up the moment the bake produces asset+golden. They
- * are wired now so the leaderboard cell and golden filenames line up. Cases on already-baked assets
- * (meta+packets present today: h264_1080p_30s.mp4, tiny_h264_360p_2s.mp4, h264_vfr.mp4, …) rank for
- * real immediately. Frame-gated cases (decodeFps via decoded-frames-bitexact, ssim-psnr golden path,
- * decode-remux) gate hard once the frame-bake fills frames[].sha256; until then they FAIL/NA honestly
- * with "golden frames pending" rather than silently running a weaker oracle.
+ * SCALE AVAILABILITY is runtime evidence, never a source flag: a resolved manifest digest+size and OK
+ * typed golden evidence admit a rung; missing evidence is NA_ASSET and corrupt evidence is ERROR.
  */
 
 import type { TranscodeOptions } from '../../core/engine.ts';
@@ -70,16 +60,16 @@ import { defineScenario } from '../../core/scenario.ts';
  */
 export const BIG_READ_GOLDEN = 'h264_1080p_30s.mp4';
 
-/** Size-ladder rungs (§5.3). Golden presence noted; the un-baked rungs degrade to NA/golden-absent. */
+/** Size-ladder rungs (§5.3); runtime manifest/golden readers decide availability. */
 export const LADDER = {
   micro: 'micro_h264_1frame.mp4', //   golden: meta+packets (1-frame edge)
   tiny: 'tiny_h264_360p_2s.mp4', //    golden: meta+packets (smallest valid media)
   medium: 'h264_1080p_30s.mp4', //     golden: meta+packets (== BIG_READ_GOLDEN)
   large4k: 'h264_4k_10s.mp4', //       golden: meta+packets (4K, large bucket, baked)
-  large: 'large_h264_1080p_120s.mp4', // manifest-defined, golden NOT yet baked → NA until bake
-  huge: 'huge_h264_1080p_600s.mov', //  manifest-defined, golden NOT yet baked → NA until bake
-  bbb: 'big_buck_bunny_1080p_h264.mov', // provided asset, golden NOT yet baked → NA until bake
-  massive: 'massive_h264_1080p_2h.mp4', // ~216k frames, golden NOT yet baked → NA until bake
+  large: 'large_h264_1080p_120s.mp4',
+  huge: 'huge_h264_1080p_600s.mov',
+  bbb: 'big_buck_bunny_1080p_h264.mov',
+  massive: 'massive_h264_1080p_2h.mp4',
 } as const;
 
 /** VFR asset (§A.16 real-vs-nominal fps). Golden meta+packets baked today. */

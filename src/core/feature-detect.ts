@@ -7,7 +7,7 @@
  * cannot run resolves to `false` (or `undefined` for optional metadata).
  */
 
-import type { BrowserName } from './engine.ts';
+import type { BrowserName, ConcreteWebCodecsConfig } from './engine.ts';
 
 export interface EnvInfo {
   browser: BrowserName;
@@ -28,6 +28,33 @@ export interface CodecSupport {
   strictSourceRgba: boolean;
   webgpu: boolean;
   measureMemory: boolean; // performance.measureUserAgentSpecificMemory available
+}
+
+export type WebCodecsConfigProbe =
+  | {
+      state: 'SUPPORTED';
+      request: ConcreteWebCodecsConfig;
+      /** Exact immutable copy of the config supplied to isConfigSupported(). */
+      checkedConfig: ConcreteWebCodecsConfig;
+    }
+  | {
+      state: 'UNSUPPORTED';
+      request: ConcreteWebCodecsConfig;
+      checkedConfig: ConcreteWebCodecsConfig;
+      reasonCode: 'WEB_CODECS_API_UNAVAILABLE' | 'WEB_CODECS_CONFIG_UNSUPPORTED';
+      detail: string;
+    }
+  | {
+      state: 'ERROR';
+      request: ConcreteWebCodecsConfig;
+      checkedConfig: ConcreteWebCodecsConfig;
+      reasonCode: 'WEB_CODECS_INVALID_CONFIG' | 'WEB_CODECS_PROBE_FAILED';
+      detail: string;
+    };
+
+export interface WebCodecsConfigProbeSet {
+  state: 'SUPPORTED' | 'UNSUPPORTED' | 'ERROR';
+  probes: WebCodecsConfigProbe[];
 }
 
 // ── Canonical codec → WebCodecs codec-string mapping ────────────────────────────────────────────
@@ -266,6 +293,147 @@ function hasGlobal(name: 'VideoDecoder' | 'VideoEncoder' | 'AudioDecoder' | 'Aud
   } catch {
     return false;
   }
+}
+
+/**
+ * Probe one exact WebCodecs configuration. Unlike the run-wide coarse codec table, this preserves
+ * profile/level, description, dimensions, rate, channel layout, bitrate, and hardware preference.
+ * A false/NotSupported result is browser applicability; a TypeError is a runner/adapter config bug.
+ */
+export async function probeWebCodecsConfig(request: ConcreteWebCodecsConfig): Promise<WebCodecsConfigProbe> {
+  const checkedConfig = cloneConcreteConfig(request);
+  const globalName = webCodecsGlobalForRole(request.role);
+  const ctor = getConfigSupportConstructor(globalName);
+  if (!ctor) {
+    return {
+      state: 'UNSUPPORTED',
+      request,
+      checkedConfig,
+      reasonCode: 'WEB_CODECS_API_UNAVAILABLE',
+      detail: `${globalName}.isConfigSupported is unavailable in this realm`,
+    };
+  }
+
+  try {
+    const result = await ctor.isConfigSupported(checkedConfig.config);
+    if (result?.supported === true) return { state: 'SUPPORTED', request, checkedConfig };
+    return {
+      state: 'UNSUPPORTED',
+      request,
+      checkedConfig,
+      reasonCode: 'WEB_CODECS_CONFIG_UNSUPPORTED',
+      detail: `${globalName}.isConfigSupported returned supported:false for the concrete config`,
+    };
+  } catch (error) {
+    const name = errorName(error);
+    if (name === 'NotSupportedError') {
+      return {
+        state: 'UNSUPPORTED',
+        request,
+        checkedConfig,
+        reasonCode: 'WEB_CODECS_CONFIG_UNSUPPORTED',
+        detail: `${globalName}.isConfigSupported rejected with NotSupportedError`,
+      };
+    }
+    if (name === 'TypeError' || error instanceof TypeError) {
+      return {
+        state: 'ERROR',
+        request,
+        checkedConfig,
+        reasonCode: 'WEB_CODECS_INVALID_CONFIG',
+        detail: `${globalName}.isConfigSupported rejected an invalid concrete config: ${errorMessage(error)}`,
+      };
+    }
+    return {
+      state: 'ERROR',
+      request,
+      checkedConfig,
+      reasonCode: 'WEB_CODECS_PROBE_FAILED',
+      detail: `${globalName}.isConfigSupported failed unexpectedly: ${errorMessage(error)}`,
+    };
+  }
+}
+
+/** Probe every adapter-declared exact config and retain every decision for cell evidence. */
+export async function probeWebCodecsConfigs(
+  requests: readonly ConcreteWebCodecsConfig[],
+): Promise<WebCodecsConfigProbeSet> {
+  const probes = await Promise.all(requests.map((request) => probeWebCodecsConfig(request)));
+  const state = probes.some((probe) => probe.state === 'ERROR')
+    ? 'ERROR'
+    : probes.some((probe) => probe.state === 'UNSUPPORTED')
+      ? 'UNSUPPORTED'
+      : 'SUPPORTED';
+  return { state, probes };
+}
+
+type ConfigSupportConstructor = {
+  isConfigSupported(config: unknown): Promise<{ supported?: boolean; config?: unknown }>;
+};
+
+function getConfigSupportConstructor(name: string): ConfigSupportConstructor | undefined {
+  try {
+    const value = (globalThis as Record<string, unknown>)[name];
+    if (typeof value !== 'function' && (typeof value !== 'object' || value === null)) return undefined;
+    const candidate = value as ConfigSupportConstructor;
+    return typeof candidate.isConfigSupported === 'function' ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function webCodecsGlobalForRole(role: ConcreteWebCodecsConfig['role']): string {
+  switch (role) {
+    case 'video-decoder':
+      return 'VideoDecoder';
+    case 'video-encoder':
+      return 'VideoEncoder';
+    case 'audio-decoder':
+      return 'AudioDecoder';
+    case 'audio-encoder':
+      return 'AudioEncoder';
+  }
+}
+
+function cloneConcreteConfig(request: ConcreteWebCodecsConfig): ConcreteWebCodecsConfig {
+  const config = cloneConfigValue(request.config) as typeof request.config;
+  return {
+    role: request.role,
+    ...(request.trackIndex !== undefined ? { trackIndex: request.trackIndex } : {}),
+    config,
+  } as ConcreteWebCodecsConfig;
+}
+
+function cloneConfigValue<T>(value: T): T {
+  if (typeof structuredClone === 'function') return structuredClone(value);
+  if (value instanceof ArrayBuffer) return value.slice(0) as T;
+  if (ArrayBuffer.isView(value)) {
+    const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return new Uint8Array(bytes) as T;
+  }
+  if (Array.isArray(value)) return value.map((item) => cloneConfigValue(item)) as T;
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) out[key] = cloneConfigValue(item);
+    return out as T;
+  }
+  return value;
+}
+
+function errorName(error: unknown): string | undefined {
+  if (error !== null && typeof error === 'object' && 'name' in error) {
+    const name = (error as { name?: unknown }).name;
+    return typeof name === 'string' ? name : undefined;
+  }
+  return undefined;
+}
+
+function errorMessage(error: unknown): string {
+  if (error !== null && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+  }
+  return String(error);
 }
 
 /**

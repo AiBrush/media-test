@@ -6,29 +6,10 @@
  * audio options; throughput probes as `transcode`/`decodeFrames`; robustness as fixture-backed
  * malformed inputs with `graceful-failure`.
  *
- * ── ORACLE HONESTY (the load-bearing decision in this file) ────────────────────────────────────
- * The standing rule is: correctness GATES every number, and "a wrong oracle that lets a fast-but-
- * incorrect engine win is WORSE than an honest FAIL." Three structural facts about the CURRENT
- * harness (engine.ts / runner.ts / oracles.ts — all outside this writer's scope) shape every oracle
- * choice below; they are documented here so a reviewer sees the choices are deliberate, not sloppy:
- *
- *   (1) `decoded-frames-bitexact` / `ssim-psnr` / `property-invariant(decode-remux)` all decode via
- *       `ctx.decodeWithPlatform`, which is a WebCodecs *VideoDecoder* → RGBA path. They are therefore
- *       not attached to audio-only conversion outputs until the suite grows a PCM/AudioDecoder oracle.
- *       Keeping those placeholders on live rows turned supported framework paths into guaranteed
- *       NA_ASSET/FAIL cells, which hid real adapter support behind an oracle limitation.
- *   (2) `golden-metadata` reads `ctx.metadata`, which the runner only populates for `op:'probe'`.
- *       For a `transcode` it is undefined → FAIL ("no probe metadata"). Audio conversions instead use
- *       `property-invariant(transcode-output-metadata)`, which reference-probes the produced bytes and
- *       asserts the OUTPUT container/codec/sample-rate/channel-count plus duration.
- *   (3) `loadGolden` keys golden to the INPUT asset id. The duration of a resample / ch-mix / PCM-
- *       reformat is INVARIANT (5s in → 5s out), so the metamorphic `property-invariant(probe-dur)`
- *       (which compares `referenceEngine.probe(output).dur` to the input golden duration) is a
- *       genuinely correct, harness-compatible duration floor. The output-metadata invariant now
- *       subsumes that duration check while adding the requested output shape.
- *
- * `graceful-failure` is fully functional today (it reads output-presence + notes tokens, no decode),
- * so the robustness/edge/negative cases below are real, gating coverage right now.
+ * ── ORACLE HONESTY ─────────────────────────────────────────────────────────────────────────────
+ * Correctness gates every number. PCM conversions use a neutral two-layer reader + native-rate
+ * signal contract: structure/rate/count/layout first, then transform-specific sample or spectral
+ * evidence. Lawful resampler representation differences are DIFF; wrong transforms are FAIL.
  *
  * ── ASSETS ─────────────────────────────────────────────────────────────────────────────────────
  * Several cases reference assets the bake author produces alongside this battery (canonical ids the
@@ -40,6 +21,7 @@
 
 import type { OracleId, MetricId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import { audioDspContractForScenario } from '../../features/audio-dsp/contracts.ts';
 
 // ── Conversion cases (A.9 + A.6 PCM edges) ──────────────────────────────────────────────────────
 
@@ -62,12 +44,6 @@ interface AudioDspCase {
   /** extra capability tokens the transform needs (e.g. 'gain','fade','downmix','upmix') */
   features?: string[];
   opts: Record<string, unknown>;
-  /**
-   * true when the conversion is exactly defined (PCM reformat, integer endianness swap, defined
-   * integer downmix) and therefore bit-reproducible against an offline PCM golden; false for
-   * resampling and lossy/perceptual mixes (format + duration-invariant assertion only).
-   */
-  bitReproducible: boolean;
   notes?: string;
 }
 
@@ -81,7 +57,6 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     outContainer: 'wav',
     features: ['resample'],
     opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44100 } },
-    bitReproducible: false,
     notes: 'Downsample 48k->44.1k; assert output sample rate + duration invariance (5s in, 5s out).',
   },
   {
@@ -94,7 +69,6 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     outContainer: 'wav',
     features: ['resample'],
     opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 48000 } },
-    bitReproducible: false,
     notes: 'Genuine upsample 44.1k->48k (source is a real 44.1k asset); format + duration assertion.',
   },
   {
@@ -105,7 +79,6 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     outContainer: 'wav',
     features: ['resample'],
     opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 } },
-    bitReproducible: false,
     notes: 'Aggressive downsample to 16k (speech rate); format + duration assertion only.',
   },
 
@@ -117,8 +90,13 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     features: ['downmix'],
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 1 } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', channels: 1,
+        inputLayout: ['FL', 'FR'], outputLayout: ['FC'], mixMatrix: [[0.5, 0.5]],
+      },
+    },
     notes: 'Stereo->mono downmix (defined L/R average); PCM digest reproducible vs golden.',
   },
   {
@@ -130,8 +108,13 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     features: ['upmix'],
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 2 } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', channels: 2,
+        inputLayout: ['FC'], outputLayout: ['FL', 'FR'], mixMatrix: [[1], [1]],
+      },
+    },
     notes: 'Real mono->stereo upmix (duplicate channel) from a genuine mono source; reproducible.',
   },
   {
@@ -141,8 +124,17 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     features: ['downmix'],
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 2 } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', channels: 2,
+        inputLayout: ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'], outputLayout: ['FL', 'FR'],
+        mixMatrix: [
+          [1, 0, 0.7071067811865476, 0, 0.7071067811865476, 0],
+          [0, 1, 0.7071067811865476, 0, 0, 0.7071067811865476],
+        ],
+      },
+    },
     notes: '5.1->stereo downmix via defined ITU-R BS.775 coefficients; exact integer mix, reproducible.',
   },
   {
@@ -152,9 +144,18 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     features: ['upmix'],
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 6 } },
-    bitReproducible: false,
-    notes: 'Stereo->5.1 upmix (channel routing varies by engine); assert 6-channel output + duration.',
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', channels: 6,
+        inputLayout: ['FL', 'FR'], outputLayout: ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
+        mixMatrix: [
+          [1, 0], [0, 1], [0.7071067811865476, 0.7071067811865476],
+          [0, 0], [0.7071067811865476, 0], [0, 0.7071067811865476],
+        ],
+      },
+    },
+    notes: 'Stereo->5.1 uses the authored FL/FR/FC/LFE/BL/BR routing matrix; unsupported matrix control is NA_ENGINE.',
   },
 
   // ── Volume / gain (A.9 — previously entirely unrepresented) ──
@@ -168,8 +169,13 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
     features: ['gain'],
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', gainDb: -6.0206, gainLinear: 0.5 } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', gainDb: -6.0206, gainLinear: 0.5,
+        quantization: { dither: 'none', rounding: 'nearest-even', clipping: 'saturate' },
+      },
+    },
     notes: 'Volume/gain -6.0206dB (exact 0.5 linear); defined LSB rounding -> reproducible PCM digest.',
   },
   {
@@ -182,7 +188,6 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     outContainer: 'wav',
     features: ['gain'],
     opts: { container: 'wav', audio: { codec: 'pcm-f32', gainLinear: 0.5 } },
-    bitReproducible: true,
     notes: 'Gain 0.5x on f32 (exact, no quantization); bit-reproducible scale.',
   },
 
@@ -203,7 +208,6 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
         fade: { inSec: 1, outSec: 1, curve: 'linear' },
       },
     },
-    bitReproducible: true,
     notes: 'Linear fade-in(1s)+fade-out(1s) on f32; deterministic envelope -> reproducible PCM digest.',
   },
 
@@ -214,8 +218,10 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16', 'pcm-f32'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-f32' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-f32', quantization: { dither: 'none', rounding: 'identity', clipping: 'saturate' } },
+    },
     notes: 's16 -> f32 (sample/32768 normalization); exact, reproducible.',
   },
   {
@@ -224,8 +230,10 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-f32', 'pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-s16', quantization: { dither: 'none', rounding: 'nearest-even', clipping: 'saturate' } },
+    },
     notes: 'f32 -> s16 (clamp + round-half-to-even); golden encodes the exact quantization.',
   },
   {
@@ -234,8 +242,13 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s24', 'pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16',
+        quantization: { dither: 'none', rounding: 'truncate-toward-negative-infinity', clipping: 'saturate' },
+      },
+    },
     notes: '24-bit -> 16-bit truncation/dither-off; exact reproducible reduction.',
   },
   {
@@ -244,8 +257,10 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s24', 'pcm-f32'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-f32' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-f32', quantization: { dither: 'none', rounding: 'identity', clipping: 'saturate' } },
+    },
     notes: '24-bit -> f32 normalization; tests full-range 24-bit sample handling.',
   },
   {
@@ -256,8 +271,13 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'aiff',
     audioCodecs: ['pcm-s16be', 'pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16',
+        quantization: { dither: 'none', rounding: 'identity', clipping: 'saturate' },
+      },
+    },
     notes: 'Big-endian(AIFF) -> little-endian(WAV) byte-swap; exact. Guards silent endianness bugs.',
   },
   {
@@ -268,8 +288,10 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16', 'pcm-s16be'],
     outContainer: 'aiff',
-    opts: { container: 'aiff', audio: { codec: 'pcm-s16be' } },
-    bitReproducible: true,
+    opts: {
+      container: 'aiff',
+      audio: { codec: 'pcm-s16be', quantization: { dither: 'none', rounding: 'identity', clipping: 'saturate' } },
+    },
     notes: 'Little-endian(WAV) -> big-endian(AIFF) byte-swap; exact reverse of pcm_s16be_to_s16le.',
   },
   {
@@ -279,19 +301,24 @@ const AUDIO_DSP_CASES: AudioDspCase[] = [
     container: 'aiff',
     audioCodecs: ['pcm-s24be', 'pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16' } },
-    bitReproducible: true,
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16',
+        quantization: { dither: 'none', rounding: 'truncate-toward-negative-infinity', clipping: 'saturate' },
+      },
+    },
     notes: '24-bit big-endian(AIFF) -> 16-bit little-endian(WAV); byte-swap + truncation, exact.',
   },
 ];
 
-// Oracle policy per conversion case. The current suite has no decoded-PCM oracle, and
-// `golden-metadata` is probe-only. So every live audio conversion uses the output-metadata invariant:
-// reference-probe the produced bytes, assert requested output shape, and preserve duration. The
-// `bitReproducible` flag remains as documentation for the future PCM-digest oracle; it does not drive
-// a guaranteed-failing video-frame oracle today.
+// Every conversion is graded by the neutral, native-rate, two-layer audio-DSP evaluator. The
+// registry grades the result; explicit operational policy (matrix/rounding/dither) is also carried
+// in audio options so a framework either honors it or rejects the concrete tuple as NA_ENGINE.
 function conversionOracles(c: AudioDspCase): OracleId[] {
-  void c;
+  if (!audioDspContractForScenario(`audio-dsp/${c.id}`)) {
+    throw new Error(`audio-DSP transform contract missing for ${c.id}`);
+  }
   return ['property-invariant'];
 }
 
@@ -300,9 +327,7 @@ const conversionScenarios: Scenario[] = AUDIO_DSP_CASES.map((c) =>
     id: `audio-dsp/${c.id}`,
     op: 'transcode',
     input: c.asset,
-    // Tag the metamorphic invariant the property-invariant oracle should evaluate (duration is
-    // preserved by every conversion in this list). Carried alongside the transcode options.
-    options: { ...c.opts, invariant: 'transcode-output-metadata' },
+    options: { ...c.opts, invariant: 'audio-dsp-transform' },
     requires: {
       operations: ['transcode'],
       containersIn: [c.container],
@@ -316,10 +341,10 @@ const conversionScenarios: Scenario[] = AUDIO_DSP_CASES.map((c) =>
   }),
 );
 
-// ── A.6 standalone audio DECODE / ENCODE throughput (samples/s) ─────────────────────────────────
+// ── A.6 standalone audio DECODE / ENCODE throughput (sample frames/s) ───────────────────────────
 // The catalog wants "two cases each — decode and encode" for the PCM edges (s24, s16be). The
 // conversion cases above fold throughput into transcode; these isolate the decode and encode legs
-// for the awkward formats so a samples/s number exists per the headline metric. primaryMetric is
+// for the awkward formats so a sample-frame/s number exists per the headline metric. primaryMetric is
 // set explicitly (per the task) so the leaderboard ranks the right number. Correctness still GATES:
 // decode is gated by the PCM-digest oracle, encode by output shape, both fail-closed.
 
@@ -348,8 +373,8 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     features: ['decode:audio-pcm'],
     opts: { maxFrames: 4096 },
     oracles: ['decoded-audio-pcm'],
-    primaryMetric: 'framesPerSec',
-    notes: 'A.6 standalone DECODE throughput for 24-bit PCM (samples/s); gated by PCM digest.',
+    primaryMetric: 'sampleFramesPerSec',
+    notes: 'A.6 standalone DECODE throughput for 24-bit PCM (sample frames/s); gated by PCM digest.',
   },
   {
     id: 'throughput_decode_s16be',
@@ -360,8 +385,8 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     features: ['decode:audio-pcm'],
     opts: { maxFrames: 4096 },
     oracles: ['decoded-audio-pcm'],
-    primaryMetric: 'framesPerSec',
-    notes: 'A.6 standalone DECODE throughput for big-endian PCM (samples/s); gated by PCM digest.',
+    primaryMetric: 'sampleFramesPerSec',
+    notes: 'A.6 standalone DECODE throughput for big-endian PCM (sample frames/s); gated by PCM digest.',
   },
   {
     id: 'throughput_encode_s24',
@@ -370,10 +395,13 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     audioCodecs: ['pcm-f32', 'pcm-s24'],
     kind: 'encode',
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s24' } },
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-s24', quantization: { dither: 'none', rounding: 'nearest-even', clipping: 'saturate' } },
+    },
     oracles: ['property-invariant'],
-    primaryMetric: 'framesPerSec',
-    notes: 'A.6 standalone ENCODE throughput to 24-bit PCM (samples/s); gated by output shape+duration.',
+    primaryMetric: 'sampleFramesPerSec',
+    notes: 'A.6 standalone ENCODE throughput to 24-bit PCM (sample frames/s); gated by native-rate output evidence.',
   },
   {
     id: 'throughput_encode_s16be',
@@ -382,10 +410,13 @@ const THROUGHPUT_CASES: ThroughputCase[] = [
     audioCodecs: ['pcm-s16', 'pcm-s16be'],
     kind: 'encode',
     outContainer: 'aiff',
-    opts: { container: 'aiff', audio: { codec: 'pcm-s16be' } },
+    opts: {
+      container: 'aiff',
+      audio: { codec: 'pcm-s16be', quantization: { dither: 'none', rounding: 'identity', clipping: 'saturate' } },
+    },
     oracles: ['property-invariant'],
-    primaryMetric: 'framesPerSec',
-    notes: 'A.6 standalone ENCODE throughput to big-endian PCM (samples/s); gated by output shape+duration.',
+    primaryMetric: 'sampleFramesPerSec',
+    notes: 'A.6 standalone ENCODE throughput to big-endian PCM (sample frames/s); gated by native-rate output evidence.',
   },
 ];
 
@@ -397,7 +428,7 @@ const throughputScenarios: Scenario[] = THROUGHPUT_CASES.map((c) =>
     options:
       c.kind === 'decode'
         ? { ...(c.opts ?? {}) }
-        : { ...(c.opts ?? {}), invariant: 'transcode-output-metadata' },
+        : { ...(c.opts ?? {}), invariant: 'audio-dsp-transform' },
     requires: {
       operations: [c.kind === 'decode' ? 'decodeFrames' : 'transcode'],
       containersIn: [c.container],
@@ -406,8 +437,8 @@ const throughputScenarios: Scenario[] = THROUGHPUT_CASES.map((c) =>
       ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles,
-    // framesPerSec/decodeFps as the headline; wall+memory for context.
-    metrics: ['framesPerSec', 'decodeFps', 'wall', 'peakMemory'],
+    // Shared metric plumbing maps this audio numerator to sampleFramesPerSec; wall+memory are context.
+    metrics: ['sampleFramesPerSec', 'wall', 'peakMemory'],
     primaryMetric: c.primaryMetric,
     ...(c.notes ? { notes: c.notes } : {}),
   }),
@@ -415,10 +446,8 @@ const throughputScenarios: Scenario[] = THROUGHPUT_CASES.map((c) =>
 
 // ── AIFF / CAF container READ tie-in (A.2 / A.6) ─────────────────────────────────────────────────
 // pcm_s16be.aiff is baked but no audio-dsp case exercised AIFF as the INPUT container as a probe.
-// This pins AIFF container detection + big-endian codec identification, gated by golden-metadata
-// (which DOES work for op:'probe' — ctx.metadata is populated). CAF has no baked asset; a probe
-// case is declared against the canonical caf id so a CAF-capable engine (ffmpeg) is exercised and
-// the rest NA(asset-missing) cleanly.
+// This pins AIFF container detection + big-endian codec identification, gated by golden-metadata.
+// CAF is a generated, content-addressed manifest asset; ordinary lack of adapter support is NA_ENGINE.
 
 interface ContainerReadCase {
   id: string;
@@ -441,7 +470,7 @@ const CONTAINER_READ_CASES: ContainerReadCase[] = [
     asset: 'pcm_s16.caf',
     container: 'caf',
     audioCodecs: ['pcm-s16'],
-    notes: 'A.2 CAF container READ (canonical asset; NA(asset-missing) until baked, NA(engine) for most).',
+    notes: 'Non-normative context: generated CAF/pcm-s16 container-read coverage; manifest identity decides availability.',
   },
 ];
 
@@ -500,7 +529,7 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 }, invariant: 'transcode-output-metadata' },
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 16000 }, invariant: 'audio-dsp-transform' },
     oracles: ['property-invariant'],
     timeoutMs: LONG_AUDIO_TIMEOUT_MS,
     notes: 'A.16 size-ladder for audio: downsample a multi-hour file streaming; duration must survive.',
@@ -516,15 +545,14 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
     opts: {
       container: 'mp4',
       frameAccurate: true,
-      invariant: 'gapless-decoded-sample-count-priming-removed',
+      invariant: 'audio-dsp-gapless-native',
       startUs: 0,
       endUs: 1_012_993,
     },
     oracles: ['property-invariant'],
     timeoutMs: LONG_AUDIO_TIMEOUT_MS,
     notes:
-      'A.16 gapless: AAC with encoder delay/padding; full-range trim is browser-audio-decoded and ' +
-      'the decoded sample count must equal the priming/padding-removed duration.',
+      'A.16 gapless: full-range AAC trim; native WebCodecs rate/count, priming/remainder, and edit-list presentation are independently evidenced.',
   },
   {
     id: 'edge_variable_channel_count_downmix',
@@ -533,7 +561,18 @@ const EDGE_AUDIO_CASES: EdgeAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 2 }, invariant: 'transcode-output-metadata' },
+    opts: {
+      container: 'wav',
+      audio: {
+        codec: 'pcm-s16', channels: 2,
+        inputLayout: ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'], outputLayout: ['FL', 'FR'],
+        mixMatrix: [
+          [1, 0, 0.7071067811865476, 0, 0.7071067811865476, 0],
+          [0, 1, 0.7071067811865476, 0, 0, 0.7071067811865476],
+        ],
+      },
+      invariant: 'audio-dsp-transform',
+    },
     oracles: ['property-invariant'],
     notes: 'A.16 variable channel count: 5.1 (non-stereo layout) -> stereo; shape + duration assertion.',
   },
@@ -692,6 +731,7 @@ interface MetamorphicCase {
   containersIn: string[];
   containersOut?: string[];
   audioCodecs: string[];
+  features?: string[];
   opts?: Record<string, unknown>;
   oracles: OracleId[];
   notes?: string;
@@ -707,7 +747,7 @@ const METAMORPHIC_CASES: MetamorphicCase[] = [
     audioCodecs: ['pcm-s16'],
     // Convert to the SAME 48000Hz/stereo/s16 the source already is: a no-op-ish round-trip whose
     // decoded PCM must equal the source decode (golden is the input-keyed source decode).
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 48000, channels: 2 }, invariant: 'audio-pcm-digest' },
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 48000, channels: 2 }, invariant: 'audio-dsp-transform' },
     oracles: ['property-invariant'],
     notes:
       'A.16 metamorphic: transcode to the identical rate/channels/format is idempotent — decoded PCM == source decode (and duration preserved).',
@@ -719,9 +759,10 @@ const METAMORPHIC_CASES: MetamorphicCase[] = [
     containersIn: ['wav'],
     containersOut: ['wav'],
     audioCodecs: ['pcm-s16', 'pcm-s16be'],
-    // s16le -> s16be -> s16le must reproduce the original bytes exactly. The roundtrip flag asks a
-    // capable engine to apply both legs; the decoded PCM of the result must equal the source decode.
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', roundtrip: 'pcm-s16be' }, invariant: 'audio-pcm-digest' },
+    features: ['audio-dsp:endianness-roundtrip'],
+    // s16le -> s16be -> s16le must expose the actual AIFF/s16be intermediate as well as the final
+    // normalized PCM. A final-only identity output is insufficient evidence and fails the invariant.
+    opts: { container: 'wav', audio: { codec: 'pcm-s16', roundtrip: 'pcm-s16be' }, invariant: 'audio-dsp-endianness-roundtrip' },
     oracles: ['property-invariant'],
     notes:
       'A.16 metamorphic: endianness round-trip s16le->s16be->s16le is PCM-bit-exact to the original.',
@@ -751,6 +792,7 @@ const metamorphicScenarios: Scenario[] = METAMORPHIC_CASES.map((c) =>
       containersIn: c.containersIn,
       ...(c.containersOut ? { containersOut: c.containersOut } : {}),
       audioCodecs: [...new Set(c.audioCodecs)],
+      ...(c.features ? { features: c.features } : {}),
     },
     oracles: c.oracles,
     metrics: ['wall', 'peakMemory'],

@@ -26,6 +26,13 @@ function hasDomCanvas(): boolean {
   return typeof document !== 'undefined' && typeof document.createElement === 'function';
 }
 
+export function hasRasterSurface(): boolean {
+  const framePrototype = (globalThis as Record<string, unknown>).VideoFrame as
+    | { prototype?: { copyTo?: unknown } }
+    | undefined;
+  return typeof framePrototype?.prototype?.copyTo === 'function' || hasOffscreenCanvas() || hasDomCanvas();
+}
+
 function makeCanvas2D(width: number, height: number): Canvas2D {
   if (hasOffscreenCanvas()) {
     const c = new OffscreenCanvas(width, height);
@@ -59,20 +66,28 @@ function videoFrameDisplaySize(frame: VideoFrame): { width: number; height: numb
  * Draw a VideoFrame to a 2D canvas and read back normalized RGBA. drawImage applies any rotation /
  * crop the frame carries and produces straight-alpha top-left pixels at display size.
  */
-export async function imageDataFromVideoFrame(frame: VideoFrame): Promise<ImageData> {
+export async function imageDataFromVideoFrame(frame: VideoFrame, signal?: AbortSignal): Promise<ImageData> {
+  throwIfAborted(signal);
   const { width, height } = videoFrameDisplaySize(frame);
   if (width <= 0 || height <= 0) throw new Error('VideoFrame has zero display size');
 
-  const copied = await imageDataViaCopyTo(frame, width, height);
+  const copied = await imageDataViaCopyTo(frame, width, height, signal);
   if (copied) return copied;
 
+  throwIfAborted(signal);
   const canvas = makeCanvas2D(width, height);
   canvas.ctx.clearRect(0, 0, width, height);
   canvas.ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0, width, height);
+  throwIfAborted(signal);
   return canvas.getImageData();
 }
 
-async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: number): Promise<ImageData | null> {
+async function imageDataViaCopyTo(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+  signal?: AbortSignal,
+): Promise<ImageData | null> {
   const f = frame as unknown as {
     codedWidth?: number;
     codedHeight?: number;
@@ -92,9 +107,42 @@ async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: numb
 
   try {
     const rgba = new Uint8Array(width * height * 4);
-    await f.copyTo(rgba, { format: 'RGBA' });
+    await raceAbort(f.copyTo(rgba, { format: 'RGBA' }), signal);
+    throwIfAborted(signal);
     return new ImageData(new Uint8ClampedArray(rgba), width, height);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new DOMException('operation aborted', 'AbortError');
+}
+
+function raceAbort<T>(promise: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return Promise.resolve(promise);
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      callback();
+    };
+    const abort = (): void => finish(() => {
+      try {
+        throwIfAborted(signal);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }

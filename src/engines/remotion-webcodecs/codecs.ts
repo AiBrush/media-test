@@ -81,10 +81,8 @@ export function canonicalToRemotionAudio(codec: string): RemotionAudioCodec | nu
       return 'aac';
     case 'opus':
       return 'opus';
-    // remotion writes 16-bit PCM into a WAV container under the token 'wav'.
+    // remotion writes exactly 16-bit PCM into a WAV container under the token 'wav'.
     case 'pcm-s16':
-    case 'pcm-f32':
-    case 'pcm-s24':
       return 'wav';
     default:
       return null; // mp3/flac/vorbis have no encode path

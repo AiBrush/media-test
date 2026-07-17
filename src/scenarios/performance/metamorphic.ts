@@ -70,7 +70,8 @@ const transcodeIdempotent: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§A.16 transcode-idempotent-in-dimensions: convert h264_1080p_30s.mp4 → WebM/VP9/Opus at SOURCE ` +
-    `1920×1080 (geometry no-op). Tight ssim-psnr floor catches 1:1 resampler distortion. Rank framesPerSec.`,
+    `1920×1080 (geometry no-op). Tight ssim-psnr floor catches 1:1 resampler distortion. Rank actual ` +
+    `output presentation units/sec; no cadence×duration estimate is permitted.`,
 });
 
 // 2) probe-duration consistent across containers — remux carries the invariant (probe needs output).
@@ -92,7 +93,7 @@ const probeDurationCrossContainer: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§A.16 probe-duration across containers: remux h264_1080p_30s.mp4 → WebM, then property-invariant ` +
-    `re-probes the output (reference engine) and asserts duration ≈ golden (baked → ranks now). Rank throughputRealtime.`,
+    `re-probes the output and asserts duration ≈ golden. Rank source-presentation seconds / wall-second.`,
 });
 
 // 3) decode(remux(x)) == decode(x) — demux+mux fast path under timing; reference-reimport gates now.

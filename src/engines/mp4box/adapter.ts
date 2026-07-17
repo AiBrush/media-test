@@ -6,7 +6,7 @@
  * NOT decode or encode media (no pixels, no PCM, no re-encode) and handles ONLY ISOBMFF. So this
  * adapter declares — and implements — exactly four operations:
  *   - probe   : read `moov` → NormalizedMetadata.
- *   - demux   : walk sample tables → encoded PacketInfo table (the WebCodecs demux fast path).
+ *   - demux   : walk sample tables → representation-aware encoded PacketInfo evidence.
  *   - remux   : ISOBMFF → FRAGMENTED-MP4 (fMP4/CMAF) via setSegmentOptions/onSegment (the fragmenter).
  *   - mux     : MP4Box-prepared encoded MP4/MOV tracks → MP4 via addTrack/addSample/getBuffer.
  * Everything else (transcode/decodeFrames/seek-to-frame/trim/decrypt) needs decode/encode or a
@@ -60,21 +60,56 @@
 
 import { registerEngine } from '../../core/registry.ts';
 import type {
+  ApplicabilityTupleSummary,
   CapabilitySet,
+  ConcreteOperationRequest,
+  DecodeOptions,
+  DemuxTrackRepresentation,
   DemuxResult,
   EncodedTrack,
   EncodedTracks,
   FrameDigest,
   FrameSink,
+  LifecycleContext,
   MediaBytes,
   MediaEngine,
   MediaInput,
+  MuxOptions,
   NormalizedMetadata,
   NormalizedTrack,
+  Operation,
+  OperationContext,
   PacketInfo,
+  RemuxOptions,
   TrackType,
   TranscodeOptions,
 } from '../../core/engine.ts';
+import {
+  AdapterLifecycleController,
+  CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  captureConfigUsedSnapshot,
+  createNotApplicableError,
+  validateAdapterResult,
+  validateEncodedTracks,
+} from '../../core/engine.ts';
+import {
+  fpsEvidenceFromSamples,
+  parseAacAudioSpecificConfig,
+  validateFragmentedMp4,
+  type AacConfigEvidence,
+  type FragmentValidation,
+} from './evidence.ts';
+import {
+  MP4BOX_AUDIO_CODECS,
+  MP4BOX_ENGINE_ID,
+  MP4BOX_INPUT_CONTAINERS,
+  MP4BOX_OUTPUT_CONTAINERS,
+  MP4BOX_VIDEO_CODECS,
+  decideMp4boxSupport,
+  mp4boxDecisionError,
+  mp4boxTupleSummary,
+} from './support.ts';
 
 // 2.x ships real types — import the typed surface directly (no local ambient module).
 type Mp4boxModule = typeof import('mp4box');
@@ -86,20 +121,75 @@ type Mp4Sample = import('mp4box').Sample;
 type Mp4ISOFile = import('mp4box').ISOFile;
 type Mp4BoxKind = import('mp4box').BoxKind;
 
-const ENGINE_ID = 'mp4box@2.3.0';
+const ENGINE_ID = MP4BOX_ENGINE_ID;
 
 /** The chosen best-path config, surfaced as configUsed (dossier §3). mp4box is pure-JS/CPU-only. */
-const CONFIG_USED = {
-  backend: 'pure-js' as const,
-  hwAccel: false,
-  wasmThreads: 0,
-  worker: false, // run inline; mp4box needs no Worker and the suite shell drives it directly
-  pipeline: 'whole-file-append(MP4BoxBuffer+fileStart)',
-  rangeReads: false, // corpus assets fit in memory; we append the whole file once for determinism
-  discardMdatDataProbe: true, // probe drops mdat (moov-only) for minimal peak memory
-  discardMdatDataDemuxRemux: false, // demux/remux keep mdat (createFile(true)) so samples survive
-  segmentRapAlignement: true, // fragmenter starts each segment on a RAP
-};
+const READ_CHUNK_BYTES = 1 * 1024 * 1024;
+const PROCESS_BATCH_SAMPLES = 16;
+
+interface Mp4boxConfigState {
+  framework: string;
+  packageVersions: Record<string, string>;
+  backend: string;
+  hardwareAcceleration: string;
+  workerCount: number;
+  threadCount: number;
+  readerMode: string;
+  writerMode: string;
+  targetMode: string;
+  codecConfigs: Array<Record<string, string | number | boolean | null>>;
+  operation: string;
+  keepMdatData: boolean;
+  readChunkBytes: number;
+  processBatchSamples: number;
+  inputBytes: number;
+  appendCount: number;
+  releasedSamples: number;
+  peakParserSampleBytes: number;
+  peakOwnedSampleBytes: number;
+  peakOutputTargetBytes: number;
+  outputBytes: number;
+  outputWrites: number;
+  firstByteMs: number | null;
+  lateErrorObserved: boolean;
+  stopCalled: boolean;
+  cleanupComplete: boolean;
+  activeFiles: number;
+  fragmentValidation: FragmentValidation | null;
+}
+
+function freshConfigState(): Mp4boxConfigState {
+  return {
+    framework: 'mp4box.js',
+    packageVersions: { mp4box: '2.3.0' },
+    backend: 'pure-js',
+    hardwareAcceleration: 'none',
+    workerCount: 0,
+    threadCount: 1,
+    readerMode: 'blob-progressive-slices',
+    writerMode: 'none',
+    targetMode: 'none',
+    codecConfigs: [],
+    operation: 'idle',
+    keepMdatData: false,
+    readChunkBytes: READ_CHUNK_BYTES,
+    processBatchSamples: PROCESS_BATCH_SAMPLES,
+    inputBytes: 0,
+    appendCount: 0,
+    releasedSamples: 0,
+    peakParserSampleBytes: 0,
+    peakOwnedSampleBytes: 0,
+    peakOutputTargetBytes: 0,
+    outputBytes: 0,
+    outputWrites: 0,
+    firstByteMs: null,
+    lateErrorObserved: false,
+    stopCalled: false,
+    cleanupComplete: true,
+    activeFiles: 0,
+    fragmentValidation: null,
+  };
+}
 
 // ── pure helpers (no lib dependency) ──────────────────────────────────────────────────────────────
 
@@ -167,6 +257,10 @@ interface BoxNode {
   type: string;
   boxes?: BoxNode[];
   data_format?: string;
+  size?: number;
+  hdr_size?: number;
+  lengthSizeMinusOne?: number;
+  write?: (stream: Mp4boxDataStream) => void;
 }
 
 interface DescriptorNode {
@@ -203,12 +297,18 @@ type EncodedChunk = EncodedTrack['chunks'][number];
 
 interface Mp4boxPreparedChunk extends EncodedChunk {
   mp4boxTiming?: Mp4boxSampleTiming;
+  sampleDescriptionIndex?: number;
 }
 
 interface Mp4boxMuxInfo {
   source: 'mp4box';
   sampleEntryType: string;
   descriptionBoxes: Mp4BoxKind[];
+  sampleEntries: BoxNode[];
+  edits: Mp4Edit[];
+  movieTimescale: number;
+  mediaOriginTicks: number;
+  presentationOffsetUs: number;
 }
 
 interface Mp4boxPreparedMuxTrack extends EncodedTrack {
@@ -225,15 +325,44 @@ interface CollectedSample {
   isSync: boolean;
   number: number;
   size: number;
+  descriptionIndex: number;
 }
 
-/** Thrown for paths this adapter intentionally does not claim at runtime; runner records NA_ENGINE. */
-class NotApplicableError extends Error {
-  constructor(op: string, reason: string) {
-    super(`${ENGINE_ID}: ${op} not applicable: ${reason}`);
-    this.name = 'NotApplicableError';
-  }
+interface Mp4Edit {
+  segmentDuration: number;
+  mediaTime: number;
+  mediaRateInteger: number;
+  mediaRateFraction: number;
 }
+
+interface ParsedSession {
+  file: Mp4ISOFile;
+  info: Mp4Movie;
+  throwIfError(): void;
+  close(primaryError?: unknown): void;
+}
+
+type ParsedReadyHook = (
+  file: Mp4ISOFile,
+  info: Mp4Movie,
+  throwIfError: () => void,
+) => void;
+
+type Mp4NormalizedTrack = NormalizedTrack & {
+  codecRaw?: string;
+  codecCanonical?: string;
+  audioObjectType?: number;
+  sbrPresent?: boolean;
+  psPresent?: boolean;
+  codedSampleRate?: number;
+  presentationSampleRate?: number;
+  codedChannels?: number;
+  presentationChannels?: number;
+  mediaTimescale?: number;
+  mediaDurationSec?: number;
+  presentationDurationSec?: number;
+  editListSpanSec?: number;
+};
 
 function findChildBox(node: BoxNode | undefined, fourcc: string): BoxNode | undefined {
   if (!node || !node.boxes) return undefined;
@@ -306,11 +435,6 @@ function canonicalContainer(brands: string[] | undefined): string {
   return 'mp4';
 }
 
-const AAC_SAMPLE_RATES = [
-  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-] as const;
-const AAC_CHANNELS_BY_CONFIG = [undefined, 1, 2, 3, 4, 5, 6, 8] as const;
-
 function validAudioSampleRate(value: number | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 7350 && value <= 384000;
 }
@@ -353,24 +477,6 @@ function audioSpecificConfigFromEntry(entry: AudioSampleEntryNode): Uint8Array |
   return findDescriptorData(esds?.esd, 5);
 }
 
-function aacParamsFromAudioSpecificConfig(data: Uint8Array | undefined): {
-  sampleRate?: number;
-  channels?: number;
-} {
-  if (!data || data.length < 2) return {};
-  const first = data[0];
-  const second = data[1];
-  if (first === undefined || second === undefined) return {};
-  const freqIndex = ((first & 0x07) << 1) | (second >> 7);
-  const sampleRate = AAC_SAMPLE_RATES[freqIndex];
-  const channelConfig = (second >> 3) & 0x0f;
-  const channels = AAC_CHANNELS_BY_CONFIG[channelConfig];
-  return {
-    ...(validAudioSampleRate(sampleRate) ? { sampleRate } : {}),
-    ...(validAudioChannels(channels) ? { channels } : {}),
-  };
-}
-
 function quickTimeV2AudioParams(entry: AudioSampleEntryNode): { sampleRate?: number; channels?: number } {
   if (entry.version !== 2) return {};
   const ext = bytesFromUnknown(entry.extensions);
@@ -389,19 +495,48 @@ function audioParamsFromSampleEntry(
   file: Mp4ISOFile,
   trackId: number,
   rawCodec: string,
-): { sampleRate?: number; channels?: number } {
+): { sampleRate?: number; channels?: number; aac?: AacConfigEvidence } {
   try {
     const entry = sampleEntryForTrack(file, trackId, rawCodec) as AudioSampleEntryNode | undefined;
     if (!entry) return {};
     const qtV2 = quickTimeV2AudioParams(entry);
-    const asc = aacParamsFromAudioSpecificConfig(audioSpecificConfigFromEntry(entry));
+    const aac = parseAacAudioSpecificConfig(audioSpecificConfigFromEntry(entry));
     return {
-      sampleRate: qtV2.sampleRate ?? asc.sampleRate,
-      channels: qtV2.channels ?? asc.channels,
+      sampleRate: qtV2.sampleRate ?? aac?.presentationSampleRate,
+      channels: qtV2.channels ?? aac?.presentationChannels,
+      ...(aac ? { aac } : {}),
     };
   } catch {
     return {};
   }
+}
+
+function normalizedEdits(track: Mp4Track): Mp4Edit[] {
+  return (track.edits ?? []).map((entry) => ({
+    segmentDuration: entry.segment_duration,
+    mediaTime: entry.media_time,
+    mediaRateInteger: entry.media_rate_integer,
+    mediaRateFraction: entry.media_rate_fraction,
+  }));
+}
+
+function editPresentationSpanSec(track: Mp4Track): number | undefined {
+  const timescale = track.movie_timescale;
+  const edits = normalizedEdits(track);
+  if (!(timescale > 0) || edits.length === 0) return undefined;
+  const ticks = edits.reduce((sum, edit) => sum + Math.max(0, edit.segmentDuration), 0);
+  return ticks > 0 ? ticks / timescale : undefined;
+}
+
+/** `Movie.tracks[].nb_samples` is an onReady snapshot and can be stale for progressive fMP4. */
+function trackSampleCount(file: Mp4ISOFile, track: Mp4Track): number {
+  try {
+    const complete = file.getTrackSamplesInfo(track.id).length;
+    if (complete > 0) return complete;
+  } catch {
+    // Non-fragmented sample tables still expose the stable getInfo() count below.
+  }
+  return track.nb_samples;
 }
 
 /**
@@ -432,21 +567,54 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
     // Unwrap CENC-protected sample entries ('encv'/'enca') to their original four-cc before
     // canonicalizing; non-encrypted tracks pass `t.codec` straight through.
     const rawCodec = unwrapEncryptedCodec(file, t.id, t.codec) ?? t.codec;
-    const track: NormalizedTrack = {
+    const normalizedCodec = canonicalCodec(rawCodec);
+    const track: Mp4NormalizedTrack = {
       type,
-      codec: canonicalCodec(rawCodec),
+      codec: normalizedCodec,
+      nativeCodecTag: rawCodec,
+      codecRaw: rawCodec,
+      // The shared canonical codec vocabulary is intentionally audio/video-only. QuickTime data
+      // tracks such as `tmcd` retain their native token without pretending it is an AV codec.
+      ...(type === 'video' || type === 'audio' ? { codecCanonical: normalizedCodec } : {}),
+      ...(t.timescale > 0 ? { mediaTimescale: t.timescale } : {}),
+      ...(trackDurSec > 0 ? { mediaDurationSec: trackDurSec } : {}),
       bitrate: typeof t.bitrate === 'number' && Number.isFinite(t.bitrate) ? Math.round(t.bitrate) : null,
       language: lang,
     };
+    const editSpanSec = editPresentationSpanSec(t);
+    if (editSpanSec !== undefined) {
+      track.editListSpanSec = editSpanSec;
+      track.presentationDurationSec = editSpanSec;
+    } else if (t.movie_timescale > 0 && t.movie_duration > 0) {
+      track.presentationDurationSec = t.movie_duration / t.movie_timescale;
+    }
     if (type === 'video') {
       track.width = t.video?.width ?? (Math.round(t.track_width) || undefined);
       track.height = t.video?.height ?? (Math.round(t.track_height) || undefined);
-      // Average fps over the track (sample count / track-seconds). VFR tracks report an average.
-      // For FRAGMENTED files the per-track duration is 0 (no samples in the moov), so fall back to
-      // the movie-level fragment duration: fps = nb_samples / fragment_seconds. (cenc_ctr.mp4:
-      // 150 / 5.0214 = 29.87, matching golden 29.872 within the ±0.05 fps oracle tolerance.)
-      const fpsDenSec = trackDurSec > 0 ? trackDurSec : movieFragSec;
-      if (fpsDenSec > 0 && t.nb_samples > 0) track.fps = t.nb_samples / fpsDenSec;
+      let observedFps: ReturnType<typeof fpsEvidenceFromSamples>;
+      try {
+        observedFps = fpsEvidenceFromSamples(file.getTrackSamplesInfo(t.id));
+      } catch {
+        observedFps = undefined;
+      }
+      if (observedFps) {
+        track.fps = observedFps.fps;
+        track.fpsProvenance = observedFps.provenance;
+      } else {
+        // Fragmented init segments may not expose sample tables. Retain an explicitly average/
+        // unknown-cadence fallback instead of presenting sample-count/duration as nominal CFR.
+        const fpsDenSec = trackDurSec > 0 ? trackDurSec : movieFragSec;
+        const sampleCount = trackSampleCount(file, t);
+        if (fpsDenSec > 0 && sampleCount > 0) {
+          track.fps = sampleCount / fpsDenSec;
+          track.fpsProvenance = {
+            source: 'average',
+            cadence: 'UNKNOWN',
+            sampleCount,
+            observedIntervalUs: fpsDenSec * 1_000_000,
+          };
+        }
+      }
       const rot = rotationFromMatrix(t.matrix);
       if (rot !== undefined) track.rotation = rot;
     } else if (type === 'audio') {
@@ -455,6 +623,15 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
       const audioParams = audioParamsFromSampleEntry(file, t.id, rawCodec);
       track.sampleRate = audioParams.sampleRate ?? t.audio?.sample_rate;
       track.channels = audioParams.channels ?? t.audio?.channel_count;
+      if (audioParams.aac) {
+        track.audioObjectType = audioParams.aac.audioObjectType;
+        track.sbrPresent = audioParams.aac.sbrPresent;
+        track.psPresent = audioParams.aac.psPresent;
+        if (audioParams.aac.codedSampleRate !== undefined) track.codedSampleRate = audioParams.aac.codedSampleRate;
+        if (audioParams.aac.presentationSampleRate !== undefined) track.presentationSampleRate = audioParams.aac.presentationSampleRate;
+        if (audioParams.aac.codedChannels !== undefined) track.codedChannels = audioParams.aac.codedChannels;
+        if (audioParams.aac.presentationChannels !== undefined) track.presentationChannels = audioParams.aac.presentationChannels;
+      }
     }
     return track;
   });
@@ -472,18 +649,43 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
   return meta;
 }
 
-/** Concatenate ArrayBuffers/Uint8Arrays into one Uint8Array (fMP4 init + media segments). */
-function concatBuffers(parts: Array<ArrayBuffer | Uint8Array>): Uint8Array {
-  let total = 0;
-  for (const p of parts) total += p instanceof Uint8Array ? p.byteLength : p.byteLength;
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    const u8 = p instanceof Uint8Array ? p : new Uint8Array(p);
-    out.set(u8, off);
-    off += u8.byteLength;
+/** Observable in-memory target: one retained buffer, no fragment list plus final concatenation copy. */
+class ProgressiveByteSink {
+  private storage = new Uint8Array(0);
+  private length = 0;
+  private peakAllocation = 0;
+
+  get byteLength(): number {
+    return this.length;
   }
-  return out;
+
+  get peakAllocatedBytes(): number {
+    return this.peakAllocation;
+  }
+
+  write(part: ArrayBuffer | Uint8Array): void {
+    const bytes = part instanceof Uint8Array ? part : new Uint8Array(part);
+    const required = this.length + bytes.byteLength;
+    if (required > this.storage.byteLength) {
+      let capacity = Math.max(1024, this.storage.byteLength);
+      while (capacity < required) capacity = Math.max(required, capacity * 2);
+      const grown = new Uint8Array(capacity);
+      this.peakAllocation = Math.max(this.peakAllocation, this.storage.byteLength + grown.byteLength);
+      grown.set(this.storage.subarray(0, this.length));
+      this.storage = grown;
+    }
+    this.storage.set(bytes, this.length);
+    this.length = required;
+  }
+
+  finish(): Uint8Array {
+    if (this.storage.byteLength !== this.length) {
+      const tight = this.storage.slice(0, this.length);
+      this.peakAllocation = Math.max(this.peakAllocation, this.storage.byteLength + tight.byteLength);
+      this.storage = tight;
+    }
+    return this.storage;
+  }
 }
 
 function copyBytes(source: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
@@ -505,35 +707,230 @@ function descriptionBoxesFromSampleEntry(entry: BoxNode | undefined): Mp4BoxKind
   return boxes;
 }
 
+function sampleEntriesForTrack(file: Mp4ISOFile, trackId: number): BoxNode[] {
+  const trak = file.getTrackById(trackId);
+  const entries = trak?.mdia?.minf?.stbl?.stsd?.entries;
+  return (entries ?? []) as unknown as BoxNode[];
+}
+
+function directBox(entry: BoxNode | undefined, fourcc: string): BoxNode | undefined {
+  if (!entry) return undefined;
+  const direct = (entry as unknown as Record<string, unknown>)[fourcc];
+  if (direct && typeof direct === 'object') return direct as BoxNode;
+  return findChildBox(entry, fourcc);
+}
+
+function serializeBoxPayload(box: BoxNode | undefined, MP4Box: Mp4boxModule): Uint8Array | undefined {
+  if (!box || typeof box.write !== 'function') return undefined;
+  try {
+    const stream = new MP4Box.DataStream(undefined, 0, MP4Box.Endianness.BIG_ENDIAN);
+    box.write(stream);
+    const bytes = streamToBytes(stream);
+    if (bytes.byteLength < 8) return undefined;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const header = view.getUint32(0) === 1 ? 16 : 8;
+    return bytes.byteLength >= header ? bytes.slice(header) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface SampleDescriptionEvidence {
+  nativeCodecTag: string;
+  framing: DemuxTrackRepresentation['framing'];
+  accessUnitGrouping: DemuxTrackRepresentation['accessUnitGrouping'];
+  parameterSetLocation: DemuxTrackRepresentation['parameterSetLocation'];
+  description?: Uint8Array;
+  descriptionRecord?: DemuxTrackRepresentation['descriptionRecord'];
+  nalLengthSize?: number;
+}
+
+function sampleDescriptionEvidence(entry: BoxNode | undefined, codec: string, MP4Box: Mp4boxModule): SampleDescriptionEvidence {
+  const nativeCodecTag = entry?.type ?? codec;
+  if (codec === 'h264') {
+    const configBox = directBox(entry, 'avcC');
+    const description = serializeBoxPayload(configBox, MP4Box);
+    const inBand = nativeCodecTag.toLowerCase().startsWith('avc3');
+    return {
+      nativeCodecTag,
+      framing: 'avc',
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: inBand ? (description ? 'both' : 'in-band') : (description ? 'description' : 'in-band'),
+      ...(description ? { description, descriptionRecord: 'avc-decoder-configuration-record' as const } : {}),
+      ...(typeof configBox?.lengthSizeMinusOne === 'number'
+        ? { nalLengthSize: (configBox.lengthSizeMinusOne & 3) + 1 }
+        : {}),
+    };
+  }
+  if (codec === 'hevc') {
+    const configBox = directBox(entry, 'hvcC');
+    const description = serializeBoxPayload(configBox, MP4Box);
+    const inBand = nativeCodecTag.toLowerCase().startsWith('hev1');
+    return {
+      nativeCodecTag,
+      framing: 'hevc',
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: inBand ? (description ? 'both' : 'in-band') : (description ? 'description' : 'in-band'),
+      ...(description ? { description, descriptionRecord: 'hevc-decoder-configuration-record' as const } : {}),
+      ...(typeof configBox?.lengthSizeMinusOne === 'number'
+        ? { nalLengthSize: (configBox.lengthSizeMinusOne & 3) + 1 }
+        : {}),
+    };
+  }
+  if (codec === 'aac') {
+    const description = audioSpecificConfigFromEntry(entry as AudioSampleEntryNode);
+    return {
+      nativeCodecTag,
+      framing: 'raw',
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: description ? 'description' : 'not-applicable',
+      ...(description ? { description: description.slice(), descriptionRecord: 'audio-specific-config' as const } : {}),
+    };
+  }
+  const configType = codec === 'vp8' || codec === 'vp9' ? 'vpcC' : codec === 'av1' ? 'av1C' : undefined;
+  const description = configType ? serializeBoxPayload(directBox(entry, configType), MP4Box) : undefined;
+  return {
+    nativeCodecTag,
+    framing: codec === 'av1' ? 'obu' : 'raw',
+    accessUnitGrouping: 'one-frame-per-chunk',
+    parameterSetLocation: description ? 'description' : 'not-applicable',
+    ...(description ? { description, descriptionRecord: 'codec-private' as const } : {}),
+  };
+}
+
+export function mp4boxSampleEvidence(
+  sample: Mp4Sample,
+  trackIndex: number,
+  type: TrackType,
+  codec: string,
+  description: SampleDescriptionEvidence,
+): PacketInfo {
+  const timescale = sample.timescale > 0 ? sample.timescale : 1;
+  const payload = sample.data ? copyBytes(sample.data) : new Uint8Array();
+  return {
+    trackIndex,
+    trackType: type,
+    codec,
+    size: sample.size,
+    ptsUs: (sample.cts * 1_000_000) / timescale,
+    dtsUs: (sample.dts * 1_000_000) / timescale,
+    durationUs: (sample.duration * 1_000_000) / timescale,
+    keyframe: !!sample.is_sync,
+    payload,
+    framing: description.framing,
+    ...(description.nalLengthSize !== undefined ? { nalLengthSize: description.nalLengthSize } : {}),
+    ...(description.description ? { decoderConfig: description.description.slice() } : {}),
+    randomAccessKind: sample.is_sync ? 'sync-sample' : 'non-sync-sample',
+  };
+}
+
+function trackRepresentation(
+  trackIndex: number,
+  codec: string,
+  entry: BoxNode | undefined,
+  timescale: number,
+  MP4Box: Mp4boxModule,
+): DemuxTrackRepresentation {
+  const evidence = sampleDescriptionEvidence(entry, codec, MP4Box);
+  return {
+    trackIndex,
+    packetOrdering: 'decode',
+    ...(timescale > 0 ? { timebase: { numerator: 1, denominator: timescale } } : {}),
+    framing: evidence.framing,
+    accessUnitGrouping: evidence.accessUnitGrouping,
+    parameterSetLocation: evidence.parameterSetLocation,
+    nativeCodecTag: evidence.nativeCodecTag,
+    ...(evidence.description ? { description: evidence.description.slice() } : {}),
+    ...(evidence.descriptionRecord ? { descriptionRecord: evidence.descriptionRecord } : {}),
+  };
+}
+
 function sampleEntryTypeFromTrack(
   file: Mp4ISOFile,
   trackId: number,
   rawCodec: string,
-): { sampleEntryType: string; descriptionBoxes: Mp4BoxKind[] } | null {
+): { sampleEntryType: string; descriptionBoxes: Mp4BoxKind[]; sampleEntries: BoxNode[] } | null {
   const entry = sampleEntryForTrack(file, trackId, rawCodec) ?? sampleEntryForTrack(file, trackId);
   const entryType = typeof entry?.type === 'string' && entry.type.length ? entry.type : rawCodec.split('.')[0];
   if (!entryType) return null;
   if (ENCRYPTED_ENTRY_TYPES.has(entryType.toLowerCase())) {
-    throw new NotApplicableError('mux', `protected sample entry '${entryType}' cannot be re-authored without decrypt`);
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'mux',
+      `protected sample entry '${entryType}' cannot be re-authored without decrypt`,
+      {},
+      'MP4BOX_PROTECTED_SAMPLE_ENTRY_UNSUPPORTED',
+    );
   }
+  const sampleEntries = sampleEntriesForTrack(file, trackId);
+  if (sampleEntries.length === 0) return null;
   return {
     sampleEntryType: entryType,
     descriptionBoxes: descriptionBoxesFromSampleEntry(entry),
+    sampleEntries,
   };
 }
 
-function rebasePreparedChunksToZero(chunks: Mp4boxPreparedChunk[]): void {
+function assertMuxSampleEntries(
+  entries: BoxNode[],
+  codec: string,
+  operation: 'mux' | 'remux',
+  tuple: Partial<ApplicabilityTupleSummary> = {},
+): void {
+  for (const entry of entries) {
+    const entryType = entry.type.toLowerCase();
+    if (ENCRYPTED_ENTRY_TYPES.has(entryType)) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        operation,
+        `protected sample entry '${entry.type}' cannot be copied without decrypt`,
+        tuple,
+        'MP4BOX_PROTECTED_SAMPLE_ENTRY_UNSUPPORTED',
+      );
+    }
+    if (canonicalCodec(entry.type) !== codec) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        operation,
+        `sample-entry change '${entry.type}' cannot be flattened into canonical codec '${codec}'`,
+        tuple,
+        'MP4BOX_MULTI_DESCRIPTION_CODEC_CHANGE_UNSUPPORTED',
+      );
+    }
+    const requiredConfig = codec === 'h264'
+      ? 'avcC'
+      : codec === 'hevc'
+        ? 'hvcC'
+        : codec === 'vp8' || codec === 'vp9'
+          ? 'vpcC'
+          : codec === 'av1'
+            ? 'av1C'
+            : undefined;
+    if (requiredConfig && !directBox(entry, requiredConfig)) {
+      // A declared sample entry missing its mandatory decoder record is malformed media, not an
+      // ordinary unsupported tuple. Keep it on the ERROR/FAIL path.
+      throw new Error(`${ENGINE_ID}: sample entry '${entry.type}' is missing required ${requiredConfig}`);
+    }
+  }
+}
+
+function preparedChunkOrigin(chunks: Mp4boxPreparedChunk[]): { originUs: number; originTicks: number } {
   let originUs = Infinity;
   let originTicks = Infinity;
   for (const chunk of chunks) {
-    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs);
+    originUs = Math.min(originUs, chunk.ptsUs, chunk.dtsUs ?? chunk.ptsUs);
     const timing = chunk.mp4boxTiming;
     if (timing) originTicks = Math.min(originTicks, timing.cts, timing.dts);
   }
+  return { originUs, originTicks };
+}
+
+function rebasePreparedChunksToZero(chunks: Mp4boxPreparedChunk[]): { originUs: number; originTicks: number } {
+  const { originUs, originTicks } = preparedChunkOrigin(chunks);
   if (Number.isFinite(originUs) && originUs !== 0) {
     for (const chunk of chunks) {
       chunk.ptsUs -= originUs;
-      chunk.dtsUs -= originUs;
+      if (chunk.dtsUs !== undefined) chunk.dtsUs -= originUs;
     }
   }
   if (Number.isFinite(originTicks) && originTicks !== 0) {
@@ -544,6 +941,24 @@ function rebasePreparedChunksToZero(chunks: Mp4boxPreparedChunk[]): void {
       timing.dts -= originTicks;
     }
   }
+  return { originUs, originTicks };
+}
+
+function preserveSelectedPresentationTimeline(selected: PreparedMuxTrackCandidate[]): void {
+  const origins = selected.map((candidate) => preparedChunkOrigin(candidate.track.chunks));
+  const finiteOrigins = origins.map((origin) => origin.originUs).filter(Number.isFinite);
+  const commonOriginUs = finiteOrigins.length ? Math.min(...finiteOrigins) : 0;
+  selected.forEach((candidate, index) => {
+    const info = candidate.track.mp4boxMux;
+    if (!info) return;
+    const origin = rebasePreparedChunksToZero(candidate.track.chunks);
+    info.mediaOriginTicks = Number.isFinite(origin.originTicks) ? origin.originTicks : 0;
+    // Existing edits already define presentation mapping. Otherwise author an empty edit equal to
+    // this track's offset from the common selected-track origin.
+    info.presentationOffsetUs = info.edits.length === 0 && Number.isFinite(origins[index]?.originUs)
+      ? Math.max(0, origins[index]!.originUs - commonOriginUs)
+      : 0;
+  });
 }
 
 function selectPreparedMuxTracks(
@@ -594,7 +1009,11 @@ function usToTrackTicks(us: number, timescale: number, minimum = 0): number {
 function trackDurationUs(track: EncodedTracks['tracks'][number]): number {
   let endUs = 0;
   for (const chunk of track.chunks) {
-    endUs = Math.max(endUs, chunk.ptsUs + chunk.durationUs, chunk.dtsUs + chunk.durationUs);
+    endUs = Math.max(
+      endUs,
+      chunk.ptsUs + chunk.durationUs,
+      (chunk.dtsUs ?? chunk.ptsUs) + chunk.durationUs,
+    );
   }
   return endUs;
 }
@@ -604,7 +1023,8 @@ function sampleTimingForChunk(chunk: Mp4boxPreparedChunk, timescale: number): Mp
   if (timing) return timing;
   return {
     cts: usToTrackTicks(chunk.ptsUs, timescale),
-    dts: usToTrackTicks(chunk.dtsUs, timescale),
+    // MP4Box requires a scheduling DTS; fall back locally without claiming observed DTS evidence.
+    dts: usToTrackTicks(chunk.dtsUs ?? chunk.ptsUs, timescale),
     duration: usToTrackTicks(chunk.durationUs, timescale, 1),
   };
 }
@@ -615,6 +1035,200 @@ function streamToBytes(stream: Mp4boxDataStream): Uint8Array {
   return new Uint8Array(buffer.slice(0, byteLength));
 }
 
+function installSampleEntries(file: Mp4ISOFile, trackId: number, entries: BoxNode[]): void {
+  const outputTrack = file.getTrackById(trackId);
+  const stsd = outputTrack?.mdia?.minf?.stbl?.stsd;
+  if (!stsd) throw new Error(`${ENGINE_ID}: output track ${trackId} has no stsd`);
+  stsd.entries = entries as never;
+}
+
+function authorPresentationEdits(
+  MP4Box: Mp4boxModule,
+  file: Mp4ISOFile,
+  trackId: number,
+  info: Mp4boxMuxInfo,
+  movieTimescale: number,
+  mediaDurationTicks: number,
+  tuple: Partial<ApplicabilityTupleSummary>,
+): void {
+  const entries: Mp4Edit[] = [];
+  if (info.edits.length > 0) {
+    for (const edit of info.edits) {
+      if (!((edit.mediaRateInteger === 1 && edit.mediaRateFraction === 0) || edit.mediaTime === -1)) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          'only rate-one and empty edit-list entries can be preserved',
+          tuple,
+          'MP4BOX_EDIT_RATE_UNSUPPORTED',
+        );
+      }
+      const mediaTime = edit.mediaTime < 0 ? -1 : edit.mediaTime - info.mediaOriginTicks;
+      if (mediaTime < -1) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          'edit media_time would become negative after writer timeline normalization',
+          tuple,
+          'MP4BOX_EDIT_TIMELINE_UNREPRESENTABLE',
+        );
+      }
+      entries.push({
+        segmentDuration: Math.max(0, Math.round(edit.segmentDuration * movieTimescale / Math.max(1, info.movieTimescale))),
+        mediaTime,
+        mediaRateInteger: edit.mediaRateInteger,
+        mediaRateFraction: edit.mediaRateFraction,
+      });
+    }
+  } else if (info.presentationOffsetUs > 0) {
+    entries.push({
+      segmentDuration: Math.round(info.presentationOffsetUs * movieTimescale / 1_000_000),
+      mediaTime: -1,
+      mediaRateInteger: 1,
+      mediaRateFraction: 0,
+    });
+    entries.push({
+      segmentDuration: Math.round(mediaDurationTicks * movieTimescale / Math.max(1, file.getTrackById(trackId)?.mdia?.mdhd?.timescale ?? 1)),
+      mediaTime: 0,
+      mediaRateInteger: 1,
+      mediaRateFraction: 0,
+    });
+  }
+  if (entries.length === 0) return;
+
+  const track = file.getTrackById(trackId);
+  if (!track) throw new Error(`${ENGINE_ID}: output track ${trackId} disappeared before edit authoring`);
+  // mp4box 2.3.0 registers edts/elst internally but intentionally does not export their constructors.
+  // Build the two boxes on the public Box/FullBox writer surface instead of reaching through an
+  // unstable private registry. Keeping the writer local also makes the exact edit payload auditable.
+  const edts = new MP4Box.Box();
+  edts.type = 'edts';
+  edts.boxes = [];
+  edts.write = (stream) => {
+    edts.size = 0;
+    edts.writeHeader(stream);
+    for (const child of edts.boxes ?? []) {
+      child.write(stream);
+      edts.size += child.size;
+    }
+    if (edts.sizePosition === undefined) throw new Error(`${ENGINE_ID}: edts writer omitted its size field`);
+    stream.adjustUint32(edts.sizePosition, edts.size);
+  };
+  const elst = new MP4Box.FullBox() as import('mp4box').FullBox & {
+    entries: Array<{
+      segment_duration: number;
+      media_time: number;
+      media_rate_integer: number;
+      media_rate_fraction: number;
+    }>;
+  };
+  elst.type = 'elst';
+  elst.version = entries.some((entry) => entry.segmentDuration > 0xffff_ffff || entry.mediaTime > 0x7fff_ffff) ? 1 : 0;
+  elst.flags = 0;
+  elst.entries = entries.map((entry) => ({
+    segment_duration: entry.segmentDuration,
+    media_time: entry.mediaTime,
+    media_rate_integer: entry.mediaRateInteger,
+    media_rate_fraction: entry.mediaRateFraction,
+  }));
+  elst.write = (stream) => {
+    const version1 = elst.version === 1
+      || elst.entries.some((entry) => entry.segment_duration > 0xffff_ffff || entry.media_time > 0x7fff_ffff);
+    elst.version = version1 ? 1 : 0;
+    elst.size = 4 + elst.entries.length * (version1 ? 20 : 12);
+    // mp4box's FullBox declaration narrows this to MultiBufferStream although the package's own
+    // writers pass DataStream here; runtime FullBox.writeHeader only needs the shared write API.
+    elst.writeHeader(stream as never);
+    stream.writeUint32(elst.entries.length);
+    for (const entry of elst.entries) {
+      if (version1) {
+        stream.writeUint64(entry.segment_duration);
+        stream.writeInt64(entry.media_time);
+      } else {
+        stream.writeUint32(entry.segment_duration);
+        stream.writeInt32(entry.media_time);
+      }
+      stream.writeInt16(entry.media_rate_integer);
+      stream.writeInt16(entry.media_rate_fraction);
+    }
+  };
+  edts.addBox(elst);
+  track.addBox(edts as never);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason ?? new DOMException('Operation aborted', 'AbortError');
+}
+
+async function raceAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  return await new Promise<T>((resolve, reject) => {
+    const aborted = (): void => reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError'));
+    signal.addEventListener('abort', aborted, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', aborted);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', aborted);
+        reject(error);
+      },
+    );
+  });
+}
+
+interface ReadRange {
+  start: number;
+  end: number;
+}
+
+/** Return a non-overlapping Blob window at/after MP4Box's requested absolute offset. */
+function nextUnreadWindow(
+  requestedOffset: number,
+  size: number,
+  ranges: readonly ReadRange[],
+): ReadRange | undefined {
+  let start = Math.max(0, Math.min(size, Math.trunc(requestedOffset)));
+  const ordered = [...ranges].sort((a, b) => a.start - b.start);
+  for (const range of ordered) {
+    if (start >= range.start && start < range.end) start = range.end;
+    if (start < range.start) {
+      return { start, end: Math.min(size, start + READ_CHUNK_BYTES, range.start) };
+    }
+  }
+  return start < size ? { start, end: Math.min(size, start + READ_CHUNK_BYTES) } : undefined;
+}
+
+function firstUnreadWindow(size: number, ranges: readonly ReadRange[]): ReadRange | undefined {
+  return nextUnreadWindow(0, size, ranges);
+}
+
+function fallbackRequest(
+  operation: Operation,
+  inputs: MediaInput[] = [],
+  outputContainer?: string,
+  options: Readonly<Record<string, unknown>> = {},
+): ConcreteOperationRequest {
+  return {
+    protocol: CONCRETE_OPERATION_PROTOCOL,
+    scenarioId: `mp4box/fallback-${operation}`,
+    operation,
+    inputs: inputs.map((input) => ({
+      id: input.id,
+      mime: input.mime,
+      container: 'mp4',
+      ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+      mutated: input.mutated === true,
+      sourceEvidence: 'UNRESOLVED',
+      tracks: [],
+    })),
+    ...(outputContainer ? { output: { container: outputContainer } } : {}),
+    options: outputContainer ? { ...options, container: outputContainer } : options,
+  };
+}
+
 /**
  * mp4box.js engine (2.3.0): probe + demux + remux-to-fragmented-MP4 for the ISO-BMFF family.
  * Pure-JS — init() only dynamically imports the lib (UNTIMED); there is no WASM/Worker to spin up.
@@ -623,9 +1237,16 @@ export class Mp4boxEngine implements MediaEngine {
   readonly id = ENGINE_ID;
 
   private mp4box: Mp4boxModule | null = null;
+  private readonly lifecycle = new AdapterLifecycleController(ENGINE_ID);
+  private readonly fallbackAbort = new AbortController();
+  private readonly activeFiles = new Set<Mp4ISOFile>();
+  private configState = freshConfigState();
+  private operationStartedAt = 0;
 
   /** The best-path config chosen; recorded per §8.5 / surfaced to the harness. */
-  readonly configUsed = CONFIG_USED;
+  get configUsed(): object {
+    return captureConfigUsedSnapshot(ENGINE_ID, this.configState, { requireProfile: true });
+  }
 
   capabilities(): CapabilitySet {
     return {
@@ -642,12 +1263,16 @@ export class Mp4boxEngine implements MediaEngine {
       },
       // ISO-BMFF only. 'mov' shares the box structure; fragmented-MP4/CMAF are the same family,
       // surfaced via the 'fragmented' feature, not a separate container token.
-      containersIn: ['mp4', 'mov'],
+      containersIn: [...MP4BOX_INPUT_CONTAINERS],
       // Remux writes FRAGMENTED MP4 (fMP4/CMAF), container token 'mp4'.
-      containersOut: ['mp4'],
+      containersOut: [...MP4BOX_OUTPUT_CONTAINERS],
       // Codecs mp4box can IDENTIFY / DEMUX from the sample table (it does not decode/encode them).
-      videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
-      audioCodecs: ['aac', 'opus', 'mp3', 'flac'],
+      videoCodecs: [...MP4BOX_VIDEO_CODECS],
+      audioCodecs: [...MP4BOX_AUDIO_CODECS],
+      videoCodecsIn: [...MP4BOX_VIDEO_CODECS],
+      audioCodecsIn: [...MP4BOX_AUDIO_CODECS],
+      videoCodecsOut: [...MP4BOX_VIDEO_CODECS],
+      audioCodecsOut: [...MP4BOX_AUDIO_CODECS],
       // Parses CENC signalling (pssh/senc/...) but does NOT decrypt → declare none.
       encryption: [],
       // 'fragmented'        : remux produces fMP4/CMAF.
@@ -656,7 +1281,6 @@ export class Mp4boxEngine implements MediaEngine {
       //                       derives video fps from fragment_duration for fragmented inputs.
       // 'metadata:protected-tracks': CENC protected sample entries are unwrapped for track metadata.
       // 'mux:vfr-timestamps': prepareMuxTracks preserves exact MP4 sample cts/dts/duration ticks.
-      // 'webcodecs:demux-feed': demux output feeds WebCodecs EncodedVideoChunk/description.
       // 'webcodecs:independent': probe/demux/remux are pure-JS and never touch the browser codec
       //                          gate, so the runner must not browser-gate them on codec availability.
       features: [
@@ -675,23 +1299,77 @@ export class Mp4boxEngine implements MediaEngine {
         // (reading 'fragment_duration')" — mp4box cannot re-fragment a file it already fragmented. So
         // double-remux stability is a GENUINE NA for this engine and stays undeclared.
         'mux:roundtrip-compare',
-        'webcodecs:demux-feed',
         'webcodecs:independent',
       ],
+      probeReadModes: ['progressive'],
     };
   }
 
-  /** UNTIMED (§0.7): dynamically import the (pure-JS) lib. No WASM/Worker/encoder warmup needed. */
-  async init(): Promise<void> {
-    if (!this.mp4box) {
-      this.mp4box = await import('mp4box');
-    }
+  supports(request: ConcreteOperationRequest) {
+    return decideMp4boxSupport(request);
   }
 
-  async dispose(): Promise<void> {
-    // Pure-JS, no global resources/workers held between operations; drop the module handle so a fresh
-    // engine per Worker/iter starts clean for peak-memory accounting.
-    this.mp4box = null;
+  /** UNTIMED (§0.7): dynamically import the (pure-JS) lib. No WASM/Worker/encoder warmup needed. */
+  async init(context?: LifecycleContext): Promise<void> {
+    const call = context ?? this.fallbackLifecycle('support');
+    await this.lifecycle.init(call, async () => {
+      if (!this.mp4box) this.mp4box = await import('mp4box');
+    });
+  }
+
+  async dispose(context?: LifecycleContext): Promise<void> {
+    const call = context ?? this.fallbackLifecycle('cleanup');
+    await this.lifecycle.dispose(call, () => {
+      for (const file of this.activeFiles) {
+        try {
+          file.stop();
+        } catch {
+          // Per-operation cleanup already records stop errors; disposal is an idempotent last resort.
+        }
+      }
+      this.activeFiles.clear();
+      this.mp4box = null;
+      this.configState = { ...this.configState, activeFiles: 0, cleanupComplete: true };
+    });
+  }
+
+  private fallbackLifecycle(phase: LifecycleContext['phase']): LifecycleContext {
+    return { signal: this.fallbackAbort.signal, phase, emit: () => undefined };
+  }
+
+  private fallbackOperation(
+    operation: Operation,
+    inputs: MediaInput[] = [],
+    outputContainer?: string,
+    options: Readonly<Record<string, unknown>> = {},
+  ): OperationContext {
+    return {
+      ...this.fallbackLifecycle('functional'),
+      checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+      request: fallbackRequest(operation, inputs, outputContainer, options),
+    };
+  }
+
+  private beginOperation(operation: Operation, keepMdatData: boolean): void {
+    this.operationStartedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this.configState = {
+      ...freshConfigState(),
+      operation,
+      keepMdatData,
+      writerMode: operation === 'remux' || operation === 'mux' ? 'fragmented-mp4' : 'none',
+      targetMode: operation === 'remux' || operation === 'mux' ? 'buffer' : 'none',
+      cleanupComplete: false,
+    };
+  }
+
+  private elapsedMs(): number {
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    return Math.max(0, now - this.operationStartedAt);
+  }
+
+  private assertSupported(context: OperationContext): void {
+    const decision = decideMp4boxSupport(context.request);
+    if (!decision.supported) throw mp4boxDecisionError(context.request, decision);
   }
 
   private lib(): Mp4boxModule {
@@ -705,54 +1383,155 @@ export class Mp4boxEngine implements MediaEngine {
   }
 
   /**
-   * Drive an ISOFile to its onReady/onError resolution by appending the whole file then flush()ing.
+   * Drive an ISOFile to completion with Blob slices at MP4Box's requested absolute byte offsets.
    * `keepMdatData` MUST be true for demux/remux (else discardMdatData drops media and no samples are
    * produced); probe leaves it false (moov-only, minimal memory). 2.x onError takes (module, message).
    */
-  private parseToInfo(
-    bytes: ArrayBuffer,
+  private async parseToInfo(
+    input: MediaInput,
     keepMdatData: boolean,
-  ): Promise<{ file: Mp4ISOFile; info: Mp4Movie }> {
+    context: OperationContext,
+    onReady?: ParsedReadyHook,
+  ): Promise<ParsedSession> {
     const MP4Box = this.lib();
-    return new Promise((resolve, reject) => {
-      const file = MP4Box.createFile(keepMdatData);
-      let settled = false;
-      file.onError = (module: string, message: string) => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`mp4box parse error [${module}]: ${message}`));
-      };
-      file.onReady = (info: Mp4Movie) => {
-        if (settled) return;
-        settled = true;
-        resolve({ file, info });
-      };
+    const file = MP4Box.createFile(keepMdatData);
+    this.activeFiles.add(file);
+    this.configState = { ...this.configState, activeFiles: this.activeFiles.size };
+    let info: Mp4Movie | undefined;
+    let operationError: unknown;
+    let closed = false;
+    let stopped = false;
+    let stopError: unknown;
+    file.onError = (module: string, message: string) => {
+      operationError ??= new Error(`mp4box parse/processing error [${module}]: ${message}`);
+      this.configState = { ...this.configState, lateErrorObserved: info !== undefined };
+    };
+    file.onReady = (ready: Mp4Movie) => {
+      info = ready;
+      if (!onReady) return;
       try {
-        file.appendBuffer(this.makeBuffer(bytes, 0));
-        file.flush();
-      } catch (e) {
-        if (!settled) {
-          settled = true;
-          reject(e instanceof Error ? e : new Error(String(e)));
-        }
-        return;
+        onReady(file, ready, () => {
+          throwIfAborted(context.signal);
+          if (operationError !== undefined) throw operationError;
+        });
+      } catch (error) {
+        operationError ??= error;
       }
-      // Neither onReady nor onError fired → no moov was parsed (truncated / not ISO-BMFF).
-      if (!settled) {
-        settled = true;
-        reject(new Error('mp4box: moov not found (not an ISO-BMFF/MP4 file, or moov truncated)'));
+    };
+    const stopFile = (): void => {
+      if (stopped) return;
+      stopped = true;
+      try {
+        file.stop();
+        this.configState = { ...this.configState, stopCalled: true };
+      } catch (error) {
+        stopError ??= error;
       }
-    });
+    };
+    const abort = (): void => stopFile();
+    if (context.signal.aborted) abort();
+    else context.signal.addEventListener('abort', abort, { once: true });
+
+    const close = (primaryError?: unknown): void => {
+      if (closed) return;
+      closed = true;
+      context.signal.removeEventListener('abort', abort);
+      stopFile();
+      file.onReady = undefined;
+      file.onSamples = undefined;
+      file.onSegment = undefined;
+      file.onError = undefined;
+      this.activeFiles.delete(file);
+      this.configState = {
+        ...this.configState,
+        activeFiles: this.activeFiles.size,
+        cleanupComplete: this.activeFiles.size === 0,
+      };
+      if (primaryError === undefined && stopError !== undefined) throw stopError;
+    };
+
+    try {
+      throwIfAborted(context.signal);
+      const blob = await raceAbort(input.blob(), context.signal);
+      let readBytes = this.configState.inputBytes;
+      const ranges: ReadRange[] = [];
+      let window = firstUnreadWindow(blob.size, ranges);
+      let iterations = 0;
+      while (window) {
+        if (++iterations > 1_000_000) throw new Error(`${ENGINE_ID}: progressive reader made no forward progress`);
+        throwIfAborted(context.signal);
+        const chunk = await raceAbort(blob.slice(window.start, window.end).arrayBuffer(), context.signal);
+        throwIfAborted(context.signal);
+        const nextOffset = file.appendBuffer(this.makeBuffer(chunk, window.start), false);
+        ranges.push(window);
+        readBytes += chunk.byteLength;
+        this.configState = {
+          ...this.configState,
+          inputBytes: readBytes,
+          appendCount: this.configState.appendCount + 1,
+          peakParserSampleBytes: Math.max(this.configState.peakParserSampleBytes, file.samplesDataSize ?? 0),
+        };
+        context.emit({ type: 'bytes-read', atMs: this.elapsedMs(), bytes: readBytes });
+        if (operationError !== undefined) throw operationError;
+        // Probe needs the complete moov, not the media payload. Sample consumers install their
+        // callbacks synchronously from onReady and follow MP4Box's requested absolute byte ranges.
+        if (info && !onReady && !keepMdatData) break;
+        if (Number.isFinite(nextOffset) && nextOffset >= blob.size) break;
+        window = Number.isFinite(nextOffset)
+          ? nextUnreadWindow(nextOffset, blob.size, ranges)
+          : undefined;
+        // Without a usable seek hint, keep scanning unread gaps until a moov is found so malformed
+        // media reaches the ordinary error path rather than masquerading as engine inapplicability.
+        if (!window && !info) window = firstUnreadWindow(blob.size, ranges);
+      }
+      file.flush();
+      throwIfAborted(context.signal);
+      if (operationError !== undefined) throw operationError;
+      if (!info) throw new Error('mp4box: moov not found (not an ISO-BMFF/MP4 file, or moov truncated)');
+      return {
+        file,
+        info,
+        throwIfError: () => {
+          throwIfAborted(context.signal);
+          if (operationError !== undefined) throw operationError;
+        },
+        close,
+      };
+    } catch (error) {
+      close(error);
+      throw error;
+    }
   }
 
   // ── probe ──────────────────────────────────────────────────────────────────────────────────
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    const bytes = await input.arrayBuffer();
-    // moov-only: discard mdat (createFile()/keepMdatData=false) for minimal peak memory. We still
-    // need the parsed `file` to resolve CENC `encv`/`enca` → original codec via frma.data_format
-    // (the OriginalFormatBox lives in the moov's stsd, so it is present even with mdat discarded).
-    const { file, info } = await this.parseToInfo(bytes, false);
-    return toNormalizedMetadata(file, info);
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    const call = context ?? this.fallbackOperation('probe', [input]);
+    return this.lifecycle.operation('probe', call, async () => {
+      this.beginOperation('probe', false);
+      this.assertSupported(call);
+      const session = await this.parseToInfo(input, false, call);
+      let primaryError: unknown;
+      try {
+        session.throwIfError();
+        const metadata = toNormalizedMetadata(session.file, session.info);
+        this.configState = {
+          ...this.configState,
+          codecConfigs: metadata.tracks.map((track, trackIndex) => ({
+            trackIndex,
+            codec: track.codec,
+            nativeCodecTag: track.nativeCodecTag ?? null,
+          })),
+        };
+        metadata.telemetry = { bytesRead: this.configState.inputBytes };
+        metadata.probeEvidence = { readMode: 'progressive' };
+        return validateAdapterResult(ENGINE_ID, 'probe', metadata);
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        session.close(primaryError);
+      }
+    });
   }
 
   // ── demux ──────────────────────────────────────────────────────────────────────────────────
@@ -762,185 +1541,478 @@ export class Mp4boxEngine implements MediaEngine {
    * observable through cts != dts). keepMdatData=true so samples carry data; we read only the scalar
    * fields we need and release sample memory as we go.
    */
-  async demux(input: MediaInput): Promise<DemuxResult> {
-    const bytes = await input.arrayBuffer();
-    const { file, info } = await this.parseToInfo(bytes, true);
-    const metadata = toNormalizedMetadata(file, info);
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    const call = context ?? this.fallbackOperation('demux', [input]);
+    return this.lifecycle.operation('demux', call, async () => {
+      this.beginOperation('demux', true);
+      this.assertSupported(call);
+      const packets: PacketInfo[] = [];
+      const extractedCounts = new Map<number, number>();
+      const idToIndex = new Map<number, number>();
+      let readyMetadata: NormalizedMetadata | undefined;
+      let ownedPacketBytes = 0;
+      const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
+        readyMetadata = toNormalizedMetadata(readyFile, readyInfo);
+        readyInfo.tracks.forEach((track, index) => idToIndex.set(track.id, index));
+        readyFile.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
+          throwIfError();
+          const trackIndex = idToIndex.get(id);
+          if (trackIndex === undefined) throw new Error(`${ENGINE_ID}: samples emitted for unknown track ${id}`);
+          const normalized = readyMetadata?.tracks[trackIndex];
+          if (!normalized) throw new Error(`${ENGINE_ID}: missing track evidence for ${id}`);
+          const entries = sampleEntriesForTrack(readyFile, id);
+          for (const sample of samples) {
+            if (!sample.data || sample.data.byteLength !== sample.size) {
+              throw new Error(`${ENGINE_ID}: track ${id} sample ${sample.number} has incomplete mdat payload`);
+            }
+            const entry = (sample.description as unknown as BoxNode | undefined)
+              ?? entries[sample.description_index]
+              ?? entries[0];
+            const packet = mp4boxSampleEvidence(
+              sample,
+              trackIndex,
+              normalized.type,
+              normalized.codec,
+              sampleDescriptionEvidence(entry, normalized.codec, this.lib()),
+            );
+            packets.push(packet);
+            ownedPacketBytes += packet.payload?.byteLength ?? 0;
+          }
+          extractedCounts.set(id, (extractedCounts.get(id) ?? 0) + samples.length);
+          const parserBytesBeforeRelease = readyFile.samplesDataSize ?? 0;
+          const last = samples[samples.length - 1];
+          if (last) readyFile.releaseUsedSamples(id, last.number + 1);
+          this.configState = {
+            ...this.configState,
+            releasedSamples: this.configState.releasedSamples + samples.length,
+            peakParserSampleBytes: Math.max(this.configState.peakParserSampleBytes, parserBytesBeforeRelease),
+            peakOwnedSampleBytes: Math.max(this.configState.peakOwnedSampleBytes, ownedPacketBytes),
+          };
+        };
+        for (const track of readyInfo.tracks) {
+          // Fragmented getInfo() counts are only an onReady snapshot. Configure all declared tracks
+          // now and prove non-zero/exact completion against the final sample list below.
+          readyFile.setExtractionOptions(track.id, null, { nbSamples: PROCESS_BATCH_SAMPLES });
+        }
+        readyFile.start();
+      });
+      const { file, info } = session;
+      let primaryError: unknown;
+      try {
+        session.throwIfError();
+        for (const track of info.tracks) {
+          const expected = trackSampleCount(file, track);
+          if ((extractedCounts.get(track.id) ?? 0) !== expected) {
+            throw new Error(`${ENGINE_ID}: incomplete extraction for track ${track.id}: ${extractedCounts.get(track.id) ?? 0}/${expected}`);
+          }
+        }
 
-    // mp4box track id → index in info.tracks, so PacketInfo.trackIndex indexes NormalizedMetadata.tracks.
-    const idToIndex = new Map<number, number>();
-    info.tracks.forEach((t, i) => idToIndex.set(t.id, i));
-
-    const packets: PacketInfo[] = [];
-
-    file.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
-      const trackIndex = idToIndex.get(id) ?? -1;
-      for (const s of samples) {
-        const ts = s.timescale > 0 ? s.timescale : 1;
-        packets.push({
-          trackIndex,
-          size: s.size,
-          ptsUs: Math.round((s.cts / ts) * 1_000_000),
-          dtsUs: Math.round((s.dts / ts) * 1_000_000),
-          keyframe: !!s.is_sync,
-        });
+        packets.sort(
+          (a, b) => (a.dtsUs ?? a.ptsUs) - (b.dtsUs ?? b.ptsUs) || a.trackIndex - b.trackIndex,
+        );
+        const metadata = toNormalizedMetadata(file, info);
+        const representations = info.tracks.map((track, index) => trackRepresentation(
+          index,
+          metadata.tracks[index]?.codec ?? canonicalCodec(track.codec),
+          sampleEntriesForTrack(file, track.id)[0],
+          track.timescale,
+          this.lib(),
+        ));
+        this.configState = {
+          ...this.configState,
+          codecConfigs: representations.map((representation) => ({
+            trackIndex: representation.trackIndex,
+            codec: metadata.tracks[representation.trackIndex]?.codec ?? 'unknown',
+            framing: representation.framing,
+            descriptionBytes: representation.description?.byteLength ?? 0,
+          })),
+        };
+        const telemetry = { bytesRead: this.configState.inputBytes, packetCount: packets.length };
+        metadata.telemetry = telemetry;
+        return validateAdapterResult(ENGINE_ID, 'demux', {
+          metadata,
+          packets,
+          packetOrdering: 'decode',
+          representations,
+          telemetry,
+        }, { requireExplicitCodedRepresentation: true });
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        for (const track of info.tracks) {
+          try {
+            file.unsetExtractionOptions(track.id);
+          } catch {
+            // stop()/session cleanup is authoritative; an unset diagnostic must not mask the result.
+          }
+        }
+        session.close(primaryError);
       }
-      // Free decoded sample memory once scalars are copied (we keep no `data`).
-      const last = samples.length ? samples[samples.length - 1] : undefined;
-      if (last) file.releaseUsedSamples(id, last.number + 1);
-    };
-
-    // Extract every track; large nbSamples keeps callback overhead low (mp4box still chunks at EOF).
-    for (const t of info.tracks) {
-      file.setExtractionOptions(t.id, null, { nbSamples: 100_000 });
-    }
-    file.start();
-    file.flush(); // synchronous for whole-file input: drives processSamples to completion
-    file.stop();
-
-    // Stable, engine-independent global decode order: dts then trackIndex.
-    packets.sort((a, b) => a.dtsUs - b.dtsUs || a.trackIndex - b.trackIndex);
-    return { metadata, packets };
+    });
   }
 
-  async prepareMuxTracks(inputs: MediaInput[], options?: Record<string, unknown>): Promise<EncodedTracks> {
-    const candidates: PreparedMuxTrackCandidate[] = [];
+  async prepareMuxTracks(
+    inputs: MediaInput[],
+    options?: Record<string, unknown>,
+    context?: OperationContext,
+  ): Promise<EncodedTracks> {
+    const outputContainer = typeof options?.container === 'string' ? options.container : 'mp4';
+    const call = context ?? this.fallbackOperation('mux', inputs, outputContainer, options);
+    return this.lifecycle.operation('prepareMuxTracks', call, async () => {
+      this.beginOperation('mux', true);
+      this.assertSupported(call);
+      if (inputs.length === 0) throw new Error(`${ENGINE_ID}: mux preparation requires at least one input`);
+      const candidates: PreparedMuxTrackCandidate[] = [];
 
-    for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
-      const input = inputs[inputIndex];
-      if (!input) continue;
-      const bytes = await input.arrayBuffer();
-      const { file, info } = await this.parseToInfo(bytes, true);
-      const metadata = toNormalizedMetadata(file, info);
-      const collectedByTrack = new Map<number, CollectedSample[]>();
-      const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
-
-      file.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
-        let collected = collectedByTrack.get(id);
-        if (!collected) {
-          collected = [];
-          collectedByTrack.set(id, collected);
-        }
-        for (const s of samples) {
-          if (!s.data || s.data.byteLength === 0) continue;
-          collected.push({
-            data: copyBytes(s.data),
-            duration: s.duration,
-            cts: s.cts,
-            dts: s.dts,
-            timescale: s.timescale > 0 ? s.timescale : 1,
-            isSync: !!s.is_sync,
-            number: s.number,
-            size: s.size,
+      for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
+        const input = inputs[inputIndex];
+        if (!input) continue;
+        const collectedByTrack = new Map<number, CollectedSample[]>();
+        const extractedCounts = new Map<number, number>();
+        let ownedBytes = candidates.reduce(
+          (sum, candidate) => sum + candidate.track.chunks.reduce((trackSum, chunk) => trackSum + chunk.data.byteLength, 0),
+          0,
+        );
+        const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
+          const mediaTracks = readyInfo.tracks.filter((track) => {
+            const type = trackType(track);
+            return type === 'video' || type === 'audio';
           });
+          if (mediaTracks.length === 0) throw new Error(`${ENGINE_ID}: parsed ISO BMFF contains no audio/video tracks`);
+          readyFile.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
+            throwIfError();
+            let collected = collectedByTrack.get(id);
+            if (!collected) {
+              collected = [];
+              collectedByTrack.set(id, collected);
+            }
+            for (const sample of samples) {
+              if (!sample.data || sample.data.byteLength !== sample.size) {
+                throw new Error(`${ENGINE_ID}: track ${id} sample ${sample.number} has incomplete mdat payload`);
+              }
+              const data = copyBytes(sample.data);
+              ownedBytes += data.byteLength;
+              collected.push({
+                data,
+                duration: sample.duration,
+                cts: sample.cts,
+                dts: sample.dts,
+                timescale: sample.timescale > 0 ? sample.timescale : 1,
+                isSync: !!sample.is_sync,
+                number: sample.number,
+                size: sample.size,
+                descriptionIndex: sample.description_index,
+              });
+            }
+            extractedCounts.set(id, (extractedCounts.get(id) ?? 0) + samples.length);
+            const parserBytesBeforeRelease = readyFile.samplesDataSize ?? 0;
+            const last = samples[samples.length - 1];
+            if (last) readyFile.releaseUsedSamples(id, last.number + 1);
+            this.configState = {
+              ...this.configState,
+              releasedSamples: this.configState.releasedSamples + samples.length,
+              peakOwnedSampleBytes: Math.max(this.configState.peakOwnedSampleBytes, ownedBytes),
+              peakParserSampleBytes: Math.max(this.configState.peakParserSampleBytes, parserBytesBeforeRelease),
+            };
+          };
+          for (const track of mediaTracks) {
+            readyFile.setExtractionOptions(track.id, null, { nbSamples: PROCESS_BATCH_SAMPLES });
+          }
+          readyFile.start();
+        });
+        const { file, info } = session;
+        let primaryError: unknown;
+        try {
+          const metadata = toNormalizedMetadata(file, info);
+          const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
+
+          const mediaTracks = info.tracks.filter((track) => {
+            const type = trackType(track);
+            return type === 'video' || type === 'audio';
+          });
+          if (mediaTracks.length === 0) throw new Error(`${ENGINE_ID}: parsed ISO BMFF contains no audio/video tracks`);
+          for (const track of mediaTracks) {
+            if (trackSampleCount(file, track) === 0) throw new Error(`${ENGINE_ID}: media track ${track.id} contains zero samples`);
+          }
+          session.throwIfError();
+          for (const track of mediaTracks) {
+            if ((extractedCounts.get(track.id) ?? 0) !== trackSampleCount(file, track)) {
+              throw new Error(`${ENGINE_ID}: incomplete mux extraction for track ${track.id}`);
+            }
+          }
+
+          for (let trackIndex = 0; trackIndex < info.tracks.length; trackIndex++) {
+            const source = info.tracks[trackIndex]!;
+            const type = trackType(source);
+            if (type !== 'video' && type !== 'audio') continue;
+            const typeOrdinal = typeCounts[type]++;
+            const rawCodec = unwrapEncryptedCodec(file, source.id, source.codec) ?? source.codec;
+            const normalized = metadata.tracks[trackIndex];
+            const codec = normalized?.codec ?? canonicalCodec(rawCodec);
+            const sampleEntry = sampleEntryTypeFromTrack(file, source.id, rawCodec);
+            if (!sampleEntry) {
+              throw createNotApplicableError(
+                ENGINE_ID,
+                'mux',
+                `cannot resolve sample entry for track ${source.id} (${rawCodec})`,
+                mp4boxTupleSummary(call.request),
+                'MP4BOX_SAMPLE_ENTRY_UNSUPPORTED',
+              );
+            }
+            assertMuxSampleEntries(sampleEntry.sampleEntries, codec, 'mux', mp4boxTupleSummary(call.request));
+
+            const samples = collectedByTrack.get(source.id) ?? [];
+            if (samples.length === 0) throw new Error(`${ENGINE_ID}: media track ${source.id} emitted no samples`);
+            samples.sort((a, b) => a.dts - b.dts || a.number - b.number);
+            const timescale = source.timescale > 0 ? source.timescale : (samples[0]?.timescale ?? 1_000_000);
+            const chunks: Mp4boxPreparedChunk[] = samples.map((sample, decodeIndex) => {
+              if (sample.descriptionIndex < 0 || sample.descriptionIndex >= sampleEntry.sampleEntries.length) {
+                throw new Error(`${ENGINE_ID}: sample ${sample.number} references missing description ${sample.descriptionIndex}`);
+              }
+              return {
+                data: sample.data,
+                ptsUs: (sample.cts * 1_000_000) / timescale,
+                dtsUs: (sample.dts * 1_000_000) / timescale,
+                decodeIndex,
+                durationUs: (sample.duration * 1_000_000) / timescale,
+                keyframe: sample.isSync,
+                sampleDescriptionIndex: sample.descriptionIndex,
+                mp4boxTiming: { cts: sample.cts, dts: sample.dts, duration: sample.duration },
+              };
+            });
+            const representation = sampleDescriptionEvidence(sampleEntry.sampleEntries[0], codec, this.lib());
+            const track: Mp4boxPreparedMuxTrack = {
+              type,
+              codec,
+              nativeCodecTag: rawCodec,
+              timescale,
+              timebase: { numerator: 1, denominator: timescale },
+              packetOrdering: 'decode',
+              framing: representation.framing,
+              accessUnitGrouping: representation.accessUnitGrouping,
+              parameterSetLocation: representation.parameterSetLocation,
+              ...(representation.description ? { description: representation.description.slice() } : {}),
+              ...(representation.descriptionRecord ? { descriptionRecord: representation.descriptionRecord } : {}),
+              ...(normalized?.width !== undefined ? { width: normalized.width } : {}),
+              ...(normalized?.height !== undefined ? { height: normalized.height } : {}),
+              ...(normalized?.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
+              ...(normalized?.channels !== undefined ? { channels: normalized.channels } : {}),
+              chunks,
+              mp4boxMux: {
+                source: 'mp4box',
+                sampleEntryType: sampleEntry.sampleEntryType,
+                descriptionBoxes: sampleEntry.descriptionBoxes,
+                sampleEntries: sampleEntry.sampleEntries,
+                edits: normalizedEdits(source),
+                movieTimescale: source.movie_timescale > 0 ? source.movie_timescale : info.timescale,
+                mediaOriginTicks: 0,
+                presentationOffsetUs: 0,
+              },
+            };
+            candidates.push({ inputIndex, type, typeOrdinal, track });
+          }
+        } catch (error) {
+          primaryError = error;
+          throw error;
+        } finally {
+          for (const track of info.tracks) {
+            try {
+              file.unsetExtractionOptions(track.id);
+            } catch {
+              // Session stop remains authoritative.
+            }
+          }
+          session.close(primaryError);
         }
-        const last = samples.length ? samples[samples.length - 1] : undefined;
-        if (last) file.releaseUsedSamples(id, last.number + 1);
+      }
+
+      const selected = selectPreparedMuxTracks(candidates, inputs.length, options);
+      if (selected.length === 0) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'prepareMuxTracks',
+          'the requested track selection resolves to no muxable tracks',
+          mp4boxTupleSummary(call.request),
+          'MP4BOX_TRACK_SELECTION_EMPTY',
+        );
+      }
+      preserveSelectedPresentationTimeline(selected);
+      this.configState = {
+        ...this.configState,
+        codecConfigs: selected.map((candidate, trackIndex) => ({
+          trackIndex,
+          codec: candidate.track.codec,
+          nativeCodecTag: candidate.track.nativeCodecTag ?? null,
+          framing: candidate.track.framing ?? null,
+          descriptionBytes: candidate.track.description?.byteLength ?? 0,
+        })),
       };
-
-      for (const t of info.tracks) {
-        const type = trackType(t);
-        if (type !== 'video' && type !== 'audio') continue;
-        file.setExtractionOptions(t.id, null, { nbSamples: 100_000 });
-      }
-      file.start();
-      file.flush();
-      file.stop();
-
-      for (let trackIndex = 0; trackIndex < info.tracks.length; trackIndex++) {
-        const t = info.tracks[trackIndex]!;
-        const type = trackType(t);
-        if (type !== 'video' && type !== 'audio') continue;
-        const typeOrdinal = typeCounts[type]++;
-        const rawCodec = unwrapEncryptedCodec(file, t.id, t.codec) ?? t.codec;
-        const normalized = metadata.tracks[trackIndex];
-        const codec = normalized?.codec ?? canonicalCodec(rawCodec);
-        const sampleEntry = sampleEntryTypeFromTrack(file, t.id, rawCodec);
-        if (!sampleEntry) {
-          throw new NotApplicableError('mux', `cannot resolve sample entry for track ${t.id} (${rawCodec})`);
-        }
-
-        const samples = collectedByTrack.get(t.id) ?? [];
-        if (samples.length === 0) continue;
-        samples.sort((a, b) => a.dts - b.dts || a.number - b.number);
-
-        const timescale = t.timescale > 0 ? t.timescale : (samples[0]?.timescale ?? 1_000_000);
-        const chunks: Mp4boxPreparedChunk[] = samples.map((s) => ({
-          data: s.data,
-          ptsUs: Math.round((s.cts / timescale) * 1_000_000),
-          dtsUs: Math.round((s.dts / timescale) * 1_000_000),
-          durationUs: Math.round((s.duration / timescale) * 1_000_000),
-          keyframe: s.isSync,
-          mp4boxTiming: {
-            cts: s.cts,
-            dts: s.dts,
-            duration: s.duration,
-          },
-        }));
-        rebasePreparedChunksToZero(chunks);
-
-        const track: Mp4boxPreparedMuxTrack = {
-          type,
-          codec,
-          timescale,
-          ...(normalized?.width !== undefined ? { width: normalized.width } : {}),
-          ...(normalized?.height !== undefined ? { height: normalized.height } : {}),
-          ...(normalized?.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
-          ...(normalized?.channels !== undefined ? { channels: normalized.channels } : {}),
-          chunks,
-          mp4boxMux: {
-            source: 'mp4box',
-            sampleEntryType: sampleEntry.sampleEntryType,
-            descriptionBoxes: sampleEntry.descriptionBoxes,
-          },
-        };
-
-        candidates.push({ inputIndex, type, typeOrdinal, track });
-      }
-    }
-
-    return { tracks: selectPreparedMuxTracks(candidates, inputs.length, options).map((c) => c.track) };
+      return validateEncodedTracks(ENGINE_ID, {
+        tracks: selected.map((candidate) => candidate.track),
+        telemetry: { bytesRead: this.configState.inputBytes },
+      });
+    });
   }
 
   // ── remux (FRAGMENTER) ───────────────────────────────────────────────────────────────────────
   /**
    * ISO-BMFF → FRAGMENTED-MP4 (fMP4 / CMAF). This is mp4box's documented "fragmenter" path:
    * setSegmentOptions per track → initializeSegmentation() (one combined init segment) → onSegment
-   * (media fragments) → start()/flush(). We concatenate the init segment + every media fragment (in
-   * arrival order) into one playable fragmented-MP4 byte buffer. Cross-family conversion (to
+   * (media fragments) → start()/flush(). An observable growable target receives init + fragments in
+   * arrival order and materializes one tight fragmented-MP4 byte buffer. Cross-family conversion (to
    * mkv/webm/ts/wav/...) is IMPOSSIBLE for mp4box, so any non-mp4 target throws.
    */
-  async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
-    if (opts.container !== 'mp4') {
-      throw new Error(
-        `${ENGINE_ID}: remux only targets fragmented 'mp4' (ISO-BMFF→fMP4); '${opts.container}' is out of scope`,
-      );
-    }
-    const bytes = await input.arrayBuffer();
-    const { file, info } = await this.parseToInfo(bytes, true); // keep mdat or no media is fragmented
+  async remux(input: MediaInput, opts: RemuxOptions, context?: OperationContext): Promise<MediaBytes> {
+    const call = context ?? this.fallbackOperation('remux', [input], opts.container, opts);
+    return this.lifecycle.operation('remux', call, async () => {
+      this.beginOperation('remux', true);
+      this.assertSupported(call);
+      const outputTarget = new ProgressiveByteSink();
+      const completedTracks = new Set<number>();
+      const nextSampleByTrack = new Map<number, number>();
+      let outputBytes = 0;
+      const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
+        if (readyInfo.tracks.length === 0) throw new Error(`${ENGINE_ID}: remux found a genuinely trackless MP4`);
+        for (const track of readyInfo.tracks) {
+          const type = trackType(track);
+          const rawCodec = unwrapEncryptedCodec(readyFile, track.id, track.codec) ?? track.codec;
+          const codec = canonicalCodec(rawCodec);
+          if (type !== 'video' && type !== 'audio') {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'remux',
+              `track ${track.id} type '${type}' is not in the adapter's segmentable contract`,
+              mp4boxTupleSummary(call.request),
+              'MP4BOX_REMUX_TRACK_TYPE_UNSUPPORTED',
+            );
+          }
+          const allowed = type === 'video' ? MP4BOX_VIDEO_CODECS : MP4BOX_AUDIO_CODECS;
+          if (!allowed.includes(codec as never)) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'remux',
+              `track ${track.id} codec '${codec}' cannot be segmented losslessly`,
+              mp4boxTupleSummary(call.request),
+              'MP4BOX_REMUX_SAMPLE_ENTRY_UNSUPPORTED',
+            );
+          }
+          const entries = sampleEntriesForTrack(readyFile, track.id);
+          if (entries.length === 0) throw new Error(`${ENGINE_ID}: track ${track.id} has no sample description`);
+          assertMuxSampleEntries(entries, codec, 'remux', mp4boxTupleSummary(call.request));
+        }
+        this.configState = {
+          ...this.configState,
+          codecConfigs: readyInfo.tracks.map((track, trackIndex) => {
+            const nativeCodecTag = unwrapEncryptedCodec(readyFile, track.id, track.codec) ?? track.codec;
+            return {
+              trackIndex,
+              codec: canonicalCodec(nativeCodecTag),
+              nativeCodecTag,
+              sampleDescriptions: sampleEntriesForTrack(readyFile, track.id).length,
+            };
+          }),
+        };
 
-    if (!info.tracks.length) throw new Error(`${ENGINE_ID}: remux found no tracks to fragment`);
+        readyFile.onSegment = (id, _user, buffer, nextSample, last) => {
+          throwIfError();
+          if (buffer.byteLength === 0) throw new Error(`${ENGINE_ID}: empty media-segment callback for track ${id}`);
+          const segment = new Uint8Array(buffer);
+          outputTarget.write(segment);
+          outputBytes = outputTarget.byteLength;
+          const previousNextSample = nextSampleByTrack.get(id) ?? 0;
+          const releasedNow = Math.max(0, nextSample - previousNextSample);
+          nextSampleByTrack.set(id, Math.max(previousNextSample, nextSample));
+          if (last) completedTracks.add(id);
+          const parserBytesBeforeRelease = readyFile.samplesDataSize ?? 0;
+          readyFile.releaseUsedSamples(id, nextSample);
+          this.configState = {
+            ...this.configState,
+            releasedSamples: this.configState.releasedSamples + releasedNow,
+            outputBytes,
+            outputWrites: this.configState.outputWrites + 1,
+            peakParserSampleBytes: Math.max(this.configState.peakParserSampleBytes, parserBytesBeforeRelease),
+            peakOutputTargetBytes: Math.max(this.configState.peakOutputTargetBytes, outputTarget.peakAllocatedBytes),
+          };
+          call.emit({ type: 'bytes-written', atMs: this.elapsedMs(), bytes: outputBytes });
+          call.emit({ type: 'write-count', atMs: this.elapsedMs(), count: this.configState.outputWrites });
+        };
 
-    const mediaSegments: Uint8Array[] = [];
-    file.onSegment = (_id, _user, buffer) => {
-      mediaSegments.push(new Uint8Array(buffer));
-    };
+        for (const track of readyInfo.tracks) {
+          // Fixed batches are the memory ceiling. RAP alignment may defer an entire long GOP and
+          // retain most of a large mdat; sample flags still preserve each fragment's sync semantics.
+          readyFile.setSegmentOptions(track.id, null, { nbSamples: PROCESS_BATCH_SAMPLES, rapAlignement: false });
+        }
+        const init = readyFile.initializeSegmentation();
+        if (init.buffer.byteLength === 0) throw new Error(`${ENGINE_ID}: initializeSegmentation returned no init bytes`);
+        outputTarget.write(init.buffer);
+        outputBytes = outputTarget.byteLength;
+        const firstByteMs = this.elapsedMs();
+        this.configState = {
+          ...this.configState,
+          firstByteMs,
+          outputBytes,
+          outputWrites: 1,
+          peakOutputTargetBytes: Math.max(this.configState.peakOutputTargetBytes, outputTarget.peakAllocatedBytes),
+        };
+        call.emit({ type: 'first-byte', atMs: firstByteMs });
+        call.emit({ type: 'bytes-written', atMs: this.elapsedMs(), bytes: outputBytes });
+        call.emit({ type: 'write-count', atMs: this.elapsedMs(), count: 1 });
+        readyFile.start();
+      });
+      const { file, info } = session;
+      let primaryError: unknown;
+      try {
+        const expectedByTrack = new Map<number, number>();
+        for (const track of info.tracks) {
+          const expectedSamples = trackSampleCount(file, track);
+          if (expectedSamples === 0) throw new Error(`${ENGINE_ID}: media track ${track.id} contains zero samples`);
+          expectedByTrack.set(track.id, expectedSamples);
+        }
+        session.throwIfError();
+        for (const [trackId, expected] of expectedByTrack) {
+          if (!completedTracks.has(trackId) || (nextSampleByTrack.get(trackId) ?? 0) < expected) {
+            throw new Error(`${ENGINE_ID}: incomplete segmentation for track ${trackId}: ${nextSampleByTrack.get(trackId) ?? 0}/${expected}`);
+          }
+        }
 
-    // 2.x requires a UNIFORM nbSamples across all segmented tracks; rapAlignement starts segments on
-    // a RAP (CMAF-friendly). Use the documented default of 1000 samples per segment.
-    const NB_SAMPLES = 1000;
-    for (const t of info.tracks) {
-      file.setSegmentOptions(t.id, null, { nbSamples: NB_SAMPLES, rapAlignement: true });
-    }
-
-    // One combined init segment (ftyp + moov with mvex), then media fragments via onSegment.
-    const init = file.initializeSegmentation();
-    file.start();
-    file.flush(); // synchronous for whole-file input: emits all media segments
-    file.stop();
-
-    const out = concatBuffers([init.buffer, ...mediaSegments]);
-    return { bytes: out, mime: 'video/mp4', container: 'mp4' };
+        const out = outputTarget.finish();
+        const expectedSamples = [...expectedByTrack.values()].reduce((sum, count) => sum + count, 0);
+        const validation = validateFragmentedMp4(out, expectedSamples);
+        this.configState = {
+          ...this.configState,
+          outputBytes: out.byteLength,
+          peakOutputTargetBytes: Math.max(this.configState.peakOutputTargetBytes, outputTarget.peakAllocatedBytes),
+          fragmentValidation: validation,
+        };
+        if (!validation.valid) throw new Error(`${ENGINE_ID}: ${validation.reasonCode}: ${validation.detail}`);
+        return validateAdapterResult(ENGINE_ID, 'remux', {
+          bytes: out,
+          mime: 'video/mp4',
+          container: 'mp4',
+          targetWrites: this.configState.outputWrites,
+          ...(this.configState.firstByteMs !== null ? { firstByteMs: this.configState.firstByteMs } : {}),
+          telemetry: {
+            bytesRead: this.configState.inputBytes,
+            bytesWritten: out.byteLength,
+            writeCount: this.configState.outputWrites,
+            ...(this.configState.firstByteMs !== null ? { firstByteMs: this.configState.firstByteMs } : {}),
+          },
+        });
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        for (const track of info.tracks) {
+          try {
+            file.unsetSegmentOptions(track.id);
+          } catch {
+            // Session stop remains authoritative.
+          }
+        }
+        session.close(primaryError);
+      }
+    });
   }
 
   // ── Undeclared operations: mp4box does none of these. They throw so a mis-wired runner fails
@@ -950,7 +2022,7 @@ export class Mp4boxEngine implements MediaEngine {
     throw new Error(`${ENGINE_ID}: transcode not supported (no encoder/decoder — ISOBMFF parser only)`);
   }
 
-  async decodeFrames(_input: MediaInput, _opts?: { maxFrames?: number }): Promise<FrameSink> {
+  async decodeFrames(_input: MediaInput, _opts?: DecodeOptions): Promise<FrameSink> {
     throw new Error(`${ENGINE_ID}: decodeFrames not supported (no decoder — pair with WebCodecs)`);
   }
 
@@ -968,87 +2040,228 @@ export class Mp4boxEngine implements MediaEngine {
   }
 
   // `decrypt` is genuinely impossible (parses CENC signalling, performs no AES) and is simply absent.
-  async mux(tracks: EncodedTracks, opts: { container: string }): Promise<MediaBytes> {
-    if (opts.container !== 'mp4') {
-      throw new NotApplicableError('mux', `only MP4 output is supported, got '${opts.container}'`);
-    }
-    const realTracks = tracks.tracks.filter((t) => t.type === 'video' || t.type === 'audio') as Mp4boxPreparedMuxTrack[];
-    if (realTracks.length === 0) {
-      throw new NotApplicableError('mux', 'requires at least one audio/video track');
-    }
-    for (const t of realTracks) {
-      if (!t.mp4boxMux || t.mp4boxMux.source !== 'mp4box') {
-        throw new NotApplicableError(
+  async mux(tracks: EncodedTracks, opts: MuxOptions, context?: OperationContext): Promise<MediaBytes> {
+    const call = context ?? this.fallbackOperation('mux', [], opts.container, opts);
+    return this.lifecycle.operation('mux', call, async () => {
+      const preparation = this.configState.operation === 'mux' ? this.configState : freshConfigState();
+      this.beginOperation('mux', true);
+      this.configState = {
+        ...this.configState,
+        inputBytes: preparation.inputBytes,
+        appendCount: preparation.appendCount,
+        releasedSamples: preparation.releasedSamples,
+        peakParserSampleBytes: preparation.peakParserSampleBytes,
+        peakOwnedSampleBytes: preparation.peakOwnedSampleBytes,
+        codecConfigs: preparation.codecConfigs,
+      };
+      this.assertSupported(call);
+      const realTracks = tracks.tracks.filter((track) => track.type === 'video' || track.type === 'audio') as Mp4boxPreparedMuxTrack[];
+      if (realTracks.length === 0) {
+        // Trackless input/operation contracts are invalid applicable input, never NA_ENGINE.
+        throw new Error(`${ENGINE_ID}: mux requires at least one non-empty audio/video track`);
+      }
+      if (realTracks.length !== tracks.tracks.length) {
+        throw createNotApplicableError(
+          ENGINE_ID,
           'mux',
-          'external EncodedTracks do not carry MP4Box sample-entry metadata; use prepareMuxTracks()',
+          'subtitle/other tracks cannot be silently discarded by the mux writer',
+          mp4boxTupleSummary(call.request),
+          'MP4BOX_MUX_TRACK_TYPE_UNSUPPORTED',
         );
       }
-      if (t.chunks.length === 0) throw new NotApplicableError('mux', `track '${t.type}' has no chunks`);
-    }
-
-    const MP4Box = this.lib();
-    const out = MP4Box.createFile(true);
-    const movieTimescale = 1_000;
-    let movieDuration = 0;
-    for (const track of realTracks) {
-      movieDuration = Math.max(movieDuration, usToTrackTicks(trackDurationUs(track), movieTimescale));
-    }
-    out.init({ brands: ['isom', 'iso6', 'mp41'], timescale: movieTimescale, duration: movieDuration });
-
-    const hasVideo = realTracks.some((t) => t.type === 'video');
-    for (let i = 0; i < realTracks.length; i++) {
-      const track = realTracks[i]!;
-      const info = track.mp4boxMux!;
-      const timescale = Number.isFinite(track.timescale) && track.timescale > 0 ? track.timescale : 1_000_000;
-      let mediaDuration = 0;
-      for (const chunk of track.chunks) {
-        const timing = sampleTimingForChunk(chunk, timescale);
-        mediaDuration = Math.max(mediaDuration, timing.dts + timing.duration, timing.cts + timing.duration);
-      }
-      const trackDuration = usToTrackTicks(trackDurationUs(track), movieTimescale);
-      const addTrackOptions: Mp4boxIsoFileOptions = {
-        id: i + 1,
-        type: info.sampleEntryType as Mp4boxIsoFileOptions['type'],
-        hdlr: track.type === 'video' ? 'vide' : 'soun',
-        name: `${track.type} track`,
-        timescale,
-        duration: trackDuration,
-        media_duration: mediaDuration,
-        ...(track.width !== undefined ? { width: Math.round(track.width) } : {}),
-        ...(track.height !== undefined ? { height: Math.round(track.height) } : {}),
-        ...(track.sampleRate !== undefined ? { samplerate: Math.round(track.sampleRate) * 65536 } : {}),
-        ...(track.channels !== undefined ? { channel_count: track.channels } : {}),
-        ...(info.descriptionBoxes.length > 0 ? { description_boxes: info.descriptionBoxes } : {}),
-      };
-      const trackId = out.addTrack(addTrackOptions);
-      if (!trackId) {
-        throw new NotApplicableError('mux', `MP4Box cannot create sample entry '${info.sampleEntryType}'`);
-      }
-
-      for (const chunk of track.chunks) {
-        const timing = sampleTimingForChunk(chunk, timescale);
-        if (timing.cts < timing.dts) {
-          throw new NotApplicableError(
+      for (const track of realTracks) {
+        if (!track.mp4boxMux || track.mp4boxMux.source !== 'mp4box') {
+          throw createNotApplicableError(
+            ENGINE_ID,
             'mux',
-            `negative composition offset on '${track.type}' is not supported by MP4Box's fragment writer`,
+            'external EncodedTracks lack exact MP4Box sample-entry/edit provenance',
+            mp4boxTupleSummary(call.request),
+            'MP4BOX_EXTERNAL_TRACK_PROVENANCE_UNSUPPORTED',
           );
         }
-        out.addSample(trackId, copyBytes(chunk.data), {
-          duration: Math.max(1, timing.duration),
-          cts: Math.max(0, timing.cts),
-          dts: Math.max(0, timing.dts),
-          is_sync: chunk.keyframe,
-        });
+        if (track.chunks.length === 0) throw new Error(`${ENGINE_ID}: '${track.type}' track has zero samples`);
+        assertMuxSampleEntries(track.mp4boxMux.sampleEntries, track.codec, 'mux', mp4boxTupleSummary(call.request));
+        const activeDescriptionIndexes = new Set<number>();
+        for (const chunk of track.chunks) {
+          const timing = sampleTimingForChunk(chunk, track.timescale);
+          if (timing.cts < timing.dts) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'mux',
+              `negative composition offset on '${track.type}' cannot be represented by this writer`,
+              mp4boxTupleSummary(call.request),
+              'MP4BOX_NEGATIVE_COMPOSITION_UNSUPPORTED',
+            );
+          }
+          const descriptionIndex = chunk.sampleDescriptionIndex ?? 0;
+          if (descriptionIndex < 0 || descriptionIndex >= track.mp4boxMux.sampleEntries.length) {
+            throw new Error(`${ENGINE_ID}: chunk references absent sample description ${descriptionIndex}`);
+          }
+          activeDescriptionIndexes.add(descriptionIndex);
+        }
+        if (activeDescriptionIndexes.size > 1) {
+          // MP4Box 2.3's fragment writer records only trex.default_sample_description_index and
+          // never emits per-fragment tfhd sample-description overrides. Reject an actual switch.
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'mux',
+            `track '${track.type}' switches sample descriptions within one fragmented output`,
+            mp4boxTupleSummary(call.request),
+            'MP4BOX_SAMPLE_DESCRIPTION_SWITCH_UNSUPPORTED',
+          );
+        }
       }
-    }
 
-    const bytes = streamToBytes(out.getBuffer());
-    if (bytes.byteLength === 0) throw new Error(`${ENGINE_ID}: mux produced an empty MP4`);
-    return {
-      bytes,
-      mime: hasVideo ? 'video/mp4' : 'audio/mp4',
-      container: 'mp4',
-    };
+      const MP4Box = this.lib();
+      const out = MP4Box.createFile(true);
+      this.activeFiles.add(out);
+      this.configState = { ...this.configState, activeFiles: this.activeFiles.size, cleanupComplete: false };
+      let writerError: Error | undefined;
+      let stopError: unknown;
+      let primaryError: unknown;
+      out.onError = (module, message) => {
+        writerError ??= new Error(`mp4box writer error [${module}]: ${message}`);
+        this.configState = { ...this.configState, lateErrorObserved: true };
+      };
+      let stopped = false;
+      const stopWriter = (): void => {
+        if (stopped) return;
+        stopped = true;
+        try {
+          out.stop();
+          this.configState = { ...this.configState, stopCalled: true };
+        } catch (error) {
+          stopError ??= error;
+        }
+      };
+      const abort = (): void => {
+        stopWriter();
+      };
+      if (call.signal.aborted) abort();
+      else call.signal.addEventListener('abort', abort, { once: true });
+
+      try {
+        throwIfAborted(call.signal);
+        const movieTimescale = 1_000;
+        let movieDuration = 0;
+        for (const track of realTracks) {
+          const muxInfo = track.mp4boxMux!;
+          const editDurationUs = muxInfo.edits.length > 0
+            ? muxInfo.edits.reduce((sum, edit) => sum + Math.max(0, edit.segmentDuration), 0)
+              * 1_000_000 / Math.max(1, muxInfo.movieTimescale)
+            : muxInfo.presentationOffsetUs + trackDurationUs(track);
+          movieDuration = Math.max(movieDuration, usToTrackTicks(editDurationUs, movieTimescale));
+        }
+        out.init({ brands: ['isom', 'iso6', 'mp41'], timescale: movieTimescale, duration: movieDuration });
+
+        const hasVideo = realTracks.some((track) => track.type === 'video');
+        let expectedSamples = 0;
+        for (let index = 0; index < realTracks.length; index++) {
+          throwIfAborted(call.signal);
+          const track = realTracks[index]!;
+          const info = track.mp4boxMux!;
+          const timescale = Number.isFinite(track.timescale) && track.timescale > 0 ? track.timescale : 1_000_000;
+          let mediaDuration = 0;
+          for (const chunk of track.chunks) {
+            const timing = sampleTimingForChunk(chunk, timescale);
+            mediaDuration = Math.max(mediaDuration, timing.dts + timing.duration, timing.cts + timing.duration);
+          }
+          const trackDuration = info.edits.length > 0
+            ? Math.round(info.edits.reduce((sum, edit) => sum + Math.max(0, edit.segmentDuration), 0)
+              * movieTimescale / Math.max(1, info.movieTimescale))
+            : usToTrackTicks(info.presentationOffsetUs + trackDurationUs(track), movieTimescale);
+          const defaultDescriptionIndex = (track.chunks[0]?.sampleDescriptionIndex ?? 0) + 1;
+          const addTrackOptions: Mp4boxIsoFileOptions = {
+            id: index + 1,
+            type: info.sampleEntryType as Mp4boxIsoFileOptions['type'],
+            hdlr: track.type === 'video' ? 'vide' : 'soun',
+            name: `${track.type} track`,
+            timescale,
+            duration: trackDuration,
+            media_duration: mediaDuration,
+            default_sample_description_index: defaultDescriptionIndex,
+            ...(track.width !== undefined ? { width: Math.round(track.width) } : {}),
+            ...(track.height !== undefined ? { height: Math.round(track.height) } : {}),
+            ...(track.sampleRate !== undefined ? { samplerate: Math.round(track.sampleRate) * 65536 } : {}),
+            ...(track.channels !== undefined ? { channel_count: track.channels } : {}),
+            ...(info.descriptionBoxes.length > 0 ? { description_boxes: info.descriptionBoxes } : {}),
+          };
+          const trackId = out.addTrack(addTrackOptions);
+          if (!trackId) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'mux',
+              `MP4Box cannot create sample entry '${info.sampleEntryType}'`,
+              mp4boxTupleSummary(call.request),
+              'MP4BOX_SAMPLE_ENTRY_WRITER_UNSUPPORTED',
+            );
+          }
+          installSampleEntries(out, trackId, info.sampleEntries);
+          authorPresentationEdits(MP4Box, out, trackId, info, movieTimescale, mediaDuration, mp4boxTupleSummary(call.request));
+
+          for (const chunk of track.chunks) {
+            throwIfAborted(call.signal);
+            const timing = sampleTimingForChunk(chunk, timescale);
+            const added = out.addSample(trackId, copyBytes(chunk.data), {
+              sample_description_index: (chunk.sampleDescriptionIndex ?? 0) + 1,
+              duration: Math.max(1, timing.duration),
+              cts: timing.cts,
+              dts: timing.dts,
+              is_sync: chunk.keyframe,
+            });
+            if (!added) throw new Error(`${ENGINE_ID}: writer rejected sample ${expectedSamples}`);
+            expectedSamples++;
+            if (writerError) throw writerError;
+          }
+        }
+
+        if (writerError) throw writerError;
+        const bytes = streamToBytes(out.getBuffer());
+        if (writerError) throw writerError;
+        if (bytes.byteLength === 0) throw new Error(`${ENGINE_ID}: mux produced an empty MP4`);
+        const validation = validateFragmentedMp4(bytes, expectedSamples);
+        const firstByteMs = this.elapsedMs();
+        this.configState = {
+          ...this.configState,
+          outputBytes: bytes.byteLength,
+          outputWrites: 1,
+          firstByteMs,
+          peakOutputTargetBytes: Math.max(this.configState.peakOutputTargetBytes, bytes.byteLength),
+          fragmentValidation: validation,
+        };
+        if (!validation.valid) throw new Error(`${ENGINE_ID}: ${validation.reasonCode}: ${validation.detail}`);
+        call.emit({ type: 'first-byte', atMs: firstByteMs });
+        call.emit({ type: 'bytes-written', atMs: this.elapsedMs(), bytes: bytes.byteLength });
+        call.emit({ type: 'write-count', atMs: this.elapsedMs(), count: 1 });
+        return validateAdapterResult(ENGINE_ID, 'mux', {
+          bytes,
+          mime: hasVideo ? 'video/mp4' : 'audio/mp4',
+          container: 'mp4',
+          targetWrites: 1,
+          firstByteMs,
+          telemetry: {
+            bytesRead: this.configState.inputBytes,
+            bytesWritten: bytes.byteLength,
+            writeCount: 1,
+            firstByteMs,
+          },
+        });
+      } catch (error) {
+        primaryError = error;
+        throw error;
+      } finally {
+        call.signal.removeEventListener('abort', abort);
+        stopWriter();
+        out.onError = undefined;
+        this.activeFiles.delete(out);
+        this.configState = {
+          ...this.configState,
+          activeFiles: this.activeFiles.size,
+          cleanupComplete: this.activeFiles.size === 0,
+        };
+        if (primaryError === undefined && stopError !== undefined) throw stopError;
+      }
+    });
   }
 }
 

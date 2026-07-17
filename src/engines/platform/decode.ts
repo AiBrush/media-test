@@ -10,7 +10,7 @@
  *      Used for containers the inline demuxer can't parse (e.g. MPEG-TS, fragmented MP4, OGG).
  */
 
-import type { FrameDigest, FrameSink } from '../../core/engine.ts';
+import type { DecodeOptions, FrameDigest, FrameSink } from '../../core/engine.ts';
 import { digestImageData } from './digest.ts';
 import { imageDataFromVideoElement, imageDataFromVideoFrame } from './raster.ts';
 
@@ -21,11 +21,13 @@ export interface DecodeInput {
   codedHeight: number;
   description?: Uint8Array;
   samples: Array<{ data: Uint8Array; alpha?: Uint8Array; ptsUs: number; dtsUs: number; keyframe: boolean }>;
+  selectedTrack?: FrameSink['selectedTrack'];
 }
 
 /** A frame sink that also retains ImageData for getPixels (SSIM/PSNR oracles need raw pixels). */
 class RetainingFrameSink implements FrameSink {
   frames: FrameDigest[] = [];
+  selectedTrack?: FrameSink['selectedTrack'];
   private pixels: ImageData[] = [];
 
   add(digest: FrameDigest, img: ImageData): void {
@@ -86,7 +88,7 @@ function codecUsesDescription(codecString: string): boolean {
  * Decode demuxed samples via WebCodecs. Resolves a FrameSink of up to `maxFrames` digests in
  * presentation order. Throws if VideoDecoder is unavailable or the config is unsupported.
  */
-export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
+export async function decodeWithWebCodecs(input: DecodeInput, opts?: DecodeOptions): Promise<FrameSink> {
   if (!hasVideoDecoder()) throw new Error('VideoDecoder/EncodedVideoChunk unavailable in this realm');
   const maxFrames = opts?.maxFrames ?? Number.POSITIVE_INFINITY;
 
@@ -153,12 +155,14 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: { maxFrames
       }
       const digest = await digestImageData(img, i, ptsUs);
       sink.add(digest, img);
+      if (i === 0) opts?.onFirstFrame?.(monotonicNowMs());
     }
   } finally {
     closeCollectedFrames(colorFrames);
     closeCollectedFrames(alphaFrames);
   }
 
+  sink.selectedTrack = input.selectedTrack;
   return sink;
 }
 
@@ -253,7 +257,7 @@ function closeCollectedFrames(frames: Array<{ frame: VideoFrame }>): void {
  */
 export async function decodeWithVideoElement(
   blob: Blob,
-  opts?: { maxFrames?: number; perFrameTimeoutMs?: number },
+  opts?: DecodeOptions & { perFrameTimeoutMs?: number; selectedTrack?: FrameSink['selectedTrack'] },
 ): Promise<FrameSink> {
   if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
     throw new Error('<video> fallback requires a DOM (page main thread)');
@@ -294,6 +298,7 @@ export async function decodeWithVideoElement(
       const ptsUs = Math.round(video.currentTime * 1_000_000);
       const digest = await digestImageData(img, i, ptsUs);
       sink.add(digest, img);
+      if (i === 0) opts?.onFirstFrame?.(monotonicNowMs());
     }
   } finally {
     video.removeAttribute('src');
@@ -304,7 +309,14 @@ export async function decodeWithVideoElement(
     }
     URL.revokeObjectURL(url);
   }
+  sink.selectedTrack = opts?.selectedTrack;
   return sink;
+}
+
+function monotonicNowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
 }
 
 /** Grab a single frame at tUs via a <video> element (used by the adapter's seek()). */

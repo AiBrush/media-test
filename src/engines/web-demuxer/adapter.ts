@@ -1,29 +1,16 @@
 /**
  * src/engines/web-demuxer/adapter.ts — MediaEngine adapter for web-demuxer@4.0.0.
  *
- * ROLE: FFmpeg-in-WASM DEMUX / PROBE / SEEK specialist, WebCodecs-first. web-demuxer compiles
- * FFmpeg's demuxers to WebAssembly and runs them in a bundled Worker; it parses containers and hands
- * back ready-to-use WebCodecs objects (VideoDecoderConfig + EncodedVideoChunk) plus raw packets and
- * media info. It does NOT decode pixels, encode, mux, remux, transcode, trim, or decrypt of its own
- * — so capabilities() declares ONLY probe, demux, seek and the OPTIONAL decodeFrames. Everything else
- * is left undeclared, which the runner records as NA(engine) (never a fabricated pass).
+ * ROLE: FFmpeg-in-WASM probe/demux specialist with browser-backed decode and seek. Parser operations
+ * are independent of the browser codec table. Pixel operations load the selected package stream,
+ * generate the exact standard VideoDecoderConfig they will configure, and route an unavailable API,
+ * rejected config, raster surface, or Web Crypto through the typed NA_BROWSER channel. Package and
+ * adapter tuple misses use the shared realm-safe NotApplicableError; malformed bytes remain errors.
  *
- * ── 'webcodecs:independent' — WHY IT IS DECLARED (a deliberate departure from dossier §9) ──────────
- * probe and demux are PURE WASM parses: they call load()->getMediaInfo()/getAVStreams()/readAVPacket()
- * and NEVER touch the browser's WebCodecs codec table — exactly like the only other pure demuxer,
- * mp4box (src/engines/mp4box/adapter.ts), which declares 'webcodecs:independent' for the same reason.
- * The runner's negotiate() Pass-2 (src/core/runner.ts) is a FLAT, whole-engine gate: WITHOUT this
- * feature it browser-gates EVERY declared codec — so probe/demux of hevc/av1 (which the WASM parses
- * perfectly with NO decoder) were being falsely marked NA_BROWSER on Brave/Chrome where HEVC/AV1
- * WebCodecs DECODE is unavailable. That false-NA hides a genuinely-supported feature (a FAIL-class
- * honesty bug under the standing rules) and is an unfair asymmetry vs mp4box, whose identical pure
- * probe/demux PASS. Declaring the feature opts the engine out of the codec gate so probe/demux are
- * judged on the only thing that matters for a parser — whether the WASM parses the bytes.
- * TRADE-OFF (accepted, and HONEST): the same flat gate means decodeFrames/seek — whose PIXELS DO come
- * from the browser's WebCodecs — are no longer auto-marked NA_BROWSER for an unconfigurable codec.
- * Instead they SELF-GATE via VideoDecoder.isConfigSupported() and THROW a clear error, which the
- * runner records as a clean ERROR (never a crash, never a fabricated pass). An honest ERROR on a
- * decode the browser cannot do is strictly better than a false NA on a parse the engine genuinely can.
+ * Raw package packets expose PTS but no DTS, so the ordinary backend leaves DTS absent. It records
+ * semantic access-unit identity and explicit framing/config evidence. The three declared large-file
+ * cells use a separately reported ISO-BMFF sample-table backend which derives real DTS, validates
+ * stsc/stco/co64 sample placement inside mdat ranges, and explicitly does not claim payload reads.
  *
  * Dossier (authoritative): research/dossiers/web-demuxer.md (researched 2026-06-17).
  *   Doc URLs cited there and used here:
@@ -49,8 +36,7 @@
  *   - Raw WebAVPacket.timestamp / .duration are in SECONDS  → demux maps ptsUs = round(ts * 1e6).
  *   - WebCodecs chunks from seek()/read() carry timestamps already in MICROSECONDS (genEncodedChunk
  *     multiplies the packet's seconds by 1e6) → used directly as the decoded frame's ptsUs.
- *   - WebAVPacket carries ONLY a presentation timestamp (no DTS field). demux therefore reports
- *     dtsUs === ptsUs (honest approximation; the library does not surface a decode timeline).
+ *   - WebAVPacket carries ONLY a presentation timestamp (no DTS field); ordinary demux omits dtsUs.
  *
  * Frame digests (seek / decodeFrames) use the SAME normalization + sha256 as oracles.ts / platform:
  * a decoded VideoFrame is drawn to a 2D canvas (straight-alpha, top-left, tight RGBA) and hashed via
@@ -70,28 +56,67 @@ import wasmUrl from 'web-demuxer/wasm?url';
 import { registerEngine } from '../../core/registry.ts';
 import type {
   CapabilitySet,
+  ConcreteOperationRequest,
   DecryptKey,
+  DecodeOptions,
   DemuxResult,
   EncodedTracks,
   EncryptionScheme,
   FrameDigest,
   FrameSink,
+  LifecycleContext,
   MediaBytes,
   MediaEngine,
   MediaInput,
   NormalizedMetadata,
   NormalizedTrack,
+  OperationContext,
   PacketInfo,
+  SeekResult,
+  SupportDecision,
   TrackType,
   TranscodeOptions,
 } from '../../core/engine.ts';
+import {
+  DECODE_TRACK_SELECTOR_SCHEMA,
+  createBrowserNotSupportedError,
+  createNotApplicableError,
+  isBrowserNotSupportedError,
+  isNotApplicableError,
+} from '../../core/engine.ts';
 
-import { digestImageData } from './digest.ts';
+import { digestImageData, hasWebCryptoDigest } from './digest.ts';
 import {
   demuxProgressiveMp4SampleTable,
   shouldUseProgressiveMp4SampleTableFastPath,
 } from './mp4-sample-table.ts';
-import { imageDataFromVideoFrame } from './raster.ts';
+import {
+  applyFrameRateEvidence,
+  createTrackEvidenceAccumulator,
+  finishTrackRepresentation,
+  mergeNormalizedStreams,
+  packetEvidenceFromWebPacket,
+  streamIndexToTrackIndex,
+} from './packet-evidence.ts';
+import { hasRasterSurface, imageDataFromVideoFrame } from './raster.ts';
+import {
+  decideWebDemuxerSupport,
+  selectedVideoTrack,
+  WEB_DEMUXER_AUDIO_CODECS,
+  WEB_DEMUXER_INPUT_CONTAINERS,
+  WEB_DEMUXER_REASON,
+  WEB_DEMUXER_VIDEO_CODECS,
+  webDemuxerTupleSummary,
+} from './support.ts';
+import {
+  closeAll,
+  retainLowestPts,
+  seekGopProgressSatisfied,
+  selectSeekLanding,
+  sortByPresentationTime,
+  WebDemuxerPartialDecodeError,
+  type TimedClosable,
+} from './temporal.ts';
 
 // Type-only import of the library's public surface (avoids pulling the runtime into the suite shell;
 // the real module is dynamically imported inside init()). AVMediaType is an enum used both as a type
@@ -117,57 +142,13 @@ const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
 ];
 const AAC_CHANNELS_BY_CONFIG = [undefined, 1, 2, 3, 4, 5, 6, 8];
+const MAX_PACKET_ROWS = 2_000_000;
+const MAX_DECODE_FRAMES = 512;
+const MAX_RETAINED_PIXEL_BYTES = 1_500 * 1024 * 1024;
+const MAX_SEEK_CHUNKS = 100_000;
 
 type PacketizedTrackType = Extract<TrackType, 'video' | 'audio' | 'subtitle'>;
 type AacAudioConfig = { sampleRate: number; channels: number };
-
-/**
- * Thrown for a path this adapter declares at the capability level but CANNOT run for a specific input
- * at runtime, due to a confirmed library limitation (not a corpus/asset problem and not a bug here).
- * The runner keys off `err.name === 'NotApplicableError'` (see src/core/runner.ts isNotApplicableError)
- * and records NA_ENGINE — an honest "not applicable", never a fabricated pass and never an ERROR.
- * Mirrors the identical helper in the mp4box / ffmpeg-wasm adapters.
- */
-class NotApplicableError extends Error {
-  constructor(op: string, reason: string) {
-    super(`${ENGINE_ID}: ${op} not applicable: ${reason}`);
-    this.name = 'NotApplicableError';
-  }
-}
-
-/**
- * Recognize the v4.0.0 MPEG-TS packet-reader failure. web-demuxer's readAVPacket() returns a
- * ReadableStream whose start() asks the bundled worker to construct an AVPacketReader; for MPEG-TS
- * the worker fails to build one and surfaces the error via the stream's controller.error(errMsg)
- * (web-demuxer.js v4 readAVPacket → `W.error(I.errMsg)`), so it is thrown from the consumer's
- * reader.read() rather than synchronously from readAVPacket(). The worker's errMsg text is not a
- * stable public contract, so we match the reader-construction signature loosely (reader/AVPacketReader
- * + a null/create/failed token). This is only ever consulted for 'ts' input (see demux()), keeping the
- * self-NA narrow: any other failure on a TS read still propagates as a genuine ERROR.
- */
-function isTsAvPacketReaderConstructionFailure(err: unknown): boolean {
-  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
-  if (!msg) return false;
-  const mentionsReader = msg.includes('avpacketreader') || msg.includes('reader');
-  const mentionsConstructFailure =
-    msg.includes('null') || msg.includes('create') || msg.includes('failed') || msg.includes('nullptr');
-  return mentionsReader && mentionsConstructFailure;
-}
-
-/** seconds → integer microseconds (web-demuxer's raw packet/stream times are in seconds). */
-function secToUs(sec: number): number {
-  return Math.round(sec * 1e6);
-}
-
-/** Parse an FFmpeg `num/den` rational string (e.g. '30000/1001') to a float; 0 if invalid/zero. */
-function parseRational(r: string | undefined): number {
-  if (!r) return 0;
-  const [a, b] = r.split('/');
-  const num = Number(a);
-  const den = b === undefined ? 1 : Number(b);
-  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) return 0;
-  return num / den;
-}
 
 /** Map an FFmpeg codec_name (WebAVStream.codec_name) → canonical lowercase token. Falls back to the
  *  raw name lowercased when unrecognized (honest: surface what the file declares). */
@@ -303,25 +284,7 @@ function languageOf(tags: Record<string, string> | undefined): string | null {
   return lang && lang !== 'und' ? lang : null;
 }
 
-function withSupplementalStreamFields(stream: WebAVStream, supplemental: WebAVStream | undefined): WebAVStream {
-  if (!supplemental || trackTypeOf(stream) !== 'audio') return stream;
-  return {
-    ...stream,
-    sample_rate: stream.sample_rate || supplemental.sample_rate,
-    channels: stream.channels || supplemental.channels,
-  };
-}
-
-function streamsWithSupplementalFields(
-  streams: WebAVStream[],
-  supplementalStreams: WebAVStream[] | undefined,
-): WebAVStream[] {
-  if (!supplementalStreams?.length) return streams;
-  const supplementalByIndex = new Map(supplementalStreams.map((stream) => [stream.index, stream]));
-  return streams.map((stream) => withSupplementalStreamFields(stream, supplementalByIndex.get(stream.index)));
-}
-
-function aacAudioConfigFromAdts(data: Uint8Array): AacAudioConfig | null {
+export function aacAudioConfigFromAdts(data: Uint8Array): AacAudioConfig | null {
   for (let i = 0; i + 6 < data.byteLength; i++) {
     const b0 = data[i]!;
     const b1 = data[i + 1]!;
@@ -420,7 +383,7 @@ function concatChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
   return out;
 }
 
-function aacAudioConfigFromMpegTs(bytes: Uint8Array): AacAudioConfig | null {
+export function aacAudioConfigFromMpegTs(bytes: Uint8Array): AacAudioConfig | null {
   const startOffset = syncOffset(bytes);
   if (startOffset == null) return null;
 
@@ -460,10 +423,12 @@ function aacAudioConfigFromMpegTs(bytes: Uint8Array): AacAudioConfig | null {
   return chunks.length ? aacAudioConfigFromAdts(concatChunks(chunks, totalLength)) : null;
 }
 
-async function withTsAacMetadataFromInput(
+export async function withTsAacMetadataFromInput(
   input: MediaInput,
   metadata: NormalizedMetadata,
+  signal?: AbortSignal,
 ): Promise<NormalizedMetadata> {
+  throwIfAborted(signal);
   if (metadata.container !== 'ts') return metadata;
   const tracks = [...metadata.tracks];
   const missingAacTracks: number[] = [];
@@ -481,7 +446,7 @@ async function withTsAacMetadataFromInput(
   }
 
   if (missingAacTracks.length !== 1) return metadata;
-  const config = aacAudioConfigFromMpegTs(new Uint8Array(await input.arrayBuffer()));
+  const config = aacAudioConfigFromMpegTs(new Uint8Array(await raceAbort(input.arrayBuffer(), signal)));
   if (!config) return metadata;
   const trackIndex = missingAacTracks[0]!;
   const track = tracks[trackIndex]!;
@@ -491,7 +456,14 @@ async function withTsAacMetadataFromInput(
     channels: track.channels ?? config.channels,
   };
 
-  return { ...metadata, tracks };
+  return {
+    ...metadata,
+    tracks,
+    tags: {
+      ...(metadata.tags ?? {}),
+      [`webDemuxer.audioConfig.${trackIndex}`]: 'adts-core',
+    },
+  };
 }
 
 /** Normalize one WebAVStream to a NormalizedTrack. */
@@ -504,22 +476,21 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
     const track: NormalizedTrack = {
       type: 'video',
       codec: canonicalCodec(stream.codec_name),
+      ...(stream.codec_string ? { nativeCodecTag: stream.codec_string } : {}),
       width: stream.width || undefined,
       height: stream.height || undefined,
       rotation: stream.rotation || 0,
       bitrate,
       language,
     };
-    // fps: prefer avg_frame_rate, fall back to r_frame_rate (both FFmpeg rationals).
-    const fps = parseRational(stream.avg_frame_rate) || parseRational(stream.r_frame_rate);
-    if (fps > 0) track.fps = fps;
-    return track;
+    return applyFrameRateEvidence(track, stream);
   }
 
   if (type === 'audio') {
     return {
       type: 'audio',
       codec: canonicalCodec(stream.codec_name),
+      ...(stream.codec_string ? { nativeCodecTag: stream.codec_string } : {}),
       sampleRate: stream.sample_rate || undefined,
       channels: stream.channels || undefined,
       bitrate,
@@ -544,7 +515,7 @@ function toNormalizedMetadata(
   const container = canonicalContainer(info.format_name, input);
   const durationSec =
     Number.isFinite(info.duration) && info.duration > 0 ? info.duration : null;
-  const streams = streamsWithSupplementalFields(info.streams ?? [], supplementalStreams);
+  const streams = mergeNormalizedStreams(info.streams ?? [], supplementalStreams ?? []);
   const tracks = streams.map(normalizeStream);
 
   const meta: NormalizedMetadata = { container, durationSec, tracks };
@@ -581,6 +552,8 @@ function toNormalizedMetadata(
 /** A FrameSink backed by digests + retained ImageData for SSIM/PSNR pixel access. */
 class RetainingFrameSink implements FrameSink {
   frames: FrameDigest[] = [];
+  selectedTrack?: FrameSink['selectedTrack'];
+  telemetry?: FrameSink['telemetry'];
   private pixels: ImageData[] = [];
 
   add(digest: FrameDigest, img: ImageData): void {
@@ -602,6 +575,49 @@ function hasVideoDecoder(): boolean {
   );
 }
 
+export interface WebDemuxerConfigUsed {
+  framework: 'web-demuxer';
+  packageVersions: { 'web-demuxer': '4.0.0' };
+  backend: 'worker-ffmpeg-wasm';
+  hardwareAcceleration: 'browser-default-unexposed';
+  workerCount: 1;
+  threadCount: 0;
+  readerMode: 'package-stream-or-bounded-iso-bmff-range';
+  writerMode: 'none';
+  targetMode: 'none';
+  codecConfigs: VideoDecoderConfig[];
+  package: 'web-demuxer@4.0.0';
+  lockIntegrity: string;
+  wasmExport: 'web-demuxer/wasm';
+  wasmFlavor: 'full';
+  wasmUrlPolicy: 'same-origin';
+  readinessBoundary: 'init-load-barrier';
+  cleanupBoundary: 'cancel-readers-close-frames-destroy-worker';
+  parserBackend: 'worker-ffmpeg-wasm';
+  limits: {
+    packetRows: number;
+    decodedFrames: number;
+    retainedPixelBytes: number;
+    seekChunks: number;
+  };
+  lastDemuxBackend?: 'worker-ffmpeg-wasm' | 'iso-bmff-sample-table';
+  lastDecoderConfig?: VideoDecoderConfig;
+  lifecycle: {
+    initAttempts: number;
+    readyCount: number;
+    loadCount: number;
+    destroyCount: number;
+    readinessMs?: number;
+  };
+}
+
+export interface WebDemuxerEngineDependencies {
+  importModule?: () => Promise<Pick<typeof import('web-demuxer'), 'WebDemuxer'>>;
+  wasmAssetUrl?: string;
+  locationHref?: string;
+  now?: () => number;
+}
+
 /**
  * web-demuxer engine: probe + demux + seek (lossless, browser-codec-independent) and optional
  * decodeFrames (browser-codec-gated WebCodecs decode). The heavy WASM is compiled once in init()
@@ -609,40 +625,71 @@ function hasVideoDecoder(): boolean {
  */
 export class WebDemuxerEngine implements MediaEngine {
   readonly id = ENGINE_ID;
+  readonly configUsed: WebDemuxerConfigUsed = {
+    framework: 'web-demuxer',
+    packageVersions: { 'web-demuxer': '4.0.0' },
+    backend: 'worker-ffmpeg-wasm',
+    hardwareAcceleration: 'browser-default-unexposed',
+    workerCount: 1,
+    threadCount: 0,
+    readerMode: 'package-stream-or-bounded-iso-bmff-range',
+    writerMode: 'none',
+    targetMode: 'none',
+    codecConfigs: [],
+    package: 'web-demuxer@4.0.0',
+    lockIntegrity: 'sha512-QFsKe8SNjP6MDtAw2lWfyVmX2wXIpDUT+9p2KHXJb5OPWdhVbjBHcV06tDMXzuU1T6Y1P9TRm9bkeVXEwy0dVw==',
+    wasmExport: 'web-demuxer/wasm',
+    wasmFlavor: 'full',
+    wasmUrlPolicy: 'same-origin',
+    readinessBoundary: 'init-load-barrier',
+    cleanupBoundary: 'cancel-readers-close-frames-destroy-worker',
+    parserBackend: 'worker-ffmpeg-wasm',
+    limits: {
+      packetRows: MAX_PACKET_ROWS,
+      decodedFrames: MAX_DECODE_FRAMES,
+      retainedPixelBytes: MAX_RETAINED_PIXEL_BYTES,
+      seekChunks: MAX_SEEK_CHUNKS,
+    },
+    lifecycle: { initAttempts: 0, readyCount: 0, loadCount: 0, destroyCount: 0 },
+  };
 
   /** Library constructor, captured in init() (dynamic import keeps the suite shell light). */
   private WebDemuxerCtor: typeof WebDemuxerType | null = null;
   /** Reused demuxer instance so the WASM compiles ONCE; each op load()s its own input. */
   private demuxer: WebDemuxerType | null = null;
+  private lifecycleState: 'new' | 'initializing' | 'ready' | 'disposing' | 'disposed' = 'new';
+  private initPromise: Promise<void> | null = null;
+  private disposePromise: Promise<void> | null = null;
+  private readonly dependencies: Required<Pick<WebDemuxerEngineDependencies, 'importModule' | 'now'>> &
+    Omit<WebDemuxerEngineDependencies, 'importModule' | 'now'>;
+
+  constructor(dependencies: WebDemuxerEngineDependencies = {}) {
+    this.dependencies = {
+      importModule: dependencies.importModule ?? (() => import('web-demuxer')),
+      now: dependencies.now ?? nowMs,
+      ...(dependencies.wasmAssetUrl !== undefined ? { wasmAssetUrl: dependencies.wasmAssetUrl } : {}),
+      ...(dependencies.locationHref !== undefined ? { locationHref: dependencies.locationHref } : {}),
+    };
+  }
 
   capabilities(): CapabilitySet {
     return {
-      // HONEST: web-demuxer is a demuxer/parser only. probe/demux/seek are its own work. decodeFrames
-      // is implemented but its PIXELS come from the browser's WebCodecs; it self-gates on
-      // VideoDecoder.isConfigSupported() and throws (→ clean ERROR) when the browser can't configure
-      // the codec — see the 'webcodecs:independent' rationale in the file header.
+      // The support(request) hook narrows these flat discovery facts by complete operation tuple.
+      // decodeFrames/seek additionally probe the exact browser decoder config immediately before use.
       operations: {
         probe: true,
         demux: true,
         seek: true,
         decodeFrames: true,
       },
-      // Read side with the FULL prebuilt wasm. Only canonical tokens the suite recognizes are
-      // declared; the full build also parses avi/flv/asf/mpeg. 'ts' (MPEG-TS) IS declared because
-      // PROBE is fully runnable for it: getMediaInfo()/getAVStreams() parse the container + streams,
-      // and this adapter's own MPEG-TS AAC byte parser (aacAudioConfigFromMpegTs) fills in sampleRate/
-      // channels — all reader-independent, no AVPacketReader involved. The DEMUX packet path is a
-      // DIFFERENT story: v4.0.0's packet-stream reader returns a null AVPacketReader for MPEG-TS in
-      // this browser/package combination, so demux() SELF-NAs at runtime for 'ts' (see the narrow
-      // catch in demux()) — recorded as a clean NA, never a fabricated pass. Declaring 'ts' here lets
-      // the reader-independent probe cells run honestly without claiming TS packet demux works.
-      containersIn: ['mp4', 'mov', 'mkv', 'webm', 'ts'],
+      // TS remains declared because parser-only probe is valid; packet/decode/seek tuples self-NA.
+      containersIn: [...WEB_DEMUXER_INPUT_CONTAINERS],
       // Demuxer writes nothing.
       containersOut: [],
       // Codecs web-demuxer can identify + packetize from these containers. Pixel decode (decodeFrames
       // / seek) routes through the browser's WebCodecs and self-gates via isConfigSupported().
-      videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
-      audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis'],
+      videoCodecs: [...WEB_DEMUXER_VIDEO_CODECS],
+      audioCodecs: [...WEB_DEMUXER_AUDIO_CODECS],
       encryption: [],
       // 'metadata:read' : probe reads container/duration/dims/fps/rotation/language/tags.
       // 'multitrack'    : demux reads EVERY stream (incl. 2nd+ same-type tracks) via each stream's
@@ -650,9 +697,6 @@ export class WebDemuxerEngine implements MediaEngine {
       // 'metadata:protected-tracks' : probe reports encrypted MP4 track metadata without decrypting.
       // 'rotation:read' : surfaces WebAVStream.rotation in NormalizedTrack.rotation.
       // 'seek:keyframe' : seek() lands on the preceding keyframe (AVSEEK_FLAG_BACKWARD).
-      // 'webcodecs:independent' : probe/demux are pure WASM and never touch the browser codec gate, so
-      //                   the runner must NOT browser-gate them on codec availability (matches mp4box;
-      //                   see the file header for the full rationale + accepted decode/seek trade-off).
       features: [
         'metadata:read',
         'metadata:protected-tracks',
@@ -660,50 +704,110 @@ export class WebDemuxerEngine implements MediaEngine {
         'rotation:read',
         'seek:keyframe',
         'decode:golden-rgba',
-        'webcodecs:independent',
       ],
+      probeReadModes: ['whole-file'],
     };
   }
 
-  async init(): Promise<void> {
-    if (this.demuxer) return;
-    let mod: typeof import('web-demuxer');
+  supports(request: ConcreteOperationRequest): SupportDecision {
+    return decideWebDemuxerSupport(request);
+  }
+
+  async init(context?: LifecycleContext): Promise<void> {
+    if (this.lifecycleState === 'ready') return;
+    if (this.lifecycleState === 'disposed' || this.lifecycleState === 'disposing') {
+      throw new Error(`${ENGINE_ID}: init() cannot follow dispose()`);
+    }
+    if (this.initPromise) return this.initPromise;
+    this.lifecycleState = 'initializing';
+    this.configUsed.lifecycle.initAttempts++;
+    this.initPromise = this.initialize(context);
     try {
-      // Dynamic import keeps the suite shell light (rule: load the heavy lib inside init()).
-      mod = await import('web-demuxer');
-    } catch (e) {
-      throw new Error(`${ENGINE_ID}: failed to import web-demuxer: ${describeError(e)}`);
+      await this.initPromise;
+      this.lifecycleState = 'ready';
+      this.configUsed.lifecycle.readyCount++;
+    } catch (error) {
+      this.lifecycleState = 'new';
+      throw error;
+    } finally {
+      this.initPromise = null;
+    }
+  }
+
+  private async initialize(context?: LifecycleContext): Promise<void> {
+    const startedAt = this.dependencies.now();
+    throwIfAborted(context?.signal);
+    let mod: Pick<typeof import('web-demuxer'), 'WebDemuxer'>;
+    try {
+      mod = await raceAbort(this.dependencies.importModule(), context?.signal);
+    } catch (error) {
+      if (isNamedError(error, 'AbortError')) throw error;
+      throw new Error(`${ENGINE_ID}: failed to import web-demuxer: ${describeError(error)}`, { cause: error });
     }
     this.WebDemuxerCtor = mod.WebDemuxer;
-    // The wasm is fetched INSIDE web-demuxer's bundled WORKER, whose base origin is opaque (blob:),
-    // so a ROOT-RELATIVE url (Vite `?url` yields '/node_modules/.../web-demuxer.wasm') fails to parse
-    // there ("Failed to parse URL"). Resolve to an ABSOLUTE same-origin URL against the page origin so
-    // the worker can fetch it (still local, no CDN — §0.8).
-    const absWasmUrl = new URL(wasmUrl, globalThis.location?.href ?? 'http://localhost/').href;
+    const baseHref = this.dependencies.locationHref ?? globalThis.location?.href ?? 'http://localhost/';
+    const absWasmUrl = new URL(this.dependencies.wasmAssetUrl ?? wasmUrl, baseHref).href;
+    const base = new URL(baseHref);
+    const resolved = new URL(absWasmUrl);
+    if ((base.protocol === 'http:' || base.protocol === 'https:') && resolved.origin !== base.origin) {
+      throw new Error(`${ENGINE_ID}: refusing cross-origin WASM URL ${absWasmUrl}`);
+    }
     try {
-      // Construct with a LOCAL, content-hashed wasm URL (Vite `?url`); NEVER the default CDN path
-      // (§0.8). Constructing spawns the bundled worker; the WASM compile (the one heavy one-time
-      // cost) happens on first load() inside that worker — within init()'s untimed bracket since the
-      // runner awaits init() before begin(). We touch the worker now so the import/compile is paid
-      // here rather than during a measured op.
-      this.demuxer = new this.WebDemuxerCtor({ wasmFilePath: absWasmUrl });
-    } catch (e) {
+      const demuxer = new this.WebDemuxerCtor({ wasmFilePath: absWasmUrl });
+      this.demuxer = demuxer;
+      // load() first awaits the package's private worker/WASM readiness promise and only then stores
+      // the source. A zero-byte sentinel therefore provides a public readiness barrier without parse.
+      await raceAbort(
+        demuxer.load('data:application/octet-stream;base64,'),
+        context?.signal,
+        () => this.destroyDemuxer(),
+      );
+      this.configUsed.lifecycle.readinessMs = this.dependencies.now() - startedAt;
+    } catch (error) {
+      try {
+        this.destroyDemuxer();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `${ENGINE_ID}: readiness and cleanup both failed`);
+      }
+      if (isNamedError(error, 'AbortError')) throw error;
       throw new Error(
-        `${ENGINE_ID}: failed to construct WebDemuxer (wasmFilePath=${absWasmUrl}): ${describeError(e)}`,
+        `${ENGINE_ID}: failed to construct/ready WebDemuxer (wasmFilePath=${absWasmUrl}): ${describeError(error)}`,
+        { cause: error },
       );
     }
   }
 
-  async dispose(): Promise<void> {
-    if (this.demuxer) {
-      try {
-        this.demuxer.destroy(); // terminate worker + free WASM heap (clean peak-memory)
-      } catch {
-        /* destroy is best-effort */
+  async dispose(context?: LifecycleContext): Promise<void> {
+    if (this.lifecycleState === 'disposed') return;
+    if (this.disposePromise) return this.disposePromise;
+    this.lifecycleState = 'disposing';
+    this.disposePromise = (async () => {
+      if (this.initPromise) {
+        try {
+          await this.initPromise;
+        } catch {
+          // Initialization failure is reported by init(); disposal still completes owned cleanup.
+        }
       }
-      this.demuxer = null;
+      // Disposal is mandatory cleanup. An already-aborted cell signal must not skip worker teardown.
+      void context;
+      this.destroyDemuxer();
+      this.WebDemuxerCtor = null;
+      this.lifecycleState = 'disposed';
+    })();
+    try {
+      await this.disposePromise;
+    } finally {
+      this.disposePromise = null;
     }
-    this.WebDemuxerCtor = null;
+  }
+
+  private destroyDemuxer(): void {
+    const demuxer = this.demuxer;
+    if (!demuxer) return;
+    this.demuxer = null;
+    demuxer.destroy();
+    this.configUsed.lifecycle.destroyCount++;
   }
 
   private requireDemuxer(): WebDemuxerType {
@@ -712,30 +816,35 @@ export class WebDemuxerEngine implements MediaEngine {
   }
 
   /** Load a MediaInput into the demuxer worker. web-demuxer's load() takes a File|URL string. Normal
-   *  corpus assets use their same-origin URL so huge probes do not materialize multi-GB Blobs; mutated
-   *  robustness inputs use a File so the rewritten bytes are what the engine reads. */
-  private async loadInput(input: MediaInput): Promise<WebDemuxerType> {
+   *  HTTP corpus assets use their same-origin URL so huge probes do not materialize multi-GB Blobs.
+   *  Object URLs are realm-local and cannot be fetched by the package worker, so runner-created
+   *  blob inputs (as well as mutated inputs) must cross the boundary as a File. */
+  private async loadInput(input: MediaInput, context?: OperationContext): Promise<WebDemuxerType> {
     const d = this.requireDemuxer();
-    if (!input.mutated) {
-      await d.load(input.url);
+    throwIfAborted(context?.signal);
+    this.configUsed.lifecycle.loadCount++;
+    if (!input.mutated && !/^blob:/i.test(input.url)) {
+      await raceAbort(d.load(input.url), context?.signal, () => this.destroyDemuxer());
       return d;
     }
-    const blob = await input.blob();
+    const blob = await raceAbort(input.blob(), context?.signal, () => this.destroyDemuxer());
     const name = input.id || 'input';
     // File extends Blob; the worker reads from it via FFmpeg's IO shim. Type set from the blob.
     const file = new File([blob], name, { type: blob.type || input.mime || 'application/octet-stream' });
-    await d.load(file);
+    await raceAbort(d.load(file), context?.signal, () => this.destroyDemuxer());
     return d;
   }
 
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
 
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
-    const d = await this.loadInput(input);
-    const info = await d.getMediaInfo();
-    const streams = await d.getAVStreams();
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    const d = await this.loadInput(input, context);
+    const info = await raceAbort(d.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
+    const streams = await raceAbort(d.getAVStreams(), context?.signal, () => this.destroyDemuxer());
     const metadata = toNormalizedMetadata(info, input, streams);
-    return withTsAacMetadataFromInput(input, metadata);
+    const normalized = await withTsAacMetadataFromInput(input, metadata, context?.signal);
+    normalized.probeEvidence = { readMode: 'whole-file' };
+    return normalized;
   }
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
@@ -758,286 +867,583 @@ export class WebDemuxerEngine implements MediaEngine {
    *   - trackIndex is set to the same absolute WebAVStream.index so it lines up with the
    *     NormalizedMetadata.tracks ordering (getMediaInfo().streams / getAVStreams() are index-aligned).
    *
-   * Each WebAVPacket carries only a presentation timestamp (SECONDS) and a 0|1 keyframe flag; there
-   * is no DTS field, so we report dtsUs === ptsUs (honest: the lib exposes no decode timeline).
+   * Each WebAVPacket carries only a presentation timestamp (SECONDS) and a 0|1 keyframe flag. DTS is
+   * absent rather than fabricated. Packet payloads are inspected for semantic framing/random-access
+   * evidence but are not retained in the normalized row.
    */
-  async demux(input: MediaInput): Promise<DemuxResult> {
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
     if (shouldUseProgressiveMp4SampleTableFastPath(input)) {
-      return demuxProgressiveMp4SampleTable(input);
+      this.configUsed.lastDemuxBackend = 'iso-bmff-sample-table';
+      return demuxProgressiveMp4SampleTable(input, {
+        signal: context?.signal,
+        emit: context?.emit,
+      });
     }
 
-    const d = await this.loadInput(input);
-    const info = await d.getMediaInfo();
-    const streams = await d.getAVStreams();
-    const metadata = toNormalizedMetadata(info, input, streams);
+    this.configUsed.lastDemuxBackend = 'worker-ffmpeg-wasm';
+    const startedAt = this.dependencies.now();
+    const d = await this.loadInput(input, context);
+    const info = await raceAbort(d.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
+    const supplementalStreams = await raceAbort(d.getAVStreams(), context?.signal, () => this.destroyDemuxer());
+    const streams = mergeNormalizedStreams(info.streams ?? [], supplementalStreams);
+    const metadata = toNormalizedMetadata({ ...info, streams }, input);
+    const indexMap = streamIndexToTrackIndex(streams);
 
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;
 
-    // MPEG-TS guard (capabilities() declares 'ts' for PROBE only): in vendored web-demuxer v4.0.0 the
-    // worker cannot construct an AVPacketReader for MPEG-TS packet streams, so the readAVPacket
-    // ReadableStream errors at the first reader.read() below. That is a confirmed LIBRARY limitation,
-    // not a bug here — so for 'ts' input we translate ONLY that reader-construction failure into a
-    // runtime NotApplicableError (clean NA_ENGINE), never a fabricated pass and never an ERROR. Any
-    // other failure on a TS read still propagates unchanged as a genuine ERROR.
+    // MPEG-TS probe is valid, but the pinned package's packet-stream constructor is not. Decide this
+    // from the concrete container before reading; never infer applicability from worker message text.
     const isTsInput = metadata.container === 'ts';
+    if (isTsInput && !input.mutated) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'demux',
+        'web-demuxer v4.0.0 cannot construct an AVPacketReader for MPEG-TS packet streams',
+        { inputContainers: ['ts'], inputCodecs: [], outputCodecs: [] },
+        WEB_DEMUXER_REASON.TS_PACKETS,
+      );
+    }
+
+    if (streams.some((stream) => trackTypeOf(stream) === 'other') && !input.mutated) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'demux',
+        'web-demuxer does not expose packet reads for data/attachment tracks',
+        context ? webDemuxerTupleSummary(context.request) : { inputContainers: [metadata.container] },
+        WEB_DEMUXER_REASON.TRACK_TYPE,
+      );
+    }
 
     const packets: PacketInfo[] = [];
+    const representations: NonNullable<DemuxResult['representations']> = [];
+    let packetBytes = 0;
     for (const stream of streams) {
+      throwIfAborted(context?.signal);
       const type = trackTypeOf(stream);
       if (!isPacketizedTrackType(type)) continue; // skip data/attachment streams we don't packetize
       const avType = avMediaTypeOf(type);
-
-      const trackIndex = stream.index; // absolute index → aligns with metadata.tracks and AVPacketReader
-      const reader = d.readAVPacket(0, endSec, avType, trackIndex).getReader();
+      const trackIndex = indexMap.get(stream.index);
+      if (trackIndex === undefined) throw new Error(`${ENGINE_ID}: stream ${stream.index} has no normalized track mapping`);
+      const codec = metadata.tracks[trackIndex]?.codec;
+      if (!codec) throw new Error(`${ENGINE_ID}: normalized track ${trackIndex} has no codec`);
+      const accumulator = createTrackEvidenceAccumulator(trackIndex, type, codec, stream);
+      const reader = d.readAVPacket(0, endSec, avType, stream.index).getReader();
+      let completed = false;
+      let primaryError: unknown;
       try {
         for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const pkt = value as WebAVPacket;
-          const ptsUs = secToUs(pkt.timestamp);
-          packets.push({
-            trackIndex,
-            size: pkt.size,
-            ptsUs,
-            dtsUs: ptsUs, // no DTS in WebAVPacket — honest approximation
-            keyframe: pkt.keyframe === 1,
+          const { done, value } = await raceAbort(reader.read(), context?.signal, () => {
+            void reader.cancel(context?.signal.reason).catch(() => undefined);
           });
+          if (done) {
+            completed = true;
+            break;
+          }
+          const pkt = value as WebAVPacket;
+          if (packets.length >= MAX_PACKET_ROWS) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'demux',
+              `packet row budget ${MAX_PACKET_ROWS} exceeded`,
+              context ? webDemuxerTupleSummary(context.request) : { inputContainers: [metadata.container] },
+              WEB_DEMUXER_REASON.MEMORY_BUDGET,
+            );
+          }
+          packets.push(await packetEvidenceFromWebPacket(pkt, accumulator, context?.signal));
+          packetBytes += pkt.data.byteLength;
+          context?.emit({ type: 'bytes-read', atMs: this.dependencies.now() - startedAt, bytes: packetBytes });
         }
       } catch (err) {
-        // Narrow self-NA: only the TS-input + AVPacketReader-construction-failure case. Honest about
-        // the limitation — do NOT represent TS packet demux as working.
-        if (isTsInput && isTsAvPacketReaderConstructionFailure(err)) {
-          throw new NotApplicableError(
-            'demux',
-            'web-demuxer v4.0.0 cannot construct an AVPacketReader for MPEG-TS packet streams',
-          );
-        }
-        throw err; // any other failure → genuine ERROR
+        primaryError = err;
+        throw err; // malformed/corrupt/worker failures remain ordinary ERROR/FAIL evidence
       } finally {
-        try {
-          reader.releaseLock();
-        } catch {
-          /* ignore */
-        }
+        await settleReader(reader, completed, primaryError);
       }
+      const representation = finishTrackRepresentation(accumulator);
+      if (representation) representations.push(representation);
     }
 
-    // Stable, engine-independent ordering: by pts then trackIndex (we have no DTS to order by).
+    // Stable presentation ordering. The package exposes no DTS; absence remains explicit.
     packets.sort((a, b) => a.ptsUs - b.ptsUs || a.trackIndex - b.trackIndex);
-    return { metadata, packets };
+    const telemetry = { bytesRead: packetBytes, packetCount: packets.length };
+    metadata.telemetry = telemetry;
+    return {
+      metadata,
+      packets,
+      packetOrdering: 'presentation',
+      representations,
+      telemetry,
+      backendEvidence: {
+        backend: 'worker-ffmpeg-wasm',
+        package: ENGINE_ID,
+        packetCount: packets.length,
+        payloadBytesObserved: packetBytes,
+        payloadEvidence: 'semantic-access-unit-id+raw-payload-sha256-when-webcrypto-present',
+        dtsEvidence: 'absent',
+        peakRetainedBytesEstimate:
+          packetBytes
+          + packets.length * 256
+          + representations.reduce((sum, item) => sum + (item.description?.byteLength ?? 0), 0),
+        trackIndexMap: Object.fromEntries([...indexMap.entries()].map(([source, normalized]) => [String(source), normalized])),
+      },
+    } as DemuxResult;
   }
 
   // ── decodeFrames ─────────────────────────────────────────────────────────────────────────────
 
   /**
-   * Decode the primary video track to normalized RGBA frame digests via the WebCodecs VideoDecoder.
-   * web-demuxer supplies the VideoDecoderConfig (incl. extradata description) and a streaming
-   * `read('video')` of EncodedVideoChunks (timestamps already in microseconds); we feed them to a
-   * VideoDecoder in a pipelined loop (dossier §6 best path), rasterize each VideoFrame to ImageData,
-   * and digest. Pixels are the BROWSER's — config support is checked first so an unsupported codec
-   * (e.g. HEVC/AV1 on a browser that can't configure it) fails LOUDLY rather than faking a pass.
-   *
-   * maxFrames means "the first N frames IN PRESENTATION ORDER". The decoder EMITS frames in DECODE
-   * order, which for B-frame streams differs from presentation order, so we must NOT truncate at the
-   * decoder output to maxFrames (that could close an early-pts frame that arrives late and keep a
-   * higher-pts one). Instead we buffer up to a slightly larger reorder window (submitCap), then sort
-   * by pts and slice to maxFrames — guaranteeing the lowest-pts N are returned for any reorder depth
-   * up to the window margin.
+   * Decode the selected package video stream with one exact, pre-probed VideoDecoderConfig. Callback
+   * order is not trusted: a bounded selector retains the lowest real PTS values and sorts them before
+   * raster/digest. Any later reader/decoder failure invalidates the surviving partial frames.
    */
-  async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
-    if (!hasVideoDecoder()) {
-      throw new Error(`${ENGINE_ID}: VideoDecoder/EncodedVideoChunk unavailable in this realm`);
+  async decodeFrames(
+    input: MediaInput,
+    opts?: DecodeOptions,
+    context?: OperationContext,
+  ): Promise<FrameSink> {
+    const startedAt = this.dependencies.now();
+    const prepared = await this.prepareVideoRuntime(input, 'decodeFrames', context, opts?.track);
+    const maxFrames = resolveDecodeFrameLimit(
+      opts?.maxFrames,
+      prepared.stream,
+      prepared.config,
+      context,
+    );
+    const sink = new RetainingFrameSink();
+    if (maxFrames === 0) {
+      sink.telemetry = { decodedFrames: 0 };
+      return sink;
     }
-    const d = await this.loadInput(input);
-    const config = (await d.getDecoderConfig('video')) as VideoDecoderConfig;
 
-    const support = await VideoDecoder.isConfigSupported(decoderConfigForSupport(config)).catch(() => null);
-    if (!support || support.supported !== true) {
-      throw new Error(`${ENGINE_ID}: VideoDecoder config not supported: ${config.codec}`);
-    }
-
-    const maxFrames = opts?.maxFrames ?? Number.POSITIVE_INFINITY;
-    // Buffer a reorder window past maxFrames so B-frame-reordered presentation frames are all present
-    // before we pick the lowest-pts maxFrames. Also bounds how many chunks we submit (pipelining).
-    const submitCap = Number.isFinite(maxFrames) ? maxFrames + 16 : Number.POSITIVE_INFINITY;
-    const collected: Array<{ ptsUs: number; frame: VideoFrame }> = [];
-    let decodeError: Error | undefined;
-
+    const collected: TimedClosable<VideoFrame>[] = [];
+    const exhaustive = opts?.maxFrames === undefined;
+    const decodeTuple = context ? webDemuxerTupleSummary(context.request) : {};
+    let callbackCount = 0;
+    let firstFrameMs: number | undefined;
+    let callbackError: unknown;
+    let primaryError: unknown;
+    let arrivalIndex = 0;
     const decoder = new VideoDecoder({
       output: (frame) => {
-        // Retain up to the reorder window (NOT maxFrames) so a late-arriving low-pts frame is kept;
-        // the final lowest-pts maxFrames selection happens after the pts sort below.
-        if (collected.length >= submitCap) {
+        callbackCount++;
+        const atMs = this.dependencies.now() - startedAt;
+        if (callbackCount === 1) {
+          firstFrameMs = atMs;
+          context?.emit({ type: 'first-frame', atMs });
+        }
+        context?.emit({ type: 'decoded-frame-count', atMs, count: callbackCount });
+        if (exhaustive && callbackCount > maxFrames) {
           frame.close();
+          callbackError ??= createNotApplicableError(
+            ENGINE_ID,
+            'decodeFrames',
+            `unbounded decode exceeds retained frame budget ${maxFrames}`,
+            decodeTuple,
+            WEB_DEMUXER_REASON.MEMORY_BUDGET,
+          );
           return;
         }
-        collected.push({ ptsUs: frame.timestamp, frame });
+        retainLowestPts(
+          collected,
+          { ptsUs: Math.round(frame.timestamp), value: frame, arrivalIndex: arrivalIndex++ },
+          maxFrames,
+        );
       },
-      error: (e) => {
-        decodeError = e instanceof Error ? e : new Error(String(e));
+      error: (error) => {
+        callbackError = error;
       },
     });
 
+    const endSec = prepared.durationSec == null ? 1e9 : prepared.durationSec + 1;
+    const reader = prepared.demuxer
+      .readAVPacket(0, endSec, AV_MEDIA_VIDEO, prepared.stream.index)
+      .getReader();
+    let completed = false;
+    let submittedChunks = 0;
     try {
-      decoder.configure(config);
-
-      // Pipelined streaming read: enqueue chunks as they arrive; cap submission at submitCap (a little
-      // past maxFrames) so B-frame reordering can flush enough presentation frames.
-      const reader = d.read('video').getReader();
-      let submitted = 0;
-      try {
-        for (;;) {
-          if (decodeError || submitted >= submitCap) break;
-          const { done, value } = await reader.read();
-          if (done) break;
-          decoder.decode(value as EncodedVideoChunk);
-          submitted++;
+      decoder.configure(prepared.config);
+      for (;;) {
+        throwIfAborted(context?.signal);
+        if (callbackError !== undefined) {
+          primaryError = callbackError;
+          break;
         }
-      } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          /* ignore */
+        const { done, value } = await raceAbort(reader.read(), context?.signal, () =>
+          reader.cancel(context?.signal.reason),
+        );
+        if (done) {
+          completed = true;
+          break;
         }
-        try {
-          reader.releaseLock();
-        } catch {
-          /* ignore */
+        if (submittedChunks >= MAX_PACKET_ROWS) {
+          primaryError = createNotApplicableError(
+            ENGINE_ID,
+            'decodeFrames',
+            `decode exceeds encoded-chunk budget ${MAX_PACKET_ROWS}`,
+            decodeTuple,
+            WEB_DEMUXER_REASON.MEMORY_BUDGET,
+          );
+          break;
+        }
+        decoder.decode(prepared.demuxer.genEncodedChunk('video', value as WebAVPacket));
+        submittedChunks++;
+        if (decoder.decodeQueueSize >= 64) {
+          await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
         }
       }
-      await decoder.flush();
-    } catch (e) {
-      for (const c of collected) c.frame.close();
-      throw e instanceof Error ? e : new Error(String(e));
+      if (primaryError === undefined) {
+        await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        if (callbackError !== undefined) primaryError = callbackError;
+      }
+    } catch (error) {
+      primaryError = callbackError === undefined
+        ? error
+        : combineErrors(callbackError, error, 'web-demuxer decode callback and operation both failed');
     } finally {
       try {
-        decoder.close();
-      } catch {
-        /* already closed */
+        await settleReader(reader, completed);
+      } catch (cleanupError) {
+        primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer decode reader cleanup failed');
+      }
+      try {
+        closeDecoder(decoder);
+      } catch (cleanupError) {
+        primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer decoder cleanup failed');
       }
     }
 
-    if (decodeError && collected.length === 0) throw decodeError;
-
-    // Sort the buffered reorder window by presentation time, THEN take the lowest-pts maxFrames. This
-    // makes the cap retain the first-N-by-presentation even when the decoder emitted them out of order
-    // (B-frames), rather than the first-N-by-decode-arrival.
-    collected.sort((a, b) => a.ptsUs - b.ptsUs);
-    const emit = collected.slice(0, Number.isFinite(maxFrames) ? maxFrames : collected.length);
-
-    const sink = new RetainingFrameSink();
-    try {
-      for (let i = 0; i < emit.length; i++) {
-        const { ptsUs, frame } = emit[i]!;
-        const img = await imageDataFromVideoFrame(frame);
-        const digest = await digestImageData(img, i, ptsUs);
-        sink.add(digest, img);
+    if (primaryError !== undefined) {
+      const emittedFrames = callbackCount;
+      primaryError = closeFrameSet(collected, primaryError);
+      if (emittedFrames > 0 && !mustPreserveError(primaryError)) {
+        throw new WebDemuxerPartialDecodeError('decode', emittedFrames, primaryError);
       }
-    } finally {
-      for (const c of collected) {
-        try {
-          c.frame.close();
-        } catch {
-          /* ignore */
-        }
-      }
+      throw primaryError;
     }
+
+    sortByPresentationTime(collected);
+    let outputError: unknown;
+    try {
+      for (let index = 0; index < collected.length; index++) {
+        const { ptsUs, value: frame } = collected[index]!;
+        const image = await imageDataFromVideoFrame(frame, context?.signal);
+        sink.add(await digestImageData(image, index, ptsUs, context?.signal), image);
+        if (index === 0) opts?.onFirstFrame?.(this.dependencies.now());
+      }
+    } catch (error) {
+      outputError = error;
+    }
+    outputError = closeFrameSet(collected, outputError);
+    if (outputError !== undefined) throw outputError;
+    sink.telemetry = {
+      decodedFrames: callbackCount,
+      ...(firstFrameMs !== undefined ? { firstFrameMs } : {}),
+    };
+    sink.selectedTrack = {
+      schema: DECODE_TRACK_SELECTOR_SCHEMA,
+      type: 'video',
+      trackIndex: prepared.trackIndex,
+      typeOrdinal: prepared.typeOrdinal,
+      codec: prepared.normalizedTrack.codec,
+      ...(prepared.normalizedTrack.width !== undefined ? { width: prepared.normalizedTrack.width } : {}),
+      ...(prepared.normalizedTrack.height !== undefined ? { height: prepared.normalizedTrack.height } : {}),
+    };
     return sink;
   }
 
   // ── seek ─────────────────────────────────────────────────────────────────────────────────────
 
   /**
-   * Seek to tUs and return the landed frame's pts + digest. web-demuxer's `seek('video', tSec)`
-   * uses AVSEEK_FLAG_BACKWARD by default, returning the EncodedVideoChunk for the preceding keyframe
-   * (timestamp already in microseconds). We configure a VideoDecoder with the supplied config and
-   * decode that single keyframe chunk to obtain the landed frame's pixels → normalized RGBA digest.
+   * Seek backward with the selected low-level stream and decode until a real next-GOP boundary, not a
+   * fixed time window. Sort callbacks by PTS and choose max PTS <= target (or earliest following), then
+   * prove that timestamp came from submitted demux timing before returning pixels.
    */
-  async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    if (!hasVideoDecoder()) {
-      throw new Error(`${ENGINE_ID}: VideoDecoder/EncodedVideoChunk unavailable in this realm`);
+  async seek(input: MediaInput, tUs: number, context?: OperationContext): Promise<SeekResult> {
+    if (!Number.isFinite(tUs)) throw new TypeError(`${ENGINE_ID}: seek target must be finite`);
+    const startedAt = this.dependencies.now();
+    const prepared = await this.prepareVideoRuntime(input, 'seek', context);
+    let targetSec = Math.max(0, tUs / 1_000_000);
+    if (prepared.durationSec != null) {
+      targetSec = Math.min(targetSec, Math.max(0, prepared.durationSec - 0.000001));
     }
-    const d = await this.loadInput(input);
-    const config = (await d.getDecoderConfig('video')) as VideoDecoderConfig;
-
-    const support = await VideoDecoder.isConfigSupported(decoderConfigForSupport(config)).catch(() => null);
-    if (!support || support.supported !== true) {
-      throw new Error(`${ENGINE_ID}: VideoDecoder config not supported: ${config.codec}`);
-    }
-
-    const mediaInfo = await d.getMediaInfo().catch(() => null);
-    const durationSec =
-      mediaInfo && Number.isFinite(mediaInfo.duration) && mediaInfo.duration > 0 ? mediaInfo.duration : null;
-    let targetSec = Math.max(0, tUs / 1e6);
-    if (durationSec != null) targetSec = Math.min(targetSec, Math.max(0, durationSec - 0.001));
-    const targetUs = Math.round(targetSec * 1e6);
-    const readEndSec = durationSec == null ? targetSec + 0.75 : Math.min(durationSec, targetSec + 0.75);
-
-    const decoded: Array<{ ptsUs: number; frame: VideoFrame }> = [];
-    let decodeError: Error | undefined;
-
+    const targetUs = Math.round(targetSec * 1_000_000);
+    const endSec = prepared.durationSec == null ? 1e9 : prepared.durationSec + 1;
+    const decoded: TimedClosable<VideoFrame>[] = [];
+    const submittedPtsUs: number[] = [];
+    let callbackCount = 0;
+    let firstFrameMs: number | undefined;
+    let arrivalIndex = 0;
+    let callbackError: unknown;
+    let primaryError: unknown;
+    const retainedFrameBudget = Math.max(
+      1,
+      Math.min(
+        MAX_SEEK_CHUNKS,
+        Math.floor(MAX_RETAINED_PIXEL_BYTES / Math.max(1, decoderPixelBytes(prepared.config))),
+      ),
+    );
+    const tuple = context ? webDemuxerTupleSummary(context.request) : {};
     const decoder = new VideoDecoder({
       output: (frame) => {
-        decoded.push({ ptsUs: Math.round(frame.timestamp), frame });
+        callbackCount++;
+        const atMs = this.dependencies.now() - startedAt;
+        if (callbackCount === 1) {
+          firstFrameMs = atMs;
+          context?.emit({ type: 'first-frame', atMs });
+        }
+        context?.emit({ type: 'decoded-frame-count', atMs, count: callbackCount });
+        if (decoded.length >= retainedFrameBudget) {
+          frame.close();
+          callbackError ??= createNotApplicableError(
+            ENGINE_ID,
+            'seek',
+            `seek GOP exceeds retained frame budget ${retainedFrameBudget}`,
+            tuple,
+            WEB_DEMUXER_REASON.MEMORY_BUDGET,
+          );
+          return;
+        }
+        decoded.push({ ptsUs: Math.round(frame.timestamp), value: frame, arrivalIndex: arrivalIndex++ });
       },
-      error: (e) => {
-        decodeError = e instanceof Error ? e : new Error(String(e));
+      error: (error) => {
+        callbackError = error;
       },
     });
 
+    const reader = prepared.demuxer
+      .readAVPacket(targetSec, endSec, AV_MEDIA_VIDEO, prepared.stream.index, AV_SEEK_FLAG_BACKWARD)
+      .getReader();
+    let completed = false;
+    let sawAtOrBeforeTarget = false;
+    let keysAfterTarget = 0;
     try {
-      decoder.configure(config);
-      const reader = d.read('video', targetSec, readEndSec, AV_SEEK_FLAG_BACKWARD).getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          decoder.decode(value as EncodedVideoChunk);
+      decoder.configure(prepared.config);
+      for (;;) {
+        throwIfAborted(context?.signal);
+        if (callbackError !== undefined) {
+          primaryError = callbackError;
+          break;
         }
-      } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          /* ignore */
+        const { done, value } = await raceAbort(reader.read(), context?.signal, () =>
+          reader.cancel(context?.signal.reason),
+        );
+        if (done) {
+          completed = true;
+          break;
         }
-        try {
-          reader.releaseLock();
-        } catch {
-          /* ignore */
+        if (submittedPtsUs.length >= MAX_SEEK_CHUNKS) {
+          primaryError = createNotApplicableError(
+            ENGINE_ID,
+            'seek',
+            `seek GOP exceeds packet budget ${MAX_SEEK_CHUNKS}`,
+            tuple,
+            WEB_DEMUXER_REASON.MEMORY_BUDGET,
+          );
+          break;
         }
+        const chunk = prepared.demuxer.genEncodedChunk('video', value as WebAVPacket);
+        const priorAtOrBefore = sawAtOrBeforeTarget;
+        sawAtOrBeforeTarget ||= chunk.timestamp <= targetUs;
+        if (chunk.type === 'key' && chunk.timestamp > targetUs) keysAfterTarget++;
+        submittedPtsUs.push(Math.round(chunk.timestamp));
+        decoder.decode(chunk);
+        const reachedBoundary = seekGopProgressSatisfied(chunk, targetUs, priorAtOrBefore)
+          || (!sawAtOrBeforeTarget && keysAfterTarget >= 2);
+        if (decoder.decodeQueueSize >= 64 || reachedBoundary) {
+          await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        }
+        if (reachedBoundary) break;
       }
-      await decoder.flush();
-    } catch (e) {
-      throw e instanceof Error ? e : new Error(String(e));
+      if (primaryError === undefined) {
+        await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        if (callbackError !== undefined) primaryError = callbackError;
+      }
+    } catch (error) {
+      primaryError = callbackError === undefined
+        ? error
+        : combineErrors(callbackError, error, 'web-demuxer seek callback and operation both failed');
     } finally {
       try {
-        decoder.close();
-      } catch {
-        /* already closed */
+        await settleReader(reader, completed);
+      } catch (cleanupError) {
+        primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer seek reader cleanup failed');
+      }
+      try {
+        closeDecoder(decoder);
+      } catch (cleanupError) {
+        primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer seek decoder cleanup failed');
       }
     }
 
-    let landed: { ptsUs: number; frame: VideoFrame } | null = null;
-    for (const candidate of decoded) {
-      if (candidate.ptsUs <= targetUs || !landed) landed = candidate;
+    if (primaryError !== undefined) {
+      const emittedFrames = callbackCount;
+      primaryError = closeFrameSet(decoded, primaryError);
+      if (emittedFrames > 0 && !mustPreserveError(primaryError)) {
+        throw new WebDemuxerPartialDecodeError('seek', emittedFrames, primaryError);
+      }
+      throw primaryError;
+    }
+
+    sortByPresentationTime(decoded);
+    let landed: TimedClosable<VideoFrame> | undefined;
+    try {
+      landed = selectSeekLanding(decoded, targetUs, submittedPtsUs);
+    } catch (error) {
+      throw closeFrameSet(decoded, error);
     }
     if (!landed) {
-      throw decodeError ?? new Error(`${ENGINE_ID}: seek produced no frame at ${tUs}us`);
+      throw closeFrameSet(decoded, new Error(`${ENGINE_ID}: seek produced no decoded frame at ${tUs}us`));
     }
+    let result: SeekResult | undefined;
+    let outputError: unknown;
     try {
-      const img = await imageDataFromVideoFrame(landed.frame);
-      const frame = await digestImageData(img, 0, landed.ptsUs);
-      return { landedPtsUs: landed.ptsUs, frame };
-    } finally {
-      for (const c of decoded) {
-        try {
-          c.frame.close();
-        } catch {
-          /* ignore */
-        }
-      }
+      const image = await imageDataFromVideoFrame(landed.value, context?.signal);
+      const frame = await digestImageData(image, 0, landed.ptsUs, context?.signal);
+      result = {
+        landedPtsUs: landed.ptsUs,
+        frame,
+        telemetry: {
+          decodedFrames: callbackCount,
+          ...(firstFrameMs !== undefined ? { firstFrameMs } : {}),
+        },
+      };
+    } catch (error) {
+      outputError = error;
     }
+    outputError = closeFrameSet(decoded, outputError);
+    if (outputError !== undefined) throw outputError;
+    return result!;
+  }
+
+  private async prepareVideoRuntime(
+    input: MediaInput,
+    operation: 'decodeFrames' | 'seek',
+    context?: OperationContext,
+    selector?: DecodeOptions['track'],
+  ): Promise<PreparedVideoRuntime> {
+    const demuxer = await this.loadInput(input, context);
+    const info = await raceAbort(demuxer.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
+    const supplemental = await raceAbort(demuxer.getAVStreams(), context?.signal, () => this.destroyDemuxer());
+    const streams = mergeNormalizedStreams(info.streams ?? [], supplemental);
+    const runtimeTracks = streams.map(normalizeStream);
+    const declaredTracks = context?.request.inputs[0]?.tracks;
+    const requestTracks = declaredTracks?.length ? declaredTracks : runtimeTracks;
+    const selected = selectedVideoTrack(
+      requestTracks,
+      selector
+        ? { ...(context?.request.options ?? {}), decodeTrackSelector: selector }
+        : context?.request.options ?? {},
+    );
+    const tuple = context
+      ? webDemuxerTupleSummary(context.request)
+      : {
+          inputContainers: [canonicalContainer(info.format_name, input)],
+          inputCodecs: runtimeTracks.map((track) => track.codec),
+        };
+    if ('reason' in selected) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        operation,
+        selected.reason,
+        tuple,
+        WEB_DEMUXER_REASON.TRACK_SELECTION,
+      );
+    }
+    if (selected.trackIndex === undefined) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        operation,
+        `${operation} requires a video track`,
+        tuple,
+        WEB_DEMUXER_REASON.VIDEO_REQUIRED,
+      );
+    }
+    const stream = streams[selected.trackIndex];
+    if (!stream || trackTypeOf(stream) !== 'video') {
+      throw new Error(
+        `${ENGINE_ID}: selected normalized video track ${selected.trackIndex} does not map to a package video stream`,
+      );
+    }
+
+    const exact = cloneVideoDecoderConfig(demuxer.genDecoderConfig('video', stream));
+    if (typeof exact.codec !== 'string' || exact.codec.trim().length === 0) {
+      throw new TypeError(`${ENGINE_ID}: package generated a malformed empty VideoDecoderConfig.codec`);
+    }
+    const browserConfig = {
+      role: 'video-decoder' as const,
+      trackIndex: selected.trackIndex,
+      config: exact,
+    };
+    if (!hasVideoDecoder() || typeof VideoDecoder.isConfigSupported !== 'function') {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        'VideoDecoder, EncodedVideoChunk, or VideoDecoder.isConfigSupported is unavailable',
+        tuple,
+        WEB_DEMUXER_REASON.BROWSER_API,
+        browserConfig,
+      );
+    }
+    let support: VideoDecoderSupport;
+    try {
+      support = await raceAbort(VideoDecoder.isConfigSupported(exact), context?.signal);
+    } catch (error) {
+      if (error instanceof TypeError) throw error;
+      if (isNamedError(error, 'NotSupportedError')) {
+        throw createBrowserNotSupportedError(
+          ENGINE_ID,
+          operation,
+          `the browser rejected decoder config '${exact.codec}'`,
+          tuple,
+          WEB_DEMUXER_REASON.BROWSER_CONFIG,
+          browserConfig,
+          error,
+        );
+      }
+      throw error;
+    }
+    if (!support.supported) {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        `the browser does not support decoder config '${exact.codec}'`,
+        tuple,
+        WEB_DEMUXER_REASON.BROWSER_CONFIG,
+        browserConfig,
+      );
+    }
+    if (!hasRasterSurface()) {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        'no VideoFrame RGBA readback surface is available in this browser realm',
+        tuple,
+        WEB_DEMUXER_REASON.BROWSER_RASTER,
+        browserConfig,
+      );
+    }
+    if (!hasWebCryptoDigest()) {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        'Web Crypto SHA-256 is unavailable in this browser realm',
+        tuple,
+        WEB_DEMUXER_REASON.BROWSER_CRYPTO,
+        browserConfig,
+      );
+    }
+    this.configUsed.lastDecoderConfig = cloneVideoDecoderConfig(exact);
+    this.configUsed.codecConfigs = [cloneVideoDecoderConfig(exact)];
+    return {
+      demuxer,
+      config: exact,
+      stream,
+      trackIndex: selected.trackIndex,
+      typeOrdinal: selected.typeOrdinal ?? 0,
+      normalizedTrack: runtimeTracks[selected.trackIndex]!,
+      durationSec: Number.isFinite(info.duration) && info.duration > 0 ? info.duration : null,
+    };
   }
 
   // ── Undeclared operations: web-demuxer does none of these. They throw so a mis-wired runner fails
@@ -1076,18 +1482,184 @@ export class WebDemuxerEngine implements MediaEngine {
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
-/**
- * web-demuxer's getDecoderConfig returns an EXTENDED VideoDecoderConfig with extra `rotation`/`flip`
- * fields (not part of the standard config). isConfigSupported is strict about unknown keys in some
- * engines, so we pass a trimmed copy carrying only the standard fields for the support probe; the
- * full config (with description) is still used for the actual configure().
- */
-function decoderConfigForSupport(config: VideoDecoderConfig): VideoDecoderConfig {
-  const out: VideoDecoderConfig = { codec: config.codec };
-  if (typeof config.codedWidth === 'number') out.codedWidth = config.codedWidth;
-  if (typeof config.codedHeight === 'number') out.codedHeight = config.codedHeight;
-  if (config.description) out.description = config.description;
-  return out;
+interface PreparedVideoRuntime {
+  demuxer: WebDemuxerType;
+  config: VideoDecoderConfig;
+  stream: WebAVStream;
+  trackIndex: number;
+  typeOrdinal: number;
+  normalizedTrack: NormalizedTrack;
+  durationSec: number | null;
+}
+
+function cloneVideoDecoderConfig(config: VideoDecoderConfig): VideoDecoderConfig {
+  const extended = config as VideoDecoderConfig & { rotation?: unknown; flip?: unknown };
+  const { rotation: _rotation, flip: _flip, ...standard } = extended;
+  const description = standard.description;
+  const copiedDescription = description === undefined
+    ? undefined
+    : ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength).slice()
+      : new Uint8Array(description as ArrayBuffer).slice();
+  return {
+    ...standard,
+    ...(copiedDescription ? { description: copiedDescription } : {}),
+    ...(standard.colorSpace ? { colorSpace: { ...standard.colorSpace } } : {}),
+  };
+}
+
+function resolveDecodeFrameLimit(
+  requested: number | undefined,
+  _stream: WebAVStream,
+  config: VideoDecoderConfig,
+  context?: OperationContext,
+): number {
+  const limit = requested ?? MAX_DECODE_FRAMES;
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new TypeError(`${ENGINE_ID}: maxFrames must be a non-negative safe integer`);
+  }
+  const tuple = context ? webDemuxerTupleSummary(context.request) : {};
+  if (limit > MAX_DECODE_FRAMES) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'decodeFrames',
+      `requested maxFrames ${limit} exceeds retained frame budget ${MAX_DECODE_FRAMES}`,
+      tuple,
+      WEB_DEMUXER_REASON.MEMORY_BUDGET,
+    );
+  }
+  const retainedBytes = decoderPixelBytes(config) * limit;
+  if (!Number.isSafeInteger(retainedBytes) || retainedBytes > MAX_RETAINED_PIXEL_BYTES) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'decodeFrames',
+      `requested decoded pixels require ${retainedBytes} bytes, exceeding ${MAX_RETAINED_PIXEL_BYTES}`,
+      tuple,
+      WEB_DEMUXER_REASON.MEMORY_BUDGET,
+    );
+  }
+  return limit;
+}
+
+function decoderPixelBytes(config: VideoDecoderConfig): number {
+  const width = Math.max(1, Math.trunc(config.displayAspectWidth ?? config.codedWidth ?? 1));
+  const height = Math.max(1, Math.trunc(config.displayAspectHeight ?? config.codedHeight ?? 1));
+  return width * height * 4;
+}
+
+async function raceAbort<T>(
+  promise: PromiseLike<T>,
+  signal?: AbortSignal,
+  onAbort?: () => void | PromiseLike<unknown>,
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    let cleanupError: unknown;
+    try {
+      await onAbort?.();
+    } catch (error) {
+      cleanupError = error;
+    }
+    const reason = abortReason(signal);
+    if (cleanupError !== undefined) throw new AggregateError([reason, cleanupError], 'abort cleanup failed');
+    throw reason;
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      callback();
+    };
+    const abort = (): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      const reason = abortReason(signal);
+      Promise.resolve()
+        .then(() => onAbort?.())
+        .then(
+          () => reject(reason),
+          (cleanupError) => reject(new AggregateError([reason, cleanupError], 'abort cleanup failed')),
+        );
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+async function settleReader<T>(
+  reader: ReadableStreamDefaultReader<T>,
+  completed: boolean,
+  primaryError?: unknown,
+): Promise<void> {
+  let cleanupError: unknown;
+  if (!completed) {
+    try {
+      await reader.cancel();
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  try {
+    reader.releaseLock();
+  } catch (error) {
+    cleanupError = combineErrors(cleanupError, error, 'reader release failed');
+  }
+  if (cleanupError !== undefined) {
+    throw combineErrors(primaryError, cleanupError, 'reader operation and cleanup both failed');
+  }
+}
+
+function closeDecoder(decoder: VideoDecoder): void {
+  if (decoder.state !== 'closed') decoder.close();
+}
+
+function combineErrors(primary: unknown, cleanup: unknown, message: string): unknown {
+  return primary === undefined ? cleanup : new AggregateError([primary, cleanup], message);
+}
+
+function closeFrameSet<T extends { close(): void }>(
+  frames: readonly TimedClosable<T>[],
+  primaryError?: unknown,
+): unknown {
+  try {
+    closeAll(frames);
+    return primaryError;
+  } catch (cleanupError) {
+    return combineErrors(primaryError, cleanupError, 'web-demuxer frame cleanup failed');
+  }
+}
+
+function mustPreserveError(error: unknown): boolean {
+  if (isNotApplicableError(error) || isBrowserNotSupportedError(error) || isNamedError(error, 'AbortError')) {
+    return true;
+  }
+  return error instanceof AggregateError && error.errors.some((item) => mustPreserveError(item));
+}
+
+function isNamedError(error: unknown, name: string): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === name;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason;
+  if (typeof DOMException === 'function') return new DOMException('operation aborted', 'AbortError');
+  const error = new Error('operation aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now?.() ?? Date.now();
 }
 
 /** Best-effort human description of an unknown thrown value. */

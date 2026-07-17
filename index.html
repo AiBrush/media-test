@@ -5,23 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Browser Media-Engine Benchmark Suite</title>
     <!--
-      Suite app entry (§4, §2). Vite serves src/app/main.ts as a module; opening this file via the
-      static server (scripts/serve.sh) runs the whole battery in any browser. No bundler-specific
-      magic beyond a single <script type="module"> so it also works under `vite preview` / a plain
-      ES-module-capable static host. All measurement happens in-page / in Workers — never in Node.
+      Suite app entry (§4, §2). The supported Vite dev/preview server compiles src/app/main.ts and
+      loads the manual-idle suite while serving fixtures, Workers, and WASM from the same isolated
+      origin. All measurement happens in-page / in Workers — never in the launcher process.
 
       Presentation only: the live scoreboard, hero chips and cell animations are wired in src/app/ui.ts
-      against the ids below. They are purely cosmetic — a run never depends on them, and the headless
+      against the ids below. They are purely cosmetic — a run never depends on them, and the automated
       launcher (scripts/launch.mjs) drives the page through window.__SUITE__, not the DOM.
     -->
     <style>
       :root {
         color-scheme: light dark;
         --pass: #1a7f37;
+        --diff: #9a6700;
         --fail: #cf222e;
         --na: #6e7781;
         --err: #bc4c00;
         --skip: #8250df;
+        --partial: #0969da;
         --accent: #0969da;
         --accent-2: #8957e5;
         --accent-3: #1f9cf0;
@@ -151,53 +152,6 @@
       }
 
       /* ── benchmark flow ─────────────────────────────────────────────────────────────────────── */
-      .pillars {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-        gap: 0.85rem;
-      }
-      .pillar {
-        border: 1px solid var(--border);
-        border-left: 3px solid var(--accent);
-        border-radius: 10px;
-        padding: 0.8rem 0.95rem;
-        background: var(--card);
-        transition:
-          transform 0.18s ease,
-          box-shadow 0.18s ease,
-          border-color 0.18s ease;
-      }
-      .pillar:hover {
-        transform: translateY(-3px);
-        box-shadow: var(--shadow);
-      }
-      .pillar.functional {
-        border-left-color: var(--pass);
-      }
-      .pillar.performance {
-        border-left-color: var(--accent-3);
-      }
-      .pillar.robustness {
-        border-left-color: var(--err);
-      }
-      .pillar h3 {
-        margin: 0 0 0.3rem;
-        font-size: 0.95rem;
-      }
-      .pillar p {
-        margin: 0;
-        color: var(--na);
-        font-size: 0.83rem;
-      }
-      .about-note {
-        margin: 0.85rem 0 0;
-        font-size: 0.85rem;
-        color: var(--na);
-      }
-      .about-note strong {
-        color: inherit;
-      }
-
       .controls {
         display: flex;
         flex-wrap: wrap;
@@ -260,6 +214,7 @@
         cursor: not-allowed;
       }
       select,
+      input[type='text'],
       input[type='number'] {
         font: inherit;
         padding: 0.3rem 0.4rem;
@@ -268,32 +223,13 @@
         background: transparent;
         color: inherit;
       }
-      #progress-wrap {
-        height: 10px;
-        background: var(--bg-alt);
-        border-radius: 5px;
-        overflow: hidden;
-        margin: 0.6rem 0;
-        display: none;
-      }
-      #progress-bar {
-        position: relative;
-        height: 100%;
-        width: 0;
-        background: var(--accent-grad);
-        background-size: 200% auto;
-        border-radius: 5px;
-        transition: width 0.2s ease;
-        animation: gradient-shift 4s ease infinite;
-      }
-      /* A travelling highlight so the bar reads as actively working, not just filling. */
-      #progress-bar::after {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
-        transform: translateX(-100%);
-        animation: shimmer 1.3s linear infinite;
+      #run-progress,
+      #file-progress,
+      #passrate-bar {
+        width: 100%;
+        accent-color: var(--accent);
+        height: 0.9rem;
+        margin: 0.35rem 0;
       }
       #progress-label {
         color: var(--na);
@@ -351,6 +287,12 @@
       }
       .stat-card.pass .num {
         color: var(--pass);
+      }
+      .stat-card.partial {
+        border-top-color: var(--partial);
+      }
+      .stat-card.partial .num {
+        color: var(--partial);
       }
       .stat-card.fail {
         border-top-color: var(--fail);
@@ -466,17 +408,24 @@
         vertical-align: top;
         overflow-wrap: anywhere;
       }
-      th:first-child,
-      td.scn {
+      th:first-child {
         width: min(24rem, 34%);
       }
-      th {
+      thead th {
         background: var(--bg-alt);
         position: sticky;
         top: 0;
-        z-index: 1;
+        z-index: 2;
       }
-      td.scn {
+      thead th:first-child {
+        left: 0;
+        z-index: 3;
+      }
+      tbody th.scn {
+        position: sticky;
+        left: 0;
+        z-index: 1;
+        background: var(--bg-alt);
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 0.78rem;
       }
@@ -491,15 +440,18 @@
       .status.FAIL {
         color: var(--fail);
       }
+      .status.PARTIAL {
+        color: var(--partial);
+      }
       .status.ERROR {
         color: var(--err);
       }
-      .status.NA_ENGINE,
-      .status.NA_BROWSER,
-      .status.NA_ASSET,
-      .status.SKIPPED {
+      .status.NA_ENGINE {
         color: var(--na);
       }
+      .status.NA_BROWSER { color: #57606a; }
+      .status.NA_ASSET { color: #656d76; }
+      .status.SKIPPED { color: var(--skip); }
       /* Winner: the fastest passing framework in a fully-reported row is bold + trophied. */
       td.winner {
         background: rgba(240, 165, 0, 0.1);
@@ -507,9 +459,12 @@
       td.winner .status.PASS {
         font-weight: 800;
       }
-      td.winner .status.PASS::after {
-        content: ' 🏆';
-        font-weight: 400;
+      /* Tie: two or more frameworks within the fastest-time band share the row. */
+      td.tie {
+        background: rgba(130, 80, 223, 0.1);
+      }
+      td.tie .status.PASS {
+        font-weight: 800;
       }
       /* Live winner race — one column per framework, height ∝ scenarios won, reorders as it updates. */
       .race-wrap {
@@ -574,6 +529,92 @@
         font-size: 0.72rem;
         display: block;
       }
+      .winner-text,
+      .cell-reason {
+        display: block;
+        margin-top: 0.25rem;
+        font-size: 0.72rem;
+      }
+      .winner-text { color: var(--diff); font-weight: 700; }
+      .tie-text { color: var(--skip); font-weight: 700; }
+      .partial-files { margin: 0.3rem 0 0; padding-left: 1.1rem; font-size: 0.72rem; }
+      .cell-details { font-size: 0.85rem; }
+      /* Cells are clickable — the full detail text lives in a popup, not inline. */
+      td.has-details { cursor: pointer; }
+      td.has-details:hover { background: rgba(127, 127, 127, 0.12); }
+      td.has-details:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+      td.winner.has-details:hover { background: rgba(240, 165, 0, 0.18); }
+      td.tie.has-details:hover { background: rgba(130, 80, 223, 0.18); }
+      /* Fast cell-details popup: toggled via [hidden], no transition, so open/close is instant. */
+      .cell-modal { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; }
+      .cell-modal[hidden] { display: none; }
+      .cell-modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55); }
+      .cell-modal-panel {
+        position: relative;
+        z-index: 1;
+        width: min(720px, 92vw);
+        max-height: 85vh;
+        overflow: auto;
+        background: Canvas;
+        color: CanvasText;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1rem 1.2rem 1.3rem;
+        box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+      }
+      .cell-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 0.6rem; }
+      .cell-modal-title { margin: 0; font-size: 0.95rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+      .cell-modal-close {
+        flex: none; border: 1px solid var(--border); background: transparent; color: inherit;
+        font-size: 1.1rem; line-height: 1; border-radius: 8px; padding: 0.15rem 0.5rem; cursor: pointer;
+      }
+      .cell-modal-close:hover { background: rgba(127, 127, 127, 0.15); }
+      .cell-modal-body h4 { margin: 0.9rem 0 0.3rem; font-size: 0.8rem; color: var(--na); }
+      .cell-modal-body ul { margin: 0.2rem 0 0; padding-left: 1.2rem; font-size: 0.8rem; }
+      .cell-modal-body li { overflow-wrap: anywhere; margin-bottom: 0.15rem; }
+      .detail-grid,
+      .manifest-grid {
+        display: grid;
+        grid-template-columns: minmax(8rem, max-content) 1fr;
+        gap: 0.2rem 0.6rem;
+      }
+      .detail-grid dt,
+      .manifest-grid dt { color: var(--na); }
+      .detail-grid dd,
+      .manifest-grid dd { margin: 0; overflow-wrap: anywhere; }
+      .matrix-scroll {
+        overflow: auto;
+        max-width: 100%;
+        outline-offset: 3px;
+      }
+      .matrix-pages {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        margin: 0.5rem 0;
+      }
+      table caption {
+        text-align: left;
+        font-weight: 600;
+        padding: 0.4rem 0;
+      }
+      .cache-warning,
+      [aria-invalid='true'] { color: var(--err); }
+      #live-status {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+      .jump-links { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0; }
+      .cache-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+      .selected-inputs ul { max-height: 12rem; overflow: auto; }
       .env-grid {
         display: grid;
         grid-template-columns: max-content 1fr;
@@ -744,13 +785,10 @@
         .fade-seq,
         .hero::before,
         h1,
-        #progress-bar,
-        #progress-bar::after,
         .chip.ok .dot {
           animation: none !important;
         }
-        .passrate-fill,
-        #progress-bar {
+        progress {
           transition: none;
         }
       }
@@ -761,8 +799,8 @@
       <span class="hero-badge">browser-only · library-agnostic</span>
       <h1>Browser Media-Engine Benchmark Suite</h1>
       <p class="subtitle">
-        Every number is produced in-page, gated by a library-independent oracle, reported vs the
-        reference engine. <strong>The comparison is the product.</strong>
+        Every number is produced in-page and gated by library-independent oracles. Golden evidence
+        judges correctness; the platform path is an unscored browser reference instrument.
       </p>
       <div class="hero-chips" id="hero-chips">
         <span class="chip" id="chip-browser"><span class="dot"></span>detecting browser…</span>
@@ -776,40 +814,6 @@
       <p class="banner">This suite requires JavaScript modules. Serve it with <code>scripts/serve.sh</code>.</p>
     </noscript>
 
-    <section id="about-section" class="fade-seq" style="animation-delay: 0.05s">
-      <h2>How it works</h2>
-      <div class="pillars">
-        <div class="pillar functional">
-          <h3>① Correctness gate</h3>
-          <p>
-            Each engine's output is checked by library-independent oracles: golden metadata &amp;
-            packet tables, bit-exact decoded frames, SSIM/PSNR for lossy ops, and re-import with the
-            reference engine. Correctness is the gate — a number only counts if the output is right.
-          </p>
-        </div>
-        <div class="pillar performance">
-          <h3>② Benchmark timing</h3>
-          <p>
-            Headline throughput &amp; cost, measured in-page over warmup + iterations: ops/s,
-            packets/s, frames/s, wall <code>ms</code>, <code>×RT</code> (realtime), peak memory,
-            long-task time, and min+gzip bundle size.
-          </p>
-        </div>
-        <div class="pillar robustness">
-          <h3>③ Issue surfacing</h3>
-          <p>
-            Malformed and mutated inputs must reject or throw within a timeout — never crash, hang,
-            or OOM. Any correctness, timing, timeout, or invariant problem is raised in the matrix.
-          </p>
-        </div>
-      </div>
-      <p class="about-note">
-        One benchmark run does the whole job: gate correctness, measure admissible performance, and
-        surface issues against the <strong>reference engine</strong>. Pick features + scenarios and press
-        <strong>Run selected features</strong>, or drive it with <code>scripts/run.sh</code>.
-      </p>
-    </section>
-
     <section id="env-section" class="fade-seq" style="animation-delay: 0.1s">
       <h2>Environment &amp; codec support</h2>
       <div id="env" class="muted">Detecting browser + WebCodecs support…</div>
@@ -818,29 +822,49 @@
     <section id="controls-section" class="fade-seq" style="animation-delay: 0.15s">
       <h2>Controls</h2>
       <div class="controls" id="controls">
-        <fieldset id="features-fs">
+        <fieldset id="features-fs" aria-describedby="scenario-intersection validation-message">
           <legend>Features</legend>
           <div id="features-list" class="muted">Registering feature groups…</div>
         </fieldset>
-        <fieldset id="scenarios-fs">
+        <fieldset id="scenarios-fs" aria-describedby="scenario-intersection validation-message">
           <legend>Scenarios</legend>
           <div id="scenarios-list" class="muted">Registering scenarios…</div>
         </fieldset>
-        <fieldset id="engines-fs">
+        <fieldset id="engines-fs" aria-describedby="validation-message">
           <legend>Engines</legend>
           <div id="engines-list" class="muted">Registering engines…</div>
         </fieldset>
-        <fieldset id="options-fs">
+        <fieldset id="operations-fs" aria-describedby="scenario-intersection">
+          <legend>Operations</legend>
+          <div id="operations-list" class="muted">Registering operations…</div>
+        </fieldset>
+        <fieldset id="options-fs" aria-describedby="validation-message next-run-note">
           <legend>Options</legend>
           <label class="opt"
-            >Warmup <input type="number" id="warmup" min="0" max="20" value="1" style="width: 4rem"
+            >Warmup <input data-run-config="true" type="number" id="warmup" min="0" max="20" value="1" style="width: 4rem"
           /></label>
           <label class="opt"
-            >Iters <input type="number" id="iters" min="1" max="50" value="1" style="width: 4rem"
+            >Iters <input data-run-config="true" type="number" id="iters" min="1" max="50" value="1" style="width: 4rem"
           /></label>
+          <label class="opt"
+            >Timeout ms <input data-run-config="true" type="number" id="timeout-ms" min="1000" max="86400000" value="1800000" style="width: 8rem"
+          /></label>
+          <label class="opt"
+            >Replay seed <input data-run-config="true" type="text" id="random-seed" value="" autocomplete="off" spellcheck="false" style="width: 13rem"
+          /></label>
+          <button id="copy-seed" type="button">Copy seed</button>
+          <label class="opt"
+            >Pillar
+            <select data-run-config="true" id="pillar">
+              <option value="all">all</option>
+              <option value="functional">functional</option>
+              <option value="performance">performance</option>
+              <option value="robustness">robustness</option>
+            </select>
+          </label>
           <label class="opt"
             >Browser tag
-            <select id="browser-tag">
+            <select data-run-config="true" id="browser-tag">
               <option value="auto">auto-detect</option>
               <option value="brave">brave</option>
               <option value="chromium">chromium</option>
@@ -852,59 +876,74 @@
             class="opt"
             title="Reuse previously stored results from this browser instead of running them again, regardless of result status."
           >
-            <input id="reuse-data" type="checkbox" checked />
+            <input data-run-config="true" id="reuse-data" type="checkbox" checked />
             Reuse all data
           </label>
           <label
             class="opt"
             title="Shuffle the selected engine/scenario cells once at run start so the next pending test row is chosen randomly instead of scenario-major order."
           >
-            <input id="randomize-order" type="checkbox" checked />
+            <input data-run-config="true" id="randomize-order" type="checkbox" checked />
             Randomize next test row
           </label>
           <label
             class="opt"
-            title="Run every scenario against ALL its candidate files (baked fixture + all real downloads), in the same order for every engine. The cell PASSes only if all files pass (a FAIL names the offending file); the number is the median across files. Uncheck for the faster one-file-per-run mode."
+            title="Run every scenario against every eligible catalog input in the same order for every engine. Full coverage requires every file to be correct (PASS); mixed coverage is reported as Partial with each file retained. Metrics use their declared exhaustive aggregation policy."
           >
-            <input id="exhaustive-media" type="checkbox" checked />
+            <input data-run-config="true" id="exhaustive-media" type="checkbox" />
             Exhaustive (all files per scenario)
           </label>
         </fieldset>
       </div>
+      <p id="scenario-intersection" class="muted">Scenario intersection pending registration.</p>
+      <p id="validation-message" class="muted"></p>
+      <p id="next-run-note" class="muted"></p>
       <div class="actions">
         <button id="run" class="primary">Run selected features</button>
-        <button id="select-all-features" type="button">All features</button>
-        <button id="select-all-eng" type="button">All engines</button>
-        <button id="select-all-scn" type="button">All scenarios</button>
-        <button id="download" type="button" disabled>Download results JSON</button>
-        <button
-          id="export-cache"
-          type="button"
-          disabled
-          title="Download every test result currently stored in this browser's persistent cache, without starting a new run."
-        >
-          Export stored test data
-        </button>
-        <button
-          id="clear-cache"
-          type="button"
-          disabled
-          title="Delete every test result currently stored in this browser's persistent cache."
-        >
-          Clear data
-        </button>
-        <button
-          id="clear-aibrush-cache"
-          type="button"
-          disabled
-          title="Delete only stored test results for aibrush-media, including all versioned aibrush-media engine IDs."
-        >
-          Clear aibrush-media data
-        </button>
-        <span id="run-status" class="muted"></span>
+        <button id="select-all-features" type="button">Select all features</button>
+        <button id="clear-features" type="button">Clear features</button>
+        <button id="select-all-eng" type="button">Select all engines</button>
+        <button id="clear-engines" type="button">Clear engines</button>
+        <button id="select-all-scn" type="button">Select all scenarios</button>
+        <button id="clear-scenarios" type="button">Clear scenarios</button>
+        <button id="select-all-operations" type="button">Select all operations</button>
+        <button id="clear-operations" type="button">Clear operations</button>
+        <button id="download" type="button" disabled>Download raw results@2 JSON</button>
+        <button id="download-report-json" type="button" disabled>Download report JSON</button>
+        <button id="download-report-md" type="button" disabled>Download report Markdown</button>
       </div>
-      <div id="progress-wrap"><div id="progress-bar"></div></div>
-      <div id="progress-label"></div>
+      <div class="jump-links">
+        <a href="#current-work">Jump to current cell</a>
+        <a href="#results-section">Jump to results</a>
+      </div>
+      <p id="run-status" class="muted">idle</p>
+      <div id="live-status" role="status" aria-live="polite" aria-atomic="true"></div>
+      <label for="run-progress">Run progress</label>
+      <progress id="run-progress" min="0" max="1" value="0" hidden>0 of 1</progress>
+      <p id="progress-label" class="muted">No run in progress.</p>
+      <div id="file-progress-group" hidden>
+        <label for="file-progress">Current exhaustive-cell input progress</label>
+        <progress id="file-progress" min="0" max="1" value="0">0 of 1</progress>
+        <p id="file-progress-label" class="muted">No exhaustive input in progress.</p>
+      </div>
+      <p id="current-work" tabindex="-1">Current cell: not running.</p>
+    </section>
+
+    <section id="run-config-section" class="fade-seq">
+      <h2>Run configuration &amp; provenance</h2>
+      <div id="run-manifest"><p class="muted">Idle — no run manifest yet.</p></div>
+    </section>
+
+    <section id="cache-section" class="fade-seq">
+      <h2>Origin-scoped result cache</h2>
+      <div id="cache-status" class="muted">Inspecting origin storage…</div>
+      <div class="cache-actions">
+        <button id="export-cache" type="button" disabled>Export validated cache bundle</button>
+        <button id="clear-cache" type="button" disabled>Clear all cached results</button>
+        <button id="clear-aibrush-cache" type="button" disabled>Clear aibrush-media cached results</button>
+        <label>Import cache bundle <input id="import-cache-file" type="file" accept="application/json,.json" /></label>
+        <button id="import-cache" type="button" disabled>Import after validation</button>
+      </div>
     </section>
 
     <section id="summary-section" class="fade-seq" hidden>
@@ -923,13 +962,29 @@
           <span class="num" id="stat-fail">0</span>
           <span class="lbl">Fail</span>
         </div>
+        <div class="stat-card partial">
+          <span class="num" id="stat-partial">0</span>
+          <span class="lbl">Partial</span>
+        </div>
         <div class="stat-card error">
           <span class="num" id="stat-error">0</span>
           <span class="lbl">Error</span>
         </div>
         <div class="stat-card na">
           <span class="num" id="stat-na">0</span>
-          <span class="lbl">N/A</span>
+          <span class="lbl">All NA (aggregate)</span>
+        </div>
+        <div class="stat-card na">
+          <span class="num" id="stat-na-engine">0</span>
+          <span class="lbl">NA_ENGINE</span>
+        </div>
+        <div class="stat-card na">
+          <span class="num" id="stat-na-browser">0</span>
+          <span class="lbl">NA_BROWSER</span>
+        </div>
+        <div class="stat-card na">
+          <span class="num" id="stat-na-asset">0</span>
+          <span class="lbl">NA_ASSET</span>
         </div>
         <div class="stat-card skip">
           <span class="num" id="stat-skipped">0</span>
@@ -942,27 +997,45 @@
       </div>
       <div class="passrate">
         <div class="passrate-head">
-          <span>Pass rate <span class="muted">(of applicable cells)</span></span>
-          <span class="passrate-val" id="stat-passrate">—</span>
+          <span>Correctness-valid rate <span class="muted">(of oracle-evaluable files/cells)</span></span>
+          <span class="passrate-val" id="stat-passrate">pending</span>
         </div>
-        <div class="passrate-track"><div class="passrate-fill" id="passrate-bar"></div></div>
+        <progress id="passrate-bar" max="100" aria-label="Correctness-valid result rate pending">pending</progress>
       </div>
+      <div id="winner-race" class="race-wrap"></div>
     </section>
 
     <section id="results-section" class="fade-seq" style="animation-delay: 0.2s">
       <h2>Conformance matrix &amp; metrics</h2>
       <div class="legend" id="legend">
-        <span class="item"><span class="swatch" style="background: var(--pass)"></span>Pass (&lt;time&gt;) - correct + timed</span>
-        <span class="item"><span class="swatch" style="background: var(--fail)"></span>Failure - oracle mismatch</span>
-        <span class="item"><span class="swatch" style="background: var(--err)"></span>Error - unexpected exception</span>
-        <span class="item"><span class="swatch" style="background: var(--na)"></span>N/A - capability/codec absent</span>
+        <span class="item"><span class="swatch" style="background: var(--pass)"></span>PASS — correct output (green); representation differences are recorded in details</span>
+        <span class="item"><span class="swatch" style="background: var(--fail)"></span>FAIL — true semantic or structural violation</span>
+        <span class="item"><span class="swatch" style="background: var(--partial)"></span>Partial — some catalog inputs valid, denominator retained</span>
+        <span class="item"><span class="swatch" style="background: var(--na)"></span>NA_ENGINE — engine or concrete tuple unsupported</span>
+        <span class="item"><span class="swatch" style="background: #57606a"></span>NA_BROWSER — browser configuration unavailable</span>
+        <span class="item"><span class="swatch" style="background: #656d76"></span>NA_ASSET — required verified evidence unavailable</span>
+        <span class="item"><span class="swatch" style="background: var(--skip)"></span>SKIPPED — explicit policy or unexecuted cell</span>
+        <span class="item"><span class="swatch" style="background: var(--err)"></span>ERROR — harness or adapter failure</span>
         <span class="sep"></span>
         <span class="item"><code>ms</code> median wall</span>
         <span class="item"><code>×RT</code> vs realtime</span>
         <span class="item"><code>lt</code> long-task ms</span>
       </div>
+      <label for="result-status-filter">Filter matrix rows by result state</label>
+      <select id="result-status-filter">
+        <option value="all">All states</option>
+        <option value="pending">Pending / not run</option>
+        <option value="partial">Partial coverage</option>
+        <option value="PASS">PASS</option>
+        <option value="FAIL">FAIL</option>
+        <option value="NA_ENGINE">NA_ENGINE</option>
+        <option value="NA_BROWSER">NA_BROWSER</option>
+        <option value="NA_ASSET">NA_ASSET</option>
+        <option value="SKIPPED">SKIPPED</option>
+        <option value="ERROR">ERROR</option>
+      </select>
       <div id="results">
-        <p class="muted">No run yet. Pick engines + scenarios and press <strong>Run matrix</strong>.</p>
+        <p class="muted">No run yet. Pick engines + scenarios and press <strong>Run selected features</strong>.</p>
       </div>
     </section>
 

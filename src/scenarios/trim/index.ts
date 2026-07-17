@@ -7,10 +7,10 @@
  *  - frame-accurate (frameAccurate: true): re-encodes the leading GOP so the cut is exact;
  *    requires the 'trim:frame-accurate' feature.
  *
- * The `trim-boundaries` oracle checks probe(out).dur ≈ requested. Boundary-frame digests are compared
- * only when trim-range-specific golden declares the same {startUs,endUs}; source-prefix golden is not
- * a valid boundary oracle for sub-range trims. Range is carried in options.range {startUs, endUs};
- * mode in options.frameAccurate.
+ * The `trim-boundaries` oracle consumes range-specific, presentation-time-windowed neutral-decode
+ * evidence. Source-prefix frame arrays are never substituted for a sub-range bake. Range is carried
+ * in options.range {startUs,endUs}; mode in options.frameAccurate. Family-local contracts additionally
+ * make feature-labelled properties and fragmented output observable to the shared oracle/runner.
  *
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  * ORACLE-STRENGTH NOTE (correctness GATES every number, §0.1; honest capabilities, §0; cite dossier).
@@ -58,6 +58,11 @@
 
 import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  TRIM_AUDIO_CONTENT_INVARIANT,
+  TRIM_FEATURE_PROPERTIES_INVARIANT,
+  TRIM_NOOP_IDENTITY_INVARIANT,
+} from '../../features/trim/index.ts';
 
 // ── Default metric sets ─────────────────────────────────────────────────────────────────────────
 
@@ -101,6 +106,8 @@ interface TrimCase {
   size?: 'normal' | 'ladder';
   /** declared additional capability features (e.g. 'rotate','alpha','fragmented'). */
   features?: string[];
+  /** Production property-oracle route for content/property evidence beyond generic boundaries. */
+  invariant?: string;
   /** Extra engine options for robustness/todo cases. */
   extraOptions?: Record<string, unknown>;
   /** per-case primary leaderboard metric (only meaningful for the size-ladder perf rungs). */
@@ -183,6 +190,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 5_000_000,
     endUs: 10_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AUDIO,
     notes: 'Audio-only copy-trim through EOF of the 10s fixture; MP3 frame boundaries are dense so duration is tight.',
@@ -334,6 +342,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 3_000_000,
     frameAccurate: false,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     tolerances: { durationToleranceSec: 0.5 },
     features: ['alpha'],
     extraOracles: PLAYABLE_AV,
@@ -349,6 +358,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_000_000,
     endUs: 7_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AUDIO,
     notes: 'Opus-in-OGG copy-trim; cut on Ogg page / granulepos boundaries.',
@@ -361,6 +371,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_000_000,
     endUs: 7_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     // Raw ADTS has no global index and <video> playback of a bare .aac is unreliable → reimport only.
     extraOracles: BOUNDARIES_ONLY,
@@ -374,6 +385,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_000_000,
     endUs: 7_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     features: ['trim:flac-seektable-copy'],
     extraOracles: BOUNDARIES_ONLY,
@@ -390,6 +402,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_000_000,
     endUs: 7_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     features: ['trim:flac-no-seektable-frame-scan'],
     extraOracles: BOUNDARIES_ONLY,
@@ -403,6 +416,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 4_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     // WAV PCM packets in the fixture are 85.333ms chunks; packet-copy trims can include one edge
     // chunk while still preserving decoded content and a rewritten RIFF data length.
     tolerances: { durationToleranceSec: 0.09 },
@@ -417,6 +431,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 4_000_000,
     frameAccurate: false,
+    invariant: TRIM_AUDIO_CONTENT_INVARIANT,
     tolerances: { durationToleranceSec: 0.02 },
     // AIFF playback in <video> is unreliable across browsers → reimport-only gate.
     extraOracles: BOUNDARIES_ONLY,
@@ -485,6 +500,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 2_700_000,
     endUs: 6_300_000,
     frameAccurate: true,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Open-GOP frame-accurate cut at an interior pts with forward refs across the boundary.',
@@ -501,6 +517,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     tolerances: { durationToleranceSec: 1.1 },
     features: ['rotate'],
     extraOracles: PLAYABLE_AV,
@@ -518,26 +535,30 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 1_000_000,
     endUs: 5_000_000,
     frameAccurate: false,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     tolerances: { durationToleranceSec: 1.1 },
     extraOracles: PLAYABLE_AV,
     notes: 'Copy-trim of a 1-video/2-audio file; every track must be cut & re-based in lockstep.',
   },
 
-  // Fragmented-MP4 / CMAF trim — A.10/A.16; cut on a fragment boundary, rewrite tfdt
-  // (dossier missingCases #8). Declares 'fragmented' so only fMP4-capable engines contest it.
+  // Fragmented ISO BMFF trim — use the real empty-moov + moof/mdat fixture and cut exactly at its
+  // second random-access media fragment. `fragmented` is both a capability and an authored output
+  // request through trimContractForScenario; progressive output fails structural evidence.
   {
     id: 'fmp4_fragment_boundary_copy',
-    asset: 'h264_1080p_30s.mp4',
+    asset: 'fragmented_cmaf.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     audioCodec: 'aac',
-    startUs: 4_000_000,
-    endUs: 10_000_000,
+    startUs: 2_021_354,
+    endUs: 4_021_354,
     frameAccurate: false,
-    tolerances: { durationToleranceSec: 0.5 },
+    tolerances: { durationToleranceSec: 0.1 },
     features: ['fragmented'],
     extraOracles: PLAYABLE_AV,
-    notes: 'Fragmented/CMAF trim: cut on a fragment boundary and rewrite tfdt/baseMediaDecodeTime.',
+    notes:
+      'Fragmented ISO BMFF trim on the actual two-fragment fixture: retain fragmented output, ' +
+      'require init + moof/mdat, tfdt in every traf, and rebase each retained track decode time.',
   },
 
   // Very short / single-GOP frame-accurate trim — exact-cut degenerate, range ≈ a few frames
@@ -551,6 +572,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 5_000_000,
     endUs: 5_100_000,
     frameAccurate: true,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: BOUNDARIES_ONLY,
     notes: 'Very short (~100ms / ~3 frame) frame-accurate trim; exact-cut on a sub-GOP range.',
@@ -567,6 +589,7 @@ const TRIM_CASES: TrimCase[] = [
     startUs: 6_000_000,
     endUs: 6_010_000,
     frameAccurate: true,
+    invariant: TRIM_FEATURE_PROPERTIES_INVARIANT,
     // A <1-frame request can only yield the enclosing video frame plus muxer/audio packet padding.
     tolerances: { durationToleranceSec: 0.1 },
     extraOracles: BOUNDARIES_ONLY,
@@ -668,7 +691,11 @@ const LADDER_CASES: TrimCase[] = [
 
 function buildTrim(c: TrimCase): Scenario {
   const metrics = c.size === 'ladder' ? TRIM_LADDER_METRICS : TRIM_METRICS;
-  const oracles: OracleId[] = ['trim-boundaries', ...(c.extraOracles ?? [])];
+  const oracles: OracleId[] = [
+    'trim-boundaries',
+    ...(c.invariant ? ['property-invariant' as const] : []),
+    ...(c.extraOracles ?? []),
+  ];
   return defineScenario({
     id: `trim/${c.id}`,
     op: 'trim',
@@ -677,6 +704,9 @@ function buildTrim(c: TrimCase): Scenario {
       container: c.container,
       frameAccurate: c.frameAccurate,
       range: { startUs: c.startUs, endUs: c.endUs },
+      ...(c.invariant ? { invariant: c.invariant } : {}),
+      ...(c.features?.includes('fragmented') ? { fragmented: true } : {}),
+      ...(c.extraOptions ?? {}),
     },
     requires: {
       operations: ['trim'],
@@ -728,6 +758,9 @@ interface InvariantTrimCase {
   endUs: number;
   frameAccurate: boolean;
   invariant: string;
+  aUs?: number;
+  bUs?: number;
+  cUs?: number;
   /** extra non-invariant oracles to also assert. */
   extraOracles?: OracleId[];
   features?: string[];
@@ -736,6 +769,26 @@ interface InvariantTrimCase {
 }
 
 const INVARIANT_CASES: InvariantTrimCase[] = [
+  {
+    id: 'h264_adjacent_concat_equivalence',
+    asset: 'h264_1080p_30s.mp4',
+    container: 'mp4',
+    videoCodec: 'h264',
+    audioCodec: 'aac',
+    startUs: 2_000_000,
+    endUs: 9_000_000,
+    frameAccurate: true,
+    invariant: 'trim(a..b)++trim(b..c)≈trim(a..c)',
+    aUs: 2_000_000,
+    bUs: 5_000_000,
+    cUs: 9_000_000,
+    features: ['trim:compose'],
+    extraOracles: ['playback-smoke'],
+    tolerances: { durationToleranceSec: 0.1, ssimMin: 0.985 },
+    notes:
+      'Real composition metamorphic: adjacent frame-accurate cuts are concatenated and compared ' +
+      'semantically with the direct 2s..9s cut; seam overlap, holes, timestamp jumps, or A/V drift fail.',
+  },
   // Idempotence / no-op edge: trim(0 .. fullDuration) ≈ identity. The probed duration must equal the
   // source duration (dossier deepEdgeToAdd "Idempotence/no-op edge").
   // Gated by: trim-boundaries (out.dur ≈ requested full range) + property-invariant probe-duration
@@ -750,7 +803,7 @@ const INVARIANT_CASES: InvariantTrimCase[] = [
     startUs: 0,
     endUs: 30_000_000,
     frameAccurate: false,
-    invariant: 'probe-duration',
+    invariant: TRIM_NOOP_IDENTITY_INVARIANT,
     // Full-range no-op: output packet count ≈ source, so reference-reimport is SOUND here (unlike on
     // sub-range trims). decoded-frames-bitexact is intentionally omitted: source-prefix golden can
     // validate only the opening frames, not the full identity trim.
@@ -770,7 +823,7 @@ const INVARIANT_CASES: InvariantTrimCase[] = [
     startUs: 0,
     endUs: 10_000_000,
     frameAccurate: false,
-    invariant: 'probe-duration',
+    invariant: TRIM_NOOP_IDENTITY_INVARIANT,
     // Full-range no-op: reference-reimport is sound (output packet count ≈ source).
     extraOracles: ['playback-smoke', 'reference-reimport'],
     tolerances: { durationToleranceSec: 0.05 },
@@ -790,6 +843,9 @@ const invariantTrimScenarios: Scenario[] = INVARIANT_CASES.map((c) =>
       frameAccurate: c.frameAccurate,
       range: { startUs: c.startUs, endUs: c.endUs },
       invariant: c.invariant,
+      ...(c.aUs !== undefined ? { a: c.aUs } : {}),
+      ...(c.bUs !== undefined ? { b: c.bUs } : {}),
+      ...(c.cUs !== undefined ? { c: c.cUs } : {}),
     },
     requires: {
       operations: ['trim'],

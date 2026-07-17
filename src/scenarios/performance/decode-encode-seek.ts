@@ -54,7 +54,8 @@ const decodeFps: Scenario = perfCase({
   primary: 'decodeFps',
   timeoutMs: T_FAST,
   notes:
-    `§A.14 decode-fps↑: decode ${DECODE_MAX_FRAMES} frames of ${BIG_READ_GOLDEN}, rank by decodeFps. ` +
+    `§A.14 decode-fps↑: decode at most ${DECODE_MAX_FRAMES} frames of ${BIG_READ_GOLDEN}; numerator is ` +
+    `the actual returned frame-sink count corroborated by final telemetry, never cadence×duration. ` +
     `Gated by decoded-frames-bitexact against the browser/WebCodecs RGBA golden; engines whose decode ` +
     `path cannot normalize to that golden declare no decode:golden-rgba feature and negotiate NA.`,
 });
@@ -89,7 +90,8 @@ const encodeFps: Scenario = perfCase({
   timeoutMs: T_ENCODE_FPS,
   notes:
     `§A.14 encode-fps↑: re-encode ${BIG_READ_GOLDEN} → WebM/VP9/Opus at SOURCE 1920×1080 (encoder-bound, ` +
-    `no scaler), rank by encodeFps. Gated by ssim-psnr + playback-smoke. Distinct from the downscale convert.`,
+    `no scaler), rank actual output presentation units/sec; no rate exists without a final counter or ` +
+    `neutral output count. Gated by ssim-psnr + playback-smoke.`,
 });
 
 // seek ms — seek to a mid-file video keyframe; rank by seekMs; gate by seek-accuracy (packets golden).
@@ -109,7 +111,8 @@ const seekMs: Scenario = perfCase({
   timeoutMs: T_FAST,
   notes:
     `§A.14 seek-ms↓: seek ${BIG_READ_GOLDEN} to ${SEEK_TARGET_US}µs (a 2 s-GOP video keyframe), rank by ` +
-    `seekMs (lower-better). Gated by seek-accuracy vs golden.packets (baked); ±50 ms band tolerates ` +
+    `seekMs (lower-better), with warm-cache state and video-keyframe target declared explicitly. ` +
+    `Gated by seek-accuracy vs golden.packets; ±50 ms band tolerates ` +
     `audio/video keyframe-snap but catches a ≥2 s broken seek.`,
 });
 

@@ -1,232 +1,175 @@
-/**
- * scripts/compare.mjs — assemble the comparison report (§12). Reads every results/raw/*.json the
- * launcher (or the in-page Download button) produced, flattens their `results[]` into one stream,
- * and calls `buildReport` (src/core/report.ts — pure TS, runs under bun) to produce
- * results/report.md + results/report.json. NO BINARY, NO MEASUREMENT — pure assembly of already-
- * measured, oracle-gated results.
- *
- * Run with bun (which executes TypeScript directly, so the .ts import of report.ts resolves):
- *   bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md]
- *
- * There is no reference engine — every candidate is scored on its own oracle-gated result. Later runs
- * supersede earlier ones for the same (engine, browser, scenario) triple (report.ts does
- * last-write-wins on that key).
- */
+/** Validate raw runs, execute the shared reporting pipeline, and write its two deterministic views. */
 
-import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildReport } from '../src/core/report.ts';
+import {
+  applyBundleArtifactToResults,
+  buildReport,
+  normalizeExpectedMatrix,
+  parseBundleMeasurementsArtifact,
+  parseRawRunArtifact,
+  serializeReportJson,
+} from '../src/core/report.ts';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(__dirname, '..');
-
-// ── args ───────────────────────────────────────────────────────────────────────────────────────
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const opts = {
   rawDir: 'results/raw',
   out: 'results/report.md',
-  bundleSizes: 'results/bundle-sizes.json',
+  bundleMeasurements: 'results/bundle-measurements.json',
+  latest: false,
+  generatedAtIso: undefined,
 };
+
 const argv = process.argv.slice(2);
-for (let i = 0; i < argv.length; i++) {
-  const a = argv[i];
-  if (a === '--raw-dir') opts.rawDir = argv[++i];
-  else if (a === '--out') opts.out = argv[++i];
-  else if (a === '--reference') {
-    // Deprecated no-op: there is no reference engine anymore. Consume + ignore the value so old
-    // invocations keep working instead of erroring on an "unknown arg".
-    const ignored = argv[++i];
-    console.error(`[compare] --reference '${ignored}' ignored: the reference-engine concept was removed.`);
-  } else if (a === '--bundle-sizes') opts.bundleSizes = argv[++i];
-  else if (a === '-h' || a === '--help') {
+for (let index = 0; index < argv.length; index++) {
+  const arg = argv[index];
+  if (arg === '--raw-dir') opts.rawDir = requiredArg(argv, ++index, arg);
+  else if (arg === '--out') opts.out = requiredArg(argv, ++index, arg);
+  else if (arg === '--bundle-measurements' || arg === '--bundle-sizes') {
+    opts.bundleMeasurements = requiredArg(argv, ++index, arg);
+  } else if (arg === '--latest') opts.latest = true;
+  else if (arg === '--generated-at') opts.generatedAtIso = requiredArg(argv, ++index, arg);
+  else if (arg === '--reference') {
+    const ignored = requiredArg(argv, ++index, arg);
+    console.error(`[compare] --reference '${ignored}' ignored: oracle evidence has no live reference engine.`);
+  } else if (arg === '-h' || arg === '--help') {
     console.log(
-      'bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md] [--bundle-sizes results/bundle-sizes.json]',
+      'bun scripts/compare.mjs [--raw-dir results/raw] [--out results/report.md] '
+      + '[--bundle-measurements results/bundle-measurements.json] [--latest] [--generated-at ISO]',
     );
     process.exit(0);
   } else {
-    console.error(`compare.mjs: unknown arg '${a}'`);
+    console.error(`compare.mjs: unknown arg '${arg}'`);
     process.exit(2);
   }
 }
 
 const rawDir = resolve(ROOT, opts.rawDir);
-if (!existsSync(rawDir)) {
-  console.error(`compare.mjs: raw results dir not found: ${rawDir}\nRun scripts/run.sh first (or use the in-page Download button into results/raw/).`);
-  process.exit(1);
-}
+if (!existsSync(rawDir)) fail(`raw results dir not found: ${rawDir}`);
+const files = readdirSync(rawDir).filter((file) => file.endsWith('.json')).sort().map((file) => join(rawDir, file));
+if (files.length === 0) fail(`no *.json in ${rawDir}`);
 
-// ── load + flatten raw result files ──────────────────────────────────────────────────────────
-const files = readdirSync(rawDir)
-  .filter((f) => f.endsWith('.json'))
-  .map((f) => join(rawDir, f))
-  .sort(); // stable order → deterministic last-write-wins when triples collide
-
-if (files.length === 0) {
-  console.error(`compare.mjs: no *.json in ${rawDir}. Nothing to compare.`);
-  process.exit(1);
-}
-
-/** @type {import('../src/core/scenario.ts').ScenarioResult[]} */
-const allResults = [];
-let suiteVersion;
-
+const runs = [];
+const quarantined = [];
 for (const file of files) {
-  let payload;
   try {
-    payload = JSON.parse(readFileSync(file, 'utf8'));
-  } catch (e) {
-    console.error(`compare.mjs: skipping unreadable ${file}: ${e?.message || e}`);
-    continue;
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    const run = parseRawRunArtifact(value);
+    runs.push(run);
+    console.log(`[compare] validated ${run.results.length} observations from ${relative(file)}`);
+  } catch (error) {
+    quarantined.push({ file: relative(file), reason: error instanceof Error ? error.message : String(error) });
+    console.error(`[compare] quarantined ${relative(file)}: ${quarantined.at(-1).reason}`);
   }
-  const results = Array.isArray(payload.results) ? payload.results : Array.isArray(payload) ? payload : [];
-  if (results.length === 0) {
-    console.error(`compare.mjs: ${file} has no results[] — skipping.`);
-    continue;
+}
+if (runs.length === 0) fail('no validated raw-run artifacts remain after quarantine');
+
+let results = runs.flatMap((run) => run.results);
+const context = new WeakMap();
+for (const run of runs) {
+  for (const result of run.results) {
+    const resultReporting = isRecord(result.reporting) ? result.reporting : undefined;
+    context.set(result, {
+      runId: run.runId,
+      observedAtIso: run.generatedAtIso,
+      ...(isRecord(resultReporting?.cohortDimensions)
+        ? { cohortDimensions: resultReporting.cohortDimensions }
+        : {}),
+    });
   }
-  allResults.push(...results);
-  for (const r of results) {
-    if (!suiteVersion && r.env?.suiteVersion) suiteVersion = r.env.suiteVersion;
-  }
-  console.log(`[compare] loaded ${results.length} results from ${file}`);
 }
 
-if (allResults.length === 0) {
-  console.error('compare.mjs: no results loaded from any file.');
-  process.exit(1);
+let bundleArtifact;
+let bundleJoins;
+const bundlePath = resolve(ROOT, opts.bundleMeasurements);
+if (existsSync(bundlePath)) {
+  try {
+    bundleArtifact = parseBundleMeasurementsArtifact(JSON.parse(readFileSync(bundlePath, 'utf8')));
+    const applied = applyBundleArtifactToResults(results, bundleArtifact, (result) => {
+      const reporting = isRecord(result.reporting) ? result.reporting : undefined;
+      return isRecord(reporting?.bundleExpectation) ? reporting.bundleExpectation : undefined;
+    });
+    results = applied.results;
+    bundleJoins = applied.joins;
+    // Clones created by bundle joining retain the original per-result run context by stable cell identity.
+    const byCell = new Map(runs.flatMap((run) => run.results.map((result) => [cellKey(result), context.get(result)])));
+    for (const result of results) {
+      const previous = byCell.get(cellKey(result));
+      if (previous) context.set(result, previous);
+    }
+    console.log(`[compare] validated bundle artifact ${bundleArtifact.contentHash}`);
+  } catch (error) {
+    quarantined.push({ file: relative(bundlePath), reason: error instanceof Error ? error.message : String(error) });
+    console.error(`[compare] quarantined ${relative(bundlePath)}: ${quarantined.at(-1).reason}`);
+    bundleArtifact = undefined;
+  }
 }
 
-// ── inject offline per-engine bundle sizes into the bundle-size case ──────────────────────────
-// The `performance/bundle-size` case is a build-time metric: there is nothing to measure at run time,
-// so the runner emits its `bench.bundleSize` with n=0/median=0 (an honest empty bench, which is why
-// the headline shows a 5-way tie at 0 kB). The real per-engine sizes are produced OFFLINE by
-// scripts/measure-bundles.mjs → results/bundle-sizes.json ({engineId: kB}). Here — after loading the
-// raw results and BEFORE buildReport — we read that map and inject each engine's kB into its
-// bundle-size ScenarioResult as a real `bundleSize` BenchSummary (median = kB). report.ts then ranks
-// the bundle-size winner (lower kB = better) and fills the leaderboard's Bundle column from
-// bench.bundleSize.median exactly like any other metric. No runtime/browser change is involved; if the
-// map is absent the results pass through untouched (the honest 0/NA stays).
-const BUNDLE_SCENARIO_ID = 'performance/bundle-size';
-const bundleInjected = injectBundleSizes(allResults, resolve(ROOT, opts.bundleSizes));
-
-// ── build the report ───────────────────────────────────────────────────────────────────────
-const { markdown, json } = buildReport({
-  results: allResults,
-  ...(suiteVersion ? { suiteVersion } : {}),
+const expected = mergeExpected(runs.map((run) => run.expected).filter(Boolean));
+const report = buildReport({
+  results,
+  suiteVersion: singleSuiteVersion(runs),
+  ...(opts.generatedAtIso ? { generatedAtIso: opts.generatedAtIso } : {}),
+  ...(expected ? { expected } : {}),
+  contextForResult: (result) => context.get(result),
+  dedupePolicy: opts.latest ? 'latest' : 'strict',
+  ...(bundleArtifact ? { bundleArtifact, bundleJoins } : {}),
 });
 
 const outMd = resolve(ROOT, opts.out);
+const outJson = outMd.replace(/\.md$/i, '.json');
 mkdirSync(dirname(outMd), { recursive: true });
-writeFileSync(outMd, markdown.endsWith('\n') ? markdown : markdown + '\n');
-
-// Emit the machine-readable JSON alongside the markdown (§12: "Emit machine-readable results/raw/*.json").
-const outJson = outMd.replace(/\.md$/, '.json');
-writeFileSync(outJson, JSON.stringify(json, null, 2) + '\n');
+writeFileSync(outMd, report.markdown.endsWith('\n') ? report.markdown : `${report.markdown}\n`);
+writeFileSync(outJson, serializeReportJson(report.json));
 
 console.log(
-  `[compare] wrote ${opts.out} + ${outJson.replace(ROOT + '/', '')} ` +
-    `· ${allResults.length} results · ${json.engines.length} engines · ${json.browsers.length} browsers · ` +
-    `${json.scenarios.length} scenarios` +
-    (bundleInjected > 0 ? ` · bundle-sizes injected into ${bundleInjected} cell(s)` : ''),
+  `[compare] wrote ${relative(outMd)} + ${relative(outJson)} · ${report.json.observations.length} normalized observations `
+  + `· ${report.json.cohorts.length} cohorts · ${report.json.deduplication.discarded.length} discarded`
+  + (quarantined.length > 0 ? ` · ${quarantined.length} quarantined` : ''),
 );
 
-// ── bundle-size injection helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Read results/bundle-sizes.json (if present) and inject each engine's kB into its bundle-size
- * ScenarioResult as a real `bundleSize` BenchSummary (median = kB). Only PASS cells are touched — the
- * correctness gate (§0.1) still governs the case, so a FAIL/ERROR/NA cell never gets a fabricated
- * number (it stays an honest no-number/NA in the report). Returns how many cells were injected.
- *
- * @param {import('../src/core/scenario.ts').ScenarioResult[]} results
- * @param {string} mapPath absolute path to results/bundle-sizes.json
- * @returns {number}
- */
-function injectBundleSizes(results, mapPath) {
-  if (!existsSync(mapPath)) {
-    console.error(
-      `[compare] no bundle-sizes map at ${mapPath.replace(ROOT + '/', '')} — bundle-size stays 0/NA. ` +
-        `Run: bun scripts/measure-bundles.mjs`,
-    );
-    return 0;
-  }
-  /** @type {Record<string, number>} */
-  let sizes;
-  try {
-    sizes = JSON.parse(readFileSync(mapPath, 'utf8'));
-  } catch (e) {
-    console.error(`[compare] unreadable bundle-sizes map ${mapPath}: ${e?.message || e} — skipping injection.`);
-    return 0;
-  }
-
-  let injected = 0;
-  const missing = new Set();
-  for (const r of results) {
-    if (r.scenarioId !== BUNDLE_SCENARIO_ID) continue;
-    // Correctness gate: only an engine whose probe oracle PASSed is eligible to carry a bench/win.
-    if (r.status !== 'PASS') continue;
-    const kb = lookupBundleKb(sizes, r.engineId);
-    if (kb === undefined) {
-      missing.add(r.engineId);
-      continue;
+function mergeExpected(values) {
+  if (values.length === 0) return undefined;
+  const cells = new Map();
+  for (const value of values) {
+    for (const cell of normalizeExpectedMatrix(value).cells) {
+      const key = `${cell.engineId}\0${cell.browser}\0${cell.scenarioId}`;
+      const previous = cells.get(key);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(cell)) {
+        throw new Error(`[EXPECTED_CELL_CONFLICT] ${key}`);
+      }
+      cells.set(key, cell);
     }
-    // Overwrite the runner's empty (n=0/median=0) bench with the real offline number. Shape matches
-    // BenchSummary (src/core/scenario.ts); report.ts reads bench.bundleSize.median.
-    r.bench = r.bench ?? {};
-    r.bench.bundleSize = {
-      n: 1,
-      warmup: 0,
-      metric: 'bundleSize',
-      median: kb,
-      p95: kb,
-      mad: 0,
-      unit: 'kB',
-      samples: [kb],
-    };
-    // Keep the result's declared ranking metric consistent (report.ts also infers it, but be explicit).
-    if (!r.primaryMetric) r.primaryMetric = 'bundleSize';
-    injected++;
   }
-
-  if (missing.size > 0) {
-    console.error(
-      `[compare] bundle-sizes map has no entry for PASSing engine(s): ${[...missing].join(', ')} ` +
-        `— those cells stay 0/NA (honest). Add them to scripts/measure-bundles.mjs.`,
-    );
-  }
-  console.log(
-    `[compare] injected bundle sizes from ${mapPath.replace(ROOT + '/', '')} into ${injected} ` +
-      `'${BUNDLE_SCENARIO_ID}' cell(s).`,
-  );
-  return injected;
+  return normalizeExpectedMatrix({ definitionId: 'merged-validated-raw-runs', cells: [...cells.values()] });
 }
 
-/**
- * Look up an engine's bundle kB in the offline map. Tries the exact engine id, then the bare registry
- * id (everything before '@'), then — for the navigator-derived `platform@<family>-<major>` ids whose
- * exact suffix is only known at run time — a `platform@`-prefix fallback to any platform key in the
- * map (they all carry the same 0 kB shipped-library cost). Returns undefined when nothing matches.
- *
- * @param {Record<string, number>} sizes
- * @param {string} engineId
- * @returns {number | undefined}
- */
-function lookupBundleKb(sizes, engineId) {
-  const direct = sizes[engineId];
-  if (typeof direct === 'number' && Number.isFinite(direct)) return direct;
+function singleSuiteVersion(runs) {
+  const versions = [...new Set(runs.map((run) => run.suiteVersion))].sort();
+  return versions.length === 1 ? versions[0] : `mixed:${versions.join(',')}`;
+}
 
-  const bare = engineId.includes('@') ? engineId.slice(0, engineId.indexOf('@')) : engineId;
-  const byBare = sizes[bare];
-  if (typeof byBare === 'number' && Number.isFinite(byBare)) return byBare;
+function cellKey(result) {
+  return `${result.engineId}\0${result.browser}\0${result.scenarioId}`;
+}
 
-  // platform@<family>-<major> variant not explicitly listed: fall back to any 'platform@*' / 'platform'
-  // key (all 0 kB — the platform engine ships no third-party library on any browser).
-  if (bare === 'platform') {
-    for (const [k, v] of Object.entries(sizes)) {
-      if ((k === 'platform' || k.startsWith('platform@')) && typeof v === 'number' && Number.isFinite(v)) {
-        return v;
-      }
-    }
-  }
-  return undefined;
+function requiredArg(values, index, flag) {
+  const value = values[index];
+  if (!value) fail(`${flag} requires a value`, 2);
+  return value;
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function relative(path) {
+  return path.startsWith(`${ROOT}/`) ? path.slice(ROOT.length + 1) : path;
+}
+
+function fail(message, code = 1) {
+  console.error(`compare.mjs: ${message}`);
+  process.exit(code);
 }

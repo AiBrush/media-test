@@ -14,40 +14,25 @@
 
 import { registerScenarios } from '../core/registry.ts';
 import type { Scenario, ScenarioFamily } from '../core/scenario.ts';
+import {
+  compareCanonicalScenarios,
+  loadScenarioFamilies,
+} from '../core/scenario-manifest.ts';
 
-import { audioDspScenarios } from './audio-dsp/index.ts';
-import { decodeSeekScenarios } from './decode-seek/index.ts';
-import { demuxScenarios } from './demux/index.ts';
-import { encryptionScenarios } from './encryption/index.ts';
-import { metadataScenarios } from './metadata/index.ts';
-import { muxScenarios } from './mux/index.ts';
-import { performanceScenarios } from './performance/index.ts';
-import { probeScenarios } from './probe/index.ts';
-import { remuxScenarios } from './remux/index.ts';
-import { robustnessScenarios } from './robustness/index.ts';
-import { streamingOutputScenarios } from './streaming-output/index.ts';
-import { transcodeScenarios } from './transcode/index.ts';
-import { trimScenarios } from './trim/index.ts';
+const loadedFamilies = await loadScenarioFamilies();
 
-/** Families in canonical (report) order. */
-export const scenariosByFamily: Record<ScenarioFamily, Scenario[]> = {
-  probe: probeScenarios,
-  demux: demuxScenarios,
-  remux: remuxScenarios,
-  transcode: transcodeScenarios,
-  'decode-seek': decodeSeekScenarios,
-  trim: trimScenarios,
-  mux: muxScenarios,
-  encryption: encryptionScenarios,
-  metadata: metadataScenarios,
-  'streaming-output': streamingOutputScenarios,
-  'audio-dsp': audioDspScenarios,
-  robustness: robustnessScenarios,
-  performance: performanceScenarios,
-};
+/** Families in the one canonical manifest order, regardless of module completion order. */
+export const scenariosByFamily: Record<ScenarioFamily, Scenario[]> = Object.fromEntries(
+  loadedFamilies.map(({ manifest, scenarios }) => [
+    manifest.family,
+    [...scenarios].sort(compareCanonicalScenarios),
+  ]),
+) as Record<ScenarioFamily, Scenario[]>;
 
 /** The full battery, flattened in family order. */
-export const allScenarios: Scenario[] = Object.values(scenariosByFamily).flat();
+export const allScenarios: Scenario[] = loadedFamilies
+  .flatMap(({ scenarios }) => scenarios)
+  .sort(compareCanonicalScenarios);
 
 /**
  * Guard against accidental duplicate ids across families (registry.registerScenario throws on a

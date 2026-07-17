@@ -16,10 +16,10 @@
  *                                          and the way to gate ESTIMATE-ONLY-duration containers (ts /
  *                                          adts / mp3) materializing a precise output duration.
  *
- * Round-trip / idempotence: modeled as a single property case whose options carry a `roundTrip`
- * target so a runner that supports remux(remux(x,'mkv'),'mp4') can re-wrap through a foreign container
- * and back; the invariant token stays 'decode(remux(x))==decode(x)' so even a runner that does a
- * single remux still gates decoded-pixel equality (a strict subset of the round-trip guarantee).
+ * Round-trip / idempotence: modeled as a single property case whose options carry an exact
+ * `roundTrip` chain. The remux feature executor consumes it and performs BOTH candidate calls; the
+ * invariant then judges the returned second-leg output. A single-remux fallback is not the named
+ * property and is deliberately not accepted.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -109,10 +109,11 @@ const PROPERTY_CASES: RemuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     extraOptions: { roundTrip: ['mkv', 'mp4'] },
+    oracles: ['property-invariant', 'reference-reimport'],
     notes:
       'Round-trip idempotence decode(remux(remux(x,mkv),mp4))==decode(x): re-wrap MP4->MKV->MP4 must ' +
-      'reproduce decoded pixels (catches asymmetric edit-list / box handling). options.roundTrip lists ' +
-      'the re-wrap chain; a single-remux runner still gates decoded-pixel equality (a subset guarantee).',
+      'reproduce decoded pixels and strict-copy structure (catches asymmetric edit-list / box handling). ' +
+      'options.roundTrip is executable: both containers are negotiated and both adapter calls are required.',
   },
 
   // ── Multi-track packet preservation: all tracks (video + 2 audio) must survive the remux.

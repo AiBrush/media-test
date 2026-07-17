@@ -10,13 +10,10 @@
  * sample COPY (no re-encode), so sustained throughput + peak memory are the meaningful axes at scale,
  * and throughputRealtime is the per-case leaderboard ranking number (§9). It is in the metrics list.
  *
- * CORRECTNESS STILL GATES (§0.1): each case keeps decoded-frames-bitexact + reference-reimport +
- * playback-smoke, so a fast-but-wrong remux FAILs and cannot win the throughput crown. NOTE: the
- * large/huge/massive assets are marked `source: generated` with sha256/sizeBytes still null in the
- * manifest (gated behind a non-skip-longform bake) and their golden frames are pending placeholders —
- * so until the bake produces those assets + golden, these cases resolve to NA(asset-missing) / a
- * clean golden-absent FAIL rather than a fabricated number. They are wired now so the leaderboard
- * cell + golden filenames line up the moment the bake completes.
+ * CORRECTNESS STILL GATES (§0.1): each case keeps the semantic reference-reimport gate, so a
+ * fast-but-wrong remux cannot win the throughput crown. Fixture availability is intentionally not
+ * copied into this comment: src/features/remux/availability.ts derives and audits it from the
+ * canonical manifest. At the current manifest revision every rung below has a concrete hash/size.
  *
  * TIMEOUT: each carries a generous per-op cap so a pathological lazy-reader hang at GB scale is caught
  * as a timeout FAIL instead of stalling the Worker (the whole point of the size axis is to surface
@@ -79,10 +76,10 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
 ];
 
-export const remuxSizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) => {
-  const s = buildRemux(c);
+export const remuxSizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
   // Size is the benchmark axis here: rank the per-case winner by sustained realtime throughput.
-  return { ...s, metrics: [...s.metrics], primaryMetric: 'throughputRealtime' as const };
-});
+  // Supply it to the builder so hashing and deep-freezing cover the final definition.
+  buildRemux({ ...c, primaryMetric: 'throughputRealtime' }),
+);
 
 export default remuxSizeLadderScenarios;

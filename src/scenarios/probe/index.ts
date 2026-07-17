@@ -21,17 +21,23 @@
  *  - DEEP EDGE / ROBUSTNESS-flavoured PROBE (§5.3/§A.16) — empty (zero-media) container and
  *    header-truncated PROBE graceful-failure, plus an explicit video-only track-COUNT assertion.
  *
- * DECLARED GAPS (assets NOT in fixtures/manifest.json — see the block at the bottom of this file):
- * fragmented-MP4/CMAF, AVI, FLV, 3GP/3G2, CAF, OGV, GIF-as-video, and the degenerate 0x0 / 1x1 /
- * 1fps / 240fps / mislabeled-container / 5.1-layout / TS-discontinuity edges. Each is in scope per
- * §A.2/§A.16 but has no corpus asset, so it cannot be a correctness-gated probe today. Rather than
- * emit permanent NA(asset-missing) cells (noise, ungateable), the gap is DECLARED with the exact
- * asset + golden the §15 research/bake pass must add. This keeps the absence auditable instead of
- * silent (§15).
+ * COVERAGE DECISIONS (REQ-FEAT-39): executable rows below cover fragmented MP4/CMAF, CAF, 1x1,
+ * 1/240 fps, mislabeled content, 5.1 audio, and TS discontinuity using present assets and goldens.
+ * Every remaining historical gap has a reasoned, versioned OUT_OF_SCOPE record in
+ * src/features/probe/coverage.ts; no missing-asset scenario is registered as fake coverage.
  */
 
 import type { MetricId, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  HLS_PLAYLIST_ONLY_CONTRACT,
+  HLS_PROTECTED_SEGMENT_CONTRACT,
+  PROBE_SCALE_BUDGETS,
+  RECORDER_HEADERLESS_DURATION_CONTRACT,
+  defineProbeMetadataFieldPolicy,
+  type ProbeBudgetContract,
+  type ProbeMetadataFieldPolicy,
+} from '../../features/probe/index.ts';
 
 // ── (A) per-container golden-metadata probes ─────────────────────────────────────────────────────
 
@@ -45,8 +51,65 @@ interface ProbeCase {
   audioCodecs?: string[];
   features?: string[];
   options?: Record<string, unknown>;
+  probeContract?: Record<string, unknown>;
   tolerances?: OracleTolerances;
   notes?: string;
+}
+
+const DECLARED_METADATA_POLICIES: Readonly<Record<string, ProbeMetadataFieldPolicy>> = Object.freeze({
+  'h264_1080p_30s.mp4': defineProbeMetadataFieldPolicy({ fields: ['tags'], tagKeys: ['major_brand'] }),
+  'h264_rotated90.mp4': defineProbeMetadataFieldPolicy({ fields: ['track.rotation'] }),
+  'big_buck_bunny_1080p_h264.mov': defineProbeMetadataFieldPolicy({ fields: ['track.language'] }),
+  'wav_s16.wav': defineProbeMetadataFieldPolicy({
+    fields: ['track.bitrate'],
+    bitrateRelativeTolerance: 0,
+  }),
+  'cenc_ctr.mp4': defineProbeMetadataFieldPolicy({
+    fields: ['protection.scheme'],
+    protectionSchemes: ['cenc'],
+  }),
+  'cenc_cbcs.mp4': defineProbeMetadataFieldPolicy({
+    fields: ['protection.scheme'],
+    protectionSchemes: ['cbcs'],
+  }),
+});
+
+const EMPTY_DURATION_NULLABILITY_POLICY = defineProbeMetadataFieldPolicy({
+  fields: ['duration-nullability'],
+});
+
+const SCALE_BUDGET_BY_ASSET: Readonly<Record<string, ProbeBudgetContract>> = Object.freeze({
+  'large_h264_1080p_120s.mp4': PROBE_SCALE_BUDGETS.large,
+  'large_vp9_1080p_120s.webm': PROBE_SCALE_BUDGETS.large,
+  'huge_h264_1080p_600s.mov': PROBE_SCALE_BUDGETS.huge,
+  'huge_vp9_1080p_240s.webm': PROBE_SCALE_BUDGETS.huge,
+  'big_buck_bunny_1080p_h264.mov': PROBE_SCALE_BUDGETS.huge,
+  'massive_h264_1080p_2h.mp4': PROBE_SCALE_BUDGETS.massive,
+  'massive_vp9_1080p_2h.webm': PROBE_SCALE_BUDGETS.massive,
+});
+
+function scenarioProbeOptions(
+  asset: string,
+  existing?: Record<string, unknown>,
+  probeContract?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const metadataFieldPolicy = DECLARED_METADATA_POLICIES[asset];
+  const probeBudget = SCALE_BUDGET_BY_ASSET[asset];
+  if (!existing && !metadataFieldPolicy && !probeBudget && !probeContract) return undefined;
+  return {
+    ...(existing ?? {}),
+    robustness: {
+      probe: {
+        schema: 'media-test/probe-scenario-contract@1',
+        ...(metadataFieldPolicy ? { metadataFieldPolicy } : {}),
+        ...(probeBudget ? { probeBudget } : {}),
+        ...(probeContract ? { probeContract } : {}),
+        ...(probeContract?.schema === 'media-test/hls-protected-segment-probe@1'
+          ? { hlsResourceIndex: 'fixtures/golden/hls_aes128.m3u8.resources.json' }
+          : {}),
+      },
+    },
+  };
 }
 
 const PROBE_CASES: ProbeCase[] = [
@@ -93,7 +156,7 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'Multiple tracks: golden lists every track; order/language must match (positional compare).',
+    notes: 'Multiple tracks: golden lists every logical track; semantic type-bucket matching keeps a stream-array reorder a PASS (recorded representation difference), not FAIL.',
   },
   { asset: 'h264_1080p_5s.mov', container: 'mov', videoCodecs: ['h264'], audioCodecs: ['aac'] },
 
@@ -140,17 +203,17 @@ const PROBE_CASES: ProbeCase[] = [
     notes: 'Playlist probe: duration aggregated across segments; engines lacking HLS negotiate NA.',
   },
   {
-    // §A.12 / §5.1: AES-128 encrypted HLS playlist. Probe reports container/tracks/segment-aggregated
-    // duration WITHOUT the AES key (metadata is unencrypted), exactly like the CENC probe cases below
-    // report scheme/structure without decrypting. golden/hls_aes128.m3u8.meta.json gates it.
+    // Full protected-segment row. Unlike the playlist-only row below, track details require reading
+    // and decrypting media and therefore explicitly require the key resource.
     asset: 'hls_aes128.m3u8',
     container: 'hls',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    features: ['hls:aes128'],
+    features: ['hls:aes128', 'probe:resource-trace'],
+    probeContract: HLS_PROTECTED_SEGMENT_CONTRACT as unknown as Record<string, unknown>,
     notes:
-      'AES-128 HLS: probe reports container/tracks/aggregated duration from the playlist without the ' +
-      'key (metadata is in the clear). The decrypt key is only needed for the decrypt op, not probe.',
+      'AES-128 HLS protected-segment probe: container, track, and codec details require decrypting at ' +
+      'least one media segment with the declared key. A denied/missing key is NA_ASSET, not FAIL/ERROR.',
   },
 
   // ── Encrypted MP4 (probe of the encrypted container, no key needed) ──
@@ -237,6 +300,70 @@ const PROBE_CASES: ProbeCase[] = [
     notes:
       'Multi-hour AUDIO-ONLY in MP4(.m4a): probe must report ~1h duration cheaply (not by scanning all ' +
       'samples) and exactly 1 audio track. Golden present only after a non-skip-longform bake.',
+  },
+
+  // ── Executable former coverage gaps (REQ-FEAT-39) ──
+  {
+    asset: 'fragmented_cmaf.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'Fragmented MP4/CMAF: committed init+media fixture with moov plus moof/mdat. Probe must recover ' +
+      'tracks and presentation duration from the fragmented structure.',
+  },
+  {
+    id: 'pcm_s16_caf',
+    asset: 'pcm_s16.caf',
+    container: 'caf',
+    audioCodecs: ['pcm-s16'],
+    notes: 'CAF container coverage with deterministic 48 kHz stereo signed-16 PCM and present metadata golden.',
+  },
+  {
+    asset: 'video_1x1.webm',
+    container: 'webm',
+    videoCodecs: ['vp9'],
+    notes: 'Degenerate valid dimension boundary: report coded width=1 and height=1 exactly.',
+  },
+  {
+    asset: 'h264_1fps_30s.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    notes: 'Extreme low cadence: report the committed CFR 1 fps value rather than treating it as absent.',
+  },
+  {
+    asset: 'video_240fps.mp4',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    tolerances: { fpsTolerance: 1.2 },
+    notes:
+      'Extreme high cadence: report nominal/observed 240 fps; the explicit 0.5% band avoids a fixed ' +
+      'low-rate absolute tolerance while still rejecting a materially wrong cadence.',
+  },
+  {
+    id: 'mislabeled_h264_content',
+    asset: 'mislabeled_h264.webm',
+    container: 'mp4',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'Mislabeled content: .webm name/MIME wraps real ISO BMFF H.264/AAC bytes. Probe must report ' +
+      "content-derived container 'mp4', never trust the suffix fallback.",
+  },
+  {
+    asset: 'wav_5_1.wav',
+    container: 'wav',
+    audioCodecs: ['pcm-s16'],
+    notes: 'WAVEFORMATEXTENSIBLE 5.1 edge: report six channels exactly.',
+  },
+  {
+    asset: 'ts_discontinuity.ts',
+    container: 'ts',
+    videoCodecs: ['h264'],
+    audioCodecs: ['aac'],
+    notes:
+      'MPEG-TS discontinuity edge: aggregate the presented timeline across the authored timestamp ' +
+      'jump without overflow, negative duration, or suffix-derived metadata.',
   },
 
   // ── (B) SIZE ladder (§5.3 first-class axis). Each bucket gets a functional, golden-gated probe. ──
@@ -346,12 +473,46 @@ const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
       ...(c.features ? { features: c.features } : {}),
     },
     oracles: ['golden-metadata'],
-    metrics: ['wall'],
-    ...(c.options ? { options: c.options } : {}),
+    metrics: SCALE_BUDGET_BY_ASSET[c.asset] ? ['wall', 'peakMemory'] : ['wall'],
+    ...(scenarioProbeOptions(c.asset, c.options, c.probeContract)
+      ? { options: scenarioProbeOptions(c.asset, c.options, c.probeContract) }
+      : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   }),
 );
+
+/**
+ * Key-free HLS is deliberately a separate, narrower observation than protected segment probing.
+ * The oracle reads EXTINF/EXT-X-KEY from the digest-verified playlist and asserts no segment/key
+ * resource was read; it never infers codec or track details that the media playlist cannot prove.
+ */
+const hlsAes128PlaylistOnlyProbe: Scenario = defineScenario({
+  id: 'probe/hls_aes128_playlist_key_free',
+  op: 'probe',
+  input: 'hls_aes128.m3u8',
+  requires: {
+    operations: ['probe'],
+    containersIn: ['hls'],
+    features: ['hls:aes128', 'probe:resource-trace'],
+  },
+  oracles: ['property-invariant'],
+  metrics: ['wall'],
+  options: {
+    invariant: 'hls-playlist-only-probe',
+    property: 'hls-playlist-only-probe',
+    robustness: {
+      probe: {
+        schema: 'media-test/probe-scenario-contract@1',
+        probeContract: HLS_PLAYLIST_ONLY_CONTRACT,
+      },
+    },
+  },
+  notes:
+    'AES-128 HLS playlist-only contract: assert only the EXTINF duration sum and EXT-X-KEY ' +
+    'protection signaling. Codec/track details are intentionally absent, and segment/key reads fail ' +
+    'this key-free row. Full track inspection remains probe/hls_aes128 and explicitly requires the key.',
+});
 
 // ── (C) PERF HEADLINE at scale (§8.1): repeated-probe ops/sec on large + huge/massive assets ──────
 
@@ -421,8 +582,9 @@ const perfProbeScenarios: Scenario[] = PERF_PROBE_CASES.map((c) =>
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
     },
     oracles: ['golden-metadata'],
-    metrics: [OPS_PER_SEC, 'wall'],
+    metrics: [OPS_PER_SEC, 'wall', 'peakMemory'],
     primaryMetric: OPS_PER_SEC,
+    options: scenarioProbeOptions(c.asset)!,
     notes: c.notes,
   }),
 );
@@ -430,25 +592,21 @@ const perfProbeScenarios: Scenario[] = PERF_PROBE_CASES.map((c) =>
 // ── (D) METAMORPHIC (§A.16): probe(x).dur consistent across containers of identical content ────────
 
 /**
- * Property-invariant probe case: the SAME underlying H.264/AAC content delivered in three containers
+ * Property-invariant probe case: the SAME underlying H.264/AAC elementary streams delivered in two containers
  * must probe to the SAME duration within tolerance. The `property-invariant` oracle's 'probe-duration'
  * branch (oracles.ts) compares the probed duration against the golden/source duration. Multi-input
  * (the runner probes each container and compares). This mirrors robustness's
  * prop_duration_consistent_across_containers but as a first-class PROBE-family metamorphic case so the
  * invariant is exercised in the probe pillar, not only in robustness.
  *
- * NOTE on inputs: h264_1080p_5s.mov is a 5 s clip while the mp4/mkv are 30 s / 10 s, so this trio is
- * NOT bit-identical-length content. The invariant is therefore declared over the two genuinely
- * length-equal wrappers of the same source — the runner compares each probed duration to its OWN
- * golden duration, and the cross-container assertion is that no wrapper changes a container's own
- * reported duration. (h264_in_mkv.mkv is the 10 s mkv twin of the 10 s sources; keeping the list to
- * mp4+mkv avoids a false cross-length mismatch.)
+ * `fixtures/golden/probe-duration-equivalent-wrappers.json` records identical stream-copy SHA-256
+ * hashes for both video and audio streams. The oracle records every per-input golden delta and the
+ * order-independent maximum direct wrapper delta.
  */
 const probeDurationInvariant: Scenario = defineScenario({
   id: 'probe/metamorphic-duration-across-containers',
   op: 'probe',
-  // mp4 + mkv wrappers of H.264/AAC content; each probed duration is compared to its own golden.
-  input: ['h264_1080p_30s.mp4', 'h264_in_mkv.mkv'],
+  input: ['h264_rotated90.mp4', 'h264_in_mkv.mkv'],
   requires: {
     operations: ['probe'],
     containersIn: ['mp4', 'mkv'],
@@ -456,11 +614,22 @@ const probeDurationInvariant: Scenario = defineScenario({
     audioCodecs: ['aac'],
   },
   oracles: ['property-invariant'],
-  options: { invariant: 'probe(x).dur consistent across containers', property: 'probe-duration' },
+  options: {
+    invariant: 'probe-duration-cross-wrapper',
+    property: 'probe-duration',
+    robustness: {
+      probe: {
+        schema: 'media-test/probe-scenario-contract@1',
+        wrapperEquivalenceEvidence: 'fixtures/golden/probe-duration-equivalent-wrappers.json',
+        wrapperEquivalenceSha256: '9c83b15031c504dafea40e2a53f5b7d7a1f886947a5f5bc177fcbcf3c5236c01',
+      },
+    },
+  },
   metrics: ['wall'],
   notes:
-    'Metamorphic (§A.16): probed duration of equivalent H.264/AAC content is invariant to the ' +
-    'container wrapper. Oracle = property-invariant (probe-duration branch); gated vs golden duration.',
+    'Metamorphic (§A.16): MP4 and Matroska wrappers carry byte-identical H.264/AAC elementary ' +
+    'streams (committed hash evidence). Compare each duration to its golden and compare measured ' +
+    'wrappers directly; a shifted wrapper fails even if an unrelated golden could otherwise pass.',
 });
 
 /**
@@ -468,12 +637,11 @@ const probeDurationInvariant: Scenario = defineScenario({
  * must still report a SANE duration; the existing golden-metadata probe case accepts a null duration
  * (golden-null path) because such a stream legitimately lacks a Segment Duration. This metamorphic
  * case ADDITIONALLY gates that IF the engine reports a non-null duration, it is within the
- * estimate-only band (probe-duration oracle uses the per-container loose band for headerless WebM).
+ * content-derived packet-span bound.
  * So "sane duration" is actually exercised rather than silently waived.
  *
- * The op is probe; the property-invariant 'probe-duration' branch needs a reference duration. The
- * golden for recorder_headerless.webm (after the browser capture bake) carries the estimated
- * duration; the oracle compares the probed duration to it within tolerance.
+ * The committed metadata duration remains null; the separate packet evidence supplies a 2.98 s
+ * observed span and the scenario explicitly declares the allowed tail/rounding allowance.
  */
 const recorderHeaderlessSaneDuration: Scenario = defineScenario({
   id: 'probe/metamorphic-recorder-headerless-sane-duration',
@@ -486,12 +654,21 @@ const recorderHeaderlessSaneDuration: Scenario = defineScenario({
     audioCodecs: ['opus'],
   },
   oracles: ['property-invariant'],
-  options: { invariant: 'probe(x).dur consistent across containers', property: 'probe-duration' },
+  options: {
+    invariant: 'probe-headerless-sane-duration',
+    property: 'probe-duration',
+    robustness: {
+      probe: {
+        schema: 'media-test/probe-scenario-contract@1',
+        probeContract: RECORDER_HEADERLESS_DURATION_CONTRACT,
+      },
+    },
+  },
   metrics: ['wall'],
   notes:
-    'Metamorphic (§A.16) "sane duration": a headerless MediaRecorder WebM must, IF it reports a ' +
-    'non-null duration, land within the estimate-only band vs golden. probe-duration oracle gates it; ' +
-    'the plain golden-metadata case above still accepts a legitimate null. Golden after the browser-capture bake.',
+    'Metamorphic (§A.16) "sane duration": null is explicitly valid; a finite estimate is a PASS with a recorded representation difference and ' +
+    'must be non-negative, finite, and no larger than the committed 2.98s packet span plus a 0.5s ' +
+    'tail/rounding allowance. NaN, infinity, negative, or larger values fail.',
 });
 
 // ── (E) DEEP EDGE / robustness-flavoured PROBE (§5.3 / §A.16) ─────────────────────────────────────
@@ -516,6 +693,14 @@ const emptyAudioProbe: Scenario = defineScenario({
   },
   oracles: ['golden-metadata'],
   metrics: ['wall'],
+  options: {
+    robustness: {
+      probe: {
+        schema: 'media-test/probe-scenario-contract@1',
+        metadataFieldPolicy: EMPTY_DURATION_NULLABILITY_POLICY,
+      },
+    },
+  },
   notes:
     "empty bucket (§5.3): structurally-valid 0-sample WAV. Probe must report the track and a null/0 " +
     'duration without crashing — golden-metadata asserts the pcm-s16 track + null duration. This is ' +
@@ -556,6 +741,7 @@ const truncatedHeaderProbe: Scenario = defineScenario({
 
 export const probeScenarios: Scenario[] = [
   ...goldenProbeScenarios,
+  hlsAes128PlaylistOnlyProbe,
   ...perfProbeScenarios,
   probeDurationInvariant,
   recorderHeaderlessSaneDuration,
@@ -566,56 +752,8 @@ export const probeScenarios: Scenario[] = [
 export default probeScenarios;
 
 /*
- * ──────────────────────────────────────────────────────────────────────────────────────────────────
- * DECLARED GAPS — in-scope probe coverage that has NO corpus asset yet (so it cannot be a
- * correctness-gated case TODAY). Listed so the absence is auditable (§15), not silent. The §15
- * research/bake pass must (a) add the asset + manifest entry, (b) bake golden/<id>.meta.json, then
- * (c) add the probe case here. These are intentionally NOT emitted as scenarios: a scenario pointing
- * at a non-existent asset is a permanent NA(asset-missing) cell — ungateable noise, not coverage.
- *
- * Each token below is `assetId` (container, §ref) — what to assert.
- *
- *  CONTAINERS (§A.2, in scope iff ≥1 core framework reads it — all the below qualify per the dossiers):
- *   - fmp4_cmaf_init_media.<mp4|cmaf> (fragmented-mp4/CMAF, §A.2/§A.10/§A.16) — assert tracks/duration
- *       are read from moov/sidx WITHOUT the media boxes (the init+media split edge). Read by
- *       ffmpeg-wasm, mediabunny, mp4box, remotion-*. No fragmented/CMAF asset exists at all.
- *   - clip.avi  (avi, §A.2) — read by ffmpeg-wasm, web-demuxer(full), remotion-media-parser/webcodecs.
- *   - clip.flv  (flv, §A.2) — read by ffmpeg-wasm, web-demuxer(full).
- *   - clip.3gp / clip.3g2 (3gp, §A.2) — read by ffmpeg-wasm, mp4box (3gp-family), web-demuxer(custom build).
- *   - clip.caf  (caf, §A.2) — read by ffmpeg-wasm.
- *   - clip.ogv  (ogv, §A.2) — read by ffmpeg-wasm (Ogg video).
- *   - anim.gif  (gif-as-video, §A.2) — read by ffmpeg-wasm (GIF demuxer / animated GIF).
- *     (Engines lacking each container negotiate NA honestly; the case is only worth emitting once the
- *      asset+golden exist so at least one engine is correctness-gated on it.)
- *
- *  DEGENERATE / EXTREME EDGES (§A.16) — no asset, all need a tiny generated fixture + golden:
- *   - degenerate_1x1.mp4 (and/or degenerate_0x0.*) — assert width/height reported EXACTLY at the
- *       degenerate boundary (dims comparison at 1×1 / 0×0).
- *   - extreme_fps_1.mp4   — 1-fps clip: assert fps==1 (stresses the fixed-0.05 absolute fps tolerance).
- *   - extreme_fps_240.mp4 — 240-fps clip: assert fps≈240; the fixed 0.05 ABSOLUTE fps tolerance in
- *       compareTrack (oracles.ts) is too tight here (239.7 vs 240 → Δ0.3 FAILs a correct engine), so a
- *       240fps golden should declare a NOMINAL-fps tolerance OR the oracle should go relative at high fps.
- *   - mislabeled_h264_es.webm — an H.264 elementary stream with a .webm name/MIME: assert the engine
- *       reports the TRUE container/codec from CONTENT, not the label (tests resolveContainer's
- *       extension-fallback path directly).
- *   - audio_5_1_layout.<mp4|wav> — 5.1 layout: assert channels==6 (compareTrack channels at an unusual layout).
- *   - ts_pts_discontinuity.ts — MPEG-TS with a PTS discontinuity/wraparound: assert the aggregated
- *       duration stays sane (exercises the documented loose-TS estimate band on a DISCONTINUOUS stream,
- *       not just a clean TS).
- *
- *  ORACLE GAPS (NOT writable here — they live in src/core/oracles.ts / engine.ts, outside this writer's
- *  scope — but recorded so the probe cases that DEPEND on them are not mistaken for fully gated):
- *   - goldenMetadata ignores track.rotation: the h264_rotated90.mp4 case above relies on the dims diff
- *       (unrotated w/h) to catch a w/h swap; a true rotation-field assertion needs a compareTrack
- *       rotation check (NormalizedTrack has `rotation?`).
- *   - goldenMetadata ignores track.language: the h264_multitrack.mp4 case's "language must match" is
- *       NOT enforced (compareTrack omits language).
- *   - goldenMetadata ignores the container-level tags map (NormalizedMetadata.tags) — metadata-family
- *       READ cases reuse this same oracle for title/artist/etc. and silently pass regardless of tags.
- *   - goldenMetadata never asserts an encryption scheme: the cenc_ctr/cenc_cbcs/hls_aes128 probe notes
- *       say "reports encryption scheme", but neither the type nor the oracle carries an encryption field,
- *       so that part of the probe contract is currently unverifiable (over-claim unless the type+oracle add it).
- *   - duration golden-null-vs-measured-present is NOT flagged (an engine that fabricates a duration for a
- *       legitimately-null container — headerless WebM, raw ADTS — is not caught).
- * ──────────────────────────────────────────────────────────────────────────────────────────────────
+ * The former free-form DECLARED GAPS list is intentionally gone. Every axis is now either an
+ * executable scenario above or a reasoned, versioned OUT_OF_SCOPE record in
+ * src/features/probe/coverage.ts. The coverage audit forbids scenario records whose asset or metadata
+ * golden is absent, so no permanent NA_ASSET row can masquerade as implemented coverage.
  */

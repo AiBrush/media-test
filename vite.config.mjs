@@ -7,8 +7,9 @@
 //
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
-import { copyFileSync, createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, extname, join, normalize } from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
+import { constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
 const MIME = {
   '.mp4': 'video/mp4',
@@ -278,46 +279,203 @@ function crossOriginIsolation() {
   };
 }
 
+export const SAVE_ENDPOINT_MAX_BYTES = 10 * 1024 * 1024;
+const SAVE_ENDPOINT_TOKEN_HEADER = 'x-media-test-save-token';
+const SAVE_ENDPOINT_MIN_TOKEN_LENGTH = 32;
+
+function headerValue(headers, name) {
+  const value = headers?.[name] ?? headers?.[name.toLowerCase()];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function tokenMatches(actual, expected) {
+  const supplied = Buffer.from(String(actual || ''), 'utf8');
+  const configured = Buffer.from(String(expected || ''), 'utf8');
+  return supplied.length === configured.length && timingSafeEqual(supplied, configured);
+}
+
+function isTrueDescendant(root, candidate) {
+  const child = relative(root, candidate);
+  return child !== '' && child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child);
+}
+
+function containsExistingSymlink(root, candidate) {
+  try {
+    if (existsSync(root) && lstatSync(root).isSymbolicLink()) return true;
+    let cursor = root;
+    for (const part of relative(root, candidate).split(sep).filter(Boolean)) {
+      cursor = join(cursor, part);
+      if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) return true;
+    }
+    return false;
+  } catch {
+    // A path component that cannot be inspected is not a safe write target.
+    return true;
+  }
+}
+
+function sameRequestOrigin(origin, host) {
+  if (!origin) return true;
+  if (!host) return false;
+  try {
+    const parsed = new URL(String(origin));
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === String(host);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Save endpoint (the /chrome-flow's persistence): POST /__save?path=results/... writes the request
- * body to a file under results/. This is how the browser-driven run (Phase F) persists window.__RESULTS__
- * to results/raw/ — the /chrome tool blocks data exfiltration through the page, so the page POSTs its
- * results here and the dev server writes them. Strictly confined to the results/ tree.
+ * Validate the optional development-only save surface without reading the body. Exported so the
+ * containment/authentication policy can be exercised without starting Vite.
+ */
+export function inspectSaveRequest({
+  enabled = false,
+  token = '',
+  method = 'GET',
+  url = '/',
+  headers = {},
+  cwd = process.cwd(),
+  maxBytes = SAVE_ENDPOINT_MAX_BYTES,
+} = {}) {
+  if (!enabled) return { ok: false, status: 404, message: 'save: disabled' };
+  if (String(token).length < SAVE_ENDPOINT_MIN_TOKEN_LENGTH) {
+    return { ok: false, status: 503, message: 'save: invalid server token configuration' };
+  }
+  if (method !== 'POST') return { ok: false, status: 405, message: 'save: POST only' };
+  if (!tokenMatches(headerValue(headers, SAVE_ENDPOINT_TOKEN_HEADER), token)) {
+    return { ok: false, status: 401, message: 'save: invalid token' };
+  }
+  if (!sameRequestOrigin(headerValue(headers, 'origin'), headerValue(headers, 'host'))) {
+    return { ok: false, status: 403, message: 'save: cross-origin request rejected' };
+  }
+  const contentType = String(headerValue(headers, 'content-type') || '').toLowerCase();
+  if (!/^application\/json(?:\s*;|$)/.test(contentType)) {
+    return { ok: false, status: 415, message: 'save: application/json required' };
+  }
+  const contentLengthRaw = headerValue(headers, 'content-length');
+  if (contentLengthRaw !== undefined) {
+    const contentLength = Number(contentLengthRaw);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+      return { ok: false, status: 400, message: 'save: invalid Content-Length' };
+    }
+    if (contentLength > maxBytes) {
+      return { ok: false, status: 413, message: `save: body exceeds ${maxBytes} bytes` };
+    }
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(String(url), 'http://localhost');
+  } catch {
+    return { ok: false, status: 400, message: 'save: invalid URL' };
+  }
+  const requestedPath = parsed.searchParams.get('path') || '';
+  const resultsRoot = resolve(cwd, 'results');
+  const filePath = resolve(cwd, requestedPath);
+  if (!isTrueDescendant(resultsRoot, filePath)) {
+    return { ok: false, status: 403, message: 'save: path must be a file under results/' };
+  }
+  if (containsExistingSymlink(resultsRoot, filePath)) {
+    return { ok: false, status: 403, message: 'save: symbolic-link paths are not allowed' };
+  }
+  if (extname(filePath).toLowerCase() !== '.json') {
+    return { ok: false, status: 415, message: 'save: only .json result files are allowed' };
+  }
+  return { ok: true, filePath, requestedPath };
+}
+
+export function createSaveEndpointHandler({
+  enabled = process.env.VITE_ENABLE_SAVE_ENDPOINT === '1',
+  token = process.env.VITE_SAVE_TOKEN || '',
+  cwd = process.cwd(),
+  maxBytes = SAVE_ENDPOINT_MAX_BYTES,
+} = {}) {
+  return (req, res, next) => {
+    let pathname;
+    try {
+      pathname = new URL(req.url || '/', 'http://localhost').pathname;
+    } catch {
+      pathname = '';
+    }
+    if (pathname !== '/__save') return next();
+
+    const verdict = inspectSaveRequest({
+      enabled,
+      token,
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      cwd,
+      maxBytes,
+    });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    if (!verdict.ok) {
+      res.statusCode = verdict.status;
+      return res.end(verdict.message);
+    }
+
+    const chunks = [];
+    let byteLength = 0;
+    let rejected = false;
+    req.on('data', (chunk) => {
+      if (rejected) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteLength += bytes.length;
+      if (byteLength > maxBytes) {
+        rejected = true;
+        chunks.length = 0;
+        res.statusCode = 413;
+        res.end(`save: body exceeds ${maxBytes} bytes`);
+        return;
+      }
+      chunks.push(bytes);
+    });
+    req.on('error', () => {
+      if (rejected || res.writableEnded) return;
+      rejected = true;
+      res.statusCode = 400;
+      res.end('save: request stream failed');
+    });
+    req.on('end', () => {
+      if (rejected) return;
+      const body = Buffer.concat(chunks, byteLength);
+      try {
+        JSON.parse(body.toString('utf8'));
+      } catch {
+        res.statusCode = 400;
+        return res.end('save: body must contain valid JSON');
+      }
+      try {
+        mkdirSync(dirname(verdict.filePath), { recursive: true });
+        const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+        writeFileSync(verdict.filePath, body, {
+          flag: fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | noFollow,
+          mode: 0o600,
+        });
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.end(`saved ${verdict.requestedPath} (${byteLength} bytes)`);
+      } catch (err) {
+        res.statusCode = 500;
+        return res.end(`save error: ${err?.message || err}`);
+      }
+    });
+  };
+}
+
+/**
+ * Optional development-only persistence for a named local orchestrator. Normal manual and
+ * Playwright exports do not use it. It is deliberately absent unless VITE_ENABLE_SAVE_ENDPOINT=1;
+ * an enabled caller must send VITE_SAVE_TOKEN in x-media-test-save-token.
  */
 function saveEndpoint() {
-  const resultsRoot = join(process.cwd(), 'results');
+  const handler = createSaveEndpointHandler();
   return {
     name: 'save-results',
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        const url = (req.url || '').split('?')[0];
-        if (url !== '/__save') return next();
-        if (req.method !== 'POST') {
-          res.statusCode = 405;
-          return res.end('save: POST only');
-        }
-        const q = new URL(req.url || '', 'http://localhost');
-        const rel = q.searchParams.get('path') || '';
-        const filePath = normalize(join(process.cwd(), rel));
-        if (!filePath.startsWith(resultsRoot)) {
-          res.statusCode = 403;
-          return res.end('save: path must be under results/');
-        }
-        const chunks = [];
-        req.on('data', (c) => chunks.push(c));
-        req.on('end', () => {
-          try {
-            mkdirSync(dirname(filePath), { recursive: true });
-            writeFileSync(filePath, Buffer.concat(chunks));
-            res.statusCode = 200;
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.end(`saved ${rel} (${Buffer.concat(chunks).length} bytes)`);
-          } catch (err) {
-            res.statusCode = 500;
-            res.end(`save error: ${err?.message || err}`);
-          }
-        });
-      });
+      server.middlewares.use(handler);
     },
   };
 }
@@ -325,8 +483,17 @@ function saveEndpoint() {
 export default {
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
   plugins: [crossOriginIsolation(), ffmpegVendorStatic(), saveEndpoint(), fixturesStatic()],
+  // The per-file robustness Worker shares dynamically imported engine/scenario chunks with the app;
+  // code-splitting workers must be emitted as ES modules rather than Vite's IIFE default.
+  worker: { format: 'es' },
+  // LAN exposure remains an explicit CLI choice (`serve.sh --host`); Vite itself is loopback-only.
+  server: { host: '127.0.0.1' },
+  preview: { host: '127.0.0.1' },
   // @aibrush/media is a file: dependency in node_modules, so vite would otherwise pre-bundle it with
   // esbuild — which rewrites the codec tails' `new URL('./x.wasm', import.meta.url)` and breaks wasm
   // loading. Exclude it so vite serves the engine as-is (same as when it lived under src/…/vendor).
   optimizeDeps: { exclude: ['@aibrush/media'] },
+  // Bundle-cost evidence walks the real emitted graph. Keep the production manifest beside dist so
+  // scripts/measure-bundles.mjs never falls back to a synthetic package-only build.
+  build: { manifest: true },
 };

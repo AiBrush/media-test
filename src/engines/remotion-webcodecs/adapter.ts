@@ -25,7 +25,7 @@
  *
  * Lib surface used (verified against the installed 4.0.479 .d.ts):
  *   @remotion/webcodecs:
- *     convertMedia, bufferWriter (./buffer), webcodecsController, createVideoDecoder,
+ *     convertMedia, bufferWriter (./buffer), webcodecsController,
  *     getAvailableContainers, getAvailableVideoCodecs, getAvailableAudioCodecs
  *   @remotion/media-parser:
  *     parseMedia, mediaParserController, MediaParserVideoTrack/AudioTrack/Track, sample callbacks
@@ -50,18 +50,42 @@
  */
 
 import type {
+  AdapterConfigProfile,
   CapabilitySet,
+  ConcreteOperationRequest,
+  ConcreteWebCodecsConfig,
+  DecodeOptions,
+  DecodeTrackSelector,
   DemuxResult,
+  DemuxTrackRepresentation,
   FrameDigest,
+  FrameRateProvenance,
   FrameSink,
+  LifecycleContext,
   MediaBytes,
   MediaEngine,
   MediaInput,
   NormalizedMetadata,
   NormalizedTrack,
+  OperationContext,
   PacketInfo,
+  SerializableValue,
+  SupportDecision,
   TranscodeOptions,
   TranscodeVideoOptions,
+} from '../../core/engine.ts';
+import {
+  AdapterLifecycleController,
+  CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  DECODE_TRACK_SELECTOR_SCHEMA,
+  captureConfigUsedSnapshot,
+  createBrowserNotSupportedError,
+  createNotApplicableError,
+  isBrowserNotSupportedError,
+  validateAdapterResult,
+  validateCapabilitySet,
+  validateSupportDecision,
 } from '../../core/engine.ts';
 
 import {
@@ -79,6 +103,10 @@ import {
   type RemotionVideoCodec,
 } from './codecs.ts';
 import { digestImageData } from './digest.ts';
+import {
+  decideRemotionWebcodecsSupport,
+  remotionTupleSummary,
+} from '../remotion/support.ts';
 
 const ENGINE_ID = 'remotion-webcodecs@4.0.479';
 const PROTECTED_TRACK_METADATA_FEATURE = 'metadata:protected-tracks';
@@ -90,6 +118,14 @@ type BufferWriterModule = typeof import('@remotion/webcodecs/buffer');
 type MediaParserModule = typeof import('@remotion/media-parser');
 type WebReaderModule = typeof import('@remotion/media-parser/web');
 type SourceOptions = { src: string | Blob; reader?: WebReaderModule['webReader'] };
+type AbortableController = { abort(reason?: unknown): void };
+
+interface IsolatedVideoDecoder {
+  decode(sample: EncodedVideoChunkInit): Promise<void>;
+  flush(): Promise<void>;
+  waitForQueueToBeLessThan(items: number): Promise<void>;
+  close(): void;
+}
 
 interface LibHandle {
   wc: WebcodecsModule;
@@ -104,21 +140,78 @@ interface LibHandle {
   webReader: WebReaderModule['webReader'];
 }
 
-/** The config we drive the lib with (best-path per dossier §0.9), surfaced as configUsed (§8.5). */
-export const CONFIG_USED = {
+export interface RemotionWebcodecsConfig extends AdapterConfigProfile {
+  framework: '@remotion/webcodecs';
+  packageVersions: {
+    '@remotion/webcodecs': '4.0.479';
+    '@remotion/media-parser': '4.0.479';
+  };
+  backend: 'webcodecs';
+  hardwareAcceleration: 'prefer-hardware-with-software-fallback';
+  workerCount: 0;
+  threadCount: 0;
+  readerMode: 'not-selected' | 'webReader' | 'blob';
+  writerMode: 'bufferWriter';
+  targetMode: 'in-memory-complete-output';
+  codecConfigs: SerializableValue[];
+  encoderNondeterministic: true;
+  pixelBackend: 'offscreencanvas-2d';
+  pipeline: 'streaming-backpressure';
+  queueDepth: 'waitForQueueToBeLessThan';
+  operation: 'none' | 'probe' | 'demux' | 'remux' | 'transcode' | 'decodeFrames' | 'seek';
+  parsePath: 'not-selected' | 'main-thread';
+  sourceReader: 'not-selected' | 'webReader' | 'blob';
+  selectedTrackIds: number[];
+  trackDecisions: Array<{ trackId: number; type: string; decision: string; reasonCode?: string }>;
+  queueHighWaterMark: number;
+  controllerFinalState: Record<string, number | null> | null;
+  outputBytes: number;
+  cleanupComplete: boolean;
+  activeControllers: number;
+  activeDecoders: number;
+  activeFrames: number;
+  activeWriterBuffers: number;
+}
+
+/** Initial immutable snapshot; instances replace operation-local fields with observed facts. */
+export const CONFIG_USED: RemotionWebcodecsConfig = {
+  framework: '@remotion/webcodecs',
+  packageVersions: {
+    '@remotion/webcodecs': '4.0.479',
+    '@remotion/media-parser': '4.0.479',
+  },
   backend: 'webcodecs',
-  hwAccel: 'prefer-hardware(+software fallback)',
+  hardwareAcceleration: 'prefer-hardware-with-software-fallback',
+  workerCount: 0,
+  threadCount: 0,
+  readerMode: 'not-selected',
+  writerMode: 'bufferWriter',
+  targetMode: 'in-memory-complete-output',
+  codecConfigs: [],
+  encoderNondeterministic: true,
   pixelBackend: 'offscreencanvas-2d',
-  wasmThreads: 0,
   pipeline: 'streaming-backpressure',
   queueDepth: 'waitForQueueToBeLessThan',
-  writer: 'bufferWriter',
-  worker: 'convert=main-thread; extractFrames/parse=worker-capable',
-} as const;
+  operation: 'none',
+  parsePath: 'not-selected',
+  sourceReader: 'not-selected',
+  selectedTrackIds: [],
+  trackDecisions: [],
+  queueHighWaterMark: 0,
+  controllerFinalState: null,
+  outputBytes: 0,
+  cleanupComplete: true,
+  activeControllers: 0,
+  activeDecoders: 0,
+  activeFrames: 0,
+  activeWriterBuffers: 0,
+};
 
 /** A FrameSink backed by digests + cached ImageData for SSIM/PSNR pixel access. */
 class CapturedFrameSink implements FrameSink {
   frames: FrameDigest[] = [];
+  telemetry?: FrameSink['telemetry'];
+  selectedTrack?: FrameSink['selectedTrack'];
   private pixels: ImageData[] = [];
 
   push(img: ImageData, digest: FrameDigest): void {
@@ -131,14 +224,6 @@ class CapturedFrameSink implements FrameSink {
     if (!img) throw new Error(`No pixels captured for frame ${i}`);
     return img;
   };
-}
-
-class NotApplicableError extends Error {
-  override name = 'NotApplicableError';
-
-  constructor(operation: string, reason: string) {
-    super(`${ENGINE_ID} ${operation}: ${reason}`);
-  }
 }
 
 /**
@@ -215,13 +300,25 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * in-memory bufferWriter). Previously CONFIG_USED was exported but never attached, so the report
    * recorded `configUsed === undefined` for this engine.
    */
-  readonly configUsed = CONFIG_USED;
-
   private lib: LibHandle | null = null;
+  private readonly lifecycle = new AdapterLifecycleController(ENGINE_ID);
+  private readonly fallbackAbort = new AbortController();
+  private readonly activeControllers = new Set<AbortableController>();
+  private readonly controllerAbortBindings = new Map<AbortableController, { signal: AbortSignal; abort: () => void }>();
+  private readonly activeDecoders = new Set<IsolatedVideoDecoder>();
+  private readonly activeFrames = new Set<VideoFrame>();
+  private activeWriterBuffers = 0;
+  private config: RemotionWebcodecsConfig = structuredClone(CONFIG_USED);
+
+  get configUsed(): RemotionWebcodecsConfig {
+    return captureConfigUsedSnapshot(ENGINE_ID, this.config, {
+      requireProfile: true,
+    }) as unknown as RemotionWebcodecsConfig;
+  }
 
   // ── capabilities (HONEST, dossier §10) ───────────────────────────────────────────────────────
   capabilities(): CapabilitySet {
-    return {
+    const capabilities: CapabilitySet = {
       operations: {
         probe: true, // via @remotion/media-parser parseMedia
         demux: true, // via parseMedia sample callbacks
@@ -245,11 +342,15 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       //
       // Video read set (MediaParserVideoCodec ⊇ these): adds 'av1' (encode-side has no av1 path).
       videoCodecs: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
+      videoCodecsIn: ['h264', 'hevc', 'vp8', 'vp9', 'av1'],
+      videoCodecsOut: ['h264', 'hevc', 'vp8', 'vp9'],
       // Audio read set (MediaParserAudioCodec ⊇ these): adds mp3/flac/vorbis + pcm-s24 that
       // media-parser reads but @remotion/webcodecs cannot encode (encode is aac/opus/pcm-s16 only).
       // Although 4.0.479's public types include `pcm-f32`, this build throws on IEEE-float WAVE
       // format tag 3 before returning metadata, so float WAV rows must negotiate NA.
       audioCodecs: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24'],
+      audioCodecsIn: ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24'],
+      audioCodecsOut: ['aac', 'opus', 'pcm-s16'],
       // No decrypt API.
       encryption: [],
       // Pixel transforms are limited to resize + rotate (90° multiples) on OffscreenCanvas 2D.
@@ -260,6 +361,11 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       // ensureSupportedTranscodeRequest (~line 2190) and channel remap stays NA there too.
       features: ['resize', 'rotate', 'resample', 'packets:dts', PROTECTED_TRACK_METADATA_FEATURE, 'decode:golden-rgba'],
     };
+    return validateCapabilitySet(this, capabilities);
+  }
+
+  supports(request: ConcreteOperationRequest): SupportDecision {
+    return validateSupportDecision(ENGINE_ID, decideRemotionWebcodecsSupport(request));
   }
 
   // ── init / dispose (UNTIMED, §0.7) ───────────────────────────────────────────────────────────
@@ -270,22 +376,36 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * A short encoder warm-up exercises the native VideoEncoder so the first measured convert does not
    * pay the codec-spin-up cost.
    */
-  async init(): Promise<void> {
-    const [wc, bufferMod, mp, webMod] = await Promise.all([
-      import('@remotion/webcodecs'),
-      import('@remotion/webcodecs/buffer'),
-      import('@remotion/media-parser'),
-      import('@remotion/media-parser/web'),
-    ]);
-    this.lib = { wc, bufferWriter: bufferMod.bufferWriter, mp, webReader: webMod.webReader };
+  async init(context?: LifecycleContext): Promise<void> {
+    const call = context ?? fallbackLifecycleContext(this.fallbackAbort.signal, 'support');
+    await this.lifecycle.init(call, async () => {
+      const [wc, bufferMod, mp, webMod] = await Promise.all([
+        import('@remotion/webcodecs'),
+        import('@remotion/webcodecs/buffer'),
+        import('@remotion/media-parser'),
+        import('@remotion/media-parser/web'),
+      ]);
+      this.lib = { wc, bufferWriter: bufferMod.bufferWriter, mp, webReader: webMod.webReader };
 
-    // Encoder warm-up (best-effort; never fails init). Spin up + tear down a hardware-preferred
-    // VideoEncoder so the codec implementation is resident before the first measured operation.
-    await warmUpEncoder();
+      // Encoder warm-up (best-effort; never fails init). Spin up + tear down a hardware-preferred
+      // VideoEncoder so the codec implementation is resident before the first measured operation.
+      await warmUpEncoder();
+    });
   }
 
-  async dispose(): Promise<void> {
-    this.lib = null;
+  async dispose(context?: LifecycleContext): Promise<void> {
+    const call = context ?? fallbackLifecycleContext(this.fallbackAbort.signal, 'cleanup');
+    await this.lifecycle.dispose(call, async () => {
+      for (const controller of this.activeControllers) controller.abort('adapter disposed');
+      for (const decoder of this.activeDecoders) decoder.close();
+      for (const frame of this.activeFrames) frame.close();
+      this.activeControllers.clear();
+      this.activeDecoders.clear();
+      this.activeFrames.clear();
+      this.activeWriterBuffers = 0;
+      this.lib = null;
+      this.updateResourceConfig(true);
+    });
   }
 
   private mustLib(): LibHandle {
@@ -304,9 +424,44 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   private async sourceOptions(input: MediaInput): Promise<SourceOptions> {
     const { webReader } = this.mustLib();
     if (isHlsInput(input) || !input.mutated) {
+      this.config = {
+        ...this.config,
+        readerMode: 'webReader',
+        sourceReader: 'webReader',
+        parsePath: 'main-thread',
+      };
       return { src: input.url, reader: webReader };
     }
+    this.config = {
+      ...this.config,
+      readerMode: 'blob',
+      sourceReader: 'blob',
+      parsePath: 'main-thread',
+    };
     return { src: await input.blob() };
+  }
+
+  private async parse<F>(
+    options: Parameters<MediaParserModule['parseMedia']>[0],
+    context: OperationContext,
+    onController?: (controller: ReturnType<MediaParserModule['mediaParserController']>) => void,
+  ): Promise<F> {
+    const { mp } = this.mustLib();
+    const controller = mp.mediaParserController();
+    onController?.(controller);
+    this.activeControllers.add(controller);
+    this.updateResourceConfig(false);
+    const abort = (): void => controller.abort(context.signal.reason);
+    if (context.signal.aborted) abort();
+    else context.signal.addEventListener('abort', abort, { once: true });
+    try {
+      return (await mp.parseMedia({ ...options, controller })) as F;
+    } finally {
+      context.signal.removeEventListener('abort', abort);
+      controller.abort('parse settled');
+      this.activeControllers.delete(controller);
+      this.updateResourceConfig(this.allResourcesClosed());
+    }
   }
 
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
@@ -316,13 +471,24 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * full decode pass; duration comes from the header where present. Metadata tags are read via the
    * `metadata` field and flattened best-effort.
    */
-  async probe(input: MediaInput): Promise<NormalizedMetadata> {
+  async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    const call = context ?? fallbackOperationContext('probe', this.fallbackAbort.signal);
+    return this.lifecycle.operation('probe', call, async () => {
+      this.beginOperation('probe');
+      try {
+        return validateAdapterResult(ENGINE_ID, 'probe', await this.probeImpl(input, call));
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
+
+  private async probeImpl(input: MediaInput, context: OperationContext): Promise<NormalizedMetadata> {
     if (isHlsInput(input)) {
-      const { metadata, packets } = await this.demux(input);
+      const { metadata, packets } = await this.demuxImpl(input, context);
       return withVideoFpsFromPackets(metadata, packets);
     }
 
-    const { mp } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
     const headerMetadata = await webmHeaderMetadata(input);
     if (shouldUseHeaderOnlyWebmProbe(input, headerMetadata)) {
@@ -330,7 +496,12 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     }
     const headerFps = singleVideoFpsFromMetadata(headerMetadata);
 
-    const result = await mp.parseMedia({
+    const result = await this.parse<{
+      container: import('@remotion/media-parser').MediaParserContainer;
+      durationInSeconds: number | null;
+      tracks: import('@remotion/media-parser').MediaParserTrack[];
+      metadata: import('@remotion/media-parser').MediaParserMetadataEntry[];
+    }>({
       ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: {
@@ -339,19 +510,16 @@ export class RemotionWebcodecsEngine implements MediaEngine {
         tracks: true,
         metadata: true,
       },
-    });
+    }, context);
 
     const container = await canonicalContainerForInput(input, result.container);
-    let metadata = await withProtectedMp4MetadataFallback(
+    const metadata = await withProtectedMp4MetadataFallback(
       input,
       normalizeMetadata(container, result.durationInSeconds, result.tracks, result.metadata),
       result.tracks,
     );
-    if (shouldPreferHeaderWebmFps(input, metadata, headerFps)) {
-      metadata = withSingleVideoFps(metadata, headerFps, { replace: true });
-    }
     if (needsPacketProbeFallback(metadata)) {
-      const { metadata: demuxMetadata, packets } = await this.demux(input);
+      const { metadata: demuxMetadata, packets } = await this.demuxImpl(input, context);
       return withProbeFieldsFromPackets(demuxMetadata, packets);
     }
 
@@ -359,7 +527,14 @@ export class RemotionWebcodecsEngine implements MediaEngine {
 
     if (headerFps != null) return withSingleVideoFps(metadata, headerFps);
 
-    const fps = await parseSlowFpsFallback(mp, srcOptions);
+    const slow = await this.parse<{ slowFps: number }>({
+      ...srcOptions,
+      acknowledgeRemotionLicense: true,
+      fields: { slowFps: true },
+    }, context);
+    const fps = typeof slow.slowFps === 'number' && Number.isFinite(slow.slowFps) && slow.slowFps > 0
+      ? slow.slowFps
+      : null;
     return fps == null ? metadata : withSingleVideoFps(metadata, fps);
   }
 
@@ -378,34 +553,44 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * ascending trackId (= container stream order), remapping every packet. The metadata track list is
    * sorted the same way so packets[i].trackIndex aligns with metadata.tracks[trackIndex].
    */
-  async demux(input: MediaInput): Promise<DemuxResult> {
-    const { mp } = this.mustLib();
+  async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    const call = context ?? fallbackOperationContext('demux', this.fallbackAbort.signal);
+    return this.lifecycle.operation('demux', call, async () => {
+      this.beginOperation('demux');
+      try {
+        return validateAdapterResult(ENGINE_ID, 'demux', await this.demuxImpl(input, call), {
+          requireExplicitCodedRepresentation: true,
+        });
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
+
+  private async demuxImpl(input: MediaInput, context: OperationContext): Promise<DemuxResult> {
     const srcOptions = await this.sourceOptions(input);
 
     // Collect packets tagged with the raw container trackId; index is resolved AFTER the parse.
     const tagged: TaggedPacket[] = [];
-    const onSample = (track: import('@remotion/media-parser').MediaParserTrack) => (
+    const onSample = (
+      track: import('@remotion/media-parser').MediaParserVideoTrack
+        | import('@remotion/media-parser').MediaParserAudioTrack,
+    ) => (
       sample: import('@remotion/media-parser').MediaParserVideoSample
         | import('@remotion/media-parser').MediaParserAudioSample,
     ): void => {
       tagged.push({
         trackId: track.trackId,
-        packet: {
-          size: sample.data.byteLength,
-          ptsUs: Math.round(sample.timestamp),
-          dtsUs: Math.round(sample.decodingTimestamp),
-          keyframe: sample.type === 'key',
-        },
-        durationUs: typeof sample.duration === 'number' && Number.isFinite(sample.duration)
-          ? Math.round(sample.duration)
-          : undefined,
-        h264AudPrefixBytes: track.type === 'video' && track.codecEnum === 'h264'
-          ? h264AudStartCodePrefixBytes(sample.data)
-          : undefined,
+        packet: remotionWebcodecsSampleEvidence(sample, track),
       });
     };
 
-    const result = await mp.parseMedia({
+    const result = await this.parse<{
+      container: import('@remotion/media-parser').MediaParserContainer;
+      durationInSeconds: number | null;
+      tracks: import('@remotion/media-parser').MediaParserTrack[];
+      metadata: import('@remotion/media-parser').MediaParserMetadataEntry[];
+    }>({
       ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: {
@@ -416,14 +601,14 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       },
       onVideoTrack: ({ track }) => onSample(track),
       onAudioTrack: ({ track }) => onSample(track),
-    });
+    }, context);
 
     // Stable trackId -> 0-based index in ascending-trackId order (= container stream order). Tracks
     // that emitted samples but were not in result.tracks (defensive) are appended after, preserving
     // their relative trackId order, so no packet is dropped.
     const indexByTrackId = new Map<number, number>();
     let nextIndex = 0;
-    for (const t of [...result.tracks].sort((a, b) => a.trackId - b.trackId)) {
+    for (const t of result.tracks) {
       if (!indexByTrackId.has(t.trackId)) indexByTrackId.set(t.trackId, nextIndex++);
     }
     for (const { trackId } of tagged) {
@@ -431,17 +616,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     }
 
     const container = await canonicalContainerForInput(input, result.container);
-    const normalizedTagged = normalizeElementaryMp3PacketTimes(
-      result.container,
-      result.tracks,
-      normalizeTransportStreamH264PacketSizes(
-        result.container,
-        result.tracks,
-        normalizeTransportStreamAacPacketTimes(result.container, result.tracks, tagged),
-      ),
-    );
-
-    const packets: PacketInfo[] = normalizedTagged.map(({ trackId, packet }) => {
+    const packets: PacketInfo[] = tagged.map(({ trackId, packet }) => {
       const trackIndex = indexByTrackId.get(trackId)!;
       return {
         trackIndex,
@@ -456,7 +631,16 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       result.metadata,
       indexByTrackId,
     );
-    return { metadata, packets };
+    const representations = result.tracks.map((track) =>
+      trackRepresentation(track, indexByTrackId.get(track.trackId) ?? indexByTrackId.size),
+    );
+    return {
+      metadata,
+      packets,
+      packetOrdering: 'decode',
+      representations,
+      telemetry: { packetCount: packets.length },
+    };
   }
 
   // ── remux ────────────────────────────────────────────────────────────────────────────────────
@@ -466,29 +650,128 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * only re-encodes if the container cannot hold the source codec. Output goes to the in-memory
    * bufferWriter so `save()` yields the bytes directly.
    */
-  async remux(input: MediaInput, opts: { container: string }): Promise<MediaBytes> {
-    const container = canonicalToRemotionContainer(opts.container);
-    if (!container) throw new Error(`${ENGINE_ID} cannot write container '${opts.container}'`);
+  async remux(
+    input: MediaInput,
+    opts: { container: string },
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    const call = context ?? fallbackOperationContext('remux', this.fallbackAbort.signal, input, opts);
+    return this.lifecycle.operation('remux', call, async () => {
+      this.beginOperation('remux');
+      try {
+        if (context) {
+          const decision = decideRemotionWebcodecsSupport(call.request);
+          if (!decision.supported) throw decisionToNotApplicable(call.request, decision);
+        }
+        return validateAdapterResult(ENGINE_ID, 'remux', await this.remuxImpl(input, opts, call));
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
 
-    return this.convert(input, { container });
+  private async remuxImpl(
+    input: MediaInput,
+    opts: { container: string },
+    context: OperationContext,
+  ): Promise<MediaBytes> {
+    const container = canonicalToRemotionContainer(opts.container);
+    if (!container) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'remux',
+        `Remotion cannot write container '${opts.container}'`,
+        remotionTupleSummary(context.request),
+        'REMOTION_OUTPUT_CONTAINER_UNSUPPORTED',
+      );
+    }
+
+    const handlers = await this.copyOnlyTrackHandlers(input, container, context);
+    return this.convert(input, { container, ...handlers }, context);
   }
 
   // ── transcode ────────────────────────────────────────────────────────────────────────────────
   /**
-   * Re-encode / resize / rotate via convertMedia. The single-bytes contract means we drive the FIRST
-   * variant when a fan-out ladder is requested (the lib has no native single-output fan-out). When a
-   * codec is requested explicitly we map+validate it; when ONLY resize/rotate is asked for we leave
-   * the codec undefined so convertMedia's default handler re-encodes with the container default
-   * (faithful to the lib's documented "convert + resize" path). Resize uses the lib's ResizeOperation
-   * ('max-height-width' when both dims are given, else width/height); rotate is a degrees number.
+   * Re-encode / resize / rotate via convertMedia. A requested fan-out ladder executes every rendition
+   * independently and retains every output in MediaBytes.variants (the primary bytes remain the first
+   * requested rendition for backward compatibility). When a codec is requested explicitly we
+   * map+validate it; when ONLY resize/rotate is asked for we leave the codec undefined so convertMedia's
+   * default handler re-encodes with the container default. Same-aspect exact width+height requests use
+   * a width operation; aspect-changing boxes are rejected before conversion.
    */
-  async transcode(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
-    const container = canonicalToRemotionContainer(opts.container);
-    if (!container) throw new Error(`${ENGINE_ID} cannot write container '${opts.container}'`);
+  async transcode(
+    input: MediaInput,
+    opts: TranscodeOptions,
+    context?: OperationContext,
+  ): Promise<MediaBytes> {
+    const call = context ?? fallbackOperationContext(
+      'transcode',
+      this.fallbackAbort.signal,
+      input,
+      opts as unknown as Record<string, unknown>,
+    );
+    return this.lifecycle.operation('transcode', call, async () => {
+      this.beginOperation('transcode');
+      try {
+        if (context) {
+          const decision = decideRemotionWebcodecsSupport(call.request);
+          if (!decision.supported) throw decisionToNotApplicable(call.request, decision);
+        }
+        const output = await this.transcodeImpl(input, opts, call);
+        return validateAdapterResult(ENGINE_ID, 'transcode', output);
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
 
-    const videoSpec = opts.variants && opts.variants.length ? opts.variants[0] : opts.video;
-    ensureSupportedTranscodeRequest(input, opts, container, videoSpec);
-    await this.assertRequestedTracksPresent(input, opts, videoSpec);
+  private async transcodeImpl(
+    input: MediaInput,
+    opts: TranscodeOptions,
+    context: OperationContext,
+  ): Promise<MediaBytes> {
+    const container = canonicalToRemotionContainer(opts.container);
+    if (!container) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'transcode',
+        `Remotion cannot write container '${opts.container}'`,
+        remotionTupleSummary(context.request),
+        'REMOTION_OUTPUT_CONTAINER_UNSUPPORTED',
+      );
+    }
+
+    if (opts.variants?.length) {
+      const outputs: MediaBytes[] = [];
+      for (const variant of opts.variants) {
+        outputs.push(await this.transcodeSingle(input, { ...opts, variants: undefined, video: variant }, container, context));
+      }
+      const first = outputs[0];
+      if (!first) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'transcode',
+          'an empty rendition ladder has no output contract',
+          remotionTupleSummary(context.request),
+          'REMOTION_EMPTY_RENDITION_LADDER',
+        );
+      }
+      return { ...first, variants: outputs.map((output) => ({ ...output })) };
+    }
+
+    return this.transcodeSingle(input, opts, container, context);
+  }
+
+  private async transcodeSingle(
+    input: MediaInput,
+    opts: TranscodeOptions,
+    container: RemotionContainer,
+    context: OperationContext,
+  ): Promise<MediaBytes> {
+
+    const videoSpec = opts.video;
+    const parsed = await this.assertRequestedTracksPresent(input, opts, videoSpec, context);
+    ensureSupportedTranscodeRequest(input, opts, container, videoSpec, parsed.tracks, context.request);
 
     let videoCodec: RemotionVideoCodec | undefined;
     let resize: import('@remotion/webcodecs').ResizeOperation | undefined;
@@ -498,7 +781,15 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     if (container !== 'wav' && videoSpec) {
       if (videoSpec.codec) {
         const mapped = canonicalToRemotionVideo(videoSpec.codec);
-        if (!mapped) throw new Error(`${ENGINE_ID} cannot encode video codec '${videoSpec.codec}'`);
+        if (!mapped) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'transcode',
+            `Remotion cannot encode video codec '${videoSpec.codec}'`,
+            remotionTupleSummary(context.request),
+            'REMOTION_VIDEO_CODEC_UNSUPPORTED',
+          );
+        }
         videoCodec = mapped;
       }
       // (no explicit codec -> leave undefined; convertMedia uses the container default on re-encode)
@@ -511,7 +802,17 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     let audioCodec: RemotionAudioCodec | undefined;
     if (opts.audio && opts.audio.codec) {
       const mapped = canonicalToRemotionAudio(opts.audio.codec);
-      if (!mapped) throw new Error(`${ENGINE_ID} cannot encode audio codec '${opts.audio.codec}'`);
+      if (!mapped || opts.audio.codec !== canonicalAudioForRemotion(mapped)) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'transcode',
+          `Remotion cannot encode '${opts.audio.codec}' exactly`,
+          remotionTupleSummary(context.request),
+          opts.audio.codec === 'pcm-s24'
+            ? 'REMOTION_PCM_S24_OUTPUT_UNSUPPORTED'
+            : 'REMOTION_AUDIO_CODEC_UNSUPPORTED',
+        );
+      }
       audioCodec = mapped;
     }
 
@@ -524,20 +825,212 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     // convertAudioData({ newSampleRate, format:'s16' }), which resamples and writes the requested rate
     // into the WAV fmt chunk. Only reachable for WAV here: ensureSupportedTranscodeRequest still throws
     // NA for non-WAV sampleRate (Chrome's AudioEncoder overrides the rate for aac/opus).
-    let onAudioTrack: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler | undefined;
-    if (opts.audio?.sampleRate != null && opts.audio.channels == null) {
-      const requestedSampleRate = opts.audio.sampleRate;
-      // getDefaultAudioCodec({container:'wav'}) === 'wav' (its getWaveAudioEncoder honors sampleRate).
-      const resampleAudioCodec = getDefaultAudioCodecForContainer(this.mustLib().wc, container);
-      onAudioTrack = () => ({
-        type: 'reencode',
-        audioCodec: resampleAudioCodec,
-        bitrate: 128000,
-        sampleRate: requestedSampleRate,
-      });
+    const handlers = this.reencodeTrackHandlers(
+      container,
+      videoCodec,
+      audioCodec,
+      resize,
+      rotate,
+      opts,
+      context,
+    );
+
+    return this.convert(input, { container, videoCodec, audioCodec, resize, rotate, ...handlers }, context);
+  }
+
+  private async copyOnlyTrackHandlers(
+    input: MediaInput,
+    container: RemotionContainer,
+    context: OperationContext,
+  ): Promise<{
+    onVideoTrack: import('@remotion/webcodecs').ConvertMediaOnVideoTrackHandler;
+    onAudioTrack: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler;
+  }> {
+    const { wc } = this.mustLib();
+    const srcOptions = await this.sourceOptions(input);
+    const parsed = await this.parse<{
+      container: import('@remotion/media-parser').MediaParserContainer;
+      tracks: import('@remotion/media-parser').MediaParserTrack[];
+    }>({
+      ...srcOptions,
+      acknowledgeRemotionLicense: true,
+      fields: { container: true, tracks: true },
+    }, context);
+
+    if (!parsed.tracks.length) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'remux',
+        'copy-only remux requires at least one track',
+        remotionTupleSummary(context.request),
+        'REMOTION_REMUX_TRACK_REQUIRED',
+      );
     }
 
-    return this.convert(input, { container, videoCodec, audioCodec, resize, rotate, onAudioTrack });
+    const copiedVideo = new Set<number>();
+    const copiedAudio = new Set<number>();
+    for (const track of parsed.tracks) {
+      let copy = false;
+      if (track.type === 'video') {
+        copy = wc.canCopyVideoTrack({
+          inputContainer: parsed.container,
+          inputTrack: track,
+          outputContainer: container,
+          outputVideoCodec: null,
+          resizeOperation: null,
+          rotationToApply: 0,
+        });
+        if (copy) copiedVideo.add(track.trackId);
+      } else if (track.type === 'audio') {
+        copy = wc.canCopyAudioTrack({
+          inputCodec: track.codecEnum,
+          inputContainer: parsed.container,
+          outputContainer: container,
+          outputAudioCodec: null,
+        });
+        if (copy) copiedAudio.add(track.trackId);
+      }
+      this.recordTrackDecision(track.trackId, track.type, copy ? 'copy' : 'reject', copy ? undefined : 'REMOTION_REMUX_COPY_INCOMPATIBLE');
+      if (!copy) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'remux',
+          `track ${track.trackId} (${track.type}) cannot be copied into ${container}`,
+          remotionTupleSummary(context.request),
+          'REMOTION_REMUX_COPY_INCOMPATIBLE',
+        );
+      }
+    }
+
+    return {
+      onVideoTrack: ({ track, canCopyTrack }) => {
+        if (!canCopyTrack || !copiedVideo.has(track.trackId)) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'remux',
+            `framework copy eligibility changed for video track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_REMUX_COPY_INCOMPATIBLE',
+          );
+        }
+        return { type: 'copy' };
+      },
+      onAudioTrack: ({ track, canCopyTrack }) => {
+        if (!canCopyTrack || !copiedAudio.has(track.trackId)) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'remux',
+            `framework copy eligibility changed for audio track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_REMUX_COPY_INCOMPATIBLE',
+          );
+        }
+        return { type: 'copy' };
+      },
+    };
+  }
+
+  private reencodeTrackHandlers(
+    container: RemotionContainer,
+    videoCodec: RemotionVideoCodec | undefined,
+    audioCodec: RemotionAudioCodec | undefined,
+    resize: import('@remotion/webcodecs').ResizeOperation | undefined,
+    rotate: number | undefined,
+    opts: TranscodeOptions,
+    context: OperationContext,
+  ): {
+    onVideoTrack: import('@remotion/webcodecs').ConvertMediaOnVideoTrackHandler;
+    onAudioTrack: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler;
+  } {
+    const { wc } = this.mustLib();
+    return {
+      onVideoTrack: async ({ track, canCopyTrack, defaultVideoCodec }) => {
+        if (container === 'wav') {
+          this.recordTrackDecision(track.trackId, 'video', 'drop');
+          return { type: 'drop' };
+        }
+        const transformRequested = Boolean(opts.video?.codec || resize || rotate);
+        if (!transformRequested && canCopyTrack) {
+          this.recordTrackDecision(track.trackId, 'video', 'copy');
+          return { type: 'copy' };
+        }
+        const codec = videoCodec ?? defaultVideoCodec;
+        if (!codec) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'transcode',
+            `no output video codec is available for track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_VIDEO_CODEC_UNSUPPORTED',
+          );
+        }
+        await this.assertExactVideoReencodeConfigs(track, codec, resize, rotate, context);
+        const supported = await wc.canReencodeVideoTrack({
+          videoCodec: codec,
+          track,
+          resizeOperation: resize ?? null,
+          rotate: rotate ?? null,
+        });
+        this.recordFrameworkCodecProbe('framework-video-reencode', track.trackId, codec, supported, {
+          width: opts.video?.width ?? track.width,
+          height: opts.video?.height ?? track.height,
+          frameRate: track.fps,
+        });
+        if (!supported) {
+          throw createBrowserNotSupportedError(
+            ENGINE_ID,
+            'transcode',
+            `the browser cannot configure Remotion's ${codec} encoder for track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_VIDEO_ENCODER_CONFIG_UNSUPPORTED',
+          );
+        }
+        this.recordTrackDecision(track.trackId, 'video', 'reencode');
+        return { type: 'reencode', videoCodec: codec, resize: resize ?? null, rotate: rotate ?? 0 };
+      },
+      onAudioTrack: async ({ track, canCopyTrack, defaultAudioCodec }) => {
+        const transformRequested = Boolean(opts.audio);
+        if (!transformRequested && canCopyTrack) {
+          this.recordTrackDecision(track.trackId, 'audio', 'copy');
+          return { type: 'copy' };
+        }
+        const codec = audioCodec ?? defaultAudioCodec;
+        if (!codec) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'transcode',
+            `no output audio codec is available for track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_AUDIO_CODEC_UNSUPPORTED',
+          );
+        }
+        const bitrate = opts.audio?.bitrate ?? 128_000;
+        const sampleRate = opts.audio?.sampleRate ?? null;
+        await this.assertExactAudioReencodeConfigs(track, codec, bitrate, sampleRate, context);
+        const supported = await wc.canReencodeAudioTrack({
+          track,
+          audioCodec: codec,
+          bitrate,
+          sampleRate,
+        });
+        this.recordFrameworkCodecProbe('framework-audio-reencode', track.trackId, codec, supported, {
+          sampleRate: sampleRate ?? track.sampleRate,
+          channels: track.numberOfChannels,
+          bitrate,
+        });
+        if (!supported) {
+          throw createBrowserNotSupportedError(
+            ENGINE_ID,
+            'transcode',
+            `the browser cannot configure Remotion's ${codec} encoder for track ${track.trackId}`,
+            remotionTupleSummary(context.request),
+            'REMOTION_AUDIO_ENCODER_CONFIG_UNSUPPORTED',
+          );
+        }
+        this.recordTrackDecision(track.trackId, 'audio', 'reencode');
+        return { type: 'reencode', audioCodec: codec, bitrate, sampleRate };
+      },
+    };
   }
 
   /** Shared convertMedia driver: buffer writer + license ack + probe-derived expected metadata. */
@@ -552,146 +1045,307 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       // Optional per-audio-track resolver (used only for the resample path). When provided it OVERRIDES
       // the lib's default copy/reencode decision so the requested output sampleRate is honored.
       onAudioTrack?: import('@remotion/webcodecs').ConvertMediaOnAudioTrackHandler;
+      onVideoTrack?: import('@remotion/webcodecs').ConvertMediaOnVideoTrackHandler;
     },
+    context: OperationContext,
   ): Promise<MediaBytes> {
-    const { wc, bufferWriter, mp } = this.mustLib();
+    const { wc, bufferWriter } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
 
     // Probe (fast, header-only) to size the MP4 moov in one pass (dossier §4.6).
     let expectedDurationInSeconds: number | null = null;
     let expectedFrameRate: number | null = null;
     try {
-      const probed = await mp.parseMedia({
+      const probed = await this.parse<{ durationInSeconds: number | null; fps: number | null }>({
         ...srcOptions,
         acknowledgeRemotionLicense: true,
         fields: { durationInSeconds: true, fps: true },
-      });
+      }, context);
       expectedDurationInSeconds = probed.durationInSeconds ?? null;
       expectedFrameRate = probed.fps ?? null;
-    } catch {
+    } catch (error) {
+      if (context.signal.aborted) {
+        throw context.signal.reason ?? error;
+      }
       // Non-fatal: convertMedia still works without the size hints, just may re-write the moov.
     }
 
     const controller = wc.webcodecsController();
+    this.activeControllers.add(controller);
+    this.activeWriterBuffers++;
+    this.updateResourceConfig(false);
+    const abort = (): void => controller.abort(context.signal.reason);
+    if (context.signal.aborted) abort();
+    else context.signal.addEventListener('abort', abort, { once: true });
 
-    // NOTE: convertMedia sets acknowledgeRemotionLicense:true internally and does NOT accept it as a
-    // param (it would be an excess property); we only pass it to parseMedia above.
-    const result = await wc.convertMedia({
-      ...srcOptions,
-      container: opts.container,
-      videoCodec: opts.videoCodec,
-      audioCodec: opts.audioCodec,
-      resize: opts.resize,
-      rotate: opts.rotate,
-      onAudioTrack: opts.onAudioTrack, // undefined for every non-resample call (preserves prior behavior)
-      controller,
-      writer: bufferWriter, // in-memory output -> save() returns the bytes
-      expectedDurationInSeconds,
-      expectedFrameRate,
-    });
+    const started = nowMs();
+    let lastAtMs = 0;
+    let lastProgress = -1;
+    let decodedFrames = 0;
+    let encodedFrames = 0;
+    let result: Awaited<ReturnType<WebcodecsModule['convertMedia']>> | undefined;
+    let primaryError: unknown;
+    try {
+      // NOTE: convertMedia sets acknowledgeRemotionLicense:true internally and does NOT accept it as
+      // a param (it would be an excess property); we only pass it to parseMedia above.
+      result = await wc.convertMedia({
+        ...srcOptions,
+        container: opts.container,
+        videoCodec: opts.videoCodec,
+        audioCodec: opts.audioCodec,
+        resize: opts.resize,
+        rotate: opts.rotate,
+        onAudioTrack: opts.onAudioTrack,
+        onVideoTrack: opts.onVideoTrack,
+        controller,
+        writer: bufferWriter,
+        expectedDurationInSeconds,
+        expectedFrameRate,
+        onProgress: (state) => {
+          const atMs = monotonicElapsed(started, lastAtMs);
+          lastAtMs = atMs;
+          if (state.overallProgress == null) {
+            context.emit({ type: 'progress', atMs, determinate: false });
+          } else if (state.overallProgress >= lastProgress) {
+            lastProgress = state.overallProgress;
+            context.emit({ type: 'progress', atMs, determinate: true, value: state.overallProgress });
+          }
+          if (state.decodedVideoFrames > decodedFrames) {
+            decodedFrames = state.decodedVideoFrames;
+            context.emit({ type: 'decoded-frame-count', atMs, count: decodedFrames });
+          }
+          if (state.encodedVideoFrames > encodedFrames) {
+            encodedFrames = state.encodedVideoFrames;
+            context.emit({ type: 'encoded-frame-count', atMs, count: encodedFrames });
+          }
+        },
+      });
 
-    const blob = await result.save();
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    // Free the in-memory output buffer held by the writer.
-    await result.remove().catch(() => undefined);
+      this.config = {
+        ...this.config,
+        controllerFinalState: normalizeFinalState(result.finalState),
+      };
 
-    return {
-      bytes,
-      mime: mimeForContainer(opts.container),
-      container: opts.container,
-    };
+      const blob = await result.save();
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const atMs = monotonicElapsed(started, lastAtMs);
+      lastAtMs = atMs;
+      context.emit({ type: 'first-byte', atMs });
+      context.emit({ type: 'bytes-written', atMs, bytes: bytes.byteLength });
+      context.emit({ type: 'write-count', atMs, count: 1 });
+      if (result.finalState.decodedVideoFrames > decodedFrames) {
+        decodedFrames = result.finalState.decodedVideoFrames;
+        context.emit({ type: 'decoded-frame-count', atMs, count: decodedFrames });
+      }
+      if (result.finalState.encodedVideoFrames > encodedFrames) {
+        encodedFrames = result.finalState.encodedVideoFrames;
+        context.emit({ type: 'encoded-frame-count', atMs, count: encodedFrames });
+      }
+      if (lastProgress < 1) {
+        lastProgress = 1;
+        context.emit({ type: 'progress', atMs, determinate: true, value: 1 });
+      }
+      this.config = {
+        ...this.config,
+        outputBytes: bytes.byteLength,
+      };
+      return {
+        bytes,
+        mime: mimeForContainer(opts.container),
+        container: opts.container,
+        targetWrites: 1,
+        firstByteMs: atMs,
+        telemetry: {
+          progress: 1,
+          bytesWritten: bytes.byteLength,
+          writeCount: 1,
+          decodedFrames,
+          encodedFrames,
+          firstByteMs: atMs,
+        },
+      };
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      context.signal.removeEventListener('abort', abort);
+      controller.abort('conversion settled');
+      let cleanupError: unknown;
+      if (result) {
+        try {
+          await result.remove();
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+      this.activeWriterBuffers = Math.max(0, this.activeWriterBuffers - 1);
+      this.activeControllers.delete(controller);
+      this.updateResourceConfig(this.allResourcesClosed() && cleanupError === undefined);
+      if (cleanupError !== undefined) {
+        if (primaryError !== undefined) {
+          throw new AggregateError([primaryError, cleanupError], 'Remotion conversion and writer cleanup both failed');
+        }
+        throw cleanupError;
+      }
+    }
   }
 
   // ── decodeFrames ─────────────────────────────────────────────────────────────────────────────
   /**
    * Decode the primary video track to normalized RGBA frame digests. We parse with media-parser to
-   * obtain the track config + encoded samples, feed those EncodedVideoChunks into the lib's
-   * createVideoDecoder (native WebCodecs, hardware-preferred), and rasterize each emitted VideoFrame
-   * to tight straight-alpha RGBA. Backpressure is honored via the decoder's waitForQueueToBeLessThan.
+   * obtain the track config + encoded samples, feed those EncodedVideoChunks into an isolated native
+   * VideoDecoder, and rasterize each emitted VideoFrame to tight straight-alpha RGBA. The isolated
+   * decoder preserves native flush failures that the pinned framework wrapper swallows; queue-size
+   * backpressure and exact hardware/software support probes remain explicit adapter evidence.
    *
    * Frames are emitted by the decoder in PRESENTATION order; we sort the captured frames by pts and
    * re-index so the digest list is presentation-ordered (matching the golden frame ordering).
    */
-  async decodeFrames(input: MediaInput, opts?: { maxFrames?: number }): Promise<FrameSink> {
-    const { wc, mp } = this.mustLib();
+  async decodeFrames(
+    input: MediaInput,
+    opts?: DecodeOptions,
+    context?: OperationContext,
+  ): Promise<FrameSink> {
+    const call = context ?? fallbackOperationContext('decodeFrames', this.fallbackAbort.signal, input);
+    return this.lifecycle.operation('decodeFrames', call, async () => {
+      this.beginOperation('decodeFrames');
+      try {
+        return validateAdapterResult(ENGINE_ID, 'decodeFrames', await this.decodeFramesImpl(input, opts, call));
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
+
+  private async decodeFramesImpl(
+    input: MediaInput,
+    opts: DecodeOptions | undefined,
+    context: OperationContext,
+  ): Promise<FrameSink> {
+    const { wc } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
-    const max = opts?.maxFrames ?? Infinity;
+    const max = opts?.maxFrames ?? Number.MAX_SAFE_INTEGER;
+    const selection = await this.primaryVideoTrack(input, context, opts?.track);
+    const selected = selection.track;
+    this.config = { ...this.config, selectedTrackIds: [selected.trackId] };
 
     const captured: Array<{ img: Promise<ImageData>; ptsUs: number }> = [];
     let decodeError: Error | null = null;
-    let decoder: import('@remotion/webcodecs').WebCodecsVideoDecoder | null = null;
+    const decoderState: { value: IsolatedVideoDecoder | null } = { value: null };
+    let decoderPromise: Promise<IsolatedVideoDecoder> | null = null;
     let stopped = false;
+    let pending = 0;
+    let firstFrameMs: number | undefined;
+    const started = nowMs();
+    const controller = wc.webcodecsController();
+    this.bindActiveController(controller, context.signal);
 
-    await mp.parseMedia({
-      ...srcOptions,
-      acknowledgeRemotionLicense: true,
-      fields: { tracks: true },
-      onVideoTrack: ({ track }) => {
-        // Build the native WebCodecs decoder from the parsed track (it IS a VideoDecoderConfig).
-        const config: VideoDecoderConfig = {
-          codec: track.codec,
-          codedWidth: track.codedWidth,
-          codedHeight: track.codedHeight,
-          description: track.description,
-          colorSpace: track.colorSpace,
-        };
-
-        const decoderPromise = wc
-          .createVideoDecoder({
-            track: config,
-            onFrame: (frame) => {
+    try {
+      await this.parse({
+        ...srcOptions,
+        acknowledgeRemotionLicense: true,
+        fields: { tracks: true },
+        onVideoTrack: ({ track }) => {
+          if (track.trackId !== selected.trackId) return null;
+          const config = decoderConfigForTrack(track);
+          decoderPromise = this.createTrackedDecoder(
+            track.trackId,
+            config,
+            'decodeFrames',
+            context,
+            controller,
+            (frame) => {
               if (captured.length >= max) {
                 frame.close();
                 return;
               }
-              const ptsUs = Math.round(frame.timestamp); // VideoFrame.timestamp is microseconds
-              const img = imageDataFromVideoFrame(frame).finally(() => frame.close());
+              this.activeFrames.add(frame);
+              this.updateResourceConfig(false);
+              const ptsUs = Math.round(frame.timestamp);
+              const img = imageDataFromVideoFrame(frame).finally(() => {
+                frame.close();
+                this.activeFrames.delete(frame);
+                this.updateResourceConfig(this.allResourcesClosed());
+              });
+              void img.catch(() => undefined);
               captured.push({ img, ptsUs });
+              const atMs = Math.max(0, nowMs() - started);
+              if (firstFrameMs === undefined) {
+                firstFrameMs = atMs;
+                context.emit({ type: 'first-frame', atMs });
+              }
+              context.emit({ type: 'decoded-frame-count', atMs, count: captured.length });
             },
-            onError: (err) => {
-              decodeError = err;
+            (error) => {
+              decodeError = error;
             },
-          })
-          .then((d) => {
-            decoder = d;
-            return d;
+          ).then((created) => {
+            decoderState.value = created;
+            return created;
           });
 
-        // Per-sample callback: push each encoded chunk into the decoder with backpressure.
-        return async (sample) => {
-          if (stopped) return;
-          const d = decoder ?? (await decoderPromise);
-          if (captured.length >= max) {
-            stopped = true;
-            return () => undefined; // OnTrackDoneCallback: stop pulling more samples
-          }
-          await d.waitForQueueToBeLessThan(16);
-          await d.decode({
-            type: sample.type,
-            timestamp: sample.timestamp,
-            duration: sample.duration,
-            data: sample.data,
-          });
-        };
-      },
-    });
+          return async (sample) => {
+            if (stopped) return;
+            const active = decoderState.value ?? (await decoderPromise!);
+            if (captured.length >= max) {
+              stopped = true;
+              return () => undefined;
+            }
+            pending++;
+            this.config = { ...this.config, queueHighWaterMark: Math.max(this.config.queueHighWaterMark, pending) };
+            try {
+              await active.waitForQueueToBeLessThan(16);
+              await active.decode({
+                type: sample.type,
+                timestamp: sample.timestamp,
+                duration: sample.duration,
+                data: sample.data,
+              });
+            } finally {
+              pending--;
+            }
+          };
+        },
+      }, context);
 
-    if (decoder) {
-      await (decoder as import('@remotion/webcodecs').WebCodecsVideoDecoder).flush().catch(() => undefined);
-      (decoder as import('@remotion/webcodecs').WebCodecsVideoDecoder).close();
-    }
-    if (decodeError) throw decodeError;
+      if (decoderPromise) decoderState.value = await decoderPromise;
+      if (decoderState.value) await decoderState.value.flush();
+      if (decodeError) throw decodeError;
 
-    // Presentation order + re-index, then digest.
-    captured.sort((a, b) => a.ptsUs - b.ptsUs);
-    const out = new CapturedFrameSink();
-    for (let i = 0; i < captured.length && i < max; i++) {
-      const c = captured[i]!;
-      const img = await c.img;
-      const digest = await digestImageData(img, i, c.ptsUs);
-      out.push(img, digest);
+      captured.sort((a, b) => a.ptsUs - b.ptsUs);
+      const out = new CapturedFrameSink();
+      for (let i = 0; i < captured.length && i < max; i++) {
+        const item = captured[i]!;
+        const img = await item.img;
+        out.push(img, await digestImageData(img, i, item.ptsUs));
+        if (i === 0) opts?.onFirstFrame?.(nowMs());
+      }
+      out.telemetry = {
+        decodedFrames: out.frames.length,
+        ...(firstFrameMs !== undefined ? { firstFrameMs } : {}),
+      };
+      out.selectedTrack = {
+        schema: DECODE_TRACK_SELECTOR_SCHEMA,
+        type: 'video',
+        trackIndex: selection.trackIndex,
+        typeOrdinal: selection.typeOrdinal,
+        trackId: String(selected.trackId),
+        codec: parserToCanonicalVideo(selected.codec),
+        width: selected.width,
+        height: selected.height,
+      };
+      return out;
+    } finally {
+      if (decoderState.value) {
+        decoderState.value.close();
+        this.activeDecoders.delete(decoderState.value);
+      }
+      for (const frame of this.activeFrames) frame.close();
+      this.activeFrames.clear();
+      await Promise.allSettled(captured.map((item) => item.img));
+      this.releaseActiveController(controller, context.signal);
+      this.updateResourceConfig(this.allResourcesClosed());
     }
-    return out;
   }
 
   // ── seek ─────────────────────────────────────────────────────────────────────────────────────
@@ -701,114 +1355,549 @@ export class RemotionWebcodecsEngine implements MediaEngine {
    * pts <= t). Returns that frame's landed pts + digest. Uses the same native decoder path as
    * decodeFrames.
    */
-  async seek(input: MediaInput, tUs: number): Promise<{ landedPtsUs: number; frame: FrameDigest }> {
-    const { wc, mp } = this.mustLib();
+  async seek(
+    input: MediaInput,
+    tUs: number,
+    context?: OperationContext,
+  ): Promise<{ landedPtsUs: number; frame: FrameDigest; telemetry?: { decodedFrames?: number; firstFrameMs?: number } }> {
+    const call = context ?? fallbackOperationContext('seek', this.fallbackAbort.signal, input);
+    return this.lifecycle.operation('seek', call, async () => {
+      this.beginOperation('seek');
+      try {
+        return validateAdapterResult(ENGINE_ID, 'seek', await this.seekImpl(input, tUs, call));
+      } finally {
+        this.updateResourceConfig(this.allResourcesClosed());
+      }
+    });
+  }
+
+  private async seekImpl(
+    input: MediaInput,
+    tUs: number,
+    context: OperationContext,
+  ): Promise<{ landedPtsUs: number; frame: FrameDigest; telemetry: { decodedFrames: number; firstFrameMs?: number } }> {
+    const { wc } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
     const targetUs = Math.max(0, tUs);
+    const selected = (await this.primaryVideoTrack(input, context)).track;
+    this.config = { ...this.config, selectedTrackIds: [selected.trackId] };
 
     let best: { img: Promise<ImageData>; ptsUs: number } | null = null;
+    const frameTasks: Promise<ImageData>[] = [];
     let decodeError: Error | null = null;
-    let decoder: import('@remotion/webcodecs').WebCodecsVideoDecoder | null = null;
+    const decoderState: { value: IsolatedVideoDecoder | null } = { value: null };
+    let decoderPromise: Promise<IsolatedVideoDecoder> | null = null;
     let done = false;
+    let parserController: ReturnType<MediaParserModule['mediaParserController']> | null = null;
+    let decodedFrames = 0;
+    let firstFrameMs: number | undefined;
+    const started = nowMs();
+    const decoderController = wc.webcodecsController();
+    this.bindActiveController(decoderController, context.signal);
 
-    const controller = mp.mediaParserController();
-
-    await mp.parseMedia({
-      ...srcOptions,
-      controller,
-      acknowledgeRemotionLicense: true,
-      fields: { tracks: true },
-      onVideoTrack: ({ track }) => {
-        // Seek to the keyframe at/just before the target time.
-        controller.seek(targetUs / 1e6);
-
-        const config: VideoDecoderConfig = {
-          codec: track.codec,
-          codedWidth: track.codedWidth,
-          codedHeight: track.codedHeight,
-          description: track.description,
-          colorSpace: track.colorSpace,
-        };
-
-        const decoderPromise = wc
-          .createVideoDecoder({
-            track: config,
-            onFrame: (frame) => {
+    try {
+      await this.parse({
+        ...srcOptions,
+        acknowledgeRemotionLicense: true,
+        fields: { tracks: true },
+        onVideoTrack: ({ track }) => {
+          if (track.trackId !== selected.trackId) return null;
+          parserController!.seek(targetUs / 1e6);
+          const config = decoderConfigForTrack(track);
+          decoderPromise = this.createTrackedDecoder(
+            track.trackId,
+            config,
+            'seek',
+            context,
+            decoderController,
+            (frame) => {
+              decodedFrames++;
+              const atMs = Math.max(0, nowMs() - started);
+              if (firstFrameMs === undefined) {
+                firstFrameMs = atMs;
+                context.emit({ type: 'first-frame', atMs });
+              }
+              context.emit({ type: 'decoded-frame-count', atMs, count: decodedFrames });
               const ptsUs = Math.round(frame.timestamp);
               let keep = false;
-              // Keep the latest frame whose pts <= target (the frame visible at t).
-              if (ptsUs <= targetUs) {
-                keep = !best || ptsUs > best.ptsUs;
-              } else if (!best) {
-                // Target is before the first decodable frame after the keyframe — take it.
-                keep = true;
-              }
+              if (ptsUs <= targetUs) keep = !best || ptsUs > best.ptsUs;
+              else if (!best) keep = true;
               if (keep) {
-                best = { img: imageDataFromVideoFrame(frame).finally(() => frame.close()), ptsUs };
+                this.activeFrames.add(frame);
+                this.updateResourceConfig(false);
+                const img = imageDataFromVideoFrame(frame).finally(() => {
+                  frame.close();
+                  this.activeFrames.delete(frame);
+                  this.updateResourceConfig(this.allResourcesClosed());
+                });
+                void img.catch(() => undefined);
+                frameTasks.push(img);
+                best = {
+                  img,
+                  ptsUs,
+                };
               } else {
                 frame.close();
               }
             },
-            onError: (err) => {
-              decodeError = err;
+            (error) => {
+              decodeError = error;
             },
-          })
-          .then((d) => {
-            decoder = d;
-            return d;
+          ).then((created) => {
+            decoderState.value = created;
+            return created;
           });
 
-        return async (sample) => {
-          if (done) return;
-          const d = decoder ?? (await decoderPromise);
-          await d.waitForQueueToBeLessThan(16);
-          await d.decode({
-            type: sample.type,
-            timestamp: sample.timestamp,
-            duration: sample.duration,
-            data: sample.data,
-          });
-          // Once we have decoded past the target, we can stop pulling samples.
-          if (sample.timestamp > targetUs) {
-            done = true;
-            return () => undefined;
-          }
-        };
-      },
-    });
+          return async (sample) => {
+            if (done) return;
+            const active = decoderState.value ?? (await decoderPromise!);
+            await active.waitForQueueToBeLessThan(16);
+            await active.decode({
+              type: sample.type,
+              timestamp: sample.timestamp,
+              duration: sample.duration,
+              data: sample.data,
+            });
+            if (sample.timestamp > targetUs) {
+              done = true;
+              return () => undefined;
+            }
+          };
+        },
+      }, context, (controller) => {
+        parserController = controller;
+      });
 
-    if (decoder) {
-      await (decoder as import('@remotion/webcodecs').WebCodecsVideoDecoder).flush().catch(() => undefined);
-      (decoder as import('@remotion/webcodecs').WebCodecsVideoDecoder).close();
+      if (decoderPromise) decoderState.value = await decoderPromise;
+      if (decoderState.value) await decoderState.value.flush();
+      if (decodeError) throw decodeError;
+      if (!best) throw new Error(`${ENGINE_ID} seek: no frame decoded at ${tUs}us`);
+
+      const landed = best as { img: Promise<ImageData>; ptsUs: number };
+      const img = await landed.img;
+      return {
+        landedPtsUs: landed.ptsUs,
+        frame: await digestImageData(img, 0, landed.ptsUs),
+        telemetry: {
+          decodedFrames,
+          ...(firstFrameMs !== undefined ? { firstFrameMs } : {}),
+        },
+      };
+    } finally {
+      if (decoderState.value) {
+        decoderState.value.close();
+        this.activeDecoders.delete(decoderState.value);
+      }
+      for (const frame of this.activeFrames) frame.close();
+      this.activeFrames.clear();
+      await Promise.allSettled(frameTasks);
+      this.releaseActiveController(decoderController, context.signal);
+      this.updateResourceConfig(this.allResourcesClosed());
     }
-    if (decodeError) throw decodeError;
-    if (!best) throw new Error(`${ENGINE_ID} seek: no frame decoded at ${tUs}us`);
-
-    const landed = best as { img: Promise<ImageData>; ptsUs: number };
-    const img = await landed.img;
-    const frame = await digestImageData(img, 0, landed.ptsUs);
-    return { landedPtsUs: landed.ptsUs, frame };
   }
 
   private async assertRequestedTracksPresent(
     input: MediaInput,
     opts: TranscodeOptions,
     videoSpec: TranscodeVideoOptions | undefined,
-  ): Promise<void> {
-    if (!videoSpec && !opts.audio) return;
-    const { mp } = this.mustLib();
+    context: OperationContext,
+  ): Promise<{ tracks: import('@remotion/media-parser').MediaParserTrack[] }> {
     const srcOptions = await this.sourceOptions(input);
-    const result = await mp.parseMedia({
+    const result = await this.parse<{ tracks: import('@remotion/media-parser').MediaParserTrack[] }>({
       ...srcOptions,
       acknowledgeRemotionLicense: true,
       fields: { tracks: true },
-    });
+    }, context);
     if (videoSpec && !result.tracks.some((track) => track.type === 'video')) {
-      throw new Error(`${ENGINE_ID} transcode: requested video output but input has no video track`);
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'transcode',
+        'requested video output but input has no video track',
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_TRACK_REQUIRED',
+      );
     }
     if (opts.audio && !result.tracks.some((track) => track.type === 'audio')) {
-      throw new Error(`${ENGINE_ID} transcode: requested audio output but input has no audio track`);
+      throw createNotApplicableError(
+        ENGINE_ID,
+        'transcode',
+        'requested audio output but input has no audio track',
+        remotionTupleSummary(context.request),
+        'REMOTION_AUDIO_TRACK_REQUIRED',
+      );
     }
+    return result;
+  }
+
+  private async primaryVideoTrack(
+    input: MediaInput,
+    context: OperationContext,
+    selector?: DecodeTrackSelector,
+  ): Promise<{
+    track: import('@remotion/media-parser').MediaParserVideoTrack;
+    trackIndex: number;
+    typeOrdinal: number;
+  }> {
+    const srcOptions = await this.sourceOptions(input);
+    const result = await this.parse<{ tracks: import('@remotion/media-parser').MediaParserTrack[] }>({
+      ...srcOptions,
+      acknowledgeRemotionLicense: true,
+      fields: { tracks: true },
+    }, context);
+    if (selector && selector.type !== 'video') {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        context.request.operation,
+        'Remotion decodeFrames currently exposes video frame sinks only',
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_TRACK_REQUIRED',
+      );
+    }
+    const videoTracks = result.tracks
+      .map((track, trackIndex) => ({ track, trackIndex }))
+      .filter((entry): entry is {
+        track: import('@remotion/media-parser').MediaParserVideoTrack;
+        trackIndex: number;
+      } => entry.track.type === 'video');
+    const selected = selector?.trackIndex !== undefined
+      ? videoTracks.find((entry) => entry.trackIndex === selector.trackIndex)
+      : selector?.typeOrdinal !== undefined
+        ? videoTracks[selector.typeOrdinal]
+        : selector?.trackId !== undefined
+          ? videoTracks.find((entry) => String(entry.track.trackId) === selector.trackId)
+          : videoTracks[0];
+    if (!selected) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        context.request.operation,
+        'the operation requires a video track',
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_TRACK_REQUIRED',
+      );
+    }
+    const typeOrdinal = selected
+      ? videoTracks.findIndex((entry) => entry.trackIndex === selected.trackIndex)
+      : -1;
+    if (selector?.typeOrdinal !== undefined && typeOrdinal !== selector.typeOrdinal) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        context.request.operation,
+        `requested video ordinal ${selector.typeOrdinal} does not exist`,
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_TRACK_REQUIRED',
+      );
+    }
+    if (selector?.trackId !== undefined && String(selected?.track.trackId) !== selector.trackId) {
+      throw createNotApplicableError(
+        ENGINE_ID,
+        context.request.operation,
+        `requested trackId '${selector.trackId}' does not exist`,
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_TRACK_REQUIRED',
+      );
+    }
+    return { track: selected.track, trackIndex: selected.trackIndex, typeOrdinal };
+  }
+
+  private async createTrackedDecoder(
+    trackId: number,
+    config: VideoDecoderConfig,
+    operation: 'decodeFrames' | 'seek',
+    context: OperationContext,
+    _controller: import('@remotion/webcodecs').WebCodecsController,
+    onFrame: (frame: VideoFrame) => void | Promise<void>,
+    onError: (error: Error) => void,
+  ): Promise<IsolatedVideoDecoder> {
+    const exactConfig = await this.assertExactVideoDecoderConfig(config, trackId, operation, context);
+    if (typeof EncodedVideoChunk === 'undefined') {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        'EncodedVideoChunk is unavailable in this browser realm',
+        remotionTupleSummary(context.request),
+        'REMOTION_ENCODED_VIDEO_CHUNK_API_UNAVAILABLE',
+        { role: 'video-decoder', trackIndex: trackId, config: exactConfig },
+      );
+    }
+    let decoder: IsolatedVideoDecoder;
+    try {
+      decoder = createIsolatedVideoDecoder(exactConfig, context.signal, onFrame, onError);
+    } catch (error) {
+      if (!isNamedError(error, 'NotSupportedError')) throw error;
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        `the browser rejected decoder config '${exactConfig.codec}' during configure`,
+        remotionTupleSummary(context.request),
+        'REMOTION_VIDEO_DECODER_CONFIG_UNSUPPORTED',
+        { role: 'video-decoder', trackIndex: trackId, config: exactConfig },
+        error,
+      );
+    }
+    this.activeDecoders.add(decoder);
+    this.updateResourceConfig(false);
+    return decoder;
+  }
+
+  private async assertExactVideoDecoderConfig(
+    config: VideoDecoderConfig,
+    trackId: number,
+    operation: 'decodeFrames' | 'seek',
+    context: OperationContext,
+  ): Promise<VideoDecoderConfig> {
+    const base = cloneVideoDecoderConfig(config);
+    const candidates: VideoDecoderConfig[] = base.hardwareAcceleration
+      ? [base]
+      : [
+          { ...base, hardwareAcceleration: 'prefer-hardware' },
+          { ...base, hardwareAcceleration: 'prefer-software' },
+        ];
+    let lastUnsupported: unknown;
+    for (const exact of candidates) {
+      try {
+        const supported = await probeExactRemotionVideoDecoderConfig(exact, trackId, operation, context.request);
+        this.recordExactCodecConfig('video-decoder', trackId, supported, true);
+        return supported;
+      } catch (error) {
+        if (!isBrowserNotSupportedError(error)) throw error;
+        this.recordExactCodecConfig('video-decoder', trackId, exact, false);
+        if (error.reasonCode !== 'REMOTION_VIDEO_DECODER_CONFIG_UNSUPPORTED') throw error;
+        lastUnsupported = error;
+      }
+    }
+    throw lastUnsupported;
+  }
+
+  private async assertExactVideoReencodeConfigs(
+    track: import('@remotion/media-parser').MediaParserVideoTrack,
+    codec: RemotionVideoCodec,
+    resize: import('@remotion/webcodecs').ResizeOperation | undefined,
+    rotate: number | undefined,
+    context: OperationContext,
+  ): Promise<void> {
+    const decoderBase = decoderConfigForTrack(track);
+    const decoderCandidates: VideoDecoderConfig[] = [
+      { ...decoderBase, hardwareAcceleration: 'prefer-hardware' },
+      { ...decoderBase, hardwareAcceleration: 'prefer-software' },
+    ];
+    await this.requireSupportedCodecCandidate(
+      'video-decoder',
+      track.trackId,
+      decoderCandidates,
+      context,
+      'REMOTION_VIDEO_DECODER_API_UNAVAILABLE',
+      'REMOTION_VIDEO_DECODER_CONFIG_UNSUPPORTED',
+    );
+
+    const encoderCandidates = remotionVideoEncoderConfigCandidates(track, codec, resize, rotate);
+    await this.requireSupportedCodecCandidate(
+      'video-encoder',
+      track.trackId,
+      encoderCandidates,
+      context,
+      'REMOTION_VIDEO_ENCODER_API_UNAVAILABLE',
+      'REMOTION_VIDEO_ENCODER_CONFIG_UNSUPPORTED',
+    );
+  }
+
+  private async assertExactAudioReencodeConfigs(
+    track: import('@remotion/media-parser').MediaParserAudioTrack,
+    codec: RemotionAudioCodec,
+    bitrate: number,
+    sampleRate: number | null,
+    context: OperationContext,
+  ): Promise<void> {
+    const decoderConfig: AudioDecoderConfig = {
+      codec: track.codec,
+      sampleRate: track.sampleRate,
+      numberOfChannels: track.numberOfChannels,
+      ...(track.description ? { description: track.description.slice() } : {}),
+    };
+    if (track.codec === 'pcm-s16' || track.codec === 'pcm-s24') {
+      this.recordExactCodecConfig('audio-decoder', track.trackId, decoderConfig, true);
+    } else {
+      await this.requireSupportedCodecCandidate(
+        'audio-decoder',
+        track.trackId,
+        [decoderConfig],
+        context,
+        'REMOTION_AUDIO_DECODER_API_UNAVAILABLE',
+        'REMOTION_AUDIO_DECODER_CONFIG_UNSUPPORTED',
+      );
+    }
+
+    const encoderCandidates = remotionAudioEncoderConfigCandidates(
+      codec,
+      track.numberOfChannels,
+      sampleRate ?? track.sampleRate,
+      bitrate,
+    );
+    if (codec === 'wav') {
+      this.recordExactCodecConfig('audio-encoder', track.trackId, encoderCandidates[0]!, true);
+      return;
+    }
+    await this.requireSupportedCodecCandidate(
+      'audio-encoder',
+      track.trackId,
+      encoderCandidates,
+      context,
+      'REMOTION_AUDIO_ENCODER_API_UNAVAILABLE',
+      'REMOTION_AUDIO_ENCODER_CONFIG_UNSUPPORTED',
+    );
+  }
+
+  private async requireSupportedCodecCandidate(
+    role: ConcreteWebCodecsConfig['role'],
+    trackId: number,
+    candidates: Array<VideoDecoderConfig | VideoEncoderConfig | AudioDecoderConfig | AudioEncoderConfig>,
+    context: OperationContext,
+    unavailableReasonCode: string,
+    unsupportedReasonCode: string,
+  ): Promise<void> {
+    const constructor = webCodecsConstructorForRole(role);
+    const first = candidates[0]!;
+    if (!constructor) {
+      this.recordExactCodecConfig(role, trackId, first, false);
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        'transcode',
+        `${role} is unavailable in this browser realm`,
+        remotionTupleSummary(context.request),
+        unavailableReasonCode,
+        concreteConfig(role, trackId, first),
+      );
+    }
+
+    let lastCause: unknown;
+    for (const candidate of candidates) {
+      let supported = false;
+      try {
+        supported = (await constructor(candidate as never)).supported === true;
+      } catch (error) {
+        if (error instanceof TypeError) throw error;
+        if (!isNamedError(error, 'NotSupportedError')) throw error;
+        lastCause = error;
+      }
+      this.recordExactCodecConfig(role, trackId, candidate, supported);
+      if (supported) return;
+    }
+
+    const last = candidates[candidates.length - 1]!;
+    throw createBrowserNotSupportedError(
+      ENGINE_ID,
+      'transcode',
+      `the browser rejected every exact ${role} configuration for track ${trackId}`,
+      remotionTupleSummary(context.request),
+      unsupportedReasonCode,
+      concreteConfig(role, trackId, last),
+      lastCause,
+    );
+  }
+
+  private bindActiveController(controller: AbortableController, signal: AbortSignal): void {
+    const abort = (): void => controller.abort(signal.reason);
+    this.activeControllers.add(controller);
+    this.controllerAbortBindings.set(controller, { signal, abort });
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+    this.updateResourceConfig(false);
+  }
+
+  private releaseActiveController(controller: AbortableController, signal: AbortSignal): void {
+    const binding = this.controllerAbortBindings.get(controller);
+    (binding?.signal ?? signal).removeEventListener('abort', binding?.abort ?? (() => undefined));
+    controller.abort('operation settled');
+    this.controllerAbortBindings.delete(controller);
+    this.activeControllers.delete(controller);
+  }
+
+  private beginOperation(operation: RemotionWebcodecsConfig['operation']): void {
+    this.config = {
+      ...this.config,
+      operation,
+      readerMode: 'not-selected',
+      sourceReader: 'not-selected',
+      parsePath: 'not-selected',
+      codecConfigs: [],
+      selectedTrackIds: [],
+      trackDecisions: [],
+      queueHighWaterMark: 0,
+      controllerFinalState: null,
+      outputBytes: 0,
+      cleanupComplete: false,
+    };
+    this.updateResourceConfig(false);
+  }
+
+  private recordTrackDecision(
+    trackId: number,
+    type: string,
+    decision: string,
+    reasonCode?: string,
+  ): void {
+    this.config = {
+      ...this.config,
+      selectedTrackIds: this.config.selectedTrackIds.includes(trackId)
+        ? this.config.selectedTrackIds
+        : [...this.config.selectedTrackIds, trackId],
+      trackDecisions: [
+        ...this.config.trackDecisions,
+        { trackId, type, decision, ...(reasonCode ? { reasonCode } : {}) },
+      ],
+    };
+  }
+
+  private recordFrameworkCodecProbe(
+    role: string,
+    trackId: number,
+    codec: string,
+    supported: boolean,
+    fields: Record<string, number | null | undefined>,
+  ): void {
+    const normalizedFields: Record<string, number | null> = {};
+    for (const [key, value] of Object.entries(fields)) {
+      if (value !== undefined) normalizedFields[key] = value;
+    }
+    this.config = {
+      ...this.config,
+      codecConfigs: [
+        ...this.config.codecConfigs,
+        { role, trackId, codec, supported, ...normalizedFields },
+      ],
+    };
+  }
+
+  private recordExactCodecConfig(
+    role: string,
+    trackId: number,
+    config: VideoDecoderConfig | VideoEncoderConfig | AudioDecoderConfig | AudioEncoderConfig,
+    supported: boolean,
+  ): void {
+    this.config = {
+      ...this.config,
+      codecConfigs: [
+        ...this.config.codecConfigs,
+        { role, trackId, supported, config: jsonWebCodecsConfig(config) },
+      ],
+    };
+  }
+
+  private allResourcesClosed(): boolean {
+    return this.activeControllers.size === 0
+      && this.activeDecoders.size === 0
+      && this.activeFrames.size === 0
+      && this.activeWriterBuffers === 0;
+  }
+
+  private updateResourceConfig(cleanupComplete: boolean): void {
+    this.config = {
+      ...this.config,
+      activeControllers: this.activeControllers.size,
+      activeDecoders: this.activeDecoders.size,
+      activeFrames: this.activeFrames.size,
+      activeWriterBuffers: this.activeWriterBuffers,
+      cleanupComplete,
+    };
   }
 
   // ── trim (NOT SUPPORTED) ─────────────────────────────────────────────────────────────────────
@@ -822,162 +1911,655 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     _input: MediaInput,
     _range: { startUs: number; endUs: number },
     _opts: { container: string; frameAccurate: boolean },
+    context?: OperationContext,
   ): Promise<MediaBytes> {
-    throw new Error(`${ENGINE_ID}: trim is not supported (NA(engine))`);
+    const request = context?.request ?? fallbackOperationContext('trim', this.fallbackAbort.signal).request;
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'trim',
+      'Remotion WebCodecs has no trim API',
+      remotionTupleSummary(request),
+      'REMOTION_TRIM_UNSUPPORTED',
+    );
   }
 }
 
 // ── module-level helpers ─────────────────────────────────────────────────────────────────────────
 
-function normalizeTransportStreamAacPacketTimes(
-  container: import('@remotion/media-parser').MediaParserContainer,
-  tracks: import('@remotion/media-parser').MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
-
-  const aacTracksById = new Map<number, import('@remotion/media-parser').MediaParserAudioTrack>();
-  for (const track of tracks) {
-    if (track.type === 'audio' && track.codecEnum === 'aac' && track.sampleRate > 0) {
-      aacTracksById.set(track.trackId, track);
-    }
-  }
-  if (!aacTracksById.size) return tagged;
-
-  const previousPtsByTrackId = new Map<number, number>();
-  const duplicatePtsTrackIds = new Set<number>();
-  for (const { trackId, packet } of tagged) {
-    if (!aacTracksById.has(trackId)) continue;
-    const previousPts = previousPtsByTrackId.get(trackId);
-    previousPtsByTrackId.set(trackId, packet.ptsUs);
-    if (previousPts === packet.ptsUs) duplicatePtsTrackIds.add(trackId);
-  }
-  if (!duplicatePtsTrackIds.size) return tagged;
-
-  const firstTimestampByTrackId = new Map<number, { ptsUs: number; dtsUs: number }>();
-  const indexByTrackId = new Map<number, number>();
-  return tagged.map((entry) => {
-    const track = aacTracksById.get(entry.trackId);
-    if (!track || !duplicatePtsTrackIds.has(entry.trackId)) return entry;
-
-    let first = firstTimestampByTrackId.get(entry.trackId);
-    if (!first) {
-      first = { ptsUs: entry.packet.ptsUs, dtsUs: entry.packet.dtsUs };
-      firstTimestampByTrackId.set(entry.trackId, first);
-    }
-
-    const index = indexByTrackId.get(entry.trackId) ?? 0;
-    indexByTrackId.set(entry.trackId, index + 1);
-    const offsetUs = Math.round((index * 1024 * 1_000_000) / track.sampleRate);
-    return {
-      ...entry,
-      packet: {
-        ...entry.packet,
-        ptsUs: first.ptsUs + offsetUs,
-        dtsUs: first.dtsUs + offsetUs,
-      },
-    };
-  });
+function fallbackLifecycleContext(
+  signal: AbortSignal,
+  phase: LifecycleContext['phase'] = 'functional',
+): LifecycleContext {
+  return { signal, emit: () => undefined, phase };
 }
 
-function normalizeTransportStreamH264PacketSizes(
-  container: import('@remotion/media-parser').MediaParserContainer,
-  tracks: import('@remotion/media-parser').MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'transport-stream' && container !== 'm3u8') return tagged;
-
-  const h264TrackIds = new Set<number>();
-  for (const track of tracks) {
-    if (track.type === 'video' && track.codecEnum === 'h264') h264TrackIds.add(track.trackId);
-  }
-  if (!h264TrackIds.size) return tagged;
-
-  let normalized: TaggedPacket[] | null = null;
-  for (const trackId of h264TrackIds) {
-    const trackPackets = tagged
-      .map((entry, index) => ({ entry, index }))
-      .filter(({ entry }) => entry.trackId === trackId);
-    if (trackPackets.length < 2) continue;
-
-    const segmentStarts = trackPackets
-      .map((packet, trackPacketIndex) => ({ ...packet, trackPacketIndex }))
-      .filter(({ entry }) => entry.h264AudPrefixBytes === 4);
-
-    for (const segmentStart of segmentStarts) {
-      const nextStart = segmentStarts.find((candidate) => candidate.trackPacketIndex > segmentStart.trackPacketIndex);
-      const segmentEndIndex = (nextStart?.trackPacketIndex ?? trackPackets.length) - 1;
-      const segmentEnd = trackPackets[segmentEndIndex];
-      if (!segmentEnd || segmentEnd.entry.h264AudPrefixBytes !== 3) continue;
-      if (segmentStart.entry.packet.size < 1) continue;
-
-      // Remotion's TS/H.264 splitter keeps the leading zero of each segment-opening four-byte
-      // Annex B AUD start code on that segment's first packet, while ffprobe counts the AUD as the
-      // canonical three-byte start code and attributes the byte budget to the segment's final access
-      // unit. Normalize only those exact segment-boundary signatures; interior packet sizes still
-      // compare exactly and broad packet-size errors remain visible.
-      if (!normalized) normalized = tagged.slice();
-      normalized[segmentStart.index] = {
-        ...segmentStart.entry,
-        packet: { ...segmentStart.entry.packet, size: segmentStart.entry.packet.size - 1 },
-      };
-      normalized[segmentEnd.index] = {
-        ...segmentEnd.entry,
-        packet: { ...segmentEnd.entry.packet, size: segmentEnd.entry.packet.size + 1 },
-      };
-    }
-  }
-
-  return normalized ?? tagged;
+function fallbackOperationContext(
+  operation: ConcreteOperationRequest['operation'],
+  signal: AbortSignal,
+  input?: MediaInput,
+  options: Record<string, unknown> = {},
+): OperationContext {
+  const outputContainer = typeof options.container === 'string' ? options.container : undefined;
+  return {
+    ...fallbackLifecycleContext(signal),
+    checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+    request: {
+      protocol: CONCRETE_OPERATION_PROTOCOL,
+      scenarioId: 'remotion-webcodecs/direct',
+      operation,
+      inputs: input
+        ? [{
+            id: input.id,
+            mime: input.mime,
+            container: containerFromInput(input),
+            ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+            mutated: input.mutated === true,
+            sourceEvidence: 'UNRESOLVED',
+            tracks: [],
+          }]
+        : [],
+      ...(outputContainer ? { output: { container: outputContainer } } : {}),
+      options,
+    },
+  };
 }
 
-function normalizeElementaryMp3PacketTimes(
-  container: import('@remotion/media-parser').MediaParserContainer,
-  tracks: import('@remotion/media-parser').MediaParserTrack[],
-  tagged: TaggedPacket[],
-): TaggedPacket[] {
-  if (container !== 'mp3') return tagged;
+function containerFromInput(input: MediaInput): string {
+  const mime = input.mime.toLowerCase();
+  if (mime.includes('quicktime')) return 'mov';
+  if (mime.includes('matroska')) return 'mkv';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('mp2t')) return 'ts';
+  if (mime.includes('mpegurl')) return 'hls';
+  if (mime.includes('wav')) return 'wav';
+  if (mime.includes('flac')) return 'flac';
+  if (mime.includes('aac')) return 'adts';
+  if (mime.includes('mpeg')) return 'mp3';
+  return 'mp4';
+}
 
-  const mp3TracksById = new Map<number, import('@remotion/media-parser').MediaParserAudioTrack>();
-  for (const track of tracks) {
-    if (track.type === 'audio' && track.codecEnum === 'mp3' && track.sampleRate > 0) {
-      mp3TracksById.set(track.trackId, track);
+function decisionToNotApplicable(
+  request: ConcreteOperationRequest,
+  decision: Extract<SupportDecision, { supported: false }>,
+): ReturnType<typeof createNotApplicableError> {
+  return createNotApplicableError(
+    ENGINE_ID,
+    request.operation,
+    decision.reason,
+    remotionTupleSummary(request),
+    decision.reasonCode,
+  );
+}
+
+function canonicalAudioForRemotion(codec: RemotionAudioCodec): string {
+  return codec === 'wav' ? 'pcm-s16' : codec;
+}
+
+function decoderConfigForTrack(
+  track: import('@remotion/media-parser').MediaParserVideoTrack,
+): VideoDecoderConfig {
+  return {
+    codec: track.codec,
+    codedWidth: track.codedWidth,
+    codedHeight: track.codedHeight,
+    ...(Number.isFinite(track.displayAspectWidth) && track.displayAspectWidth > 0
+      ? { displayAspectWidth: track.displayAspectWidth }
+      : {}),
+    ...(Number.isFinite(track.displayAspectHeight) && track.displayAspectHeight > 0
+      ? { displayAspectHeight: track.displayAspectHeight }
+      : {}),
+    ...(track.description ? { description: track.description.slice() } : {}),
+    colorSpace: { ...track.colorSpace },
+  };
+}
+
+function cloneVideoDecoderConfig(config: VideoDecoderConfig): VideoDecoderConfig {
+  const description = config.description;
+  let copiedDescription: Uint8Array | undefined;
+  if (description !== undefined) {
+    const view = ArrayBuffer.isView(description)
+      ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+      : new Uint8Array(description as ArrayBuffer);
+    copiedDescription = view.slice();
+  }
+  return {
+    ...config,
+    ...(copiedDescription ? { description: copiedDescription } : {}),
+    ...(config.colorSpace ? { colorSpace: { ...config.colorSpace } } : {}),
+  };
+}
+
+/**
+ * Probe the exact decoder configuration immediately before use. The returned value is the owned
+ * clone that the adapter passes unchanged to the isolated native decoder; a browser-normalized
+ * `support.config` is deliberately ignored because it is not the requested concrete configuration.
+ */
+export async function probeExactRemotionVideoDecoderConfig(
+  config: VideoDecoderConfig,
+  trackId: number,
+  operation: 'decodeFrames' | 'seek',
+  request: ConcreteOperationRequest,
+): Promise<VideoDecoderConfig> {
+  const exact = cloneVideoDecoderConfig(config);
+  const browserConfig: ConcreteWebCodecsConfig = {
+    role: 'video-decoder',
+    trackIndex: trackId,
+    config: exact,
+  };
+  if (typeof VideoDecoder === 'undefined' || typeof VideoDecoder.isConfigSupported !== 'function') {
+    throw createBrowserNotSupportedError(
+      ENGINE_ID,
+      operation,
+      'VideoDecoder is unavailable in this browser realm',
+      remotionTupleSummary(request),
+      'REMOTION_VIDEO_DECODER_API_UNAVAILABLE',
+      browserConfig,
+    );
+  }
+
+  let support: VideoDecoderSupport;
+  try {
+    support = await VideoDecoder.isConfigSupported(exact);
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    if (isNamedError(error, 'NotSupportedError')) {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        operation,
+        `the browser rejected decoder config '${exact.codec}'`,
+        remotionTupleSummary(request),
+        'REMOTION_VIDEO_DECODER_CONFIG_UNSUPPORTED',
+        browserConfig,
+        error,
+      );
+    }
+    throw error;
+  }
+  if (!support.supported) {
+    throw createBrowserNotSupportedError(
+      ENGINE_ID,
+      operation,
+      `the browser does not support decoder config '${exact.codec}'`,
+      remotionTupleSummary(request),
+      'REMOTION_VIDEO_DECODER_CONFIG_UNSUPPORTED',
+      browserConfig,
+    );
+  }
+  return exact;
+}
+
+type WebCodecsSupportProbe = (
+  config: VideoDecoderConfig | VideoEncoderConfig | AudioDecoderConfig | AudioEncoderConfig,
+) => Promise<{ supported?: boolean }>;
+
+function webCodecsConstructorForRole(role: ConcreteWebCodecsConfig['role']): WebCodecsSupportProbe | null {
+  if (role === 'video-decoder') {
+    if (
+      typeof VideoDecoder === 'undefined'
+      || typeof VideoDecoder.isConfigSupported !== 'function'
+      || typeof EncodedVideoChunk === 'undefined'
+    ) return null;
+    return (config) => VideoDecoder.isConfigSupported(config as VideoDecoderConfig);
+  }
+  if (role === 'video-encoder') {
+    if (typeof VideoEncoder === 'undefined' || typeof VideoEncoder.isConfigSupported !== 'function') return null;
+    return (config) => VideoEncoder.isConfigSupported(config as VideoEncoderConfig);
+  }
+  if (role === 'audio-decoder') {
+    if (
+      typeof AudioDecoder === 'undefined'
+      || typeof AudioDecoder.isConfigSupported !== 'function'
+      || typeof EncodedAudioChunk === 'undefined'
+    ) return null;
+    return (config) => AudioDecoder.isConfigSupported(config as AudioDecoderConfig);
+  }
+  if (typeof AudioEncoder === 'undefined' || typeof AudioEncoder.isConfigSupported !== 'function') return null;
+  return (config) => AudioEncoder.isConfigSupported(config as AudioEncoderConfig);
+}
+
+function concreteConfig(
+  role: ConcreteWebCodecsConfig['role'],
+  trackIndex: number,
+  config: VideoDecoderConfig | VideoEncoderConfig | AudioDecoderConfig | AudioEncoderConfig,
+): ConcreteWebCodecsConfig {
+  switch (role) {
+    case 'video-decoder':
+      return { role, trackIndex, config: config as VideoDecoderConfig };
+    case 'video-encoder':
+      return { role, trackIndex, config: config as VideoEncoderConfig };
+    case 'audio-decoder':
+      return { role, trackIndex, config: config as AudioDecoderConfig };
+    case 'audio-encoder':
+      return { role, trackIndex, config: config as AudioEncoderConfig };
+  }
+}
+
+export function remotionVideoEncoderConfigCandidates(
+  track: import('@remotion/media-parser').MediaParserVideoTrack,
+  codec: RemotionVideoCodec,
+  resize: import('@remotion/webcodecs').ResizeOperation | undefined,
+  rotate: number | undefined,
+): VideoEncoderConfig[] {
+  const dimensions = remotionOutputDimensions(
+    track.codedWidth,
+    track.codedHeight,
+    resize,
+    rotate ?? 0,
+    codec === 'h264',
+  );
+  const safari = typeof navigator !== 'undefined'
+    && /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const base: VideoEncoderConfig = {
+    codec: remotionEncoderCodecString(codec, dimensions.width, dimensions.height, track.fps),
+    width: dimensions.width,
+    height: dimensions.height,
+    ...(safari ? { bitrate: 3_000_000 } : {}),
+    ...(codec === 'vp9' && !safari ? { bitrateMode: 'quantizer' as const } : {}),
+    ...(track.fps == null ? {} : { framerate: track.fps }),
+  };
+  return [
+    { ...base, hardwareAcceleration: 'prefer-hardware' },
+    { ...base, hardwareAcceleration: 'prefer-software' },
+  ];
+}
+
+function remotionAudioEncoderConfigCandidates(
+  codec: RemotionAudioCodec,
+  numberOfChannels: number,
+  sampleRate: number,
+  bitrate: number,
+): AudioEncoderConfig[] {
+  const config: AudioEncoderConfig = {
+    codec: codec === 'aac'
+      ? 'mp4a.40.02'
+      : codec === 'opus'
+        ? 'opus'
+        : 'wav-should-not-to-into-audio-encoder',
+    numberOfChannels,
+    sampleRate,
+    bitrate,
+  };
+  if (codec === 'wav' || sampleRate === 48_000 || sampleRate === 44_100) return [config];
+  return [
+    config,
+    { ...config, sampleRate: sampleRate === 22_050 ? 44_100 : 48_000 },
+  ];
+}
+
+export function remotionOutputDimensions(
+  sourceWidth: number,
+  sourceHeight: number,
+  resize: import('@remotion/webcodecs').ResizeOperation | undefined,
+  rotation: number,
+  even: boolean,
+): { width: number; height: number } {
+  const normalizedRotation = ((rotation % 360) + 360) % 360;
+  let width = normalizedRotation === 90 || normalizedRotation === 270 ? sourceHeight : sourceWidth;
+  let height = normalizedRotation === 90 || normalizedRotation === 270 ? sourceWidth : sourceHeight;
+  if (resize?.mode === 'width') {
+    height = Math.round((resize.width / width) * height);
+    width = resize.width;
+  } else if (resize?.mode === 'height') {
+    width = Math.round((resize.height / height) * width);
+    height = resize.height;
+  } else if (resize?.mode === 'max-height-width') {
+    const scale = Math.min(
+      Math.min(width, resize.maxWidth) / width,
+      Math.min(height, resize.maxHeight) / height,
+    );
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
+  } else if (resize?.mode === 'max-height') {
+    const target = Math.min(height, resize.maxHeight);
+    width = Math.round((target / height) * width);
+    height = target;
+  } else if (resize?.mode === 'max-width') {
+    const target = Math.min(width, resize.maxWidth);
+    height = Math.round((target / width) * height);
+    width = target;
+  } else if (resize?.mode === 'scale') {
+    width = Math.round(width * resize.scale);
+    height = Math.round(height * resize.scale);
+  }
+  if (even) {
+    width = Math.floor(width / 2) * 2;
+    height = Math.floor(height / 2) * 2;
+  }
+  return { width, height };
+}
+
+function remotionEncoderCodecString(
+  codec: RemotionVideoCodec,
+  width: number,
+  height: number,
+  fps: number | null,
+): string {
+  if (codec === 'vp8') return 'vp8';
+  if (codec === 'vp9') return 'vp09.00.10.08';
+  if (codec === 'h264') {
+    const profiles = [
+      { hex: '1F', width: 1280, height: 720, fps: 30 },
+      { hex: '20', width: 1280, height: 1024, fps: 42.2 },
+      { hex: '28', width: 2048, height: 1024, fps: 30 },
+      { hex: '29', width: 2048, height: 1024, fps: 30 },
+      { hex: '2A', width: 2048, height: 1080, fps: 60 },
+      { hex: '32', width: 3672, height: 1536, fps: 26.7 },
+      { hex: '33', width: 4096, height: 2304, fps: 26.7 },
+      { hex: '34', width: 4096, height: 2304, fps: 56.3 },
+      { hex: '3C', width: 8192, height: 4320, fps: 30.2 },
+      { hex: '3D', width: 8192, height: 4320, fps: 60.4 },
+      { hex: '3E', width: 8192, height: 4320, fps: 120.8 },
+    ];
+    const profile = profiles.find((candidate) =>
+      width <= candidate.width && height <= candidate.height && (fps ?? 60) <= candidate.fps,
+    );
+    if (!profile) throw new Error(`No suitable AVC1 profile found for ${width}x${height}@${fps}fps`);
+    return `avc1.6400${profile.hex}`;
+  }
+
+  const levels = [
+    { level: 3.1, limits: [[720, 480, 84.3], [720, 576, 75], [960, 540, 60], [1280, 720, 33.7]] },
+    { level: 4, limits: [[1280, 720, 68], [1920, 1080, 32], [2048, 1080, 30]] },
+    { level: 4.1, limits: [[1280, 720, 136], [1920, 1080, 64], [2048, 1080, 60]] },
+    { level: 5, limits: [[1920, 1080, 128], [2048, 1080, 120], [3840, 2160, 32], [4096, 2160, 30]] },
+    { level: 5.1, limits: [[1920, 1080, 256], [2048, 1080, 240], [3840, 2160, 64], [4096, 2160, 60]] },
+    { level: 5.2, limits: [[2048, 1080, 300], [3840, 2160, 128], [4096, 2160, 120]] },
+    { level: 6, limits: [[3840, 2160, 128], [4096, 2160, 120], [7680, 4320, 32], [8192, 4320, 30]] },
+    { level: 6.1, limits: [[3840, 2160, 256], [4096, 2160, 240], [7680, 4320, 64], [8192, 4320, 60]] },
+    { level: 6.2, limits: [[3840, 2160, 512], [4096, 2160, 480], [7680, 4320, 128], [8192, 4320, 120]] },
+  ] as const;
+  const level = levels.find((candidate) => candidate.limits.some((limit) =>
+    width <= limit[0] && height <= limit[1] && (fps ?? 60) <= limit[2],
+  ));
+  if (!level) throw new Error(`No suitable HEVC profile found for ${width}x${height}@${fps}fps`);
+  return `hvc1.1.0.L${Math.round(level.level * 30)}.b0`;
+}
+
+/**
+ * Native decoder wrapper used instead of Remotion's decoder helper because 4.0.479 intentionally
+ * catches and discards the native `VideoDecoder.flush()` rejection. Correctness needs that rejection
+ * (and its original cause) to reach the runner, while still retaining Remotion's parser/controller
+ * for sample production and cancellation.
+ */
+function createIsolatedVideoDecoder(
+  config: VideoDecoderConfig,
+  signal: AbortSignal,
+  onFrame: (frame: VideoFrame) => void | Promise<void>,
+  onError: (error: Error) => void,
+): IsolatedVideoDecoder {
+  let codecError: Error | null = null;
+  let closed = false;
+  const pendingOutputs = new Set<Promise<void>>();
+  const reportError = (error: unknown): void => {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    codecError ??= normalized;
+    onError(normalized);
+  };
+  const native = new VideoDecoder({
+    output: (frame) => {
+      let output: Promise<void>;
+      try {
+        output = Promise.resolve(onFrame(frame));
+      } catch (error) {
+        frame.close();
+        reportError(error);
+        return;
+      }
+      const tracked = output
+        .catch((error) => {
+          frame.close();
+          reportError(error);
+        })
+        .finally(() => pendingOutputs.delete(tracked));
+      pendingOutputs.add(tracked);
+    },
+    error: reportError,
+  });
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    signal.removeEventListener('abort', abort);
+    if (native.state !== 'closed') native.close();
+  };
+  const abort = (): void => close();
+  if (signal.aborted) abort();
+  else signal.addEventListener('abort', abort, { once: true });
+
+  try {
+    if (!closed) native.configure(config);
+  } catch (error) {
+    close();
+    throw error;
+  }
+
+  const throwIfUnavailable = (): void => {
+    if (signal.aborted) throw signal.reason ?? new DOMException('Operation aborted', 'AbortError');
+    if (codecError) throw codecError;
+    if (closed || native.state === 'closed') throw new Error('video decoder is closed');
+  };
+
+  return {
+    decode: async (sample) => {
+      throwIfUnavailable();
+      native.decode(new EncodedVideoChunk(sample));
+    },
+    flush: async () => {
+      throwIfUnavailable();
+      await native.flush();
+      await Promise.all([...pendingOutputs]);
+      if (codecError) throw codecError;
+    },
+    waitForQueueToBeLessThan: async (items) => {
+      throwIfUnavailable();
+      if (native.decodeQueueSize < items) return;
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+          native.removeEventListener('dequeue', check);
+          signal.removeEventListener('abort', onAbort);
+        };
+        const check = (): void => {
+          if (native.decodeQueueSize >= items) return;
+          cleanup();
+          resolve();
+        };
+        const onAbort = (): void => {
+          cleanup();
+          reject(signal.reason ?? new DOMException('Operation aborted', 'AbortError'));
+        };
+        native.addEventListener('dequeue', check);
+        signal.addEventListener('abort', onAbort, { once: true });
+        check();
+      });
+      throwIfUnavailable();
+    },
+    close,
+  };
+}
+
+function jsonWebCodecsConfig(
+  config: VideoDecoderConfig | VideoEncoderConfig | AudioDecoderConfig | AudioEncoderConfig,
+): Record<string, SerializableValue> {
+  const out: Record<string, SerializableValue> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (
+      typeof value === 'string'
+      || typeof value === 'boolean'
+      || (typeof value === 'number' && Number.isFinite(value))
+      || value === null
+    ) {
+      out[key] = value;
+      continue;
+    }
+    if (key === 'description' && (ArrayBuffer.isView(value) || value instanceof ArrayBuffer)) {
+      const view = ArrayBuffer.isView(value)
+        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : new Uint8Array(value);
+      out.descriptionHex = bytesToHex(view);
+      continue;
+    }
+    if (value && typeof value === 'object') {
+      const nested: Record<string, SerializableValue> = {};
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        if (
+          typeof nestedValue === 'string'
+          || typeof nestedValue === 'boolean'
+          || (typeof nestedValue === 'number' && Number.isFinite(nestedValue))
+          || nestedValue === null
+        ) {
+          nested[nestedKey] = nestedValue;
+        }
+      }
+      if (Object.keys(nested).length) out[key] = nested;
     }
   }
-  if (!mp3TracksById.size) return tagged;
+  return out;
+}
 
-  const indexByTrackId = new Map<number, number>();
-  return tagged.map((entry) => {
-    const track = mp3TracksById.get(entry.trackId);
-    if (!track || !entry.durationUs || entry.durationUs <= 0) return entry;
+function bytesToHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
+  return out;
+}
 
-    const index = indexByTrackId.get(entry.trackId) ?? 0;
-    indexByTrackId.set(entry.trackId, index + 1);
+function isNamedError(error: unknown, name: string): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'name' in error
+    && (error as { name?: unknown }).name === name;
+}
 
-    const samplesPerFrame = Math.max(1, Math.round((entry.durationUs * track.sampleRate) / 1_000_000));
-    const timestampUs = Math.round((index * samplesPerFrame * 1_000_000) / track.sampleRate);
-    return {
-      ...entry,
-      packet: {
-        ...entry.packet,
-        ptsUs: timestampUs,
-        dtsUs: timestampUs,
-      },
-    };
-  });
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function monotonicElapsed(started: number, previous: number): number {
+  return Math.max(previous, Math.max(0, nowMs() - started));
+}
+
+function normalizeFinalState(
+  state: import('@remotion/webcodecs').ConvertMediaProgress,
+): Record<string, number | null> {
+  return {
+    decodedVideoFrames: state.decodedVideoFrames,
+    decodedAudioFrames: state.decodedAudioFrames,
+    encodedVideoFrames: state.encodedVideoFrames,
+    encodedAudioFrames: state.encodedAudioFrames,
+    bytesWritten: state.bytesWritten,
+    millisecondsWritten: state.millisecondsWritten,
+    expectedOutputDurationInMs: state.expectedOutputDurationInMs,
+    overallProgress: state.overallProgress,
+  };
 }
 
 interface TaggedPacket {
   trackId: number;
   packet: Omit<PacketInfo, 'trackIndex'>;
-  durationUs?: number;
-  h264AudPrefixBytes?: 3 | 4;
 }
 
-function h264AudStartCodePrefixBytes(data: Uint8Array): 3 | 4 | undefined {
-  if (data[0] === 0 && data[1] === 0 && data[2] === 1 && data[3] === 9) return 3;
-  if (data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data[4] === 9) return 4;
+/** Preserve the media-parser sample exactly; semantic representation comparison belongs to oracles. */
+export function remotionWebcodecsSampleEvidence(
+  sample: import('@remotion/media-parser').MediaParserVideoSample
+    | import('@remotion/media-parser').MediaParserAudioSample,
+  track: import('@remotion/media-parser').MediaParserVideoTrack
+    | import('@remotion/media-parser').MediaParserAudioTrack,
+): Omit<PacketInfo, 'trackIndex'> {
+  return {
+    size: sample.data.byteLength,
+    ptsUs: sample.timestamp,
+    ...(typeof sample.decodingTimestamp === 'number' && Number.isFinite(sample.decodingTimestamp)
+      ? { dtsUs: sample.decodingTimestamp }
+      : {}),
+    ...(typeof sample.duration === 'number' && Number.isFinite(sample.duration)
+      ? { durationUs: sample.duration }
+      : {}),
+    keyframe: sample.type === 'key',
+    trackType: track.type,
+    codec: track.type === 'video'
+      ? parserToCanonicalVideo(track.codec)
+      : parserToCanonicalAudio(track.codec),
+    payload: sample.data.slice(),
+    framing: packetFraming(track),
+    ...(track.type === 'video' && nalLengthSize(track) !== undefined
+      ? { nalLengthSize: nalLengthSize(track) }
+      : {}),
+    ...(track.description ? { decoderConfig: track.description.slice() } : {}),
+  };
+}
+
+function packetFraming(
+  track: import('@remotion/media-parser').MediaParserVideoTrack
+    | import('@remotion/media-parser').MediaParserAudioTrack,
+): NonNullable<PacketInfo['framing']> {
+  if (track.type === 'video') {
+    if (track.codecEnum === 'h264') return track.description ? 'avc' : 'annexb';
+    if (track.codecEnum === 'h265') return track.description ? 'hevc' : 'annexb';
+    if (track.codecEnum === 'av1') return 'obu';
+    if (track.codecEnum === 'vp8' || track.codecEnum === 'vp9') return 'raw';
+    return 'codec-private';
+  }
+  if (track.codecEnum === 'aac') return track.description ? 'raw' : 'adts';
+  if (track.codecEnum === 'opus' || track.codecEnum === 'vorbis') return 'codec-private';
+  return 'raw';
+}
+
+function nalLengthSize(track: import('@remotion/media-parser').MediaParserVideoTrack): number | undefined {
+  const description = track.description;
+  if (!description) return undefined;
+  if (track.codecEnum === 'h264' && description.byteLength > 4) return (description[4]! & 0x03) + 1;
+  if (track.codecEnum === 'h265' && description.byteLength > 21) return (description[21]! & 0x03) + 1;
   return undefined;
+}
+
+function trackRepresentation(
+  track: import('@remotion/media-parser').MediaParserTrack,
+  trackIndex: number,
+): DemuxTrackRepresentation {
+  if (track.type === 'video') {
+    const coded = track.codecEnum === 'h264' || track.codecEnum === 'h265';
+    return {
+      trackIndex,
+      packetOrdering: 'decode',
+      timebase: { numerator: 1, denominator: 1_000_000 },
+      framing: packetFraming(track),
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: coded ? (track.description ? 'description' : 'in-band') : 'not-applicable',
+      nativeCodecTag: track.codec,
+      ...(track.description ? { description: track.description.slice() } : {}),
+      ...(track.codecEnum === 'h264' && track.description
+        ? { descriptionRecord: 'avc-decoder-configuration-record' as const }
+        : {}),
+      ...(track.codecEnum === 'h265' && track.description
+        ? { descriptionRecord: 'hevc-decoder-configuration-record' as const }
+        : {}),
+    };
+  }
+  if (track.type === 'audio') {
+    return {
+      trackIndex,
+      packetOrdering: 'decode',
+      timebase: { numerator: 1, denominator: 1_000_000 },
+      framing: packetFraming(track),
+      accessUnitGrouping: 'one-frame-per-chunk',
+      parameterSetLocation: track.codecEnum === 'aac' && track.description ? 'description' : 'not-applicable',
+      nativeCodecTag: track.codec,
+      ...(track.description ? { description: track.description.slice() } : {}),
+      ...(track.codecEnum === 'aac' && track.description
+        ? { descriptionRecord: 'audio-specific-config' as const }
+        : track.description
+          ? { descriptionRecord: 'codec-private' as const }
+          : {}),
+    };
+  }
+  return {
+    trackIndex,
+    packetOrdering: 'decode',
+    timebase: { numerator: 1, denominator: 1_000_000 },
+    framing: 'codec-private',
+    accessUnitGrouping: 'one-packet-per-chunk',
+    parameterSetLocation: 'not-applicable',
+    nativeCodecTag: 'unknown',
+  };
 }
 
 /**
@@ -1027,7 +2609,7 @@ async function canonicalContainerForInput(
     const docType = ebmlDocTypeFromPrefix(await readInputPrefix(input, 256));
     if (docType === 'matroska') return 'mkv';
     if (docType === 'webm') return 'webm';
-    return webmFamilyContainerHint(input) ?? canonical;
+    return canonical;
   }
   if (canonical !== 'mp4') return canonical;
 
@@ -1144,21 +2726,13 @@ function readEbmlVint(bytes: Uint8Array, offset: number): { value: number; lengt
   return { value, length };
 }
 
-function webmFamilyContainerHint(input: MediaInput): string | null {
-  const sourceHint = `${input.id || ''} ${input.url || ''} ${input.mime || ''}`.toLowerCase();
-  if (sourceHint.includes('matroska') || sourceHint.includes('.mkv')) return 'mkv';
-  if (sourceHint.includes('webm')) return 'webm';
-  return null;
-}
-
 async function webmHeaderMetadata(input: MediaInput): Promise<NormalizedMetadata | null> {
-  if (!looksLikeWebmFamilyInput(input)) return null;
   const prefix = await readInputPrefix(input, WEBM_HEADER_RANGE_BYTES);
   if (!prefix) return null;
 
   const docType = ebmlDocTypeFromPrefix(prefix);
-  const hint = webmFamilyContainerHint(input);
-  const container: 'mkv' | 'webm' = docType === 'matroska' || hint === 'mkv' ? 'mkv' : 'webm';
+  if (docType !== 'matroska' && docType !== 'webm') return null;
+  const container: 'mkv' | 'webm' = docType === 'matroska' ? 'mkv' : 'webm';
   return webmHeaderMetadataFromPrefix(prefix, container);
 }
 
@@ -1175,28 +2749,6 @@ function singleVideoFpsFromMetadata(metadata: NormalizedMetadata | null): number
   const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
   if (videoTracks.length !== 1) return null;
   return videoTracks[0]?.fps ?? null;
-}
-
-function looksLikeWebmFamilyInput(input: MediaInput): boolean {
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  return hint.includes('.webm') || hint.includes('.mkv') || hint.includes('webm') || hint.includes('matroska');
-}
-
-function looksLikeRecorderWebmInput(input: MediaInput): boolean {
-  if (!looksLikeWebmFamilyInput(input)) return false;
-  const hint = `${input.id} ${input.url} ${input.mime}`.toLowerCase();
-  return hint.includes('recorder') || hint.includes('mediarecorder') || hint.includes('headerless');
-}
-
-function shouldPreferHeaderWebmFps(
-  input: MediaInput,
-  metadata: NormalizedMetadata,
-  headerFps: number | null,
-): headerFps is number {
-  if (headerFps == null || !Number.isFinite(headerFps) || headerFps <= 0) return false;
-  if (!looksLikeRecorderWebmInput(input)) return false;
-  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
-  return videoTracks.length === 1;
 }
 
 interface EbmlElement {
@@ -2026,19 +3578,24 @@ function normalizeTrack(t: import('@remotion/media-parser').MediaParserTrack): N
     const out: NormalizedTrack = {
       type: 'video',
       codec: parserToCanonicalVideo(t.codecEnum),
+      nativeCodecTag: t.codec,
       width: t.width || t.codedWidth || undefined,
       height: t.height || t.codedHeight || undefined,
       rotation: t.rotation || 0,
       bitrate: null,
       language: null,
     };
-    if (typeof t.fps === 'number' && Number.isFinite(t.fps) && t.fps > 0) out.fps = t.fps;
+    if (typeof t.fps === 'number' && Number.isFinite(t.fps) && t.fps > 0) {
+      out.fps = t.fps;
+      out.fpsProvenance = { source: 'nominal', cadence: 'UNKNOWN' };
+    }
     return out;
   }
   if (t.type === 'audio') {
     return {
       type: 'audio',
       codec: parserToCanonicalAudio(t.codecEnum),
+      nativeCodecTag: t.codec,
       sampleRate: t.sampleRate || undefined,
       channels: t.numberOfChannels || undefined,
       bitrate: null,
@@ -2056,11 +3613,13 @@ function normalizeTrack(t: import('@remotion/media-parser').MediaParserTrack): N
 function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketInfo[]): NormalizedMetadata {
   const tracks = metadata.tracks.map((track, trackIndex) => {
     if (track.type !== 'video' || track.fps != null) return track;
-    const fps = fpsFromTrackPackets(
+    const observation = fpsObservationFromTrackPackets(
       packets.filter((packet) => packet.trackIndex === trackIndex),
       metadata.durationSec,
     );
-    return fps == null ? track : { ...track, fps };
+    return observation == null
+      ? track
+      : { ...track, fps: observation.fps, fpsProvenance: observation.provenance };
   });
   return { ...metadata, tracks };
 }
@@ -2077,11 +3636,13 @@ function withProbeFieldsFromPackets(
   const durationSec = metadata.durationSec ?? durationFromPacketPts(packets);
   const tracks = metadata.tracks.map((track, trackIndex) => {
     if (track.type !== 'video' || track.fps != null) return track;
-    const fps = fpsFromTrackPackets(
+    const observation = fpsObservationFromTrackPackets(
       packets.filter((packet) => packet.trackIndex === trackIndex),
       null,
     );
-    return fps == null ? track : { ...track, fps };
+    return observation == null
+      ? track
+      : { ...track, fps: observation.fps, fpsProvenance: observation.provenance };
   });
   return { ...metadata, durationSec, tracks };
 }
@@ -2097,16 +3658,6 @@ function needsWebmFamilyFpsFallback(metadata: NormalizedMetadata): boolean {
   return needsSingleVideoFpsFallback(metadata);
 }
 
-async function parseSlowFpsFallback(mp: MediaParserModule, srcOptions: SourceOptions): Promise<number | null> {
-  const result = await mp.parseMedia({
-    ...srcOptions,
-    acknowledgeRemotionLicense: true,
-    fields: { slowFps: true },
-  });
-  const fps = result.slowFps;
-  return typeof fps === 'number' && Number.isFinite(fps) && fps > 0 ? fps : null;
-}
-
 function withSingleVideoFps(
   metadata: NormalizedMetadata,
   fps: number,
@@ -2117,22 +3668,13 @@ function withSingleVideoFps(
   const tracks = metadata.tracks.map((track) => {
     if (track.type !== 'video' || (!options.replace && track.fps != null) || applied) return track;
     applied = true;
-    return { ...track, fps };
+    return {
+      ...track,
+      fps,
+      fpsProvenance: { source: 'nominal' as const, cadence: 'UNKNOWN' as const },
+    };
   });
   return applied ? { ...metadata, tracks } : metadata;
-}
-
-/**
- * Resolve the lib's default audio codec for an output container via the lib's own getDefaultAudioCodec
- * (the same helper convertMedia uses internally), so the resample resolver re-encodes with the codec
- * the container would have chosen anyway. For 'wav' this returns 'wav' — the only path whose encoder
- * (getWaveAudioEncoder) honors the requested sampleRate exactly.
- */
-function getDefaultAudioCodecForContainer(
-  wc: WebcodecsModule,
-  container: RemotionContainer,
-): RemotionAudioCodec {
-  return wc.getDefaultAudioCodec({ container });
 }
 
 function ensureSupportedTranscodeRequest(
@@ -2140,39 +3682,85 @@ function ensureSupportedTranscodeRequest(
   opts: TranscodeOptions,
   container: RemotionContainer,
   videoSpec: TranscodeVideoOptions | undefined,
+  tracks: import('@remotion/media-parser').MediaParserTrack[],
+  request: ConcreteOperationRequest,
 ): void {
+  const tuple = remotionTupleSummary(request);
   // Channel remap (downmix/upmix) has NO native path in @remotion/webcodecs on ANY container,
   // including WAV: the onAudioTrack resolver can change the sample rate but not numberOfChannels.
   // Check this BEFORE the WAV early-return so a channel-count request (e.g. 5.1 -> stereo) is an
   // honest NA_ENGINE rather than silently emitting the source layout and failing the metadata oracle.
   if (opts.audio?.channels != null) {
-    throw new NotApplicableError('transcode', 'the adapter cannot remap audio channel count (downmix/upmix)');
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'the adapter cannot remap audio channel count (downmix/upmix)',
+      tuple,
+      'REMOTION_CHANNEL_REMAP_UNSUPPORTED',
+    );
   }
-  if (container === 'wav') return;
 
   if (
     videoSpec &&
     ((videoSpec.width !== undefined && videoSpec.width <= 0) ||
       (videoSpec.height !== undefined && videoSpec.height <= 0))
   ) {
-    throw new Error('Remotion WebCodecs transcode rejected invalid video dimensions');
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'video dimensions must be positive',
+      tuple,
+      'REMOTION_INVALID_DIMENSIONS',
+    );
   }
 
   if (videoSpec?.codec === 'av1') {
-    throw new NotApplicableError('transcode', 'Remotion WebCodecs 4.0.479 exposes no AV1 encoder');
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'Remotion WebCodecs 4.0.479 exposes no AV1 encoder',
+      tuple,
+      'REMOTION_AV1_ENCODER_UNAVAILABLE',
+    );
   }
 
-  if (isLargePressureFixture(input)) {
-    throw new NotApplicableError(
+  if (input.sizeBytes !== undefined && input.sizeBytes > 512 * 1024 * 1024) {
+    throw createNotApplicableError(
+      ENGINE_ID,
       'transcode',
-      'large fixture transcodes are not reliable through the in-memory bufferWriter output path',
+      'input exceeds the adapter\'s 512MiB in-memory bufferWriter policy',
+      tuple,
+      'REMOTION_BUFFER_WRITER_RESOURCE_LIMIT',
     );
   }
 
   if (videoSpec?.fps != null) {
-    throw new NotApplicableError(
+    throw createNotApplicableError(
+      ENGINE_ID,
       'transcode',
       'Remotion WebCodecs 4.0.479 convertMedia has no output FPS conversion option',
+      tuple,
+      'REMOTION_OUTPUT_FPS_UNSUPPORTED',
+    );
+  }
+
+  if (videoSpec?.bitrate != null) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'Remotion WebCodecs 4.0.479 convertMedia has no exact video bitrate option',
+      tuple,
+      'REMOTION_VIDEO_BITRATE_UNSUPPORTED',
+    );
+  }
+
+  if (container === 'wav' && videoSpec) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'WAV is audio-only and cannot satisfy a requested video output',
+      tuple,
+      'REMOTION_WAV_VIDEO_OUTPUT_UNSUPPORTED',
     );
   }
 
@@ -2181,32 +3769,48 @@ function ensureSupportedTranscodeRequest(
   // requested rate). For mp4/webm, Chrome's AudioEncoder overrides the requested sampleRate for
   // aac/opus, so non-WAV resample is NOT exact -> still NA. Channel remap has no native path on ANY
   // container (the resolver cannot change numberOfChannels) -> still NA everywhere.
-  if (opts.audio?.channels != null || opts.audio?.sampleRate != null) {
-    throw new NotApplicableError('transcode', 'the adapter cannot request audio resampling or channel remapping');
+  if (container !== 'wav' && opts.audio?.sampleRate != null) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'the pinned browser encoders do not honor non-WAV sample-rate requests exactly',
+      tuple,
+      'REMOTION_NON_WAV_SAMPLE_RATE_UNSUPPORTED',
+    );
   }
 
   const rotate = typeof videoSpec?.rotate === 'number' ? ((videoSpec.rotate % 360) + 360) % 360 : 0;
   if (container === 'mp4' && (rotate === 90 || rotate === 270)) {
-    throw new NotApplicableError('transcode', 'rotated MP4 outputs are not playback-smoke-safe in this package');
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'rotated MP4 outputs are not playback-smoke-safe in this package',
+      tuple,
+      'REMOTION_ROTATED_MP4_UNSUPPORTED',
+    );
   }
 
-  if (looksLikeBFrameFixture(input)) {
-    throw new NotApplicableError('transcode', 'B-frame reorder sources are not reliably re-encoded by this package');
+  const sourceVideo = tracks.find(
+    (track): track is import('@remotion/media-parser').MediaParserVideoTrack => track.type === 'video',
+  );
+  if (
+    sourceVideo
+    && videoSpec?.width !== undefined
+    && videoSpec.height !== undefined
+    && sourceVideo.width * videoSpec.height !== sourceVideo.height * videoSpec.width
+  ) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'transcode',
+      'the requested two-dimensional resize changes aspect ratio but convertMedia only exposes box fit',
+      tuple,
+      'REMOTION_RESIZE_BOX_NOT_EXACT',
+    );
   }
-}
-
-function looksLikeBFrameFixture(input: MediaInput): boolean {
-  const hint = `${input.id} ${input.url}`.toLowerCase();
-  return hint.includes('bframe');
-}
-
-function isLargePressureFixture(input: MediaInput): boolean {
-  const hint = `${input.id} ${input.url}`.toLowerCase();
-  return hint.includes('large_h264_1080p_120s') || hint.includes('large_vp9_1080p_120s');
 }
 
 function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {
-  return fpsFromPts(packets.map((packet) => packet.ptsUs), durationSec);
+  return fpsObservationFromTrackPackets(packets, durationSec)?.fps ?? null;
 }
 
 function fpsFromPts(ptsUs: number[], durationSec: number | null): number | null {
@@ -2218,6 +3822,52 @@ function fpsFromPts(ptsUs: number[], durationSec: number | null): number | null 
   const pts = [...ptsUs].sort((a, b) => a - b);
   const spanUs = pts[pts.length - 1]! - pts[0]!;
   return spanUs > 0 ? ((pts.length - 1) * 1_000_000) / spanUs : null;
+}
+
+function fpsObservationFromTrackPackets(
+  packets: PacketInfo[],
+  durationSec: number | null,
+): { fps: number; provenance: FrameRateProvenance } | null {
+  if (!packets.length) return null;
+  const pts = packets.map((packet) => packet.ptsUs).sort((a, b) => a - b);
+  const deltas: number[] = [];
+  for (let i = 1; i < pts.length; i++) {
+    const delta = pts[i]! - pts[i - 1]!;
+    if (delta > 0) deltas.push(delta);
+  }
+  const cadence = deltas.length > 1 && Math.max(...deltas) - Math.min(...deltas) > 2
+    ? 'VFR' as const
+    : deltas.length
+      ? 'CFR' as const
+      : 'UNKNOWN' as const;
+  const envelope = deltas.length
+    ? { minFps: 1_000_000 / Math.max(...deltas), maxFps: 1_000_000 / Math.min(...deltas) }
+    : undefined;
+  if (durationSec != null && Number.isFinite(durationSec) && durationSec > 0) {
+    return {
+      fps: packets.length / durationSec,
+      provenance: {
+        source: 'average',
+        cadence,
+        sampleCount: packets.length,
+        observedIntervalUs: durationSec * 1_000_000,
+        ...(envelope ? { envelope } : {}),
+      },
+    };
+  }
+  if (pts.length < 2) return null;
+  const observedIntervalUs = pts[pts.length - 1]! - pts[0]!;
+  if (observedIntervalUs <= 0) return null;
+  return {
+    fps: ((pts.length - 1) * 1_000_000) / observedIntervalUs,
+    provenance: {
+      source: 'observed',
+      cadence,
+      sampleCount: pts.length - 1,
+      observedIntervalUs,
+      ...(envelope ? { envelope } : {}),
+    },
+  };
 }
 
 function durationFromPacketPts(packets: PacketInfo[]): number | null {
@@ -2283,16 +3933,16 @@ function flattenMetadata(
 }
 
 /** Build a remotion ResizeOperation from the suite's video transcode dims (or undefined if none). */
-function buildResize(
+export function buildResize(
   v: TranscodeVideoOptions,
 ): import('@remotion/webcodecs').ResizeOperation | undefined {
   const hasW = typeof v.width === 'number' && v.width > 0;
   const hasH = typeof v.height === 'number' && v.height > 0;
   if (hasW && hasH) {
-    // Exact target box. 'max-height-width' fits within the box preserving aspect; when the source
-    // aspect matches the requested box this lands on the exact dimensions, which is the common case
-    // for the suite's resize scenarios (e.g. 320x180 from 16:9 sources).
-    return { mode: 'max-height-width', maxWidth: v.width as number, maxHeight: v.height as number };
+    // The request contract is an exact width+height, not a non-upscaling bounding box. Applicability
+    // already proves the source/request aspect ratios match, so Remotion's width mode deterministically
+    // lands on both requested dimensions for downscales and upscales alike.
+    return { mode: 'width', width: v.width as number };
   }
   if (hasW) return { mode: 'width', width: v.width as number };
   if (hasH) return { mode: 'height', height: v.height as number };

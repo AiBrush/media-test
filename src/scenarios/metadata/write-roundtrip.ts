@@ -2,24 +2,19 @@
  * src/scenarios/metadata/write-roundtrip.ts — WRITE-tags (re-observed honestly) + tag-edit-must-not-
  * corrupt-media + cross-container consistency + no-tags/empty + malformed-tag-region negatives.
  *
- * This file REPLACES the family's previous 4 write cases (which attached `golden-metadata` to a
- * remux op — a guaranteed FAIL for a plumbing reason, masking that no tag was ever written; see
- * _shared.ts ORACLE TRUTH §2). Every case here carries an oracle that ACTUALLY observes the output.
- *
- * WHAT IS — and IS NOT — realizable from a scenario file (honest scope, §0):
- *  - REALIZABLE: "a tag-bearing rewrite produces a valid container that did NOT corrupt the media."
- *    Gated by reference-reimport (parseable container) + property-invariant (decode/duration
- *    unchanged). This DIRECTLY realizes the deepEdge "tag-write must not corrupt media" and the
- *    write_flac note "audio samples must remain bit-identical" (proxied by duration for audio, since
- *    no PCM oracle exists; decode-pixel-exact for video).
- *  - NOT REALIZABLE here: reading the WRITTEN tag CONTENT back and asserting tags ⊇ T. The runner
- *    forwards options.tags, but no oracle re-probes a remux output and compares a tag map. That needs
- *    oracle + model work. We keep options.tags on each case and record the gap in index.ts. We do NOT
- *    attach an oracle that pretends to check it.
+ * Every write carries three independent gates: neutral semantic-tag readback, structural re-import,
+ * and media preservation. No-tag probes explicitly reject fabricated semantic values. Malformed
+ * ID3/ilst inputs may reject cleanly or return only schema-valid bounded structure with every
+ * corrupt-region semantic key absent.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import {
+  SEMANTIC_TAG_KEYS,
+  defineMetadataRecoveryContract,
+  defineMetadataTagContract,
+} from '../../features/metadata/index.ts';
 import {
   buildNegative,
   buildProperty,
@@ -32,10 +27,9 @@ import {
 } from './_shared.ts';
 
 // Unicode / boundary-stressing tag values (emoji + CJK title, non-ASCII artist, a >255-byte comment to
-// cross the ID3 text-frame size boundary). Carried on the write cases so a future readback oracle
-// exercises UTF-8 round-trip; today they document the intent and ride along in options.tags.
+// cross the ID3 text-frame size boundary). Neutral readback exercises every value.
 const LONG_COMMENT = 'metadata:write roundtrip — '.repeat(12); // ~324 bytes, > the 255-byte ID3 frame edge
-const UNICODE_TAGS = {
+export const METADATA_UNICODE_TAGS = {
   title: 'Conformance 🎬 字幕 Clip',
   artist: 'aibrűsh-media-tëst',
   album: 'Suite Vol. 1',
@@ -54,12 +48,12 @@ const WRITE_CASES: TagWriteCase[] = [
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    tags: UNICODE_TAGS,
+    tags: METADATA_UNICODE_TAGS,
     invariant: DECODE_REMUX,
     notes:
       'Set MP4 ilst tags, re-observe: the output is a valid MP4 (reference-reimport) and the tag-only ' +
-      'rewrite did NOT change decoded pixels (decode(remux(x))==decode(x)). Tag CONTENT readback is ' +
-      'not gated yet because no oracle re-probes ctx.output tags — see index.ts oracleGaps.',
+      'rewrite did NOT change decoded pixels (decode(remux(x))==decode(x)). A neutral ilst re-probe ' +
+      'independently requires the complete requested Unicode semantic subset.',
   },
   {
     id: 'write_mkv_tags',
@@ -67,18 +61,19 @@ const WRITE_CASES: TagWriteCase[] = [
     container: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    tags: UNICODE_TAGS,
+    tags: METADATA_UNICODE_TAGS,
     invariant: DECODE_REMUX,
     notes:
       'Write Matroska SimpleTag entries, re-observe: valid MKV (reference-reimport) + decoded pixels ' +
-      'unchanged (decode(remux(x))==decode(x)). Tag-content readback not gated (see index.ts).',
+      'unchanged (decode(remux(x))==decode(x)). A neutral Matroska SimpleTag re-probe independently ' +
+      'requires the requested semantic subset at the correct scope.',
   },
   {
     id: 'write_mp3_id3',
     asset: 'mp3_xing.mp3',
     container: 'mp3',
     audioCodecs: ['mp3'],
-    tags: UNICODE_TAGS,
+    tags: METADATA_UNICODE_TAGS,
     invariant: PROBE_DUR,
     tolerances: { durationToleranceSec: 0.1 },
     notes:
@@ -93,7 +88,7 @@ const WRITE_CASES: TagWriteCase[] = [
     asset: 'flac_seektable.flac',
     container: 'flac',
     audioCodecs: ['flac'],
-    tags: UNICODE_TAGS,
+    tags: METADATA_UNICODE_TAGS,
     invariant: PROBE_DUR,
     notes:
       'Write FLAC VORBIS_COMMENT, re-observe: valid FLAC (reference-reimport) + duration preserved ' +
@@ -105,7 +100,7 @@ const WRITE_CASES: TagWriteCase[] = [
     asset: 'opus.ogg',
     container: 'ogg',
     audioCodecs: ['opus'],
-    tags: UNICODE_TAGS,
+    tags: METADATA_UNICODE_TAGS,
     invariant: PROBE_DUR,
     notes:
       'Write OGG/Opus VorbisComment header tags, re-observe: valid OGG (reference-reimport) + duration ' +
@@ -121,12 +116,21 @@ const WRITE_CASES: TagWriteCase[] = [
 const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
   {
     id: 'tagedit_no_corrupt_video_mp4_mkv',
+    revision: 2,
     invariant: DECODE_REMUX,
     input: 'h264_1080p_30s.mp4',
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['metadata:write'],
+    tags: METADATA_UNICODE_TAGS,
+    metadataTagContract: defineMetadataTagContract({
+      mode: 'cross-container-equality',
+      sourceCarrier: 'mp4',
+      carrier: 'mkv',
+      requested: METADATA_UNICODE_TAGS,
+    }),
     notes:
       'Tag edit must not corrupt VIDEO: a tag-only rewrite (modeled as a lossless remux) must leave the ' +
       'coded samples untouched — decode(remux(x))==decode(x) (pixels bit-exact). Catches an engine that ' +
@@ -147,37 +151,43 @@ const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
 ];
 
 // ── Cross-container tag/normalization consistency (A.16 metamorphic) ──────────────────────────────
-// True cross-container tag-SET equality needs a tag-readback oracle (absent). The expressible
-// invariant is that the same logical content, re-wrapped to another container, yields a consistent
-// (precise, source-matching) probe — i.e. the metadata layer is container-independent for the
-// properties the oracle CAN read (duration). Gated by probe(remux(x)).dur≈probe(x).dur.
+// The same logical subset is written MP4→Matroska and mapped back by the neutral reader. Container
+// carrier differences are DIFF; lost/changed values are FAIL. Duration/media survival stays separate.
 
 const CROSS_CONTAINER_PROPERTY: MetaPropertyCase[] = [
   {
     id: 'meta_consistent_mp4_to_mkv',
+    revision: 2,
     invariant: PROBE_DUR,
     input: 'h264_1080p_30s.mp4',
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    features: ['metadata:write'],
+    tags: METADATA_UNICODE_TAGS,
+    metadataTagContract: defineMetadataTagContract({
+      mode: 'cross-container-equality',
+      sourceCarrier: 'mp4',
+      carrier: 'mkv',
+      requested: METADATA_UNICODE_TAGS,
+    }),
     tolerances: { durationToleranceSec: 0.1 },
     notes:
       'Cross-container metadata consistency (A.16): the same content re-wrapped MP4->MKV must yield a ' +
-      'consistent, source-matching probe — probe(remux(x)).dur≈probe(x).dur — proving the metadata ' +
-      'layer is container-independent for the properties the oracle can read. Allows a 100ms remux ' +
-      'duration band for audio/video block rounding while preserving the no-large-drift gate. Full ' +
-      'semantic-tag-set equality across containers needs a tag-readback oracle (see index.ts oracleGaps).',
+      'consistent, source-matching probe — probe(remux(x)).dur≈probe(x).dur — while a neutral Matroska ' +
+      're-probe maps SimpleTags back to the same requested logical subset. Equal values in a different ' +
+      'lossless carrier surface as PASS with a recorded representation difference; altered/lost values FAIL. Allows a 100ms remux duration band.',
   },
 ];
 
 // ── No-tags / empty input: must read cleanly, never crash or fabricate ────────────────────────────
-// An asset with NO semantic tags must probe to a sane metadata object (empty/absent tag map), never
-// null-deref. golden-metadata gates the structural side; the absence of a tag assertion is correct
-// (there is nothing to assert, and the oracle does not read tags anyway).
+// An asset with NO semantic tags must probe to sane structure and the metadata-tags-absent contract
+// independently rejects any fabricated semantic key.
 
 const noTagsAudioRead: Scenario = defineScenario({
   id: 'metadata/read_no_tags_wav',
+  revision: 2,
   op: 'probe',
   input: 'wav_s16.wav',
   requires: {
@@ -185,17 +195,24 @@ const noTagsAudioRead: Scenario = defineScenario({
     containersIn: ['wav'],
     audioCodecs: ['pcm-s16'],
   },
-  oracles: ['golden-metadata'],
+  options: {
+    invariant: 'metadata-tags-absent',
+    robustness: {
+      metadataTags: defineMetadataTagContract({ mode: 'assert-absence', carrier: 'wav' }),
+    },
+  },
+  oracles: ['golden-metadata', 'property-invariant'],
   metrics: ['wall'],
   notes:
     'No-tags input (A.16): a bare WAV carries no semantic tags. probe must return a sane metadata ' +
     'object with an empty/absent tag map and the correct structural fields — never null-deref, never ' +
-    'fabricate tags. golden-metadata gates container/duration/track (pcm-s16, sr, ch); there is no tag ' +
-    'content to assert (and the oracle does not read tags).',
+      'fabricate tags. golden-metadata gates container/duration/track and metadata-tags-absent rejects ' +
+      'any fabricated semantic key while retaining technical diagnostics.',
 });
 
 const noTagsRecorderRead: Scenario = defineScenario({
   id: 'metadata/read_no_tags_recorder_webm',
+  revision: 2,
   op: 'probe',
   input: 'recorder_headerless.webm',
   requires: {
@@ -204,7 +221,13 @@ const noTagsRecorderRead: Scenario = defineScenario({
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
   },
-  oracles: ['golden-metadata'],
+  options: {
+    invariant: 'metadata-tags-absent',
+    robustness: {
+      metadataTags: defineMetadataTagContract({ mode: 'assert-absence', carrier: 'webm' }),
+    },
+  },
+  oracles: ['golden-metadata', 'property-invariant'],
   metrics: ['wall'],
   tolerances: { fpsTolerance: 0.25 },
   timeoutMs: 20_000,
@@ -224,6 +247,14 @@ const META_NEGATIVE_CASES: MetaNegativeCase[] = [
     container: 'mp3',
     audioCodecs: ['mp3'],
     gracefulAllowOutput: true,
+    recovery: defineMetadataRecoveryContract({
+      corruptRegion: 'id3',
+      expectedContainer: 'mp3',
+      maximumTracks: 16,
+      maximumTagEntries: 256,
+      maximumTagValueBytes: 65_536,
+      forbiddenSemanticTags: SEMANTIC_TAG_KEYS,
+    }),
     timeoutMs: 15_000,
     notes:
       'Malformed ID3 tag region (A.16 fuzz): the leading ID3v2/Xing bytes of an MP3 are garbled. probe ' +
@@ -237,6 +268,14 @@ const META_NEGATIVE_CASES: MetaNegativeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     gracefulAllowOutput: true,
+    recovery: defineMetadataRecoveryContract({
+      corruptRegion: 'mp4-ilst',
+      expectedContainer: 'mp4',
+      maximumTracks: 64,
+      maximumTagEntries: 256,
+      maximumTagValueBytes: 65_536,
+      forbiddenSemanticTags: SEMANTIC_TAG_KEYS,
+    }),
     timeoutMs: 15_000,
     notes:
       'Truncated/garbled ilst region (A.16 fuzz): the leading ftyp/moov bytes of an MP4 (where ' +

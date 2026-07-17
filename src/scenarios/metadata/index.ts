@@ -12,33 +12,11 @@
  *                              consistency, no-tags/empty reads, malformed-tag-region negatives.
  *   - ./_shared.ts           : the builders + the authoritative ORACLE TRUTH comment.
  *
- * ════════════════════════════════════════════════════════════════════════════════════════════════
- * HONEST SCOPE — what the family CANNOT verify today, and why (so a number is never a vanity green).
- * These are oracle/model/runner gaps OUTSIDE a scenario writer's reach (oracles.ts / engine.ts /
- * runner.ts are off-limits); the cases here gate every property that IS expressible and document the
- * rest rather than attaching a fake oracle:
- *
- *   • TAG CONTENT (read): `golden-metadata` (compareTrack) never compares `tags`. A read case can
- *     gate container/duration/track-layout/codec/dims/fps/sr/ch — NOT a title/artist/comment value.
- *     Closing it needs (a) a tag-bearing corpus with semantic-key golden and (b) a SUBSET/semantic
- *     tag comparison in goldenMetadata (case/whitespace-normalized, ignoring container artifacts like
- *     major_brand/encoder).
- *   • TAG CONTENT (write→readback): the runner forwards options.tags to engine.remux, but no oracle
- *     re-probes the output and compares a tag map. A genuine `probe(writeTags(x,T)).tags ⊇ T` needs a
- *     tags-roundtrip oracle. We gate the write with reference-reimport + property-invariant (valid
- *     container, media uncorrupted).
- *   • ROTATION VALUE: compareTrack never compares `track.rotation`, and there are no 180/270/-90
- *     rotated assets. We gate rotation by its OBSERVABLE DECODED EFFECT (decode read + survival), the
- *     only path expressible from a scenario file; a `rotation==90 ∧ width/height un-swapped` assertion
- *     needs a compareTrack edit + corpus.
- *   • LANGUAGE per-track VALUE: compareTrack never compares `track.language`; all golden languages are
- *     'und'/null; no distinct-language (eng/fra/jpn) asset exists. We gate positional track
- *     ATTRIBUTION (order/codec/index) instead; distinct-language proof needs all three.
- *   • CHAPTERS / EDIT-LISTS / COVER-ART / TIMECODE: `NormalizedMetadata`/`NormalizedTrack` have no
- *     fields for them and no oracle reads them — UNVERIFIABLE until the model + golden + an oracle
- *     gain the fields. No fabricated case is added (a case with no real gate is worse than an honest
- *     absence, §0.1).
- * ════════════════════════════════════════════════════════════════════════════════════════════════
+ * Family-local contracts live under src/features/metadata: the extended schema retains raw and
+ * canonical evidence, the neutral reader understands each supported tag carrier, safe recovery is
+ * bounded and semantic, and the committed equivalence matrix pairs every valid normalization with a
+ * nearby invalid counterexample. Shared oracle integration consumes those contracts; scenario rows
+ * remain engine-neutral.
  */
 
 import type { Scenario } from '../../core/scenario.ts';
@@ -48,7 +26,8 @@ import { metadataWriteRoundtripScenarios } from './write-roundtrip.ts';
 
 // ── READ structural metadata across tag-bearing + coverage containers ─────────────────────────────
 // Every case probes the asset and gates the STRUCTURAL metadata via golden-metadata (container,
-// duration, per-track type/codec/dims/fps/sr/ch). Tag CONTENT is NOT asserted (see HONEST SCOPE).
+// duration and logical track evidence). These legacy sources declare no semantic tag subset; tag
+// content is asserted by the authored write/readback rows and explicit no-tag rows below.
 
 const TAG_READ_CASES: TagReadCase[] = [
   {
@@ -57,8 +36,8 @@ const TAG_READ_CASES: TagReadCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes:
-      'MP4 udta/ilst container (©nam/©ART/©alb/©day/trkn live here). Gates the structural metadata; ' +
-      'the full ilst tag SET would need a tag-readback oracle (see HONEST SCOPE).',
+      'MP4 udta/ilst container (©nam/©ART/©alb/©day/trkn live here). Gates structural metadata; the ' +
+      'authored metadata/write_mp4_tags row owns the complete semantic ilst subset.',
   },
   {
     asset: 'h264_1080p_5s.mov',

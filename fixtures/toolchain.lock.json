@@ -1,0 +1,27 @@
+{
+  "$schema": "./schemas/toolchain-perimeter-v1.schema.json",
+  "schemaVersion": "media-test/toolchain-perimeter@1",
+  "sourceDateEpoch": 1784160000,
+  "locale": "C.UTF-8",
+  "timezone": "UTC",
+  "required": {
+    "bun": "1.3.14",
+    "ffmpeg": "8.1.2",
+    "ffprobe": "8.1.2"
+  },
+  "optional": {
+    "bento4": "record-if-present",
+    "shakaPackager": "record-if-present",
+    "playwright": "1.48.x",
+    "browser": "record-executable-and-build"
+  },
+  "environmentVariables": [
+    "SOURCE_DATE_EPOCH",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "BRAVE_PATH",
+    "FFMPEG_PATH",
+    "FFPROBE_PATH"
+  ]
+}

@@ -8,10 +8,11 @@
  *     single-cluster files are a known muxer off-by-one source (§A.16 single-frame / 0×0-ish). A mux
  *     that mishandles a 1-sample stts/stsz/stco or an empty-ish chunk list shows up here, never on the
  *     medium rung.
- *   - LARGE / LONG rung (large_h264_1080p_120s.mp4, longform_1h_audio.m4a): mp4 sample-offset crossover
- *     from 32-bit stco to 64-bit co64, and mkv cue density, only appear once the file is large/long
- *     enough (§A.16 multi-hour / many-thousand-sample). The muxer must pick co64 when offsets exceed
- *     4 GiB-addressable and write a dense-enough cue index — untested by any short clip.
+ *   - LARGE / LONG rung (large_h264_1080p_120s.mp4, longform_1h_audio.m4a): sustained table/index
+ *     growth and Matroska cue density across many-thousand samples.
+ *   - SPARSE >4 GiB rung: an explicit runner-injected sparse target crosses 0xffffffff without a
+ *     multi-gigabyte allocation. A declaring muxer must author co64/large-size boxes and the neutral
+ *     reader re-imports sample prefixes on both sides of the boundary.
  *
  * PRIMARY METRIC: `throughputRealtime` (output media-seconds per wall-second). Mux is an I/O-bound
  * sample COPY (no re-encode), so sustained throughput + peak memory are the meaningful axes at scale,
@@ -29,6 +30,7 @@
  */
 
 import type { Scenario } from '../../core/scenario.ts';
+import { MUX_SPARSE_CO64_ACCEPTANCE_CASE } from '../../features/mux/index.ts';
 import { buildMux, type MuxCase } from './_shared.ts';
 
 const SIZE_LADDER_TIMEOUT_MS = 120_000; // 2 min: bounds a large/long mux index-rewrite hang.
@@ -108,6 +110,25 @@ const SIZE_LADDER_CASES: MuxCase[] = [
     notes:
       'SIZE LADDER (long, multi-hour §A.16): mux 1 h of AAC → mp4(.m4a). Many-thousand-sample audio ' +
       'sample table — forces the index-growth path (large stsz/stco) a short clip never reaches.',
+  },
+  {
+    id: 'size_sparse_gt4gib_co64',
+    input: 'micro_h264_1frame.mp4',
+    containersIn: ['mp4'],
+    to: 'mp4',
+    videoCodecs: ['h264'],
+    features: ['mux:sparse-co64'],
+    extraOptions: {
+      invariant: 'mux-large-file-addressing',
+      robustness: { muxLargeFile: MUX_SPARSE_CO64_ACCEPTANCE_CASE.contract },
+    },
+    oracles: ['property-invariant'],
+    metrics: ['wall'],
+    timeoutMs: 600_000,
+    notes:
+      'LONG RESOURCE GATE: author MP4 into the runner sparse target with media offsets below and above ' +
+      '0xffffffff. Neutral re-import requires co64, a 64-bit mdat size, in-range offsets, and exact ' +
+      'sample-prefix readback without allocating the virtual >4 GiB extent.',
   },
 ];
 
