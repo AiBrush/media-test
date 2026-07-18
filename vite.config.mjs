@@ -487,8 +487,8 @@ export default {
   // code-splitting workers must be emitted as ES modules rather than Vite's IIFE default.
   worker: { format: 'es' },
   // LAN exposure remains an explicit CLI choice (`serve.sh --host`); Vite itself is loopback-only.
-  server: { host: '127.0.0.1' },
-  preview: { host: '127.0.0.1' },
+  server: { host: '127.0.0.1', port: 5151, strictPort: true },
+  preview: { host: '127.0.0.1', port: 5151, strictPort: true },
   // @aibrush/media is a file: dependency in node_modules, so vite would otherwise pre-bundle it with
   // esbuild — which rewrites the codec tails' `new URL('./x.wasm', import.meta.url)` and breaks wasm
   // loading. Exclude it so vite serves the engine as-is (same as when it lived under src/…/vendor).

@@ -6,6 +6,7 @@ import { PassThrough } from 'node:stream';
 
 import {
   RUN_OPTION_DEFINITIONS,
+  RUN_OPTION_LIMITS,
   RunOptionValidationError,
   freezeRunConfiguration,
 } from '../src/app/options.ts';
@@ -23,9 +24,11 @@ import {
   CACHE_EXPORT_SCHEMA,
   CACHE_VALIDATION_EPOCH,
   createResultCache,
+  latestCachedRunView,
   unavailableCacheSnapshot,
   validateCacheExportBundle,
 } from '../src/app/result-cache.ts';
+import type { CachedResultRow } from '../src/app/result-cache.ts';
 import {
   MAX_MATRIX_ROWS,
   appendBrowserRunEvidence,
@@ -38,6 +41,7 @@ import {
   reconcileBrowserRunEvidence,
   resultDisplay,
   runContinuationAction,
+  unresolvedMatrixState,
 } from '../src/app/ui.ts';
 import type { FrozenRunConfiguration } from '../src/app/options.ts';
 import type { RegistrationReport } from '../src/app/register.ts';
@@ -128,6 +132,28 @@ describe('REQ-UI-01/02/06/07/19: honest and bounded presentation model', () => {
     }])).toEqual({ numerator: 1, denominator: 3 });
   });
 
+  test('executed PASS, FAIL, ERROR, and partial cells retain their measured elapsed time', () => {
+    expect(resultDisplay({ ...displayResult('PASS', 'ok'), durationMs: 12.34 }).label)
+      .toBe('PASS (12.34 ms)');
+    expect(resultDisplay({ ...displayResult('FAIL', 'semantic mismatch'), durationMs: 1_250 }).label)
+      .toBe('FAIL (1.25 s)');
+    expect(resultDisplay({ ...displayResult('ERROR', 'adapter failed'), durationMs: 800 }).label)
+      .toBe('ERROR (800 ms)');
+    const partial = resultDisplay({
+      ...displayResult('FAIL', 'mixed exhaustive coverage'),
+      durationMs: 3_210,
+      exhaustive: [
+        { file: '01.wav', isBaked: true, status: 'PASS', oracleOutcomes: [], executed: true },
+        { file: '02.wav', isBaked: false, status: 'FAIL', oracleOutcomes: [], executed: true },
+      ],
+      coverage: {
+        passed: 1, admissible: 2, total: 2, valid: 1, grade: 'partial',
+        counts: { pass: 1, fail: 1, error: 0, naEngine: 0, naBrowser: 0, naAsset: 0, skipped: 0, total: 2 },
+      },
+    } as ScenarioResult);
+    expect(partial.label).toBe('Partial 1/2 (3.21 s)');
+  });
+
   test('every applicability/policy/error status keeps a unique machine-visible label', () => {
     const statuses: ResultStatus[] = [
       'PASS', 'FAIL', 'NA_ENGINE', 'NA_BROWSER', 'NA_ASSET', 'SKIPPED', 'ERROR',
@@ -135,6 +161,13 @@ describe('REQ-UI-01/02/06/07/19: honest and bounded presentation model', () => {
     const labels = statuses.map(formatStatusLabel);
     expect(new Set(labels).size).toBe(statuses.length);
     expect(labels).toEqual(statuses);
+  });
+
+  test('unfinished terminal snapshots keep unresolved cells pending instead of marking them not run', () => {
+    expect(unresolvedMatrixState('completed')).toBe('not-run');
+    for (const state of ['idle', 'validating', 'running', 'stopping', 'completed-partial', 'failed'] as const) {
+      expect(unresolvedMatrixState(state)).toBe('pending');
+    }
   });
 
   test('10,000 logical rows never produce a page larger than the DOM bound', () => {
@@ -507,6 +540,59 @@ describe('REQ-UI-09/18: cache validation and non-fatal failure evidence', () => 
   });
 });
 
+describe('reload view uses the existing result cache', () => {
+  test('selects one latest source run, normalizes cache-tagged scenario ids, and never mixes browsers', () => {
+    const row = (
+      key: string,
+      runId: string,
+      updatedAtIso: string,
+      result: ScenarioResult,
+      overrides: Partial<CachedResultRow> = {},
+    ): CachedResultRow => ({
+      key,
+      createdAtIso: updatedAtIso,
+      updatedAtIso,
+      sourceRunId: runId,
+      originalOrigin: 'http://127.0.0.1:5151',
+      validationEpoch: CACHE_VALIDATION_EPOCH,
+      result,
+      invalidated: false,
+      ...overrides,
+    });
+    const entries = [
+      row('old', 'run-old', '2026-07-17T10:00:00.000Z', displayResult('FAIL', 'old result')),
+      row('newer-duplicate', 'run-new', '2026-07-18T10:01:00.000Z', {
+        ...displayResult('PASS', 'new result'),
+        scenarioId: `probe/example#selection-sha256:${SHA_A}`,
+      }),
+      row('older-duplicate', 'run-new', '2026-07-18T10:00:00.000Z', {
+        ...displayResult('FAIL', 'superseded physical cache row'),
+        scenarioId: `probe/example#selection-sha256:${'b'.repeat(64)}`,
+      }),
+      row('new-second-cell', 'run-new', '2026-07-18T10:02:00.000Z', {
+        ...displayResult('ERROR', 'diagnostic remains visible but is not reusable'),
+        engineId: 'engine@2',
+        scenarioId: 'probe/other',
+      }, { invalidated: true, invalidationReason: 'missing full execution-manifest fingerprint' }),
+      row('other-browser', 'run-other-browser', '2026-07-18T11:00:00.000Z', {
+        ...displayResult('PASS', 'firefox result'),
+        browser: 'firefox',
+      }),
+      row('old-epoch', 'run-old-epoch', '2026-07-18T12:00:00.000Z', displayResult('PASS', 'stale epoch'), {
+        validationEpoch: 'previous-epoch',
+      }),
+    ];
+
+    const view = latestCachedRunView(entries, 'chromium', ['probe/example', 'probe/other']);
+    expect(view?.sourceRunId).toBe('run-new');
+    expect(view?.updatedAtIso).toBe('2026-07-18T10:02:00.000Z');
+    expect(view?.results.map((result) => [result.engineId, result.scenarioId, result.status])).toEqual([
+      ['engine@1', 'probe/example', 'PASS'],
+      ['engine@2', 'probe/other', 'ERROR'],
+    ]);
+  });
+});
+
 describe('REQ-UI-16: loopback and opt-in save boundary', () => {
   const token = 'non-guessable-test-token-0123456789abcdef';
   const headers = {
@@ -569,10 +655,10 @@ describe('REQ-UI-16: loopback and opt-in save boundary', () => {
     }
   });
 
-  test('Vite keeps ES-module workers and defaults both servers to loopback', () => {
+  test('Vite keeps ES-module workers and defaults both servers to loopback port 5151', () => {
     expect(viteConfig.worker).toEqual({ format: 'es' });
-    expect(viteConfig.server).toEqual({ host: '127.0.0.1' });
-    expect(viteConfig.preview).toEqual({ host: '127.0.0.1' });
+    expect(viteConfig.server).toEqual({ host: '127.0.0.1', port: 5151, strictPort: true });
+    expect(viteConfig.preview).toEqual({ host: '127.0.0.1', port: 5151, strictPort: true });
     expect(viteConfig.plugins.map((plugin: { name: string }) => plugin.name)).toEqual([
       'cross-origin-isolation', 'ffmpeg-vendor-static', 'save-results', 'fixtures-static',
     ]);
@@ -605,6 +691,8 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(launcher).toContain('visible browser window');
     expect(wrapper).toContain('visible window');
     expect(server).toContain('loopback by default');
+    expect(RUN_OPTION_LIMITS.timeoutMs.default).toBe(86_400_000);
+    expect(wrapper).toContain('Default run deadline: 86400000 ms (24 hours).');
   });
 
   test('run.sh accepts and forwards every canonical value exactly once', () => {

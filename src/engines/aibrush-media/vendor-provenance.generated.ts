@@ -4,9 +4,9 @@ export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {
   formatVersion: 1,
   dependency: 'file:../media',
   packageVersion: '0.0.0',
-  sourceRevision: 'c2445f51d037b8925ea9feef22353494fa82da27',
-  sourceTreeDigest: '2c42f9727c53465567ef4a24904a3e8e49e4f55f49d6b31a314feeb935838246',
-  dirtyState: 'dirty',
+  sourceRevision: 'a6a3cda5c3cf3100050740d876703d5576c65333',
+  sourceTreeDigest: '6db18a7f0a0c1a544ebf48e8273ea2aa867c3a471cff3a456280dba6cc1602b4',
+  dirtyState: 'clean',
   buildFlags: [
     'bun run build',
     'bun run vendor-wasm',

@@ -17,7 +17,7 @@
 #                        to pin one; if a pinned port is already taken the run aborts (it will NOT
 #                        reuse a foreign server).
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
-#   --timeout-ms <ms>    per-browser run cap (default 1800000 = 30 min).
+#   --timeout-ms <ms>    per-browser run cap (default 86400000 = 24 hours).
 #   --random-seed <text> deterministic execution/media-selection seed for exact replay.
 #   --exhaustive         run every eligible catalog input for each selected scenario.
 #   --no-reuse           force every selected executable cell to run instead of reusing stored
@@ -45,7 +45,7 @@ PORT=""            # empty ⇒ auto-select a free ephemeral port (see port selec
 PORT_EXPLICIT=0   # set when the user pins --port (we then refuse to reuse a foreign server on it)
 WARMUP=""
 ITERS=""
-TIMEOUT_MS="1800000"
+TIMEOUT_MS="86400000"
 NO_SERVE=0
 KEEP_SERVING=0
 BASE_URL=""
@@ -61,6 +61,7 @@ print_help() {
   echo "The wrapper opens each requested browser in a visible window."
   echo "Canonical options (generated from src/app/options.ts):"
   bun "${SCRIPT_DIR}/launch.mjs" --help-canonical
+  echo "Default run deadline: 86400000 ms (24 hours)."
   printf '%s\n' \
     "Wrapper options:" \
     "  --port <n>         pin the suite server port (default: choose a free port)" \
@@ -116,15 +117,15 @@ pids_on_port() {
   command -v lsof >/dev/null 2>&1 && lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null | tr '\n' ' '
 }
 
-# pick_free_port → echo a TCP port nothing is listening on. Tries 5173 first (familiar dev port),
+# pick_free_port → echo a TCP port nothing is listening on. Tries 5151 first (the app's dev port),
 # then a spread of candidates so concurrent runs/agents don't collide. Bash 3.2-safe (no $RANDOM
 # arithmetic surprises — we still seed from $$ + $RANDOM for spread). Exits non-zero if none free.
 pick_free_port() {
   local cand seed
   seed=$(( ( $$ + ${RANDOM:-0} ) % 4000 ))
-  # Candidate list: the classic 5173, then a deterministic-ish spread in the 49152–65535 ephemeral
+  # Candidate list: the app's 5151 default, then a deterministic-ish spread in the 49152–65535 ephemeral
   # range so we avoid well-known ports and reduce collision odds across parallel launchers.
-  for cand in 5173 5174 5175 $((49152 + seed)) $((50000 + seed)) $((51000 + seed)) $((52000 + seed)) $((53000 + seed)) $((54000 + seed)) $((55000 + seed)); do
+  for cand in 5151 5152 5153 $((49152 + seed)) $((50000 + seed)) $((51000 + seed)) $((52000 + seed)) $((53000 + seed)) $((54000 + seed)) $((55000 + seed)); do
     if ! port_in_use "${cand}"; then echo "${cand}"; return 0; fi
   done
   return 1
@@ -147,7 +148,7 @@ if [[ "${NO_SERVE}" -ne 1 ]]; then
 fi
 
 # Default port for the --no-serve display case (server is foreign / already up).
-if [[ -z "${PORT}" ]]; then PORT="5173"; fi
+if [[ -z "${PORT}" ]]; then PORT="5151"; fi
 if [[ -z "${BASE_URL}" ]]; then BASE_URL="http://127.0.0.1:${PORT}"; fi
 
 # ── start the static server (unless told not to) ─────────────────────────────────────────────

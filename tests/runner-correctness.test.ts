@@ -1069,6 +1069,7 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
         schema: EXECUTION_RESULT_SCHEMA,
         hash: (status === 'PASS' ? 'a' : file === '02.mp4' ? 'b' : 'c').repeat(64),
       },
+      durationMs: file === '01.mp4' ? 10 : file === '02.mp4' ? 20 : 30,
       ...(status === 'FAIL' ? { reason: `${file} mismatch` } : {}),
     });
     const aggregate = aggregateExhaustive(
@@ -1093,6 +1094,7 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
       detail: '02.mp4',
     });
     expect(aggregate.exhaustive?.map((entry) => entry.executionFingerprint?.hash[0])).toEqual(['a', 'b', 'c']);
+    expect(aggregate.durationMs).toBe(60);
   });
 });
 

@@ -45,6 +45,7 @@ const fakeFixtureRuntime = {
 } as unknown as ActiveFixtureRuntime;
 
 let probeCalls = 0;
+let mediaBodyFetches = 0;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -55,13 +56,22 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     registerAcceptanceSurface();
     installAcceptanceFetch();
     probeCalls = 0;
+    mediaBodyFetches = 0;
 
-    const cache = memoryResultReuseStore();
+    const cache = validatedPersistentResultReuseStore();
     const baseOptions = {
       browser: 'chromium' as const,
       engineIds: [ENGINE_ID],
       scenarioIds: [SCENARIO_ID],
-      pillar: 'functional' as const,
+      pillar: 'all' as const,
+      benchOptions: {
+        warmup: 1,
+        iters: 1,
+        minDurationMs: 0.01,
+        minRepetitions: 5,
+        slowRepetitions: 3,
+        maxInnerIterations: 1,
+      },
       randomSeed: 'selection-policy-e2e-seed-v1',
       resultReuse: cache,
       fixtureIntegrityRuntime: fakeFixtureRuntime,
@@ -121,10 +131,20 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     expect(report.markdown).toContain('03-na.mp4');
 
     const callsAfterFirstExhaustive = probeCalls;
+    const fetchesAfterFirstExhaustive = mediaBodyFetches;
     const reused = await runMatrix({ ...baseOptions, exhaustiveMedia: true });
     expect(probeCalls).toBe(callsAfterFirstExhaustive);
+    expect(mediaBodyFetches).toBe(fetchesAfterFirstExhaustive);
+    expect(reused[0]?.cacheReuse?.sourceRunId).toBe('selection-e2e-prior-run');
     expect(reused[0]?.exhaustive?.every((entry) => entry.reason?.startsWith('cached') === true)).toBe(true);
     expect(reused[0]?.selection?.runSeed).toBe(baseOptions.randomSeed);
+
+    await runMatrix({
+      ...baseOptions,
+      exhaustiveMedia: true,
+      benchOptions: { ...baseOptions.benchOptions, warmup: 2 },
+    });
+    expect(mediaBodyFetches).toBeGreaterThan(fetchesAfterFirstExhaustive);
   });
 });
 
@@ -137,7 +157,7 @@ function registerAcceptanceSurface(): void {
     options: {},
     requires: { operations: ['probe'], containersIn: ['mp4'] },
     oracles: ['golden-metadata'],
-    metrics: [],
+    metrics: ['wall'],
     notes: 'REQ-SEL-08 real selection/runner/cache/report acceptance surface.',
   }));
 }
@@ -225,6 +245,7 @@ function installAcceptanceFetch(): void {
         (assetId === `${REAL_PREFIX}/${BAKED_ID}` ? media.get(BAKED_ID) : undefined);
       if (!body) return new Response(null, { status: 404, statusText: 'Not Found' });
       if (init?.method === 'HEAD') return new Response(null, { status: 200 });
+      mediaBodyFetches += 1;
       return new Response(body.slice(), { status: 200 });
     }
     const goldenMarker = 'fixtures/golden/';
@@ -255,14 +276,50 @@ function sourceRecord(file: string, bytes: Uint8Array): Record<string, unknown> 
   };
 }
 
-function memoryResultReuseStore(): ResultReuseStore {
+function validatedPersistentResultReuseStore(): ResultReuseStore {
   const rows = new Map<string, ScenarioResult>();
   const key = (engineId: string, scenarioId: string, browser: string): string =>
     `${engineId}\u0000${scenarioId}\u0000${browser}`;
   return {
-    get: async (engineId, scenarioId, browser) => rows.get(key(engineId, scenarioId, browser)),
+    exactSelectionReuse: true,
+    get: async (engineId, scenarioId, browser) => {
+      const sourceKey = key(engineId, scenarioId, browser);
+      const stored = rows.get(sourceKey);
+      if (!stored) return undefined;
+      const cacheReuse = {
+        schema: 'media-test/cache-reuse@1' as const,
+        sourceKey,
+        sourceObservationHash:
+          stored.executionFingerprint?.hash ??
+          stored.exhaustive?.find((entry) => entry.executionFingerprint)?.executionFingerprint?.hash ??
+          'a'.repeat(64),
+        sourceRunId: 'selection-e2e-prior-run',
+        createdAtIso: '2026-07-18T00:00:00.000Z',
+        originalOrigin: 'http://127.0.0.1:5151',
+        validationEpoch: 'selection-e2e-current',
+        validBecause: 'test store admitted the exact selection key and current validation epoch',
+        ...(stored.env ? { sourceEnvironment: stored.env } : {}),
+        ...(stored.selection ? { selectionEnvelope: stored.selection } : {}),
+      };
+      return {
+        ...structuredClone(stored),
+        cacheReuse,
+        ...(stored.exhaustive
+          ? { exhaustive: stored.exhaustive.map((entry) => ({ ...structuredClone(entry), cacheReuse })) }
+          : {}),
+      };
+    },
     put: async (result) => {
-      rows.set(key(result.engineId, result.scenarioId, result.browser), structuredClone(result));
+      const stored = structuredClone(result);
+      delete stored.cacheReuse;
+      if (stored.exhaustive) {
+        stored.exhaustive = stored.exhaustive.map((entry) => {
+          const clean = { ...entry };
+          delete clean.cacheReuse;
+          return clean;
+        });
+      }
+      rows.set(key(result.engineId, result.scenarioId, result.browser), stored);
     },
   };
 }

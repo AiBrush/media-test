@@ -6,7 +6,7 @@ import type { Operation } from '../core/engine.ts';
 import type { ResultStatus, ScenarioResult } from '../core/scenario.ts';
 import { runReportingPipeline } from '../core/reporting/pipeline.ts';
 import type { MetricId } from '../core/scenario.ts';
-import type { CacheManifestSnapshot, RunManifest } from './run-artifact.ts';
+import type { CacheManifestSnapshot, RunCompletionState, RunManifest } from './run-artifact.ts';
 
 export interface MatrixCellRef {
   engineId: string;
@@ -185,6 +185,13 @@ export interface RunContinuationAction {
   readonly resumable: boolean;
   readonly label: 'Resume validated run' | 'Start new run';
   readonly reason: string;
+}
+
+export type UnresolvedMatrixState = 'not-run' | 'pending';
+
+/** Only a fully completed matrix may claim that every unresolved cell is terminally not run. */
+export function unresolvedMatrixState(completionState: RunCompletionState): UnresolvedMatrixState {
+  return completionState === 'completed' ? 'not-run' : 'pending';
 }
 
 /** Resume wording is a capability claim, so every checkpoint identity must be proven first. */
@@ -721,8 +728,10 @@ export class MatrixView {
     this.renderScoreboard();
   }
 
-  finish(): void {
-    this.finished = true;
+  finish(options: { unresolvedState?: 'not-run' | 'pending' } = {}): void {
+    // A partial/failed snapshot still has runnable work. Keep its unresolved cells Pending so the
+    // terminal view agrees with reload recovery and the "Run remaining with cache" action.
+    this.finished = options.unresolvedState !== 'pending';
     this.currentKey = undefined;
     this.stopElapsed();
     this.renderElapsed();
@@ -732,6 +741,30 @@ export class MatrixView {
 
   getResults(): ScenarioResult[] {
     return this.results.slice();
+  }
+
+  /** Restore a durable snapshot after reload without pretending that an unfinished run is active. */
+  restore(
+    engines: string[],
+    scenarios: string[],
+    results: readonly ScenarioResult[],
+    options: { executionOrder?: MatrixCellRef[]; finished?: boolean } = {},
+  ): void {
+    this.start(engines, scenarios, { executionOrder: options.executionOrder });
+    this.results = [...results];
+    this.resultByKey.clear();
+    for (const result of results) this.resultByKey.set(this.key(result.engineId, result.scenarioId), result);
+    this.winnerKeys.clear();
+    this.tieKeys.clear();
+    this.wins.clear();
+    this.rankings.clear();
+    for (const scenarioId of this.scenarios) this.recomputeWinner(scenarioId);
+    this.stopElapsed();
+    this.startedAtMs = 0;
+    this.currentKey = undefined;
+    this.finished = options.finished === true;
+    this.renderPage();
+    this.renderScoreboard();
   }
 
   getRenderedRowCount(): number {
@@ -986,10 +1019,16 @@ export function resultDisplay(result: ScenarioResult): ResultDisplay {
     const failures = (result.exhaustive ?? [])
       .filter((file) => file.status !== 'PASS')
       .map((file) => `${file.file}: ${formatStatusLabel(file.status)}${file.reason ? ` — ${file.reason}` : ''}`);
-    const label = `Partial ${valid}/${result.coverage.total}`;
+    const ms = pickExecutionMs(result);
+    const timing = ms === undefined ? '' : ` (${formatExecTime(ms)})`;
+    const label = `Partial ${valid}/${result.coverage.total}${timing}`;
     return { kind: 'PARTIAL', label, accessibleLabel: `${label}. Mixed file coverage.`, partialFailures: failures };
   }
-  const ms = result.status === 'PASS' ? pickExecutionMs(result) : undefined;
+  // PASS, FAIL, and ERROR all represent work that reached an executable boundary. Keep their elapsed
+  // cost visible when the runner measured one; a semantic failure must not erase how long it ran.
+  const ms = result.status === 'PASS' || result.status === 'FAIL' || result.status === 'ERROR'
+    ? pickExecutionMs(result)
+    : undefined;
   const metric = ms === undefined ? '' : ` (${formatExecTime(ms)})`;
   const label = `${formatStatusLabel(result.status)}${metric}`;
   const accessibleLabel = result.status === 'FAIL'

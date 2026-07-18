@@ -6,7 +6,9 @@ import type { ScenarioFamily } from '../core/scenario.ts';
 export const RUN_OPTION_LIMITS = Object.freeze({
   warmup: Object.freeze({ min: 0, max: 20, default: 1 }),
   iters: Object.freeze({ min: 1, max: 50, default: 1 }),
-  timeoutMs: Object.freeze({ min: 1_000, max: 86_400_000, default: 1_800_000 }),
+  // A full 592-row, multi-engine, exhaustive suite legitimately exceeds 30 minutes before the
+  // long-form audio rows finish. Keep a bounded safety deadline, but make the default a full day.
+  timeoutMs: Object.freeze({ min: 1_000, max: 86_400_000, default: 86_400_000 }),
 });
 
 export const RUN_OPTION_DEFINITIONS = Object.freeze([

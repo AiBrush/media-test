@@ -48,6 +48,8 @@ export interface CacheExportBundle {
 }
 
 export interface ResultCache {
+  /** This cache validates epoch/TTL and is keyed by the complete selected-input contract. */
+  readonly exactSelectionReuse: true;
   get(engineId: string, scenarioId: string, browser: string): Promise<CachedScenarioResult | undefined>;
   put(result: ScenarioResult): Promise<void>;
   list(): Promise<CachedResultRow[]>;
@@ -57,6 +59,12 @@ export interface ResultCache {
   snapshot(forcedFresh?: boolean): Promise<CacheManifestSnapshot>;
   exportBundle(): Promise<CacheExportBundle>;
   importBundle(value: unknown, sourceLabel?: string): Promise<number>;
+}
+
+export interface LatestCachedRunView {
+  sourceRunId?: string;
+  updatedAtIso: string;
+  results: ScenarioResult[];
 }
 
 export interface ResultCacheOptions {
@@ -199,6 +207,7 @@ export function createResultCache(options: ResultCacheOptions = {}): ResultCache
   };
 
   const api: ResultCache = {
+    exactSelectionReuse: true,
     async get(engineId, scenarioId, browser) {
       try {
         const wanted = lookupKey(engineId, scenarioId, browser);
@@ -445,6 +454,61 @@ export function unavailableCacheSnapshot(error = 'IndexedDB is not available'): 
     hits: [],
     lastError: error,
   });
+}
+
+/**
+ * Build a display-only view of the most recently written run from the existing result cache.
+ *
+ * This deliberately does not grant cache reuse: `ResultCache.get()` remains the only path that
+ * applies fingerprint/TTL validation before a cached observation can replace live execution. The
+ * view merely reconstructs the latest run's visible cells after a reload, including current-epoch
+ * rows that are useful as terminal diagnostics but are not semantically reusable.
+ */
+export function latestCachedRunView(
+  entries: readonly CachedResultRow[],
+  browser: string,
+  registeredScenarioIds: readonly string[],
+): LatestCachedRunView | undefined {
+  const registered = new Set(registeredScenarioIds);
+  const candidates = entries
+    .filter((entry) =>
+      entry.validationEpoch === CACHE_VALIDATION_EPOCH &&
+      entry.result.browser === browser &&
+      registered.has(registeredScenarioId(entry.result.scenarioId)) &&
+      Number.isFinite(Date.parse(entry.updatedAtIso)))
+    .sort((left, right) =>
+      right.updatedAtIso.localeCompare(left.updatedAtIso) || right.key.localeCompare(left.key));
+  if (candidates.length === 0) return undefined;
+
+  // Rows written during a run already carry sourceRunId. Prefer the newest such group so a page
+  // refresh never mixes cells from unrelated runs. Legacy/imported rows without run attribution are
+  // still useful as a fallback cache view, deduplicated to the newest observation per logical cell.
+  const newestAttributed = candidates.find((entry) => entry.sourceRunId !== undefined);
+  const sourceRunId = newestAttributed?.sourceRunId;
+  const selected = sourceRunId
+    ? candidates.filter((entry) => entry.sourceRunId === sourceRunId)
+    : candidates;
+  const byCell = new Map<string, CachedResultRow>();
+  for (const entry of selected) {
+    const scenarioId = registeredScenarioId(entry.result.scenarioId);
+    const key = `${entry.result.engineId}\u0000${scenarioId}`;
+    if (!byCell.has(key)) byCell.set(key, entry);
+  }
+  const results = [...byCell.values()]
+    .map((entry) => {
+      const scenarioId = registeredScenarioId(entry.result.scenarioId);
+      return scenarioId === entry.result.scenarioId
+        ? entry.result
+        : { ...entry.result, scenarioId };
+    })
+    .sort((left, right) =>
+      left.scenarioId.localeCompare(right.scenarioId) || left.engineId.localeCompare(right.engineId));
+  if (results.length === 0) return undefined;
+  return {
+    ...(sourceRunId ? { sourceRunId } : {}),
+    updatedAtIso: selected[0]!.updatedAtIso,
+    results,
+  };
 }
 
 export function validateCacheExportBundle(value: unknown): CacheExportBundle {

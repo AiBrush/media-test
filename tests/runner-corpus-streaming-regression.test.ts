@@ -149,6 +149,81 @@ describe('runner demand-driven corpus preparation regression', () => {
     });
   });
 
+  test('contains an unexpected exhaustive-cell failure and continues with the next scenario', async () => {
+    const engineId = 'runner-exhaustive-error-continuation@1.0.0';
+    const failingId = 'remux/exhaustive-error-contained';
+    const followingId = 'remux/exhaustive-error-following';
+    const failingAsset = 'contained-baked.mp4';
+    const followingAsset = 'following-baked.mp4';
+    const bodies = new Map<string, Uint8Array>([
+      [`scenarios/${failingId}/${failingAsset}`, encoder.encode('contained-baked')],
+      [`scenarios/${failingId}/contained-real.mp4`, encoder.encode('contained-real')],
+      [`scenarios/${followingId}/${followingAsset}`, encoder.encode('following-baked')],
+      [`scenarios/${followingId}/following-real.mp4`, encoder.encode('following-real')],
+    ]);
+    let injected = false;
+    let operations = 0;
+    const persisted: Array<{ scenarioId: string; status: string }> = [];
+
+    registerEngine(engineId, async () => remuxEngine(engineId, async () => {
+      operations += 1;
+      return outputBytes();
+    }));
+    registerScenario(remuxScenario(failingId, failingAsset));
+    registerScenario(remuxScenario(followingId, followingAsset));
+    installCorpusFetch({
+      rows: [
+        sourceRow(failingId, 'contained-real.mp4', bodies.get(`scenarios/${failingId}/contained-real.mp4`)!),
+        sourceRow(followingId, 'following-real.mp4', bodies.get(`scenarios/${followingId}/following-real.mp4`)!),
+      ],
+      manifestAssets: [
+        manifestAsset(failingAsset, bodies.get(`scenarios/${failingId}/${failingAsset}`)!),
+        manifestAsset(followingAsset, bodies.get(`scenarios/${followingId}/${followingAsset}`)!),
+      ],
+      bodies,
+    });
+
+    const results = await runMatrix({
+      browser: 'chromium',
+      engineIds: [engineId],
+      scenarioIds: [failingId, followingId],
+      pillar: 'functional',
+      exhaustiveMedia: true,
+      fixtureIntegrityRuntime: fixtureRuntime,
+      playbackSmoke: async () => true,
+      resultReuse: {
+        get: async () => undefined,
+        put: async (result) => {
+          persisted.push({ scenarioId: result.scenarioId, status: result.status });
+        },
+      },
+      onFileProgress: () => {
+        if (injected) return;
+        injected = true;
+        throw new Error('deliberate exhaustive orchestration failure');
+      },
+    });
+
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({
+      scenarioId: failingId,
+      status: 'ERROR',
+      coverage: { grade: 'none', valid: 0, total: 2 },
+    });
+    expect(results[0]?.reason).toContain('[EXHAUSTIVE_CELL_ERROR] deliberate exhaustive orchestration failure');
+    expect(results[0]?.exhaustive?.every((entry) => entry.status === 'ERROR')).toBe(true);
+    expect(results[1]).toMatchObject({
+      scenarioId: followingId,
+      status: 'PASS',
+      coverage: { grade: 'full', valid: 2, total: 2 },
+    });
+    expect(operations).toBe(2);
+    expect(persisted.map((result) => [result.scenarioId.split('#', 1)[0], result.status])).toEqual([
+      [failingId, 'ERROR'],
+      [followingId, 'PASS'],
+    ]);
+  });
+
   test('memoizes a same-size digest rejection across engines without invoking an adapter operation', async () => {
     const firstEngine = 'runner-stable-asset-block-a@1.0.0';
     const secondEngine = 'runner-stable-asset-block-b@1.0.0';

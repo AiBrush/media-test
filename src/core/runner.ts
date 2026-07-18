@@ -646,6 +646,13 @@ function codecOption(value: unknown): string | undefined {
 // ── Run options ──────────────────────────────────────────────────────────────────────────────
 
 export interface ResultReuseStore {
+  /**
+   * The store has already applied its persistent validation epoch, status TTL, and exact
+   * engine/browser/selection-key policy. A candidate carrying typed cache provenance may therefore
+   * be returned before immutable media bodies are downloaded again. Stores that merely memoize
+   * results in memory should omit this flag and retain the full fingerprint-preflight path.
+   */
+  readonly exactSelectionReuse?: true;
   get(engineId: string, scenarioId: string, browser: BrowserName): Promise<ScenarioResult | undefined>;
   put(result: ScenarioResult): Promise<void>;
 }
@@ -1467,6 +1474,253 @@ function restoreLogicalScenarioId(result: ScenarioResult, scenarioId: string): S
     scenarioId,
     ...(result.instance ? { instance: { ...result.instance, scenarioId } } : {}),
   };
+}
+
+/**
+ * A persistent result-cache hit is already bound to the exact selected-input key and has passed the
+ * cache's validation epoch/TTL policy. For immutable, digest-declared selections, re-downloading the
+ * complete body before accepting that hit defeats the cache (the long-form audio exhaustive set is
+ * roughly 800 MB). Keep the strict runOne fingerprint path for untrusted/in-memory stores and for
+ * selection types whose complete resource closure is discovered from the body itself.
+ */
+function exactPersistedSelectionResult(
+  cached: ScenarioResult | undefined,
+  engineId: string,
+  browser: BrowserName,
+  scenario: Scenario,
+  selection: ScenarioSelection,
+  exhaustiveSelections: readonly ScenarioSelection[] | undefined,
+  runEnvBase: RunEnv,
+  runSeed: string | undefined,
+  pillar: RunOptions['pillar'],
+  benchOptions: BenchOptions | undefined,
+  cacheLookupDurationMs: number,
+): ScenarioResult | undefined {
+  if (!cached?.cacheReuse || cached.cacheReuse.schema !== 'media-test/cache-reuse@1') return undefined;
+  if (
+    cached.engineId !== engineId ||
+    cached.browser !== browser ||
+    cached.family !== scenario.family ||
+    !isTypedScenarioResult(cached)
+  ) return undefined;
+
+  const selections = exhaustiveSelections && exhaustiveSelections.length > 0
+    ? exhaustiveSelections
+    : [selection];
+  if (!selections.every(selectionAllowsExactPersistedReuse)) return undefined;
+  if (!cacheEnvironmentMatches(cached.env, { ...runEnvBase, engineId })) return undefined;
+  if (!cacheMeasurementProtocolMatches(cached, scenario, pillar, benchOptions)) return undefined;
+
+  let exhaustive: ScenarioResult['exhaustive'];
+  let currentSelection: ScenarioResult['selection'];
+  if (exhaustiveSelections && exhaustiveSelections.length > 0) {
+    if (!cached.exhaustive || !cachedExhaustiveSetMatches(cached.exhaustive, exhaustiveSelections)) {
+      return undefined;
+    }
+    exhaustive = cached.exhaustive.map((entry) => ({
+      ...entry,
+      reason: cachedResultReason(entry.reason, entry.status),
+      ...(entry.selection
+        ? { selection: replaceSelectionRunSeed(entry.selection, runSeed) }
+        : {}),
+      ...(entry.cacheReuse
+        ? { cacheReuse: exactSelectionCacheReuse(entry.cacheReuse) }
+        : {}),
+    }));
+    currentSelection = cached.selection
+      ? replaceSelectionRunSeed(cached.selection, runSeed)
+      : undefined;
+  } else {
+    if (cached.exhaustive || !cachedSelectionMatches(selection, cached.selection)) return undefined;
+    currentSelection = {
+      ...resultSelectionFor(selection),
+      ...(runSeed !== undefined ? { runSeed } : {}),
+    };
+  }
+
+  const result: ScenarioResult = {
+    ...restoreLogicalScenarioId(cached, scenario.id),
+    engineId,
+    browser,
+    scenarioId: scenario.id,
+    family: scenario.family,
+    reason: cachedResultReason(cached.reason, cached.status),
+    cacheReuse: exactSelectionCacheReuse(cached.cacheReuse),
+    ...(exhaustive ? { exhaustive } : {}),
+    ...(currentSelection ? { selection: currentSelection } : {}),
+    env: { ...runEnvBase, engineId },
+    startedAtIso: new Date().toISOString(),
+    durationMs: Math.max(0, cacheLookupDurationMs),
+  };
+  if (pillar === 'functional') {
+    delete result.bench;
+    result.measurement = { state: 'NOT_REQUESTED' };
+    if (result.exhaustive) {
+      result.exhaustive = result.exhaustive.map((entry) => {
+        const functional = { ...entry, measurement: { state: 'NOT_REQUESTED' } as const };
+        delete functional.bench;
+        return functional;
+      });
+    }
+  }
+  return result;
+}
+
+function selectionAllowsExactPersistedReuse(selection: ScenarioSelection): boolean {
+  const scenario = selection.effectiveScenario;
+  const options = recordOption(scenario.options);
+  const scheme = options?.scheme;
+  return (
+    scenario.family !== 'robustness' &&
+    typeof scenario.mutate !== 'function' &&
+    scenario.op !== 'decrypt' &&
+    scheme !== 'hls-aes128' &&
+    scheme !== 'hls-sample-aes' &&
+    hlsResourceIndexFromOptions(scenario.options) === undefined &&
+    selection.resolvedInputs.length > 0 &&
+    selection.resolvedInputs.every((input) =>
+      input.transport === undefined &&
+      typeof input.sha256 === 'string' &&
+      /^[0-9a-f]{64}$/.test(input.sha256) &&
+      Number.isSafeInteger(input.sizeBytes) &&
+      Number(input.sizeBytes) >= 0)
+  );
+}
+
+function cacheEnvironmentMatches(cached: RunEnv | undefined, current: RunEnv): boolean {
+  if (!cached) return false;
+  const identity = (env: RunEnv): unknown => ({
+    suiteVersion: env.suiteVersion,
+    engineId: env.engineId,
+    browser: env.browser,
+    browserVersion: env.browserVersion ?? null,
+    userAgent: env.userAgent ?? null,
+    corpusChecksum: env.corpusChecksum ?? null,
+    pixelBehavior: env.pixelBehavior ?? null,
+  });
+  return stableCanonicalString(identity(cached)) === stableCanonicalString(identity(current));
+}
+
+function cacheMeasurementProtocolMatches(
+  cached: ScenarioResult,
+  scenario: Scenario,
+  pillar: RunOptions['pillar'],
+  benchOptions: BenchOptions | undefined,
+): boolean {
+  const wantsPerformance = (pillar ?? 'all') === 'all' || pillar === 'performance';
+  if (!wantsPerformance || scenario.metrics.length === 0) return true;
+  const observations = cached.exhaustive ?? [cached];
+  for (const observation of observations) {
+    if (observation.status !== 'PASS') continue;
+    if (observation.measurement?.state !== 'AVAILABLE' || !observation.bench) return false;
+    for (const metric of scenario.metrics) {
+      const summary = observation.bench[metric];
+      if (!summary || !adaptiveTimingProtocolMatches(summary, benchOptions)) return false;
+    }
+  }
+  return true;
+}
+
+function adaptiveTimingProtocolMatches(summary: BenchSummary, options: BenchOptions | undefined): boolean {
+  const evidence = recordOption(summary.protocolEvidence);
+  const timing = recordOption(evidence?.timingProtocol);
+  if (timing?.schema !== 'media-test/adaptive-timing@1') return false;
+  const warmup = options?.warmup ?? DEFAULT_BENCH.warmup;
+  const requested = options?.iters ?? DEFAULT_BENCH.iters;
+  const minDurationMs = options?.minDurationMs ?? DEFAULT_BENCH.minDurationMs;
+  const minRepetitions = options?.minRepetitions ?? DEFAULT_BENCH.minRepetitions;
+  const slowRepetitions = options?.slowRepetitions ?? DEFAULT_BENCH.slowRepetitions;
+  const slowOperation = timing.slowOperation === true;
+  const measuredCount = Math.max(requested, slowOperation ? slowRepetitions : minRepetitions);
+  return (
+    timing.warmupCount === warmup &&
+    timing.minDurationMs === minDurationMs &&
+    timing.measuredCount === measuredCount &&
+    summary.warmup === warmup &&
+    summary.n === measuredCount
+  );
+}
+
+function cachedExhaustiveSetMatches(
+  cached: readonly ExhaustiveFileResult[],
+  selections: readonly ScenarioSelection[],
+): boolean {
+  if (cached.length !== selections.length) return false;
+  const remaining = [...cached];
+  for (const selection of selections) {
+    const index = remaining.findIndex((entry) =>
+      entry.file === selection.selectedFile &&
+      entry.isBaked === selection.isBaked &&
+      (selection.selectedSha256 === undefined || entry.sha256 === selection.selectedSha256) &&
+      cachedSelectionMatches(selection, entry.selection, selections.length));
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return remaining.length === 0;
+}
+
+function cachedSelectionMatches(
+  selection: ScenarioSelection,
+  cached: ScenarioResult['selection'] | undefined,
+  candidateCount = selection.candidateCount,
+): boolean {
+  if (!cached) return false;
+  const expected = resultSelectionFor(selection, candidateCount);
+  // `prepareSelection()` may expand or rebind resolved paths and therefore records a derived
+  // executedInputDigest in the per-file result. The persistent physical key was formed from the
+  // pre-preparation selection contract and already binds that digest. Match the durable candidate,
+  // pool, evidence, and policy identities here instead of incorrectly comparing the two phases.
+  return stableCanonicalString({
+    file: cached.file,
+    sha256: cached.sha256 ?? null,
+    isBaked: cached.isBaked,
+    candidateCount: cached.candidateCount ?? null,
+    eligiblePoolDigest: cached.eligiblePoolDigest ?? null,
+    candidateIdentity: cached.candidateIdentity ?? null,
+    selectionPolicyVersion: cached.selectionPolicyVersion ?? null,
+    selectionAlgorithmId: cached.selectionAlgorithmId ?? null,
+    evidenceContractDigest: cached.evidenceContractDigest ?? null,
+    catalogState: cached.catalogState ?? null,
+    catalogReason: cached.catalogReason ?? null,
+  }) === stableCanonicalString({
+    file: expected.file,
+    sha256: expected.sha256 ?? null,
+    isBaked: expected.isBaked,
+    candidateCount: expected.candidateCount ?? null,
+    eligiblePoolDigest: expected.eligiblePoolDigest ?? null,
+    candidateIdentity: expected.candidateIdentity ?? null,
+    selectionPolicyVersion: expected.selectionPolicyVersion ?? null,
+    selectionAlgorithmId: expected.selectionAlgorithmId ?? null,
+    evidenceContractDigest: expected.evidenceContractDigest ?? null,
+    catalogState: expected.catalogState ?? null,
+    catalogReason: expected.catalogReason ?? null,
+  });
+}
+
+function replaceSelectionRunSeed(
+  selection: NonNullable<ScenarioResult['selection']>,
+  runSeed: string | undefined,
+): NonNullable<ScenarioResult['selection']> {
+  const { runSeed: _priorRunSeed, ...withoutPriorSeed } = selection;
+  return {
+    ...withoutPriorSeed,
+    ...(runSeed !== undefined ? { runSeed } : {}),
+  };
+}
+
+function exactSelectionCacheReuse(
+  reuse: NonNullable<ScenarioResult['cacheReuse']>,
+): NonNullable<ScenarioResult['cacheReuse']> {
+  return {
+    ...reuse,
+    validBecause:
+      `${reuse.validBecause}; exact immutable selection key and current run environment matched`,
+  };
+}
+
+function cachedResultReason(reason: string | undefined, status: ScenarioResult['status']): string {
+  const clean = reason?.replace(/^(cached:\s*)+/i, '');
+  return clean ? `cached: ${clean}` : `cached previous ${status} result`;
 }
 
 type PreparedSelection =
@@ -4088,6 +4342,16 @@ export function aggregateExhaustive(
     .sort((a, b) => a.sel.selectedFile.localeCompare(b.sel.selectedFile));
   const allOutcomes = perFile.flatMap((entry) => entry.result.oracleOutcomes);
   const aggregateBench = aggregateBenchAcrossFiles(valid.map((entry) => entry.result.bench));
+  const measuredDurations = perFile
+    .map((entry) => entry.result.durationMs)
+    .filter((duration): duration is number =>
+      typeof duration === 'number' && Number.isFinite(duration) && duration >= 0);
+  // Exhaustive variants execute serially. Preserve their summed cell cost as the functional fallback
+  // when a long-form/failed/partially-covered cell has no admissible benchmark summary. Previously the
+  // aggregate discarded every per-file duration, leaving the live matrix with only PASS/FAIL/Partial.
+  const durationMs = measuredDurations.length > 0
+    ? measuredDurations.reduce((total, duration) => total + duration, 0)
+    : undefined;
   const unavailableMeasurement = valid.find((entry) => entry.result.measurement?.state === 'UNAVAILABLE');
   const measuredMetrics = new Set<MetricId>();
   for (const entry of valid) {
@@ -4170,6 +4434,7 @@ export function aggregateExhaustive(
     env: { ...runEnvBase, engineId },
     measurement,
     ...(perFile[0]?.result.startedAtIso ? { startedAtIso: perFile[0].result.startedAtIso } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
     ...(perFile[0]?.result.primaryMetric ? { primaryMetric: perFile[0].result.primaryMetric } : {}),
   };
   const diagnostics = decisive
@@ -6985,6 +7250,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             env: { ...runEnvBase, engineId },
           };
       if (scenario.primaryMetric !== undefined) r.primaryMetric = scenario.primaryMetric;
+      await opts.resultReuse?.put(r).catch(() => undefined);
       results.push(r);
       opts.onResult?.(r);
       done += 1;
@@ -7004,6 +7270,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         env: { ...runEnvBase, engineId },
         ...(scenario.primaryMetric ? { primaryMetric: scenario.primaryMetric } : {}),
       };
+      await opts.resultReuse?.put(blocked).catch(() => undefined);
       results.push(blocked);
       opts.onResult?.(blocked);
       done += 1;
@@ -7030,6 +7297,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await opts.resultReuse?.put(result).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;
@@ -7059,6 +7327,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await opts.resultReuse?.put(result).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;
@@ -7084,12 +7353,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       const withCacheKey = (r: ScenarioResult): ScenarioResult =>
         cacheScenarioKey === scenario.id ? r : { ...r, scenarioId: cacheScenarioKey };
 
-      // Read a candidate keyed by the selected input(s), but never return it here. runOne first reruns
-      // current tuple/browser/asset/golden preflight and validates the content-addressed fingerprint.
+      // Read a candidate keyed by the selected input(s). The validated persistent cache may satisfy
+      // an exact immutable selection below; every other store/candidate continues through runOne,
+      // which reruns current tuple/browser/asset/golden preflight and validates the fingerprint.
       // Old boolean rows and stale cached NAs therefore cannot bypass changed support evidence.
+      const cacheLookupStartedAt = performance.now();
       let cachedCandidate = await opts.resultReuse
         ?.get(engine.id, cacheScenarioKey, opts.browser)
         .catch(() => undefined);
+      const cacheLookupDurationMs = performance.now() - cacheLookupStartedAt;
 
       let validatedCapabilities: CapabilitySet;
       try {
@@ -7108,6 +7380,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;
@@ -7137,6 +7410,46 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
+      // The browser's persistent result cache has already validated its epoch/TTL and looked up the
+      // exact immutable input (or exhaustive input-set) key. Honor that hit before downloading and
+      // hashing the same large bodies again. Generic/in-memory stores omit exactSelectionReuse and
+      // continue through runOne's full current-fingerprint preflight below.
+      const exactCachedResult = opts.resultReuse?.exactSelectionReuse === true
+        ? exactPersistedSelectionResult(
+            cachedCandidate ? restoreLogicalScenarioId(cachedCandidate, scenario.id) : undefined,
+            engine.id,
+            opts.browser,
+            scenario,
+            selection,
+            exhaustiveList,
+            runEnvBase,
+            opts.randomSeed,
+            opts.pillar,
+            opts.benchOptions,
+            cacheLookupDurationMs,
+          )
+        : undefined;
+      if (exactCachedResult) {
+        result = exactCachedResult;
+        if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
+          result.primaryMetric = scenario.primaryMetric;
+        }
+        await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
+        results.push(result);
+        opts.onResult?.(result);
+        if (exhaustiveList && exhaustiveList.length > 0) {
+          opts.onFileProgress?.(
+            exhaustiveList.length,
+            exhaustiveList.length,
+            `${scenario.id} / ${engine.id} / cached exact selection set`,
+          );
+        }
+        done += 1;
+        opts.onProgress?.(done, total, `${label} (cached)`);
+        continue;
+      }
+
       // §6.2 EXHAUSTIVE: run EVERY candidate file for this cell (same order for every engine) and
       // aggregate — cell PASSes only if ALL files pass; bench combines across passing files (sum/max/
       // median per metric). `engine` (constructed + negotiated OK) is reused for file 0; fresh engines
@@ -7144,21 +7457,39 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       if (exhaustive) {
         const list = exhaustiveList ?? [];
         if (list.length > 0) {
-          result = await runExhaustiveCell(
-            engine,
-            engineId,
-            reg,
-            list,
-            scenario,
-            opts,
-            support,
-            runEnvBase,
-            pillar,
-            pixelBehavior,
-            fixtureIntegrityRuntime,
-            prepareSelection,
-            cachedCandidate ? restoreLogicalScenarioId(cachedCandidate, scenario.id) : undefined,
-          );
+          try {
+            result = await runExhaustiveCell(
+              engine,
+              engineId,
+              reg,
+              list,
+              scenario,
+              opts,
+              support,
+              runEnvBase,
+              pillar,
+              pixelBehavior,
+              fixtureIntegrityRuntime,
+              prepareSelection,
+              cachedCandidate ? restoreLogicalScenarioId(cachedCandidate, scenario.id) : undefined,
+            );
+          } catch (error) {
+            // One failed preparation/aggregation boundary is one ERROR cell, never a reason to abandon
+            // every later scenario in the matrix. runOne is total, but the surrounding exhaustive
+            // orchestration performs additional fetch, verification, construction, and aggregation work.
+            await disposeConstructedEngine(engine, opts.signal);
+            result = matrixSelectionStatusResult(
+              engine.id,
+              opts.browser,
+              scenario,
+              'ERROR',
+              `[EXHAUSTIVE_CELL_ERROR] ${errMessage(error)}`,
+              selection,
+              list,
+              runEnvBase,
+              opts.randomSeed,
+            );
+          }
           if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
             result.primaryMetric = scenario.primaryMetric;
           }
@@ -7178,7 +7509,31 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       // cannot execute the tuple must report NA_ENGINE without downloading an otherwise valid asset.
       // Successful preparation is held only for this one runOne call and becomes collectible as soon
       // as the cell completes.
-      const prepared = await prepareSelection(selection);
+      let prepared: PreparedSelection;
+      try {
+        prepared = await prepareSelection(selection);
+      } catch (error) {
+        // Content preparation sits outside runOne. Keep an unexpected fetch/hash/preflight exception
+        // local to this cell so the matrix advances instead of marking all following rows "Not run".
+        result = selectedStatusResult(
+          engine.id,
+          opts.browser,
+          scenario,
+          selection,
+          'ERROR',
+          `[CELL_PREPARATION_ERROR] ${errMessage(error)}`,
+          runEnvBase,
+          opts.randomSeed,
+        );
+        if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${scenario.id} / ${engine.id} (preparation error)`);
+        continue;
+      }
       if (prepared.state !== 'VERIFIED') {
         result = blockedSelectionResult(
           engine.id,
@@ -7191,6 +7546,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
         results.push(result);
         opts.onResult?.(result);
         done += 1;

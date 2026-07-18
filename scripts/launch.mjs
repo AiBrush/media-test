@@ -9,7 +9,7 @@ import { validateCanonicalRunArtifact, withLauncherProvenance } from '../src/app
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const opts = {
-  baseUrl: 'http://127.0.0.1:5173',
+  baseUrl: 'http://127.0.0.1:5151',
   browser: 'brave',
   engines: [],
   features: [],

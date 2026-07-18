@@ -7,7 +7,7 @@
 # the .ts module imports and serves the repo root, which already contains fixtures/, so no extra
 # config is needed. Falls back to `vite preview` against a build if a dev server is not wanted.
 #
-#   serve.sh                 # vite dev server on :5173 (default)
+#   serve.sh                 # vite dev server on :5151 (default)
 #   serve.sh --port 8080     # choose a port
 #   serve.sh --host          # explicitly expose on the LAN (0.0.0.0; review trust boundary first)
 #   serve.sh --preview       # build then `vite preview` (serves dist/ + fixtures via symlink)
@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
-PORT="5173"
+PORT="5151"
 HOST_VALUE="127.0.0.1"
 PREVIEW=0
 
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       printf '%s\n' \
         "bash scripts/serve.sh [--port <n>] [--host] [--preview]" \
-        "Serves on loopback by default. --host explicitly exposes 0.0.0.0 to the LAN." \
+        "Serves on 127.0.0.1:5151 (loopback by default). --host explicitly exposes 0.0.0.0 to the LAN." \
         "The suite can be opened manually or automated in a visible browser window by scripts/run.sh."
       exit 0 ;;
     *) echo "serve.sh: unknown arg '$1'" >&2; exit 2 ;;

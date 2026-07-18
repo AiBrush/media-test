@@ -46,7 +46,7 @@ function listScenarioFrameAssetIds(root) {
 }
 
 const opts = {
-  baseUrl: 'http://localhost:5173',
+  baseUrl: 'http://localhost:5151',
   browser: 'brave',
   assetIds: /** @type {string[]} */ ([]),
   outDir: 'fixtures/golden',

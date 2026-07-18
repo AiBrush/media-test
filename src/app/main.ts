@@ -12,6 +12,7 @@ import type { Scenario, ScenarioFamily, ScenarioResult } from '../core/scenario.
 import { installFrameBakeControl } from '../core/frame-bake.ts';
 import {
   createResultCache,
+  latestCachedRunView,
   unavailableCacheSnapshot,
 } from './result-cache.ts';
 import type { ResultCache } from './result-cache.ts';
@@ -65,6 +66,7 @@ import {
   setProgress,
   setRunState,
   setRunStatus,
+  unresolvedMatrixState,
 } from './ui.ts';
 import type { ActiveRunWork, BrowserRunEvidence, CancellationBoundary, ResultFilter } from './ui.ts';
 import {
@@ -194,9 +196,53 @@ async function boot(): Promise<void> {
     optionSchema: RUN_OPTION_DEFINITIONS,
     ready: true,
   };
+  const restored = await restoreLatestCachedRun();
   setRunState('idle');
-  setRunStatus(`idle · ${listScoredEngines().length} scored engines · ${registration.scenarioCount} scenarios`);
+  if (!restored) {
+    setRunStatus(lastCacheWarning ??
+      `idle · ${listScoredEngines().length} scored engines · ${registration.scenarioCount} scenarios`);
+  }
   if (shouldAutoStart()) window.setTimeout(() => { void runFromUi(); }, 0);
+}
+
+async function restoreLatestCachedRun(): Promise<boolean> {
+  if (!resultCache) return false;
+  try {
+    const view = latestCachedRunView(
+      await resultCache.list(),
+      env.browser,
+      listScenarios().map((scenario) => scenario.id),
+    );
+    if (!view) return false;
+    const engines = [...new Set(view.results.map((result) => result.engineId))].sort();
+    const scenarios = [...new Set(view.results.map((result) => result.scenarioId))].sort();
+    matrix.restore(engines, scenarios, view.results, { finished: false });
+    currentManifest = undefined;
+    currentArtifact = undefined;
+    window.__RUN_ARTIFACT__ = undefined;
+    window.__RESULTS__ = [...view.results];
+    window.__RUN_DONE__ = true;
+    delete window.__SUITE_ERROR__;
+    renderRunManifest(undefined);
+    hideProgress();
+    hideFileProgress();
+    setConfigurationControlsDisabled(false);
+    setCacheControlsDisabled(false);
+    // The result cache does not contain the frozen run manifest/configuration required for a
+    // canonical export. Show its results, but keep export disabled until a live run creates one.
+    setExportControlsDisabled(true);
+    getEl<HTMLButtonElement>('run').textContent = 'Run selected features';
+    const source = view.sourceRunId ? ` run ${view.sourceRunId}` : '';
+    setRunStatus(
+      `Loaded ${view.results.length} persisted result${view.results.length === 1 ? '' : 's'} from the existing cache${source}` +
+      ` · ${summarize(view.results)}`,
+    );
+    setCurrentWork('Showing the latest cached run. A new run will revalidate every cache candidate before reuse.');
+    return true;
+  } catch (error) {
+    lastCacheWarning = `Cached results could not be displayed: ${error instanceof Error ? error.message : String(error)}`;
+    return false;
+  }
 }
 
 function wireControls(): void {
@@ -492,7 +538,16 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   };
   if (configuration.featureIds.length > 0) opts.featureIds = [...configuration.featureIds];
   if (configuration.operations.length > 0) opts.operations = [...configuration.operations];
-  if (configuration.reuseData && resultCache) opts.resultReuse = resultCache;
+  if (resultCache) {
+    // "No reuse" forces live execution but should not throw the newly observed result away. Keep
+    // writing through the one existing cache while disabling only its read side for this run.
+    opts.resultReuse = configuration.reuseData
+      ? resultCache
+      : {
+          get: async () => undefined,
+          put: async (result) => resultCache.put(result),
+        };
+  }
 
   let terminalState: RunCompletionState = 'completed';
   let partialReason: string | undefined;
@@ -544,7 +599,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     renderRunManifest(currentManifest);
     renderCacheStatus(cache);
     hideProgress();
-    matrix.finish();
+    matrix.finish({ unresolvedState: unresolvedMatrixState(terminalState) });
     activeRun = undefined;
     resultCache?.setRunContext(undefined);
     setConfigurationControlsDisabled(false);
@@ -552,9 +607,12 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     setExportControlsDisabled(currentArtifact === undefined);
     window.__RUN_DONE__ = true;
     setRunState(terminalState);
+    const hasRemainingCells = streamed.length < executionOrder.length;
     runButton.textContent = terminalState === 'completed'
       ? 'Run selected features'
-      : runContinuationAction(undefined).label;
+      : hasRemainingCells && configuration.reuseData
+        ? 'Run remaining with cache'
+        : runContinuationAction(undefined).label;
     const summary = summarize(currentArtifact?.results ?? streamed);
     if (currentArtifact) {
       setRunStatus(terminalState === 'completed'
