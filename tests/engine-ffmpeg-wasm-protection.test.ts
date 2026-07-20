@@ -46,6 +46,20 @@ describe('REQ-ENG-19: syntax-first CENC applicability', () => {
     expect(inspection.unsupported?.reasonCode).toBe('FFMPEG_CENC_MIXED_SCHEMES_UNSUPPORTED');
   });
 
+  test('validates fragmented subsample encryption with the track tenc IV size', () => {
+    const inspection = inspectIsoBmffProtection(protectedMp4({
+      scheme: 'cenc',
+      fragmented: true,
+      ivSize: 16,
+      fragmentSubsamples: true,
+    }));
+    expect(inspection).toMatchObject({
+      protectedTracks: 1,
+      scheme: 'cenc',
+      unsupported: { reasonCode: 'FFMPEG_CENC_FRAGMENTED_UNSUPPORTED' },
+    });
+  });
+
   test('classifies a valid but unimplemented requested scheme even on clear ISO BMFF', () => {
     const clear = box('moov', new Uint8Array());
     const inspection = inspectIsoBmffProtection(clear);
@@ -131,16 +145,18 @@ interface ProtectedOptions {
   fragmented?: boolean;
   truncateTenc?: boolean;
   truncatedSenc?: boolean;
+  ivSize?: 8 | 16;
+  fragmentSubsamples?: boolean;
 }
 
 function protectedMp4(options: ProtectedOptions): Uint8Array {
-  const tracks = [protectedTrack(options)];
-  if (options.secondTrackScheme) tracks.push(protectedTrack({ ...options, scheme: options.secondTrackScheme }));
+  const tracks = [protectedTrack(options, 1)];
+  if (options.secondTrackScheme) tracks.push(protectedTrack({ ...options, scheme: options.secondTrackScheme }, 2));
   const moovChildren = [...tracks];
   if (options.fragmented) moovChildren.push(box('mvex', box('trex', new Uint8Array())));
   const roots = [box('ftyp', concat(utf8('isom'), u32(0), utf8('isom'))), box('moov', concat(...moovChildren))];
   if (options.fragmented) {
-    const fragmentSenc = senc({});
+    const fragmentSenc = senc({ ivSize: options.ivSize, subsamples: options.fragmentSubsamples });
     const traf = box('traf', concat(
       box('tfhd', Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 1)),
       box('trun', Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0)),
@@ -151,12 +167,12 @@ function protectedMp4(options: ProtectedOptions): Uint8Array {
   return concat(...roots);
 }
 
-function protectedTrack(options: ProtectedOptions): Uint8Array {
+function protectedTrack(options: ProtectedOptions, trackId: number): Uint8Array {
   const tencBody = new Uint8Array(options.constantIv ? 33 : 24);
   tencBody[0] = options.pattern ? 1 : 0;
   if (options.pattern) tencBody[5] = ((options.pattern[0] & 0x0f) << 4) | (options.pattern[1] & 0x0f);
   tencBody[6] = 1;
-  tencBody[7] = options.constantIv ? 0 : 8;
+  tencBody[7] = options.constantIv ? 0 : (options.ivSize ?? 8);
   for (let index = 0; index < 16; index++) tencBody[8 + index] = index;
   if (options.constantIv) {
     tencBody[24] = 8;
@@ -175,15 +191,17 @@ function protectedTrack(options: ProtectedOptions): Uint8Array {
     if (options.auxiliaryInfo || options.onlySaiz) aux.push(saiz());
     if (options.auxiliaryInfo) aux.push(saio());
     if (!options.auxiliaryInfo && !options.onlySaiz) {
-      aux.push(senc({ override: options.sencOverride, truncated: options.truncatedSenc }));
+      aux.push(senc({ override: options.sencOverride, truncated: options.truncatedSenc, ivSize: options.ivSize }));
     }
   }
   const stbl = box('stbl', concat(stsd, ...aux));
-  return box('trak', box('mdia', box('minf', stbl)));
+  const tkhd = new Uint8Array(16);
+  tkhd.set(u32(trackId), 12);
+  return box('trak', concat(box('tkhd', tkhd), box('mdia', box('minf', stbl))));
 }
 
-function senc(options: { override?: boolean; truncated?: boolean }): Uint8Array {
-  const flags = options.override ? 1 : 0;
+function senc(options: { override?: boolean; truncated?: boolean; ivSize?: 8 | 16; subsamples?: boolean }): Uint8Array {
+  const flags = (options.override ? 1 : 0) | (options.subsamples ? 2 : 0);
   const prefix = Uint8Array.of(0, 0, 0, flags);
   if (options.override) {
     const override = new Uint8Array(20);
@@ -191,6 +209,14 @@ function senc(options: { override?: boolean; truncated?: boolean }): Uint8Array 
     return box('senc', concat(prefix, override, u32(0)));
   }
   if (options.truncated) return box('senc', concat(prefix, u32(1), Uint8Array.of(1, 2, 3)));
+  if (options.subsamples) {
+    return box('senc', concat(
+      prefix,
+      u32(1),
+      new Uint8Array(options.ivSize ?? 8),
+      Uint8Array.of(0, 1, 0, 16, 0, 0, 4, 0),
+    ));
+  }
   return box('senc', concat(prefix, u32(0)));
 }
 

@@ -18,6 +18,7 @@ import {
   applyObservedAudioPresentationEvidence,
   createMediabunnyAuthenticatedRangeFetch,
   createCencKeyResolver,
+  h264PacketKeyframe,
   hlsExplicitIvHexesFromPlaylist,
   hlsKeyUrisFromPlaylist,
   normalizeTrack,
@@ -640,6 +641,17 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
     expect(representationForCodec('aac')).toMatchObject({ framing: 'adts', parameterSetLocation: 'in-band' });
   });
 
+  test('classifies non-IDR H.264 I/SI slices as keyframes from the coded slice header', () => {
+    const avc = (nalHeader: number, sliceHeader: number): Uint8Array =>
+      Uint8Array.from([0, 0, 0, 2, nalHeader, sliceHeader]);
+    expect(h264PacketKeyframe(avc(0x65, 0xc0), 'avc', 4)).toBe(true); // IDR
+    expect(h264PacketKeyframe(avc(0x41, 0xb0), 'avc', 4)).toBe(true); // I slice_type=2
+    expect(h264PacketKeyframe(avc(0x41, 0x94), 'avc', 4)).toBe(true); // SI slice_type=4
+    expect(h264PacketKeyframe(avc(0x41, 0xc0), 'avc', 4)).toBe(false); // P slice_type=0
+    expect(h264PacketKeyframe(Uint8Array.from([0, 0, 1, 0x41, 0xb0]), 'annexb')).toBe(true);
+    expect(h264PacketKeyframe(Uint8Array.from([0, 0, 0, 5, 0x41]), 'avc', 4)).toBeUndefined();
+  });
+
   test('demux leaves DTS absent, exposes decode order/config, and reports observed FPS provenance', async () => {
     await withEngine(async (engine) => {
       const source = await engine.demux(await fixture('micro_h264_1frame.mp4'));
@@ -652,6 +664,7 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
         framing: 'avc',
         randomAccessKind: 'bitstream-verified-key',
       });
+      expect(source.packets[0]?.decoderConfig?.byteLength).toBeGreaterThan(0);
       expect(source.packets[0]?.payload?.byteLength).toBe(source.packets[0]?.size);
       expect(source.representations?.[0]).toMatchObject({
         packetOrdering: 'decode',

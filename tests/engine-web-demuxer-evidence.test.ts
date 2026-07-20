@@ -5,6 +5,10 @@ import { isNotApplicableError, type MediaInput, type NormalizedMetadata } from '
 import {
   aacAudioConfigFromAdts,
   aacAudioConfigFromMpegTs,
+  normalizeWebDemuxerRotation,
+  normalizeWebDemuxerStream,
+  probeMetadataWithByteEvidence,
+  tsVideoFrameRateFromMpegTs,
   withTsAacMetadataFromInput,
 } from '../src/engines/web-demuxer/adapter.ts';
 import {
@@ -108,6 +112,68 @@ describe('REQ-ENG-27: representation-aware web-demuxer packet evidence', () => {
       fps: 24,
       provenance: { source: 'nominal', cadence: 'VFR', envelope: { minFps: 24, maxFps: 60 } },
     });
+    expect(frameRateFromStream(stream({
+      avg_frame_rate: '30/1', r_frame_rate: '30/1', nb_frames: '300', duration: 10.021,
+    }))).toMatchObject({
+      fps: 30,
+      provenance: { source: 'nominal', sampleCount: 300, observedIntervalUs: 10_021_000 },
+    });
+  });
+
+  test('normalizes FFmpeg rotation and AAC presentation evidence without losing the coded view', () => {
+    expect(normalizeWebDemuxerRotation(270)).toBe(90);
+    expect(normalizeWebDemuxerRotation(-90)).toBe(90);
+    expect(normalizeWebDemuxerStream(stream({
+      codec_type: 1,
+      codec_type_string: 'audio',
+      codec_name: 'aac',
+      codec_string: 'mp4a.40.29',
+      sample_rate: 48_000,
+      channels: 1,
+      extradata: Uint8Array.of(0xe9, 0x89, 0x88),
+      extradata_size: 3,
+    }))).toMatchObject({
+      type: 'audio',
+      codec: 'aac',
+      channels: 2,
+      codedChannels: 1,
+      presentationChannels: 2,
+      sbrPresent: true,
+      psPresent: true,
+    });
+  });
+
+  test('derives required ISO, Matroska, and discontinuous-TS probe fields from container bytes', async () => {
+    const mp4 = new Uint8Array(await readFile('fixtures/media/h264_1080p_30s.mp4'));
+    const branded = probeMetadataWithByteEvidence({
+      container: 'mp4', durationSec: 30, tracks: [],
+    }, mp4);
+    expect(branded.tags?.major_brand).toBe('isom');
+
+    const psMp4 = new Uint8Array(await readFile('fixtures/media/scenarios/probe/tiny_h264_360p_2s/02.mp4'));
+    const psPresentation = probeMetadataWithByteEvidence({
+      container: 'mp4', durationSec: 7.403,
+      tracks: [{ type: 'audio', codec: 'aac', channels: 1, codedChannels: 1, sbrPresent: true }],
+    }, psMp4);
+    expect(psPresentation.tracks[0]).toMatchObject({
+      channels: 2, codedChannels: 1, presentationChannels: 2,
+    });
+
+    const webm = new Uint8Array(await readFile('fixtures/media/recorder_headerless.webm'));
+    const disposition = probeMetadataWithByteEvidence({
+      container: 'webm', durationSec: null,
+      tracks: [{ type: 'video', codec: 'vp8' }],
+    }, webm);
+    expect(disposition.tracks[0]?.defaultDisposition).toBe(true);
+
+    const ts = new Uint8Array(await readFile('fixtures/media/ts_discontinuity.ts'));
+    const cadence = tsVideoFrameRateFromMpegTs(ts);
+    expect(cadence?.fps).toBeCloseTo(30, 3);
+    const repaired = probeMetadataWithByteEvidence({
+      container: 'ts', durationSec: 600.584,
+      tracks: [{ type: 'video', codec: 'h264', fps: 240 }],
+    }, ts);
+    expect(repaired.tracks[0]?.fps).toBeCloseTo(30, 3);
   });
 });
 

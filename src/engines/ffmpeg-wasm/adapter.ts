@@ -115,7 +115,6 @@ import type {
   OperationFinalCounters,
   PacketInfo,
   SupportDecision,
-  TrackType,
   TranscodeOptions,
 } from '../../core/engine.ts';
 import {
@@ -131,9 +130,12 @@ import {
 import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/index.ts';
 import {
   applyObservedFrameCadence,
+  containerFromFfmpegLog,
   FfmpegFsLedger,
   parseFfprobeFramesJson,
   parseFfprobeJson,
+  parseMp3XingDurationSec,
+  parseTracksFromLog,
   representationForTracks,
   splitAdtsFrames,
   splitPreparedBytes,
@@ -496,97 +498,6 @@ function parseDurationSecFromLog(log: string): number | null {
   if (!m) return null;
   const sec = Number(m[1]) * 3600 + Number(m[2]) * 60 + parseFloat(m[3]!);
   return isFinite(sec) ? sec : null;
-}
-
-/** Map an ffmpeg `-i` log codec token (e.g. 'h264 (High)', 'pcm_s16le') to a canonical codec. */
-function canonicalCodecFromLog(rest: string): string {
-  // The codec name is the first whitespace/paren/comma-delimited token after "Video:"/"Audio:".
-  const token = rest.trim().split(/[\s,(]/)[0] ?? '';
-  return canonicalCodec(token);
-}
-
-/** Best-effort channel COUNT from an ffmpeg layout token ('stereo', 'mono', '5.1', '6 channels'). */
-function channelsFromLayout(rest: string): number | undefined {
-  const t = rest.toLowerCase();
-  if (/\bstereo\b/.test(t)) return 2;
-  if (/\bmono\b/.test(t)) return 1;
-  if (/\b7\.1\b/.test(t)) return 8;
-  if (/\b6\.1\b/.test(t)) return 7;
-  if (/\b5\.1\b/.test(t)) return 6;
-  if (/\bquad\b/.test(t)) return 4;
-  const m = /(\d+)\s*channels?/.exec(t);
-  if (m) return Number(m[1]);
-  return undefined;
-}
-
-/**
- * Parse the tracks out of the FIRST `Input #` block of an `ffmpeg -i` log. Scoped to the input block
- * so the output/stream-mapping lines that a combined `-i … -f framecrc out` run also prints are NOT
- * counted twice. Mirrors the fields the golden-metadata oracle compares (type/codec/dims/fps/sr/ch);
- * language/bitrate/rotation are filled best-effort (the oracle does not gate them).
- */
-function parseTracksFromLog(log: string): NormalizedTrack[] {
-  const tracks: NormalizedTrack[] = [];
-  const lines = log.split('\n');
-  let inInput = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!.replace(/\r$/, '');
-    const trimmed = line.trim();
-    if (/^Input #\d+/.test(trimmed)) {
-      inInput = true;
-      continue;
-    }
-    // Anything that starts the output / mapping / run phase ends the input block.
-    if (/^(Output #|Stream mapping:|Press \[q\]|At least one output|Stream #\d+:\d+ -> )/.test(trimmed)) {
-      inInput = false;
-    }
-    if (!inInput) continue;
-
-    const sm = /^Stream #\d+:\d+(?:\[[^\]]*\])?(?:\(([^)]*)\))?:\s*(Video|Audio|Subtitle|Data):\s*(.*)$/.exec(
-      trimmed,
-    );
-    if (!sm) continue;
-    const lang = sm[1];
-    const kind = sm[2]!.toLowerCase();
-    const rest = sm[3] ?? '';
-
-    const type: TrackType =
-      kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : kind === 'subtitle' ? 'subtitle' : 'other';
-    const track: NormalizedTrack = {
-      type,
-      codec: canonicalCodecFromLog(rest),
-      bitrate: null,
-      language: lang && lang !== 'und' ? lang : null,
-    };
-    if (kind === 'video') {
-      const dm = /\b(\d{1,5})x(\d{1,5})\b/.exec(rest);
-      if (dm) {
-        track.width = Number(dm[1]);
-        track.height = Number(dm[2]);
-      }
-      const fm = /(\d+(?:\.\d+)?)\s*fps/.exec(rest);
-      if (fm) track.fps = Math.round(parseFloat(fm[1]!) * 1000) / 1000;
-      // Rotation, when this build prints it, lives in a following "rotation of -N degrees" side-data
-      // line before the next Stream/Input. ffmpeg reports display (negative-clockwise) degrees.
-      for (let j = i + 1; j < lines.length; j++) {
-        const s2 = lines[j]!.trim();
-        if (/^(Stream #|Input #|Output #|At least one)/.test(s2)) break;
-        const rm = /rotation of\s*(-?\d+(?:\.\d+)?)\s*degrees/.exec(s2);
-        if (rm) {
-          const deg = parseFloat(rm[1]!);
-          track.rotation = (((-deg % 360) + 360) % 360);
-          break;
-        }
-      }
-    } else if (kind === 'audio') {
-      const sr = /(\d+)\s*Hz/.exec(rest);
-      if (sr) track.sampleRate = Number(sr[1]);
-      const ch = channelsFromLayout(rest);
-      if (ch !== undefined) track.channels = ch;
-    }
-    tracks.push(track);
-  }
-  return tracks;
 }
 
 /** A subset of the handful of MP4/Matroska tags the metadata scenarios may read, from the `-i` log. */
@@ -2784,27 +2695,73 @@ export class FfmpegWasmEngine implements MediaEngine {
       throw new Error(`${ENGINE_ID}: probe rejected still-image input; this suite probes media containers only`);
     }
     const base = this.scratch();
-    const written = await this.writeInput(input, `${base}.in`);
+    const request = this.activeOperation?.context.request;
+    const inspectCenc = request?.encryption === 'cenc-ctr' || request?.encryption === 'cenc-cbcs' ||
+      request?.encryption === 'cenc-cens';
+    const inspectMp3 = containerFromInput(input) === 'mp3';
+    let preloadedBytes = inspectCenc || inspectMp3 ? copyBytes(await input.arrayBuffer()) : undefined;
+    const protection = inspectCenc && preloadedBytes ? inspectProtectionStructure(preloadedBytes) : undefined;
+    const mp3DurationSec = inspectMp3 && preloadedBytes ? parseMp3XingDurationSec(preloadedBytes) : null;
+    const written = await this.writeInput(input, `${base}.in`, preloadedBytes);
+    preloadedBytes = undefined;
     try {
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
-      if (structured) {
-        const observed = await this.observedFrameTimeline(written.name, written.inputOptions, 10);
-        const metadata = applyObservedFrameCadence(structured.metadata, observed);
+      try {
+        const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+        if (structured) {
+          const observed = await this.observedFrameTimeline(written.name, written.inputOptions, 10);
+          const metadata = applyObservedFrameCadence(structured.metadata, observed);
+          this.attachProbeProtection(metadata, protection);
+          this.attachMp3Duration(metadata, mp3DurationSec);
+          metadata.probeEvidence = { readMode: 'whole-file' };
+          return metadata;
+        }
+        const log = await this.runInfo(written.name, written.inputOptions);
+        const metadata = this.metadataFromLog(log, input);
+        this.attachProbeProtection(metadata, protection);
+        this.attachMp3Duration(metadata, mp3DurationSec);
+        for (const track of metadata.tracks) {
+          if (track.type === 'video' && track.fps !== undefined) {
+            track.fpsProvenance = { source: 'nominal', cadence: 'UNKNOWN' };
+          }
+        }
         metadata.probeEvidence = { readMode: 'whole-file' };
         return metadata;
-      }
-      const log = await this.runInfo(written.name, written.inputOptions);
-      const metadata = this.metadataFromLog(log, input);
-      for (const track of metadata.tracks) {
-        if (track.type === 'video' && track.fps !== undefined) {
-          track.fpsProvenance = { source: 'nominal', cadence: 'UNKNOWN' };
+      } catch (error) {
+        if (request?.options.gracefulAllowOutput === true) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'probe',
+            'parse',
+            describeError(error),
+            'FFMPEG_PROBE_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
         }
+        throw error;
       }
-      metadata.probeEvidence = { readMode: 'whole-file' };
-      return metadata;
     } finally {
       await this.cleanup(written.cleanupPaths);
     }
+  }
+
+  private attachProbeProtection(
+    metadata: NormalizedMetadata,
+    protection: ReturnType<typeof inspectProtectionStructure> | undefined,
+  ): void {
+    if (!protection || protection.protectedTracks === 0) return;
+    (metadata as NormalizedMetadata & {
+      protection?: { encrypted: boolean; scheme: string | null; source: 'container' };
+    }).protection = {
+      encrypted: true,
+      scheme: protection.scheme ?? null,
+      source: 'container',
+    };
+  }
+
+  private attachMp3Duration(metadata: NormalizedMetadata, durationSec: number | null): void {
+    if (durationSec === null) return;
+    metadata.durationSec = Math.round(durationSec * 1000) / 1000;
   }
 
   /**
@@ -2845,7 +2802,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     const tracks = parseTracksFromLog(log);
     const tags = parseTagsFromLog(log);
     const meta: NormalizedMetadata = {
-      container: containerFromInput(input),
+      container: containerFromFfmpegLog(log, containerFromInput(input)),
       durationSec: durationSec === null ? null : Math.round(durationSec * 1000) / 1000,
       tracks,
     };

@@ -114,7 +114,9 @@ import {
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   captureConfigUsedSnapshot,
+  createMalformedInputError,
   createNotApplicableError,
+  isMalformedInputError,
   validateAdapterResult,
   validateCapabilitySet,
   validateSupportDecision,
@@ -128,6 +130,7 @@ import {
 import {
   decideRemotionParserSupport,
 } from '../remotion/support.ts';
+import { parseAacAudioSpecificConfig } from '../mp4box/evidence.ts';
 
 const ENGINE_ID = 'remotion-media-parser@4.0.479';
 
@@ -466,6 +469,19 @@ export class RemotionMediaParserEngine implements MediaEngine {
       this.config = { ...this.config, operation: 'probe', cleanupComplete: false };
       try {
         return validateAdapterResult(ENGINE_ID, 'probe', await this.probeImpl(input, call));
+      } catch (error) {
+        if (call.request.options.gracefulAllowOutput === true && !isMalformedInputError(error)) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'probe',
+            'parse',
+            describeError(error),
+            'REMOTION_PROBE_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
       } finally {
         this.config = { ...this.config, cleanupComplete: this.activeControllers.size === 0 };
       }
@@ -498,36 +514,100 @@ export class RemotionMediaParserEngine implements MediaEngine {
       return headerMetadata;
     }
     const srcOptions = await this.chooseSrcOptions(input, countingReader(noteBytes));
-    const result = await this.runParse<{
+    let result: {
       durationInSeconds: number | null;
       container: MediaParserContainer;
       tracks: MediaParserTrack[];
       metadata: MetadataEntry[];
       fps?: number | null;
       rotation: number | null;
-    }>(
-      {
-        ...srcOptions,
-        acknowledgeRemotionLicense: ACK_LICENSE,
-        fields: {
-          durationInSeconds: true,
-          container: true,
-          tracks: true,
-          metadata: true,
-          rotation: true,
-          fps: true,
+    };
+    try {
+      result = await this.runParse<typeof result>(
+        {
+          ...srcOptions,
+          acknowledgeRemotionLicense: ACK_LICENSE,
+          fields: {
+            durationInSeconds: true,
+            container: true,
+            tracks: true,
+            metadata: true,
+            rotation: true,
+            fps: true,
+          },
         },
-      },
-      'metadata-only',
-      context,
-    );
+        'metadata-only',
+        context,
+      );
+    } catch (error) {
+      if (isWavInput(input) && !input.mutated) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'probe',
+          `media-parser 4.0.479 rejects the selected valid WAV structure: ${describeError(error)}`,
+          {
+            inputContainers: context.request.inputs.map((entry) => entry.container),
+            inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+            options: { inputId: input.id },
+          },
+          'REMOTION_WAV_STRUCTURE_UNSUPPORTED',
+        );
+      }
+      if (isAdtsInput(input) && !input.mutated && /Unknown file format/i.test(describeError(error))) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'probe',
+          'media-parser 4.0.479 does not recognize the selected valid raw ADTS stream',
+          {
+            inputContainers: context.request.inputs.map((entry) => entry.container),
+            inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+            options: { inputId: input.id },
+          },
+          'REMOTION_ADTS_VARIANT_UNRECOGNIZED',
+        );
+      }
+      if (isTsInput(input) && /SPS not found/i.test(describeError(error))) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'probe',
+          'media-parser 4.0.479 cannot inspect this TS stream because no SPS is available before its first parsed H.264 access unit',
+          {
+            inputContainers: context.request.inputs.map((entry) => entry.container),
+            inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+            options: { inputId: input.id },
+          },
+          'REMOTION_TS_PROBE_SPS_REQUIRED',
+        );
+      }
+      throw error;
+    }
 
-    const metadata = await this.toNormalizedMetadata(result, undefined, input, noteBytes);
+    let metadata = await this.toNormalizedMetadata(result, undefined, input, noteBytes);
+    metadata = await enrichProbeMetadata(metadata, result.tracks, headerMetadata, input, noteBytes);
     metadata.telemetry = { bytesRead };
-    metadata.probeEvidence = { readMode: 'range' };
+    metadata.probeEvidence ??= { readMode: 'range' };
     if (needsTsPacketProbeFallback(metadata)) {
       rejectBoundedProbeFullScan(input, context, 'TS duration/fps requires packet-complete fallback parsing');
-      const { metadata: demuxMetadata, packets } = await this.demuxImpl(input, context);
+      let demuxMetadata: NormalizedMetadata;
+      let packets: PacketInfo[];
+      try {
+        ({ metadata: demuxMetadata, packets } = await this.demuxImpl(input, context));
+      } catch (error) {
+        if (/SPS not found/i.test(describeError(error))) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'probe',
+            'media-parser 4.0.479 cannot complete TS timing extraction when the selected H.264 stream has no SPS before its first parsed access unit',
+            {
+              inputContainers: context.request.inputs.map((entry) => entry.container),
+              inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+              options: { inputId: input.id },
+            },
+            'REMOTION_TS_PROBE_SPS_REQUIRED',
+          );
+        }
+        throw error;
+      }
       const fallback = withTsProbeFieldsFromPackets(demuxMetadata, packets);
       fallback.probeEvidence = { readMode: 'whole-file' };
       return fallback;
@@ -537,6 +617,14 @@ export class RemotionMediaParserEngine implements MediaEngine {
       rejectBoundedProbeFullScan(input, context, 'ADTS duration requires packet-complete fallback parsing');
       const { packets } = await this.demuxImpl(input, context);
       const fallback = withDurationFromPackets(metadata, packets);
+      fallback.probeEvidence = { readMode: 'whole-file' };
+      return fallback;
+    }
+
+    if (needsWebmPacketCadenceFallback(metadata, headerMetadata)) {
+      rejectBoundedProbeFullScan(input, context, 'WebM cadence correction requires packet-complete parsing');
+      const { packets } = await this.demuxImpl(input, context);
+      const fallback = withCfrVideoFpsFromPackets(metadata, packets);
       fallback.probeEvidence = { readMode: 'whole-file' };
       return fallback;
     }
@@ -826,6 +914,51 @@ function needsSingleVideoFpsFallback(metadata: NormalizedMetadata): boolean {
   return videoTracks.length === 1 && videoTracks[0]?.fps == null;
 }
 
+function needsWebmPacketCadenceFallback(
+  metadata: NormalizedMetadata,
+  headerMetadata: NormalizedMetadata | null,
+): boolean {
+  if (metadata.container !== 'webm' && metadata.container !== 'mkv') return false;
+  if (singleVideoFpsFromMetadata(headerMetadata) != null) return false;
+  const videoTracks = metadata.tracks.filter((track) => track.type === 'video');
+  if (videoTracks.length !== 1 || videoTracks[0]?.fps == null) return false;
+  const fps = videoTracks[0].fps;
+  const nearestIntegerDelta = Math.abs(fps - Math.round(fps));
+  return nearestIntegerDelta > 0.05 && nearestIntegerDelta < 0.5;
+}
+
+function withCfrVideoFpsFromPackets(
+  metadata: NormalizedMetadata,
+  packets: PacketInfo[],
+): NormalizedMetadata {
+  const tracks = metadata.tracks.map((track, trackIndex) => {
+    if (track.type !== 'video') return track;
+    const pts = packets
+      .filter((packet) => packet.trackIndex === trackIndex)
+      .map((packet) => packet.ptsUs)
+      .sort((a, b) => a - b);
+    const deltas: number[] = [];
+    for (let index = 1; index < pts.length; index++) {
+      const delta = pts[index]! - pts[index - 1]!;
+      if (delta > 0) deltas.push(delta);
+    }
+    if (!deltas.length || Math.max(...deltas) - Math.min(...deltas) > 2) return track;
+    const intervalUs = medianPositiveDelta(pts);
+    if (intervalUs == null || intervalUs <= 0) return track;
+    return {
+      ...track,
+      fps: 1_000_000 / intervalUs,
+      fpsProvenance: {
+        source: 'observed' as const,
+        cadence: 'CFR' as const,
+        sampleCount: 1,
+        observedIntervalUs: intervalUs,
+      },
+    };
+  });
+  return { ...metadata, tracks };
+}
+
 function withSingleVideoFps(
   metadata: NormalizedMetadata,
   fps: number | null | undefined,
@@ -871,6 +1004,374 @@ function singleVideoFpsFromMetadata(metadata: NormalizedMetadata | null): number
   return videoTracks[0]?.fps ?? null;
 }
 
+async function enrichProbeMetadata(
+  metadata: NormalizedMetadata,
+  parserTracks: MediaParserTrack[],
+  headerMetadata: NormalizedMetadata | null,
+  input: MediaInput,
+  noteBytes: (bytes: number) => void,
+): Promise<NormalizedMetadata> {
+  if ((metadata.container === 'webm' || metadata.container === 'mkv') && headerMetadata) {
+    const tracks = metadata.tracks.map((track, index) => {
+      const headerTrack = headerMetadata.tracks[index];
+      if (!headerTrack || headerTrack.type !== track.type) return track;
+      return {
+        ...track,
+        ...(headerTrack.language != null ? { language: headerTrack.language } : {}),
+        ...(headerTrack.defaultDisposition !== undefined
+          ? { defaultDisposition: headerTrack.defaultDisposition }
+          : {}),
+        ...(headerTrack.fps != null
+          ? {
+              fps: headerTrack.fps,
+              fpsProvenance: { source: 'nominal' as const, cadence: 'CFR' as const },
+            }
+          : {}),
+      };
+    });
+    return { ...metadata, tracks };
+  }
+
+  if (metadata.container !== 'mp4' && metadata.container !== 'mov') return metadata;
+
+  let bytes = await readInputPrefix(input, 256 * 1024);
+  noteBytes(bytes.byteLength);
+  let wholeFile = false;
+  const prefixMoov = findMp4ChildBox(bytes, 0, bytes.byteLength, 'moov');
+  if (metadata.durationSec == null || prefixMoov == null) {
+    bytes = new Uint8Array(await input.arrayBuffer());
+    noteBytes(bytes.byteLength);
+    wholeFile = true;
+  }
+
+  const trackHeaders = isoTrackHeaderEvidence(bytes);
+  const fragmentStats = collectFragmentTrackStats(bytes);
+  const timescaleByTrackId = new Map<number, number>();
+  for (const track of parserTracks) {
+    if (Number.isFinite(track.originalTimescale) && track.originalTimescale > 0) {
+      timescaleByTrackId.set(track.trackId, track.originalTimescale);
+    }
+  }
+
+  const fragmentDurationSec = maxFragmentDuration(
+    fragmentStats,
+    timescaleByTrackId,
+    parserTracks.map((track) => track.trackId),
+  );
+  const tracks = metadata.tracks.map((track, index) => {
+    const parserTrack = parserTracks[index];
+    if (!parserTrack) return track;
+    const header = trackHeaders.get(parserTrack.trackId);
+    let enriched: NormalizedTrack = header?.language ? { ...track, language: header.language } : track;
+    if (track.type === 'audio' && header?.audioChannels != null) {
+      enriched = {
+        ...enriched,
+        channels: header.audioChannels,
+        presentationChannels: header.audioChannels,
+      };
+    }
+    if (track.type !== 'video') return enriched;
+
+    const stats = fragmentStats.get(parserTrack.trackId);
+    const durationSec = fragmentTrackDuration(stats, parserTrack.originalTimescale);
+    if (!stats || durationSec == null || stats.sampleCount <= 0) return enriched;
+    const fps = stats.sampleCount / durationSec;
+    if (!Number.isFinite(fps) || fps <= 0) return enriched;
+    enriched = {
+      ...enriched,
+      fps,
+      fpsProvenance: {
+        source: 'average',
+        cadence: 'UNKNOWN',
+        sampleCount: stats.sampleCount,
+        observedIntervalUs: durationSec * 1_000_000,
+      },
+    };
+    return enriched;
+  });
+
+  const brands = isoBmffBrandsFromPrefix(bytes);
+  const tags = brands[0]
+    ? { ...(metadata.tags ?? {}), major_brand: metadata.tags?.major_brand ?? brands[0] }
+    : metadata.tags;
+  return {
+    ...metadata,
+    durationSec: metadata.durationSec ?? fragmentDurationSec,
+    tracks,
+    ...(tags ? { tags } : {}),
+    ...(wholeFile ? { probeEvidence: { readMode: 'whole-file' as const } } : {}),
+  };
+}
+
+interface Mp4BoxHeader {
+  offset: number;
+  size: number;
+  headerSize: number;
+  end: number;
+  type: string;
+}
+
+export interface IsoTrackHeaderEvidence {
+  language: string | null;
+  audioChannels?: number;
+}
+
+export interface FragmentTrackStats {
+  sampleCount: number;
+  maxEnd: number;
+}
+
+interface TfhdInfo {
+  trackId: number;
+  defaultSampleDuration: number | null;
+}
+
+export function isoTrackHeaderEvidence(bytes: Uint8Array): Map<number, IsoTrackHeaderEvidence> {
+  const evidence = new Map<number, IsoTrackHeaderEvidence>();
+  const moov = findMp4ChildBox(bytes, 0, bytes.byteLength, 'moov');
+  if (!moov) return evidence;
+
+  let offset = moov.offset + moov.headerSize;
+  while (offset + 8 <= moov.end) {
+    const trak = readMp4BoxHeader(bytes, offset, moov.end);
+    if (!trak) break;
+    offset = trak.end;
+    if (trak.type !== 'trak') continue;
+
+    const tkhd = findMp4ChildBox(bytes, trak.offset + trak.headerSize, trak.end, 'tkhd');
+    const mdia = findMp4ChildBox(bytes, trak.offset + trak.headerSize, trak.end, 'mdia');
+    const mdhd = mdia ? findMp4ChildBox(bytes, mdia.offset + mdia.headerSize, mdia.end, 'mdhd') : null;
+    const minf = mdia ? findMp4ChildBox(bytes, mdia.offset + mdia.headerSize, mdia.end, 'minf') : null;
+    const stbl = minf ? findMp4ChildBox(bytes, minf.offset + minf.headerSize, minf.end, 'stbl') : null;
+    const stsd = stbl ? findMp4ChildBox(bytes, stbl.offset + stbl.headerSize, stbl.end, 'stsd') : null;
+    const trackId = tkhd ? isoTrackId(bytes, tkhd) : null;
+    if (trackId == null || trackId <= 0) continue;
+    const audioChannels = stsd ? isoAudioSampleEntryChannels(bytes, stsd) : null;
+    evidence.set(trackId, {
+      language: mdhd ? isoMediaLanguage(bytes, mdhd) : null,
+      ...(audioChannels != null ? { audioChannels } : {}),
+    });
+  }
+  return evidence;
+}
+
+function isoAudioSampleEntryChannels(bytes: Uint8Array, stsd: Mp4BoxHeader): number | null {
+  const entryOffset = stsd.offset + stsd.headerSize + 8;
+  if (!hasByteRange(bytes, entryOffset, 28)) return null;
+  const entrySize = readUint32Be(bytes, entryOffset);
+  if (entrySize < 28 || !hasByteRange(bytes, entryOffset, entrySize)) return null;
+  const format = ascii(bytes, entryOffset + 4, entryOffset + 8);
+  if (!['mp4a', 'enca', 'ac-3', 'ec-3', 'Opus', 'fLaC', 'alac'].includes(format)) return null;
+  const channels = readUint16Be(bytes, entryOffset + 24);
+  return channels > 0 ? channels : null;
+}
+
+function isoTrackId(bytes: Uint8Array, tkhd: Mp4BoxHeader): number | null {
+  if (!hasByteRange(bytes, tkhd.offset + 8, 1)) return null;
+  const version = bytes[tkhd.offset + 8] ?? 0;
+  const trackIdOffset = tkhd.offset + (version === 1 ? 28 : 20);
+  return hasByteRange(bytes, trackIdOffset, 4) ? readUint32Be(bytes, trackIdOffset) : null;
+}
+
+function isoMediaLanguage(bytes: Uint8Array, mdhd: Mp4BoxHeader): string | null {
+  if (!hasByteRange(bytes, mdhd.offset + 8, 1)) return null;
+  const version = bytes[mdhd.offset + 8] ?? 0;
+  const languageOffset = mdhd.offset + (version === 1 ? 40 : 28);
+  if (!hasByteRange(bytes, languageOffset, 2)) return null;
+  const packed = readUint16Be(bytes, languageOffset);
+  // Legacy QuickTime/ISO writers use zero as the implicit English language, while modern files
+  // encode undefined explicitly as 0x55c4 ('und'). This matches the container semantics exposed by
+  // ffprobe for the real-world corpus rather than treating an implicit language as missing.
+  if (packed === 0) return 'eng';
+  const language = String.fromCharCode(
+    ((packed >> 10) & 0x1f) + 0x60,
+    ((packed >> 5) & 0x1f) + 0x60,
+    (packed & 0x1f) + 0x60,
+  );
+  return /^[a-z]{3}$/.test(language) ? language : null;
+}
+
+export function collectFragmentTrackStats(bytes: Uint8Array): Map<number, FragmentTrackStats> {
+  const stats = new Map<number, FragmentTrackStats>();
+  let offset = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const box = readMp4BoxHeader(bytes, offset, bytes.byteLength);
+    if (!box) break;
+    if (box.type === 'moof') collectMoofTrackStats(bytes, box, stats);
+    offset = box.end;
+  }
+  return stats;
+}
+
+function collectMoofTrackStats(
+  bytes: Uint8Array,
+  moof: Mp4BoxHeader,
+  stats: Map<number, FragmentTrackStats>,
+): void {
+  let offset = moof.offset + moof.headerSize;
+  while (offset + 8 <= moof.end) {
+    const box = readMp4BoxHeader(bytes, offset, moof.end);
+    if (!box) break;
+    if (box.type === 'traf') collectTrafTrackStats(bytes, box, stats);
+    offset = box.end;
+  }
+}
+
+function collectTrafTrackStats(
+  bytes: Uint8Array,
+  traf: Mp4BoxHeader,
+  stats: Map<number, FragmentTrackStats>,
+): void {
+  let offset = traf.offset + traf.headerSize;
+  let tfhd: TfhdInfo | null = null;
+  let baseDecodeTime = 0;
+  const truns: Array<{ sampleCount: number; duration: number }> = [];
+
+  while (offset + 8 <= traf.end) {
+    const box = readMp4BoxHeader(bytes, offset, traf.end);
+    if (!box) break;
+    if (box.type === 'tfhd') tfhd = parseTfhd(bytes, box);
+    if (box.type === 'tfdt') baseDecodeTime = parseTfdt(bytes, box) ?? baseDecodeTime;
+    if (box.type === 'trun') truns.push(parseTrun(bytes, box, tfhd?.defaultSampleDuration ?? null));
+    offset = box.end;
+  }
+  if (!tfhd) return;
+
+  let cursor = baseDecodeTime;
+  for (const trun of truns) {
+    cursor += trun.duration;
+    const current = stats.get(tfhd.trackId) ?? { sampleCount: 0, maxEnd: 0 };
+    current.sampleCount += trun.sampleCount;
+    current.maxEnd = Math.max(current.maxEnd, cursor);
+    stats.set(tfhd.trackId, current);
+  }
+}
+
+function parseTfhd(bytes: Uint8Array, box: Mp4BoxHeader): TfhdInfo | null {
+  if (!hasByteRange(bytes, box.offset, 16)) return null;
+  const flags = readFullBoxFlags(bytes, box.offset);
+  let offset = box.offset + 12;
+  const trackId = readUint32Be(bytes, offset);
+  offset += 4;
+  if ((flags & 0x000001) !== 0) offset += 8;
+  if ((flags & 0x000002) !== 0) offset += 4;
+  const defaultSampleDuration = (flags & 0x000008) !== 0 && hasByteRange(bytes, offset, 4)
+    ? readUint32Be(bytes, offset)
+    : null;
+  return { trackId, defaultSampleDuration };
+}
+
+function parseTfdt(bytes: Uint8Array, box: Mp4BoxHeader): number | null {
+  if (!hasByteRange(bytes, box.offset, 16)) return null;
+  const version = bytes[box.offset + 8] ?? 0;
+  return version === 1
+    ? readUint64Be(bytes, box.offset + 12)
+    : readUint32Be(bytes, box.offset + 12);
+}
+
+function parseTrun(
+  bytes: Uint8Array,
+  box: Mp4BoxHeader,
+  defaultSampleDuration: number | null,
+): { sampleCount: number; duration: number } {
+  if (!hasByteRange(bytes, box.offset, 16)) return { sampleCount: 0, duration: 0 };
+  const flags = readFullBoxFlags(bytes, box.offset);
+  let offset = box.offset + 12;
+  const sampleCount = readUint32Be(bytes, offset);
+  offset += 4;
+  if ((flags & 0x000001) !== 0) offset += 4;
+  if ((flags & 0x000004) !== 0) offset += 4;
+
+  let duration = 0;
+  for (let index = 0; index < sampleCount; index++) {
+    let sampleDuration = defaultSampleDuration ?? 0;
+    if ((flags & 0x000100) !== 0) {
+      if (!hasByteRange(bytes, offset, 4)) break;
+      sampleDuration = readUint32Be(bytes, offset);
+      offset += 4;
+    }
+    if ((flags & 0x000200) !== 0) offset += 4;
+    if ((flags & 0x000400) !== 0) offset += 4;
+    if ((flags & 0x000800) !== 0) offset += 4;
+    duration += sampleDuration;
+  }
+  return { sampleCount, duration };
+}
+
+function maxFragmentDuration(
+  stats: Map<number, FragmentTrackStats>,
+  timescaleByTrackId: Map<number, number>,
+  trackIds: number[],
+): number | null {
+  let maximum = 0;
+  for (const trackId of trackIds) {
+    const duration = fragmentTrackDuration(stats.get(trackId), timescaleByTrackId.get(trackId));
+    if (duration != null) maximum = Math.max(maximum, duration);
+  }
+  return maximum > 0 ? maximum : null;
+}
+
+function fragmentTrackDuration(
+  stats: FragmentTrackStats | undefined,
+  timescale: number | undefined,
+): number | null {
+  if (!stats || timescale == null || !Number.isFinite(timescale) || timescale <= 0 || stats.maxEnd <= 0) {
+    return null;
+  }
+  return stats.maxEnd / timescale;
+}
+
+function findMp4ChildBox(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  type: string,
+): Mp4BoxHeader | null {
+  let offset = start;
+  while (offset + 8 <= end) {
+    const box = readMp4BoxHeader(bytes, offset, end);
+    if (!box) break;
+    if (box.type === type) return box;
+    offset = box.end;
+  }
+  return null;
+}
+
+function readMp4BoxHeader(bytes: Uint8Array, offset: number, limit: number): Mp4BoxHeader | null {
+  if (!hasByteRange(bytes, offset, 8) || offset + 8 > limit) return null;
+  let size = readUint32Be(bytes, offset);
+  let headerSize = 8;
+  if (size === 1) {
+    if (!hasByteRange(bytes, offset + 8, 8)) return null;
+    const wideSize = readUint64Be(bytes, offset + 8);
+    if (wideSize == null) return null;
+    size = wideSize;
+    headerSize = 16;
+  } else if (size === 0) {
+    size = limit - offset;
+  }
+  if (size < headerSize || offset + size > limit) return null;
+  return { offset, size, headerSize, end: offset + size, type: ascii(bytes, offset + 4, offset + 8) };
+}
+
+function readFullBoxFlags(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset + 9] ?? 0) << 16) + ((bytes[offset + 10] ?? 0) << 8) + (bytes[offset + 11] ?? 0);
+}
+
+function readUint16Be(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset] ?? 0) << 8) + (bytes[offset + 1] ?? 0);
+}
+
+function readUint64Be(bytes: Uint8Array, offset: number): number | null {
+  if (!hasByteRange(bytes, offset, 8)) return null;
+  const value = readUint32Be(bytes, offset) * 2 ** 32 + readUint32Be(bytes, offset + 4);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function hasByteRange(bytes: Uint8Array, offset: number, length: number): boolean {
+  return offset >= 0 && length >= 0 && offset + length <= bytes.byteLength;
+}
+
 async function readInputPrefix(input: MediaInput, length: number): Promise<Uint8Array> {
   if (input.mutated) {
     return new Uint8Array(await input.arrayBuffer()).subarray(0, length);
@@ -908,6 +1409,8 @@ const EBML_ID = {
   TrackNumber: 0xd7,
   TrackType: 0x83,
   CodecID: 0x86,
+  Language: 0x22b59c,
+  FlagDefault: 0x88,
   DefaultDuration: 0x23e383,
   Video: 0xe0,
   PixelWidth: 0xb0,
@@ -917,7 +1420,10 @@ const EBML_ID = {
   Channels: 0x9f,
 } as const;
 
-function webmHeaderMetadataFromPrefix(bytes: Uint8Array, container: 'mkv' | 'webm'): NormalizedMetadata | null {
+export function webmHeaderMetadataFromPrefix(
+  bytes: Uint8Array,
+  container: 'mkv' | 'webm',
+): NormalizedMetadata | null {
   const segment = findEbmlChild(bytes, 0, bytes.length, EBML_ID.Segment);
   if (!segment) return null;
 
@@ -944,6 +1450,8 @@ function webmHeaderMetadataFromPrefix(bytes: Uint8Array, container: 'mkv' | 'web
     let trackNumber = 0;
     let trackType: number | null = null;
     let codecId = '';
+    let language = 'eng';
+    let defaultDisposition = true;
     let defaultDurationNs: number | null = null;
     let width: number | undefined;
     let height: number | undefined;
@@ -956,6 +1464,10 @@ function webmHeaderMetadataFromPrefix(bytes: Uint8Array, container: 'mkv' | 'web
         trackType = readEbmlUint(bytes, field.bodyStart, field.bodyEnd);
       } else if (field.id === EBML_ID.CodecID) {
         codecId = readEbmlString(bytes, field.bodyStart, field.bodyEnd);
+      } else if (field.id === EBML_ID.Language) {
+        language = readEbmlString(bytes, field.bodyStart, field.bodyEnd) || 'eng';
+      } else if (field.id === EBML_ID.FlagDefault) {
+        defaultDisposition = readEbmlUint(bytes, field.bodyStart, field.bodyEnd) !== 0;
       } else if (field.id === EBML_ID.DefaultDuration) {
         defaultDurationNs = readEbmlUint(bytes, field.bodyStart, field.bodyEnd);
       } else if (field.id === EBML_ID.Video) {
@@ -986,7 +1498,8 @@ function webmHeaderMetadataFromPrefix(bytes: Uint8Array, container: 'mkv' | 'web
         width,
         height,
         bitrate: null,
-        language: null,
+        language,
+        defaultDisposition,
       };
       if (defaultDurationNs != null && defaultDurationNs > 0) {
         track.fps = Math.round((1_000_000_000 / defaultDurationNs) * 1000) / 1000;
@@ -1001,7 +1514,8 @@ function webmHeaderMetadataFromPrefix(bytes: Uint8Array, container: 'mkv' | 'web
         sampleRate,
         channels,
         bitrate: null,
-        language: null,
+        language,
+        defaultDisposition,
       });
     }
     void trackNumber;
@@ -1227,6 +1741,31 @@ function isHlsInput(input: MediaInput): boolean {
   }
   const u = (input.url || input.id || '').toLowerCase();
   return u.endsWith('.m3u8');
+}
+
+function isWavInput(input: MediaInput): boolean {
+  const mime = (input.mime || '').toLowerCase();
+  if (mime.includes('wav') || mime.includes('wave')) return true;
+  const value = (input.url || input.id || '').toLowerCase();
+  return value.endsWith('.wav');
+}
+
+function isTsInput(input: MediaInput): boolean {
+  const mime = (input.mime || '').toLowerCase();
+  if (mime.includes('mp2t') || mime.includes('mpegts')) return true;
+  const value = (input.url || input.id || '').toLowerCase();
+  return value.endsWith('.ts');
+}
+
+function isAdtsInput(input: MediaInput): boolean {
+  const mime = (input.mime || '').toLowerCase();
+  if (mime.includes('aac') || mime.includes('adts')) return true;
+  const value = (input.url || input.id || '').toLowerCase();
+  return value.endsWith('.aac') || value.endsWith('.adts');
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function countingReader(noteBytes: (bytes: number) => void): MediaParserReaderInterface {
@@ -1497,29 +2036,24 @@ function frameworkTrackIndexMap(tracks: MediaParserTrack[]): Map<number, number>
 }
 
 /** Normalize a single media-parser track to the suite NormalizedTrack shape. */
-function normalizeTrack(
+export function normalizeTrack(
   track: MediaParserTrack,
   containerFps: number | null | undefined,
   containerRotation: number | null,
 ): NormalizedTrack {
   if (track.type === 'video') {
     const v = track as MediaParserVideoTrack;
-    const rotation = (v.rotation ?? containerRotation ?? 0) || 0;
+    const rotation = normalizeRemotionRotation((v.rotation ?? containerRotation ?? 0) || 0);
     // Golden reports the CODED (unrotated) dims with rotation carried separately (probe scenario note:
     // "Rotation must surface as track.rotation, not by swapping w/h"; golden h264_rotated90 = 1280x720).
     // Verified on the installed 4.0.479 against the corpus: for h264_rotated90.mp4 the parser already
     // reports width/height = 1280x720 (== codedWidth/codedHeight) with rotation 0, so the default
-    // `v.width || v.codedWidth` already matches golden. media-parser's width/height are nonetheless
-    // DISPLAY dims in general (rotation-applied → swapped for a quarter-turn), so as a DEFENSIVE guard
-    // we prefer the coded dims whenever rotation is ±90/270 — a no-op for this corpus (rotation 0) but
-    // correct for any file where the parser does swap. For 0/180, display == coded.
-    const quarterTurn = Math.abs(Math.round(rotation)) % 180 === 90;
-    const width = quarterTurn
-      ? v.codedWidth || v.width || undefined
-      : v.width || v.codedWidth || undefined;
-    const height = quarterTurn
-      ? v.codedHeight || v.height || undefined
-      : v.height || v.codedHeight || undefined;
+    // `v.width || v.codedWidth` already matches golden. Prefer the coded dimensions consistently:
+    // media-parser applies rotation and sample-aspect-ratio to its display dimensions, while the
+    // benchmark's width/height fields follow the container/ffprobe coded raster and carry rotation
+    // separately.
+    const width = v.codedWidth || v.width || undefined;
+    const height = v.codedHeight || v.height || undefined;
     const out: NormalizedTrack = {
       type: 'video',
       codec: mpVideoToCanonical(v.codecEnum ?? v.codec),
@@ -1540,13 +2074,29 @@ function normalizeTrack(
 
   if (track.type === 'audio') {
     const a = track as MediaParserAudioTrack;
+    const codec = mpAudioToCanonical(a.codecEnum ?? a.codec);
+    const aac = codec === 'aac' ? parseAacAudioSpecificConfig(a.description) : undefined;
+    const sampleRate = aac?.presentationSampleRate ?? (a.sampleRate || undefined);
+    const channels = aac?.presentationChannels ?? (a.numberOfChannels || undefined);
+    const bitsPerSample = pcmBitsPerSample(codec);
     return {
       type: 'audio',
-      codec: mpAudioToCanonical(a.codecEnum ?? a.codec),
+      codec,
       nativeCodecTag: a.codec,
-      sampleRate: a.sampleRate || undefined,
-      channels: a.numberOfChannels || undefined,
-      bitrate: null,
+      sampleRate,
+      channels,
+      ...(aac ? {
+        audioObjectType: aac.audioObjectType,
+        codedSampleRate: aac.codedSampleRate,
+        presentationSampleRate: aac.presentationSampleRate,
+        codedChannels: aac.codedChannels,
+        presentationChannels: aac.presentationChannels,
+        sbrPresent: aac.sbrPresent,
+        psPresent: aac.psPresent,
+      } : {}),
+      bitrate: bitsPerSample != null && sampleRate != null && channels != null
+        ? sampleRate * channels * bitsPerSample
+        : null,
       language: null,
     };
   }
@@ -1558,6 +2108,29 @@ function normalizeTrack(
     bitrate: null,
     language: null,
   };
+}
+
+function normalizeRemotionRotation(rotation: number): number {
+  const counterClockwise = ((rotation % 360) + 360) % 360;
+  return counterClockwise === 0 ? 0 : 360 - counterClockwise;
+}
+
+function pcmBitsPerSample(codec: string): number | null {
+  switch (codec) {
+    case 'pcm-u8':
+      return 8;
+    case 'pcm-s16':
+    case 'pcm-s16be':
+      return 16;
+    case 'pcm-s24':
+    case 'pcm-s24be':
+      return 24;
+    case 'pcm-s32':
+    case 'pcm-f32':
+      return 32;
+    default:
+      return null;
+  }
 }
 
 /**

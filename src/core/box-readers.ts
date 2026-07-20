@@ -31,7 +31,9 @@ export interface ReadTrack {
   codec: string | null;
   width?: number;
   height?: number;
+  rotation?: number;
   language?: string;
+  defaultDisposition?: boolean;
   protectionScheme?: string;
 }
 
@@ -178,6 +180,10 @@ function u32(dv: DataView, off: number): number {
   return off + 4 <= dv.byteLength ? dv.getUint32(off) : 0;
 }
 
+function i32(dv: DataView, off: number): number {
+  return off + 4 <= dv.byteLength ? dv.getInt32(off) : 0;
+}
+
 /** 64-bit big-endian as a JS number (exact up to 2^53; container sizes/durations never exceed that). */
 function u64(dv: DataView, off: number): number {
   if (off + 8 > dv.byteLength) return 0;
@@ -268,6 +274,21 @@ function parseTkhdDims(dv: DataView, box: Box): { w: number; h: number } {
   const hOff = box.end - 4;
   if (wOff < box.bodyStart) return { w: 0, h: 0 };
   return { w: u32(dv, wOff) >>> 16, h: u32(dv, hOff) >>> 16 };
+}
+
+/** tkhd display matrix → canonical clockwise cardinal rotation. Identity stays absent. */
+function parseTkhdRotation(dv: DataView, box: Box): number | undefined {
+  const b = box.bodyStart;
+  if (b + 4 > box.end || b >= dv.byteLength) return undefined;
+  const matrixOffset = b + (dv.getUint8(b) === 1 ? 52 : 40);
+  if (matrixOffset + 20 > box.end) return undefined;
+  const a = i32(dv, matrixOffset) / 65_536;
+  const c = i32(dv, matrixOffset + 12) / 65_536;
+  if (a === 0 && c === 0) return undefined;
+  const raw = ((Math.atan2(c, a) * 180 / Math.PI) % 360 + 360) % 360;
+  const cardinal = (Math.round(raw / 90) * 90) % 360;
+  const distance = Math.min(Math.abs(raw - cardinal), 360 - Math.abs(raw - cardinal));
+  return distance <= 1 && cardinal !== 0 ? cardinal : undefined;
 }
 
 /** mdhd media duration in seconds. Unknown sentinels stay absent rather than becoming huge values. */
@@ -461,6 +482,16 @@ function parseTrak(bytes: Uint8Array, dv: DataView, trak: Box): ReadTrack | null
   if (protectionScheme) track.protectionScheme = protectionScheme;
   const language = mdhd ? parseMdhdLanguage(dv, mdhd) : undefined;
   if (language) track.language = language;
+  if (tkhd && tkhd.bodyStart + 4 <= tkhd.end) {
+    const flags = (
+      (u8(bytes, tkhd.bodyStart + 1) << 16) |
+      (u8(bytes, tkhd.bodyStart + 2) << 8) |
+      u8(bytes, tkhd.bodyStart + 3)
+    );
+    // ISO BMFF has no Matroska-style FlagDefault. FFmpeg and the suite's normalized view use the
+    // TrackHeaderBox enabled flag as the observable default-disposition evidence.
+    track.defaultDisposition = (flags & 0x000001) !== 0;
+  }
   if (type === 'video') {
     // Prefer the visual sample-entry dimensions; fall back to tkhd.
     let w = stsdW;
@@ -472,6 +503,8 @@ function parseTrak(bytes: Uint8Array, dv: DataView, trak: Box): ReadTrack | null
     }
     if (w > 0) track.width = w;
     if (h > 0) track.height = h;
+    const rotation = tkhd ? parseTkhdRotation(dv, tkhd) : undefined;
+    if (rotation !== undefined) track.rotation = rotation;
   }
   return track;
 }
@@ -517,9 +550,12 @@ export function readMp4Structure(bytes: Uint8Array): ReadStructure | null {
     if (findBox(top, 'moof') || findBox(moovChildren, 'mvex')) {
       const fragmentPackets = readMp4FragmentPackets(bytes, dv, top, moov);
       if (fragmentPackets?.length) {
-        const fragmentEndUs = Math.max(
-          ...fragmentPackets.map((packet) => packet.ptsUs + (packet.durationUs ?? 0)),
-        );
+        // Do not spread the packet table into Math.max: long-form fragmented inputs can contain
+        // enough packets to exceed a browser engine's function-argument limit.
+        let fragmentEndUs = 0;
+        for (const packet of fragmentPackets) {
+          fragmentEndUs = Math.max(fragmentEndUs, packet.ptsUs + (packet.durationUs ?? 0));
+        }
         if (Number.isFinite(fragmentEndUs) && fragmentEndUs > 0) {
           durationSec = Math.max(durationSec ?? 0, fragmentEndUs / 1_000_000);
         }
@@ -556,6 +592,8 @@ const EBML_ID = {
   TrackEntry: 0xae,
   TrackType: 0x83,
   CodecID: 0x86,
+  Language: 0x22b59c,
+  FlagDefault: 0x88,
   Video: 0xe0,
   Audio: 0xe1,
   PixelWidth: 0xb0,
@@ -663,6 +701,9 @@ function ebmlString(bytes: Uint8Array, el: Element): string {
 function parseTrackEntry(bytes: Uint8Array, dv: DataView, entry: Element): ReadTrack {
   let type: 'video' | 'audio' | 'other' = 'other';
   let codecId: string | null = null;
+  // Matroska defaults both fields when the elements are absent.
+  let language = 'eng';
+  let defaultDisposition = true;
   let w = 0;
   let h = 0;
   for (const el of ebmlChildren(bytes, entry.bodyStart, entry.bodyEnd)) {
@@ -675,6 +716,12 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, entry: Element): ReadT
       case EBML_ID.CodecID:
         codecId = ebmlString(bytes, el);
         break;
+      case EBML_ID.Language:
+        language = ebmlString(bytes, el) || 'eng';
+        break;
+      case EBML_ID.FlagDefault:
+        defaultDisposition = ebmlUint(dv, el) !== 0;
+        break;
       case EBML_ID.Video:
         for (const v of ebmlChildren(bytes, el.bodyStart, el.bodyEnd)) {
           if (v.id === EBML_ID.PixelWidth) w = ebmlUint(dv, v);
@@ -685,7 +732,12 @@ function parseTrackEntry(bytes: Uint8Array, dv: DataView, entry: Element): ReadT
         break;
     }
   }
-  const track: ReadTrack = { type, codec: codecId ? canonicalCodecToken(codecId) : null };
+  const track: ReadTrack = {
+    type,
+    codec: codecId ? canonicalCodecToken(codecId) : null,
+    language,
+    defaultDisposition,
+  };
   if (type === 'video') {
     if (w > 0) track.width = w;
     if (h > 0) track.height = h;

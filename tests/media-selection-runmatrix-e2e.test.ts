@@ -602,8 +602,7 @@ function installAcceptanceFetch(): void {
     const mediaAt = url.indexOf(mediaMarker);
     if (mediaAt >= 0) {
       const assetId = decodeURIComponent(url.slice(mediaAt + mediaMarker.length).split(/[?#]/, 1)[0]!);
-      const body = media.get(assetId) ??
-        (assetId === `${REAL_PREFIX}/${BAKED_ID}` ? media.get(BAKED_ID) : undefined);
+      const body = media.get(assetId);
       if (!body) return new Response(null, { status: 404, statusText: 'Not Found' });
       if (init?.method === 'HEAD') return new Response(null, { status: 200 });
       mediaBodyFetches += 1;

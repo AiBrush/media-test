@@ -16,8 +16,12 @@ import {
 } from '../src/core/engine.ts';
 import { CONCRETE_OPERATION_PROTOCOL } from '../src/core/engine.ts';
 import {
+  collectFragmentTrackStats,
+  isoTrackHeaderEvidence,
+  normalizeTrack as normalizeRemotionParserTrack,
   RemotionMediaParserEngine,
   remotionParserSampleEvidence,
+  webmHeaderMetadataFromPrefix,
 } from '../src/engines/remotion-media-parser/adapter.ts';
 import {
   buildResize,
@@ -492,6 +496,90 @@ describe('REQ-ENG-10: raw representation-aware packet evidence', () => {
     expect([first.ptsUs, second.ptsUs]).toEqual([0, 0]);
     expect(first.framing).toBe('adts');
     expect('dtsUs' in first).toBe(false);
+  });
+});
+
+describe('probe container-evidence normalization', () => {
+  test('Matroska defaults, ISO language, and fragmented timing remain byte-derived', async () => {
+    const webmBytes = new Uint8Array(
+      await Bun.file('fixtures/media/recorder_headerless.webm').arrayBuffer(),
+    );
+    const webm = webmHeaderMetadataFromPrefix(webmBytes.subarray(0, 64 * 1024), 'webm');
+    expect(webm?.tracks[0]).toMatchObject({
+      type: 'video',
+      language: 'eng',
+      defaultDisposition: true,
+    });
+
+    const languageBytes = new Uint8Array(
+      await Bun.file('fixtures/media/scenarios/probe/h264_vfr/01.mp4').arrayBuffer(),
+    );
+    expect([...isoTrackHeaderEvidence(languageBytes)]).toMatchObject([
+      [1, { language: 'eng' }],
+      [2, { language: 'eng' }],
+    ]);
+
+    const fragmentedBytes = new Uint8Array(
+      await Bun.file('fixtures/media/fragmented_cmaf.mp4').arrayBuffer(),
+    );
+    expect([...collectFragmentTrackStats(fragmentedBytes)]).toEqual([
+      [1, { sampleCount: 120, maxEnd: 61_768 }],
+      [2, { sampleCount: 189, maxEnd: 193_024 }],
+    ]);
+  });
+
+  test('probe tracks use coded raster, clockwise rotation, and exact PCM bitrate', () => {
+    expect(normalizeRemotionParserTrack({
+      type: 'video',
+      trackId: 1,
+      originalTimescale: 1_000,
+      codec: 'vp09.00.10.08',
+      codecEnum: 'vp9',
+      width: 427,
+      height: 240,
+      codedWidth: 426,
+      codedHeight: 240,
+      rotation: 270,
+      fps: 25,
+    } as any, null, null)).toMatchObject({
+      type: 'video',
+      codec: 'vp9',
+      width: 426,
+      height: 240,
+      rotation: 90,
+    });
+
+    expect(normalizeRemotionParserTrack({
+      type: 'audio',
+      trackId: 2,
+      originalTimescale: 48_000,
+      codec: 'pcm-s16',
+      codecEnum: 'pcm-s16',
+      sampleRate: 48_000,
+      numberOfChannels: 2,
+    } as any, null, null)).toMatchObject({
+      type: 'audio',
+      codec: 'pcm-s16',
+      bitrate: 1_536_000,
+    });
+
+    expect(normalizeRemotionParserTrack({
+      type: 'audio',
+      trackId: 3,
+      originalTimescale: 24_000,
+      codec: 'mp4a.40.02',
+      codecEnum: 'aac',
+      sampleRate: 24_000,
+      numberOfChannels: 1,
+      description: new Uint8Array([0x13, 0x08, 0x56, 0xe5, 0x98]),
+    } as any, null, null)).toMatchObject({
+      type: 'audio',
+      codec: 'aac',
+      sampleRate: 48_000,
+      codedSampleRate: 24_000,
+      presentationSampleRate: 48_000,
+      sbrPresent: true,
+    });
   });
 });
 

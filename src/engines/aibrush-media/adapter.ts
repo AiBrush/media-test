@@ -53,8 +53,12 @@ import type {
 import {
   createNotApplicableError,
   DECODE_TRACK_SELECTOR_SCHEMA,
+  isBrowserNotSupportedError,
+  isMalformedInputError,
+  isNotApplicableError,
   MalformedInputError,
 } from '../../core/engine.ts';
+import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
 import {
   type AibrushErrorClasses,
@@ -3539,6 +3543,85 @@ function normalizedMetadataFromAibrushInfo(
   };
 }
 
+function pcmBitsPerSample(codec: string): number | undefined {
+  const match = /^pcm-[usf](\d+)(?:be)?$/.exec(codec);
+  if (!match) return undefined;
+  const bits = Number(match[1]);
+  return Number.isSafeInteger(bits) && bits > 0 ? bits : undefined;
+}
+
+function structuralTracksByType(
+  tracks: readonly ReadTrack[],
+): Readonly<Record<NormalizedTrack['type'], readonly ReadTrack[]>> {
+  return {
+    video: tracks.filter((track) => track.type === 'video'),
+    audio: tracks.filter((track) => track.type === 'audio'),
+    subtitle: [],
+    other: tracks.filter((track) => track.type === 'other'),
+  };
+}
+
+/** Add only facts independently observable from the exact selected container bytes. */
+export function enrichAibrushProbeMetadata(
+  metadata: NormalizedMetadata,
+  bytes: Uint8Array,
+): NormalizedMetadata {
+  const structure = readOutputStructure(bytes);
+  const byType = structuralTracksByType(structure?.tracks ?? []);
+  const seen: Partial<Record<NormalizedTrack['type'], number>> = {};
+  const tracks = metadata.tracks.map((track) => {
+    const index = seen[track.type] ?? 0;
+    seen[track.type] = index + 1;
+    const structural = byType[track.type][index];
+    const bits = pcmBitsPerSample(track.codec);
+    const pcmBitrate = bits !== undefined && track.sampleRate !== undefined && track.channels !== undefined
+      ? bits * track.sampleRate * track.channels
+      : undefined;
+    return {
+      ...track,
+      ...(structural?.language !== undefined ? { language: structural.language } : {}),
+      ...(structural?.defaultDisposition !== undefined
+        ? { defaultDisposition: structural.defaultDisposition }
+        : {}),
+      ...(structural?.rotation !== undefined ? { rotation: structural.rotation } : {}),
+      ...(pcmBitrate !== undefined ? { bitrate: pcmBitrate } : {}),
+    };
+  });
+  const majorBrand = structure?.majorBrand;
+  const protectionScheme = structure?.tracks
+    .map((track) => track.protectionScheme)
+    .find((scheme): scheme is string => typeof scheme === 'string' && scheme.length > 0);
+  const enriched: NormalizedMetadata = {
+    ...metadata,
+    tracks,
+    ...(majorBrand !== undefined
+      ? { tags: { ...(metadata.tags ?? {}), major_brand: majorBrand } }
+      : {}),
+  };
+  if (protectionScheme !== undefined) {
+    (enriched as NormalizedMetadata & { protectionScheme: string }).protectionScheme = protectionScheme;
+  }
+  return enriched;
+}
+
+function preserveProbeError(error: unknown): boolean {
+  return (
+    isMalformedInputError(error) ||
+    isNotApplicableError(error) ||
+    isBrowserNotSupportedError(error) ||
+    (typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError')
+  );
+}
+
+function aibrushErrorReason(error: unknown): string {
+  if (error instanceof Error && error.message.trim().length > 0) return error.message;
+  if (typeof error === 'object' && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === 'string' && message.trim().length > 0) return message;
+  }
+  return String(error);
+}
+
 function rationalFrameRate(fps: number): { numerator: number; denominator: number } {
   const ntsc = [24_000, 30_000, 60_000, 120_000].find(
     (numerator) => Math.abs(fps - numerator / 1_001) <= Math.max(1e-6, fps * 1e-6),
@@ -4289,6 +4372,7 @@ export class AibrushMediaEngine implements MediaEngine {
   async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
     return this.#run('probe', 'framework.probe', context, async (signal) => {
       let info: AibrushInfo;
+      let bytes: Uint8Array | undefined;
       try {
         const engine = this.#engine();
         if (isHlsAsset(input)) {
@@ -4300,16 +4384,30 @@ export class AibrushMediaEngine implements MediaEngine {
           );
           if (hlsMetadata !== undefined) return hlsMetadata;
         }
-        const src = await this.#src(engine, input);
+        if (isMalformedHarnessInput(input) && !input.mutated) bytes = await inputBytes(input);
+        // A malformed/mislabeled name or MIME is not authoritative. Feeding its verified bytes
+        // without a container hint lets the framework sniff the actual representation.
+        const src = bytes === undefined ? await this.#src(engine, input) : engine.from(bytes);
         const knownContainer = knownContainerProbeToken(input);
         info =
           knownContainer !== undefined && engine.probeContainer !== undefined
             ? await engine.probeContainer(src, knownContainer, { signal })
             : await engine.probe(src, { signal });
       } catch (e) {
-        return this.#naIfMiss('probe', e, input);
+        try {
+          return this.#naIfMiss('probe', e, input);
+        } catch (translated) {
+          if (
+            context?.request.options.gracefulAllowOutput === true &&
+            !preserveProbeError(translated)
+          ) {
+            throw new GracefulRejectionError('probe', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
-      const metadata = normalizedMetadataFromAibrushInfo(input, info);
+      bytes ??= await inputBytes(input);
+      const metadata = enrichAibrushProbeMetadata(normalizedMetadataFromAibrushInfo(input, info), bytes);
       metadata.probeEvidence = { readMode: 'whole-file' };
       return metadata;
     });

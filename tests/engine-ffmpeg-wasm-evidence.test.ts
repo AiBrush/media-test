@@ -6,8 +6,11 @@ import {
 } from '../src/engines/ffmpeg-wasm/codecs.ts';
 import {
   applyObservedFrameCadence,
+  containerFromFfmpegLog,
   parseFfprobeFramesJson,
   parseFfprobeJson,
+  parseMp3XingDurationSec,
+  parseTracksFromLog,
   representationForTracks,
   splitAdtsFrames,
   splitPreparedBytes,
@@ -211,6 +214,62 @@ describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
 });
 
 describe('REQ-ENG-13/18: exact runtime-build parsers', () => {
+  test('parses the loaded core stream prefix with source index and timebase diagnostics', () => {
+    const log = [
+      "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'op1.in':",
+      '  Duration: 00:00:10.50, start: 0.000000, bitrate: 5888 kb/s',
+      '  Stream #0:0[0x1](und), 31, 1/60: Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive), 1080x1920, 5723 kb/s, 60 fps, 60 tbr, 60 tbn (default)',
+      '  Stream #0:1[0x2](eng), 1, 1/48000: Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 189 kb/s (default)',
+      'At least one output file must be specified',
+    ].join('\n');
+
+    expect(parseTracksFromLog(log)).toEqual([
+      {
+        type: 'video', codec: 'h264', bitrate: null, language: null,
+        width: 1080, height: 1920, fps: 60, defaultDisposition: true,
+      },
+      {
+        type: 'audio', codec: 'aac', bitrate: null, language: 'eng',
+        sampleRate: 48000, channels: 2, defaultDisposition: true,
+      },
+    ]);
+  });
+
+  test('uses observed tbr, PCM rate, display rotation, and demuxer identity', () => {
+    const log = [
+      "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'mislabeled.webm':",
+      '  Stream #0:0, 31, 1/90000: Video: h264, yuv420p, 640x480, 29.97 tbr, 90k tbn',
+      '    Side data:',
+      '      displaymatrix: rotation of 90.00 degrees',
+      '  Stream #0:1: Audio: pcm_s16le, 48000 Hz, stereo, s16, 1536 kb/s (default)',
+    ].join('\n');
+    expect(containerFromFfmpegLog(log, 'webm')).toBe('mp4');
+    expect(parseTracksFromLog(log)).toEqual([
+      {
+        type: 'video', codec: 'h264', bitrate: null, language: null,
+        width: 640, height: 480, fps: 29.97, rotation: 90,
+      },
+      {
+        type: 'audio', codec: 'pcm-s16', bitrate: 1_536_000, language: null,
+        sampleRate: 48_000, channels: 2, defaultDisposition: true,
+      },
+    ]);
+  });
+
+  test('derives sample-accurate MP3 duration from Xing frame count and LAME trim', () => {
+    const frame = new Uint8Array(417);
+    frame.set([0xff, 0xfb, 0x90, 0x64], 0); // MPEG-1 Layer III, 44.1 kHz, stereo
+    const xing = 4 + 32;
+    frame.set(new TextEncoder().encode('Xing'), xing);
+    frame.set([0, 0, 0, 1], xing + 4); // frame-count field present
+    frame.set([0, 0, 2, 30], xing + 8); // 542 frames
+    const lame = xing + 12;
+    frame.set(new TextEncoder().encode('LAME3.100'), lame);
+    frame.set([0x24, 0x04, 0xc0], lame + 21); // delay=576, padding=1216
+    expect(parseMp3XingDurationSec(frame)).toBeCloseTo(14.1177324263, 9);
+    expect(parseMp3XingDurationSec(frame.subarray(0, xing))).toBeNull();
+  });
+
   test('parses codec, format, and filter rows from the loaded core output', () => {
     const codecLog = ['Encoders:', ' ------', ' V..... libx264  H.264', ' A..... aac      AAC'].join('\n');
     const formatLog = ['File formats:', ' --', ' DE mp4      MP4', ' D  hls      HLS', '  E webm     WebM'].join('\n');

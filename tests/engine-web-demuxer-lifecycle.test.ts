@@ -90,6 +90,51 @@ describe('REQ-ENG-30: observable web-demuxer lifecycle and cancellation', () => 
     await engine.dispose(lifecycle());
   });
 
+  test('materializes same-origin WASM for the package nested worker in an isolated worker realm', async () => {
+    const fetched: string[] = [];
+    const engine = makeEngine({
+      workerRealm: true,
+      fetchWasm: async (url) => {
+        fetched.push(url);
+        return Uint8Array.of(0x00, 0x61, 0x73, 0x6d);
+      },
+    });
+    await engine.init(lifecycle());
+    expect(fetched).toEqual(['https://suite.invalid/assets/web-demuxer.wasm']);
+    expect(FakeWebDemuxer.instances[0]?.wasmFilePath).toBe('data:application/wasm;base64,AGFzbQ==');
+    expect(engine.configUsed.wasmTransport).toBe('same-origin-materialized-data-url');
+    await engine.dispose(lifecycle());
+  });
+
+  test('turns package string rejections for malformed probe input into ordinary Errors', async () => {
+    plan.mediaInfoError = 'get_media_info failed: undefined';
+    const engine = makeEngine();
+    await engine.init(lifecycle());
+    await expect(engine.probe(input(), operationContext('probe'))).rejects.toThrow(
+      'web-demuxer@4.0.0: probe failed: get_media_info failed: undefined',
+    );
+    await engine.dispose(lifecycle());
+  });
+
+  test('does not relabel cancellation as malformed input in a graceful probe row', async () => {
+    plan.mediaInfoError = abortError('cancel probe');
+    const engine = makeEngine();
+    await engine.init(lifecycle());
+    const context = operationContext('probe');
+    const gracefulContext: OperationContext = {
+      ...context,
+      request: {
+        ...context.request,
+        options: { ...context.request.options, gracefulAllowOutput: true },
+      },
+    };
+    await expect(engine.probe(input(), gracefulContext)).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'cancel probe',
+    });
+    await engine.dispose(lifecycle());
+  });
+
   test('abort during readiness terminates the worker and cannot publish a late ready transition', async () => {
     const readiness = deferred<void>();
     plan.readiness = readiness.promise;
@@ -370,6 +415,7 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
 
 interface FakePlan {
   readiness?: Promise<void>;
+  mediaInfoError?: unknown;
   info: WebMediaInfo;
   streams: WebAVStream[];
   config: VideoDecoderConfig & { rotation?: number; flip?: boolean };
@@ -414,6 +460,7 @@ class FakeWebDemuxer {
   }
 
   async getMediaInfo(): Promise<WebMediaInfo> {
+    if (plan.mediaInfoError !== undefined) throw plan.mediaInfoError;
     return plan.info;
   }
 

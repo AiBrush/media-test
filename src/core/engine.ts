@@ -2820,7 +2820,10 @@ export class OperationTelemetryCollector {
     if (this.closed || this.signal.aborted) {
       throw new AdapterContractError(this.engineId, 'telemetry.emit', 'must not emit after abort/close', 'ADAPTER_WORK_AFTER_ABORT');
     }
-    validateOperationTelemetry(this.engineId, [...this.events, event], undefined, 'telemetry.events', true);
+    // Validate the new event's schema immediately; cumulative/order relationships are validated
+    // once over the complete sequence in close(). Revalidating a copied prefix on every emit makes
+    // packet-scale telemetry O(n²) without strengthening the final contract.
+    validateOperationTelemetry(this.engineId, [event], undefined, 'telemetry.events', true);
     this.events.push(cloneTelemetryEvent(event));
   };
 

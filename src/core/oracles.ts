@@ -34,7 +34,7 @@ import type {
 import type { MediaEngine, PacketInfo } from './engine.ts';
 import { isNotApplicableError } from './engine.ts';
 import type { OracleId, OracleOutcome, OracleTolerances, Scenario } from './scenario.ts';
-import { canonicalizeJson, type JsonObject } from './canonical-json.ts';
+import { canonicalizeJson, sha256Hex as sha256HexSync, type JsonObject } from './canonical-json.ts';
 import {
   COMPACT_GOLDEN_PACKETS_SCHEMA,
   readCompactGoldenPacketRows,
@@ -1943,6 +1943,7 @@ interface NormalizedAccessUnit {
   dtsUs?: number;
   durationUs?: number;
   primary: string[];
+  payloadDigests: string[];
   randomAccess: boolean;
   hasParameterSets: boolean;
   rows: number;
@@ -1971,7 +1972,10 @@ function comparePacketTables(
   got: PacketInfo[],
   want: PacketInfo[],
   tsTolUs: number,
-  opts?: { looseFirstPacket?: (trackIndex: number) => boolean },
+  opts?: {
+    looseFirstPacket?: (trackIndex: number) => boolean;
+    looseKeyframe?: (trackIndex: number) => boolean;
+  },
 ): PacketTableComparison {
   const diffs: string[] = [];
   const measurements: Record<string, number> = {
@@ -2004,13 +2008,20 @@ function comparePacketTables(
       }
       g.push(p);
     }
-    for (const g of m.values()) {
-      g.sort((x, y) => (packetDts(x) ?? x.ptsUs) - (packetDts(y) ?? y.ptsUs) || x.ptsUs - y.ptsUs);
-    }
     return m;
   };
   const gotByTrack = byTrack(got);
   const wantByTrack = byTrack(want);
+  for (const trackIndex of new Set([...gotByTrack.keys(), ...wantByTrack.keys()])) {
+    const measured = gotByTrack.get(trackIndex) ?? [];
+    const golden = wantByTrack.get(trackIndex) ?? [];
+    const compareByDts = [...measured, ...golden].every((packet) => packetDts(packet) !== undefined);
+    const order = compareByDts
+      ? (packet: SemanticPacketInfo): number => packetDts(packet)!
+      : (packet: SemanticPacketInfo): number => packet.ptsUs;
+    measured.sort((a, b) => order(a) - order(b) || a.ptsUs - b.ptsUs || a.size - b.size);
+    golden.sort((a, b) => order(a) - order(b) || a.ptsUs - b.ptsUs || a.size - b.size);
+  }
 
   let sizeMismatch = 0;
   let kfMismatch = 0;
@@ -2035,7 +2046,7 @@ function comparePacketTables(
       const a = gotTrack[i]!;
       const b = wantTrack[i]!;
       if (a.size !== b.size) sizeMismatch++;
-      if (!!a.keyframe !== !!b.keyframe) kfMismatch++;
+      if (!(opts?.looseKeyframe?.(trackIndex) ?? false) && !!a.keyframe !== !!b.keyframe) kfMismatch++;
       if (looseFirstPacket && i === 0) continue;
       const ptsResid = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
       const aDts = packetDts(a);
@@ -2046,7 +2057,8 @@ function comparePacketTables(
       if (ptsResid > maxPtsDriftUs) maxPtsDriftUs = ptsResid;
       if (ptsResid > tsTolUs) ptsDrift++;
       if (dtsResid > tsTolUs) dtsDrift++;
-      if ((aDts === undefined) !== (bDts === undefined)) dtsDrift++;
+      // DTS capability and partial coverage are judged once by assessDemuxDts(). Missing DTS must
+      // not also fail the packet-identity/timing comparator.
     }
   }
   measurements.comparedTracks = comparedTracks;
@@ -2077,15 +2089,46 @@ function compareSemanticPacketEvidence(
   const want = wantInput as SemanticPacketInfo[];
   const raw = comparePacketTables(gotInput, wantInput, toleranceUs, {
     looseFirstPacket: (trackIndex) => usesOpusPreskipLoosePacket(ctx, trackIndex),
+    looseKeyframe: (trackIndex) => ctx.demux?.metadata.tracks[trackIndex]?.type === 'audio',
   });
-  const hasSemanticEvidence = [...got, ...want].some(
-    (packet) =>
-      packetPayloadBytes(packet) !== undefined ||
-      !!packet.payloadDigest ||
-      !!packet.normalizedAccessUnitId ||
-      !!packet.accessUnitId,
-  );
-  if (raw.ok && !hasSemanticEvidence) {
+  const carriesSemanticEvidence = (packet: SemanticPacketInfo): boolean =>
+    packetPayloadBytes(packet) !== undefined ||
+    !!packet.payloadDigest ||
+    !!packet.normalizedAccessUnitId ||
+    !!packet.accessUnitId;
+  const measuredHasSemanticEvidence = got.some(carriesSemanticEvidence);
+  const goldenHasSemanticEvidence = want.some(carriesSemanticEvidence);
+  if (!goldenHasSemanticEvidence && measuredHasSemanticEvidence) {
+    // Legacy ffprobe tables intentionally bind the complete exact row inventory but do not retain
+    // payload bytes. Extra adapter payloads must not make scoring stricter than an adapter that
+    // reports the same exact rows without bytes. Still reject any adapter-declared digest that
+    // conflicts with those supplied bytes.
+    for (const packet of got) {
+      const payload = packetPayloadBytes(packet);
+      const declaredDigest = normHex(packet.payloadDigest);
+      if (payload && declaredDigest && sha256HexSync(payload) !== declaredDigest) {
+        return {
+          state: 'ERROR',
+          reasonCode: 'ORACLE_PACKET_PAYLOAD_DIGEST_CONFLICT',
+          detail: `measured packet payload digest ${declaredDigest} does not match its supplied bytes`,
+          measurements: raw.measurements,
+        };
+      }
+    }
+    if (!raw.ok) {
+      return {
+        state: 'FAIL',
+        detail: `exact baked packet rows differ and carry no semantic payload identity: ${raw.diffs.join('; ')}`,
+        measurements: raw.measurements,
+      };
+    }
+    return {
+      state: 'PASS',
+      detail: `exact baked packet rows agree (${got.length} packet(s)); payload evidence was not retained by this golden`,
+      measurements: raw.measurements,
+    };
+  }
+  if (!goldenHasSemanticEvidence && raw.ok) {
     return {
       state: 'PASS',
       detail: `semantic and baked packet rows agree exactly (${got.length} packet(s))`,
@@ -2120,7 +2163,8 @@ function compareSemanticPacketEvidence(
       return {
         state: 'ERROR',
         reasonCode: measuredNormalized.reasonCode,
-        detail: `measured ${match.type} track has no complete semantic normalizer: ${measuredNormalized.detail}`,
+        detail: `measured ${match.type} track has no complete semantic normalizer: ${measuredNormalized.detail}; ` +
+          `exact-row differences: ${raw.diffs.join('; ') || 'none'}`,
         measurements,
       };
     }
@@ -2253,10 +2297,22 @@ function normalizePacketTrack(
   for (const group of groups.values()) {
     const first = group[0]!.packet;
     const primary: string[] = [];
+    const payloadDigests: string[] = [];
     const explicitAccessUnitIdentities = new Set<string>();
     let randomAccess = false;
     let hasParameterSets = false;
     for (const { packet } of group) {
+      const payload = packetPayloadBytes(packet);
+      const declaredDigest = normHex(packet.payloadDigest);
+      const observedDigest = payload ? sha256HexSync(payload) : undefined;
+      if (declaredDigest && observedDigest && declaredDigest !== observedDigest) {
+        return {
+          reasonCode: 'ORACLE_PACKET_PAYLOAD_DIGEST_CONFLICT',
+          detail: `packet payload digest ${declaredDigest} does not match its supplied bytes`,
+        };
+      }
+      const digest = declaredDigest || observedDigest;
+      if (digest) payloadDigests.push(digest);
       const normalized = normalizePacketPayload(packet, codec);
       if ('reasonCode' in normalized) return normalized;
       const explicitIdentity = packet.normalizedAccessUnitId ?? packet.accessUnitId;
@@ -2285,6 +2341,7 @@ function normalizePacketTrack(
       ...(packetDts(first) !== undefined ? { dtsUs: packetDts(first)! } : {}),
       ...(first.durationUs !== undefined ? { durationUs: first.durationUs } : {}),
       primary,
+      payloadDigests,
       randomAccess,
       hasParameterSets,
       rows: group.length,
@@ -2407,7 +2464,15 @@ function compareNormalizedAccessUnits(
   for (let i = 0; i < count; i++) {
     const a = measured.units[i]!;
     const b = golden.units[i]!;
-    if (a.primary.length !== b.primary.length || a.primary.some((identity, j) => identity !== b.primary[j])) {
+    const samePrimary = a.primary.length === b.primary.length &&
+      a.primary.every((identity, j) => identity === b.primary[j]);
+    const samePayloadDigests = a.payloadDigests.length > 0 &&
+      a.payloadDigests.length === b.payloadDigests.length &&
+      a.payloadDigests.every((digest, j) => digest === b.payloadDigests[j]);
+    // Some committed golden tables intentionally retain only independently baked SHA-256 packet
+    // identities. Verify any measured digest against its supplied bytes above, then use an exact
+    // digest match as the content identity when only one side retained payload bytes.
+    if (!samePrimary && !samePayloadDigests) {
       failures.push(`${label}: access unit ${i} primary coded content changed/reordered`);
     }
     const ptsResidual = Math.abs(a.ptsUs - b.ptsUs - ptsOffset);
@@ -2467,7 +2532,13 @@ function splitNalUnits(
   framing: PacketFraming | undefined,
   nalLengthSize = 4,
 ): Uint8Array[] | undefined {
-  const annexB = framing === 'annex-b' || hasAnnexBStartCode(payload);
+  const lengthPrefixed =
+    framing === 'length-prefixed' || framing === 'avcc' || framing === 'hvcc' ||
+    framing === 'avc' || framing === 'hevc';
+  // A valid four-byte length such as 0x0000018f begins with the bytes of a three-byte Annex-B start
+  // code. Explicit container framing is authoritative; sniff only when no length framing was given.
+  const annexB = framing === 'annex-b' || framing === 'annexb' ||
+    (!lengthPrefixed && hasAnnexBStartCode(payload));
   if (annexB) {
     const starts: Array<{ start: number; payloadStart: number }> = [];
     for (let i = 0; i + 3 <= payload.length; i++) {
@@ -2484,7 +2555,7 @@ function splitNalUnits(
       .map((start, index) => payload.subarray(start.payloadStart, starts[index + 1]?.start ?? payload.length))
       .filter((nal) => nal.byteLength > 0);
   }
-  if (framing === 'length-prefixed' || framing === 'avcc' || framing === 'hvcc') {
+  if (lengthPrefixed) {
     if (![1, 2, 3, 4].includes(nalLengthSize)) return undefined;
     const out: Uint8Array[] = [];
     let offset = 0;

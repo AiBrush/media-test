@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { NormalizedMetadata } from '../src/core/engine.ts';
+import { enrichAibrushProbeMetadata } from '../src/engines/aibrush-media/adapter.ts';
 import {
   buildAibrushDemuxResult,
   normalizeAibrushTrack,
@@ -7,6 +8,37 @@ import {
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('enriches probe metadata from selected bytes without inventing container facts', async () => {
+    const mp4 = new Uint8Array(await Bun.file('fixtures/media/h264_1080p_30s.mp4').arrayBuffer());
+    const branded = enrichAibrushProbeMetadata({
+      container: 'mp4', durationSec: 30,
+      tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
+    }, mp4);
+    expect(branded.tags?.major_brand).toBe('isom');
+    expect(branded.tracks.map((track) => track.language)).toEqual(['und', 'und']);
+
+    const protectedBytes = new Uint8Array(await Bun.file('fixtures/media/cenc_cbcs.mp4').arrayBuffer());
+    const protectedMetadata = enrichAibrushProbeMetadata({
+      container: 'mp4', durationSec: 5,
+      tracks: [{ type: 'video', codec: 'h264' }],
+    }, protectedBytes) as NormalizedMetadata & { protectionScheme?: string };
+    expect(protectedMetadata.protectionScheme).toBe('cbcs');
+    expect(protectedMetadata.tracks[0]?.defaultDisposition).toBe(true);
+
+    const rotatedBytes = new Uint8Array(await Bun.file('fixtures/media/h264_rotated90.mp4').arrayBuffer());
+    const rotated = enrichAibrushProbeMetadata({
+      container: 'mp4', durationSec: 10,
+      tracks: [{ type: 'video', codec: 'h264', rotation: 270 }, { type: 'audio', codec: 'aac' }],
+    }, rotatedBytes);
+    expect(rotated.tracks[0]?.rotation).toBe(90);
+
+    const pcm = enrichAibrushProbeMetadata({
+      container: 'wav', durationSec: 1,
+      tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels: 2, bitrate: null }],
+    }, new Uint8Array());
+    expect(pcm.tracks[0]?.bitrate).toBe(1_411_200);
+  });
+
   test('retains AVC description/framing, semantic payload, and absent DTS without synthesis', () => {
     const description = new Uint8Array([1, 100, 0, 40, 0xff, 0xe1]);
     const track = {

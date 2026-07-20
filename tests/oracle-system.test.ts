@@ -15,6 +15,7 @@ import {
   type OracleContext,
 } from '../src/core/oracles.ts';
 import { readOutputPacketsResult, readOutputStructure } from '../src/core/box-readers.ts';
+import { sha256Hex as sha256HexSync } from '../src/core/canonical-json.ts';
 import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
 
 test('neutral MP4 structure duration does not truncate a complete media timeline behind a short mvhd', async () => {
@@ -31,6 +32,34 @@ test.each([
   const bytes = new Uint8Array(await Bun.file(`fixtures/media/${name}`).arrayBuffer());
   const structure = readOutputStructure(bytes, 'mp4');
   expect(structure?.tracks.map((track) => track.protectionScheme).filter(Boolean)).toEqual([...expected]);
+});
+
+test('neutral structure exposes ISO and Matroska default/language facts', async () => {
+  const protectedBytes = new Uint8Array(await Bun.file('fixtures/media/cenc_ctr.mp4').arrayBuffer());
+  const protectedStructure = readOutputStructure(protectedBytes);
+  expect(protectedStructure?.tracks.map((track) => track.defaultDisposition)).toEqual([true, true]);
+
+  const mkvBytes = new Uint8Array(
+    await Bun.file('fixtures/media/scenarios/probe/h264_in_mkv/01.mkv').arrayBuffer(),
+  );
+  const mkvStructure = readOutputStructure(mkvBytes);
+  expect(mkvStructure?.tracks.map((track) => [track.language, track.defaultDisposition])).toEqual([
+    ['und', true],
+    ['eng', true],
+  ]);
+
+  const longFormBytes = new Uint8Array(
+    await Bun.file('fixtures/media/scenarios/probe/longform_1h_audio/02.mp4').arrayBuffer(),
+  );
+  const longFormStructure = readOutputStructure(longFormBytes);
+  expect(longFormStructure?.tracks.map((track) => [track.type, track.language])).toEqual([
+    ['audio', 'eng'],
+  ]);
+
+  const rotatedBytes = new Uint8Array(
+    await Bun.file('fixtures/media/h264_rotated90.mp4').arrayBuffer(),
+  );
+  expect(readOutputStructure(rotatedBytes)?.tracks[0]?.rotation).toBe(90);
 });
 
 const input: MediaInput = {
@@ -357,6 +386,78 @@ describe('REQ-ORAC-02 semantic packets', () => {
     const out = await compare(got, want);
     expect(verdict(out)).toBe('PASS');
     expect(out.reasonCode).toBe('ORACLE_REPRESENTATION_DIFF');
+  });
+
+  test('canonical adapter framing tokens and independently baked packet digests remain comparable', async () => {
+    const h264Payload = avcc([0x65, 0xaa]);
+    const canonicalToken = await compare(
+      [packet(h264Payload, { framing: 'avc', decoderConfig: [1, 2, 3] })],
+      [packet(h264Payload, { framing: 'length-prefixed', decoderConfig: [1, 2, 3] })],
+    );
+    expect(verdict(canonicalToken)).toBe('PASS');
+
+    const aacMeta: NormalizedMetadata = {
+      container: 'mp4', durationSec: 1,
+      tracks: [{ type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 }],
+    };
+    const aacPayload = [1, 2, 3, 4];
+    const digest = sha256HexSync(Uint8Array.from(aacPayload));
+    const measured = [packet(aacPayload, {
+      trackIndex: 0, framing: 'raw', payloadDigest: digest, decoderConfig: [0x11, 0x90],
+    })];
+    const baked = [{
+      trackIndex: 0, size: aacPayload.length, ptsUs: 0, dtsUs: 0, keyframe: true,
+      framing: 'raw', payloadDigest: digest, decoderConfig: [0x11, 0x90],
+    }] as PacketInfo[];
+    expect(verdict(await compare(measured, baked, aacMeta, aacMeta))).toBe('PASS');
+
+    const corrupt = structuredClone(measured);
+    corrupt[0]!.payload = Uint8Array.from([1, 2, 3, 5]);
+    const conflict = await compare(corrupt, baked, aacMeta, aacMeta);
+    expect(conflict.state).toBe('ERROR');
+    if (conflict.state === 'ERROR') expect(conflict.reasonCode).toBe('ORACLE_PACKET_PAYLOAD_DIGEST_CONFLICT');
+  });
+
+  test('explicit AVC length framing cannot be mistaken for an Annex-B prefix', async () => {
+    const payload = new Array<number>(403).fill(0x55);
+    payload.splice(0, 5, 0x00, 0x00, 0x01, 0x8f, 0x41);
+    const framed = packet(payload, { framing: 'avc', nalLengthSize: 4, decoderConfig: [1, 2, 3] });
+    expect(verdict(await compare([framed], [{ ...framed, payload: [...payload] }]))).toBe('PASS');
+  });
+
+  test('extra measured payload evidence does not change an exact legacy ffprobe-row verdict', async () => {
+    const payload = avcc([0x65, 0xaa]);
+    const measured = packet(payload, {
+      framing: 'avc',
+      payloadDigest: sha256HexSync(Uint8Array.from(payload)),
+    });
+    const legacy = {
+      trackIndex: 0,
+      size: measured.size,
+      ptsUs: measured.ptsUs,
+      dtsUs: measured.dtsUs,
+      keyframe: measured.keyframe,
+    } as PacketInfo;
+    expect(verdict(await compare([measured], [legacy]))).toBe('PASS');
+    expect(verdict(await compare([{ ...measured, size: measured.size + 1 }], [legacy]))).toBe('FAIL');
+  });
+
+  test('DTS-unavailable rows use shared PTS identity order and audio key flags are representational', async () => {
+    const audioMeta: NormalizedMetadata = {
+      container: 'mkv', durationSec: 1,
+      tracks: [{ type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 }],
+    };
+    const payloadA = [1, 2];
+    const payloadB = [3, 4, 5];
+    const measured = [
+      { ...packet(payloadB), trackIndex: 0, ptsUs: 20_000, dtsUs: undefined, keyframe: true },
+      { ...packet(payloadA), trackIndex: 0, ptsUs: 0, dtsUs: undefined, keyframe: true },
+    ] as PacketInfo[];
+    const legacy = [
+      { trackIndex: 0, size: payloadA.length, ptsUs: 0, dtsUs: 20_000, keyframe: false },
+      { trackIndex: 0, size: payloadB.length, ptsUs: 20_000, dtsUs: 0, keyframe: false },
+    ] as PacketInfo[];
+    expect(verdict(await compare(measured, legacy, audioMeta, audioMeta))).toBe('PASS');
   });
 
   test('two legal NAL groupings are DIFF', async () => {

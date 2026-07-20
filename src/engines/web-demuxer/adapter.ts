@@ -80,8 +80,10 @@ import type {
 import {
   DECODE_TRACK_SELECTOR_SCHEMA,
   createBrowserNotSupportedError,
+  createMalformedInputError,
   createNotApplicableError,
   isBrowserNotSupportedError,
+  isMalformedInputError,
   isNotApplicableError,
 } from '../../core/engine.ts';
 
@@ -117,6 +119,7 @@ import {
   WebDemuxerPartialDecodeError,
   type TimedClosable,
 } from './temporal.ts';
+import { parseAacAudioSpecificConfig } from '../mp4box/evidence.ts';
 
 // Type-only import of the library's public surface (avoids pulling the runtime into the suite shell;
 // the real module is dynamically imported inside init()). AVMediaType is an enum used both as a type
@@ -351,6 +354,23 @@ function parsePmtAacPid(bytes: Uint8Array, start: number, packetEnd: number): nu
   return null;
 }
 
+function parsePmtVideoPid(bytes: Uint8Array, start: number, packetEnd: number): number | null {
+  if (bytes[start] !== 0x02) return null;
+  const end = Math.min(start + 3 + sectionLength(bytes, start) - 4, packetEnd);
+  const programInfoLength = ((bytes[start + 10]! & 0x0f) << 8) | bytes[start + 11]!;
+  for (let pos = start + 12 + programInfoLength; pos + 5 <= end;) {
+    const streamType = bytes[pos]!;
+    const elementaryPid = ((bytes[pos + 1]! & 0x1f) << 8) | bytes[pos + 2]!;
+    const esInfoLength = ((bytes[pos + 3]! & 0x0f) << 8) | bytes[pos + 4]!;
+    // AVC, HEVC, MPEG-2 video, and MPEG-1 video.
+    if (streamType === 0x1b || streamType === 0x24 || streamType === 0x02 || streamType === 0x01) {
+      return elementaryPid;
+    }
+    pos += 5 + esInfoLength;
+  }
+  return null;
+}
+
 function payloadOffset(bytes: Uint8Array, packetStart: number): number | null {
   const adaptationControl = (bytes[packetStart + 3]! >> 4) & 0x03;
   if (adaptationControl !== 1 && adaptationControl !== 3) return null;
@@ -423,12 +443,95 @@ export function aacAudioConfigFromMpegTs(bytes: Uint8Array): AacAudioConfig | nu
   return chunks.length ? aacAudioConfigFromAdts(concatChunks(chunks, totalLength)) : null;
 }
 
-export async function withTsAacMetadataFromInput(
-  input: MediaInput,
+function pesPts90Khz(payload: Uint8Array): number | null {
+  if (
+    payload.byteLength < 14 ||
+    payload[0] !== 0x00 ||
+    payload[1] !== 0x00 ||
+    payload[2] !== 0x01
+  ) {
+    return null;
+  }
+  const ptsDtsFlags = (payload[7]! >> 6) & 0x03;
+  if (ptsDtsFlags !== 2 && ptsDtsFlags !== 3) return null;
+  const p0 = payload[9]!;
+  const p1 = payload[10]!;
+  const p2 = payload[11]!;
+  const p3 = payload[12]!;
+  const p4 = payload[13]!;
+  if ((p0 & 1) !== 1 || (p2 & 1) !== 1 || (p4 & 1) !== 1) return null;
+  return (
+    (p0 & 0x0e) * 2 ** 29 +
+    p1 * 2 ** 22 +
+    (p2 & 0xfe) * 2 ** 14 +
+    p3 * 2 ** 7 +
+    (p4 & 0xfe) / 2
+  );
+}
+
+export function tsVideoFrameRateFromMpegTs(
+  bytes: Uint8Array,
+): { fps: number; sampleCount: number; observedIntervalUs: number; cadence: 'CFR' | 'VFR' } | null {
+  const startOffset = syncOffset(bytes);
+  if (startOffset == null) return null;
+  let pmtPid: number | null = null;
+  let videoPid: number | null = null;
+  const pts: number[] = [];
+
+  for (let packetStart = startOffset; packetStart + 188 <= bytes.byteLength; packetStart += 188) {
+    if (bytes[packetStart] !== 0x47) continue;
+    const payloadUnitStart = (bytes[packetStart + 1]! & 0x40) !== 0;
+    const pid = ((bytes[packetStart + 1]! & 0x1f) << 8) | bytes[packetStart + 2]!;
+    const offset = payloadOffset(bytes, packetStart);
+    if (offset == null) continue;
+    const packetEnd = packetStart + 188;
+
+    if (payloadUnitStart && pid === 0) {
+      const start = sectionStart(bytes, offset, packetEnd);
+      if (start != null) pmtPid = parsePatPmtPid(bytes, start, packetEnd) ?? pmtPid;
+      continue;
+    }
+    if (payloadUnitStart && pmtPid != null && pid === pmtPid) {
+      const start = sectionStart(bytes, offset, packetEnd);
+      if (start != null) videoPid = parsePmtVideoPid(bytes, start, packetEnd) ?? videoPid;
+      continue;
+    }
+    if (!payloadUnitStart || videoPid == null || pid !== videoPid) continue;
+    const value = pesPts90Khz(bytes.subarray(offset, packetEnd));
+    if (value != null) pts.push(value);
+  }
+
+  if (pts.length < 3) return null;
+  const deltas: number[] = [];
+  for (let index = 1; index < pts.length; index++) {
+    let delta = pts[index]! - pts[index - 1]!;
+    if (delta < -(2 ** 32)) delta += 2 ** 33;
+    // Discontinuities and timestamp resets are excluded; frame intervals longer than one second do
+    // not provide useful cadence evidence for the suite's video corpus.
+    if (delta > 0 && delta <= 90_000) deltas.push(delta);
+  }
+  if (deltas.length < 2) return null;
+  const ordered = [...deltas].sort((a, b) => a - b);
+  const median = ordered[Math.floor(ordered.length / 2)]!;
+  const inliers = deltas.filter((delta) => Math.abs(delta - median) <= Math.max(2, median * 0.25));
+  if (inliers.length < 2) return null;
+  const ticks = inliers.reduce((sum, delta) => sum + delta, 0);
+  const fps = (inliers.length * 90_000) / ticks;
+  const cadence = Math.max(...inliers) - Math.min(...inliers) <= Math.max(2, median * 0.001)
+    ? 'CFR'
+    : 'VFR';
+  return {
+    fps,
+    sampleCount: inliers.length,
+    observedIntervalUs: (ticks * 1_000_000) / 90_000,
+    cadence,
+  };
+}
+
+function withTsAacMetadataFromBytes(
   metadata: NormalizedMetadata,
-  signal?: AbortSignal,
-): Promise<NormalizedMetadata> {
-  throwIfAborted(signal);
+  bytes: Uint8Array,
+): NormalizedMetadata {
   if (metadata.container !== 'ts') return metadata;
   const tracks = [...metadata.tracks];
   const missingAacTracks: number[] = [];
@@ -436,17 +539,15 @@ export async function withTsAacMetadataFromInput(
   for (let i = 0; i < tracks.length; i++) {
     const track = tracks[i]!;
     if (
-      track.type !== 'audio' ||
-      track.codec !== 'aac' ||
-      (track.sampleRate != null && track.channels != null)
+      track.type === 'audio' &&
+      track.codec === 'aac' &&
+      (track.sampleRate == null || track.channels == null)
     ) {
-      continue;
+      missingAacTracks.push(i);
     }
-    missingAacTracks.push(i);
   }
-
   if (missingAacTracks.length !== 1) return metadata;
-  const config = aacAudioConfigFromMpegTs(new Uint8Array(await raceAbort(input.arrayBuffer(), signal)));
+  const config = aacAudioConfigFromMpegTs(bytes);
   if (!config) return metadata;
   const trackIndex = missingAacTracks[0]!;
   const track = tracks[trackIndex]!;
@@ -455,7 +556,6 @@ export async function withTsAacMetadataFromInput(
     sampleRate: track.sampleRate ?? config.sampleRate,
     channels: track.channels ?? config.channels,
   };
-
   return {
     ...metadata,
     tracks,
@@ -466,8 +566,19 @@ export async function withTsAacMetadataFromInput(
   };
 }
 
+export async function withTsAacMetadataFromInput(
+  input: MediaInput,
+  metadata: NormalizedMetadata,
+  signal?: AbortSignal,
+): Promise<NormalizedMetadata> {
+  throwIfAborted(signal);
+  if (metadata.container !== 'ts') return metadata;
+  const bytes = new Uint8Array(await raceAbort(input.arrayBuffer(), signal));
+  return withTsAacMetadataFromBytes(metadata, bytes);
+}
+
 /** Normalize one WebAVStream to a NormalizedTrack. */
-function normalizeStream(stream: WebAVStream): NormalizedTrack {
+export function normalizeWebDemuxerStream(stream: WebAVStream): NormalizedTrack {
   const type = trackTypeOf(stream);
   const bitrate = bitrateOf(stream.bit_rate);
   const language = languageOf(stream.tags);
@@ -479,7 +590,7 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
       ...(stream.codec_string ? { nativeCodecTag: stream.codec_string } : {}),
       width: stream.width || undefined,
       height: stream.height || undefined,
-      rotation: stream.rotation || 0,
+      rotation: normalizeWebDemuxerRotation(stream.rotation || 0),
       bitrate,
       language,
     };
@@ -487,12 +598,23 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
   }
 
   if (type === 'audio') {
+    const codec = canonicalCodec(stream.codec_name);
+    const aac = codec === 'aac' ? parseAacAudioSpecificConfig(stream.extradata) : undefined;
     return {
       type: 'audio',
-      codec: canonicalCodec(stream.codec_name),
+      codec,
       ...(stream.codec_string ? { nativeCodecTag: stream.codec_string } : {}),
-      sampleRate: stream.sample_rate || undefined,
-      channels: stream.channels || undefined,
+      sampleRate: aac?.presentationSampleRate ?? (stream.sample_rate || undefined),
+      channels: aac?.presentationChannels ?? (stream.channels || undefined),
+      ...(aac?.codedSampleRate !== undefined ? { codedSampleRate: aac.codedSampleRate } : {}),
+      ...(aac?.presentationSampleRate !== undefined
+        ? { presentationSampleRate: aac.presentationSampleRate }
+        : {}),
+      ...(aac?.codedChannels !== undefined ? { codedChannels: aac.codedChannels } : {}),
+      ...(aac?.presentationChannels !== undefined
+        ? { presentationChannels: aac.presentationChannels }
+        : {}),
+      ...(aac ? { sbrPresent: aac.sbrPresent, psPresent: aac.psPresent } : {}),
       bitrate,
       language,
     };
@@ -506,6 +628,243 @@ function normalizeStream(stream: WebAVStream): NormalizedTrack {
   };
 }
 
+/** web-demuxer/FFmpeg reports the counter-clockwise matrix angle; the suite contract is clockwise. */
+export function normalizeWebDemuxerRotation(rotation: number): number {
+  const counterClockwise = ((rotation % 360) + 360) % 360;
+  return counterClockwise === 0 ? 0 : 360 - counterClockwise;
+}
+
+interface EbmlElement {
+  id: number;
+  bodyStart: number;
+  bodyEnd: number;
+}
+
+function readEbmlVint(
+  bytes: Uint8Array,
+  offset: number,
+  keepMarker: boolean,
+): { value: number; length: number; unknown: boolean } | null {
+  const first = bytes[offset];
+  if (first == null || first === 0) return null;
+  let length = 1;
+  let marker = 0x80;
+  while (length <= 8 && (first & marker) === 0) {
+    length++;
+    marker >>= 1;
+  }
+  if (length > 8 || offset + length > bytes.byteLength) return null;
+  let value = keepMarker ? first : first & (marker - 1);
+  let unknown = !keepMarker && (first & (marker - 1)) === marker - 1;
+  for (let index = 1; index < length; index++) {
+    const next = bytes[offset + index]!;
+    value = value * 256 + next;
+    unknown &&= next === 0xff;
+  }
+  if (!Number.isSafeInteger(value) && !unknown) return null;
+  return { value, length, unknown };
+}
+
+function ebmlChildren(bytes: Uint8Array, start: number, end: number): EbmlElement[] {
+  const children: EbmlElement[] = [];
+  let offset = start;
+  while (offset < end) {
+    const id = readEbmlVint(bytes, offset, true);
+    if (!id) break;
+    const size = readEbmlVint(bytes, offset + id.length, false);
+    if (!size) break;
+    const bodyStart = offset + id.length + size.length;
+    const bodyEnd = size.unknown ? end : bodyStart + size.value;
+    if (bodyStart > end || bodyEnd > end || bodyEnd < bodyStart) break;
+    children.push({ id: id.value, bodyStart, bodyEnd });
+    if (size.unknown) break;
+    offset = bodyEnd;
+  }
+  return children;
+}
+
+function matroskaDefaultDispositions(bytes: Uint8Array): boolean[] | null {
+  const segment = ebmlChildren(bytes, 0, bytes.byteLength).find((element) => element.id === 0x18538067);
+  if (!segment) return null;
+  const tracks = ebmlChildren(bytes, segment.bodyStart, segment.bodyEnd)
+    .find((element) => element.id === 0x1654ae6b);
+  if (!tracks) return null;
+  const dispositions: boolean[] = [];
+  for (const entry of ebmlChildren(bytes, tracks.bodyStart, tracks.bodyEnd)) {
+    if (entry.id !== 0xae) continue;
+    const flag = ebmlChildren(bytes, entry.bodyStart, entry.bodyEnd)
+      .find((element) => element.id === 0x88);
+    // Matroska FlagDefault defaults to 1 when the element is absent.
+    if (!flag) {
+      dispositions.push(true);
+      continue;
+    }
+    let value = 0;
+    for (let offset = flag.bodyStart; offset < flag.bodyEnd; offset++) {
+      value = value * 256 + bytes[offset]!;
+    }
+    dispositions.push(value !== 0);
+  }
+  return dispositions.length ? dispositions : null;
+}
+
+function isoBmffMajorBrand(bytes: Uint8Array): string | null {
+  if (bytes.byteLength < 16) return null;
+  const type = String.fromCharCode(...bytes.subarray(4, 8));
+  if (type !== 'ftyp') return null;
+  return String.fromCharCode(...bytes.subarray(8, 12));
+}
+
+interface IsoBoxHeader {
+  offset: number;
+  headerSize: number;
+  end: number;
+  type: string;
+}
+
+function readIsoBoxHeader(bytes: Uint8Array, offset: number, limit: number): IsoBoxHeader | null {
+  if (offset < 0 || offset + 8 > limit || limit > bytes.byteLength) return null;
+  let size = (
+    (bytes[offset]! * 0x1000000) +
+    (bytes[offset + 1]! << 16) +
+    (bytes[offset + 2]! << 8) +
+    bytes[offset + 3]!
+  );
+  const type = String.fromCharCode(...bytes.subarray(offset + 4, offset + 8));
+  let headerSize = 8;
+  if (size === 1) {
+    if (offset + 16 > limit) return null;
+    const high = (
+      (bytes[offset + 8]! * 0x1000000) +
+      (bytes[offset + 9]! << 16) +
+      (bytes[offset + 10]! << 8) +
+      bytes[offset + 11]!
+    );
+    const low = (
+      (bytes[offset + 12]! * 0x1000000) +
+      (bytes[offset + 13]! << 16) +
+      (bytes[offset + 14]! << 8) +
+      bytes[offset + 15]!
+    );
+    size = high * 2 ** 32 + low;
+    headerSize = 16;
+  } else if (size === 0) {
+    size = limit - offset;
+  }
+  if (!Number.isSafeInteger(size) || size < headerSize || offset + size > limit) return null;
+  return { offset, headerSize, end: offset + size, type };
+}
+
+function findIsoChild(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  type: string,
+): IsoBoxHeader | null {
+  let offset = start;
+  while (offset + 8 <= end) {
+    const box = readIsoBoxHeader(bytes, offset, end);
+    if (!box) return null;
+    if (box.type === type) return box;
+    offset = box.end;
+  }
+  return null;
+}
+
+function isoAudioSampleEntryChannels(bytes: Uint8Array): number[] {
+  const moov = findIsoChild(bytes, 0, bytes.byteLength, 'moov');
+  if (!moov) return [];
+  const channels: number[] = [];
+  let offset = moov.offset + moov.headerSize;
+  while (offset + 8 <= moov.end) {
+    const trak = readIsoBoxHeader(bytes, offset, moov.end);
+    if (!trak) break;
+    offset = trak.end;
+    if (trak.type !== 'trak') continue;
+    const mdia = findIsoChild(bytes, trak.offset + trak.headerSize, trak.end, 'mdia');
+    const minf = mdia ? findIsoChild(bytes, mdia.offset + mdia.headerSize, mdia.end, 'minf') : null;
+    const stbl = minf ? findIsoChild(bytes, minf.offset + minf.headerSize, minf.end, 'stbl') : null;
+    const stsd = stbl ? findIsoChild(bytes, stbl.offset + stbl.headerSize, stbl.end, 'stsd') : null;
+    if (!stsd) continue;
+    const entryOffset = stsd.offset + stsd.headerSize + 8;
+    const entry = readIsoBoxHeader(bytes, entryOffset, stsd.end);
+    if (!entry || !['mp4a', 'enca', 'ac-3', 'ec-3', 'Opus', 'fLaC', 'alac'].includes(entry.type)) continue;
+    const channelOffset = entry.offset + entry.headerSize + 16;
+    if (channelOffset + 2 > entry.end) continue;
+    const count = (bytes[channelOffset]! << 8) | bytes[channelOffset + 1]!;
+    if (count > 0) channels.push(count);
+  }
+  return channels;
+}
+
+export function probeMetadataWithByteEvidence(
+  metadata: NormalizedMetadata,
+  bytes: Uint8Array,
+): NormalizedMetadata {
+  let enriched = withTsAacMetadataFromBytes(metadata, bytes);
+
+  if (enriched.container === 'mp4' || enriched.container === 'mov') {
+    const majorBrand = isoBmffMajorBrand(bytes);
+    const audioChannels = isoAudioSampleEntryChannels(bytes);
+    let audioIndex = 0;
+    const tracks = enriched.tracks.map((track) => {
+      if (track.type !== 'audio') return track;
+      const channelCount = audioChannels[audioIndex++];
+      return channelCount == null
+        ? track
+        : { ...track, channels: channelCount, presentationChannels: channelCount };
+    });
+    enriched = { ...enriched, tracks };
+    if (majorBrand) {
+      enriched = { ...enriched, tags: { ...(enriched.tags ?? {}), major_brand: majorBrand } };
+    }
+  }
+
+  if (enriched.container === 'webm' || enriched.container === 'mkv') {
+    const dispositions = matroskaDefaultDispositions(bytes);
+    if (dispositions) {
+      enriched = {
+        ...enriched,
+        tracks: enriched.tracks.map((track, index) =>
+          dispositions[index] === undefined
+            ? track
+            : { ...track, defaultDisposition: dispositions[index] },
+        ),
+      };
+    }
+  }
+
+  if (enriched.container === 'ts') {
+    const evidence = tsVideoFrameRateFromMpegTs(bytes);
+    const videoIndices = enriched.tracks
+      .map((track, index) => track.type === 'video' ? index : -1)
+      .filter((index) => index >= 0);
+    if (evidence && videoIndices.length === 1) {
+      const trackIndex = videoIndices[0]!;
+      const track = enriched.tracks[trackIndex]!;
+      if (track.fps == null || (
+        track.fps > 120 &&
+        Math.abs(track.fps - evidence.fps) > Math.max(0.01, evidence.fps * 0.001)
+      )) {
+        const tracks = [...enriched.tracks];
+        tracks[trackIndex] = {
+          ...track,
+          fps: evidence.fps,
+          fpsProvenance: {
+            source: 'observed',
+            cadence: evidence.cadence,
+            sampleCount: evidence.sampleCount,
+            observedIntervalUs: evidence.observedIntervalUs,
+          },
+        };
+        enriched = { ...enriched, tracks };
+      }
+    }
+  }
+
+  return enriched;
+}
+
 /** Build NormalizedMetadata from a WebMediaInfo (+ optional stream details from getAVStreams). */
 function toNormalizedMetadata(
   info: WebMediaInfo,
@@ -516,7 +875,7 @@ function toNormalizedMetadata(
   const durationSec =
     Number.isFinite(info.duration) && info.duration > 0 ? info.duration : null;
   const streams = mergeNormalizedStreams(info.streams ?? [], supplementalStreams ?? []);
-  const tracks = streams.map(normalizeStream);
+  const tracks = streams.map(normalizeWebDemuxerStream);
 
   const meta: NormalizedMetadata = { container, durationSec, tracks };
 
@@ -591,6 +950,7 @@ export interface WebDemuxerConfigUsed {
   wasmExport: 'web-demuxer/wasm';
   wasmFlavor: 'full';
   wasmUrlPolicy: 'same-origin';
+  wasmTransport: 'same-origin-url' | 'same-origin-materialized-data-url';
   readinessBoundary: 'init-load-barrier';
   cleanupBoundary: 'cancel-readers-close-frames-destroy-worker';
   parserBackend: 'worker-ffmpeg-wasm';
@@ -616,6 +976,8 @@ export interface WebDemuxerEngineDependencies {
   wasmAssetUrl?: string;
   locationHref?: string;
   now?: () => number;
+  workerRealm?: boolean;
+  fetchWasm?: (url: string, signal?: AbortSignal) => Promise<Uint8Array>;
 }
 
 /**
@@ -641,6 +1003,7 @@ export class WebDemuxerEngine implements MediaEngine {
     wasmExport: 'web-demuxer/wasm',
     wasmFlavor: 'full',
     wasmUrlPolicy: 'same-origin',
+    wasmTransport: 'same-origin-url',
     readinessBoundary: 'init-load-barrier',
     cleanupBoundary: 'cancel-readers-close-frames-destroy-worker',
     parserBackend: 'worker-ffmpeg-wasm',
@@ -669,6 +1032,8 @@ export class WebDemuxerEngine implements MediaEngine {
       now: dependencies.now ?? nowMs,
       ...(dependencies.wasmAssetUrl !== undefined ? { wasmAssetUrl: dependencies.wasmAssetUrl } : {}),
       ...(dependencies.locationHref !== undefined ? { locationHref: dependencies.locationHref } : {}),
+      ...(dependencies.workerRealm !== undefined ? { workerRealm: dependencies.workerRealm } : {}),
+      ...(dependencies.fetchWasm !== undefined ? { fetchWasm: dependencies.fetchWasm } : {}),
     };
   }
 
@@ -752,8 +1117,19 @@ export class WebDemuxerEngine implements MediaEngine {
     if ((base.protocol === 'http:' || base.protocol === 'https:') && resolved.origin !== base.origin) {
       throw new Error(`${ENGINE_ID}: refusing cross-origin WASM URL ${absWasmUrl}`);
     }
+    const workerRealm = this.dependencies.workerRealm ?? (
+      typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope
+    );
+    let packageWasmUrl = absWasmUrl;
+    if (workerRealm) {
+      const bytes = this.dependencies.fetchWasm
+        ? await raceAbort(this.dependencies.fetchWasm(absWasmUrl, context?.signal), context?.signal)
+        : await fetchSameOriginWasm(absWasmUrl, context?.signal);
+      packageWasmUrl = wasmDataUrlFromBytes(bytes);
+      this.configUsed.wasmTransport = 'same-origin-materialized-data-url';
+    }
     try {
-      const demuxer = new this.WebDemuxerCtor({ wasmFilePath: absWasmUrl });
+      const demuxer = new this.WebDemuxerCtor({ wasmFilePath: packageWasmUrl });
       this.demuxer = demuxer;
       // load() first awaits the package's private worker/WASM readiness promise and only then stores
       // the source. A zero-byte sentinel therefore provides a public readiness barrier without parse.
@@ -838,13 +1214,34 @@ export class WebDemuxerEngine implements MediaEngine {
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
 
   async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
-    const d = await this.loadInput(input, context);
-    const info = await raceAbort(d.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
-    const streams = await raceAbort(d.getAVStreams(), context?.signal, () => this.destroyDemuxer());
-    const metadata = toNormalizedMetadata(info, input, streams);
-    const normalized = await withTsAacMetadataFromInput(input, metadata, context?.signal);
-    normalized.probeEvidence = { readMode: 'whole-file' };
-    return normalized;
+    try {
+      const d = await this.loadInput(input, context);
+      const info = await raceAbort(d.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
+      const streams = await raceAbort(d.getAVStreams(), context?.signal, () => this.destroyDemuxer());
+      const metadata = toNormalizedMetadata(info, input, streams);
+      const bytes = new Uint8Array(await raceAbort(input.arrayBuffer(), context?.signal, () => this.destroyDemuxer()));
+      const normalized = probeMetadataWithByteEvidence(metadata, bytes);
+      normalized.probeEvidence = { readMode: 'whole-file' };
+      return normalized;
+    } catch (error) {
+      if (
+        context?.request.options.gracefulAllowOutput === true &&
+        !isMalformedInputError(error) &&
+        !mustPreserveError(error)
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'probe',
+          'parse',
+          describeError(error),
+          'WEB_DEMUXER_PROBE_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      if (mustPreserveError(error) || error instanceof Error) throw error;
+      throw new Error(`${ENGINE_ID}: probe failed: ${describeError(error)}`);
+    }
   }
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
@@ -1326,7 +1723,7 @@ export class WebDemuxerEngine implements MediaEngine {
     const info = await raceAbort(demuxer.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
     const supplemental = await raceAbort(demuxer.getAVStreams(), context?.signal, () => this.destroyDemuxer());
     const streams = mergeNormalizedStreams(info.streams ?? [], supplemental);
-    const runtimeTracks = streams.map(normalizeStream);
+    const runtimeTracks = streams.map(normalizeWebDemuxerStream);
     const declaredTracks = context?.request.inputs[0]?.tracks;
     const requestTracks = declaredTracks?.length ? declaredTracks : runtimeTracks;
     const selected = selectedVideoTrack(
@@ -1478,6 +1875,21 @@ export class WebDemuxerEngine implements MediaEngine {
   ): Promise<MediaBytes> {
     throw new Error(`${ENGINE_ID}: decrypt not supported (no decryption surface)`);
   }
+}
+
+async function fetchSameOriginWasm(url: string, signal?: AbortSignal): Promise<Uint8Array> {
+  const response = await raceAbort(fetch(url, { credentials: 'same-origin', signal }), signal);
+  if (!response.ok) throw new Error(`failed to materialize web-demuxer WASM: HTTP ${response.status}`);
+  return new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+}
+
+export function wasmDataUrlFromBytes(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return `data:application/wasm;base64,${btoa(binary)}`;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────

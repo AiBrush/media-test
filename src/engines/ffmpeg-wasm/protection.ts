@@ -82,12 +82,15 @@ export function inspectIsoBmffProtection(bytes: Uint8Array): ProtectionInspectio
   let protectedTracks = 0;
   let observedScheme: string | undefined;
   let unsupported: ProtectionInspection['unsupported'];
+  const protectedIvSizeByTrackId = new Map<number, number>();
   const remember = (reasonCode: string, reason: string): void => {
     unsupported ??= { reasonCode, reason };
   };
 
   for (const trak of moovChildren.filter((box) => box.type === 'trak')) {
-    const mdia = requireBox(boxes(bytes, trak.bodyStart, trak.bodyEnd, 'trak'), 'mdia', 'trak');
+    const trakChildren = boxes(bytes, trak.bodyStart, trak.bodyEnd, 'trak');
+    const trackId = trackIdFromTkhd(bytes, requireBox(trakChildren, 'tkhd', 'trak'));
+    const mdia = requireBox(trakChildren, 'mdia', 'trak');
     const minf = requireBox(boxes(bytes, mdia.bodyStart, mdia.bodyEnd, 'trak/mdia'), 'minf', 'trak/mdia');
     const stbl = requireBox(boxes(bytes, minf.bodyStart, minf.bodyEnd, 'trak/mdia/minf'), 'stbl', 'trak/mdia/minf');
     const stblChildren = boxes(bytes, stbl.bodyStart, stbl.bodyEnd, 'trak/mdia/minf/stbl');
@@ -116,6 +119,11 @@ export function inspectIsoBmffProtection(bytes: Uint8Array): ProtectionInspectio
       const schi = requireBox(sinfChildren, 'schi', 'sinf');
       const tenc = requireBox(boxes(bytes, schi.bodyStart, schi.bodyEnd, 'sinf/schi'), 'tenc', 'sinf/schi');
       const tencInfo = inspectTenc(bytes, tenc);
+      const priorIvSize = protectedIvSizeByTrackId.get(trackId);
+      if (priorIvSize !== undefined && priorIvSize !== tencInfo.ivSize) {
+        throw new Error(`${ENGINE_ID}: protected track ${trackId} has inconsistent per-sample IV sizes`);
+      }
+      protectedIvSizeByTrackId.set(trackId, tencInfo.ivSize);
 
       if (scheme !== 'cenc') {
         remember(
@@ -149,8 +157,11 @@ export function inspectIsoBmffProtection(bytes: Uint8Array): ProtectionInspectio
       }
       for (const traf of moofChildren.filter((box) => box.type === 'traf')) {
         const trafChildren = boxes(bytes, traf.bodyStart, traf.bodyEnd, 'moof/traf');
-        requireBox(trafChildren, 'tfhd', 'moof/traf');
+        const trackId = trackIdFromTfhd(bytes, requireBox(trafChildren, 'tfhd', 'moof/traf'));
         requireBox(trafChildren, 'trun', 'moof/traf');
+        const ivSize = protectedIvSizeByTrackId.get(trackId);
+        // Clear tracks may legitimately share a fragment with protected tracks.
+        if (ivSize === undefined) continue;
         const senc = trafChildren.find((box) => box.type === 'senc');
         const saiz = trafChildren.find((box) => box.type === 'saiz');
         const saio = trafChildren.find((box) => box.type === 'saio');
@@ -158,7 +169,7 @@ export function inspectIsoBmffProtection(bytes: Uint8Array): ProtectionInspectio
         if (!senc && Boolean(saiz) !== Boolean(saio)) {
           throw new Error(`${ENGINE_ID}: fragmented auxiliary encryption info requires both saiz and saio`);
         }
-        if (senc) inspectSenc(bytes, senc, 8, remember);
+        if (senc) inspectSenc(bytes, senc, ivSize, remember);
       }
     }
     remember(
@@ -172,6 +183,24 @@ export function inspectIsoBmffProtection(bytes: Uint8Array): ProtectionInspectio
     ...(observedScheme !== undefined ? { scheme: observedScheme } : {}),
     ...(unsupported !== undefined ? { unsupported } : {}),
   };
+}
+
+function trackIdFromTkhd(bytes: Uint8Array, tkhd: IsoBox): number {
+  if (tkhd.bodyEnd - tkhd.bodyStart < 16) throw new Error(`${ENGINE_ID}: truncated tkhd`);
+  const version = bytes[tkhd.bodyStart]!;
+  if (version > 1) throw new Error(`${ENGINE_ID}: invalid tkhd version ${version}`);
+  const offset = tkhd.bodyStart + (version === 1 ? 20 : 12);
+  if (offset + 4 > tkhd.bodyEnd) throw new Error(`${ENGINE_ID}: truncated tkhd track ID`);
+  const trackId = u32(bytes, offset);
+  if (trackId === 0) throw new Error(`${ENGINE_ID}: invalid zero tkhd track ID`);
+  return trackId;
+}
+
+function trackIdFromTfhd(bytes: Uint8Array, tfhd: IsoBox): number {
+  if (tfhd.bodyEnd - tfhd.bodyStart < 8) throw new Error(`${ENGINE_ID}: truncated tfhd`);
+  const trackId = u32(bytes, tfhd.bodyStart + 4);
+  if (trackId === 0) throw new Error(`${ENGINE_ID}: invalid zero tfhd track ID`);
+  return trackId;
 }
 
 /** Syntax-first HLS key inspection used before scheme applicability is decided. */

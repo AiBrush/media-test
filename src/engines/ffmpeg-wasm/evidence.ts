@@ -115,6 +115,179 @@ export interface StructuredProbeResult {
   rawDigestInput: string;
 }
 
+/**
+ * Parse tracks from the first `Input #` block of an `ffmpeg -i` log. The loaded
+ * wasm core includes source-index and timebase diagnostics between the optional
+ * language token and the media type (for example `, 31, 1/60`).
+ */
+export function parseTracksFromLog(log: string): NormalizedTrack[] {
+  const tracks: NormalizedTrack[] = [];
+  const lines = log.split('\n');
+  let inInput = false;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]!.replace(/\r$/, '').trim();
+    if (/^Input #\d+/.test(trimmed)) {
+      inInput = true;
+      continue;
+    }
+    if (/^(Output #|Stream mapping:|Press \[q\]|At least one output|Stream #\d+:\d+ -> )/.test(trimmed)) {
+      inInput = false;
+    }
+    if (!inInput) continue;
+
+    const match = /^Stream #\d+:\d+(?:\[[^\]]*\])?(?:\(([^)]*)\))?(?:,\s*[^:]+)?:\s*(Video|Audio|Subtitle|Data):\s*(.*)$/.exec(trimmed);
+    if (!match) continue;
+    const language = match[1];
+    const kind = match[2]!.toLowerCase();
+    const rest = match[3] ?? '';
+    const track: NormalizedTrack = {
+      type: kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : kind === 'subtitle' ? 'subtitle' : 'other',
+      codec: canonicalCodec(rest.trim().split(/[\s,(]/)[0] ?? ''),
+      bitrate: null,
+      language: language && language !== 'und' ? language : null,
+    };
+    if (/\(default\)/i.test(rest)) track.defaultDisposition = true;
+
+    if (kind === 'video') {
+      const dimensions = /\b(\d{1,5})x(\d{1,5})\b/.exec(rest);
+      if (dimensions) {
+        track.width = Number(dimensions[1]);
+        track.height = Number(dimensions[2]);
+      }
+      const frameRate = /(\d+(?:\.\d+)?)\s*(?:fps|tbr)\b/.exec(rest);
+      if (frameRate) track.fps = Math.round(parseFloat(frameRate[1]!) * 1000) / 1000;
+      for (let next = i + 1; next < lines.length; next++) {
+        const sideData = lines[next]!.trim();
+        if (/^(Stream #|Input #|Output #|At least one)/.test(sideData)) break;
+        const rotation = /rotation of\s*(-?\d+(?:\.\d+)?)\s*degrees/.exec(sideData);
+        if (rotation) {
+          const degrees = parseFloat(rotation[1]!);
+          track.rotation = ((degrees % 360) + 360) % 360;
+          break;
+        }
+      }
+    } else if (kind === 'audio') {
+      const sampleRate = /(\d+)\s*Hz/.exec(rest);
+      if (sampleRate) track.sampleRate = Number(sampleRate[1]);
+      const channels = channelsFromLayout(rest);
+      if (channels !== undefined) track.channels = channels;
+      const bitDepth = pcmBitDepth(track.codec);
+      if (bitDepth !== undefined && track.sampleRate !== undefined && track.channels !== undefined) {
+        track.bitrate = bitDepth * track.sampleRate * track.channels;
+      }
+    }
+    tracks.push(track);
+  }
+  return tracks;
+}
+
+/** Canonicalize the demuxer family FFmpeg actually observed, retaining suffix precision when valid. */
+export function containerFromFfmpegLog(log: string, fallback: string): string {
+  const match = /^Input #\d+,\s*(.+?),\s+from\s+/m.exec(log);
+  if (!match) return fallback;
+  const demuxers = new Set(match[1]!.toLowerCase().split(',').map((value) => value.trim()));
+  if (demuxers.has('mov') || demuxers.has('mp4')) return fallback === 'mov' || fallback === 'mp4' ? fallback : 'mp4';
+  if (demuxers.has('matroska') || demuxers.has('webm')) return fallback === 'mkv' || fallback === 'webm' ? fallback : 'webm';
+  if (demuxers.has('mpegts')) return 'ts';
+  if (demuxers.has('hls')) return 'hls';
+  if (demuxers.has('wav')) return 'wav';
+  if (demuxers.has('aiff')) return 'aiff';
+  if (demuxers.has('caf')) return 'caf';
+  if (demuxers.has('mp3')) return 'mp3';
+  if (demuxers.has('flac')) return 'flac';
+  if (demuxers.has('ogg')) return 'ogg';
+  if (demuxers.has('aac')) return 'adts';
+  return fallback;
+}
+
+/**
+ * Recover presentation duration from an MPEG-1 Layer III Xing/Info + LAME header. FFmpeg's human
+ * `-i` log rounds duration to centiseconds, while the header retains frame count and the encoder
+ * delay/padding required for sample-accurate presentation length.
+ */
+export function parseMp3XingDurationSec(bytes: Uint8Array): number | null {
+  let frameStart = id3v2End(bytes);
+  while (frameStart + 4 <= bytes.byteLength && !isMp3FrameSync(bytes, frameStart)) frameStart++;
+  if (frameStart + 4 > bytes.byteLength) return null;
+
+  const b1 = bytes[frameStart + 1]!;
+  const b2 = bytes[frameStart + 2]!;
+  const b3 = bytes[frameStart + 3]!;
+  const versionBits = (b1 >> 3) & 0x03;
+  const layerBits = (b1 >> 1) & 0x03;
+  if (versionBits === 1 || layerBits !== 1) return null; // reserved version or not Layer III
+  const sampleRateIndex = (b2 >> 2) & 0x03;
+  if (sampleRateIndex === 3) return null;
+  const baseRates = [44_100, 48_000, 32_000] as const;
+  const sampleRate = baseRates[sampleRateIndex]! / (versionBits === 3 ? 1 : versionBits === 2 ? 2 : 4);
+  const samplesPerFrame = versionBits === 3 ? 1152 : 576;
+  const mono = ((b3 >> 6) & 0x03) === 3;
+  const sideInfoBytes = versionBits === 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+  const crcBytes = (b1 & 0x01) === 0 ? 2 : 0;
+  const xing = frameStart + 4 + crcBytes + sideInfoBytes;
+  if (xing + 12 > bytes.byteLength) return null;
+  const marker = String.fromCharCode(bytes[xing]!, bytes[xing + 1]!, bytes[xing + 2]!, bytes[xing + 3]!);
+  if (marker !== 'Xing' && marker !== 'Info') return null;
+
+  const flags = readU32Be(bytes, xing + 4);
+  let offset = xing + 8;
+  if ((flags & 0x01) === 0 || offset + 4 > bytes.byteLength) return null;
+  const frameCount = readU32Be(bytes, offset);
+  offset += 4;
+  if ((flags & 0x02) !== 0) offset += 4;
+  if ((flags & 0x04) !== 0) offset += 100;
+  if ((flags & 0x08) !== 0) offset += 4;
+  if (frameCount === 0 || offset + 24 > bytes.byteLength) return null;
+
+  let delay = 0;
+  let padding = 0;
+  const encoder = new TextDecoder('ascii').decode(bytes.subarray(offset, Math.min(offset + 9, bytes.byteLength)));
+  if (/^(?:LAME|Lavf|Lavc)/.test(encoder) && offset + 24 <= bytes.byteLength) {
+    delay = (bytes[offset + 21]! << 4) | (bytes[offset + 22]! >> 4);
+    padding = ((bytes[offset + 22]! & 0x0f) << 8) | bytes[offset + 23]!;
+  }
+  const presentationSamples = frameCount * samplesPerFrame - delay - padding;
+  return presentationSamples > 0 ? presentationSamples / sampleRate : null;
+}
+
+function id3v2End(bytes: Uint8Array): number {
+  if (
+    bytes.byteLength < 10 ||
+    bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33 ||
+    (bytes[6]! | bytes[7]! | bytes[8]! | bytes[9]!) >= 0x80
+  ) return 0;
+  const size = (bytes[6]! << 21) | (bytes[7]! << 14) | (bytes[8]! << 7) | bytes[9]!;
+  const footer = (bytes[5]! & 0x10) !== 0 ? 10 : 0;
+  return Math.min(bytes.byteLength, 10 + size + footer);
+}
+
+function isMp3FrameSync(bytes: Uint8Array, offset: number): boolean {
+  return bytes[offset] === 0xff && (bytes[offset + 1]! & 0xe0) === 0xe0;
+}
+
+function readU32Be(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! * 0x1000000 + (bytes[offset + 1]! << 16) + (bytes[offset + 2]! << 8) + bytes[offset + 3]!;
+}
+
+function channelsFromLayout(value: string): number | undefined {
+  const layout = value.toLowerCase();
+  if (/\bstereo\b/.test(layout)) return 2;
+  if (/\bmono\b/.test(layout)) return 1;
+  if (/\b7\.1\b/.test(layout)) return 8;
+  if (/\b6\.1\b/.test(layout)) return 7;
+  if (/\b5\.1\b/.test(layout)) return 6;
+  if (/\bquad\b/.test(layout)) return 4;
+  const channels = /(\d+)\s*channels?/.exec(layout);
+  return channels ? Number(channels[1]) : undefined;
+}
+
+function pcmBitDepth(codec: string): number | undefined {
+  if (codec === 'pcm-s16') return 16;
+  if (codec === 'pcm-s24') return 24;
+  if (codec === 'pcm-f32') return 32;
+  return undefined;
+}
+
 export function parseFfprobeJson(text: string, container: string): StructuredProbeResult {
   const root = parseRecord(text, 'ffprobe JSON');
   const format = record(root.format);

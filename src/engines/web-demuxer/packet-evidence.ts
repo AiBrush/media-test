@@ -64,9 +64,26 @@ export function frameRateFromStream(
     : undefined;
 
   if (average && Number.isSafeInteger(sampleCount) && sampleCount > 0 && durationUs > 0) {
-    const fps = (sampleCount * 1_000_000) / durationUs;
+    const observedFps = (sampleCount * 1_000_000) / durationUs;
+    // FFmpeg's stream duration commonly includes the final sample duration while nb_frames counts
+    // presentation instants. Dividing those two values then shifts an otherwise exact CFR rational
+    // by roughly one frame. Keep that sampled cross-check, but use the reported rational as nominal
+    // evidence when the two views materially disagree.
+    if (Math.abs(observedFps - average.value) > Math.max(0.001, average.value * 0.001)) {
+      return {
+        fps: average.value,
+        provenance: {
+          source: 'nominal',
+          sampleCount,
+          observedIntervalUs: durationUs,
+          rational: { numerator: average.numerator, denominator: average.denominator },
+          cadence,
+          ...(envelope ? { envelope } : {}),
+        },
+      };
+    }
     return {
-      fps,
+      fps: observedFps,
       provenance: {
         source: 'average',
         sampleCount,

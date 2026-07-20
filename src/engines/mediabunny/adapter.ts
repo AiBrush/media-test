@@ -135,6 +135,7 @@ import {
   readHlsPlaylistProbeEvidence,
 } from '../../features/probe/hls.ts';
 import { probeBudgetFromOptions } from '../../features/probe/budget.ts';
+import { demuxScaleContractFromOptions } from '../../features/demux/scale.ts';
 import type {
   SinkTrace,
   SinkTraceEvent,
@@ -344,6 +345,8 @@ interface OpenInputOptions {
   trace?: MediabunnyHlsReadTrace;
   starvation?: PipelineStarvationSampler;
   authenticatedRangeTrace?: MediabunnyAuthenticatedRangeTrace;
+  /** Physical source bytes delivered to the framework, reported as deltas. */
+  onSourceRead?: (bytes: number) => void;
 }
 
 const AUTHENTICATED_URL_CACHE_BYTES = 16 * 1024 * 1024;
@@ -393,6 +396,7 @@ async function authenticatedBlock(
   trace: MediabunnyAuthenticatedRangeTrace,
   fetchImpl: typeof fetch,
   init?: RequestInit,
+  onSourceRead?: (bytes: number) => void,
 ): Promise<Uint8Array> {
   const blockStart = blockIndex * attestation.chunkSizeBytes;
   const blockEnd = Math.min(attestation.sizeBytes, blockStart + attestation.chunkSizeBytes) - 1;
@@ -420,6 +424,7 @@ async function authenticatedBlock(
   const bytes = new Uint8Array(await response.arrayBuffer());
   trace.blockRequests += 1;
   trace.bytesRead += bytes.byteLength;
+  onSourceRead?.(bytes.byteLength);
   const expectedSize = blockEnd - blockStart + 1;
   if (bytes.byteLength !== expectedSize) {
     throw deliveryError(
@@ -451,6 +456,7 @@ export function createMediabunnyAuthenticatedRangeFetch(
   attestation: MediaInputContentAttestation,
   trace: MediabunnyAuthenticatedRangeTrace,
   fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
+  onSourceRead?: (bytes: number) => void,
 ): typeof fetch {
   return async (resource, init) => {
     const url = requestUrl(resource);
@@ -489,6 +495,7 @@ export function createMediabunnyAuthenticatedRangeFetch(
             trace,
             fetchImpl,
             init,
+            onSourceRead,
           );
           const offset = cursor - blockStart;
           const take = Math.min(bytes.byteLength - offset, endExclusive - cursor);
@@ -518,12 +525,13 @@ export function createMediabunnyAuthenticatedRangeFetch(
 
 async function openInput(mb: MB, input: MediaInput, container?: string, options: OpenInputOptions = {}): Promise<Input> {
   if (isHlsAsset(input, container)) {
-    if (input.mutated || options.hlsKeyBytes || options.trace) {
-      // A CustomPathedSource keeps relative segment/key resolution while making the root playlist
-      // bytes authoritative. This is the only safe way to ensure a mutated root is not silently
-      // reread from its pristine URL.
+    {
+      // A CustomPathedSource keeps relative/absolute segment and key resolution while making the
+      // verified root bytes authoritative. This is required even for an unmutated root: the runner
+      // may bind the playlist to a blob URL whose sealed child URIs cannot be resolved by UrlSource.
       const startedAt = nowMs();
       const rootBytes = new Uint8Array(await input.arrayBuffer());
+      options.onSourceRead?.(rootBytes.byteLength);
       options.starvation?.noteSourceWait(nowMs() - startedAt);
       const rootDigest = await sha256Hex(rootBytes);
       const playlist = new TextDecoder().decode(rootBytes);
@@ -546,18 +554,13 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
           options.trace?.reads.push({ path: resolved, source: 'caller-key', disposition: 'read' });
           return new mb.BufferSource(options.hlsKeyBytes);
         }
-        return new mb.UrlSource(resolved, options.trace
-          ? { fetchFn: traceHlsFetch(options.trace, resolved) }
-          : undefined);
+        return new mb.UrlSource(resolved, {
+          ...(options.trace ? { fetchFn: traceHlsFetch(options.trace, resolved) } : {}),
+          getRetryDelay: () => null,
+        });
       });
       return new mb.Input({ source, formats: mb.HLS_FORMATS });
     }
-    // PathedSource (UrlSource) is mandatory for HLS segment resolution. The library's HLS_FORMATS
-    // keeps HLS first while also allowing child TS/MP4/AAC/MP3 segments to be recognized.
-    return new mb.Input({
-      source: new mb.UrlSource(input.url),
-      formats: mb.HLS_FORMATS,
-    });
   }
   const formats: InputFormat[] = [];
   if (container) {
@@ -567,6 +570,7 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
   if (isBlobUrl(input.url)) {
     const startedAt = nowMs();
     const buffer = await input.arrayBuffer();
+    options.onSourceRead?.(buffer.byteLength);
     options.starvation?.noteSourceWait(nowMs() - startedAt);
     return new mb.Input({
       source: new mb.BufferSource(buffer),
@@ -587,6 +591,8 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
             input.url,
             input.contentAttestation,
             authenticatedRangeTrace,
+            globalThis.fetch.bind(globalThis),
+            options.onSourceRead,
           ),
           getRetryDelay: () => null,
           maxCacheSize: AUTHENTICATED_URL_CACHE_BYTES,
@@ -602,6 +608,7 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
   }
   const startedAt = nowMs();
   const blob = await input.blob();
+  options.onSourceRead?.(blob.size);
   options.starvation?.noteSourceWait(nowMs() - startedAt);
   return new mb.Input({
     source: new mb.BlobSource(blob),
@@ -1036,6 +1043,113 @@ export function representationForCodec(
   };
 }
 
+/**
+ * Mediabunny's packet `type` identifies H.264 IDR pictures, but non-IDR I/SI pictures are also
+ * surfaced as random-access packets by the suite's neutral ffprobe evidence. Read the two leading
+ * unsigned Exp-Golomb fields from each VCL slice so the adapter reports the complete coded-picture
+ * kind without retaining packet payloads. `undefined` means that no complete VCL slice was found.
+ */
+export function h264PacketKeyframe(
+  data: Uint8Array,
+  framing: string | undefined,
+  nalLengthSize = 4,
+): boolean | undefined {
+  let sawVcl = false;
+  for (const nal of h264PacketNals(data, framing, nalLengthSize)) {
+    if (nal.byteLength < 2) continue;
+    const nalType = nal[0]! & 0x1f;
+    if (nalType === 5) return true;
+    if (nalType !== 1) continue;
+    sawVcl = true;
+    const bits = new H264RbspBitReader(nal.subarray(1));
+    if (bits.readUe() === undefined) return undefined;
+    const sliceType = bits.readUe();
+    if (sliceType === undefined) return undefined;
+    const primarySliceType = sliceType % 5;
+    if (primarySliceType === 2 || primarySliceType === 4) return true;
+  }
+  return sawVcl ? false : undefined;
+}
+
+function h264PacketNals(data: Uint8Array, framing: string | undefined, nalLengthSize: number): Uint8Array[] {
+  if (framing === 'avc' || framing === 'length-prefixed') {
+    if (!Number.isSafeInteger(nalLengthSize) || nalLengthSize < 1 || nalLengthSize > 4) return [];
+    const nals: Uint8Array[] = [];
+    let offset = 0;
+    while (offset + nalLengthSize <= data.byteLength) {
+      let length = 0;
+      for (let index = 0; index < nalLengthSize; index++) length = length * 256 + data[offset + index]!;
+      offset += nalLengthSize;
+      if (length <= 0 || offset + length > data.byteLength) return [];
+      nals.push(data.subarray(offset, offset + length));
+      offset += length;
+    }
+    return offset === data.byteLength ? nals : [];
+  }
+
+  if (framing === 'annexb' || framing === 'annex-b') {
+    const starts: Array<{ prefix: number; nal: number }> = [];
+    for (let offset = 0; offset + 3 <= data.byteLength; offset++) {
+      if (data[offset] !== 0 || data[offset + 1] !== 0) continue;
+      if (data[offset + 2] === 1) {
+        starts.push({ prefix: offset, nal: offset + 3 });
+        offset += 2;
+      } else if (offset + 4 <= data.byteLength && data[offset + 2] === 0 && data[offset + 3] === 1) {
+        starts.push({ prefix: offset, nal: offset + 4 });
+        offset += 3;
+      }
+    }
+    return starts.map((start, index) =>
+      data.subarray(start.nal, index + 1 < starts.length ? starts[index + 1]!.prefix : data.byteLength));
+  }
+
+  return data.byteLength > 0 ? [data] : [];
+}
+
+class H264RbspBitReader {
+  private byteOffset = 0;
+  private bitOffset = 0;
+  private zeroRun = 0;
+
+  constructor(private readonly bytes: Uint8Array) {}
+
+  readUe(): number | undefined {
+    let zeroBits = 0;
+    while (true) {
+      const bit = this.readBit();
+      if (bit === undefined) return undefined;
+      if (bit === 1) break;
+      zeroBits++;
+      if (zeroBits > 31) return undefined;
+    }
+    let suffix = 0;
+    for (let index = 0; index < zeroBits; index++) {
+      const bit = this.readBit();
+      if (bit === undefined) return undefined;
+      suffix = suffix * 2 + bit;
+    }
+    return 2 ** zeroBits - 1 + suffix;
+  }
+
+  private readBit(): number | undefined {
+    while (this.bitOffset === 0 && this.byteOffset < this.bytes.byteLength &&
+      this.zeroRun >= 2 && this.bytes[this.byteOffset] === 0x03) {
+      this.byteOffset++;
+      this.zeroRun = 0;
+    }
+    if (this.byteOffset >= this.bytes.byteLength) return undefined;
+    const byte = this.bytes[this.byteOffset]!;
+    const bit = (byte >> (7 - this.bitOffset)) & 1;
+    this.bitOffset++;
+    if (this.bitOffset === 8) {
+      this.bitOffset = 0;
+      this.byteOffset++;
+      this.zeroRun = byte === 0 ? this.zeroRun + 1 : 0;
+    }
+    return bit;
+  }
+}
+
 function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): void {
   let originUs = Infinity;
   for (const chunk of chunks) {
@@ -1071,8 +1185,12 @@ function applyObservedFrameRateEvidence(
   let cadence: NonNullable<NormalizedTrack['fpsProvenance']>['cadence'] = 'UNKNOWN';
   let envelope: { minFps: number; maxFps: number } | undefined;
   if (intervals.length > 0) {
-    const minInterval = Math.min(...intervals);
-    const maxInterval = Math.max(...intervals);
+    let minInterval = Infinity;
+    let maxInterval = 0;
+    for (const interval of intervals) {
+      minInterval = Math.min(minInterval, interval);
+      maxInterval = Math.max(maxInterval, interval);
+    }
     const meanInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
     // Integer timebases make NTSC-like CFR alternate by one tick. Treat <=0.1%/2us jitter as CFR,
     // while preserving a real cadence envelope whenever packet timing varies materially.
@@ -3147,15 +3265,40 @@ export class MediabunnyEngine implements MediaEngine {
    */
   async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
     this.assertRuntimeSupport(context);
-    const mbInput = await openInput(this.lib, input);
-    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
+    const scaleContract = demuxScaleContractFromOptions(context?.request.options);
+    const containerHint = context?.request.inputs[0]?.container;
+    const neutralStructure = !scaleContract && !isHlsAsset(input, containerHint) &&
+      /^(?:mp4|mov|mkv|webm)$/.test(containerHint ?? '')
+      ? readOutputStructure(new Uint8Array(await input.arrayBuffer()), containerHint) ?? undefined
+      : undefined;
+    const operationStart = nowMs();
+    let sourceBytesRead = 0;
+    const onSourceRead = scaleContract && context
+      ? (bytes: number): void => {
+          sourceBytesRead += bytes;
+          if (!context.signal.aborted) {
+            context.emit({
+              type: 'bytes-read',
+              atMs: Math.max(0, nowMs() - operationStart),
+              bytes: sourceBytesRead,
+            });
+          }
+        }
+      : undefined;
+    let mbInput: Input | undefined;
+    let unbindAbort = (): void => undefined;
     try {
-      const metadata = await metadataFromInput(mbInput, input);
+      mbInput = await openInput(this.lib, input, undefined, { ...(onSourceRead ? { onSourceRead } : {}) });
+      unbindAbort = bindAbortToInput(mbInput, context?.signal);
+      const metadata = await metadataFromInput(mbInput, input, {
+        ...(!scaleContract ? { audioPresentationWith: this.lib } : {}),
+        ...(neutralStructure ? { neutralStructure } : {}),
+      });
       const tracks = await mbInput.getTracks();
       const packets: PacketInfo[] = [];
       const representations: NonNullable<DemuxResult['representations']> = [];
       let bytesRead = 0;
-      const operationStart = nowMs();
+      let lastPacketAtMs: number | undefined;
 
       for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
         const track = tracks[trackIndex];
@@ -3191,32 +3334,65 @@ export class MediabunnyEngine implements MediaEngine {
           verifyKeyPackets: true,
         })) {
           const ptsUs = pkt.microsecondTimestamp;
-          const payload = copyBytes(pkt.data);
-          bytesRead += payload.byteLength;
+          const payload = scaleContract ? undefined : copyBytes(pkt.data);
+          const keyframe = normalized.codec === 'h264'
+            ? h264PacketKeyframe(pkt.data, representation.framing, representation.nalLengthSize) ?? pkt.type === 'key'
+            : pkt.type === 'key';
+          bytesRead += pkt.byteLength;
           const packet: PacketInfo = {
             trackIndex,
             size: pkt.byteLength,
             ptsUs,
             // Mediabunny exposes decode ordering via sequenceNumber, not a decode timestamp.
             // Absence is explicit; packetOrdering/accessUnitId retain the observed ordering.
-            keyframe: pkt.type === 'key',
+            keyframe,
             durationUs: pkt.microsecondDuration,
             trackType: normalized.type,
             codec: normalized.codec,
-            payload,
-            payloadDigest: await sha256Hex(payload),
-            accessUnitId: pkt.sequenceNumber >= 0 ? `${trackIndex}:${pkt.sequenceNumber}` : `${trackIndex}:unknown:${packets.length}`,
+            ...(payload ? { payload, payloadDigest: await sha256Hex(payload) } : {}),
+            ...(!scaleContract
+              ? { accessUnitId: pkt.sequenceNumber >= 0 ? `${trackIndex}:${pkt.sequenceNumber}` : `${trackIndex}:unknown:${packets.length}` }
+              : {}),
             framing: representation.framing,
             ...(representation.nalLengthSize ? { nalLengthSize: representation.nalLengthSize } : {}),
-            randomAccessKind: pkt.type === 'key' ? 'bitstream-verified-key' : 'dependent',
+            ...(observedPackets.length === 0 && description ? { decoderConfig: copyBytes(description) } : {}),
+            randomAccessKind: keyframe ? 'bitstream-verified-key' : 'dependent',
           };
           packets.push(packet);
           observedPackets.push(packet);
           if (context && !context.signal.aborted) {
-            context.emit({ type: 'bytes-read', atMs: Math.max(0, nowMs() - operationStart), bytes: bytesRead });
+            const packetAtMs = Math.max(0, nowMs() - operationStart);
+            if (scaleContract) {
+              lastPacketAtMs = packetAtMs;
+              if (packets.length === 1) {
+                context.emit({ type: 'progress', atMs: packetAtMs, determinate: false });
+              }
+            } else {
+              context.emit({ type: 'bytes-read', atMs: packetAtMs, bytes: bytesRead });
+            }
           }
         }
         applyObservedFrameRateEvidence(normalized, observedPackets);
+      }
+
+      if (scaleContract && context && !context.signal.aborted && packets.length > 1 && lastPacketAtMs !== undefined) {
+        context.emit({ type: 'progress', atMs: lastPacketAtMs, determinate: false });
+      }
+
+      const robustness = context?.request.options.robustness;
+      if (
+        packets.length === 0 &&
+        isPlainObject(robustness) &&
+        robustness.schema === 'media-test/robustness-contract@1'
+      ) {
+        throw createMalformedInputError(
+          this.id,
+          'demux',
+          'parse',
+          'demux produced no structurally valid packet survivor',
+          'MEDIABUNNY_DEMUX_EMPTY_PARTIAL',
+          input.id,
+        );
       }
 
       return {
@@ -3224,11 +3400,29 @@ export class MediabunnyEngine implements MediaEngine {
         packets,
         packetOrdering: 'decode',
         representations,
-        telemetry: { bytesRead, packetCount: packets.length },
+        telemetry: { bytesRead: scaleContract ? sourceBytesRead : bytesRead, packetCount: packets.length },
       };
+    } catch (error) {
+      const robustness = context?.request.options.robustness;
+      if (
+        error instanceof this.lib.UnsupportedInputFormatError &&
+        isPlainObject(robustness) &&
+        robustness.schema === 'media-test/robustness-contract@1'
+      ) {
+        throw createMalformedInputError(
+          this.id,
+          'demux',
+          'parse',
+          'Mediabunny rejected the declared malformed demux input',
+          'MEDIABUNNY_DEMUX_INPUT_MALFORMED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       unbindAbort();
-      mbInput.dispose();
+      mbInput?.dispose();
     }
   }
 

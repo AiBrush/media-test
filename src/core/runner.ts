@@ -126,7 +126,7 @@ import { disabledCellReason } from './disabled-cells.ts';
 // Per-scenario media-file rotation (§6/§10): the ONE seeded RNG shared with media-selection, plus the
 // selection API. The runner only decides WHICH file is fetched — it never mutates bytes, softens an
 // oracle, or routes a real defect to NA (hard rules R1/R2/R3).
-import { mulberry32, hashSeed } from './seeded-rng.ts';
+import { mulberry32, hashSeed, sha256Hex } from './seeded-rng.ts';
 import {
   loadScenarioSources,
   selectForRun,
@@ -1030,6 +1030,17 @@ async function resolvedInputMissingReason(resolved: ResolvedInput, signal?: Abor
   try {
     const res = await fetch(url, { method: 'HEAD', cache: 'no-store', ...(signal ? { signal } : {}) });
     if (res.status === 404) {
+      // Baked candidates retain a scenario-qualified logical identity while their canonical bytes
+      // also live at the flat manifest id. Some older bake plans omitted the redundant scenario
+      // mirror; admit the manifest path only when that distinct, declared id is actually present.
+      if (resolved.id !== resolved.urlAssetPath) {
+        const baked = await fetch(mediaAssetUrl(resolved.id), {
+          method: 'HEAD',
+          cache: 'no-store',
+          ...(signal ? { signal } : {}),
+        });
+        if (baked.ok) return undefined;
+      }
       return `selected file missing on disk: '${resolved.urlAssetPath}' (404 ${res.statusText})`;
     }
   } catch {
@@ -1069,7 +1080,10 @@ function buildMediaInput(
   let cached: Promise<ArrayBuffer> | undefined;
   const fetchBytes = (): Promise<ArrayBuffer> => {
     if (!cached) {
-      cached = fetch(url, signal ? { signal } : undefined).then((res) => {
+      cached = fetch(url, signal ? { signal } : undefined).then(async (res) => {
+        if (res.status === 404 && urlAssetPath !== undefined && urlAssetPath !== assetId) {
+          res = await fetch(mediaAssetUrl(assetId), signal ? { signal } : undefined);
+        }
         if (!res.ok) throw new Error(`failed to fetch corpus asset '${assetId}' (${res.status} ${res.statusText})`);
         return res.arrayBuffer();
       });
@@ -1119,7 +1133,14 @@ function buildDeliveredMediaInput(
   mutated: boolean,
 ): { input: MediaInput; objectUrl: string } {
   const mime = mimeForAssetId(resolved.id);
-  const blob = new Blob([delivered.slice().buffer], { type: mime });
+  // `delivered` is already an adapter-private copy made by buildVerifiedMediaInput/rebinding. Keep
+  // one tight buffer and return that same sealed body to the single adapter invocation; another
+  // artifact-sized slice during the measured operation makes the huge/massive memory contract
+  // impossible despite no engine-side retention.
+  const deliveredBuffer = delivered.byteOffset === 0 && delivered.byteLength === delivered.buffer.byteLength
+    ? delivered.buffer as ArrayBuffer
+    : delivered.slice().buffer as ArrayBuffer;
+  const blob = new Blob([deliveredBuffer], { type: mime });
   if (typeof URL.createObjectURL !== 'function') {
     throw new Error('[VERIFIED_TRANSPORT_UNAVAILABLE] URL.createObjectURL is unavailable');
   }
@@ -1132,7 +1153,7 @@ function buildDeliveredMediaInput(
       ...(!mutated ? { sizeBytes: delivered.byteLength } : {}),
       mutated,
       async arrayBuffer(): Promise<ArrayBuffer> {
-        return delivered.slice().buffer as ArrayBuffer;
+        return deliveredBuffer;
       },
       async blob(): Promise<Blob> {
         return blob;
@@ -1189,6 +1210,35 @@ function boundedProbeStreamTransportEligible(
     hlsResourceIndexFromOptions(scenario.options) === undefined &&
     !/\.m3u8?(?:$|[?#])/i.test(root.id) &&
     !/\.m3u8?(?:$|[?#])/i.test(root.urlAssetPath);
+}
+
+/**
+ * Demux/probe HLS rows use the same committed closure evidence as encryption rows, but their
+ * scenario contract does not carry encryption key provenance. Infer only the conventional baked
+ * resource-index URL for a plain corpus asset id; rotated/real paths still need an explicit
+ * contract and can never borrow another asset's sidecars.
+ */
+function hlsClosureOptions(options: unknown, root: ResolvedInput): unknown | undefined {
+  if (hlsResourceIndexFromOptions(options)) return options;
+  if (
+    root.id !== root.urlAssetPath &&
+    /^[A-Za-z0-9._-]+\.m3u8$/i.test(root.id)
+  ) {
+    const existing = recordOption(options) ?? {};
+    const robustness = recordOption(existing.robustness) ?? {};
+    const probe = recordOption(robustness.probe) ?? {};
+    return {
+      ...existing,
+      robustness: {
+        ...robustness,
+        probe: {
+          ...probe,
+          hlsResourceIndex: `/fixtures/golden/${root.id}.resources.json`,
+        },
+      },
+    };
+  }
+  return undefined;
 }
 
 function supportsAuthenticatedRangeProbeTransport(capabilities: CapabilitySet): boolean {
@@ -5913,11 +5963,17 @@ function assessFunctionalDemuxScale(
   const readEvents = (events ?? []).filter(
     (event): event is Extract<OperationTelemetry, { type: 'bytes-read' }> => event.type === 'bytes-read',
   );
+  const packetEvents = (events ?? []).filter(
+    (event): event is Extract<OperationTelemetry, { type: 'progress' }> =>
+      event.type === 'progress' && event.determinate === false,
+  );
   const finalReadBytes = demux.telemetry?.bytesRead ?? readEvents.at(-1)?.bytes;
-  // Existing adapters emit one cumulative bytes-read event at each packet-yield boundary when they
-  // can expose it. Cardinality equality is the conservative proof that first/last event timestamps
-  // are packet latency rather than a one-shot input-load notification.
-  const hasPacketBoundaryTrace = demux.packets.length > 0 && readEvents.length === demux.packets.length;
+  // Distinguish physical source reads (`bytes-read`) from packet-yield boundaries (indeterminate
+  // `progress`). Retain the legacy one-read-event-per-packet shape for older adapters.
+  const expectedBoundaryEvents = Math.min(2, demux.packets.length);
+  const explicitPacketBoundaryTrace = demux.packets.length > 0 && packetEvents.length === expectedBoundaryEvents;
+  const legacyPacketBoundaryTrace = demux.packets.length > 0 && readEvents.length === demux.packets.length;
+  const packetBoundaryEvents = explicitPacketBoundaryTrace ? packetEvents : readEvents;
   const observation: DemuxScaleObservation = {
     schema: 'media-test/demux-scale-observation@1',
     assetBytes: input.sizeBytes ?? 0,
@@ -5926,10 +5982,10 @@ function assessFunctionalDemuxScale(
     ...(finalReadBytes !== undefined ? { sourceBytesRead: finalReadBytes } : {}),
     longestLongTaskMs: longtasks.value.longestDurationMs,
     totalLongTaskMs: longtasks.value.totalDurationMs,
-    ...(hasPacketBoundaryTrace
+    ...(explicitPacketBoundaryTrace || legacyPacketBoundaryTrace
       ? {
-          firstPacketMs: readEvents[0]!.atMs,
-          lastPacketMs: readEvents.at(-1)!.atMs,
+          firstPacketMs: packetBoundaryEvents[0]!.atMs,
+          lastPacketMs: packetBoundaryEvents.at(-1)!.atMs,
         }
       : {}),
   };
@@ -7090,6 +7146,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const results: ScenarioResult[] = [];
   const scenarioById = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
   const fixtureIntegrityRuntime = opts.fixtureIntegrityRuntime ?? createRunFixtureIntegrityRuntime();
+  const integrityMirrorPaths = new Map<string, string[]>();
 
   // §6/§10 Per-scenario media-file rotation: pick ONE input per scenario for THIS run (seeded on
   // randomSeed, reproducible), shared by every engine so a run replays from (runSeed, corpus). A
@@ -7106,6 +7163,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   let exhaustiveCandidates = new Map<string, ScenarioSelection[]>();
   try {
     const mediaSources = await loadScenarioSources();
+    for (const [scenarioId, row] of mediaSources) {
+      for (const file of row.files) {
+        const paths = integrityMirrorPaths.get(file.sha256) ?? [];
+        const scenarioPath = `scenarios/${scenarioId}/${file.file}`;
+        if (!paths.includes(scenarioPath)) paths.push(scenarioPath);
+        if (file.poolPath && !paths.includes(file.poolPath)) paths.push(file.poolPath);
+        integrityMirrorPaths.set(file.sha256, paths);
+      }
+    }
     const scenarioContractDigests = new Map(
       scenarios.map((scenario) => [scenario.id, scenario.definitionHash] as const),
     );
@@ -7160,6 +7226,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       return { state: 'NA_ASSET', reason: declared.reason ?? '[CORPUS_IDENTITY_MISSING] invalid identity' };
     }
     const activeBytes = new Map<string, Uint8Array>();
+    const resolvedByLogicalPath = new Map(resolvedInputs.map((resolved) => [resolved.urlAssetPath, resolved]));
     for (const resolved of resolvedInputs) {
       const activeAssetId = resolved.id.includes(':') ? resolved.urlAssetPath : resolved.id;
       const active = await fixtureIntegrityRuntime.resolveMedia(activeAssetId);
@@ -7172,16 +7239,13 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         resolved.sha256 !== undefined &&
         resolved.sha256.toLowerCase() !== active.actualSha256
       ) {
-        return {
-          state: 'NA_ASSET',
-          reason: `[FIXTURE_SELECTED_DIGEST_MISMATCH] '${activeAssetId}' selected identity differs from the active generation`,
-        };
+        // A scenario-local robustness mirror may intentionally contain already-mutated bytes while
+        // the catalog identity names the original source. Do not admit it, but allow the exact SHA
+        // mirror search below to find another local copy of the declared content.
+        continue;
       }
       if (resolved.sizeBytes !== undefined && resolved.sizeBytes !== active.bytes.byteLength) {
-        return {
-          state: 'NA_ASSET',
-          reason: `[FIXTURE_SELECTED_SIZE_MISMATCH] '${activeAssetId}' selected size differs from the active generation`,
-        };
+        continue;
       }
       activeBytes.set(resolved.urlAssetPath, active.bytes);
     }
@@ -7198,8 +7262,51 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             cache: 'no-store',
             ...(opts.signal ? { signal: opts.signal } : {}),
           }).then(async (response) => {
+            const resolved = resolvedByLogicalPath.get(identity.logicalPath);
+            if (
+              response.status === 404 &&
+              resolved !== undefined &&
+              resolved.id !== resolved.urlAssetPath
+            ) {
+              response = await fetch(mediaAssetUrl(resolved.id), {
+                cache: 'no-store',
+                ...(opts.signal ? { signal: opts.signal } : {}),
+              });
+            }
             if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-            return response.arrayBuffer();
+            let bytes = new Uint8Array(await response.arrayBuffer());
+            // Scenario mirrors are a delivery optimization, not an authority. A stale mirror may
+            // exist (so a 404-only fallback is insufficient); retry the flat baked asset and let the
+            // outer integrity gate accept it only when the declared SHA/size match exactly.
+            if (
+              resolved !== undefined &&
+              resolved.id !== resolved.urlAssetPath &&
+              (bytes.byteLength !== identity.sizeBytes || sha256Hex(bytes) !== identity.sha256)
+            ) {
+              const fallback = await fetch(mediaAssetUrl(resolved.id), {
+                cache: 'no-store',
+                ...(opts.signal ? { signal: opts.signal } : {}),
+              });
+              if (!fallback.ok) throw new Error(`${fallback.status} ${fallback.statusText}`);
+              bytes = new Uint8Array(await fallback.arrayBuffer());
+            }
+            if (bytes.byteLength !== identity.sizeBytes || sha256Hex(bytes) !== identity.sha256) {
+              const mirrors = integrityMirrorPaths.get(identity.sha256) ?? [];
+              for (const logicalPath of mirrors) {
+                if (logicalPath === identity.logicalPath || logicalPath === resolved?.id) continue;
+                const mirror = await fetch(mediaAssetUrl(logicalPath), {
+                  cache: 'no-store',
+                  ...(opts.signal ? { signal: opts.signal } : {}),
+                });
+                if (!mirror.ok) continue;
+                const candidate = new Uint8Array(await mirror.arrayBuffer());
+                if (candidate.byteLength === identity.sizeBytes && sha256Hex(candidate) === identity.sha256) {
+                  bytes = candidate;
+                  break;
+                }
+              }
+            }
+            return bytes.buffer;
           }).finally(() => {
             if (inFlightByteLoads.get(identityKey) === tracked) {
               inFlightByteLoads.delete(identityKey);
@@ -7397,7 +7504,13 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         }
       }
       const scheme = recordOption(selection.effectiveScenario.options)?.scheme;
-      const hlsContract = hlsResourceIndexFromOptions(selection.effectiveScenario.options);
+      const selectedRoot = selection.resolvedInputs.length === 1
+        ? selection.resolvedInputs[0]
+        : undefined;
+      const hlsOptions = selectedRoot
+        ? hlsClosureOptions(selection.effectiveScenario.options, selectedRoot)
+        : undefined;
+      const hlsContract = hlsOptions ? hlsResourceIndexFromOptions(hlsOptions) : undefined;
       if (scheme === 'hls-aes128' || scheme === 'hls-sample-aes' || hlsContract !== undefined) {
         if (selection.resolvedInputs.length !== 1) {
           return {
@@ -7410,7 +7523,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           return { state: 'NA_ASSET', reason: '[HLS_RESOURCE_ROOT_IDENTITY_MISSING] playlist identity is incomplete' };
         }
         const closure = await preflightHlsResourceIndex(
-          selection.effectiveScenario.options,
+          hlsOptions ?? selection.effectiveScenario.options,
           {
             assetId: root.id,
             logicalPath: root.urlAssetPath,
