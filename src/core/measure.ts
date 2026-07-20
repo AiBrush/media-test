@@ -301,6 +301,7 @@ export interface MemoryPoint {
 }
 
 export interface MemoryPeakObservation {
+  schema: 'media-test/memory-window@1';
   api: MemorySampler['api'];
   baselineBytes: number;
   maximumBytes: number;
@@ -308,6 +309,12 @@ export interface MemoryPeakObservation {
   memoryAfterOperationBytes: number;
   settleWindowMs: number;
   sampleIntervalMs: number;
+  /** Whether an observation request was started immediately after the operation promise began. */
+  immediateOperationSample: boolean;
+  /** Null means the generic window was unbounded; benchmark windows use a finite audited cap. */
+  operationSampleLimit: number | null;
+  /** Per-request deadline applied independently to every baseline/operation/end/settle sample. */
+  sampleTimeoutMs: number;
   samples: MemoryPoint[];
 }
 
@@ -315,6 +322,24 @@ export interface MemoryWindowResult<T> {
   result: T;
   memory: MemoryPeakObservation;
 }
+
+export interface MemoryWindowOptions {
+  sampleIntervalMs?: number;
+  settleWindowMs?: number;
+  /** Start one observation request immediately while the operation promise is outstanding. */
+  sampleImmediatelyDuringOperation?: boolean;
+  /** Bound in-operation observation requests; omitted preserves the generic unbounded window. */
+  maxOperationSamples?: number;
+  /** Independently bound every memory API request, including baseline, end, and settle samples. */
+  sampleTimeoutMs?: number;
+  /** Abort a pending memory API request without waiting for its implementation to settle. */
+  signal?: AbortSignal;
+  clock?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Long enough for Chromium's cross-process memory accounting, while still fail-closing a wedge. */
+export const DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS = 30_000;
 
 /** Preflight the one comparable memory API. Deprecated performance.memory is never mixed in. */
 export function userAgentSpecificMemorySampler(): PerformanceEvidence<MemorySampler> {
@@ -344,16 +369,20 @@ export function userAgentSpecificMemorySampler(): PerformanceEvidence<MemorySamp
 export async function measurePeakMemoryWindow<T>(
   operation: () => Promise<T>,
   samplerEvidence: PerformanceEvidence<MemorySampler> = userAgentSpecificMemorySampler(),
-  options: {
-    sampleIntervalMs?: number;
-    settleWindowMs?: number;
-    clock?: () => number;
-    sleep?: (ms: number) => Promise<void>;
-  } = {},
+  options: MemoryWindowOptions = {},
 ): Promise<PerformanceEvidence<MemoryWindowResult<T>>> {
   if (samplerEvidence.state === 'UNAVAILABLE') return samplerEvidence;
   const sampleIntervalMs = finitePositiveOption(options.sampleIntervalMs ?? 100, 'sampleIntervalMs');
   const settleWindowMs = finiteNonNegativeOption(options.settleWindowMs ?? 500, 'settleWindowMs');
+  const immediateOperationSample = options.sampleImmediatelyDuringOperation === true;
+  const operationSampleLimit = options.maxOperationSamples === undefined
+    ? Number.POSITIVE_INFINITY
+    : nonNegativeSafeIntegerOption(options.maxOperationSamples, 'maxOperationSamples');
+  const sampleTimeoutMs = finitePositiveOption(
+    options.sampleTimeoutMs ?? DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS,
+    'sampleTimeoutMs',
+  );
+  const signal = options.signal;
   const clock = options.clock ?? nowMs;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const sampler = samplerEvidence.value;
@@ -361,30 +390,292 @@ export async function measurePeakMemoryWindow<T>(
   let operationFailure: unknown;
   let operationFailed = false;
   const origin = clock();
-  const take = async (phase: MemoryPoint['phase']): Promise<number> => {
-    const bytes = await sampler.sample();
-    if (!finiteNonNegative(bytes)) throw new TypeError('memory sampler returned a non-finite byte count');
-    points.push({ atMs: Math.max(0, clock() - origin), bytes, phase });
-    return bytes;
+
+  type OperationOutcome = { ok: true; result: T } | { ok: false; error: unknown };
+  type OperationFailure = { kind: 'operation-failure'; error: unknown };
+  type ObservationOutcome =
+    | { ok: true; point: MemoryPoint }
+    | { ok: false; error: unknown };
+  type ObservationRace =
+    | { kind: 'observation'; outcome: ObservationOutcome }
+    | { kind: 'instrumentation-failure'; error: Error }
+    | { kind: 'abort'; reason: unknown }
+    | OperationFailure;
+  type OperationSettlement = { kind: 'operation-ended' };
+  interface OperationSubscription<U> {
+    promise: Promise<U>;
+    dispose(): void;
+  }
+  interface ActiveOperation {
+    outcome: Promise<OperationOutcome>;
+    subscribeFailure(): OperationSubscription<OperationFailure>;
+    subscribeSettlement(): OperationSubscription<OperationSettlement>;
+  }
+
+  let abortFailure: unknown;
+  let aborted = false;
+
+  const failOperation = (error: unknown): never => {
+    operationFailed = true;
+    operationFailure = error;
+    throw error;
+  };
+
+  const failAbort = (reason: unknown): never => {
+    aborted = true;
+    abortFailure = reason;
+    throw reason;
+  };
+
+  // Invoke sample() synchronously so its request boundary is auditable. Its rejection is converted
+  // immediately to a fulfilled outcome: a timeout/abort winner can abandon it without ever leaving
+  // a late unhandled rejection or allowing a late value to mutate finalized evidence.
+  const requestPoint = (phase: MemoryPoint['phase']): Promise<ObservationOutcome> => {
+    let request: Promise<number>;
+    try {
+      request = Promise.resolve(sampler.sample());
+    } catch (error) {
+      return Promise.resolve({ ok: false, error });
+    }
+    return request.then(
+      (bytes): ObservationOutcome => {
+        try {
+          return finiteNonNegative(bytes)
+            ? { ok: true, point: { atMs: Math.max(0, clock() - origin), bytes, phase } }
+            : { ok: false, error: new TypeError('memory sampler returned a non-finite byte count') };
+        } catch (error) {
+          return { ok: false, error };
+        }
+      },
+      (error): ObservationOutcome => ({ ok: false, error }),
+    );
+  };
+
+  const take = async (
+    phase: MemoryPoint['phase'],
+    activeOperation?: ActiveOperation,
+  ): Promise<number> => {
+    if (signal?.aborted) {
+      const reason = signal.reason;
+      if (activeOperation) {
+        const operationOutcome = await activeOperation.outcome;
+        if (operationOutcome.ok === false) failOperation(operationOutcome.error);
+      }
+      failAbort(reason);
+    }
+
+    const observation = requestPoint(phase);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let removeAbort = (): void => undefined;
+    let operationFailureSubscription: OperationSubscription<OperationFailure> | undefined;
+    const competitors: Array<Promise<ObservationRace>> = [
+      observation.then((outcome) => ({ kind: 'observation' as const, outcome })),
+      new Promise<ObservationRace>((resolve) => {
+        timer = setTimeout(() => resolve({
+          kind: 'instrumentation-failure',
+          error: memorySampleTimeoutError(phase, sampleTimeoutMs),
+        }), sampleTimeoutMs);
+      }),
+    ];
+    if (signal) {
+      competitors.push(new Promise<ObservationRace>((resolve) => {
+        const onAbort = (): void => resolve({ kind: 'abort', reason: signal.reason });
+        signal.addEventListener('abort', onAbort, { once: true });
+        removeAbort = () => signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) onAbort();
+      }));
+    }
+    if (activeOperation) {
+      operationFailureSubscription = activeOperation.subscribeFailure();
+      competitors.push(operationFailureSubscription.promise);
+    }
+
+    const winner = await (async (): Promise<ObservationRace> => {
+      try {
+        return await Promise.race(competitors);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        removeAbort();
+        operationFailureSubscription?.dispose();
+        // `observation` is deliberately a fulfilled outcome even when the underlying sampler
+        // rejects, so late completion remains handled and cannot mutate finalized points.
+      }
+    })();
+    switch (winner.kind) {
+      case 'operation-failure':
+        return failOperation(winner.error);
+      case 'abort': {
+        if (activeOperation) {
+          const operationOutcome = await activeOperation.outcome;
+          if (operationOutcome.ok === false) failOperation(operationOutcome.error);
+        }
+        return failAbort(winner.reason);
+      }
+      case 'instrumentation-failure': {
+        // Never let the runner finalize/dispose an engine whose operation is still active. Runner
+        // operations own their cancellation/timeout guard, so this settles promptly there; a typed
+        // operation failure still outranks the instrumentation error.
+        if (activeOperation) {
+          const operationOutcome = await activeOperation.outcome;
+          if (operationOutcome.ok === false) failOperation(operationOutcome.error);
+          if (signal?.aborted) failAbort(signal.reason);
+        }
+        throw winner.error;
+      }
+      case 'observation':
+        if (winner.outcome.ok === false) {
+          if (activeOperation) {
+            const operationOutcome = await activeOperation.outcome;
+            if (operationOutcome.ok === false) failOperation(operationOutcome.error);
+            if (signal?.aborted) failAbort(signal.reason);
+          }
+          throw winner.outcome.error;
+        }
+        points.push(winner.outcome.point);
+        return winner.outcome.point.bytes;
+    }
   };
   try {
     const baselineBytes = await take('baseline');
     let settled = false;
-    const operationOutcome = Promise.resolve()
-      .then(operation)
-      .then(
-        (result) => ({ ok: true as const, result }),
-        (error) => ({ ok: false as const, error }),
-      )
-      .finally(() => { settled = true; });
-    while (!settled) {
-      const turn = await Promise.race([
-        operationOutcome.then(() => 'operation-ended' as const),
-        sleep(sampleIntervalMs).then(() => 'sample' as const),
-      ]);
-      if (turn === 'sample' && !settled) await take('operation');
+    let terminalOutcome: OperationOutcome | undefined;
+    const failureListeners = new Set<(failure: OperationFailure) => void>();
+    const settlementListeners = new Set<(settlement: OperationSettlement) => void>();
+    const publishOperationOutcome = (outcome: OperationOutcome): OperationOutcome => {
+      terminalOutcome = outcome;
+      settled = true;
+      if (outcome.ok === false) {
+        const failure: OperationFailure = { kind: 'operation-failure', error: outcome.error };
+        for (const notify of failureListeners) notify(failure);
+      }
+      failureListeners.clear();
+      const settlement: OperationSettlement = { kind: 'operation-ended' };
+      for (const notify of settlementListeners) notify(settlement);
+      settlementListeners.clear();
+      return outcome;
+    };
+    // The operation begins before an immediate observation request. This both captures a quick
+    // peak and installs its rejection handler before a synchronously rejected sampler can win.
+    let operationPromise: Promise<T>;
+    try {
+      operationPromise = Promise.resolve(operation());
+    } catch (error) {
+      return failOperation(error);
+    }
+    const operationOutcome = operationPromise.then(
+      (result): OperationOutcome => publishOperationOutcome({ ok: true, result }),
+      (error): OperationOutcome => publishOperationOutcome({ ok: false, error }),
+    );
+    const activeOperation: ActiveOperation = {
+      outcome: operationOutcome,
+      subscribeFailure() {
+        let listener: ((failure: OperationFailure) => void) | undefined;
+        const promise = new Promise<OperationFailure>((resolve) => {
+          if (terminalOutcome?.ok === false) {
+            resolve({ kind: 'operation-failure', error: terminalOutcome.error });
+          } else if (terminalOutcome === undefined) {
+            listener = resolve;
+            failureListeners.add(resolve);
+          }
+        });
+        return {
+          promise,
+          dispose() {
+            if (listener) failureListeners.delete(listener);
+            listener = undefined;
+          },
+        };
+      },
+      subscribeSettlement() {
+        let listener: ((settlement: OperationSettlement) => void) | undefined;
+        const promise = new Promise<OperationSettlement>((resolve) => {
+          if (terminalOutcome !== undefined) {
+            resolve({ kind: 'operation-ended' });
+          } else {
+            listener = resolve;
+            settlementListeners.add(resolve);
+          }
+        });
+        return {
+          promise,
+          dispose() {
+            if (listener) settlementListeners.delete(listener);
+            listener = undefined;
+          },
+        };
+      },
+    };
+
+    type OperationTurn =
+      | OperationSettlement
+      | { kind: 'sample' }
+      | { kind: 'sleep-failure'; error: unknown }
+      | { kind: 'abort'; reason: unknown };
+    const waitForOperationTurn = async (): Promise<'operation-ended' | 'sample'> => {
+      if (signal?.aborted) {
+        const reason = signal.reason;
+        const outcome = await activeOperation.outcome;
+        if (outcome.ok === false) failOperation(outcome.error);
+        return failAbort(reason);
+      }
+
+      const settlementSubscription = activeOperation.subscribeSettlement();
+      let sleepOutcome: Promise<OperationTurn>;
+      try {
+        sleepOutcome = Promise.resolve(sleep(sampleIntervalMs)).then(
+          (): OperationTurn => ({ kind: 'sample' }),
+          (error): OperationTurn => ({ kind: 'sleep-failure', error }),
+        );
+      } catch (error) {
+        sleepOutcome = Promise.resolve({ kind: 'sleep-failure', error });
+      }
+      let removeAbort = (): void => undefined;
+      const competitors: Array<Promise<OperationTurn>> = [
+        settlementSubscription.promise,
+        sleepOutcome,
+      ];
+      if (signal) {
+        competitors.push(new Promise<OperationTurn>((resolve) => {
+          const onAbort = (): void => resolve({ kind: 'abort', reason: signal.reason });
+          signal.addEventListener('abort', onAbort, { once: true });
+          removeAbort = () => signal.removeEventListener('abort', onAbort);
+          if (signal.aborted) onAbort();
+        }));
+      }
+
+      const winner = await (async (): Promise<OperationTurn> => {
+        try {
+          return await Promise.race(competitors);
+        } finally {
+          settlementSubscription.dispose();
+          removeAbort();
+        }
+      })();
+      if (winner.kind === 'operation-ended') return 'operation-ended';
+      if (winner.kind === 'sample') return 'sample';
+
+      const outcome = await activeOperation.outcome;
+      if (outcome.ok === false) failOperation(outcome.error);
+      if (winner.kind === 'abort' || signal?.aborted) {
+        return failAbort(winner.kind === 'abort' ? winner.reason : signal?.reason);
+      }
+      throw winner.error;
+    };
+
+    let operationSamples = 0;
+    if (immediateOperationSample && !settled && operationSamples < operationSampleLimit) {
+      await take('operation', activeOperation);
+      operationSamples += 1;
+    }
+    while (!settled && operationSamples < operationSampleLimit) {
+      const turn = await waitForOperationTurn();
+      if (turn === 'sample' && !settled) {
+        await take('operation', activeOperation);
+        operationSamples += 1;
+      }
     }
     const outcome = await operationOutcome;
+    const operationResult = outcome.ok ? outcome.result : failOperation(outcome.error);
     const memoryAfterOperationBytes = await take('end');
     let settledFor = 0;
     while (settledFor < settleWindowMs) {
@@ -393,15 +684,11 @@ export async function measurePeakMemoryWindow<T>(
       settledFor += step;
       await take('settle');
     }
-    if (!outcome.ok) {
-      operationFailed = true;
-      operationFailure = outcome.error;
-      throw outcome.error;
-    }
     const maximumBytes = Math.max(...points.map((point) => point.bytes));
     return available({
-      result: outcome.result,
+      result: operationResult,
       memory: {
+        schema: 'media-test/memory-window@1',
         api: sampler.api,
         baselineBytes,
         maximumBytes,
@@ -409,6 +696,9 @@ export async function measurePeakMemoryWindow<T>(
         memoryAfterOperationBytes,
         settleWindowMs,
         sampleIntervalMs,
+        immediateOperationSample,
+        operationSampleLimit: Number.isFinite(operationSampleLimit) ? operationSampleLimit : null,
+        sampleTimeoutMs,
         samples: points,
       },
     });
@@ -416,12 +706,19 @@ export async function measurePeakMemoryWindow<T>(
     // Applicability, cancellation, timeout, and adapter failures belong to the operation channel.
     // Memory instrumentation may observe around them, but must never relabel them as a memory error.
     if (operationFailed) throw operationFailure;
+    if (aborted) throw abortFailure;
     return unavailable(
       'ERROR',
       'MEMORY_PROTOCOL_ERROR',
       error instanceof Error ? error.message : String(error),
     );
   }
+}
+
+function memorySampleTimeoutError(phase: MemoryPoint['phase'], timeoutMs: number): Error {
+  const error = new Error(`memory sampler ${phase} request exceeded timeout of ${timeoutMs}ms`);
+  error.name = 'MemorySampleTimeoutError';
+  return error;
 }
 
 export interface MemoryAfterOperationObservation {
@@ -464,6 +761,13 @@ function finitePositiveOption(value: number, field: string): number {
 
 function finiteNonNegativeOption(value: number, field: string): number {
   if (!Number.isFinite(value) || value < 0) throw new RangeError(`${field} must be finite and >= 0`);
+  return value;
+}
+
+function nonNegativeSafeIntegerOption(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${field} must be a non-negative safe integer`);
+  }
   return value;
 }
 

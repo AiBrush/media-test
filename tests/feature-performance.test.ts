@@ -145,6 +145,18 @@ describe('REQ-FEAT-69: adaptive, repeated, randomized/interleaved timing', () =>
 });
 
 describe('REQ-FEAT-70: honest memory window', () => {
+  const within = async <T>(promise: Promise<T>, timeoutMs = 100): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`test deadline exceeded ${timeoutMs}ms`)), timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, deadline]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
   test('records one API, baseline, operation maximum, delta, end, and settle samples', async () => {
     let now = 0;
     let sleepCount = 0;
@@ -205,6 +217,364 @@ describe('REQ-FEAT-70: honest memory window', () => {
       available({ api: 'measureUserAgentSpecificMemory', sample: async () => 100 }),
       { sampleIntervalMs: 1, settleWindowMs: 0 },
     )).rejects.toBe(operationError);
+  });
+
+  test('starts the operation synchronously before requesting the immediate operation sample', async () => {
+    const events: string[] = [];
+    let sampleCall = 0;
+    let finishOperation!: () => void;
+    const result = await measurePeakMemoryWindow(
+      () => {
+        events.push('operation-start');
+        return new Promise<string>((resolve) => {
+          finishOperation = () => {
+            events.push('operation-end');
+            resolve('done');
+          };
+        });
+      },
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: async () => {
+          sampleCall += 1;
+          events.push(`sample-${sampleCall}-request`);
+          if (sampleCall === 2) finishOperation();
+          return sampleCall === 1 ? 100 : sampleCall === 2 ? 180 : 120;
+        },
+      }),
+      {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 50,
+      },
+    );
+    expect(result).toMatchObject({ state: 'AVAILABLE', value: { result: 'done' } });
+    expect(events).toEqual([
+      'sample-1-request',
+      'operation-start',
+      'sample-2-request',
+      'operation-end',
+      'sample-3-request',
+    ]);
+  });
+
+  test('successful bounded scale path records exactly baseline, immediate operation, and end', async () => {
+    let calls = 0;
+    const result = await measurePeakMemoryWindow(
+      async () => 'ok',
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: async () => 100 + ++calls,
+      }),
+      {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 50,
+      },
+    );
+    expect(calls).toBe(3);
+    expect(result).toMatchObject({
+      state: 'AVAILABLE',
+      value: { memory: { sampleTimeoutMs: 50 } },
+    });
+    if (result.state === 'AVAILABLE') {
+      expect(result.value.memory.samples.map((point) => point.phase)).toEqual([
+        'baseline', 'operation', 'end',
+      ]);
+    }
+  });
+
+  test('operation rejection preempts a never-resolving immediate sampler request', async () => {
+    const operationError = new Error('operation rejected while memory API wedged');
+    let calls = 0;
+    await expect(within(measurePeakMemoryWindow(
+      () => new Promise<never>((_resolve, reject) => {
+        queueMicrotask(() => reject(operationError));
+      }),
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => ++calls === 1
+          ? Promise.resolve(100)
+          : new Promise<number>(() => undefined),
+      }),
+      {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    ))).rejects.toBe(operationError);
+    expect(calls).toBe(2);
+  });
+
+  test('operation rejection wins when operation and immediate sampler reject together', async () => {
+    const operationError = new Error('simultaneous operation rejection');
+    const memoryError = new Error('simultaneous memory rejection');
+    let calls = 0;
+    await expect(measurePeakMemoryWindow(
+      () => Promise.reject(operationError),
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => ++calls === 1 ? Promise.resolve(100) : Promise.reject(memoryError),
+      }),
+      {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 50,
+      },
+    )).rejects.toBe(operationError);
+  });
+
+  test('sampler failure waits for the active operation to terminate before returning unavailable', async () => {
+    let finishOperation!: () => void;
+    let failureSampleRequested!: () => void;
+    const failureSampleStarted = new Promise<void>((resolve) => { failureSampleRequested = resolve; });
+    let calls = 0;
+    let returned = false;
+    const measured = measurePeakMemoryWindow(
+      () => new Promise<string>((resolve) => { finishOperation = () => resolve('clean'); }),
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => {
+          calls += 1;
+          if (calls === 1) return Promise.resolve(100);
+          failureSampleRequested();
+          return Promise.reject(new Error('memory observation failed'));
+        },
+      }),
+      {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 50,
+      },
+    );
+    void measured.then(() => { returned = true; });
+    await failureSampleStarted;
+    await Promise.resolve();
+    expect(returned).toBe(false);
+    finishOperation();
+    const result = await within(measured);
+    expect(result).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'ERROR',
+      reasonCode: 'MEMORY_PROTOCOL_ERROR',
+      reason: 'memory observation failed',
+    });
+  });
+
+  test('a synchronous interval failure waits for the active operation to terminate before returning unavailable', async () => {
+    const intervalError = new Error('interval sleep failed');
+    let finishOperation!: () => void;
+    let intervalAttempted!: () => void;
+    const intervalStarted = new Promise<void>((resolve) => { intervalAttempted = resolve; });
+    let returned = false;
+    const measured = measurePeakMemoryWindow(
+      () => new Promise<string>((resolve) => { finishOperation = () => resolve('clean'); }),
+      available({ api: 'measureUserAgentSpecificMemory', sample: async () => 100 }),
+      {
+        sampleIntervalMs: 1,
+        settleWindowMs: 0,
+        sleep: () => {
+          intervalAttempted();
+          throw intervalError;
+        },
+      },
+    );
+    void measured.then(
+      () => { returned = true; },
+      () => { returned = true; },
+    );
+    await intervalStarted;
+    await Promise.resolve();
+    expect(returned).toBe(false);
+
+    finishOperation();
+    const result = await within(measured);
+    expect(result).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'ERROR',
+      reasonCode: 'MEMORY_PROTOCOL_ERROR',
+      reason: intervalError.message,
+    });
+  });
+
+  test('operation rejection outranks an asynchronous interval rejection', async () => {
+    const intervalError = new Error('async interval rejection');
+    const operationError = new Error('operation failed during interval cleanup');
+    let rejectOperation!: (error: unknown) => void;
+    let intervalAttempted!: () => void;
+    const intervalStarted = new Promise<void>((resolve) => { intervalAttempted = resolve; });
+    const measured = measurePeakMemoryWindow(
+      () => new Promise<never>((_resolve, reject) => { rejectOperation = reject; }),
+      available({ api: 'measureUserAgentSpecificMemory', sample: async () => 100 }),
+      {
+        sampleIntervalMs: 1,
+        settleWindowMs: 0,
+        sleep: async () => {
+          intervalAttempted();
+          throw intervalError;
+        },
+      },
+    );
+    await intervalStarted;
+    rejectOperation(operationError);
+    await expect(within(measured)).rejects.toBe(operationError);
+  });
+
+  test('abort interrupts a wedged interval only after operation cleanup and preserves its exact reason', async () => {
+    const controller = new AbortController();
+    const stop = new Error('cancel recurring memory sampling');
+    let intervalAttempted!: () => void;
+    const intervalStarted = new Promise<void>((resolve) => { intervalAttempted = resolve; });
+    let cleanupComplete = false;
+    const measured = measurePeakMemoryWindow(
+      () => new Promise<string>((resolve) => {
+        controller.signal.addEventListener('abort', () => {
+          queueMicrotask(() => {
+            cleanupComplete = true;
+            resolve('clean');
+          });
+        }, { once: true });
+      }),
+      available({ api: 'measureUserAgentSpecificMemory', sample: async () => 100 }),
+      {
+        signal: controller.signal,
+        sampleIntervalMs: 1,
+        settleWindowMs: 0,
+        sleep: () => {
+          intervalAttempted();
+          return new Promise<void>(() => undefined);
+        },
+      },
+    );
+    await intervalStarted;
+    controller.abort(stop);
+    await expect(within(measured)).rejects.toBe(stop);
+    expect(cleanupComplete).toBe(true);
+  });
+
+  test('recurring samples do not accumulate reactions on a pending operation promise', async () => {
+    const originalThen = Promise.prototype.then;
+    const reactionCounts = new Map<Promise<unknown>, number>();
+    const instrumentedThen = function (
+      this: Promise<unknown>,
+      ...args: Parameters<Promise<unknown>['then']>
+    ): Promise<unknown> {
+      reactionCounts.set(this, (reactionCounts.get(this) ?? 0) + 1);
+      return Reflect.apply(originalThen, this, args) as Promise<unknown>;
+    };
+    Promise.prototype.then = instrumentedThen as typeof Promise.prototype.then;
+
+    let measuredState: string | undefined;
+    let operationSampleCount = 0;
+    let maximumReactions = 0;
+    try {
+      let sampleCalls = 0;
+      let finishOperation!: () => void;
+      let operationFinished = false;
+      const result = await measurePeakMemoryWindow(
+        () => new Promise<string>((resolve) => { finishOperation = () => resolve('done'); }),
+        available({
+          api: 'measureUserAgentSpecificMemory',
+          sample: async () => {
+            sampleCalls += 1;
+            if (sampleCalls > 1 && !operationFinished) {
+              operationSampleCount += 1;
+              if (operationSampleCount === 64) {
+                operationFinished = true;
+                finishOperation();
+              }
+            }
+            return 100 + sampleCalls;
+          },
+        }),
+        {
+          sampleIntervalMs: 1,
+          settleWindowMs: 0,
+          sampleTimeoutMs: 1_000,
+          sleep: async () => undefined,
+        },
+      );
+      measuredState = result.state;
+      maximumReactions = Math.max(0, ...reactionCounts.values());
+    } finally {
+      Promise.prototype.then = originalThen;
+    }
+
+    expect(measuredState).toBe('AVAILABLE');
+    expect(operationSampleCount).toBe(64);
+    expect(maximumReactions).toBeLessThanOrEqual(4);
+  });
+
+  test('a wedged baseline times out without starting the operation', async () => {
+    let ran = false;
+    const result = await within(measurePeakMemoryWindow(
+      async () => { ran = true; },
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => new Promise<number>(() => undefined),
+      }),
+      { sampleTimeoutMs: 5 },
+    ));
+    expect(result).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'ERROR',
+      reasonCode: 'MEMORY_PROTOCOL_ERROR',
+    });
+    if (result.state === 'UNAVAILABLE') expect(result.reason).toContain('baseline request exceeded timeout');
+    expect(ran).toBe(false);
+  });
+
+  test('a wedged end sample times out only after the successful operation terminates', async () => {
+    let calls = 0;
+    let ran = false;
+    const result = await within(measurePeakMemoryWindow(
+      async () => {
+        ran = true;
+        return 'done';
+      },
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => ++calls === 1
+          ? Promise.resolve(100)
+          : new Promise<number>(() => undefined),
+      }),
+      { settleWindowMs: 0, sampleTimeoutMs: 5 },
+    ));
+    expect(ran).toBe(true);
+    expect(result).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'ERROR',
+      reasonCode: 'MEMORY_PROTOCOL_ERROR',
+    });
+    if (result.state === 'UNAVAILABLE') expect(result.reason).toContain('end request exceeded timeout');
+  });
+
+  test('abort preserves the exact cancellation reason and never starts after a wedged baseline', async () => {
+    const controller = new AbortController();
+    const stop = new Error('Stop');
+    let baselineRequested!: () => void;
+    const baselineStarted = new Promise<void>((resolve) => { baselineRequested = resolve; });
+    let ran = false;
+    const measured = measurePeakMemoryWindow(
+      async () => { ran = true; },
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: () => {
+          baselineRequested();
+          return new Promise<number>(() => undefined);
+        },
+      }),
+      { signal: controller.signal, sampleTimeoutMs: 1_000 },
+    );
+    await baselineStarted;
+    controller.abort(stop);
+    await expect(within(measured)).rejects.toBe(stop);
+    expect(ran).toBe(false);
   });
 });
 

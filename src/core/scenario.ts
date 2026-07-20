@@ -1603,17 +1603,17 @@ export interface ScenarioResult {
    * Exhaustive-mode (§6.2) per-file sub-results: present when the scenario was run against EVERY
    * candidate file (baked + all shape-passing real files) in one run, in the same order for every
    * engine. The top-level `status` is the AND of these (PASS only if EVERY file passed; any FAIL/ERROR
-   * makes the scenario FAIL and names the offending file); `bench.<metric>.aggregate` COMBINES the
-   * passing files (sum of cost for time/IO metrics, MAX for peak memory, median for rate metrics —
-   * never averaging a FAIL into a pass, §9) while `.samples` keeps each file's value. This array
-   * preserves each file's individual verdict + numbers so the spread is visible and a FAIL is
-   * traceable to its bytes. See `coverage` for how many files were scored (winner ranking is
-   * coverage-first).
+   * makes the scenario FAIL and names the offending file). When the aggregate itself PASSes,
+   * `bench.<metric>.aggregate` COMBINES its passing files (sum of cost for time/IO metrics, MAX for
+   * peak memory, median for rate metrics, §9) while `.samples` keeps each file's value. A FAIL/ERROR
+   * aggregate has no headline benchmark; this array still preserves every passing file's individual
+   * numbers so the spread is visible and a failure is traceable to its bytes. See `coverage` for how
+   * many files were scored (winner ranking is coverage-first).
    */
   exhaustive?: ExhaustiveFileResult[];
   /**
    * Exhaustive-mode (§6.2) file coverage: how many candidate files this engine was actually scored
-   * over. `passed` = files that PASSed (the ones combined into `bench.<metric>.aggregate`);
+   * over. `passed` = files that PASSed (eligible for `bench.<metric>.aggregate` when the cell PASSes);
    * `admissible` = PASS+FAIL+ERROR (files that produced a real signal); `total` = all candidate files
    * offered. The per-case WINNER is ranked coverage-FIRST (higher `passed` wins) THEN by the aggregate
    * number, so an engine that skips the hard files (NA on them) can never out-rank one that handled

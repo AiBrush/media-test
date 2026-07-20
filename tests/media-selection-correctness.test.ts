@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { OracleOutcome, Scenario } from '../src/core/scenario.ts';
+import { Sha256, bytesToLowerHex } from '../src/core/seeded-rng.ts';
 import {
   DECRYPT_METAMORPHIC_INVARIANT,
   ROBUSTNESS_VARIANT_SELECTION_CONTRACT,
@@ -25,6 +26,7 @@ import {
   selectForRun,
   selectionCacheTag,
   sha256Hex,
+  verifyContentStream,
   withVerifiedContent,
   type CandidateEvidenceDeclaration,
   type FrozenSelectionManifest,
@@ -250,6 +252,97 @@ describe('REQ-SEL-01 canonical validated candidate manifest', () => {
 });
 
 describe('REQ-SEL-02 exact byte identity before engine use', () => {
+  test('incremental SHA-256 matches FIPS vectors and an independent digest across block boundaries', async () => {
+    const vectors = [
+      ['', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'],
+      ['abc', 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'],
+      [
+        'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq',
+        '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1',
+      ],
+    ] as const;
+    for (const [input, expected] of vectors) {
+      expect(new Sha256().update(input).hex()).toBe(expected);
+    }
+
+    for (const length of [55, 56, 63, 64, 65, 119, 120, 127, 128, 129, 1_087]) {
+      const input = Uint8Array.from({ length }, (_, index) => (index * 131 + length) & 0xff);
+      const expected = bytesToLowerHex(new Uint8Array(await crypto.subtle.digest('SHA-256', input)));
+      const incremental = new Sha256();
+      const updateSizes = [1, 63, 7, 64, 65];
+      let offset = 0;
+      let updateIndex = 0;
+      while (offset < input.byteLength) {
+        const end = Math.min(input.byteLength, offset + updateSizes[updateIndex % updateSizes.length]!);
+        incremental.update(input.subarray(offset, end));
+        offset = end;
+        updateIndex += 1;
+      }
+      expect(incremental.hex()).toBe(expected);
+    }
+  });
+
+  test('stream admission is incremental, non-retained, and preserves an authenticated block map', async () => {
+    const expected = bytes('authenticated scale body');
+    const identity = {
+      logicalPath: 'scenarios/probe/selection/scale.mp4',
+      sha256: sha256Hex(expected),
+      sizeBytes: expected.byteLength,
+    };
+    const chunks = [expected.subarray(0, 3), expected.subarray(3, 11), expected.subarray(11)];
+    const result = await verifyContentStream(identity, async () => new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    }), 5);
+    expect(result).toMatchObject({
+      state: 'VERIFIED_STREAM',
+      actualSha256: identity.sha256,
+      actualSizeBytes: expected.byteLength,
+      chunkSizeBytes: 5,
+      retainedBytes: 0,
+    });
+    if (result.state === 'VERIFIED_STREAM') {
+      expect(result.chunkSha256).toHaveLength(Math.ceil(expected.byteLength / 5));
+      expect('bytes' in result).toBe(false);
+      for (let index = 0; index < result.chunkSha256.length; index++) {
+        expect(result.chunkSha256[index]).toBe(sha256Hex(expected.subarray(index * 5, (index + 1) * 5)));
+      }
+    }
+
+    const corrupt = expected.slice();
+    corrupt[7] ^= 0xff;
+    const rejected = await verifyContentStream(identity, async () => new Response(corrupt).body!);
+    expect(rejected).toMatchObject({ state: 'REJECTED', issue: { reasonCode: 'CORPUS_DIGEST_MISMATCH' } });
+  });
+
+  test('non-retained double-hash stream admission has a practical throughput floor', async () => {
+    const sizeBytes = 8 * 1024 * 1024;
+    const input = Uint8Array.from({ length: sizeBytes }, (_, index) => (index * 17 + 29) & 0xff);
+    const identity = {
+      logicalPath: 'scenarios/probe/selection/throughput.bin',
+      sha256: bytesToLowerHex(new Uint8Array(await crypto.subtle.digest('SHA-256', input))),
+      sizeBytes,
+    };
+    const startedAt = performance.now();
+    const result = await verifyContentStream(identity, async () => new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < input.byteLength; offset += 256 * 1024) {
+          controller.enqueue(input.subarray(offset, Math.min(input.byteLength, offset + 256 * 1024)));
+        }
+        controller.close();
+      },
+    }));
+    const elapsedMs = Math.max(performance.now() - startedAt, 0.001);
+    const throughputMiBPerSec = (sizeBytes / (1024 * 1024)) / (elapsedMs / 1_000);
+    expect(result).toMatchObject({ state: 'VERIFIED_STREAM', retainedBytes: 0 });
+    // Deliberately loose enough for loaded CI, but strong enough to prevent multi-hour 1 GiB
+    // admission regressions in this exact overall+fixed-block double-hash path.
+    expect(throughputMiBPerSec).toBeGreaterThan(2);
+  });
+
   test('an empty verified pool returns eligible=0 without scoring or execution', () => {
     const emptyBaked = bakedManifest([]);
     const emptyCatalog = catalogFromRows([row([], { class: 'SYNTHETIC' })]);
@@ -531,6 +624,104 @@ describe('REQ-SEL-06 fail-closed source/base-bound CENC eligibility', () => {
     ];
     for (const file of mutations) {
       const eligibility = assessCandidateEligibility(cencScenario, { ...cencRow, files: [file] }, file);
+      expect(eligibility.eligible).toBe(false);
+      if (!eligibility.eligible) expect(eligibility.rejection.reasonCode).toMatch(/^CENC_/);
+    }
+  });
+});
+
+describe('REQ-SEL-06 protected probe DERIVED eligibility', () => {
+  const baseSha256 = sha256Hex('protected probe clear base');
+  const protectedFile = sourceFile('01.mp4', 'protected probe bytes', {
+    keys: {
+      keyHex: '00112233445566778899aabbccddeeff',
+      kid: '11223344556677889900aabbccddeeff',
+      scheme: 'cenc-cbcs',
+    },
+    cleartextBase: {
+      poolPath: '_derived_cleartext/base.mp4',
+      sha256: baseSha256,
+      sizeBytes: 123,
+    },
+  });
+  protectedFile.evidence = {
+    sourceSha256: protectedFile.sha256,
+    available: ['SOURCE_GOLDEN', 'CANDIDATE_DECODE'],
+    requiredOracles: ['golden-metadata'],
+    sufficientOracleSets: [['golden-metadata']],
+  };
+  const protectedProbe = scenario({
+    id: 'probe/cenc-cbcs-selection',
+    family: 'probe',
+    op: 'probe',
+    input: 'cenc-baked.mp4',
+    requires: {
+      operations: ['probe'],
+      containersIn: ['mp4'],
+      videoCodecs: ['h264'],
+      audioCodecs: ['aac'],
+      encryption: ['cenc-cbcs'],
+      features: ['metadata:protected-tracks'],
+    },
+    oracles: ['golden-metadata'],
+  });
+  const protectedRow = row([protectedFile], {
+    scenarioId: protectedProbe.id,
+    class: 'DERIVED',
+    requires: {
+      container: 'mp4',
+      video: true,
+      videoCodecs: ['h264'],
+      audioCodecs: ['aac'],
+      encryption: ['cenc-cbcs'],
+    },
+  });
+
+  test('a source-bound protected probe keeps probe semantics and its metadata oracle', () => {
+    const sources = new Map([[protectedProbe.id, protectedRow]]);
+    const selections = candidatesForRun([protectedProbe], sources, {
+      bakedManifest: bakedManifest([{ id: 'cenc-baked.mp4', contents: 'baked protected bytes' }]),
+    }).get(protectedProbe.id)!;
+    const derived = selections.find((selection) => !selection.isBaked);
+    expect(derived).toBeDefined();
+    expect(derived?.effectiveScenario).toMatchObject({
+      id: protectedProbe.id,
+      op: 'probe',
+      input: `scenarios/${protectedProbe.id}/${protectedFile.file}`,
+      oracles: ['golden-metadata'],
+    });
+    expect(derived?.evidencePlan).toMatchObject({
+      declaredAvailable: ['CANDIDATE_DECODE', 'SOURCE_GOLDEN'],
+      requiredOracles: ['golden-metadata'],
+      sufficientOracleSets: [['golden-metadata']],
+    });
+    expect((derived?.effectiveScenario.options as Record<string, unknown>).invariant).toBeUndefined();
+  });
+
+  test('missing decoded evidence, wrong scheme, or malformed key material fails closed', () => {
+    const mutations: SourceFileRecord[] = [
+      {
+        ...protectedFile,
+        evidence: {
+          ...protectedFile.evidence!,
+          available: ['SOURCE_GOLDEN'],
+        },
+      },
+      {
+        ...protectedFile,
+        keys: { ...protectedFile.keys!, scheme: 'cenc-ctr' },
+      },
+      {
+        ...protectedFile,
+        keys: { ...protectedFile.keys!, kid: 'abcd' },
+      },
+    ];
+    for (const file of mutations) {
+      const eligibility = assessCandidateEligibility(
+        protectedProbe,
+        { ...protectedRow, files: [file] },
+        file,
+      );
       expect(eligibility.eligible).toBe(false);
       if (!eligibility.eligible) expect(eligibility.rejection.reasonCode).toMatch(/^CENC_/);
     }

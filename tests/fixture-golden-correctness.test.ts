@@ -46,6 +46,7 @@ import { parseScenarioSourceCatalog, scenarioSourceMap } from '../src/core/selec
 import { assessCandidateEligibility, assessRobustnessVariantEligibility } from '../src/core/media-selection.ts';
 import { robustnessScenarios } from '../src/scenarios/robustness/index.ts';
 import { encryptionScenarios } from '../src/scenarios/encryption/index.ts';
+import { probeScenarios } from '../src/scenarios/probe/index.ts';
 import {
   inspectHlsResourceReferences,
   parseHlsResourceIndex,
@@ -367,6 +368,47 @@ describe('FIX acceptance corpus reality', () => {
 });
 
 describe('HLS source-closure fixture integration', () => {
+  test('the unencrypted probe playlist has a verified complete segment closure', async () => {
+    const name = 'hls_vod';
+    const scenario = probeScenarios.find((entry) => entry.id === 'probe/hls_vod')!;
+    const playlistBytes = new Uint8Array(readFileSync(`fixtures/media/${name}.m3u8`));
+    const rawIndex = JSON.parse(readFileSync(`fixtures/golden/${name}.m3u8.resources.json`, 'utf8'));
+    const index = parseHlsResourceIndex(rawIndex);
+
+    expect(index.resources.map((entry) => ({ role: entry.role, uri: entry.uri }))).toEqual(
+      inspectHlsResourceReferences(new TextDecoder().decode(playlistBytes)),
+    );
+    for (const resource of index.resources) {
+      const bytes = readFileSync(join('fixtures/media', resource.uri));
+      expect({ sha256: digest(bytes), sizeBytes: bytes.byteLength }).toEqual({
+        sha256: resource.sha256,
+        sizeBytes: resource.sizeBytes,
+      });
+      const scenarioBytes = readFileSync(join('fixtures/media/scenarios/probe/hls_vod', resource.uri));
+      expect({ sha256: digest(scenarioBytes), sizeBytes: scenarioBytes.byteLength }).toEqual({
+        sha256: resource.sha256,
+        sizeBytes: resource.sizeBytes,
+      });
+    }
+    const scenarioPlaylist = readFileSync('fixtures/media/scenarios/probe/hls_vod/hls_vod.m3u8');
+    expect({ sha256: digest(scenarioPlaylist), sizeBytes: scenarioPlaylist.byteLength }).toEqual({
+      sha256: index.playlist.sha256,
+      sizeBytes: index.playlist.sizeBytes,
+    });
+    const decision = await preflightHlsResourceIndex(
+      scenario.options,
+      {
+        assetId: `${name}.m3u8`,
+        logicalPath: `${name}.m3u8`,
+        sha256: digest(playlistBytes),
+        sizeBytes: playlistBytes.byteLength,
+      },
+      playlistBytes,
+      async () => ({ state: 'OK', value: rawIndex }),
+    );
+    expect(decision.state).toBe('READY');
+  });
+
   test('all six resource indices exactly bind playlist/key/segment closure and pass scenario preflight', async () => {
     const cases = [
       ['encryption/hls_aes128_decrypt', 'hls_aes128'],

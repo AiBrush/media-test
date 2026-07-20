@@ -10,6 +10,22 @@
 
 export type BrowserName = 'brave' | 'chromium' | 'webkit' | 'firefox';
 
+/** Adapter promises that URL probe reads enforce MediaInput.contentAttestation block-by-block. */
+export const AUTHENTICATED_RANGE_PROBE_FEATURE = 'probe:authenticated-range' as const;
+
+/**
+ * Authenticated fixed-block snapshot for a large URL input. Adapters may use the URL only through a
+ * fetch surface that verifies each delivered block against this map.
+ */
+export interface MediaInputContentAttestation {
+  schema: 'media-test/url-content-attestation@1';
+  logicalPath: string;
+  sha256: string;
+  sizeBytes: number;
+  chunkSizeBytes: number;
+  chunkSha256: readonly string[];
+}
+
 /** A corpus asset, served as a static file (supports HTTP Range). */
 export interface MediaInput {
   /** corpus asset id, e.g. 'h264_1080p_30s.mp4' */
@@ -21,6 +37,8 @@ export interface MediaInput {
   sizeBytes?: number;
   /** true when robustness logic rewrites bytes before the engine receives them */
   mutated?: boolean;
+  /** Present only on bounded, unmutated URL transport admitted by incremental full-body hashing. */
+  contentAttestation?: MediaInputContentAttestation;
   blob(): Promise<Blob>;
   arrayBuffer(): Promise<ArrayBuffer>;
 }

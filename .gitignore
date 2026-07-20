@@ -1,6 +1,5 @@
 # raw media is rebuilt by the offline bake — never committed
-fixtures/media/
-
+/fixtures/
 # deps & build output
 node_modules/
 dist/

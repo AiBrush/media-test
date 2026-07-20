@@ -1,18 +1,29 @@
 import { describe, expect, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
+import type { InputTrack } from 'mediabunny';
 
 import {
+  CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   isNotApplicableError,
   type DemuxResult,
   type EncodedTracks,
   type MediaInput,
+  type NormalizedTrack,
 } from '../src/core/engine.ts';
+import { isCorpusDeliveryIntegrityError, sha256Hex as selectionSha256Hex } from '../src/core/media-selection.ts';
+import { HLS_PLAYLIST_ONLY_CONTRACT } from '../src/features/probe/hls.ts';
 import {
   MediabunnyEngine,
+  applyObservedAudioPresentationEvidence,
+  createMediabunnyAuthenticatedRangeFetch,
   createCencKeyResolver,
   hlsExplicitIvHexesFromPlaylist,
   hlsKeyUrisFromPlaylist,
+  normalizeTrack,
   representationForCodec,
+  type MediabunnyHlsReadTrace,
+  type MediabunnyAuthenticatedRangeTrace,
 } from '../src/engines/mediabunny/adapter.ts';
 import { MEDIABUNNY_REASON } from '../src/engines/mediabunny/support.ts';
 
@@ -60,6 +71,294 @@ function packetEssence(result: DemuxResult): string[][] {
   return tracks;
 }
 
+describe('REQ-FEAT-38 authenticated Mediabunny range transport', () => {
+  test('validates fixed blocks before delivery and reports physical source bytes', async () => {
+    const original = new TextEncoder().encode('authenticated-range-body');
+    const chunkSizeBytes = 5;
+    const attestation = {
+      schema: 'media-test/url-content-attestation@1' as const,
+      logicalPath: 'scale.mp4',
+      sha256: selectionSha256Hex(original),
+      sizeBytes: original.byteLength,
+      chunkSizeBytes,
+      chunkSha256: Array.from(
+        { length: Math.ceil(original.byteLength / chunkSizeBytes) },
+        (_, index) => selectionSha256Hex(original.subarray(index * chunkSizeBytes, (index + 1) * chunkSizeBytes)),
+      ),
+    };
+    let served = original.slice();
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    const fetchImpl = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const header = new Headers(init?.headers).get('Range');
+      const match = /^bytes=(\d+)-(\d+)$/.exec(header ?? '');
+      if (!match) return new Response(null, { status: 400 });
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      physicalRanges.push({ start, end });
+      return new Response(served.slice(start, end + 1), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${end}/${served.byteLength}` },
+      });
+    }) as typeof fetch;
+    const trace = (): MediabunnyAuthenticatedRangeTrace => ({
+      bytesRead: 0,
+      rangeRequests: 0,
+      blockRequests: 0,
+      ranges: [],
+    });
+
+    const firstTrace = trace();
+    const verifiedFetch = createMediabunnyAuthenticatedRangeFetch(
+      'https://fixtures.test/scale.mp4',
+      attestation,
+      firstTrace,
+      fetchImpl,
+    );
+    const response = await verifiedFetch('https://fixtures.test/scale.mp4', {
+      headers: { Range: 'bytes=3-12' },
+    });
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(original.slice(3, 13));
+    expect(firstTrace).toMatchObject({ rangeRequests: 1, blockRequests: 3, bytesRead: 15 });
+    expect(physicalRanges.every(({ start, end }) => end - start + 1 <= chunkSizeBytes)).toBe(true);
+
+    served = original.slice();
+    served[6] ^= 0xff;
+    const changedTrace = trace();
+    const changedFetch = createMediabunnyAuthenticatedRangeFetch(
+      'https://fixtures.test/scale.mp4',
+      attestation,
+      changedTrace,
+      fetchImpl,
+    );
+    const changed = await changedFetch('https://fixtures.test/scale.mp4', {
+      headers: { Range: 'bytes=5-9' },
+    });
+    let thrown: unknown;
+    try {
+      await changed.arrayBuffer();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isCorpusDeliveryIntegrityError(thrown)).toBe(true);
+    if (isCorpusDeliveryIntegrityError(thrown)) {
+      expect(thrown.reasonCode).toBe('CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH');
+    }
+  });
+
+  test('rejects an explicit range whose end precedes its start before fetching source bytes', async () => {
+    const bytes = new TextEncoder().encode('range-shape');
+    const attestation = {
+      schema: 'media-test/url-content-attestation@1' as const,
+      logicalPath: 'scale.mp4',
+      sha256: selectionSha256Hex(bytes),
+      sizeBytes: bytes.byteLength,
+      chunkSizeBytes: bytes.byteLength,
+      chunkSha256: [selectionSha256Hex(bytes)],
+    };
+    const trace: MediabunnyAuthenticatedRangeTrace = {
+      bytesRead: 0,
+      rangeRequests: 0,
+      blockRequests: 0,
+      ranges: [],
+    };
+    let sourceFetches = 0;
+    const verifiedFetch = createMediabunnyAuthenticatedRangeFetch(
+      'https://fixtures.test/scale.mp4',
+      attestation,
+      trace,
+      (async () => {
+        sourceFetches += 1;
+        return new Response(null, { status: 500 });
+      }) as typeof fetch,
+    );
+    let thrown: unknown;
+    try {
+      await verifiedFetch('https://fixtures.test/scale.mp4', {
+        headers: { Range: 'bytes=7-6' },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isCorpusDeliveryIntegrityError(thrown)).toBe(true);
+    if (isCorpusDeliveryIntegrityError(thrown)) {
+      expect(thrown.reasonCode).toBe('CORPUS_AUTHENTICATED_RANGE_REQUEST_INVALID');
+    }
+    expect(sourceFetches).toBe(0);
+    expect(trace).toEqual({ bytesRead: 0, rangeRequests: 0, blockRequests: 0, ranges: [] });
+  });
+
+  test('scale probe reports UrlSource range mode and authenticated physical-byte telemetry', async () => {
+    const source = new Uint8Array(await readFile(new URL('h264_1fps_30s.mp4', MEDIA_ROOT)));
+    const chunkSizeBytes = 32 * 1024;
+    const attestation = {
+      schema: 'media-test/url-content-attestation@1' as const,
+      logicalPath: 'h264_1fps_30s.mp4',
+      sha256: selectionSha256Hex(source),
+      sizeBytes: source.byteLength,
+      chunkSizeBytes,
+      chunkSha256: Array.from(
+        { length: Math.ceil(source.byteLength / chunkSizeBytes) },
+        (_, index) => selectionSha256Hex(source.subarray(index * chunkSizeBytes, (index + 1) * chunkSizeBytes)),
+      ),
+    };
+    const originalFetch = globalThis.fetch;
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    globalThis.fetch = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+      if (!match) return new Response(null, { status: 400 });
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      physicalRanges.push({ start, end });
+      return new Response(source.slice(start, end + 1), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${end}/${source.byteLength}` },
+      });
+    }) as typeof fetch;
+    try {
+      await withEngine(async (engine) => {
+        const input: MediaInput = {
+          id: 'h264_1fps_30s.mp4',
+          url: 'https://fixtures.test/h264_1fps_30s.mp4',
+          mime: 'video/mp4',
+          sizeBytes: source.byteLength,
+          contentAttestation: attestation,
+          blob: async () => { throw new Error('whole-file blob access is forbidden'); },
+          arrayBuffer: async () => { throw new Error('whole-file byte access is forbidden'); },
+        };
+        const controller = new AbortController();
+        const metadata = await engine.probe(input, {
+          signal: controller.signal,
+          phase: 'functional',
+          emit: () => undefined,
+          checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+          request: {
+            protocol: CONCRETE_OPERATION_PROTOCOL,
+            scenarioId: 'probe/scale-authenticated-range-test',
+            operation: 'probe',
+            inputs: [{
+              id: input.id,
+              mime: input.mime,
+              container: 'mp4',
+              mutated: false,
+              tracks: [{ type: 'video', codec: 'h264' }],
+            }],
+            options: {
+              robustness: {
+                probe: {
+                  schema: 'media-test/probe-scenario-contract@1',
+                  probeBudget: {
+                    schema: 'media-test/probe-budget@1',
+                    scale: 'large',
+                    allowedReadModes: ['range'],
+                    maxBytesRead: source.byteLength,
+                    maxReadFraction: 1,
+                    maxPeakMemoryDeltaBytes: 64 * 1024 * 1024,
+                  },
+                },
+              },
+            },
+          },
+        });
+        expect(metadata.probeEvidence?.readMode).toBe('range');
+        expect(metadata.telemetry?.bytesRead).toBeGreaterThan(0);
+        expect(metadata.telemetry?.bytesRead).toBeLessThanOrEqual(source.byteLength);
+        expect(metadata.tracks.map((track) => track.language)).toEqual([null]);
+        expect(physicalRanges.length).toBeGreaterThan(0);
+        expect(physicalRanges.every(({ start, end }) => end - start + 1 <= chunkSizeBytes)).toBe(true);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('scale MOV probe recovers legacy QuickTime English from the already authenticated prefix', async () => {
+    const source = new Uint8Array(await readFile(
+      new URL('scenarios/probe/h264_1080p_5s/03.mov', MEDIA_ROOT),
+    ));
+    const chunkSizeBytes = 1024 * 1024;
+    const attestation = {
+      schema: 'media-test/url-content-attestation@1' as const,
+      logicalPath: 'legacy-language.mov',
+      sha256: selectionSha256Hex(source),
+      sizeBytes: source.byteLength,
+      chunkSizeBytes,
+      chunkSha256: Array.from(
+        { length: Math.ceil(source.byteLength / chunkSizeBytes) },
+        (_, index) => selectionSha256Hex(source.subarray(index * chunkSizeBytes, (index + 1) * chunkSizeBytes)),
+      ),
+    };
+    const originalFetch = globalThis.fetch;
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    globalThis.fetch = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+      if (!match) return new Response(null, { status: 400 });
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      physicalRanges.push({ start, end });
+      return new Response(source.slice(start, end + 1), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${end}/${source.byteLength}` },
+      });
+    }) as typeof fetch;
+    try {
+      await withEngine(async (engine) => {
+        const input: MediaInput = {
+          id: 'legacy-language.mov',
+          url: 'https://fixtures.test/legacy-language.mov',
+          mime: 'video/quicktime',
+          sizeBytes: source.byteLength,
+          contentAttestation: attestation,
+          blob: async () => { throw new Error('whole-file blob access is forbidden'); },
+          arrayBuffer: async () => { throw new Error('whole-file byte access is forbidden'); },
+        };
+        const controller = new AbortController();
+        const metadata = await engine.probe(input, {
+          signal: controller.signal,
+          phase: 'functional',
+          emit: () => undefined,
+          checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+          request: {
+            protocol: CONCRETE_OPERATION_PROTOCOL,
+            scenarioId: 'probe/legacy-quicktime-language-range-test',
+            operation: 'probe',
+            inputs: [{
+              id: input.id,
+              mime: input.mime,
+              container: 'mov',
+              mutated: false,
+              tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
+            }],
+            options: {
+              robustness: {
+                probe: {
+                  schema: 'media-test/probe-scenario-contract@1',
+                  probeBudget: {
+                    schema: 'media-test/probe-budget@1',
+                    scale: 'large',
+                    allowedReadModes: ['range'],
+                    maxBytesRead: source.byteLength,
+                    maxReadFraction: 1,
+                    maxPeakMemoryDeltaBytes: 64 * 1024 * 1024,
+                  },
+                },
+              },
+            },
+          },
+        });
+        expect(metadata.tracks.map((track) => track.language)).toEqual(['eng', 'eng']);
+        expect(metadata.probeEvidence?.readMode).toBe('range');
+        expect(metadata.telemetry?.bytesRead).toBe(
+          physicalRanges.reduce((sum, { start, end }) => sum + end - start + 1, 0),
+        );
+        expect(physicalRanges.filter(({ start }) => start === 0)).toHaveLength(1);
+        expect(physicalRanges.every(({ start, end }) => end - start + 1 <= chunkSizeBytes)).toBe(true);
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 function ptsRegressions(result: DemuxResult, trackIndex = 0): number {
   const pts = result.packets.filter((packet) => packet.trackIndex === trackIndex).map((packet) => packet.ptsUs);
   let count = 0;
@@ -68,6 +367,247 @@ function ptsRegressions(result: DemuxResult, trackIndex = 0): number {
 }
 
 describe('REQ-ENG-03: explicit packet representation and timing evidence', () => {
+  test('normalizes coded video dimensions without folding display geometry into metadata', async () => {
+    let displayGetterCalls = 0;
+    const track = {
+      type: 'video',
+      isVideoTrack: () => true,
+      isAudioTrack: () => false,
+      getLanguageCode: async () => 'eng',
+      getBitrate: async () => 3_000_000,
+      getInternalCodecId: async () => 'avc1.64001f',
+      getCodec: async () => 'avc',
+      getCodedWidth: async () => 1_280,
+      getCodedHeight: async () => 480,
+      getDisplayWidth: async () => {
+        displayGetterCalls++;
+        return 1_280;
+      },
+      getDisplayHeight: async () => {
+        displayGetterCalls++;
+        return 481;
+      },
+      getRotation: async () => 90,
+      computePacketStats: async () => ({ averagePacketRate: 30, packetCount: 120 }),
+    } as unknown as InputTrack;
+
+    expect(await normalizeTrack(track)).toMatchObject({
+      type: 'video',
+      codec: 'h264',
+      nativeCodecTag: 'avc1.64001f',
+      width: 1_280,
+      height: 480,
+      rotation: 90,
+      bitrate: 3_000_000,
+      language: 'eng',
+      fps: 30,
+    });
+    expect(displayGetterCalls).toBe(0);
+  });
+
+  test('translates only ISO-BMFF quarter-turns into the suite-clockwise convention', async () => {
+    const track = (rotation: 0 | 90 | 180 | 270) => ({
+      type: 'video',
+      isVideoTrack: () => true,
+      isAudioTrack: () => false,
+      getLanguageCode: async () => 'und',
+      getBitrate: async () => null,
+      getInternalCodecId: async () => 'avc1',
+      getCodec: async () => 'avc',
+      getCodedWidth: async () => 1_280,
+      getCodedHeight: async () => 720,
+      getRotation: async () => rotation,
+      computePacketStats: async () => ({ averagePacketRate: 30, packetCount: 120 }),
+    }) as unknown as InputTrack;
+
+    expect((await normalizeTrack(track(270), { sourceContainer: 'mp4' })).rotation).toBe(90);
+    expect((await normalizeTrack(track(90), { sourceContainer: 'mov' })).rotation).toBe(270);
+    expect((await normalizeTrack(track(0), { sourceContainer: 'mp4' })).rotation).toBe(0);
+    expect((await normalizeTrack(track(180), { sourceContainer: 'mov' })).rotation).toBe(180);
+    expect((await normalizeTrack(track(270), { sourceContainer: 'mkv' })).rotation).toBe(270);
+    expect((await normalizeTrack(track(90), { sourceContainer: 'webm' })).rotation).toBe(90);
+    expect((await normalizeTrack(track(270))).rotation).toBe(270);
+  });
+
+  test('probe reports the baked ISO display matrix as clockwise 90 degrees with coded dimensions', async () => {
+    const metadata = await withEngine(async (engine) => engine.probe(await fixture('h264_rotated90.mp4')));
+    expect(metadata).toMatchObject({ container: 'mp4', durationSec: 10 });
+    expect(metadata.tracks.find((track) => track.type === 'video')).toMatchObject({
+        type: 'video',
+        codec: 'h264',
+        width: 1_280,
+        height: 720,
+        rotation: 90,
+    });
+  });
+
+  test('derives declared PCM bitrate from the public sample format', async () => {
+    const track = {
+      type: 'audio',
+      isVideoTrack: () => false,
+      isAudioTrack: () => true,
+      getLanguageCode: async () => 'und',
+      getBitrate: async () => null,
+      getInternalCodecId: async () => 1,
+      getCodec: async () => 'pcm-s16',
+      getSampleRate: async () => 48_000,
+      getNumberOfChannels: async () => 2,
+    } as unknown as InputTrack;
+
+    expect(await normalizeTrack(track)).toMatchObject({
+      type: 'audio',
+      codec: 'pcm-s16',
+      sampleRate: 48_000,
+      channels: 2,
+      bitrate: 1_536_000,
+      language: null,
+    });
+  });
+
+  test('normalizes explicit HE-AAC core and presentation views from decoder config', async () => {
+    const track = {
+      type: 'audio',
+      isVideoTrack: () => false,
+      isAudioTrack: () => true,
+      getLanguageCode: async () => 'und',
+      getBitrate: async () => null,
+      getInternalCodecId: async () => 'mp4a',
+      getCodec: async () => 'aac',
+      getSampleRate: async () => 22_050,
+      getNumberOfChannels: async () => 2,
+      getDecoderConfig: async () => ({
+        codec: 'mp4a.40.5',
+        sampleRate: 22_050,
+        numberOfChannels: 2,
+        description: new Uint8Array([0x2b, 0x92, 0x08]),
+      }),
+    } as unknown as InputTrack;
+
+    expect(await normalizeTrack(track)).toMatchObject({
+      codec: 'aac',
+      rawCodec: 'mp4a.40.5',
+      sampleRate: 44_100,
+      channels: 2,
+      audioObjectType: 5,
+      codedSampleRate: 22_050,
+      presentationSampleRate: 44_100,
+      sbrPresent: true,
+      psPresent: false,
+    });
+  });
+
+  test('uses decoded output as presentation evidence for implicit HE-AAC Parametric Stereo', () => {
+    const track: NormalizedTrack = {
+      type: 'audio',
+      codec: 'aac',
+      sampleRate: 48_000,
+      channels: 1,
+      codedSampleRate: 24_000,
+      presentationSampleRate: 48_000,
+      codedChannels: 1,
+      presentationChannels: 1,
+      sbrPresent: true,
+      psPresent: false,
+      bitrate: null,
+      language: null,
+    };
+
+    applyObservedAudioPresentationEvidence(track, {
+      sampleRate: 48_000,
+      numberOfChannels: 2,
+    });
+
+    expect(track).toMatchObject({
+      sampleRate: 48_000,
+      channels: 2,
+      codedSampleRate: 24_000,
+      presentationSampleRate: 48_000,
+      codedChannels: 1,
+      presentationChannels: 2,
+      sbrPresent: true,
+      psPresent: true,
+    });
+  });
+
+  test('probe derives VFR cadence from the complete packet timeline when no scale budget applies', async () => {
+    const input = await fixture('scenarios/probe/h264_vfr/03.mp4');
+    const controller = new AbortController();
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(input, {
+        signal: controller.signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'probe/h264_vfr',
+          operation: 'probe',
+          inputs: [{
+            id: input.id,
+            mime: input.mime,
+            container: 'mp4',
+            mutated: false,
+            tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
+          }],
+          options: {},
+        },
+      });
+      expect(metadata.tracks[0]?.fps).toBeCloseTo(16.216, 3);
+      expect(metadata.tracks[0]?.fpsProvenance).toMatchObject({
+        source: 'observed',
+        cadence: 'VFR',
+      });
+      expect(metadata.tracks[0]?.fpsProvenance?.sampleCount).toBeGreaterThan(120);
+      expect(metadata.tracks.map((track) => track.language)).toEqual(['eng', 'eng']);
+      expect(metadata.tags?.major_brand).toBe('isom');
+    });
+  });
+
+  test('probe reports ISO movie presentation duration instead of the raw edited media span', async () => {
+    const input = await fixture('scenarios/probe/h264_1080p_5s/01.mov');
+    const controller = new AbortController();
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(input, {
+        signal: controller.signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'probe/h264_1080p_5s',
+          operation: 'probe',
+          inputs: [{
+            id: input.id,
+            mime: 'video/quicktime',
+            container: 'mov',
+            mutated: false,
+            tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
+          }],
+          options: {},
+        },
+      });
+      expect(metadata.durationSec).toBeCloseTo(6.46671, 5);
+      expect(metadata.presentationDurationSec).toBeCloseTo(6.46671, 5);
+    });
+  });
+
+  test('probe converts a positive-offset MPEG-TS end timestamp into presentation duration', async () => {
+    const input = await fixture('ts_discontinuity.ts');
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(input);
+      expect(metadata.container).toBe('ts');
+      expect(metadata.durationSec).toBeCloseTo(600.605, 3);
+      expect(metadata.tracks[0]).toMatchObject({
+        type: 'video',
+        codec: 'h264',
+        fpsProvenance: {
+          cadence: 'VFR',
+        },
+      });
+      expect(metadata.tracks[0]?.fpsProvenance?.envelope?.maxFps).toBeCloseTo(30, 3);
+    });
+  });
+
   test('maps AVCC/Annex-B, HEVC configuration, and AAC framing without inference ambiguity', () => {
     const avcC = new Uint8Array(8);
     avcC[4] = 0xff;
@@ -128,6 +668,100 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
         observedIntervalUs: 1_000_000,
       });
     });
+  });
+});
+
+describe('Mediabunny HLS root classification', () => {
+  test('playlist-only AES probing reads no key or segment resources', async () => {
+    const playlistName = 'hls_aes128.m3u8';
+    const bytes = new Uint8Array(await readFile(new URL(playlistName, MEDIA_ROOT)));
+    const input = memoryInput(playlistName, bytes, 'application/octet-stream');
+    const controller = new AbortController();
+
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(input, {
+        signal: controller.signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'probe/hls_aes128_playlist_key_free',
+          operation: 'probe',
+          inputs: [{
+            id: playlistName,
+            mime: 'application/vnd.apple.mpegurl',
+            container: 'hls',
+            mutated: false,
+            tracks: [],
+          }],
+          options: {
+            invariant: 'hls-playlist-only-probe',
+            robustness: { probe: { probeContract: HLS_PLAYLIST_ONLY_CONTRACT } },
+          },
+        },
+      });
+      expect(metadata).toMatchObject({
+        container: 'hls',
+        durationSec: 10,
+        tracks: [],
+        protectionScheme: 'hls-aes128',
+        probeEvidence: {
+          resourceAccesses: [{ role: 'playlist', disposition: 'read' }],
+        },
+      });
+    });
+  });
+
+  test('a verified blob URL retains HLS PathedSource handling through its stable .m3u8 id', async () => {
+    const playlistName = 'hls_vod.m3u8';
+    const names = [
+      playlistName,
+      ...Array.from({ length: 5 }, (_, index) => `hls_vod_${String(index).padStart(3, '0')}.ts`),
+    ];
+    const files = new Map<string, Uint8Array>();
+    for (const name of names) files.set(name, new Uint8Array(await readFile(new URL(name, MEDIA_ROOT))));
+    const originalFetch = globalThis.fetch;
+    let rootNetworkReads = 0;
+    globalThis.fetch = (async (resource: RequestInfo | URL, init?: RequestInit) => {
+      const request = resource instanceof Request ? resource : new Request(resource, init);
+      const name = names.find((candidate) => request.url.endsWith(candidate));
+      if (!name) return new Response('not found', { status: 404 });
+      if (name === playlistName) rootNetworkReads++;
+      const bytes = files.get(name)!;
+      const range = request.headers.get('range');
+      const match = range ? /^bytes=(\d+)-(\d*)$/i.exec(range) : null;
+      if (match) {
+        const start = Number(match[1]);
+        const end = match[2] ? Number(match[2]) : bytes.byteLength - 1;
+        const body = bytes.slice(start, end + 1);
+        return new Response(body, {
+          status: 206,
+          headers: {
+            'accept-ranges': 'bytes',
+            'content-length': String(body.byteLength),
+            'content-range': `bytes ${start}-${end}/${bytes.byteLength}`,
+          },
+        });
+      }
+      return new Response(bytes.slice(), {
+        headers: { 'accept-ranges': 'bytes', 'content-length': String(bytes.byteLength) },
+      });
+    }) as typeof fetch;
+    try {
+      const input = memoryInput(playlistName, files.get(playlistName)!, 'application/octet-stream');
+
+      await withEngine(async (engine) => {
+        const metadata = await engine.probe(input);
+        const sourceTrace = (metadata as typeof metadata & { sourceTrace: MediabunnyHlsReadTrace }).sourceTrace;
+        expect(metadata.container).toBe('hls');
+        expect(sourceTrace.rootMode).toBe('url');
+        expect(sourceTrace.reads.some((read) => read.source === 'network-sidecar')).toBe(true);
+      });
+      expect(rootNetworkReads).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
@@ -238,6 +872,41 @@ describe('REQ-ENG-02/04: strict packet-copy remux and mux contract', () => {
 });
 
 describe('REQ-ENG-05: protected-form and metadata correctness', () => {
+  test('probe exposes Mediabunny track disposition through normalized metadata', async () => {
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(await fixture('recorder_headerless.webm'));
+      expect(metadata.tracks).toHaveLength(1);
+      expect(metadata.tracks[0]).toMatchObject({
+        type: 'video',
+        defaultDisposition: true,
+        disposition: { default: true },
+      });
+    });
+  });
+
+  test('CENC-CBCS probe surfaces neutral protection evidence through normalized metadata', async () => {
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(await fixture('cenc_cbcs.mp4'));
+      expect((metadata as typeof metadata & { protectionScheme?: string }).protectionScheme).toBe('cbcs');
+    });
+  });
+
+  test('fragmented CENC-CTR scenario probe surfaces neutral protection evidence', async () => {
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(await fixture('scenarios/probe/cenc_ctr/01.mp4'));
+      expect((metadata as typeof metadata & { protectionScheme?: string }).protectionScheme).toBe('cenc');
+    });
+  });
+
+  test('an empty PCM container truthfully reports its zero-sample duration', async () => {
+    await withEngine(async (engine) => {
+      const metadata = await engine.probe(await fixture('empty_audio.wav'));
+      expect(metadata.durationSec).toBe(0);
+      expect(metadata.tracks).toHaveLength(1);
+      expect(metadata.tracks[0]).toMatchObject({ type: 'audio', codec: 'pcm-s16' });
+    });
+  });
+
   test('metadata edits round-trip and preserve unrelated normalized tags across a second edit', async () => {
     await withEngine(async (engine) => {
       const input = await fixture('micro_h264_1frame.mp4');

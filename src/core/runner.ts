@@ -54,6 +54,7 @@ import type {
   SeekResult,
 } from './engine.ts';
 import {
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   AdapterContractError,
@@ -93,11 +94,14 @@ import { getEngine, listScoredEngines, listScenarios, getScenario } from './regi
 import type { RegisteredEngine } from './registry.ts';
 import { detectCodecSupport, detectEnv, probeWebCodecsConfigs } from './feature-detect.ts';
 import {
+  DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS,
   Meter,
   measurePeakMemoryWindow,
   userAgentSpecificMemorySampler,
   type MeterEvidence,
+  type MemorySampler,
   type MemoryPeakObservation,
+  type MemoryWindowOptions,
   type LongTaskObserverEnvironment,
 } from './measure.ts';
 import {
@@ -132,6 +136,8 @@ import {
   contentIdentityDigest,
   DECRYPT_METAMORPHIC_INVARIANT,
   evaluateCandidateEvidence,
+  isCorpusDeliveryIntegrityError,
+  verifyContentStream,
   withVerifiedContent,
 } from './media-selection.ts';
 import type {
@@ -140,6 +146,7 @@ import type {
   ResolvedInput,
   ScenarioSelection,
   VerifiedContent,
+  VerifiedStreamContent,
 } from './media-selection.ts';
 // The platform engine IS the browser-pure oracle decoder/player (§8). runMatrix injects these into
 // every cell so oracles that decode output / smoke-play it work without the caller wiring them.
@@ -773,6 +780,8 @@ export interface RunOneOptions extends Partial<RunOptions> {
   selectionEvidencePlan?: CandidateOracleEvidencePlan;
   /** Exact bytes verified once at the run boundary, shared across every engine for this candidate. */
   verifiedContents?: readonly VerifiedContent[];
+  /** Non-retained authenticated URL snapshot, valid only for bounded unmutated scale probes. */
+  verifiedStreamContents?: readonly VerifiedStreamContent[];
   /** Engine-facing key bytes admitted by the source-record parity preflight. Scenario provenance is
    * retained for fingerprints/oracles but is never forwarded through the adapter key object. */
   decryptKeyOverride?: DecryptKey;
@@ -786,6 +795,10 @@ export interface RunOneOptions extends Partial<RunOptions> {
   probeMemorySampler?: ReturnType<typeof userAgentSpecificMemorySampler>;
   /** Measurement-window controls; production callers normally use the audited defaults. */
   probeMemoryWindowOptions?: Parameters<typeof measurePeakMemoryWindow>[2];
+  /** Injectable benchmark memory instrument for deterministic protocol tests/host bridges. */
+  benchMemorySampler?: PerformanceEvidence<MemorySampler>;
+  /** Benchmark-only memory window controls; matrix runs use the audited bounded defaults. */
+  benchMemoryWindowOptions?: MemoryWindowOptions;
   /** Injectable only for deterministic scale-contract tests/host bridges; browsers use PerformanceObserver. */
   demuxScaleLongTaskEnvironment?: LongTaskObserverEnvironment;
 }
@@ -1129,6 +1142,59 @@ function buildDeliveredMediaInput(
   };
 }
 
+/**
+ * Build the only URL-backed transport admitted by the runner. The adapter-facing whole-file methods
+ * are intentionally unavailable: the authenticated block map must be consumed through the URL
+ * reader's validating fetch seam, never bypassed by a second unguarded full-body fetch.
+ */
+function buildAttestedStreamMediaInput(
+  resolved: ResolvedInput,
+  verified: VerifiedStreamContent,
+): MediaInput {
+  const unavailable = async (): Promise<never> => {
+    throw new Error('[ATTESTED_URL_WHOLE_FILE_FORBIDDEN] bounded URL input must use authenticated range transport');
+  };
+  return {
+    id: resolved.id,
+    url: mediaAssetUrl(resolved.urlAssetPath),
+    mime: mimeForAssetId(resolved.id),
+    sizeBytes: verified.actualSizeBytes,
+    mutated: false,
+    contentAttestation: {
+      schema: 'media-test/url-content-attestation@1',
+      logicalPath: verified.identity.logicalPath,
+      sha256: verified.actualSha256,
+      sizeBytes: verified.actualSizeBytes,
+      chunkSizeBytes: verified.chunkSizeBytes,
+      chunkSha256: verified.chunkSha256,
+    },
+    arrayBuffer: unavailable,
+    blob: unavailable,
+  };
+}
+
+function boundedProbeStreamTransportEligible(
+  scenario: Scenario,
+  resolvedInputs: readonly ResolvedInput[],
+): boolean {
+  if (resolvedInputs.length !== 1) return false;
+  const root = resolvedInputs[0]!;
+  const scheme = objectOptionRoot(scenario.options).scheme;
+  return scenario.op === 'probe' &&
+    probeBudgetFromOptions(scenario.options) !== undefined &&
+    typeof scenario.mutate !== 'function' &&
+    root.transport === undefined &&
+    scheme !== 'hls-aes128' &&
+    scheme !== 'hls-sample-aes' &&
+    hlsResourceIndexFromOptions(scenario.options) === undefined &&
+    !/\.m3u8?(?:$|[?#])/i.test(root.id) &&
+    !/\.m3u8?(?:$|[?#])/i.test(root.urlAssetPath);
+}
+
+function supportsAuthenticatedRangeProbeTransport(capabilities: CapabilitySet): boolean {
+  return capabilities.features.includes(AUTHENTICATED_RANGE_PROBE_FEATURE);
+}
+
 /** HLS URL consumers receive a closed object-URL graph: verified sidecar blobs first, then a
  * verified playlist whose exact local references are rebound to those URLs. Transport resources do
  * not inflate the operation input cardinality. */
@@ -1230,6 +1296,36 @@ function verifiedContentsMismatch(
   return undefined;
 }
 
+function verifiedStreamContentsMismatch(
+  identities: readonly ContentIdentity[],
+  contents: readonly VerifiedStreamContent[],
+): string | undefined {
+  if (contents.length !== identities.length) {
+    return `expected ${identities.length} verified stream inputs, received ${contents.length}`;
+  }
+  for (let index = 0; index < identities.length; index++) {
+    const expected = identities[index]!;
+    const actual = contents[index]!;
+    const expectedChunks = Math.ceil(expected.sizeBytes / actual.chunkSizeBytes);
+    if (
+      actual.state !== 'VERIFIED_STREAM' ||
+      actual.identity.logicalPath !== expected.logicalPath ||
+      actual.identity.sha256 !== expected.sha256 ||
+      actual.identity.sizeBytes !== expected.sizeBytes ||
+      actual.actualSha256 !== expected.sha256 ||
+      actual.actualSizeBytes !== expected.sizeBytes ||
+      actual.retainedBytes !== 0 ||
+      !Number.isSafeInteger(actual.chunkSizeBytes) ||
+      actual.chunkSizeBytes <= 0 ||
+      actual.chunkSha256.length !== expectedChunks ||
+      actual.chunkSha256.some((digest) => !/^[a-f0-9]{64}$/.test(digest))
+    ) {
+      return `verified stream input ${index} does not match '${expected.logicalPath}' (${expected.sha256}/${expected.sizeBytes})`;
+    }
+  }
+  return undefined;
+}
+
 // ── Pillar gating ──────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -1284,9 +1380,37 @@ const DEFAULT_INIT_TIMEOUT_MS = 120_000; // engine.init() (WASM compile/instanti
 const DEFAULT_BENCH_TIMEOUT_MS = 300_000; // the whole bench (warmup+iters) for one cell
 const DEFAULT_CLEANUP_TIMEOUT_MS = 5_000;
 
+// `measureUserAgentSpecificMemory()` is a high-latency cross-process observation in Chromium.
+// Digest-attested scale probes are deliberately bounded, short metadata reads, so one observation
+// request started during the operation plus the end point is a credible bounded peak window. Long
+// demux/transcode/decode workloads keep measurePeakMemoryWindow's recurring/default-settle policy.
+const AUTHENTICATED_SCALE_PROBE_MEMORY_WINDOW: Readonly<MemoryWindowOptions> = Object.freeze({
+  sampleIntervalMs: 100,
+  settleWindowMs: 0,
+  sampleImmediatelyDuringOperation: true,
+  maxOperationSamples: 1,
+  sampleTimeoutMs: DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS,
+});
+
+function cancellableMemoryWindowOptions(
+  options: MemoryWindowOptions | undefined,
+  cancellation: CancellationScope,
+): MemoryWindowOptions {
+  return {
+    ...(options ?? {}),
+    sampleTimeoutMs: options?.sampleTimeoutMs ?? DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS,
+    // The scope's memory signal normalizes caller cancellation and hard deadlines into the same
+    // typed errors produced by cancellation.run(). Measurement abort must never be relabelled as
+    // MEMORY_PROTOCOL_ERROR merely because it happened during baseline/end instrumentation.
+    signal: cancellation.memorySignal,
+  };
+}
+
 interface CancellationScope {
   /** The one composed signal passed to every lifecycle, operation, oracle, fetch, and bench call. */
   signal: AbortSignal;
+  /** Same cancellation boundary, with its reason normalized for measurement-only waits. */
+  memorySignal: AbortSignal;
   run<T>(task: (signal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T>;
   abort(reason?: unknown): void;
   close(): void;
@@ -1304,6 +1428,14 @@ function createCancellationScope(
   const deadline = AbortSignal.timeout(Math.max(1, hardDeadlineMs));
   const sources = callerSignal ? [callerSignal, deadline, controller.signal] : [deadline, controller.signal];
   const signal = AbortSignal.any(sources);
+  const memoryController = new AbortController();
+  const forwardMemoryAbort = (): void => {
+    if (!memoryController.signal.aborted) {
+      memoryController.abort(cancellationError(signal.reason, hardDeadlineMs, deadline.aborted));
+    }
+  };
+  signal.addEventListener('abort', forwardMemoryAbort, { once: true });
+  if (signal.aborted) forwardMemoryAbort();
 
   const abort = (reason?: unknown): void => {
     if (!controller.signal.aborted) controller.abort(reason);
@@ -1311,9 +1443,11 @@ function createCancellationScope(
 
   return {
     signal,
+    memorySignal: memoryController.signal,
     abort,
     close() {
-      // Timers/listeners are owned by each run() call. AbortSignal.timeout is self-cleaning.
+      signal.removeEventListener('abort', forwardMemoryAbort);
+      // Timers/listeners are otherwise owned by each run() call. AbortSignal.timeout is self-cleaning.
     },
     async run<T>(task: (sharedSignal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T> {
       const ms = timeoutMs && timeoutMs > 0 ? timeoutMs : DEFAULT_OP_TIMEOUT_MS;
@@ -1617,8 +1751,35 @@ function cacheMeasurementProtocolMatches(
       const summary = observation.bench[metric];
       if (!summary || !adaptiveTimingProtocolMatches(summary, benchOptions)) return false;
     }
+    if (
+      scenario.op === 'probe' &&
+      probeBudgetFromOptions(scenario.options) !== undefined &&
+      scenario.metrics.includes('peakMemory')
+    ) {
+      const primary = observation.bench[scenario.primaryMetric ?? scenario.metrics[0]!];
+      if (!primary || !authenticatedScaleProbeMemoryProtocolMatches(primary)) return false;
+    }
   }
   return true;
+}
+
+function authenticatedScaleProbeMemoryProtocolMatches(summary: BenchSummary): boolean {
+  const evidence = recordOption(summary.protocolEvidence);
+  const memory = evidence?.memory;
+  if (!Array.isArray(memory) || memory.length !== summary.n) return false;
+  return memory.every((value) => {
+    const observation = recordOption(value);
+    if (
+      observation?.schema !== 'media-test/memory-window@1' ||
+      observation?.immediateOperationSample !== true ||
+      observation.operationSampleLimit !== 1 ||
+      observation.settleWindowMs !== 0 ||
+      observation.sampleTimeoutMs !== DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS
+    ) return false;
+    const samples = observation.samples;
+    if (!Array.isArray(samples) || samples.length !== 3) return false;
+    return samples.map((sample) => recordOption(sample)?.phase).join(',') === 'baseline,operation,end';
+  });
 }
 
 function adaptiveTimingProtocolMatches(summary: BenchSummary, options: BenchOptions | undefined): boolean {
@@ -1727,6 +1888,7 @@ type PreparedSelection =
   | {
       state: 'VERIFIED';
       verified: readonly VerifiedContent[];
+      verifiedStreamContents?: readonly VerifiedStreamContent[];
       resolvedInputs: readonly ResolvedInput[];
       selection: ScenarioSelection;
       decryptKeyOverride?: DecryptKey;
@@ -1735,7 +1897,15 @@ type PreparedSelection =
   | { state: 'ERROR'; reason: string }
   | { state: 'SKIPPED'; reason: string };
 
-type PrepareSelection = (selection: ScenarioSelection) => Promise<PreparedSelection>;
+interface PrepareSelectionOptions {
+  /** Only adapters declaring and enforcing digest-bound range delivery may receive URL attestations. */
+  authenticatedStreamTransport?: boolean;
+}
+
+type PrepareSelection = (
+  selection: ScenarioSelection,
+  options?: PrepareSelectionOptions,
+) => Promise<PreparedSelection>;
 
 type DerivedDecryptSelectionPreflight =
   | {
@@ -4109,7 +4279,9 @@ async function runExhaustiveCell(
           ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
           pixelBehavior,
-          verifiedContents: prepared.verified,
+          ...(prepared.verifiedStreamContents
+            ? { verifiedStreamContents: prepared.verifiedStreamContents }
+            : { verifiedContents: prepared.verified }),
           ...(prepared.decryptKeyOverride ? { decryptKeyOverride: prepared.decryptKeyOverride } : {}),
           ...(cachedResult ? { cachedResult } : {}),
         };
@@ -4164,7 +4336,9 @@ async function runExhaustiveCell(
         ...(opts.signal ? { signal: opts.signal } : {}),
         pixelBehavior,
         fixtureIntegrityRuntime,
-        verifiedContents: prepared.verified,
+        ...(prepared.verifiedStreamContents
+          ? { verifiedStreamContents: prepared.verifiedStreamContents }
+          : { verifiedContents: prepared.verified }),
         ...(prepared.decryptKeyOverride ? { decryptKeyOverride: prepared.decryptKeyOverride } : {}),
         ...(cachedResult ? { cachedResult } : {}),
       };
@@ -4290,10 +4464,12 @@ export function reduceExhaustiveStatuses(
  * Aggregate per-file results into ONE cell (§6.2/§9). CORRECTNESS = logical AND: any admissible
  * FAIL/ERROR ⇒ the cell FAILs/ERRORs and names the offending file(s) (a FAIL is NEVER averaged into a
  * pass); all admissible PASS ⇒ PASS; no admissible file (all NA_*) ⇒ carry the NA kind. PERFORMANCE =
- * summarizeAcrossFiles per metric — `.aggregate` COMBINES the passing files (SUM for additive cost
- * metrics, MAX for peakMemory, MEDIAN for rate metrics) while `.samples` keeps the per-file spread.
- * `coverage` records passed/admissible/total so winners rank coverage-first. The `exhaustive[]` array
- * preserves every file's verdict + numbers so the spread is visible and a FAIL traces to its bytes.
+ * for a correctness-valid aggregate, summarizeAcrossFiles per metric — `.aggregate` COMBINES the
+ * passing files (SUM for additive cost metrics, MAX for peakMemory, MEDIAN for rate metrics) while
+ * `.samples` keeps the per-file spread. A FAIL/ERROR aggregate publishes no headline benchmark;
+ * each passing member's numbers remain in `exhaustive[]`. `coverage` records
+ * passed/admissible/total so winners rank coverage-first. The `exhaustive[]` array preserves every
+ * file's verdict + numbers so the spread is visible and a FAIL traces to its bytes.
  */
 export function aggregateExhaustive(
   engineId: string,
@@ -4359,19 +4535,31 @@ export function aggregateExhaustive(
       for (const metric of entry.result.measurement.metrics) measuredMetrics.add(metric);
     }
   }
-  const measurement: ScenarioResult['measurement'] = unavailableMeasurement
-    ? {
-        state: 'UNAVAILABLE',
-        reasonCode: 'EXHAUSTIVE_MEASUREMENT_PARTIAL',
-        detail: `${unavailableMeasurement.sel.selectedFile}: ${
-          unavailableMeasurement.result.measurement?.state === 'UNAVAILABLE'
-            ? unavailableMeasurement.result.measurement.detail
-            : 'measurement unavailable'
-        }`,
-      }
-    : measuredMetrics.size > 0
-      ? { state: 'AVAILABLE', metrics: [...measuredMetrics].sort() }
-      : { state: 'NOT_REQUESTED' };
+  const hasMemberPerformanceEvidence = aggregateBench !== undefined || valid.some((entry) =>
+    entry.result.measurement?.state === 'AVAILABLE' ||
+    entry.result.measurement?.state === 'UNAVAILABLE');
+  const measurement: ScenarioResult['measurement'] =
+    reduction.status !== 'PASS' && hasMemberPerformanceEvidence
+      ? {
+          state: 'UNAVAILABLE',
+          reasonCode: 'EXHAUSTIVE_CORRECTNESS_GATE',
+          detail:
+            `aggregate status ${reduction.status} is not benchmark-eligible; ` +
+            'passing-member measurements remain in exhaustive[]',
+        }
+      : unavailableMeasurement
+        ? {
+            state: 'UNAVAILABLE',
+            reasonCode: 'EXHAUSTIVE_MEASUREMENT_PARTIAL',
+            detail: `${unavailableMeasurement.sel.selectedFile}: ${
+              unavailableMeasurement.result.measurement?.state === 'UNAVAILABLE'
+                ? unavailableMeasurement.result.measurement.detail
+                : 'measurement unavailable'
+            }`,
+          }
+        : measuredMetrics.size > 0
+          ? { state: 'AVAILABLE', metrics: [...measuredMetrics].sort() }
+          : { state: 'NOT_REQUESTED' };
 
   const coverage = {
     // Legacy names remain populated for existing consumers; valid is PASS (correctness is binary).
@@ -4426,8 +4614,9 @@ export function aggregateExhaustive(
     family: scenario.family,
     exhaustive: files as ExhaustiveFileResult[],
     // §6.2 coverage: how many candidate files this engine was actually scored over. `passed` are the
-    // files combined into bench.<metric>.aggregate; `admissible` = PASS+FAIL+ERROR (real signal);
-    // `total` = every candidate offered. The report ranks winners coverage-FIRST (higher passed wins).
+    // files eligible for bench.<metric>.aggregate when the cell itself PASSes;
+    // `admissible` = PASS+FAIL+ERROR (real signal); `total` = every candidate offered. The report
+    // ranks winners coverage-FIRST (higher passed wins).
     coverage: coverage as ScenarioResult['coverage'],
     // Representative provenance: this cell spanned N files (per-file detail is in `exhaustive`).
     selection: aggregateSelection,
@@ -4447,7 +4636,7 @@ export function aggregateExhaustive(
     reason:
       `coverage ${reduction.grade} ${reduction.valid}/${reduction.counts.total}; ` +
       (diagnostics || 'no executed variant produced a decisive diagnostic'),
-    ...(aggregateBench ? { bench: aggregateBench } : {}),
+    ...(reduction.status === 'PASS' && aggregateBench ? { bench: aggregateBench } : {}),
   };
 }
 
@@ -4642,12 +4831,19 @@ export async function runOne(
     }
     // Budget applicability must run before verified bytes become Blobs/object URLs and before init.
     // Load at most the small identity manifest here; never touch the media body for this gate.
-    if (probeBudget && operationResolvedInputs?.[0]?.sizeBytes === undefined && !opts?.verifiedContents?.[0]) {
+    if (
+      probeBudget &&
+      operationResolvedInputs?.[0]?.sizeBytes === undefined &&
+      !opts?.verifiedContents?.[0] &&
+      !opts?.verifiedStreamContents?.[0]
+    ) {
       await fixtureManifestById();
     }
     let probeInputSize = probeBudget
       ? operationResolvedInputs?.[0]?.sizeBytes ??
         opts?.verifiedContents?.find((entry) =>
+          entry.identity.logicalPath === (operationResolvedInputs?.[0]?.urlAssetPath ?? assetIds[0]))?.actualSizeBytes ??
+        opts?.verifiedStreamContents?.find((entry) =>
           entry.identity.logicalPath === (operationResolvedInputs?.[0]?.urlAssetPath ?? assetIds[0]))?.actualSizeBytes ??
         fixtureManifestCache?.get(assetIds[0]!)?.sizeBytes ??
         undefined
@@ -4742,7 +4938,34 @@ export async function runOne(
       }
     }
     let materializedVerifiedContents = false;
-    if (resolvedInputs && resolvedInputs.length > 0 && opts?.verifiedContents) {
+    if (opts?.verifiedContents && opts.verifiedStreamContents) {
+      return finalize('ERROR', [], '[CORPUS_VERIFIED_TRANSPORT_AMBIGUOUS] retained and stream verification were both supplied');
+    }
+    if (resolvedInputs && resolvedInputs.length > 0 && opts?.verifiedStreamContents) {
+      if (!boundedProbeStreamTransportEligible(scenario, resolvedInputs)) {
+        return finalize(
+          'ERROR',
+          [],
+          '[CORPUS_STREAM_TRANSPORT_FORBIDDEN] authenticated URL transport is limited to unmutated single-file scale probes',
+        );
+      }
+      if (!supportsAuthenticatedRangeProbeTransport(caps)) {
+        return finalize(
+          'ERROR',
+          [],
+          `[CORPUS_STREAM_TRANSPORT_ADAPTER_UNAUTHENTICATED] adapter must declare '${AUTHENTICATED_RANGE_PROBE_FEATURE}' before receiving a digest-bound URL`,
+        );
+      }
+      const declared = resolvedContentIdentities(resolvedInputs);
+      if (!declared.identities) {
+        return finalize('NA_ASSET', [], declared.reason ?? '[CORPUS_IDENTITY_MISSING] invalid identity');
+      }
+      const mismatch = verifiedStreamContentsMismatch(declared.identities, opts.verifiedStreamContents);
+      if (mismatch) return finalize('NA_ASSET', [], `[CORPUS_VERIFIED_STREAM_MISMATCH] ${mismatch}`);
+      inputs = [buildAttestedStreamMediaInput(resolvedInputs[0]!, opts.verifiedStreamContents[0]!)];
+      primaryInput = inputs[0]!;
+      materializedVerifiedContents = true;
+    } else if (resolvedInputs && resolvedInputs.length > 0 && opts?.verifiedContents) {
       const declared = resolvedContentIdentities(resolvedInputs);
       if (!declared.identities) {
         return finalize('NA_ASSET', [], declared.reason ?? '[CORPUS_IDENTITY_MISSING] invalid identity');
@@ -5184,7 +5407,7 @@ export async function runOne(
         const observed = await measurePeakMemoryWindow(
           timed,
           demuxScaleMemorySampler,
-          opts?.probeMemoryWindowOptions,
+          cancellableMemoryWindowOptions(opts?.probeMemoryWindowOptions, cancellation),
         );
         if (observed.state === 'UNAVAILABLE') {
           return finalize(observed.status, [], `[${observed.reasonCode}] ${observed.reason}`);
@@ -5210,7 +5433,14 @@ export async function runOne(
         const observed = await measurePeakMemoryWindow(
           executeFunctional,
           probeMemorySampler,
-          opts?.probeMemoryWindowOptions,
+          cancellableMemoryWindowOptions(
+            opts?.probeMemoryWindowOptions ?? (
+              primaryInput.contentAttestation && supportsAuthenticatedRangeProbeTransport(caps)
+                ? { ...AUTHENTICATED_SCALE_PROBE_MEMORY_WINDOW }
+                : undefined
+            ),
+            cancellation,
+          ),
         );
         if (observed.state === 'UNAVAILABLE') {
           return finalize(
@@ -5242,6 +5472,9 @@ export async function runOne(
       }
       if (isBrowserNotSupportedError(err)) {
         return finalize('NA_BROWSER', [], browserApplicabilityReason(err));
+      }
+      if (isCorpusDeliveryIntegrityError(err)) {
+        return finalize('NA_ASSET', [], `[${err.reasonCode}] ${err.detail}`);
       }
       if (
         err instanceof AdapterContractError &&
@@ -5380,6 +5613,14 @@ export async function runOne(
           concreteRequest,
           cancellation,
           opts?.resolvedInputs,
+          opts?.benchMemorySampler,
+          opts?.benchMemoryWindowOptions ?? (
+            probeBudget &&
+            primaryInput.contentAttestation &&
+            supportsAuthenticatedRangeProbeTransport(caps)
+              ? { ...AUTHENTICATED_SCALE_PROBE_MEMORY_WINDOW }
+              : undefined
+          ),
         ),
         DEFAULT_BENCH_TIMEOUT_MS,
       );
@@ -5389,6 +5630,9 @@ export async function runOne(
       }
       if (isBrowserNotSupportedError(err)) {
         return finalize('NA_BROWSER', oracleOutcomes, browserApplicabilityReason(err));
+      }
+      if (isCorpusDeliveryIntegrityError(err)) {
+        return finalize('NA_ASSET', oracleOutcomes, `[${err.reasonCode}] ${err.detail}`);
       }
       if (err instanceof TimeoutError) {
         return finalize(
@@ -5400,7 +5644,20 @@ export async function runOne(
         );
       }
       if (err instanceof RunCancelledError) {
-        return finalize('SKIPPED', oracleOutcomes, `[RUN_CANCELLED] ${err.message}`);
+        // Correctness and candidate-evidence reduction already completed before measurement began.
+        // A run-level stop at this point cancels only the optional benchmark; relabelling the row
+        // SKIPPED would contradict its retained PASS evidence and make the result unwritable.
+        return finalize(
+          correctnessStatus,
+          oracleOutcomes,
+          undefined,
+          undefined,
+          {
+            state: 'UNAVAILABLE',
+            reasonCode: 'BENCH_CANCELLED',
+            detail: `[RUN_CANCELLED] ${err.message}`,
+          },
+        );
       }
       if (err instanceof MeasurementProtocolUnavailable || err instanceof MetricProtocolError) {
         return finalize(
@@ -5472,6 +5729,9 @@ export async function runOne(
     }
     if (isBrowserNotSupportedError(err)) {
       return finalize('NA_BROWSER', [], browserApplicabilityReason(err));
+    }
+    if (isCorpusDeliveryIntegrityError(err)) {
+      return finalize('NA_ASSET', [], `[${err.reasonCode}] ${err.detail}`);
     }
     if (err instanceof AdapterContractError) {
       return finalize('ERROR', [], errMessage(err));
@@ -6288,6 +6548,8 @@ async function runBench(
   request: ConcreteOperationRequest,
   cancellation: CancellationScope,
   resolvedInputs?: ResolvedInput[],
+  memorySamplerEvidence?: PerformanceEvidence<MemorySampler>,
+  memoryWindowOptions?: MemoryWindowOptions,
 ): Promise<ScenarioResult['bench']> {
   const primaryMetric = scenario.primaryMetric ?? scenario.metrics[0];
   if (!primaryMetric) return {};
@@ -6305,7 +6567,7 @@ async function runBench(
   }
   preflightLongTaskMeasurement(scenario.metrics.includes('longtasks'));
   const memorySampler = scenario.metrics.includes('peakMemory')
-    ? requirePerformanceEvidence(userAgentSpecificMemorySampler(), 'peakMemory')
+    ? requirePerformanceEvidence(memorySamplerEvidence ?? userAgentSpecificMemorySampler(), 'peakMemory')
     : undefined;
 
   const measured: BenchBatchEvidence[] = [];
@@ -6327,7 +6589,11 @@ async function runBench(
         cancellation,
         batch,
         resolvedInputs,
-        memorySampler,
+        // Warmup and calibration samples are intentionally discarded by adaptiveBench. Running the
+        // expensive cross-process memory API around those phases multiplies overhead without adding
+        // evidence. Every retained repetition below still owns an independent bounded window.
+        batch.phase === 'measured' ? memorySampler : undefined,
+        memoryWindowOptions,
       );
       if (batch.phase === 'measured') measured.push(evidence);
       return evidence.sample;
@@ -6412,7 +6678,8 @@ async function runBenchBatch(
   cancellation: CancellationScope,
   batch: AdaptiveBatchRequest,
   resolvedInputs: ResolvedInput[] | undefined,
-  memorySampler: ReturnType<typeof userAgentSpecificMemorySampler> extends PerformanceEvidence<infer T> ? T | undefined : never,
+  memorySampler: MemorySampler | undefined,
+  memoryWindowOptions: MemoryWindowOptions | undefined,
 ): Promise<BenchBatchEvidence> {
   const meter = new Meter({ observeLongtasks: scenario.metrics.includes('longtasks') });
   const ctx: MeasureContext = { ops: 0 };
@@ -6581,7 +6848,11 @@ async function runBenchBatch(
   let memory: MemoryPeakObservation | undefined;
   if (memorySampler) {
     const window = requirePerformanceEvidence(
-      await measurePeakMemoryWindow(timed, { state: 'AVAILABLE', value: memorySampler }),
+      await measurePeakMemoryWindow(
+        timed,
+        { state: 'AVAILABLE', value: memorySampler },
+        cancellableMemoryWindowOptions(memoryWindowOptions, cancellation),
+      ),
       'peakMemory',
     );
     timedResult = window.result;
@@ -6953,8 +7224,63 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         .join('; ') || '[CORPUS_NO_VERIFIED_CANDIDATE] no verified bytes',
     };
   };
-  const prepareSelection = (selection: ScenarioSelection): Promise<PreparedSelection> => {
-    const selectionKey = selectionPreparationKey(selection);
+  const verifyResolvedInputStreams = async (
+    resolvedInputs: readonly ResolvedInput[],
+  ): Promise<
+    | {
+        state: 'VERIFIED';
+        verified: readonly VerifiedContent[];
+        verifiedStreamContents: readonly VerifiedStreamContent[];
+      }
+    | { state: 'NA_ASSET'; reason: string }
+    | { state: 'ERROR'; reason: string }
+    | { state: 'SKIPPED'; reason: string }
+  > => {
+    if (opts.signal?.aborted) {
+      return { state: 'SKIPPED', reason: '[RUN_CANCELLED] content verification cancelled' };
+    }
+    const declared = resolvedContentIdentities(resolvedInputs);
+    if (!declared.identities) {
+      return { state: 'NA_ASSET', reason: declared.reason ?? '[CORPUS_IDENTITY_MISSING] invalid identity' };
+    }
+    if (declared.identities.length !== 1) {
+      return {
+        state: 'ERROR',
+        reason: '[CORPUS_STREAM_TRANSPORT_CARDINALITY] authenticated URL transport requires exactly one input',
+      };
+    }
+    const identity = declared.identities[0]!;
+    const result = await verifyContentStream(identity, async () => {
+      const response = await fetch(mediaAssetUrl(identity.logicalPath), {
+        cache: 'no-store',
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      if (!response.body) throw new Error('response has no readable body');
+      return response.body;
+    });
+    if (opts.signal?.aborted) {
+      return { state: 'SKIPPED', reason: '[RUN_CANCELLED] content verification cancelled' };
+    }
+    if (result.state === 'VERIFIED_STREAM') {
+      return { state: 'VERIFIED', verified: [], verifiedStreamContents: [result] };
+    }
+    return {
+      state: 'NA_ASSET',
+      reason: `[${result.issue.reasonCode}] ${result.issue.detail}`,
+    };
+  };
+  const prepareSelection = (
+    selection: ScenarioSelection,
+    prepareOptions: PrepareSelectionOptions = {},
+  ): Promise<PreparedSelection> => {
+    const useStreamTransport = prepareOptions.authenticatedStreamTransport === true &&
+      boundedProbeStreamTransportEligible(selection.effectiveScenario, selection.resolvedInputs);
+    // Transport mode is part of preparation identity: retained bytes and an authenticated URL are
+    // different adapter-visible contracts and must never share an in-flight or blocked result.
+    const selectionKey = `${selectionPreparationKey(selection)}\u0000transport:${
+      useStreamTransport ? AUTHENTICATED_RANGE_PROBE_FEATURE : 'retained-bytes'
+    }`;
     const blocked = blockedPreparations.get(selectionKey);
     if (blocked) return Promise.resolve(blocked);
     const inFlight = inFlightPreparations.get(selectionKey);
@@ -6984,13 +7310,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           authoritativeKeyRecord = keyPreflight.record;
         }
       }
-      const rootVerification = await verifyResolvedInputs(selection.resolvedInputs);
+      const rootVerification = useStreamTransport
+        ? await verifyResolvedInputStreams(selection.resolvedInputs)
+        : await verifyResolvedInputs(selection.resolvedInputs);
       if (rootVerification.state !== 'VERIFIED') return rootVerification;
 
-      const encryptionFixtureEvidence = preflightEncryptionFixtureEvidence(
-        selection.effectiveScenario,
-        rootVerification.verified[0]!.bytes,
-      );
+      const retainedRoot = rootVerification.verified[0];
+      const encryptionFixtureEvidence = retainedRoot
+        ? preflightEncryptionFixtureEvidence(selection.effectiveScenario, retainedRoot.bytes)
+        : { state: 'READY' as const };
       if (encryptionFixtureEvidence.state === 'BLOCKED') {
         return { state: 'ERROR', reason: encryptionFixtureEvidence.reason };
       }
@@ -7000,6 +7328,10 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         integrity: 'VERIFIED',
       }));
       let verified: readonly VerifiedContent[] = rootVerification.verified;
+      const verifiedStreamContents: readonly VerifiedStreamContent[] | undefined =
+        'verifiedStreamContents' in rootVerification && Array.isArray(rootVerification.verifiedStreamContents)
+          ? rootVerification.verifiedStreamContents as readonly VerifiedStreamContent[]
+          : undefined;
       if (derivedCleartextBase) {
         const baseInput: ResolvedInput = {
           id: `cleartext-base:${derivedCleartextBase.logicalPath}`,
@@ -7139,6 +7471,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       return {
         state: 'VERIFIED',
         verified,
+        ...(verifiedStreamContents ? { verifiedStreamContents } : {}),
         resolvedInputs,
         selection: preparedSelection,
         ...(decryptKeyOverride ? { decryptKeyOverride } : {}),
@@ -7410,6 +7743,70 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
+      // Scale-probe read-mode applicability is capability-only and must precede content
+      // preparation. In exhaustive mode a candidate set can span many GiB; fetching and hashing
+      // every body before returning the already-known whole-file-only NA_ENGINE is both wasteful and
+      // capable of exhausting the browser. Preserve the selected identities in the aggregate while
+      // deciding the cell from declared adapter read modes alone.
+      const matrixProbeBudget = probeBudgetFromOptions(scenario.options);
+      const authenticatedStreamTransport = supportsAuthenticatedRangeProbeTransport(
+        validatedCapabilities,
+      );
+      if (matrixProbeBudget) {
+        const budgetSelections = exhaustiveList && exhaustiveList.length > 0
+          ? exhaustiveList
+          : [selection];
+        const inputSizeBytes = Math.max(
+          0,
+          ...budgetSelections.map((candidate) => {
+            const size = candidate.resolvedInputs[0]?.sizeBytes;
+            return Number.isSafeInteger(size) && Number(size) >= 0 ? Number(size) : 0;
+          }),
+        );
+        const budgetPreflight = probeBudgetPreflight(
+          matrixProbeBudget,
+          inputSizeBytes,
+          validatedCapabilities.probeReadModes ?? ['whole-file'],
+        );
+        const transportFailure = !budgetPreflight.supported
+          ? { reasonCode: budgetPreflight.reasonCode, detail: budgetPreflight.detail }
+          : !authenticatedStreamTransport
+            ? {
+                reasonCode: 'PROBE_AUTHENTICATED_RANGE_TRANSPORT_UNAVAILABLE',
+                detail:
+                  `adapter declares a bounded probe read mode but not '${AUTHENTICATED_RANGE_PROBE_FEATURE}', so URL blocks cannot be bound to the admitted corpus digest`,
+              }
+            : undefined;
+        if (transportFailure) {
+          result = matrixSelectionStatusResult(
+            engine.id,
+            opts.browser,
+            scenario,
+            'NA_ENGINE',
+            `[${transportFailure.reasonCode}] ${transportFailure.detail}`,
+            selection,
+            exhaustiveList,
+            runEnvBase,
+            opts.randomSeed,
+          );
+          if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+          await disposeConstructedEngine(engine, opts.signal);
+          await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
+          results.push(result);
+          opts.onResult?.(result);
+          if (exhaustiveList && exhaustiveList.length > 0) {
+            opts.onFileProgress?.(
+              exhaustiveList.length,
+              exhaustiveList.length,
+              `${scenario.id} / ${engine.id} / bounded-read preflight`,
+            );
+          }
+          done += 1;
+          opts.onProgress?.(done, total, `${label} (bounded-read NA_ENGINE)`);
+          continue;
+        }
+      }
+
       // The browser's persistent result cache has already validated its epoch/TTL and looked up the
       // exact immutable input (or exhaustive input-set) key. Honor that hit before downloading and
       // hashing the same large bodies again. Generic/in-memory stores omit exactSelectionReuse and
@@ -7470,7 +7867,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
               pillar,
               pixelBehavior,
               fixtureIntegrityRuntime,
-              prepareSelection,
+              (candidate) => prepareSelection(candidate, { authenticatedStreamTransport }),
               cachedCandidate ? restoreLogicalScenarioId(cachedCandidate, scenario.id) : undefined,
             );
           } catch (error) {
@@ -7511,7 +7908,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       // as the cell completes.
       let prepared: PreparedSelection;
       try {
-        prepared = await prepareSelection(selection);
+        prepared = await prepareSelection(selection, { authenticatedStreamTransport });
       } catch (error) {
         // Content preparation sits outside runOne. Keep an unexpected fetch/hash/preflight exception
         // local to this cell so the matrix advances instead of marking all following rows "Not run".
@@ -7581,7 +7978,9 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         ...(executionSelection.evidencePlan
           ? { selectionEvidencePlan: executionSelection.evidencePlan }
           : {}),
-        verifiedContents: prepared.verified,
+        ...(prepared.verifiedStreamContents
+          ? { verifiedStreamContents: prepared.verifiedStreamContents }
+          : { verifiedContents: prepared.verified }),
         ...(prepared.decryptKeyOverride ? { decryptKeyOverride: prepared.decryptKeyOverride } : {}),
         ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),

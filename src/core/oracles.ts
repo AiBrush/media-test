@@ -35,6 +35,10 @@ import type { MediaEngine, PacketInfo } from './engine.ts';
 import { isNotApplicableError } from './engine.ts';
 import type { OracleId, OracleOutcome, OracleTolerances, Scenario } from './scenario.ts';
 import { canonicalizeJson, type JsonObject } from './canonical-json.ts';
+import {
+  COMPACT_GOLDEN_PACKETS_SCHEMA,
+  readCompactGoldenPacketRows,
+} from './lossless-json-columnar.ts';
 import type {
   GoldenEvidenceProvider,
   GoldenEvidenceResult as StrictGoldenEvidenceResult,
@@ -361,7 +365,12 @@ async function loadGoldenEvidence<T>(
 
   let raw: unknown;
   try {
-    raw = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    let jsonText = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // The scoped fallback does not return source bytes. Release that whole-artifact reference before
+    // JSON.parse builds the object graph, then release the decoded text immediately afterwards.
+    bytes = new Uint8Array(0);
+    raw = JSON.parse(jsonText) as unknown;
+    jsonText = '';
   } catch {
     return { state: 'PARSE_ERROR', reasonCode: 'GOLDEN_JSON_PARSE_ERROR', url };
   }
@@ -436,6 +445,16 @@ function parseGoldenMetadata(value: unknown): NormalizedMetadata | undefined {
 }
 
 function parseGoldenPackets(value: unknown): PacketInfo[] | undefined {
+  if (isObject(value) && value.schema === 'media-test/golden-artifact@1' && isObject(value.payload)) {
+    value = value.payload;
+  }
+  if (isObject(value) && value.schema === COMPACT_GOLDEN_PACKETS_SCHEMA) {
+    try {
+      value = { packets: readCompactGoldenPacketRows(value) };
+    } catch {
+      return undefined;
+    }
+  }
   const packets = unwrap(value, ['packets']);
   if (!Array.isArray(packets)) return undefined;
   if (
@@ -1348,8 +1367,8 @@ function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): Orac
     requiredLayers.push(probeAssessmentOutcome(
       oracle,
       assessDeclaredMetadataFields(
-        got as ProbeMetadataObservation,
-        want as ProbeMetadataObservation,
+        { ...(got as ProbeMetadataObservation), tracks: gotTracks },
+        { ...(want as ProbeMetadataObservation), tracks: goldTracks },
         fieldPolicy,
       ),
     ));

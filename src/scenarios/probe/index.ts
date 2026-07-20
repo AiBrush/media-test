@@ -28,6 +28,7 @@
  */
 
 import type { MetricId, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
+import type { EncryptionScheme } from '../../core/engine.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import {
   HLS_PLAYLIST_ONLY_CONTRACT,
@@ -49,6 +50,7 @@ interface ProbeCase {
   videoCodecs?: string[];
   videoCodecsIn?: string[];
   audioCodecs?: string[];
+  encryption?: EncryptionScheme[];
   features?: string[];
   options?: Record<string, unknown>;
   probeContract?: Record<string, unknown>;
@@ -64,7 +66,7 @@ const DECLARED_METADATA_POLICIES: Readonly<Record<string, ProbeMetadataFieldPoli
     fields: ['track.bitrate'],
     bitrateRelativeTolerance: 0,
   }),
-  'cenc_ctr.mp4': defineProbeMetadataFieldPolicy({
+  'cenc_ctr_fragmented.mp4': defineProbeMetadataFieldPolicy({
     fields: ['protection.scheme'],
     protectionSchemes: ['cenc'],
   }),
@@ -76,6 +78,7 @@ const DECLARED_METADATA_POLICIES: Readonly<Record<string, ProbeMetadataFieldPoli
 
 const EMPTY_DURATION_NULLABILITY_POLICY = defineProbeMetadataFieldPolicy({
   fields: ['duration-nullability'],
+  zeroDurationEquivalentToUnknown: true,
 });
 
 const SCALE_BUDGET_BY_ASSET: Readonly<Record<string, ProbeBudgetContract>> = Object.freeze({
@@ -95,7 +98,12 @@ function scenarioProbeOptions(
 ): Record<string, unknown> | undefined {
   const metadataFieldPolicy = DECLARED_METADATA_POLICIES[asset];
   const probeBudget = SCALE_BUDGET_BY_ASSET[asset];
-  if (!existing && !metadataFieldPolicy && !probeBudget && !probeContract) return undefined;
+  const hlsResourceIndex = asset === 'hls_vod.m3u8'
+    ? 'fixtures/golden/hls_vod.m3u8.resources.json'
+    : probeContract?.schema === 'media-test/hls-protected-segment-probe@1'
+      ? 'fixtures/golden/hls_aes128.m3u8.resources.json'
+      : undefined;
+  if (!existing && !metadataFieldPolicy && !probeBudget && !probeContract && !hlsResourceIndex) return undefined;
   return {
     ...(existing ?? {}),
     robustness: {
@@ -104,9 +112,7 @@ function scenarioProbeOptions(
         ...(metadataFieldPolicy ? { metadataFieldPolicy } : {}),
         ...(probeBudget ? { probeBudget } : {}),
         ...(probeContract ? { probeContract } : {}),
-        ...(probeContract?.schema === 'media-test/hls-protected-segment-probe@1'
-          ? { hlsResourceIndex: 'fixtures/golden/hls_aes128.m3u8.resources.json' }
-          : {}),
+        ...(hlsResourceIndex ? { hlsResourceIndex } : {}),
       },
     },
   };
@@ -218,20 +224,24 @@ const PROBE_CASES: ProbeCase[] = [
 
   // ── Encrypted MP4 (probe of the encrypted container, no key needed) ──
   {
-    asset: 'cenc_ctr.mp4',
+    id: 'cenc_ctr',
+    asset: 'cenc_ctr_fragmented.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    encryption: ['cenc-ctr'],
     features: ['metadata:protected-tracks'],
     notes:
-      'CENC ctr: probe reports protected MP4 track metadata (container/tracks/duration) without ' +
-      'decrypting. Encryption-scheme assertions wait until the normalized metadata shape carries it.',
+      'Probe-owned fully fragmented CENC ctr: probe reports protected MP4 track metadata ' +
+      '(container/tracks/duration/scheme) without decrypting. The legacy cenc_ctr.mp4 remains ' +
+      'reserved for encryption/decrypt scenarios.',
   },
   {
     asset: 'cenc_cbcs.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    encryption: ['cenc-cbcs'],
     features: ['metadata:protected-tracks'],
     notes:
       'CENC cbcs: probe reports protected MP4 track metadata without decrypting; no decrypt key is ' +
@@ -418,7 +428,11 @@ const PROBE_CASES: ProbeCase[] = [
     container: 'mov',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
-    notes: 'huge bucket (~500-700 MB) self-contained big-read .mov. Probe reads header without scanning media.',
+    options: { metadataTrackTypes: ['video', 'audio'] },
+    notes:
+      'huge bucket (~500-700 MB) self-contained big-read .mov. Probe reads header without scanning media. ' +
+      'Only media tracks are compared because the real-source candidates also contain auxiliary QuickTime ' +
+      'tmcd data tracks, which are outside the normalized probe media-track contract.',
   },
   {
     asset: 'huge_vp9_1080p_240s.webm',
@@ -470,6 +484,7 @@ const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.videoCodecsIn ? { videoCodecsIn: c.videoCodecsIn } : {}),
       ...(c.audioCodecs ? { audioCodecs: c.audioCodecs } : {}),
+      ...(c.encryption ? { encryption: c.encryption } : {}),
       ...(c.features ? { features: c.features } : {}),
     },
     oracles: ['golden-metadata'],
@@ -530,6 +545,7 @@ interface PerfProbeCase {
   container: string;
   videoCodecs?: string[];
   audioCodecs?: string[];
+  options?: Record<string, unknown>;
   notes: string;
 }
 
@@ -550,10 +566,12 @@ const PERF_PROBE_CASES: PerfProbeCase[] = [
     container: 'mov',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    options: { metadataTrackTypes: ['video', 'audio'] },
     notes:
       'Headline §8.1 at HUGE scale: repeated metadata extraction on the self-contained ~500-700 MB ' +
-      'big-read .mov. Score = probes/sec; correctness gated by golden-metadata. Faststart moov keeps ' +
-      'a correct probe a cheap front-of-file read even at huge size.',
+      'big-read .mov. Score = probes/sec; correctness gated by golden-metadata for video/audio tracks. ' +
+      'Auxiliary QuickTime tmcd tracks in real-source candidates are not part of this media-track headline. ' +
+      'Faststart moov keeps a correct probe a cheap front-of-file read even at huge size.',
   },
   {
     id: 'perf-extract-metadata-massive',
@@ -584,7 +602,7 @@ const perfProbeScenarios: Scenario[] = PERF_PROBE_CASES.map((c) =>
     oracles: ['golden-metadata'],
     metrics: [OPS_PER_SEC, 'wall', 'peakMemory'],
     primaryMetric: OPS_PER_SEC,
-    options: scenarioProbeOptions(c.asset)!,
+    options: scenarioProbeOptions(c.asset, c.options)!,
     notes: c.notes,
   }),
 );

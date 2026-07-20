@@ -9,7 +9,11 @@ import type {
   MediaInput,
   NormalizedMetadata,
 } from '../src/core/engine.ts';
-import { createMalformedInputError, createNotApplicableError } from '../src/core/engine.ts';
+import {
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
+  createMalformedInputError,
+  createNotApplicableError,
+} from '../src/core/engine.ts';
 import {
   buildExecutionFingerprint,
   EXECUTION_RESULT_SCHEMA,
@@ -26,20 +30,23 @@ import {
 import type { ExecutionFingerprintComponents, PixelBehaviorEvidence } from '../src/core/runner.ts';
 import { defineScenario } from '../src/core/scenario.ts';
 import type { OracleOutcome, Scenario, ScenarioResult } from '../src/core/scenario.ts';
-import { sha256Hex } from '../src/core/media-selection.ts';
+import { CorpusDeliveryIntegrityError, sha256Hex } from '../src/core/media-selection.ts';
 import type {
   CandidateOracleEvidencePlan,
   ResolvedInput,
   ScenarioSelection,
   VerifiedContent,
+  VerifiedStreamContent,
 } from '../src/core/media-selection.ts';
 import type { CodecSupport } from '../src/core/feature-detect.ts';
+import { validateScenarioResultV2 } from '../src/core/result-schema.ts';
 import {
   auditDisabledCells,
   disabledCellReason,
   reviewedDisabledCells,
   reviewedForcedTimeoutCells,
 } from '../src/core/disabled-cells.ts';
+import { RemotionMediaParserEngine } from '../src/engines/remotion-media-parser/adapter.ts';
 
 const originalFetch = globalThis.fetch;
 const changedGlobals = new Map<string, PropertyDescriptor | undefined>();
@@ -197,6 +204,31 @@ function verifiedProbeInput(): { resolvedInputs: ResolvedInput[]; verifiedConten
       bytes: probeBytes,
       actualSha256: probeSha256,
       actualSizeBytes: probeBytes.byteLength,
+    }],
+  };
+}
+
+function streamVerifiedProbeInput(): {
+  resolvedInputs: ResolvedInput[];
+  verifiedStreamContents: VerifiedStreamContent[];
+} {
+  const resolvedInputs: ResolvedInput[] = [{
+    id: 'input.mp4',
+    urlAssetPath: 'input.mp4',
+    sha256: probeSha256,
+    sizeBytes: probeBytes.byteLength,
+    integrity: 'VERIFIED',
+  }];
+  return {
+    resolvedInputs,
+    verifiedStreamContents: [{
+      state: 'VERIFIED_STREAM',
+      identity: { logicalPath: 'input.mp4', sha256: probeSha256, sizeBytes: probeBytes.byteLength },
+      actualSha256: probeSha256,
+      actualSizeBytes: probeBytes.byteLength,
+      chunkSizeBytes: probeBytes.byteLength,
+      chunkSha256: [probeSha256],
+      retainedBytes: 0,
     }],
   };
 }
@@ -799,6 +831,172 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     });
   });
 
+  test('Remotion range/progressive declarations stay sealed and cannot receive a URL attestation', async () => {
+    let supportsCalls = 0;
+    let probeCalls = 0;
+    let observedInput: MediaInput | undefined;
+    const remotionCapabilities = new RemotionMediaParserEngine().capabilities();
+    expect(remotionCapabilities.probeReadModes).toEqual(['range', 'progressive']);
+    expect(remotionCapabilities.features).not.toContain(AUTHENTICATED_RANGE_PROBE_FEATURE);
+    const engine = baseEngine('probe', {
+      id: 'remotion-media-parser@4.0.479',
+      capabilities: () => remotionCapabilities,
+      supports: async () => {
+        supportsCalls += 1;
+        return { supported: true };
+      },
+      probe: async (input) => {
+        probeCalls += 1;
+        observedInput = input;
+        expect(input.url.startsWith('blob:')).toBe(true);
+        expect(input.contentAttestation).toBeUndefined();
+        expect(new Uint8Array(await input.arrayBuffer())).toEqual(probeBytes);
+        return {
+          container: 'mp4', durationSec: 1, tracks: [],
+          telemetry: { bytesRead: probeBytes.byteLength }, probeEvidence: { readMode: 'whole-file' },
+        };
+      },
+    });
+    const result = await runOne(engine, boundedProbeScenario(), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(result).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_ADAPTER_UNAUTHENTICATED'),
+    });
+    expect({ supportsCalls, probeCalls }).toEqual({ supportsCalls: 0, probeCalls: 0 });
+
+    installProbeGoldenFetch();
+    const sealed = await runOne(engine, boundedProbeScenario(), browser, support, {
+      pixelBehavior: pixelPass,
+      ...verifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(sealed.status).toBe('FAIL');
+    expect(sealed.reason).toContain('PROBE_READ_MODE_CONTRACT_VIOLATION');
+    expect(observedInput?.url.startsWith('blob:')).toBe(true);
+    expect(observedInput?.contentAttestation).toBeUndefined();
+    expect({ supportsCalls, probeCalls }).toEqual({ supportsCalls: 2, probeCalls: 1 });
+  });
+
+  test('authenticated URL delivery is exclusive to unmutated scale probes and preserves identity', async () => {
+    installProbeGoldenFetch();
+    let observedInput: MediaInput | undefined;
+    const engine = baseEngine('probe', {
+      capabilities: () => ({
+        ...caps('probe'),
+        features: [...caps('probe').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range', 'whole-file'],
+      }),
+      supports: async () => ({ supported: true }),
+      probe: async (input) => {
+        observedInput = input;
+        expect(input.url).toBe('http://localhost/fixtures/media/input.mp4');
+        expect(input.url.startsWith('blob:')).toBe(false);
+        expect(input.contentAttestation).toMatchObject({
+          logicalPath: 'input.mp4',
+          sha256: probeSha256,
+          sizeBytes: probeBytes.byteLength,
+        });
+        await expect(input.arrayBuffer()).rejects.toThrow('ATTESTED_URL_WHOLE_FILE_FORBIDDEN');
+        return {
+          container: 'mp4', durationSec: 1, tracks: [],
+          telemetry: { bytesRead: 2 }, probeEvidence: { readMode: 'range' },
+        };
+      },
+    });
+    const accepted = await runOne(engine, boundedProbeScenario(), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(accepted.status).toBe('PASS');
+    expect(observedInput?.contentAttestation?.sha256).toBe(probeSha256);
+
+    let nonScaleCalls = 0;
+    const nonScale = await runOne(baseEngine('probe', {
+      capabilities: () => ({
+        ...caps('probe'),
+        features: [...caps('probe').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range', 'whole-file'],
+      }),
+      probe: async () => {
+        nonScaleCalls += 1;
+        return { container: 'mp4', durationSec: 1, tracks: [] };
+      },
+    }), defineScenario({
+      id: 'probe/non-scale-stream-forbidden',
+      op: 'probe',
+      input: 'input.mp4',
+      requires: { operations: ['probe'], containersIn: ['mp4'] },
+      options: {},
+      oracles: ['golden-metadata'],
+      metrics: [],
+    }), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+    });
+    expect(nonScale).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_FORBIDDEN'),
+    });
+    expect(nonScaleCalls).toBe(0);
+
+    const mutatedScale = {
+      ...boundedProbeScenario('probe/mutated-scale-stream-forbidden'),
+      mutate: (value: Uint8Array) => value.slice(),
+    } as Scenario;
+    const mutated = await runOne(baseEngine('probe', {
+      capabilities: () => ({
+        ...caps('probe'),
+        features: [...caps('probe').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range', 'whole-file'],
+      }),
+      probe: async () => {
+        nonScaleCalls += 1;
+        return { container: 'mp4', durationSec: 1, tracks: [] };
+      },
+    }), mutatedScale, browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(mutated).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_FORBIDDEN'),
+    });
+    expect(nonScaleCalls).toBe(0);
+  });
+
+  test('post-attestation delivery drift remains a corpus NA_ASSET', async () => {
+    installProbeGoldenFetch();
+    const result = await runOne(baseEngine('probe', {
+      capabilities: () => ({
+        ...caps('probe'),
+        features: [...caps('probe').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range'],
+      }),
+      supports: async () => ({ supported: true }),
+      probe: async () => {
+        throw new CorpusDeliveryIntegrityError(
+          'CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH',
+          'input.mp4',
+          'authenticated block changed after admission',
+        );
+      },
+    }), boundedProbeScenario(), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(result).toMatchObject({
+      status: 'NA_ASSET',
+      reason: expect.stringContaining('CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH'),
+    });
+  });
+
   test('bounded runtime telemetry is persisted; exceeded and missing evidence are FAIL and ERROR', async () => {
     const run = async (metadata: NormalizedMetadata): Promise<ScenarioResult> => {
       installProbeGoldenFetch();
@@ -862,6 +1060,46 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     expect(result.status).toBe('NA_ENGINE');
     expect(result.reason).toContain('PROBE_BOUNDED_FULL_SCAN_UNSUPPORTED');
     expect(result.reason).not.toContain('MEMORY_PROTOCOL_ERROR');
+  });
+
+  test('cancellation during a wedged memory baseline is SKIPPED and never starts the operation', async () => {
+    installProbeGoldenFetch();
+    const controller = new AbortController();
+    let baselineRequested!: () => void;
+    const baselineStarted = new Promise<void>((resolve) => { baselineRequested = resolve; });
+    let probeCalls = 0;
+    const engine = baseEngine('probe', {
+      capabilities: () => ({ ...caps('probe'), probeReadModes: ['range'] }),
+      supports: async () => ({ supported: true }),
+      probe: async () => {
+        probeCalls += 1;
+        return { container: 'mp4', durationSec: 1, tracks: [] };
+      },
+    });
+    const running = runOne(engine, boundedProbeScenario('probe/runner-memory-baseline-cancel'), browser, support, {
+      signal: controller.signal,
+      pixelBehavior: pixelPass,
+      ...verifiedProbeInput(),
+      probeMemorySampler: {
+        state: 'AVAILABLE',
+        value: {
+          api: 'measureUserAgentSpecificMemory',
+          sample: () => {
+            baselineRequested();
+            return new Promise<number>(() => undefined);
+          },
+        },
+      },
+      probeMemoryWindowOptions: { settleWindowMs: 0, sampleTimeoutMs: 50 },
+    });
+    await baselineStarted;
+    controller.abort(new Error('Stop'));
+    const result = await running;
+    expect(result.status).toBe('SKIPPED');
+    expect(String(result.reason ?? '')).toContain('[RUN_CANCELLED]');
+    expect(String(result.reason ?? '')).toContain('Stop');
+    expect(String(result.reason ?? '')).not.toContain('MEMORY_PROTOCOL_ERROR');
+    expect(probeCalls).toBe(0);
   });
 
   test('headerless null is valid while NaN, infinity, negative, and excessive finite durations are FAIL', async () => {
@@ -934,6 +1172,82 @@ describe('REQ-RUN-03 three-way performance admission', () => {
     expect(result.status).toBe('PASS');
     expect(result.bench).toBeUndefined();
     expect(result.measurement).toMatchObject({ state: 'UNAVAILABLE', reasonCode: 'BENCH_ERROR' });
+  });
+
+  test('run cancellation during measurement preserves completed candidate correctness and a writable row', async () => {
+    installCorpusFetch();
+    const controller = new AbortController();
+    let calls = 0;
+    const engine = baseEngine('remux', {
+      supports: async () => ({ supported: true }),
+      remux: async () => {
+        calls += 1;
+        if (calls > 1) {
+          controller.abort(new Error('run deadline elapsed'));
+          return new Promise<MediaBytes>(() => undefined);
+        }
+        return bytes();
+      },
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('remux/runner-bench-cancelled-after-correctness'),
+      metrics: ['wall'],
+    });
+    const sourceSha256 = 'ab'.repeat(32);
+    const evidencePlan: CandidateOracleEvidencePlan = {
+      schemaVersion: 'candidate-oracle-evidence@1',
+      sourceSha256,
+      requirements: [{
+        oracle: 'playback-smoke',
+        role: 'REQUIRED',
+        needs: [{ kind: 'BROWSER_CAPABILITY' }],
+      }],
+      requiredOracles: ['playback-smoke'],
+      sufficientOracleSets: [['playback-smoke']],
+      declaredAvailable: ['BROWSER_CAPABILITY'],
+      contractDigest: 'cd'.repeat(32),
+    };
+    const result = await runOne(engine, scenario, browser, support, {
+      signal: controller.signal,
+      pillar: 'performance',
+      benchOptions: { warmup: 0, iters: 1 },
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      selectionEvidencePlan: evidencePlan,
+    });
+
+    expect(calls).toBe(2);
+    expect(result.status).toBe('PASS');
+    expect(result.candidateEvidence).toMatchObject({
+      status: 'PASS',
+      reasonCode: 'EVIDENCE_SUFFICIENT_PASS',
+      sufficient: true,
+    });
+    expect(result.measurement).toEqual({
+      state: 'UNAVAILABLE',
+      reasonCode: 'BENCH_CANCELLED',
+      detail: expect.stringContaining('run deadline elapsed'),
+    });
+    expect(result.measurement?.state === 'UNAVAILABLE' ? result.measurement.detail : '')
+      .toStartWith('[RUN_CANCELLED]');
+
+    const inputVariantId = 'selected:input.mp4';
+    const serialized = {
+      ...result,
+      schemaVersion: 2,
+      scenarioRevision: scenario.revision,
+      definitionHash: scenario.definitionHash,
+      inputVariantId,
+      inputSha256: sourceSha256,
+      instance: {
+        scenarioId: scenario.id,
+        scenarioRevision: scenario.revision,
+        definitionHash: scenario.definitionHash,
+        inputVariantId,
+        inputSha256: sourceSha256,
+      },
+    };
+    expect(validateScenarioResultV2(serialized)).toEqual([]);
   });
 
   test('adaptive output rates use neutral presentation units and retain ratio/basis evidence', async () => {
@@ -1014,6 +1328,150 @@ describe('REQ-RUN-03 three-way performance admission', () => {
     expect(result.measurement).toMatchObject({ state: 'UNAVAILABLE', reasonCode: 'MEMORY_API_UNSUPPORTED' });
     expect(calls).toBe(1);
   });
+
+  test('authenticated scale-probe memory sampling instruments only retained independent repetitions', async () => {
+    installProbeGoldenFetch();
+    let operationCalls = 0;
+    let samplerCalls = 0;
+    const engine = baseEngine('probe', {
+      capabilities: () => ({
+        ...caps('probe'),
+        features: [...caps('probe').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range'],
+      }),
+      supports: async () => ({ supported: true }),
+      probe: async () => {
+        operationCalls += 1;
+        return {
+          container: 'mp4', durationSec: 1, tracks: [],
+          telemetry: { bytesRead: 2 }, probeEvidence: { readMode: 'range' },
+        };
+      },
+    });
+    const scenario = defineScenario({
+      ...boundedProbeScenario('probe/runner-bounded-memory-window'),
+      metrics: ['wall', 'peakMemory'],
+      primaryMetric: 'wall',
+    });
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      benchOptions: {
+        warmup: 2,
+        iters: 1,
+        minDurationMs: 100,
+        maxInnerIterations: 1,
+        slowRepetitions: 5,
+      },
+      benchMemorySampler: {
+        state: 'AVAILABLE',
+        value: {
+          api: 'measureUserAgentSpecificMemory',
+          sample: async () => 1_000 + ++samplerCalls,
+        },
+      },
+      pixelBehavior: pixelPass,
+      ...streamVerifiedProbeInput(),
+      ...probeMemoryOptions,
+    });
+    expect(result.status).toBe('PASS');
+    expect(result.measurement).toMatchObject({ state: 'AVAILABLE' });
+    expect(result.bench?.wall?.n).toBe(5);
+    // 1 functional + 2 discarded warmups + 1 discarded calibration + 5 measured operations.
+    expect(operationCalls).toBe(9);
+    // Exactly baseline + immediate in-operation + end for each retained repetition. The discarded
+    // warmup/calibration phases invoke no memory API calls.
+    expect(samplerCalls).toBe(15);
+    const memory = result.bench?.wall?.protocolEvidence?.memory as Array<{
+      baselineBytes: number;
+      immediateOperationSample: boolean;
+      operationSampleLimit: number | null;
+      settleWindowMs: number;
+      samples: Array<{ phase: string }>;
+    }> | undefined;
+    expect(memory).toHaveLength(5);
+    expect(memory?.map((entry) => entry.baselineBytes)).toEqual([1_001, 1_004, 1_007, 1_010, 1_013]);
+    expect(memory?.every((entry) =>
+      entry.immediateOperationSample === true &&
+      entry.operationSampleLimit === 1 &&
+      entry.settleWindowMs === 0 &&
+      entry.samples.map((sample) => sample.phase).join(',') === 'baseline,operation,end'
+    )).toBe(true);
+  });
+
+  test('non-probe peak-memory batches retain recurring operation samples and the default settle window', async () => {
+    installCorpusFetch();
+    let operationCalls = 0;
+    let samplerCalls = 0;
+    let memoryInstrumentationStarted = false;
+    let operationSleeps = 0;
+    let finishMeasuredOperation: (() => void) | undefined;
+    const engine = baseEngine('remux', {
+      supports: async () => ({ supported: true }),
+      remux: async () => {
+        operationCalls += 1;
+        if (!memoryInstrumentationStarted) return bytes();
+        operationSleeps = 0;
+        return new Promise<MediaBytes>((resolve) => {
+          finishMeasuredOperation = () => {
+            finishMeasuredOperation = undefined;
+            resolve(bytes());
+          };
+        });
+      },
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('performance/runner-generic-memory-window'),
+      metrics: ['wall', 'peakMemory'],
+      primaryMetric: 'wall',
+    });
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      benchOptions: { warmup: 0, iters: 5, minDurationMs: 100, maxInnerIterations: 1 },
+      benchMemorySampler: {
+        state: 'AVAILABLE',
+        value: {
+          api: 'measureUserAgentSpecificMemory',
+          sample: async () => {
+            memoryInstrumentationStarted = true;
+            return 2_000 + ++samplerCalls;
+          },
+        },
+      },
+      benchMemoryWindowOptions: {
+        // Preserve production's 100 ms interval and 500 ms settle defaults while making this
+        // deterministic test instantaneous. The third interval releases each measured operation.
+        sleep: async () => {
+          if (finishMeasuredOperation && ++operationSleeps === 3) finishMeasuredOperation();
+          await Promise.resolve();
+        },
+      },
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+    });
+    expect(result.status).toBe('PASS');
+    expect(result.bench?.wall?.n).toBe(5);
+    expect(operationCalls).toBe(7); // functional + calibration + five measured repetitions
+    const memory = result.bench?.wall?.protocolEvidence?.memory as Array<{
+      immediateOperationSample: boolean;
+      operationSampleLimit: number | null;
+      settleWindowMs: number;
+      sampleIntervalMs: number;
+      samples: Array<{ phase: string }>;
+    }> | undefined;
+    expect(memory).toHaveLength(5);
+    expect(memory?.every((entry) => {
+      const phases = entry.samples.map((sample) => sample.phase);
+      return entry.immediateOperationSample === false &&
+        entry.operationSampleLimit === null &&
+        entry.settleWindowMs === 500 &&
+        entry.sampleIntervalMs === 100 &&
+        phases[0] === 'baseline' &&
+        phases.filter((phase) => phase === 'operation').length >= 2 &&
+        phases.filter((phase) => phase === 'end').length === 1 &&
+        phases.filter((phase) => phase === 'settle').length === 5;
+    })).toBe(true);
+    expect(samplerCalls).toBe(memory?.reduce((sum, entry) => sum + entry.samples.length, 0));
+  });
 });
 
 describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
@@ -1046,8 +1504,8 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
       scenarioId: scenario.id,
       isBaked: file === '01.mp4',
       selectedFile: file,
-      selectedSha256: file.repeat(4),
-      resolvedInputs: [{ id: file, urlAssetPath: file, sha256: file.repeat(4) }],
+      selectedSha256: file.slice(0, 2).repeat(32),
+      resolvedInputs: [{ id: file, urlAssetPath: file, sha256: file.slice(0, 2).repeat(32) }],
       effectiveScenario: scenario,
       candidateCount: 3,
       shapeWarnings: [],
@@ -1056,6 +1514,7 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
       state: 'VERDICT',
       oracle: 'playback-smoke',
       verdict: status,
+      reasonCode: status === 'PASS' ? 'PLAYBACK_SUCCEEDED' : 'PLAYBACK_FAILED',
       detail: file,
     });
     const makeResult = (status: 'PASS' | 'FAIL', file: string): ScenarioResult => ({
@@ -1070,6 +1529,23 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
         hash: (status === 'PASS' ? 'a' : file === '02.mp4' ? 'b' : 'c').repeat(64),
       },
       durationMs: file === '01.mp4' ? 10 : file === '02.mp4' ? 20 : 30,
+      ...(status === 'PASS'
+        ? {
+            bench: {
+              wall: {
+                n: 1,
+                warmup: 0,
+                metric: 'wall',
+                median: 10,
+                p95: 10,
+                mad: 0,
+                unit: 'ms',
+                samples: [10],
+              },
+            },
+            measurement: { state: 'AVAILABLE' as const, metrics: ['wall' as const] },
+          }
+        : { measurement: { state: 'NOT_REQUESTED' as const } }),
       ...(status === 'FAIL' ? { reason: `${file} mismatch` } : {}),
     });
     const aggregate = aggregateExhaustive(
@@ -1086,8 +1562,16 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
     );
     expect(aggregate.status).toBe('FAIL');
     expect(aggregate.coverage).toMatchObject({ valid: 1, total: 3, grade: 'partial' });
+    expect(aggregate.bench).toBeUndefined();
+    expect(aggregate.measurement).toEqual({
+      state: 'UNAVAILABLE',
+      reasonCode: 'EXHAUSTIVE_CORRECTNESS_GATE',
+      detail: 'aggregate status FAIL is not benchmark-eligible; passing-member measurements remain in exhaustive[]',
+    });
     expect(aggregate.reason).toContain('02.mp4(FAIL)');
     expect(aggregate.reason).toContain('03.mp4(FAIL)');
+    expect(aggregate.exhaustive?.[0]?.bench?.wall?.median).toBe(10);
+    expect(aggregate.exhaustive?.[0]?.measurement).toEqual({ state: 'AVAILABLE', metrics: ['wall'] });
     expect((aggregate.exhaustive?.[1] as unknown as { oracleOutcomes: OracleOutcome[] }).oracleOutcomes[0]).toMatchObject({
       state: 'VERDICT',
       verdict: 'FAIL',
@@ -1095,6 +1579,37 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
     });
     expect(aggregate.exhaustive?.map((entry) => entry.executionFingerprint?.hash[0])).toEqual(['a', 'b', 'c']);
     expect(aggregate.durationMs).toBe(60);
+
+    const aggregateInputSha256 = aggregate.selection?.executedInputDigest;
+    if (!aggregateInputSha256) throw new Error('missing aggregate input identity');
+    const inputVariantId = 'exhaustive:runner-test';
+    expect(validateScenarioResultV2({
+      ...aggregate,
+      schemaVersion: 2,
+      scenarioRevision: scenario.revision,
+      definitionHash: scenario.definitionHash,
+      inputVariantId,
+      inputSha256: aggregateInputSha256,
+      instance: {
+        scenarioId: scenario.id,
+        scenarioRevision: scenario.revision,
+        definitionHash: scenario.definitionHash,
+        inputVariantId,
+        inputSha256: aggregateInputSha256,
+      },
+    })).toEqual([]);
+
+    const passingAggregate = aggregateExhaustive(
+      'runner-fake@1.0.0',
+      browser,
+      scenario,
+      [{ sel: makeSelection('01.mp4'), result: makeResult('PASS', '01.mp4') }],
+      { suiteVersion: 'test', engineId: 'runner-fake@1.0.0', browser },
+      'seed',
+    );
+    expect(passingAggregate.status).toBe('PASS');
+    expect(passingAggregate.bench?.wall).toMatchObject({ aggregate: 10, samples: [10] });
+    expect(passingAggregate.measurement).toEqual({ state: 'AVAILABLE', metrics: ['wall'] });
   });
 });
 

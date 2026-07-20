@@ -9,24 +9,43 @@ import {
   GOLDEN_NORMALIZATION_VERSION,
   GOLDEN_PACKETS_SCHEMA,
   PACKET_SEMANTICS_VERSION,
+  compactGoldenPacketEvidence,
+  expandCompactGoldenPacketEvidence,
+  buildGoldenFrameProbeArgs,
   buildGoldenPacketProbeArgs,
+  buildGoldenStreamDataProbeArgs,
   buildGoldenSemanticDecodeArgs,
   canonicalJson,
   normalizeGoldenPacketEvidence,
+  mergeGoldenFrames,
+  mergeGoldenStreamData,
   normalizeProbeMetadata,
   parseMappedFrameMd5,
   selectPresentationFramePlaceholders,
 } from '../fixtures/lib/golden-normalization.mjs';
+import { readCompactGoldenPacketRows } from '../src/core/lossless-json-columnar.ts';
+import { loadGolden } from '../src/core/oracles.ts';
+import {
+  MAX_COLUMNAR_SCALAR_JSON_BYTES,
+  validateColumnarNode,
+} from '../fixtures/lib/lossless-json-columnar-validator.mjs';
 import {
   BENTO4_CBCS_IV_LABEL,
+  LEGACY_FFMPEG_CENC_CTR_IDENTITY,
   buildBento4CbcsEncryptionArgs,
   flatFramePlaceholderForGolden,
+  flatProtectedReferenceLimitationForGolden,
   normalizeFlatProbeForGolden,
 } from '../fixtures/bake.mjs';
 import {
   normalizeScenarioProbeForGolden,
   scenarioFramePlaceholderForGolden,
 } from '../fixtures/bake-scenario-goldens.mjs';
+import {
+  PROTECTED_PROBE_DERIVATIONS,
+  assertProtectedProbeCandidate,
+  buildProtectedProbeCatalogRows,
+} from '../fixtures/curate-protected-probe-candidates.mjs';
 
 // Correctness is binary now; a representation difference is a PASS distinguished by its reasonCode.
 type OracleView = { verdict: 'PASS' | 'FAIL'; reasonCode: string };
@@ -58,22 +77,134 @@ describe('REQ-FIX-05 production-shared versioned normalization', () => {
   test('both production entrypoints call the shared packet/decode builders and contain no local normalizer copy', () => {
     const flatSource = readFileSync('fixtures/bake.mjs', 'utf8');
     const scenarioSource = readFileSync('fixtures/bake-scenario-goldens.mjs', 'utf8');
+    const normalizationSource = readFileSync('fixtures/lib/golden-normalization.mjs', 'utf8');
     for (const source of [flatSource, scenarioSource]) {
       expect(source).toContain('buildGoldenPacketProbeArgs(inOpts, mediaPath)');
-      expect(source).toContain('buildGoldenSemanticDecodeArgs(inOpts, mediaPath)');
+      expect(source).toContain('runStreamingFfprobePacketProbe({');
+      expect(source).toContain('preparePacketProbeForNormalization(captured, DEFAULT_COMPACT_PACKET_ROW_THRESHOLD)');
+      expect(source).toContain('captured.cleanup()');
+      expect(source).toMatch(/buildGoldenFrameProbeArgs\(/);
+      expect(source).toContain('buildGoldenStreamDataProbeArgs(inOpts, mediaPath)');
+      expect(source).toContain('mergeGoldenStreamData(prepared.probe, streamProbe)');
+      expect(source).toContain('const probe = mergeGoldenFrames(');
+      expect(source).toMatch(/buildGoldenSemanticDecodeArgs\(/);
       expect(source).toContain('normalizeGoldenPacketEvidence(probe');
-      expect(source).toContain('parseMappedFrameMd5(result.stdout, inputStreams)');
+      expect(source).toContain('iterateMappedFrameMd5Lines');
+      expect(source).toContain('inputStreams');
       expect(source).toContain('publicationScope,');
       expect(source).toContain("activeScope?.mode === 'complete-corpus'");
       expect(source).toContain('stagedRootAssetIds');
       expect(source).not.toMatch(/function\s+canonicalCodec\s*\(/);
       expect(source).not.toMatch(/function\s+parseFps\s*\(/);
     }
+    expect(flatSource).toContain('withDecodedReference(assetId, mediaPath, inOpts');
+    expect(flatSource).toContain('compactStorage: prepared.compactStorage');
+    expect(flatSource).toContain('packetSource: prepared.packetSource');
+    expect(flatSource).not.toContain('ffprobeJson(buildGoldenPacketProbeArgs(inOpts, mediaPath)');
+    expect(flatSource).not.toContain('compactGoldenPacketEvidence(packets');
+    expect(flatSource).not.toContain("h.update(readFileSync(path))");
+    expect(flatSource).toContain('decryptProtectedMp4ForReference(assetId, mediaPath, protectedSecret)');
+    expect(flatSource).toContain('flatProtectedReferenceLimitationForMedia(assetId, mediaPath)');
+    expect(flatSource).not.toContain("inputOptions: ['-decryption_key', protectedSecret.keyHex]");
+    expect(scenarioSource).toContain('withDecodedReference(assetId, mediaPath, catalogFile');
+    expect(scenarioSource).toContain("'mp4decrypt'");
+    expect(scenarioSource).toContain('representationProbe.streams ?? []');
+    expect(scenarioSource).not.toContain("'-decryption_key'");
+    expect(scenarioSource).not.toContain("createHash('sha256').update(bytes)");
+    expect(normalizationSource).toContain('const firstForTrack = !firstPacketSeen.has(trackIndex)');
+    expect(normalizationSource).toContain('packetSource.rows()');
+    expect(normalizationSource).toContain('packetRowsByTime.get(`${trackIndex}:${decoded.ptsUs}`)');
+    expect(normalizationSource).not.toContain('normalizedPackets.filter(');
+    expect(normalizationSource).not.toContain('firstPacketIndexForTrack(');
 
-    expect(buildGoldenPacketProbeArgs([], 'input.mp4')).toContain('-show_frames');
+    expect(buildGoldenPacketProbeArgs([], 'input.mp4')).not.toContain('-show_frames');
+    expect(buildGoldenPacketProbeArgs([], 'input.mp4')).not.toContain('-show_data');
+    expect(buildGoldenPacketProbeArgs([], 'input.mp4')).toContain('-show_data_hash');
+    expect(buildGoldenFrameProbeArgs([], 'input.mp4')).toEqual(expect.arrayContaining([
+      '-select_streams', 'v',
+      '-show_frames', '-show_entries',
+      'frame=stream_index,pts_time,best_effort_timestamp_time,duration_time,key_frame,pict_type',
+      '-read_intervals', `%+#76`,
+    ]));
+    expect(buildGoldenStreamDataProbeArgs([], 'input.mp4')).toEqual(expect.arrayContaining([
+      '-show_streams', '-show_data', '-show_data_hash', 'sha256',
+    ]));
     expect(buildGoldenSemanticDecodeArgs([], 'input.mp4')).toEqual(expect.arrayContaining([
       '-map', '0:v?', '-map', '0:a?', '-f', 'framemd5', '-hash', 'sha256', '-',
     ]));
+  });
+
+  test('protected probe curation reuses three structurally genuine candidates per declared scheme', () => {
+    const rows = readFileSync('fixtures/media/scenarios/_sources.ndjson', 'utf8')
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line));
+    const replacements = buildProtectedProbeCatalogRows(rows);
+    for (const contract of PROTECTED_PROBE_DERIVATIONS) {
+      const row = replacements.get(contract.scenarioId)!;
+      expect(row).toMatchObject({
+        class: 'DERIVED',
+        requires: { encryption: [contract.catalogScheme] },
+      });
+      expect(row.files).toHaveLength(3);
+      for (const file of row.files) {
+        expect(file.evidence).toMatchObject({
+          sourceSha256: file.sha256,
+          available: ['SOURCE_GOLDEN', 'CANDIDATE_DECODE'],
+          requiredOracles: ['golden-metadata'],
+          sufficientOracleSets: [['golden-metadata']],
+        });
+        if (contract.materialization === 'probe-owned') {
+          const published = rows.find((candidate) => candidate.scenarioId === contract.scenarioId);
+          expect(row).toEqual(published);
+          continue;
+        }
+        const sourcePath = join('fixtures/media/scenarios', contract.sourceScenarioId, file.file);
+        const evidence = assertProtectedProbeCandidate(
+          new Uint8Array(readFileSync(sourcePath)),
+          file,
+          contract,
+        );
+        expect(evidence.state).toBe('OK');
+        if (evidence.state === 'OK') {
+          expect(evidence.tracks.filter((track) => track.protected).map((track) => track.scheme))
+            .toEqual(expect.arrayContaining([contract.boxScheme]));
+        }
+      }
+    }
+  });
+
+  test('stream-only representation bytes merge without changing packet timeline evidence', () => {
+    const packetProbe = {
+      streams: [{ index: 0, codec_name: 'h264' }, { index: 1, codec_name: 'aac' }],
+      packets: [{ stream_index: 0, pts: 0, data_hash: `SHA256:${'1'.repeat(64)}` }],
+    };
+    const merged = mergeGoldenStreamData(packetProbe, {
+      streams: [{ index: 1, extradata: '00000000: 1210' }, { index: 0, extradata: '00000000: 0164' }],
+    });
+
+    expect(merged.packets).toEqual(packetProbe.packets);
+    expect(merged.streams).toEqual([
+      { index: 0, codec_name: 'h264', extradata: '00000000: 0164' },
+      { index: 1, codec_name: 'aac', extradata: '00000000: 1210' },
+    ]);
+    expect(mergeGoldenFrames(merged, { frames: [{ stream_index: 0, pts_time: '0.0' }] })).toEqual({
+      ...merged,
+      frames: [{ stream_index: 0, pts_time: '0.0' }],
+    });
+  });
+
+  test('bounded cadence probing discards only the decoder-flush overread tail', () => {
+    const contiguous = Array.from({ length: 75 }, (_, index) => index * 33_367);
+    const withFlushTail = [...contiguous, contiguous.at(-1)! + 66_734];
+    const normalized = normalizeProbeMetadata(metadataProbe(), {
+      assetId: 'flush-tail.mp4',
+      frameProbe: frameProbe(0, withFlushTail),
+    });
+
+    expect(normalized.canonical.tracks[0]).toMatchObject({ cadenceMode: 'CFR' });
+    expect(normalized.canonical.tracks[0].fpsMin).toBeCloseTo(30_000 / 1_001, 3);
+    expect(normalized.canonical.tracks[0].fpsMax).toBeCloseTo(30_000 / 1_001, 3);
   });
 });
 
@@ -202,6 +333,229 @@ describe('REQ-FIX-01 raw plus canonical multi-view metadata', () => {
 });
 
 describe('REQ-FIX-02/10 semantic access units versus representation fingerprints', () => {
+  test('lossless columnar long-form storage round-trips every logical view and runtime packet row', () => {
+    const packets = Array.from({ length: 64 }, (_, index) => ({
+      stream_index: index % 2,
+      size: String(100 + index),
+      pts: String(index * 1_024),
+      dts: String(index * 1_024 - (index % 3) * 512),
+      duration: '1024',
+      pts_time: String(index / 30),
+      dts_time: String((index * 1_024 - (index % 3) * 512) / 30_720),
+      duration_time: String(1 / 30),
+      flags: index % 30 === 0 ? 'K__' : '___',
+      pos: String(index * 4096),
+      data_hash: `SHA256:${index.toString(16).padStart(64, '0')}`,
+    }));
+    const probe = packetProbe('avc1', 'one-row');
+    probe.packets = packets;
+    probe.frames = packets.map((packet) => ({
+      stream_index: packet.stream_index,
+      pts_time: packet.pts_time,
+      key_frame: packet.flags.includes('K') ? 1 : 0,
+      pict_type: packet.flags.includes('K') ? 'I' : 'P',
+    }));
+    const decodedUnits = packets.map((packet, index) => ({
+      streamIndex: packet.stream_index,
+      ptsUs: Math.round(Number(packet.pts_time) * 1_000_000),
+      durationUs: 33_333,
+      sha256: (index + 1).toString(16).padStart(64, '0'),
+    }));
+    const logical = normalizeGoldenPacketEvidence(probe, {
+      assetId: 'long.mp4', decodedUnits, decoderObservation: { state: 'validated' },
+    });
+    // JSON text removes the deliberate packets↔representationFingerprint aliases, exercising the
+    // destructive tree fast path independently from the alias-preserving fallback below.
+    const consumed = JSON.parse(JSON.stringify(logical));
+    const compact = compactGoldenPacketEvidence(consumed, { consume: true });
+    const repeated = compactGoldenPacketEvidence(structuredClone(logical));
+    const expanded = expandCompactGoldenPacketEvidence(compact);
+
+    expect(canonicalJson(repeated)).toBe(canonicalJson(compact));
+    expect(canonicalJson(expanded)).toBe(canonicalJson(logical));
+    expect(canonicalJson((expanded as any).raw)).toBe(canonicalJson(logical.raw));
+    expect(canonicalJson((expanded as any).semantic)).toBe(canonicalJson(logical.semantic));
+    expect(canonicalJson((expanded as any).representation)).toBe(canonicalJson(logical.representation));
+    expect(canonicalJson((expanded as any).packets)).toBe(canonicalJson(logical.packets));
+    expect(canonicalJson(readCompactGoldenPacketRows(compact))).toBe(canonicalJson(logical.packets));
+    expect(Object.keys(consumed)).toEqual([]);
+
+    const direct = normalizeGoldenPacketEvidence(structuredClone(probe), {
+      assetId: 'long.mp4', decodedUnits: structuredClone(decodedUnits),
+      decoderObservation: { state: 'validated' }, compactStorage: true, consumeSource: true,
+    });
+    const directRepeated = normalizeGoldenPacketEvidence(structuredClone(probe), {
+      assetId: 'long.mp4', decodedUnits: structuredClone(decodedUnits),
+      decoderObservation: { state: 'validated' }, compactStorage: true, consumeSource: true,
+    });
+    expect(canonicalJson(directRepeated)).toBe(canonicalJson(direct));
+    expect(canonicalJson(expandCompactGoldenPacketEvidence(direct))).toBe(canonicalJson(logical));
+  });
+
+  test('consume mode preserves aliased JSON values and rejects cycles before mutation', () => {
+    const logical = normalizeGoldenPacketEvidence(packetProbe('avc1', 'one-row'), {
+      assetId: 'same.mp4', decodedUnits: decodedUnits(), decoderObservation: { state: 'validated' },
+    }) as any;
+    const shared = { exact: ['aliased', 7] };
+    logical.raw.aliasA = shared;
+    logical.raw.aliasB = shared;
+    const expected = canonicalJson(logical);
+    const compact = compactGoldenPacketEvidence(logical, { consume: true });
+    expect(canonicalJson(expandCompactGoldenPacketEvidence(compact))).toBe(expected);
+    expect(logical.raw.aliasA).toBe(shared);
+    expect(logical.raw.aliasB).toBe(shared);
+
+    const cyclic = normalizeGoldenPacketEvidence(packetProbe('avc1', 'one-row'), {
+      assetId: 'same.mp4', decodedUnits: decodedUnits(), decoderObservation: { state: 'validated' },
+    }) as any;
+    cyclic.raw.cycle = cyclic.raw;
+    expect(() => compactGoldenPacketEvidence(cyclic, { consume: true })).toThrow(/cyclic/);
+    expect(cyclic.raw.cycle).toBe(cyclic.raw);
+  });
+
+  test('lossless columnar mutation is rejected instead of yielding partial packet evidence', () => {
+    const logical = normalizeGoldenPacketEvidence(packetProbe('avc1', 'one-row'), {
+      assetId: 'same.mp4', decodedUnits: decodedUnits(), decoderObservation: { state: 'validated' },
+    });
+    const compact = compactGoldenPacketEvidence(structuredClone(logical));
+    const wrongCount = structuredClone(compact) as any;
+    wrongCount.rowCount += 1;
+    expect(() => expandCompactGoldenPacketEvidence(wrongCount)).toThrow(/count contract/);
+    expect(() => readCompactGoldenPacketRows(wrongCount)).toThrow(/count mismatch/);
+
+    const wrongLogicalSchema = structuredClone(compact) as any;
+    wrongLogicalSchema.logicalSchema = 'media-test/not-packet-evidence@1';
+    expect(() => expandCompactGoldenPacketEvidence(wrongLogicalSchema)).toThrow(/unsupported compact/);
+    expect(() => readCompactGoldenPacketRows(wrongLogicalSchema)).toThrow(/unsupported compact/);
+
+    const duplicateRoot = structuredClone(compact) as any;
+    const packetEntry = duplicateRoot.storage.root.entries.find((entry: any[]) => entry[0] === 'packets');
+    duplicateRoot.storage.root.entries.push(structuredClone(packetEntry));
+    expect(() => expandCompactGoldenPacketEvidence(duplicateRoot)).toThrow(/duplicate/);
+    expect(() => readCompactGoldenPacketRows(duplicateRoot)).toThrow(/duplicate/);
+
+    const unknownRoot = structuredClone(compact) as any;
+    unknownRoot.storage.root.entries.push(['surprise', 1]);
+    expect(() => expandCompactGoldenPacketEvidence(unknownRoot)).toThrow(/unknown/);
+    expect(() => readCompactGoldenPacketRows(unknownRoot)).toThrow(/unknown/);
+
+    const wrongInnerVersion = structuredClone(compact) as any;
+    wrongInnerVersion.storage.root.entries.find((entry: any[]) => entry[0] === 'schemaVersion')[1] = 'packet-semantics@2';
+    expect(() => expandCompactGoldenPacketEvidence(wrongInnerVersion)).toThrow(/logical schema/);
+    expect(() => readCompactGoldenPacketRows(wrongInnerVersion)).toThrow(/inner schema/);
+
+    const unknownOuter = structuredClone(compact) as any;
+    unknownOuter.surprise = true;
+    expect(() => expandCompactGoldenPacketEvidence(unknownOuter)).toThrow(/unknown keys/);
+    expect(() => readCompactGoldenPacketRows(unknownOuter)).toThrow(/unknown keys/);
+
+    const truncated = structuredClone(compact) as any;
+    const stack = [truncated.storage.root];
+    let delta: any;
+    while (stack.length && !delta) {
+      const value = stack.pop();
+      if (value && typeof value === 'object' && value.$type === 'integer-delta-varint') delta = value;
+      else if (Array.isArray(value)) stack.push(...value);
+      else if (value && typeof value === 'object') stack.push(...Object.values(value));
+    }
+    expect(delta).toBeDefined();
+    delta.count += 1;
+    expect(() => expandCompactGoldenPacketEvidence(truncated)).toThrow(/truncated integer delta varint/);
+    expect(() => readCompactGoldenPacketRows(truncated)).toThrow(/truncated integer delta varint/);
+
+    const unknownInnerNode = structuredClone(compact) as any;
+    unknownInnerNode.storage.root.surprise = true;
+    expect(() => expandCompactGoldenPacketEvidence(unknownInnerNode)).toThrow(/unknown keys/);
+    expect(() => readCompactGoldenPacketRows(unknownInnerNode)).toThrow(/unknown keys/);
+
+    const numericPrefixedSuffix = structuredClone(compact) as any;
+    const compactPackets = numericPrefixedSuffix.storage.root.entries
+      .find((entry: any[]) => entry[0] === 'packets')[1];
+    compactPackets.columns[0].values = {
+      $type: 'prefixed-strings', prefix: 'prefix-', suffixes: { $type: 'array', values: [1] },
+    };
+    expect(() => expandCompactGoldenPacketEvidence(numericPrefixedSuffix)).toThrow(/prefixed string suffixes/);
+    expect(() => readCompactGoldenPacketRows(numericPrefixedSuffix)).toThrow(/prefixed string suffixes/);
+
+    const allocationTrap = structuredClone(compact) as any;
+    allocationTrap.rowCount = Number.MAX_SAFE_INTEGER;
+    allocationTrap.storage.root.entries.find((entry: any[]) => entry[0] === 'packets')[1].rowCount =
+      Number.MAX_SAFE_INTEGER;
+    expect(() => readCompactGoldenPacketRows(allocationTrap)).toThrow(/value count mismatch/);
+
+    const emptyColumnAllocationTrap = structuredClone(compact) as any;
+    emptyColumnAllocationTrap.rowCount = 100_000_000;
+    emptyColumnAllocationTrap.storage.root.entries.find((entry: any[]) => entry[0] === 'packets')[1] = {
+      $type: 'record-columns', rowCount: 100_000_000, columns: [],
+    };
+    expect(() => readCompactGoldenPacketRows(emptyColumnAllocationTrap)).toThrow(/nonempty record table/);
+
+    const nestedRequiredScalars = structuredClone(compact) as any;
+    const nestedPacketColumns = nestedRequiredScalars.storage.root.entries
+      .find((entry: any[]) => entry[0] === 'packets')[1].columns;
+    for (const key of ['trackIndex', 'size', 'ptsUs', 'keyframe']) {
+      const column = nestedPacketColumns.find((candidate: any) => candidate.key === key);
+      column.values = {
+        $type: 'array',
+        values: Array.from({ length: nestedRequiredScalars.rowCount }, () => ({ $type: 'array', values: [1] })),
+      };
+    }
+    expect(() => readCompactGoldenPacketRows(nestedRequiredScalars)).toThrow(/mistyped/);
+
+    const loneSurrogate = structuredClone(compact) as any;
+    loneSurrogate.storage.root.entries.find((entry: any[]) => entry[0] === 'raw')[1].entries
+      .push(['surrogate', '\ud800']);
+    expect(() => expandCompactGoldenPacketEvidence(loneSurrogate)).toThrow(/lone high surrogate/);
+    expect(() => readCompactGoldenPacketRows(loneSurrogate)).toThrow(/lone high surrogate/);
+
+    expect(() => validateColumnarNode('x'.repeat(MAX_COLUMNAR_SCALAR_JSON_BYTES + 1)))
+      .toThrow(/bounded scalar limit/);
+
+    const magicKeyColumn = structuredClone(compact) as any;
+    magicKeyColumn.storage.root.entries.find((entry: any[]) => entry[0] === 'packets')[1].columns.unshift({
+      key: '__proto__',
+      values: {
+        $type: 'array',
+        values: Array.from({ length: magicKeyColumn.rowCount }, () => ({
+          $type: 'object', entries: [['polluted', true]],
+        })),
+      },
+    });
+    const runtimeMagicRows = readCompactGoldenPacketRows(magicKeyColumn) as any[];
+    const offlineMagicRows = (expandCompactGoldenPacketEvidence(magicKeyColumn) as any).packets;
+    for (const row of [runtimeMagicRows[0], offlineMagicRows[0]]) {
+      expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+      expect(Object.prototype.hasOwnProperty.call(row, '__proto__')).toBe(true);
+      expect(row.__proto__).toEqual({ polluted: true });
+    }
+    expect(({} as any).polluted).toBeUndefined();
+
+    const nonVarintDictionary = structuredClone(compact) as any;
+    nonVarintDictionary.storage.root.entries.find((entry: any[]) => entry[0] === 'raw')[1].entries.push([
+      'zzDictionary',
+      { $type: 'string-dictionary', indices: { $type: 'array', values: [0] }, values: ['only'] },
+    ]);
+    expect(() => expandCompactGoldenPacketEvidence(nonVarintDictionary)).toThrow(/indices must use integer delta/);
+    expect(() => readCompactGoldenPacketRows(nonVarintDictionary)).toThrow(/indices must use integer delta/);
+  });
+
+  test('direct golden fallback unwraps a compact envelope while small legacy packet arrays remain valid', async () => {
+    const logical = normalizeGoldenPacketEvidence(packetProbe('avc1', 'one-row'), {
+      assetId: 'same.mp4', decodedUnits: decodedUnits(), decoderObservation: { state: 'validated' },
+    });
+    const compact = compactGoldenPacketEvidence(structuredClone(logical));
+    const envelope = { schema: 'media-test/golden-artifact@1', payload: compact };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json(envelope)) as typeof fetch;
+    try {
+      const loaded = await loadGolden('same.mp4', { requestedKinds: ['packets'] });
+      expect(loaded.evidence.packets.state).toBe('OK');
+      expect(canonicalJson(loaded.packets)).toBe(canonicalJson(logical.packets));
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('AVCC, in-band avc3 grouping, and Annex-B are representation-diff PASS with identical decoded semantics', () => {
     const decoded = decodedUnits();
     const avcc = normalizeGoldenPacketEvidence(packetProbe('avc1', 'one-row'), {
@@ -290,6 +644,30 @@ describe('REQ-FIX-02/10 semantic access units versus representation fingerprints
 });
 
 describe('REQ-FIX-07 deterministic crypto and pinned normal entrypoint', () => {
+  test('legacy FFmpeg CENC semantic unavailability is bound to the exact committed source', () => {
+    expect(flatProtectedReferenceLimitationForGolden(
+      'cenc_ctr.mp4',
+      LEGACY_FFMPEG_CENC_CTR_IDENTITY,
+    )).toEqual({
+      state: 'reference-unavailable',
+      reasonCode: 'REFERENCE_DECODER_FFMPEG_CENC_CTR_BENTO4_UNAVAILABLE',
+      detail:
+        'source-bound non-fragmented FFmpeg CENC-CTR cannot be semantically recovered by the independent Bento4 reference decoder',
+    });
+    expect(flatProtectedReferenceLimitationForGolden('cenc_ctr.mp4', {
+      ...LEGACY_FFMPEG_CENC_CTR_IDENTITY,
+      sha256: '0'.repeat(64),
+    })).toBeUndefined();
+    expect(flatProtectedReferenceLimitationForGolden('cenc_ctr.mp4', {
+      ...LEGACY_FFMPEG_CENC_CTR_IDENTITY,
+      sizeBytes: LEGACY_FFMPEG_CENC_CTR_IDENTITY.sizeBytes + 1,
+    })).toBeUndefined();
+    expect(flatProtectedReferenceLimitationForGolden(
+      'cenc_cbcs.mp4',
+      LEGACY_FFMPEG_CENC_CTR_IDENTITY,
+    )).toBeUndefined();
+  });
+
   test('Bento4 CBCS uses a committed-seed IV, retains key/KID, and never emits the random token', () => {
     const seed = JSON.parse(readFileSync('fixtures/fixture-seed.json', 'utf8')).seedHex as string;
     const changedSeed = `${seed[0] === '0' ? '1' : '0'}${seed.slice(1)}`;

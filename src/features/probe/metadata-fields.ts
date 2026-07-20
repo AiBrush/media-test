@@ -23,6 +23,8 @@ export interface ProbeMetadataFieldPolicy {
   bitrateRelativeTolerance?: number;
   /** Explicit escape hatch for formats whose duration is intentionally unknowable from the header. */
   allowUnknownDuration?: boolean;
+  /** Treat an exact zero-sample duration as equivalent to an unknown duration for an empty asset. */
+  zeroDurationEquivalentToUnknown?: boolean;
 }
 
 export interface DeclaredTrackPair {
@@ -57,6 +59,9 @@ export function defineProbeMetadataFieldPolicy(
     ...(protectionSchemes ? { protectionSchemes: Object.freeze(protectionSchemes) } : {}),
     ...(value.bitrateRelativeTolerance !== undefined ? { bitrateRelativeTolerance: tolerance } : {}),
     ...(value.allowUnknownDuration !== undefined ? { allowUnknownDuration: value.allowUnknownDuration } : {}),
+    ...(value.zeroDurationEquivalentToUnknown !== undefined
+      ? { zeroDurationEquivalentToUnknown: value.zeroDurationEquivalentToUnknown }
+      : {}),
   });
 }
 
@@ -102,6 +107,9 @@ export function parseProbeMetadataFieldPolicy(value: unknown): ProbeMetadataFiel
       ...(typeof value.allowUnknownDuration === 'boolean'
         ? { allowUnknownDuration: value.allowUnknownDuration }
         : {}),
+      ...(typeof value.zeroDurationEquivalentToUnknown === 'boolean'
+        ? { zeroDurationEquivalentToUnknown: value.zeroDurationEquivalentToUnknown }
+        : {}),
     });
   } catch {
     return undefined;
@@ -126,9 +134,19 @@ export function assessDeclaredMetadataFields(
   if (policy.fields.includes('duration-nullability')) {
     const gotNull = measured.durationSec == null;
     const wantNull = golden.durationSec == null;
-    fieldsEvidence.durationNullability = { measured: gotNull ? 'null' : 'finite', golden: wantNull ? 'null' : 'finite' };
-    if (gotNull !== wantNull && !policy.allowUnknownDuration) {
+    const zeroUnknownEquivalent = policy.zeroDurationEquivalentToUnknown === true &&
+      wantNull && measured.durationSec === 0;
+    fieldsEvidence.durationNullability = {
+      measured: gotNull ? 'null' : 'finite',
+      golden: wantNull ? 'null' : 'finite',
+      measuredDurationSec: measured.durationSec,
+      goldenDurationSec: golden.durationSec,
+      zeroUnknownEquivalent,
+    };
+    if (gotNull !== wantNull && !zeroUnknownEquivalent && !policy.allowUnknownDuration) {
       failures.push(`duration nullability measured ${gotNull ? 'null' : 'finite'} vs golden ${wantNull ? 'null' : 'finite'}`);
+    } else if (zeroUnknownEquivalent) {
+      differences.push('duration 0s and unknown duration are equivalent for the declared empty asset');
     }
   }
 

@@ -102,18 +102,6 @@ export function tupleSummary(request: ConcreteOperationRequest): ApplicabilityTu
 
 /** Full-tuple decision used by MediabunnyEngine.supports(). */
 export function decideMediabunnySupport(request: ConcreteOperationRequest): SupportDecision {
-  if (
-    request.operation === 'probe' &&
-    requestedProbeProtectionSchemes(request.options).includes('cenc')
-  ) {
-    // The committed CENC-CTR probe requests the ISO `cenc` scheme explicitly. This package build can
-    // abort below JavaScript while parsing that valid protection form, so reject the exact field tuple
-    // before the no-output fast path admits it. CBCS (`cbcs`) remains independently executable.
-    return no(
-      MEDIABUNNY_REASON.PROTECTION_FORM,
-      'Mediabunny 1.48.0 cannot safely probe the requested CENC-CTR protection form',
-    );
-  }
   if (request.operation === 'decrypt') {
     if (request.encryption === 'cenc-ctr') {
       // 1.48.0 can abort below JS on the committed CENC-CTR assertion fixture.  Keep every CTR
@@ -545,15 +533,6 @@ function outputOptions(options: Readonly<Record<string, unknown>>): { fastStart?
 
 function hasRequestedTags(options: Readonly<Record<string, unknown>>): boolean {
   return isRecord(options.tags) && Object.keys(options.tags).length > 0;
-}
-
-function requestedProbeProtectionSchemes(options: Readonly<Record<string, unknown>>): string[] {
-  const robustness = isRecord(options.robustness) ? options.robustness : undefined;
-  const probe = isRecord(robustness?.probe) ? robustness.probe : undefined;
-  const policy = isRecord(probe?.metadataFieldPolicy) ? probe.metadataFieldPolicy : undefined;
-  return Array.isArray(policy?.protectionSchemes)
-    ? policy.protectionSchemes.filter((value): value is string => typeof value === 'string')
-    : [];
 }
 
 export function unsupportedRequestedMetadataTag(options: Readonly<Record<string, unknown>>): string | undefined {

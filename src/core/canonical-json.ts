@@ -1,5 +1,7 @@
 /** RFC 8785-style JSON canonicalization and synchronous SHA-256 for stable browser identities. */
 
+import { Sha256 } from './seeded-rng.ts';
+
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -49,6 +51,95 @@ export function canonicalizeJson(value: unknown): string {
 
 export function canonicalJsonSha256(value: unknown): string {
   return sha256Hex(new TextEncoder().encode(canonicalizeJson(value)));
+}
+
+/** Canonical SHA-256 and UTF-8 size without an artifact-sized canonical string/byte allocation. */
+export function canonicalJsonIdentityStreaming(value: unknown): { sha256: string; sizeBytes: number } {
+  const active = new Set<object>();
+  const hash = new Sha256();
+  const encoder = new TextEncoder();
+  let sizeBytes = 0;
+  let pending: string[] = [];
+  let pendingLength = 0;
+  const update = (text: string): void => {
+    const bytes = encoder.encode(text);
+    hash.update(bytes);
+    sizeBytes += bytes.byteLength;
+  };
+  const flush = (): void => {
+    if (!pendingLength) return;
+    update(pending.join(''));
+    pending = [];
+    pendingLength = 0;
+  };
+  const emit = (text: string): void => {
+    if (text.length >= 64 * 1024) {
+      flush();
+      update(text);
+    } else {
+      pending.push(text);
+      pendingLength += text.length;
+      if (pendingLength >= 64 * 1024) flush();
+    }
+  };
+  const encode = (item: unknown, path: string): void => {
+    if (item === null) { emit('null'); return; }
+    if (typeof item === 'boolean') { emit(item ? 'true' : 'false'); return; }
+    if (typeof item === 'string') {
+      assertUnicodeScalarString(item, path);
+      // Long compact columns are canonical ASCII and need no escaping. Slicing bounds both the
+      // JSON-string and TextEncoder temporaries while preserving the exact canonical bytes.
+      if (item.length >= 1024 * 1024 && /^[A-Za-z0-9+/=]+$/.test(item)) {
+        emit('"');
+        for (let offset = 0; offset < item.length; offset += 1024 * 1024) {
+          emit(item.slice(offset, Math.min(offset + 1024 * 1024, item.length)));
+        }
+        emit('"');
+      } else {
+        emit(JSON.stringify(item));
+      }
+      return;
+    }
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) throw new TypeError(`${path}: expected a finite JSON number`);
+      emit(JSON.stringify(item));
+      return;
+    }
+    if (typeof item !== 'object') throw new TypeError(`${path}: ${typeof item} is not JSON-safe`);
+    if (active.has(item)) throw new TypeError(`${path}: cyclic values are not JSON-safe`);
+    active.add(item);
+    try {
+      if (Array.isArray(item)) {
+        emit('[');
+        for (let index = 0; index < item.length; index++) {
+          if (index) emit(',');
+          encode(item[index], `${path}[${index}]`);
+        }
+        emit(']');
+        return;
+      }
+      if (Object.getPrototypeOf(item) !== Object.prototype) {
+        throw new TypeError(`${path}: only plain JSON objects are canonicalizable`);
+      }
+      const record = item as Record<string, unknown>;
+      const keys = Object.keys(record).sort(compareUtf16);
+      emit('{');
+      for (let index = 0; index < keys.length; index++) {
+        const key = keys[index]!;
+        assertUnicodeScalarString(key, `${path} key`);
+        if (index) emit(',');
+        emit(JSON.stringify(key));
+        emit(':');
+        encode(record[key], `${path}.${key}`);
+      }
+      emit('}');
+    } finally {
+      active.delete(item);
+    }
+  };
+  encode(value, '$');
+  flush();
+  return { sha256: hash.hex(), sizeBytes };
 }
 
 /** Small dependency-free SHA-256 implementation usable during synchronous scenario definition. */

@@ -3,6 +3,7 @@ import * as mediabunny from 'mediabunny';
 import { readFile } from 'node:fs/promises';
 
 import {
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
   CONCRETE_OPERATION_PROTOCOL,
   isBrowserNotSupportedError,
   type ConcreteOperationRequest,
@@ -99,6 +100,12 @@ async function fixtureInput(name: string, mime = 'video/mp4'): Promise<MediaInpu
 }
 
 describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
+  test('declares authenticated range transport only alongside bounded probe modes', () => {
+    const capabilities = new MediabunnyEngine().capabilities();
+    expect(capabilities.features).toContain(AUTHENTICATED_RANGE_PROBE_FEATURE);
+    expect(capabilities.probeReadModes).toEqual(['range', 'whole-file']);
+  });
+
   const positiveRows: Array<{ container: string; tracks: NormalizedTrack[]; videoCodec?: string; audioCodec?: string }> = [
     { container: 'mp4', tracks: [VIDEO, AUDIO], videoCodec: 'h264', audioCodec: 'aac' },
     { container: 'mov', tracks: [VIDEO, AUDIO], videoCodec: 'h264', audioCodec: 'aac' },
@@ -212,7 +219,7 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
     });
   }
 
-  test('rejects the valid CENC-CTR metadata probe before the no-output fast path', () => {
+  test('admits the independently verified fragmented CENC-CTR metadata probe', () => {
     const value = request({
       operation: 'probe',
       outputContainer: '',
@@ -226,11 +233,7 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
       },
     });
     delete value.output;
-    expect(decideMediabunnySupport(value)).toMatchObject({
-      supported: false,
-      status: 'NA_ENGINE',
-      reasonCode: MEDIABUNNY_REASON.PROTECTION_FORM,
-    });
+    expect(decideMediabunnySupport(value)).toEqual({ supported: true });
   });
 
   test('one unsupported fanout rung does not erase a supported sibling', () => {

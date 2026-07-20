@@ -27,6 +27,19 @@ export interface FixtureGenerationEntry {
   };
 }
 
+/** Digest-bound media served from ignored `/fixtures/media/`, not copied into a generation. */
+export interface FixtureMaterializedMedia {
+  logicalPath: string;
+  sha256: string;
+  sizeBytes: number;
+  provenanceSha256: string;
+  audit: {
+    recipe: string;
+    bakerVersion: string;
+    outputArtifactSha256: string;
+  };
+}
+
 export interface FixtureAvailabilityEntry {
   logicalPath: string;
   state: 'absent-expected' | 'pending' | 'producer-failed';
@@ -43,6 +56,7 @@ export interface FixtureGenerationIndex {
     | { mode: 'complete-corpus' }
     | { mode: 'selected-assets'; assetIds: string[] };
   entries: FixtureGenerationEntry[];
+  materializedMedia: FixtureMaterializedMedia[];
   availability: FixtureAvailabilityEntry[];
 }
 
@@ -80,7 +94,10 @@ export type FixtureGenerationValidation =
 export function validateFixtureGenerationIndex(value: unknown): FixtureGenerationValidation {
   const issues: string[] = [];
   if (!isRecord(value)) return { ok: false, reasonCode: 'GENERATION_INDEX_OBJECT_REQUIRED', issues: ['index must be an object'] };
-  const topFields = new Set(['schema', 'schemaVersion', 'generationId', 'createdAtIso', 'publicationScope', 'entries', 'availability']);
+  const topFields = new Set([
+    'schema', 'schemaVersion', 'generationId', 'createdAtIso', 'publicationScope',
+    'entries', 'materializedMedia', 'availability',
+  ]);
   for (const field of Object.keys(value)) if (!topFields.has(field)) issues.push(`index has unknown field '${field}'`);
   if (value.schema !== FIXTURE_GENERATION_INDEX_SCHEMA) issues.push('index schema is unsupported');
   if (!/^1\.\d+\.\d+$/.test(typeof value.schemaVersion === 'string' ? value.schemaVersion : '')) issues.push('index schema major is unsupported');
@@ -88,6 +105,10 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
   if (typeof value.createdAtIso !== 'string' || !Number.isFinite(Date.parse(value.createdAtIso))) issues.push('createdAtIso is invalid');
   if (!Array.isArray(value.entries)) issues.push('entries must be an array');
   if (!Array.isArray(value.availability)) issues.push('availability must be an array');
+  const hasMaterializedMedia = Object.prototype.hasOwnProperty.call(value, 'materializedMedia');
+  if (hasMaterializedMedia && !Array.isArray(value.materializedMedia)) {
+    issues.push('materializedMedia must be an array');
+  }
   const publicationScope = validatePublicationScope(value.publicationScope, issues);
   const paths = new Set<string>();
   const entryFields = new Set(['logicalPath', 'generationPath', 'artifactKind', 'sha256', 'sizeBytes', 'sourceMediaSha256', 'provenanceSha256', 'audit']);
@@ -119,6 +140,69 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
       compareCodePoints(isRecord(left) && typeof left.logicalPath === 'string' ? left.logicalPath : '', isRecord(right) && typeof right.logicalPath === 'string' ? right.logicalPath : ''));
     if (value.entries.some((entry, index) => entry !== sorted[index])) issues.push('entries must be in canonical logicalPath order');
   }
+  const materializedMedia: FixtureMaterializedMedia[] = [];
+  const materializedPaths = new Set<string>();
+  const materializedFields = new Set(['logicalPath', 'sha256', 'sizeBytes', 'provenanceSha256', 'audit']);
+  for (const [index, entry] of (
+    Array.isArray(value.materializedMedia) ? value.materializedMedia : []
+  ).entries()) {
+    if (!isRecord(entry)) {
+      issues.push(`materializedMedia[${index}] must be an object`);
+      continue;
+    }
+    for (const field of Object.keys(entry)) {
+      if (!materializedFields.has(field)) issues.push(`materializedMedia[${index}] has unknown field '${field}'`);
+    }
+    if (!safePath(entry.logicalPath) || typeof entry.logicalPath !== 'string' ||
+        !entry.logicalPath.startsWith('media/')) {
+      issues.push(`materializedMedia[${index}].logicalPath is not a canonical media path`);
+    } else {
+      if (materializedPaths.has(entry.logicalPath)) {
+        issues.push(`duplicate materialized media path '${entry.logicalPath}'`);
+      }
+      materializedPaths.add(entry.logicalPath);
+      if (paths.has(entry.logicalPath)) {
+        issues.push(`logical path '${entry.logicalPath}' cannot be both an indexed entry and materialized media`);
+      }
+    }
+    if (!isSha(entry.sha256)) issues.push(`materializedMedia[${index}].sha256 is invalid`);
+    if (!Number.isSafeInteger(entry.sizeBytes) || Number(entry.sizeBytes) < 0) {
+      issues.push(`materializedMedia[${index}].sizeBytes is invalid`);
+    }
+    if (!isSha(entry.provenanceSha256)) {
+      issues.push(`materializedMedia[${index}].provenanceSha256 is invalid`);
+    }
+    if (!isRecord(entry.audit)) {
+      issues.push(`materializedMedia[${index}].audit is invalid`);
+    } else {
+      const auditFields = new Set(['recipe', 'bakerVersion', 'outputArtifactSha256']);
+      for (const field of Object.keys(entry.audit)) {
+        if (!auditFields.has(field)) issues.push(`materializedMedia[${index}].audit has unknown field '${field}'`);
+      }
+      if (typeof entry.audit.recipe !== 'string' || !entry.audit.recipe) {
+        issues.push(`materializedMedia[${index}].audit.recipe is invalid`);
+      }
+      if (typeof entry.audit.bakerVersion !== 'string' || !entry.audit.bakerVersion) {
+        issues.push(`materializedMedia[${index}].audit.bakerVersion is invalid`);
+      }
+      if (!isSha(entry.audit.outputArtifactSha256)) {
+        issues.push(`materializedMedia[${index}].audit.outputArtifactSha256 is invalid`);
+      } else if (isSha(entry.sha256) && entry.audit.outputArtifactSha256 !== entry.sha256) {
+        issues.push(`materializedMedia[${index}].audit output digest does not match materialized bytes`);
+      }
+    }
+    materializedMedia.push(entry as unknown as FixtureMaterializedMedia);
+  }
+  if (Array.isArray(value.materializedMedia)) {
+    const sorted = [...value.materializedMedia].sort((left, right) =>
+      compareCodePoints(
+        isRecord(left) && typeof left.logicalPath === 'string' ? left.logicalPath : '',
+        isRecord(right) && typeof right.logicalPath === 'string' ? right.logicalPath : '',
+      ));
+    if (value.materializedMedia.some((entry, index) => entry !== sorted[index])) {
+      issues.push('materializedMedia must be in canonical logicalPath order');
+    }
+  }
   const availabilityPaths = new Set<string>();
   const availabilityFields = new Set(['logicalPath', 'state', 'reasonCode', 'detail']);
   for (const [index, entry] of (Array.isArray(value.availability) ? value.availability : []).entries()) {
@@ -133,6 +217,9 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
     availabilityPaths.add(entry.logicalPath);
     if (paths.has(entry.logicalPath)) {
       issues.push(`logical path '${entry.logicalPath}' cannot be both an indexed entry and availability`);
+    }
+    if (materializedPaths.has(entry.logicalPath)) {
+      issues.push(`logical path '${entry.logicalPath}' cannot be both materialized media and availability`);
     }
   }
   if (Array.isArray(value.availability)) {
@@ -155,9 +242,16 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
       if (!assetId) issues.push(`availability[${index}] is not a canonical selected-asset path`);
       else if (!selected.has(assetId)) issues.push(`availability[${index}] asset '${assetId}' is outside selected publication scope`);
     }
+    for (const [index, entry] of materializedMedia.entries()) {
+      const assetId = logicalPathAssetId(entry.logicalPath, 'media');
+      if (!assetId) issues.push(`materializedMedia[${index}] is not a canonical selected-asset path`);
+      else if (!selected.has(assetId)) {
+        issues.push(`materializedMedia[${index}] asset '${assetId}' is outside selected publication scope`);
+      }
+    }
     for (const assetId of publicationScope.assetIds) {
       const mediaPath = `media/${assetId}`;
-      if (!paths.has(mediaPath) && !availabilityPaths.has(mediaPath)) {
+      if (!paths.has(mediaPath) && !materializedPaths.has(mediaPath) && !availabilityPaths.has(mediaPath)) {
         issues.push(`${mediaPath}: selected asset is neither indexed nor covered by typed availability`);
       }
     }
@@ -173,6 +267,7 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
         schema: FIXTURE_GENERATION_INDEX_SCHEMA,
         publicationScope,
         entries: identityEntries,
+        ...(hasMaterializedMedia ? { materializedMedia } : {}),
         availability: value.availability,
       })));
       if (expectedGenerationId !== value.generationId) {
@@ -184,7 +279,13 @@ export function validateFixtureGenerationIndex(value: unknown): FixtureGeneratio
   }
   return issues.length
     ? { ok: false, reasonCode: 'GENERATION_INDEX_SCHEMA_INVALID', issues }
-    : { ok: true, index: value as unknown as FixtureGenerationIndex };
+    : {
+        ok: true,
+        index: {
+          ...(value as unknown as Omit<FixtureGenerationIndex, 'materializedMedia'>),
+          materializedMedia,
+        },
+      };
 }
 
 export function resolveFixtureGenerationEntry(
@@ -195,12 +296,23 @@ export function resolveFixtureGenerationEntry(
     index.availability.find((entry) => entry.logicalPath === logicalPath);
 }
 
+export function resolveFixtureMaterializedMedia(
+  index: FixtureGenerationIndex,
+  logicalPath: string,
+): FixtureMaterializedMedia | undefined {
+  return index.materializedMedia.find((entry) => entry.logicalPath === logicalPath);
+}
+
 export type FixtureIntegrityResult =
   | { state: 'verified'; entry: FixtureGenerationEntry; bytes: Uint8Array; actualSha256: string; cacheHit: boolean }
   | {
       state: 'quarantined';
       execution: 'NA_ASSET';
-      reasonCode: 'FIXTURE_SIZE_MISMATCH' | 'FIXTURE_DIGEST_MISMATCH' | 'FIXTURE_FETCH_FAILED';
+      reasonCode:
+        | 'FIXTURE_SIZE_MISMATCH'
+        | 'FIXTURE_DIGEST_MISMATCH'
+        | 'FIXTURE_FETCH_FAILED'
+        | 'FIXTURE_MEDIA_NOT_MATERIALIZED';
       entry: FixtureGenerationEntry;
       expectedSha256: string;
       actualSha256?: string;
@@ -220,6 +332,8 @@ export interface FixtureIntegrityCacheOptions {
   /** Test/host instrumentation; production uses the shared realm-safe SHA-256 implementation. */
   hash?: (bytes: Uint8Array, entry: FixtureGenerationEntry) => string;
 }
+
+class MaterializedMediaMissingError extends Error {}
 
 /** One instance is one integrity-cache lifetime. Every distinct indexed identity is hashed once. */
 export class FixtureIntegrityCache {
@@ -259,6 +373,17 @@ export class FixtureIntegrityCache {
           ? loaded
           : new Uint8Array(loaded);
     } catch (error) {
+      if (error instanceof MaterializedMediaMissingError) {
+        return {
+          state: 'quarantined',
+          execution: 'NA_ASSET',
+          reasonCode: 'FIXTURE_MEDIA_NOT_MATERIALIZED',
+          entry,
+          expectedSha256: entry.sha256,
+          expectedSizeBytes: entry.sizeBytes,
+          detail: error.message,
+        };
+      }
       return {
         state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_TRANSPORT_ERROR', entry,
         detail: errorMessage(error),
@@ -417,7 +542,8 @@ export class ActiveFixtureRuntime {
     const mediaPath = `media/${assetId}`;
     let inScope = index.publicationScope.mode === 'selected-assets'
       ? index.publicationScope.assetIds.includes(assetId)
-      : resolveFixtureGenerationEntry(index, mediaPath) !== undefined;
+      : resolveFixtureGenerationEntry(index, mediaPath) !== undefined ||
+        resolveFixtureMaterializedMedia(index, mediaPath) !== undefined;
     if (!inScope && index.publicationScope.mode === 'complete-corpus') {
       const manifest = await this.#loadManifest(index);
       if (manifest.state !== 'ready') return manifest.result;
@@ -431,15 +557,17 @@ export class ActiveFixtureRuntime {
       };
     }
 
-    const record = resolveFixtureGenerationEntry(index, mediaPath);
-    if (!record) {
+    const indexedRecord = resolveFixtureGenerationEntry(index, mediaPath);
+    const materializedRecord = resolveFixtureMaterializedMedia(index, mediaPath);
+    if (!indexedRecord && !materializedRecord) {
       return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_MEDIA_INDEX_RECORD_MISSING', detail: `${mediaPath} is in scope but has no ready/availability record` };
     }
-    if ('state' in record) return availabilityAsMediaResult(record);
+    if (indexedRecord && 'state' in indexedRecord) return availabilityAsMediaResult(indexedRecord);
+    const record = indexedRecord ?? materializedMediaAsGenerationEntry(materializedRecord!);
     if (record.artifactKind !== 'media') {
       return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_MEDIA_KIND_INVALID', detail: `${mediaPath} is indexed as '${record.artifactKind}'` };
     }
-    const verified = await this.#verify(record);
+    const verified = await this.#verify(record, materializedRecord !== undefined);
     if (verified.state === 'error') {
       return { state: 'error', execution: 'ERROR', reasonCode: verified.reasonCode, detail: verified.detail };
     }
@@ -530,10 +658,17 @@ export class ActiveFixtureRuntime {
     });
   }
 
-  #verify(entry: FixtureGenerationEntry): Promise<FixtureIntegrityResult> {
+  #verify(entry: FixtureGenerationEntry, materialized = false): Promise<FixtureIntegrityResult> {
     return this.#integrity.verify(entry, async (generationPath) => {
       const response = await this.#fetch(this.#generationUrl(generationPath), { cache: 'no-store' });
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+      if (!response.ok) {
+        if (materialized && response.status === 404) {
+          throw new MaterializedMediaMissingError(
+            `${entry.logicalPath} is declared by the active generation but is not materialized locally`,
+          );
+        }
+        throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+      }
       return response.arrayBuffer();
     });
   }
@@ -574,7 +709,8 @@ export class ActiveFixtureRuntime {
         return manifestError('GENERATION_MANIFEST_SCHEMA_INVALID', `assets[${position}] identity is invalid`);
       }
       assets.set(asset.id, { sha256: asset.sha256, sizeBytes: Number(asset.sizeBytes) });
-      if (!resolveFixtureGenerationEntry(index, `media/${asset.id}`)) {
+      if (!resolveFixtureGenerationEntry(index, `media/${asset.id}`) &&
+          !resolveFixtureMaterializedMedia(index, `media/${asset.id}`)) {
         return manifestError('GENERATION_MANIFEST_COVERAGE_INVALID', `media/${asset.id} is neither ready nor typed unavailable`);
       }
     }
@@ -660,6 +796,21 @@ function goldenLogicalPath(
 ): string {
   const suffix = kind === 'metadata' ? 'meta' : kind;
   return `golden/${assetId}.${suffix}.json`;
+}
+
+function materializedMediaAsGenerationEntry(
+  declaration: FixtureMaterializedMedia,
+): FixtureGenerationEntry {
+  return {
+    logicalPath: declaration.logicalPath,
+    generationPath: declaration.logicalPath,
+    artifactKind: 'media',
+    sha256: declaration.sha256,
+    sizeBytes: declaration.sizeBytes,
+    sourceMediaSha256: declaration.sha256,
+    provenanceSha256: declaration.provenanceSha256,
+    audit: declaration.audit,
+  };
 }
 
 function availabilityAsMediaResult(record: FixtureAvailabilityEntry): Extract<ActiveFixtureMediaResult, { state: 'unavailable' }> {

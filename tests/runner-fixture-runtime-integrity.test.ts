@@ -16,6 +16,7 @@ import {
   type FixtureAvailabilityEntry,
   type FixtureGenerationEntry,
   type FixtureGenerationIndex,
+  type FixtureMaterializedMedia,
 } from '../src/core/fixture-integrity.ts';
 import { runOne, type PixelBehaviorEvidence } from '../src/core/runner.ts';
 import { defineScenario } from '../src/core/scenario.ts';
@@ -132,7 +133,11 @@ function flipOneByte(bytes: Uint8Array): Uint8Array {
 
 function goldenEnvelope(schema = 'media-test/golden-artifact@1'): Record<string, unknown> {
   const payloadBytes = encoder.encode(canonicalizeJson(metadata));
-  const outputArtifact = { sha256: sha256Hex(payloadBytes), sizeBytes: payloadBytes.byteLength };
+  const outputArtifact = {
+    digestScope: 'canonical-payload',
+    sha256: sha256Hex(payloadBytes),
+    sizeBytes: payloadBytes.byteLength,
+  };
   const sourceMedia = { sha256: mediaSha256, sizeBytes: mediaBytes.byteLength };
   return {
     schema,
@@ -155,7 +160,7 @@ function goldenEnvelope(schema = 'media-test/golden-artifact@1'): Record<string,
       },
       runDetails: {
         baker: 'runner-fixture-runtime-test@1',
-        perimeter: {},
+        perimeter: runtimeToolPerimeter(),
         startedAtIso: '2026-01-01T00:00:00.000Z',
         finishedAtIso: '2026-01-01T00:00:00.000Z',
         timeMode: 'source-date-epoch',
@@ -167,7 +172,50 @@ function goldenEnvelope(schema = 'media-test/golden-artifact@1'): Record<string,
   };
 }
 
-function buildPublication(options: { evidence?: EvidenceMode; tamperMedia?: boolean } = {}): TestPublication {
+function runtimeToolPerimeter(): Record<string, unknown> {
+  const present = (name: string) => ({
+    state: 'present',
+    executable: name,
+    versionOutput: `${name} test-version`,
+  });
+  return {
+    schemaVersion: 'tool-perimeter@1',
+    tools: {
+      bun: present('bun'),
+      ffmpeg: present('ffmpeg'),
+      ffprobe: present('ffprobe'),
+      bento4: { state: 'absent' },
+      bento4Hls: { state: 'absent' },
+      shakaPackager: { state: 'absent' },
+      playwright: { state: 'not-applicable' },
+      browser: { state: 'not-applicable' },
+    },
+    platform: { os: 'test', release: 'test', arch: 'test', locale: 'C', timezone: 'UTC' },
+    environment: {
+      SOURCE_DATE_EPOCH: '0',
+      LANG: 'C',
+      LC_ALL: 'C',
+      TZ: 'UTC',
+      BRAVE_PATH: null,
+      FFMPEG_PATH: null,
+      FFPROBE_PATH: null,
+    },
+    declaredLock: {
+      sha256: 'd'.repeat(64),
+      sourceDateEpoch: 0,
+      locale: 'C',
+      timezone: 'UTC',
+      required: { bun: 'test', ffmpeg: 'test', ffprobe: 'test' },
+      optional: {},
+    },
+  };
+}
+
+function buildPublication(options: {
+  evidence?: EvidenceMode;
+  tamperMedia?: boolean;
+  materializedMedia?: 'ready' | 'missing' | 'corrupt';
+} = {}): TestPublication {
   const evidence = options.evidence ?? 'ready';
   const manifestBytes = encoder.encode(JSON.stringify({ schema: 'media-test/fixture-manifest@1', assets: [] }));
   const validEvidenceBytes = encoder.encode(JSON.stringify(goldenEnvelope()));
@@ -204,8 +252,23 @@ function buildPublication(options: { evidence?: EvidenceMode; tamperMedia?: bool
 
   const identityEntries: Array<Omit<FixtureGenerationEntry, 'generationPath'>> = [
     entry('manifest.json', 'manifest', manifestBytes, zeroSha),
-    entry(`media/${assetId}`, 'media', mediaBytes, mediaSha256),
   ];
+  const materializedMedia: FixtureMaterializedMedia[] = [];
+  if (options.materializedMedia) {
+    materializedMedia.push({
+      logicalPath: `media/${assetId}`,
+      sha256: mediaSha256,
+      sizeBytes: mediaBytes.byteLength,
+      provenanceSha256: zeroSha,
+      audit: {
+        recipe: 'test-materialized-media',
+        bakerVersion: 'runner-fixture-runtime-test@1',
+        outputArtifactSha256: mediaSha256,
+      },
+    });
+  } else {
+    identityEntries.push(entry(`media/${assetId}`, 'media', mediaBytes, mediaSha256));
+  }
   const availability: FixtureAvailabilityEntry[] = [];
   if (evidence === 'absent-expected' || evidence === 'pending' || evidence === 'producer-failed') {
     availability.push({
@@ -235,11 +298,12 @@ function buildPublication(options: { evidence?: EvidenceMode; tamperMedia?: bool
     schema: FIXTURE_GENERATION_INDEX_SCHEMA,
     publicationScope,
     entries: identityEntries,
+    materializedMedia,
     availability,
   })));
   const index: FixtureGenerationIndex = {
     schema: FIXTURE_GENERATION_INDEX_SCHEMA,
-    schemaVersion: '1.0.0',
+    schemaVersion: '1.1.0',
     generationId,
     createdAtIso: '2026-01-01T00:00:00.000Z',
     publicationScope,
@@ -247,6 +311,7 @@ function buildPublication(options: { evidence?: EvidenceMode; tamperMedia?: bool
       ...value,
       generationPath: `generations/${generationId}/${value.logicalPath}`,
     })),
+    materializedMedia,
     availability,
   };
 
@@ -275,7 +340,15 @@ function buildPublication(options: { evidence?: EvidenceMode; tamperMedia?: bool
       });
     }
     const generationEntry = index.entries.find((candidate) => url.endsWith(candidate.generationPath));
-    if (!generationEntry) return new Response(null, { status: 404, statusText: 'Not Found' });
+    const materializedEntry = index.materializedMedia.find((candidate) => url.endsWith(candidate.logicalPath));
+    if (!generationEntry && !materializedEntry) return new Response(null, { status: 404, statusText: 'Not Found' });
+    if (materializedEntry) {
+      if (options.materializedMedia === 'missing') {
+        return new Response(null, { status: 404, statusText: 'Not Found' });
+      }
+      const body = options.materializedMedia === 'corrupt' ? flipOneByte(mediaBytes) : mediaBytes;
+      return new Response(body.slice().buffer, { status: 200 });
+    }
     if (generationEntry.logicalPath === `golden/${assetId}.meta.json`) {
       if (evidence === 'http-404') return new Response(null, { status: 404, statusText: 'Not Found' });
       if (evidence === 'http-500') return new Response(null, { status: 500, statusText: 'Injected failure' });
@@ -361,6 +434,48 @@ describe('REQ-FIX-08/09 active-generation runtime integrity', () => {
     expect(publication.hashCount(`media/${assetId}`)).toBe(1);
     expect(publication.hashCount(`golden/${assetId}.meta.json`)).toBe(1);
     expect(publication.requestedUrls.filter((url) => url.includes('/generations/'))).toHaveLength(2);
+  });
+
+  test('materialized media is verified from the ignored media path and ready evidence may bind to it', async () => {
+    const publication = buildPublication({ materializedMedia: 'ready' });
+    const observed = counters();
+    const result = await runOne(fakeEngine(observed), probeScenario(), browser, support, {
+      fixtureIntegrityRuntime: publication.runtime,
+      pixelBehavior: pixelPass,
+    });
+
+    expect(result.status).toBe('PASS');
+    expect(observed.operation).toBe(1);
+    expect(publication.requestedUrls.some((url) => url.endsWith('/fixtures/media/active.mp4'))).toBe(true);
+    expect(publication.hashCount(`media/${assetId}`)).toBe(1);
+  });
+
+  test('missing materialized media is typed NA_ASSET before engine execution', async () => {
+    const publication = buildPublication({ materializedMedia: 'missing' });
+    const observed = counters();
+    const result = await runOne(fakeEngine(observed), probeScenario(), browser, support, {
+      fixtureIntegrityRuntime: publication.runtime,
+      pixelBehavior: pixelPass,
+    });
+
+    expect(result.status).toBe('NA_ASSET');
+    expect(result.reason).toContain('FIXTURE_MEDIA_NOT_MATERIALIZED');
+    expect(observed.init).toBe(0);
+    expect(observed.operation).toBe(0);
+  });
+
+  test('corrupt materialized media is quarantined by its declaration digest', async () => {
+    const publication = buildPublication({ materializedMedia: 'corrupt' });
+    const observed = counters();
+    const result = await runOne(fakeEngine(observed), probeScenario(), browser, support, {
+      fixtureIntegrityRuntime: publication.runtime,
+      pixelBehavior: pixelPass,
+    });
+
+    expect(result.status).toBe('NA_ASSET');
+    expect(result.reason).toContain('FIXTURE_DIGEST_MISMATCH');
+    expect(observed.init).toBe(0);
+    expect(observed.operation).toBe(0);
   });
 });
 

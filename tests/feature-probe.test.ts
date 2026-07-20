@@ -121,6 +121,32 @@ describe('REQ-FEAT-34 declared metadata fields', () => {
     )).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
   });
 
+  test('allows exactly zero as unknown only when the empty-asset policy opts in', () => {
+    const emptyPolicy = defineProbeMetadataFieldPolicy({
+      fields: ['duration-nullability'],
+      zeroDurationEquivalentToUnknown: true,
+    });
+    expect(assessDeclaredMetadataFields(
+      observation({ durationSec: 0 }),
+      observation({ durationSec: null }),
+      emptyPolicy,
+    )).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'DIFF',
+      reasonCode: 'PROBE_DECLARED_METADATA_REPRESENTATION_DIFFERENCE',
+    });
+    expect(verdictOf(assessDeclaredMetadataFields(
+      observation({ durationSec: 0.001 }),
+      observation({ durationSec: null }),
+      emptyPolicy,
+    ))).toBe('FAIL');
+    expect(verdictOf(assessDeclaredMetadataFields(
+      observation({ durationSec: 0 }),
+      observation({ durationSec: null }),
+      defineProbeMetadataFieldPolicy({ fields: ['duration-nullability'] }),
+    ))).toBe('FAIL');
+  });
+
   test('registered scenarios carry explicit policies for rotation, language, bitrate, tags, protection and nullability', () => {
     for (const id of [
       'probe/h264_rotated90',
@@ -132,6 +158,14 @@ describe('REQ-FEAT-34 declared metadata fields', () => {
     ]) {
       expect(metadataFieldPolicyFromOptions(scenario(id).options)?.fields.length).toBeGreaterThan(0);
     }
+    expect(metadataFieldPolicyFromOptions(
+      scenario('probe/empty-audio-wav').options,
+    )?.zeroDurationEquivalentToUnknown).toBe(true);
+    expect(scenario('probe/cenc_ctr').input).toBe('cenc_ctr_fragmented.mp4');
+    expect(metadataFieldPolicyFromOptions(scenario('probe/cenc_ctr').options)).toMatchObject({
+      fields: ['protection.scheme'],
+      protectionSchemes: ['cenc'],
+    });
   });
 });
 
@@ -302,6 +336,16 @@ describe('REQ-FEAT-38 bounded scale probing', () => {
       const item = scenario(id);
       expect(probeBudgetFromOptions(item.options)).toBeDefined();
       expect(item.metrics).toContain('peakMemory');
+    }
+  });
+
+  test('real huge MOV rows compare media tracks without requiring auxiliary tmcd exposure', () => {
+    for (const id of [
+      'probe/huge_h264_1080p_600s',
+      'probe/perf-extract-metadata-huge',
+    ]) {
+      expect(scenario(id).options?.metadataTrackTypes).toEqual(['video', 'audio']);
+      expect(scenario(id).notes).toContain('tmcd');
     }
   });
 });

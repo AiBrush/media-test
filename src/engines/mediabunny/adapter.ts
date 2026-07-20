@@ -112,6 +112,7 @@ import type {
   MuxWriteTraceEvidence,
   MediaEngine,
   MediaInput,
+  MediaInputContentAttestation,
   NormalizedMetadata,
   NormalizedTrack,
   PacketInfo,
@@ -124,8 +125,16 @@ import type {
   SerializableValue,
   SupportDecision,
 } from '../../core/engine.ts';
+import { CorpusDeliveryIntegrityError } from '../../core/selection-integrity.ts';
+import { readOutputStructure, type ReadStructure } from '../../core/box-readers.ts';
 import type { StreamingRuntimeEvidence } from '../../features/streaming-output/runtime.ts';
 import type { StreamingRepresentation } from '../../features/streaming-output/contracts.ts';
+import {
+  HLS_PLAYLIST_ONLY_PROBE_SCHEMA,
+  hlsProbeContractFromOptions,
+  readHlsPlaylistProbeEvidence,
+} from '../../features/probe/hls.ts';
+import { probeBudgetFromOptions } from '../../features/probe/budget.ts';
 import type {
   SinkTrace,
   SinkTraceEvent,
@@ -135,6 +144,7 @@ type WithoutSequence<T> = T extends unknown ? Omit<T, 'sequence'> : never;
 type UnsequencedSinkTraceEvent = WithoutSequence<SinkTraceEvent>;
 
 import {
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
   DECODE_TRACK_SELECTOR_SCHEMA,
   createBrowserNotSupportedError,
   createMalformedInputError,
@@ -143,6 +153,7 @@ import {
   isNotApplicableError,
 } from '../../core/engine.ts';
 import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/index.ts';
+import { parseAacAudioSpecificConfig } from '../mp4box/evidence.ts';
 
 import {
   canonicalToMediabunnyAudio,
@@ -224,11 +235,14 @@ function secToUs(sec: number): number {
 /** Micro-tolerance for recognizing an explicit trim(0..duration) identity request. */
 const NOOP_TRIM_TOLERANCE_SEC = 0.001;
 
-/** True when the asset is an HLS playlist (explicit container hint or an .m3u8/.m3u URL). */
+/** True when the asset is an HLS playlist, including verified roots rebound to a blob URL. */
 function isHlsAsset(input: MediaInput, container?: string): boolean {
-  if (container === 'hls') return true;
-  const u = input.url.split(/[?#]/, 1)[0] ?? '';
-  return /\.m3u8?$/i.test(u);
+  if (container?.toLowerCase() === 'hls') return true;
+  if (input.mime.toLowerCase().includes('mpegurl')) return true;
+  return [input.id, input.url].some((value) => {
+    const path = value.split(/[?#]/, 1)[0] ?? '';
+    return /\.m3u8?$/i.test(path);
+  });
 }
 
 function isBlobUrl(url: string): boolean {
@@ -310,10 +324,196 @@ export interface MediabunnyHlsReadTrace {
   }>;
 }
 
+export interface MediabunnyAuthenticatedRangeTrace {
+  bytesRead: number;
+  rangeRequests: number;
+  blockRequests: number;
+  ranges: Array<{ start: number; end: number }>;
+}
+
+/**
+ * The verified first source block, retained only for the lifetime of its range trace. QuickTime can
+ * encode English as legacy mdhd language code 0; Mediabunny 1.48.0 reports that value as `und`, while
+ * the neutral box reader can distinguish it from packed ISO-639 `und`. Reusing the block already read
+ * by UrlSource keeps scale-probe byte telemetry exact and avoids a second source request.
+ */
+const authenticatedRangeBlockZero = new WeakMap<MediabunnyAuthenticatedRangeTrace, Uint8Array>();
+
 interface OpenInputOptions {
   hlsKeyBytes?: Uint8Array;
   trace?: MediabunnyHlsReadTrace;
   starvation?: PipelineStarvationSampler;
+  authenticatedRangeTrace?: MediabunnyAuthenticatedRangeTrace;
+}
+
+const AUTHENTICATED_URL_CACHE_BYTES = 16 * 1024 * 1024;
+
+function requestUrl(resource: RequestInfo | URL): string {
+  return resource instanceof Request
+    ? resource.url
+    : resource instanceof URL
+      ? resource.href
+      : String(resource);
+}
+
+function requestRangeHeader(resource: RequestInfo | URL, init?: RequestInit): string | null {
+  const fromInit = new Headers(init?.headers).get('Range');
+  return fromInit ?? (resource instanceof Request ? resource.headers.get('Range') : null);
+}
+
+function parseClosedOrOpenRange(value: string | null, sizeBytes: number): { start: number; end: number } | undefined {
+  const match = value ? /^bytes=(\d+)-(\d*)$/.exec(value.trim()) : null;
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const explicitEnd = match[2] ? Number(match[2]) : sizeBytes - 1;
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(explicitEnd) ||
+    start < 0 ||
+    start >= sizeBytes ||
+    explicitEnd < start
+  ) {
+    return undefined;
+  }
+  return { start, end: Math.min(explicitEnd, sizeBytes - 1) };
+}
+
+function deliveryError(
+  attestation: MediaInputContentAttestation,
+  reasonCode: string,
+  detail: string,
+): CorpusDeliveryIntegrityError {
+  return new CorpusDeliveryIntegrityError(reasonCode, attestation.logicalPath, detail);
+}
+
+async function authenticatedBlock(
+  url: string,
+  attestation: MediaInputContentAttestation,
+  blockIndex: number,
+  trace: MediabunnyAuthenticatedRangeTrace,
+  fetchImpl: typeof fetch,
+  init?: RequestInit,
+): Promise<Uint8Array> {
+  const blockStart = blockIndex * attestation.chunkSizeBytes;
+  const blockEnd = Math.min(attestation.sizeBytes, blockStart + attestation.chunkSizeBytes) - 1;
+  const headers = new Headers(init?.headers);
+  headers.set('Range', `bytes=${blockStart}-${blockEnd}`);
+  const response = await fetchImpl(url, { ...init, headers, cache: 'no-store' });
+  if (response.status !== 206) {
+    response.body?.cancel().catch(() => undefined);
+    throw deliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_UNAVAILABLE',
+      `'${attestation.logicalPath}' returned HTTP ${response.status} for authenticated range ${blockStart}-${blockEnd}`,
+    );
+  }
+  const contentRange = response.headers.get('Content-Range');
+  const expectedContentRange = `bytes ${blockStart}-${blockEnd}/${attestation.sizeBytes}`;
+  if (contentRange !== expectedContentRange) {
+    response.body?.cancel().catch(() => undefined);
+    throw deliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_SHAPE_MISMATCH',
+      `'${attestation.logicalPath}' returned Content-Range '${contentRange ?? 'missing'}', expected '${expectedContentRange}'`,
+    );
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  trace.blockRequests += 1;
+  trace.bytesRead += bytes.byteLength;
+  const expectedSize = blockEnd - blockStart + 1;
+  if (bytes.byteLength !== expectedSize) {
+    throw deliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_SIZE_MISMATCH',
+      `'${attestation.logicalPath}' block ${blockIndex} has ${bytes.byteLength} bytes, expected ${expectedSize}`,
+    );
+  }
+  const actualSha256 = await sha256Hex(bytes);
+  const expectedSha256 = attestation.chunkSha256[blockIndex];
+  if (actualSha256 !== expectedSha256) {
+    throw deliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH',
+      `'${attestation.logicalPath}' block ${blockIndex} no longer matches the admitted content snapshot`,
+    );
+  }
+  if (blockIndex === 0) authenticatedRangeBlockZero.set(trace, bytes);
+  return bytes;
+}
+
+/**
+ * Public UrlSource `fetchFn` bridge that serves only fixed blocks proven against the runner's
+ * admitted snapshot. It transforms Mediabunny's open-ended request into bounded block requests,
+ * validates each block before enqueueing it, and therefore never exposes post-preflight drift.
+ */
+export function createMediabunnyAuthenticatedRangeFetch(
+  expectedUrl: string,
+  attestation: MediaInputContentAttestation,
+  trace: MediabunnyAuthenticatedRangeTrace,
+  fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
+): typeof fetch {
+  return async (resource, init) => {
+    const url = requestUrl(resource);
+    if (new URL(url, expectedUrl).href !== new URL(expectedUrl, expectedUrl).href) {
+      throw deliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_URL_MISMATCH',
+        `UrlSource requested '${url}' instead of admitted URL '${expectedUrl}'`,
+      );
+    }
+    const requested = parseClosedOrOpenRange(requestRangeHeader(resource, init), attestation.sizeBytes);
+    if (!requested) {
+      throw deliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_REQUEST_INVALID',
+        `UrlSource did not issue a valid byte range for '${attestation.logicalPath}'`,
+      );
+    }
+    trace.rangeRequests += 1;
+    trace.ranges.push(requested);
+    let cursor = requested.start;
+    const endExclusive = requested.end + 1;
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (cursor >= endExclusive) {
+          controller.close();
+          return;
+        }
+        try {
+          const blockIndex = Math.floor(cursor / attestation.chunkSizeBytes);
+          const blockStart = blockIndex * attestation.chunkSizeBytes;
+          const bytes = await authenticatedBlock(
+            expectedUrl,
+            attestation,
+            blockIndex,
+            trace,
+            fetchImpl,
+            init,
+          );
+          const offset = cursor - blockStart;
+          const take = Math.min(bytes.byteLength - offset, endExclusive - cursor);
+          controller.enqueue(bytes.subarray(offset, offset + take));
+          cursor += take;
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    });
+    const response = new Response(body, {
+      status: 206,
+      statusText: 'Partial Content',
+      headers: {
+        'Accept-Ranges': 'bytes',
+        'Content-Length': String(endExclusive - requested.start),
+        'Content-Range': `bytes ${requested.start}-${requested.end}/${attestation.sizeBytes}`,
+      },
+    });
+    // Response.url is otherwise empty for a programmatically constructed response. UrlSource uses it
+    // only for redirect-relative child paths, but preserving the admitted URL keeps that public
+    // contract truthful without changing the body.
+    Object.defineProperty(response, 'url', { value: expectedUrl, configurable: true });
+    return response;
+  };
 }
 
 async function openInput(mb: MB, input: MediaInput, container?: string, options: OpenInputOptions = {}): Promise<Input> {
@@ -374,6 +574,27 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
     });
   }
   if (!input.mutated) {
+    if (input.contentAttestation) {
+      const authenticatedRangeTrace = options.authenticatedRangeTrace ?? {
+        bytesRead: 0,
+        rangeRequests: 0,
+        blockRequests: 0,
+        ranges: [],
+      };
+      return new mb.Input({
+        source: new mb.UrlSource(input.url, {
+          fetchFn: createMediabunnyAuthenticatedRangeFetch(
+            input.url,
+            input.contentAttestation,
+            authenticatedRangeTrace,
+          ),
+          getRetryDelay: () => null,
+          maxCacheSize: AUTHENTICATED_URL_CACHE_BYTES,
+          parallelism: 2,
+        }),
+        formats: formats.length ? formats : mb.ALL_FORMATS,
+      });
+    }
     return new mb.Input({
       source: new mb.UrlSource(input.url),
       formats: formats.length ? formats : mb.ALL_FORMATS,
@@ -495,6 +716,44 @@ function resolveHlsPath(path: string, rootUrl: string): string {
   }
 }
 
+async function probeHlsPlaylistOnly(input: MediaInput): Promise<NormalizedMetadata> {
+  let playlist: string;
+  try {
+    playlist = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(await input.arrayBuffer()));
+  } catch (error) {
+    throw createMalformedInputError(
+      'mediabunny',
+      'probe',
+      'parse',
+      'HLS playlist bytes are not valid UTF-8',
+      'MEDIABUNNY_HLS_PLAYLIST_INVALID_UTF8',
+      input.id,
+      error,
+    );
+  }
+  const evidence = readHlsPlaylistProbeEvidence(playlist);
+  if (evidence.state !== 'OK') {
+    throw createMalformedInputError(
+      'mediabunny',
+      'probe',
+      'parse',
+      evidence.detail,
+      evidence.reasonCode,
+      input.id,
+    );
+  }
+  return {
+    container: 'hls',
+    durationSec: evidence.value.durationSec,
+    tracks: [],
+    protectionScheme: 'hls-aes128',
+    probeEvidence: {
+      readMode: 'whole-file',
+      resourceAccesses: [{ role: 'playlist', uri: input.url, disposition: 'read' }],
+    },
+  } as NormalizedMetadata & { protectionScheme: string };
+}
+
 function bindAbortToInput(input: Input, signal?: AbortSignal): () => void {
   if (!signal) return () => undefined;
   const onAbort = () => input.dispose();
@@ -530,40 +789,67 @@ function canonicalContainerFromFormat(name: string, source?: MediaInput): string
 }
 
 /** Normalize a single input track to the suite's NormalizedTrack shape. */
-async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
+export async function normalizeTrack(
+  track: InputTrack,
+  options: {
+    frameRateMode?: 'prefix' | 'external';
+    /** Canonical source container; required when translating container-specific metadata conventions. */
+    sourceContainer?: string;
+  } = {},
+): Promise<NormalizedTrack> {
   const language = await track.getLanguageCode().catch(() => 'und');
   const bitrate = await track.getBitrate().catch(() => null);
+  const disposition = typeof track.getDisposition === 'function'
+    ? await track.getDisposition().catch(() => null)
+    : null;
   const internalCodecId = await track.getInternalCodecId().catch(() => null);
   const nativeCodecTag = typeof internalCodecId === 'string' || typeof internalCodecId === 'number'
     ? String(internalCodecId)
     : undefined;
+  const dispositionFields = disposition
+    ? {
+        defaultDisposition: disposition.default,
+        disposition: { ...disposition },
+      }
+    : {};
 
   if (track.isVideoTrack()) {
     const v = track as InputVideoTrack;
     const mbCodec = await v.getCodec().catch(() => null);
-    const [width, height, rotation] = await Promise.all([
-      v.getDisplayWidth().catch(() => 0),
-      v.getDisplayHeight().catch(() => 0),
+    const [width, height, mediabunnyRotation] = await Promise.all([
+      v.getCodedWidth().catch(() => 0),
+      v.getCodedHeight().catch(() => 0),
       v.getRotation().catch(() => 0 as Rotation),
     ]);
+    // Mediabunny 1.48 derives an ISO-BMFF tkhd quarter-turn with atan2(b, a), which is the
+    // opposite sign from the suite's clockwise display convention (also used by ffprobe and the
+    // independent structural orientation reader). Its Matroska demuxer already performs that sign
+    // conversion, so invert only MP4/MOV quarter-turns at this explicit container boundary.
+    const rotation: Rotation =
+      (options.sourceContainer === 'mp4' || options.sourceContainer === 'mov') &&
+      (mediabunnyRotation === 90 || mediabunnyRotation === 270)
+        ? (360 - mediabunnyRotation) as Rotation
+        : mediabunnyRotation;
     // FPS: estimate from a prefix of packets (averagePacketRate == frame rate for video).
     let fps: number | undefined;
     let fpsProvenance: NormalizedTrack['fpsProvenance'];
-    try {
-      const stats = await v.computePacketStats(120);
-      if (Number.isFinite(stats.averagePacketRate) && stats.averagePacketRate > 0) {
-        fps = stats.averagePacketRate;
-        if (Number.isSafeInteger(stats.packetCount) && stats.packetCount > 0) {
-          fpsProvenance = {
-            source: 'average',
-            cadence: 'UNKNOWN',
-            sampleCount: stats.packetCount,
-            observedIntervalUs: stats.packetCount * 1e6 / stats.averagePacketRate,
-          };
+    if (options.frameRateMode !== 'external') {
+      try {
+        const stats = await v.computePacketStats(120);
+        if (Number.isFinite(stats.averagePacketRate) && stats.averagePacketRate > 0) {
+          fps = stats.averagePacketRate;
+          if (Number.isSafeInteger(stats.packetCount) && stats.packetCount > 0) {
+            fpsProvenance = {
+              source: 'average',
+              cadence: 'UNKNOWN',
+              sampleCount: stats.packetCount,
+              observedIntervalUs: stats.packetCount * 1e6 / stats.averagePacketRate,
+            };
+          }
         }
+      } catch {
+        fps = undefined;
       }
-    } catch {
-      fps = undefined;
     }
     const out: NormalizedTrack = {
       type: 'video',
@@ -574,6 +860,7 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
       rotation: rotation || 0,
       bitrate: bitrate ?? null,
       language: language === 'und' ? null : language,
+      ...dispositionFields,
     };
     if (fps !== undefined) out.fps = fps;
     if (fpsProvenance !== undefined) out.fpsProvenance = fpsProvenance;
@@ -587,14 +874,40 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
       a.getSampleRate().catch(() => 0),
       a.getNumberOfChannels().catch(() => 0),
     ]);
+    const codec = mediabunnyToCanonicalAudio(mbCodec) ?? mbCodec ?? 'unknown';
+    const decoderConfig = codec === 'aac'
+      ? await a.getDecoderConfig().catch(() => null)
+      : null;
+    const aac = parseAacAudioSpecificConfig(
+      decoderConfig?.description ? copyBytes(decoderConfig.description) : undefined,
+    );
+    const normalizedSampleRate = aac?.presentationSampleRate ?? sampleRate;
+    const normalizedChannels = aac?.presentationChannels ?? channels;
+    const pcmWidth = /^pcm-[suf](\d+)(?:be)?$/i.exec(codec)?.[1];
+    const derivedBitrate = bitrate ?? (
+      pcmWidth !== undefined && normalizedSampleRate > 0 && normalizedChannels > 0
+        ? normalizedSampleRate * normalizedChannels * Number(pcmWidth)
+        : null
+    );
     return {
       type: 'audio',
-      codec: mediabunnyToCanonicalAudio(mbCodec) ?? mbCodec ?? 'unknown',
+      codec,
       ...(nativeCodecTag ? { nativeCodecTag } : {}),
-      sampleRate: sampleRate || undefined,
-      channels: channels || undefined,
-      bitrate: bitrate ?? null,
+      ...(decoderConfig?.codec ? { rawCodec: decoderConfig.codec } : {}),
+      sampleRate: normalizedSampleRate || undefined,
+      channels: normalizedChannels || undefined,
+      ...(aac ? {
+        audioObjectType: aac.audioObjectType,
+        codedSampleRate: aac.codedSampleRate,
+        presentationSampleRate: aac.presentationSampleRate,
+        codedChannels: aac.codedChannels,
+        presentationChannels: aac.presentationChannels,
+        sbrPresent: aac.sbrPresent,
+        psPresent: aac.psPresent,
+      } : {}),
+      bitrate: derivedBitrate,
       language: language === 'und' ? null : language,
+      ...dispositionFields,
     };
   }
 
@@ -605,7 +918,35 @@ async function normalizeTrack(track: InputTrack): Promise<NormalizedTrack> {
     ...(nativeCodecTag ? { nativeCodecTag } : {}),
     bitrate: bitrate ?? null,
     language: language === 'und' ? null : language,
+    ...dispositionFields,
   };
+}
+
+/**
+ * Preserve the AAC core values reported by the container while using one decoded sample as
+ * presentation evidence. Some implicit HE-AAC streams signal SBR/PS in the elementary stream, so
+ * their ASC truthfully describes a 24 kHz mono core while WebCodecs renders 48 kHz stereo audio.
+ */
+export function applyObservedAudioPresentationEvidence(
+  track: NormalizedTrack,
+  observation: { sampleRate: number; numberOfChannels: number },
+): void {
+  if (track.type !== 'audio' || track.codec !== 'aac') return;
+  const sampleRate = observation.sampleRate;
+  if (Number.isFinite(sampleRate) && sampleRate > 0) {
+    track.sampleRate = sampleRate;
+    track.presentationSampleRate = sampleRate;
+  }
+  const channels = observation.numberOfChannels;
+  if (Number.isSafeInteger(channels) && channels > 0) {
+    track.channels = channels;
+    track.presentationChannels = channels;
+    // A declared mono AAC core that renders as stereo under SBR is decoded evidence of Parametric
+    // Stereo, even when its sync extension lives in raw payload instead of the container ASC.
+    if (track.sbrPresent === true && track.codedChannels === 1 && channels === 2) {
+      track.psPresent = true;
+    }
+  }
 }
 
 function copyBytes(source: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): Uint8Array {
@@ -707,7 +1048,10 @@ function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): 
   }
 }
 
-function applyObservedFrameRateEvidence(track: NormalizedTrack, packets: readonly PacketInfo[]): void {
+function applyObservedFrameRateEvidence(
+  track: NormalizedTrack,
+  packets: readonly Pick<PacketInfo, 'ptsUs' | 'durationUs'>[],
+): void {
   if (track.type !== 'video' || packets.length === 0) return;
   const ordered = [...packets].sort((a, b) => a.ptsUs - b.ptsUs);
   const startUs = ordered[0]!.ptsUs;
@@ -883,8 +1227,34 @@ async function prepareOpenedInput(
   };
 }
 
+/** Fill only language values that Mediabunny could not expose from equivalent neutral track evidence. */
+function applyNeutralTrackLanguageEvidence(
+  tracks: NormalizedTrack[],
+  neutralStructure: ReadStructure,
+): void {
+  const used = new Set<number>();
+  for (const track of tracks) {
+    if (track.language !== null && track.language !== undefined) continue;
+    const matchIndex = neutralStructure.tracks.findIndex((candidate, index) =>
+      !used.has(index) && candidate.type === track.type &&
+      (candidate.codec === null || candidate.codec === track.codec));
+    if (matchIndex < 0) continue;
+    used.add(matchIndex);
+    const language = neutralStructure.tracks[matchIndex]?.language;
+    if (language && language !== 'und') track.language = language;
+  }
+}
+
 /** Probe an already-opened Input into NormalizedMetadata. */
-async function metadataFromInput(input: Input, source?: MediaInput): Promise<NormalizedMetadata> {
+async function metadataFromInput(
+  input: Input,
+  source?: MediaInput,
+  options: {
+    exactFrameRateWith?: MB;
+    audioPresentationWith?: MB;
+    neutralStructure?: ReadStructure;
+  } = {},
+): Promise<NormalizedMetadata> {
   const format = await input.getFormat();
   const container = canonicalContainerFromFormat(format.name, source);
 
@@ -895,6 +1265,7 @@ async function metadataFromInput(input: Input, source?: MediaInput): Promise<Nor
   // explicitly require duration "cheaply, not by scanning every sample, no OOM"). Only when metadata
   // yields null/non-finite do we fall back to the precise computeDuration() scan.
   let durationSec: number | null = null;
+  let durationIsComputedEndTimestamp = false;
   try {
     const meta = await input.getDurationFromMetadata();
     durationSec = meta != null && Number.isFinite(meta) ? meta : null;
@@ -905,20 +1276,77 @@ async function metadataFromInput(input: Input, source?: MediaInput): Promise<Nor
     try {
       const d = await input.computeDuration();
       durationSec = Number.isFinite(d) ? d : null;
+      durationIsComputedEndTimestamp = durationSec !== null;
     } catch {
       durationSec = null;
     }
   }
 
   const tracks = await input.getTracks();
+  if (durationIsComputedEndTimestamp && durationSec !== null && tracks.length > 0) {
+    // MediaBunny defines computeDuration() as the absolute end timestamp, not end-minus-start.
+    // Normalize positive-offset timelines (notably MPEG-TS) to the presentation span while keeping
+    // negative priming timestamps outside the presented interval.
+    const starts = await Promise.all(tracks.map((track) => track.getFirstTimestamp().catch(() => 0)));
+    const finiteStarts = starts.filter((value) => Number.isFinite(value));
+    const presentationStart = Math.max(0, finiteStarts.length > 0 ? Math.min(...finiteStarts) : 0);
+    durationSec = Math.max(0, durationSec - presentationStart);
+  }
+  if (options.neutralStructure?.durationSec !== undefined) {
+    durationSec = options.neutralStructure.durationSec;
+  }
+
   const normalized: NormalizedTrack[] = [];
   for (const t of tracks) {
-    normalized.push(await normalizeTrack(t));
+    const track = await normalizeTrack(t, {
+      frameRateMode: options.exactFrameRateWith && t.isVideoTrack() ? 'external' : 'prefix',
+      sourceContainer: container,
+    });
+    if (options.exactFrameRateWith && t.isVideoTrack()) {
+      const sink = new options.exactFrameRateWith.EncodedPacketSink(t);
+      const observations: Array<Pick<PacketInfo, 'ptsUs' | 'durationUs'>> = [];
+      for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
+        observations.push({
+          ptsUs: packet.microsecondTimestamp,
+          durationUs: packet.microsecondDuration,
+        });
+      }
+      applyObservedFrameRateEvidence(track, observations);
+    }
+    if (
+      options.audioPresentationWith &&
+      t.isAudioTrack() &&
+      track.codec === 'aac' &&
+      track.sbrPresent === true
+    ) {
+      // Best-effort only: container probing remains available when this browser cannot decode the
+      // AAC configuration. In that case the ASC-derived core/presentation view is still truthful.
+      try {
+        const sink = new options.audioPresentationWith.AudioSampleSink(t);
+        for await (const sample of sink.samples()) {
+          try {
+            applyObservedAudioPresentationEvidence(track, sample);
+          } finally {
+            sample.close();
+          }
+          break;
+        }
+      } catch {
+        // Keep the container/ASC view when decoded presentation evidence is unavailable.
+      }
+    }
+    normalized.push(track);
+  }
+  if (options.neutralStructure) {
+    applyNeutralTrackLanguageEvidence(normalized, options.neutralStructure);
   }
 
   const meta: NormalizedMetadata = {
     container,
     durationSec,
+    ...(options.neutralStructure?.durationSec !== undefined
+      ? { presentationDurationSec: options.neutralStructure.durationSec }
+      : {}),
     tracks: normalized,
   };
 
@@ -938,6 +1366,15 @@ async function metadataFromInput(input: Input, source?: MediaInput): Promise<Nor
     if (Object.keys(flat).length) meta.tags = flat;
   } catch {
     // tags unsupported for this container — leave undefined.
+  }
+  if (options.neutralStructure?.majorBrand) {
+    meta.tags = { ...(meta.tags ?? {}), major_brand: options.neutralStructure.majorBrand };
+  }
+  const protectionScheme = options.neutralStructure?.tracks
+    .map((track) => track.protectionScheme)
+    .find((scheme): scheme is string => typeof scheme === 'string' && scheme.length > 0);
+  if (protectionScheme) {
+    (meta as NormalizedMetadata & { protectionScheme: string }).protectionScheme = protectionScheme;
   }
 
   return meta;
@@ -2524,6 +2961,7 @@ export class MediabunnyEngine implements MediaEngine {
         'audio-samples:gapless-priming', // full-range AAC trims preserve priming/padding-stripped decode length
         'hls:aes128', // read/probe/decrypt AES-128 HLS playlists via EXT-X-KEY segment decryption
         'probe:resource-trace', // adapter-owned successful/missing/error HLS resource observations
+        AUTHENTICATED_RANGE_PROBE_FEATURE, // UrlSource fetchFn verifies every delivered fixed block
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
@@ -2542,20 +2980,17 @@ export class MediabunnyEngine implements MediaEngine {
         // runner's negotiate() reads this token to SKIP the browser encode/decode gate for pcm-*
         // codecs (those gates would otherwise NA a codec mediabunny genuinely handles with no browser).
         'audio:pcm-native',
-        // NOTE: 'webcrypto:cenc-ctr-clear-output' is deliberately NOT declared. The NA audit proposed
-        // it (decrypt() structurally builds a clear-sample MP4 via resolveKeyId + no-transform
-        // Conversion), but a real browser run proved mediabunny@1.48.0 WASM-ABORTS ("Assertion failed.")
-        // when reading THIS CENC-CTR fixture (cenc_ctr.mp4) — both on decrypt and on plain probe — while
-        // it handles cenc_cbcs.mp4 fine and ffmpeg.wasm decrypts cenc_ctr.mp4 correctly. The clear-output
-        // decrypt path is therefore NOT a real, working capability for this engine/build, so it stays
-        // undeclared (honest NA_ENGINE) rather than surfacing as ERROR. See disabled-cells.ts for the
-        // matching probe/cenc_ctr entry.
+        // NOTE: 'webcrypto:cenc-ctr-clear-output' is deliberately NOT declared. Fragmented CENC-CTR
+        // metadata is safely probed, but clear-output decryption remains unproven for this engine/build
+        // and therefore stays an honest NA_ENGINE capability.
         // decodeFrames() decodes the primary AUDIO track (AudioSampleSink) to interleaved-f32
         // per-sample-frame digests when the input has no video track, mirroring the decoded-audio-pcm
         // oracle. Unblocks audio-dsp/throughput_decode_s24 and throughput_decode_s16be.
         'decode:audio-pcm',
       ],
-      probeReadModes: ['whole-file'],
+      // Scale probes receive an authenticated fixed-block URL transport; ordinary sealed Blob
+      // inputs remain whole-file. The range claim is backed by UrlSource's public fetchFn trace.
+      probeReadModes: ['range', 'whole-file'],
     };
   }
 
@@ -2616,14 +3051,67 @@ export class MediabunnyEngine implements MediaEngine {
   async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
     this.assertRuntimeSupport(context);
     if (context?.signal.aborted) throw abortError(context.signal.reason);
+    const operationStartedAt = nowMs();
+    const hlsContract = hlsProbeContractFromOptions(context?.request.options);
+    if (hlsContract?.schema === HLS_PLAYLIST_ONLY_PROBE_SCHEMA) {
+      return probeHlsPlaylistOnly(input);
+    }
+    const probeBudget = probeBudgetFromOptions(context?.request.options);
+    const neutralStructure = !probeBudget && /\.(?:mp4|mov)(?:$|[?#])/i.test(input.id)
+      ? readOutputStructure(
+          new Uint8Array(await input.arrayBuffer()),
+          input.id.toLowerCase().endsWith('.mov') ? 'mov' : 'mp4',
+        ) ?? undefined
+      : undefined;
     const trace: MediabunnyHlsReadTrace | undefined = isHlsAsset(input)
       ? { rootMode: input.mutated ? 'mutated-buffer' : 'url', reads: [] }
       : undefined;
-    const mbInput = await openInput(this.lib, input, undefined, { ...(trace ? { trace } : {}) });
+    const authenticatedRangeTrace: MediabunnyAuthenticatedRangeTrace | undefined =
+      probeBudget && input.contentAttestation
+        ? { bytesRead: 0, rangeRequests: 0, blockRequests: 0, ranges: [] }
+        : undefined;
+    const mbInput = await openInput(this.lib, input, undefined, {
+      ...(trace ? { trace } : {}),
+      ...(authenticatedRangeTrace ? { authenticatedRangeTrace } : {}),
+    });
     const unbindAbort = bindAbortToInput(mbInput, context?.signal);
     try {
-      const metadata = await metadataFromInput(mbInput, input);
-      metadata.probeEvidence = { readMode: 'whole-file' };
+      const metadata = await metadataFromInput(mbInput, input, {
+        ...(!probeBudget
+          ? { exactFrameRateWith: this.lib, audioPresentationWith: this.lib }
+          : {}),
+        ...(neutralStructure ? { neutralStructure } : {}),
+      });
+      if (authenticatedRangeTrace) {
+        if (authenticatedRangeTrace.rangeRequests === 0 || authenticatedRangeTrace.blockRequests === 0) {
+          throw deliveryError(
+            input.contentAttestation!,
+            'CORPUS_AUTHENTICATED_RANGE_EVIDENCE_MISSING',
+            `Mediabunny returned metadata for '${input.id}' without reading an authenticated range`,
+          );
+        }
+        if (siblingContainerHint(input) === 'mov') {
+          const blockZero = authenticatedRangeBlockZero.get(authenticatedRangeTrace);
+          const verifiedPrefixStructure = blockZero
+            ? readOutputStructure(blockZero, 'mov') ?? undefined
+            : undefined;
+          if (verifiedPrefixStructure) {
+            applyNeutralTrackLanguageEvidence(metadata.tracks, verifiedPrefixStructure);
+          }
+        }
+        metadata.probeEvidence = { readMode: 'range' };
+        metadata.telemetry = {
+          ...(metadata.telemetry ?? {}),
+          bytesRead: authenticatedRangeTrace.bytesRead,
+        };
+        context?.emit({
+          type: 'bytes-read',
+          atMs: Math.max(0, nowMs() - operationStartedAt),
+          bytes: authenticatedRangeTrace.bytesRead,
+        });
+      } else {
+        metadata.probeEvidence = { readMode: 'whole-file' };
+      }
       if (trace) {
         (metadata as NormalizedMetadata & { sourceTrace: MediabunnyHlsReadTrace }).sourceTrace = trace;
         const playlist = new TextDecoder().decode(new Uint8Array(await input.arrayBuffer()));

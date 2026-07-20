@@ -31,12 +31,16 @@ export interface ReadTrack {
   codec: string | null;
   width?: number;
   height?: number;
+  language?: string;
+  protectionScheme?: string;
 }
 
 export interface ReadStructure {
   container: 'mp4' | 'webm';
   tracks: ReadTrack[];
   durationSec?: number;
+  /** ISO-BMFF ftyp major_brand when present. */
+  majorBrand?: string;
 }
 
 export type ReaderState =
@@ -282,6 +286,23 @@ function parseMdhdDurationSec(dv: DataView, box: Box): number | undefined {
   return duration / timescale;
 }
 
+/** Decode the packed ISO-639-2/T language carried by mdhd. */
+function parseMdhdLanguage(dv: DataView, box: Box): string | undefined {
+  const b = box.bodyStart;
+  if (b + 4 > box.end || b >= dv.byteLength) return undefined;
+  const version = dv.getUint8(b);
+  const offset = version === 1 ? b + 32 : b + 20;
+  if (offset + 2 > box.end) return undefined;
+  const packed = u16(dv, offset);
+  // QuickTime's legacy language table uses code 0 for English. FFmpeg applies that convention to
+  // older authored files whose mdhd carries zero rather than the ISO-639 packed `und` value.
+  if (packed === 0) return 'eng';
+  const language = [10, 5, 0]
+    .map((shift) => String.fromCharCode(((packed >> shift) & 0x1f) + 0x60))
+    .join('');
+  return /^[a-z]{3}$/.test(language) ? language : undefined;
+}
+
 /** Sum stts run lengths without expanding a potentially multi-million-sample table. */
 function parseSttsSpanSec(dv: DataView, box: Box, timescale: number): number | undefined {
   const b = box.bodyStart;
@@ -354,24 +375,39 @@ function findFrma(bytes: Uint8Array, dv: DataView, start: number, end: number): 
   return null;
 }
 
+/** Locate a CENC SchemeTypeBox inside an encrypted sample entry. */
+function findProtectionScheme(bytes: Uint8Array, dv: DataView, start: number, end: number): string | null {
+  const hardEnd = Math.min(end, bytes.length) - 16;
+  for (let i = start; i <= hardEnd; i++) {
+    if (ascii(bytes, i + 4, 4) !== 'schm') continue;
+    const size = u32(dv, i);
+    if (size < 16 || i + size > end) continue;
+    const scheme = ascii(bytes, i + 12, 4).trim();
+    if (/^[\x20-\x7e]{4}$/.test(scheme)) return scheme;
+  }
+  return null;
+}
+
 /** stsd → first sample-entry fourcc + (for visual entries) width/height. */
 function parseStsd(
   bytes: Uint8Array,
   dv: DataView,
   box: Box,
   isVideo: boolean,
-): { fourcc: string | null; w: number; h: number } {
+): { fourcc: string | null; w: number; h: number; protectionScheme: string | null } {
   // version(1)+flags(3) entry_count(4) then the first sample-entry box: size(4) type(4) …
   const entryStart = box.bodyStart + 8;
-  if (entryStart + 8 > box.end) return { fourcc: null, w: 0, h: 0 };
+  if (entryStart + 8 > box.end) return { fourcc: null, w: 0, h: 0, protectionScheme: null };
   const entrySize = u32(dv, entryStart);
   const entryEnd = entrySize >= 8 ? Math.min(entryStart + entrySize, box.end) : box.end;
   let fourcc = ascii(bytes, entryStart + 4, 4).trim();
+  let protectionScheme: string | null = null;
 
   // CENC/CBCS encrypted entries ('encv'/'enca'/'encs') hide the real codec in sinf→frma. Unwrap it —
   // frma is authoritative, so the token stays golden-exact with zero false-FAIL risk. (The encrypted
   // entry keeps the underlying VisualSampleEntry layout, so dimensions are still read below.)
   if (fourcc === 'encv' || fourcc === 'enca' || fourcc === 'encs') {
+    protectionScheme = findProtectionScheme(bytes, dv, entryStart + 8, entryEnd);
     const original = findFrma(bytes, dv, entryStart + 8, entryEnd);
     if (original) fourcc = original;
   }
@@ -386,7 +422,7 @@ function parseStsd(
       h = u16(dv, seBody + 26);
     }
   }
-  return { fourcc: fourcc || null, w, h };
+  return { fourcc: fourcc || null, w, h, protectionScheme };
 }
 
 /** Descend a `trak` into a single ReadTrack. */
@@ -398,10 +434,12 @@ function parseTrak(bytes: Uint8Array, dv: DataView, trak: Box): ReadTrack | null
 
   const mdiaChildren = readBoxes(bytes, dv, mdia.bodyStart, mdia.end);
   const hdlr = findBox(mdiaChildren, 'hdlr');
+  const mdhd = findBox(mdiaChildren, 'mdhd');
   const type = hdlr ? parseHandlerType(bytes, hdlr) : 'other';
 
   // mdia → minf → stbl → stsd
   let fourcc: string | null = null;
+  let protectionScheme: string | null = null;
   let stsdW = 0;
   let stsdH = 0;
   const minf = findBox(mdiaChildren, 'minf');
@@ -412,6 +450,7 @@ function parseTrak(bytes: Uint8Array, dv: DataView, trak: Box): ReadTrack | null
       if (stsd) {
         const parsed = parseStsd(bytes, dv, stsd, type === 'video');
         fourcc = parsed.fourcc;
+        protectionScheme = parsed.protectionScheme;
         stsdW = parsed.w;
         stsdH = parsed.h;
       }
@@ -419,6 +458,9 @@ function parseTrak(bytes: Uint8Array, dv: DataView, trak: Box): ReadTrack | null
   }
 
   const track: ReadTrack = { type, codec: fourcc ? canonicalCodecToken(fourcc) : null };
+  if (protectionScheme) track.protectionScheme = protectionScheme;
+  const language = mdhd ? parseMdhdLanguage(dv, mdhd) : undefined;
+  if (language) track.language = language;
   if (type === 'video') {
     // Prefer the visual sample-entry dimensions; fall back to tkhd.
     let w = stsdW;
@@ -484,7 +526,15 @@ export function readMp4Structure(bytes: Uint8Array): ReadStructure | null {
       }
     }
 
-    const out: ReadStructure = { container: 'mp4', tracks };
+    const ftyp = findBox(top, 'ftyp');
+    const majorBrand = ftyp && ftyp.bodyStart + 4 <= ftyp.end
+      ? ascii(bytes, ftyp.bodyStart, 4).replace(/\0+$/g, '')
+      : '';
+    const out: ReadStructure = {
+      container: 'mp4',
+      tracks,
+      ...(majorBrand ? { majorBrand } : {}),
+    };
     if (durationSec != null && isFinite(durationSec) && durationSec >= 0) out.durationSec = durationSec;
     return out;
   } catch {

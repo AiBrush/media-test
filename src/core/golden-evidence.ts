@@ -1,7 +1,20 @@
 /** Browser/Worker-safe versioned golden evidence reader and typed availability contract. */
 
-import { canonicalizeJson } from './canonical-json.ts';
+import {
+  canonicalJsonIdentityStreaming,
+  canonicalJsonSha256,
+  canonicalizeJson,
+} from './canonical-json.ts';
 import { sha256Hex } from './seeded-rng.ts';
+import {
+  COMPACT_GOLDEN_PACKETS_SCHEMA,
+  validateCompactGoldenPacketPayload,
+} from '../../fixtures/lib/lossless-json-columnar-validator.mjs';
+import { validateGoldenProvenanceCrossFields } from '../../fixtures/lib/golden-provenance-validation.mjs';
+import {
+  COMPRESSED_GOLDEN_ARTIFACT_SCHEMA,
+  decodeCompressedGoldenArtifact,
+} from './compressed-golden-artifact.ts';
 
 export const GOLDEN_ARTIFACT_SCHEMA = 'media-test/golden-artifact@1' as const;
 export const GOLDEN_PROVENANCE_SCHEMA = 'media-test/golden-provenance@1' as const;
@@ -24,7 +37,7 @@ export interface GoldenProvenance {
     recipe: string;
     normalizedArguments: unknown;
     normalizedArgumentsSha256: string;
-    dependencies: Array<{ logicalId: string; sha256: string; sizeBytes?: number }>;
+    dependencies: Array<{ logicalId: string; sha256: string; sizeBytes: number }>;
   };
   runDetails: {
     baker: string;
@@ -34,7 +47,7 @@ export interface GoldenProvenance {
     timeMode: string;
     browserQualified: boolean;
   };
-  outputArtifact: DigestSubject & { digestScope?: string };
+  outputArtifact: DigestSubject & { digestScope: 'canonical-payload' };
 }
 
 export interface GoldenArtifactEnvelope<T = unknown> {
@@ -160,9 +173,9 @@ export async function loadGoldenEvidenceV1<T = unknown>(
  * Strictly validate already-materialized evidence. Callers that verified the active-generation
  * entry pass `actualArtifactSha256`, so repeated consumers do not re-hash the same artifact.
  */
-export function readGoldenEvidenceBytesV1<T = unknown>(
+export async function readGoldenEvidenceBytesV1<T = unknown>(
   options: ReadGoldenEvidenceBytesOptions<T>,
-): GoldenEvidenceResult<T> {
+): Promise<GoldenEvidenceResult<T>> {
   const base = { kind: options.kind, reference: options.reference };
   const bytes = options.bytes;
   const actualArtifactSha256 = options.actualArtifactSha256 ?? sha256Hex(bytes);
@@ -185,17 +198,20 @@ export function readGoldenEvidenceBytesV1<T = unknown>(
     });
   }
 
-  let raw: unknown;
-  try {
-    raw = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-  } catch (error) {
-    return unavailable(base, 'schema-invalid', 'GOLDEN_JSON_INVALID', errorMessage(error));
+  let envelope: GoldenArtifactEnvelope;
+  {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as unknown;
+    } catch (error) {
+      return unavailable(base, 'schema-invalid', 'GOLDEN_JSON_INVALID', errorMessage(error));
+    }
+    const validated = validateGoldenArtifactEnvelope(raw, options.kind);
+    if (!validated.ok) {
+      return unavailable(base, 'schema-invalid', validated.reasonCode, validated.issues.join('; '));
+    }
+    envelope = validated.envelope;
   }
-  const validated = validateGoldenArtifactEnvelope(raw, options.kind);
-  if (!validated.ok) {
-    return unavailable(base, 'schema-invalid', validated.reasonCode, validated.issues.join('; '));
-  }
-  const envelope = validated.envelope;
   const withProvenance = { ...base, provenance: envelope.provenance };
   if (
     options.reference.expectedSourceMediaSha256 !== undefined &&
@@ -206,12 +222,77 @@ export function readGoldenEvidenceBytesV1<T = unknown>(
       actualSha256: envelope.sourceMedia.sha256,
     });
   }
-  const payloadSha256 = sha256Hex(new TextEncoder().encode(canonicalizeJson(envelope.payload)));
-  if (payloadSha256 !== normalizeHex(envelope.provenance.outputArtifact.sha256)) {
-    return unavailable(withProvenance, 'digest-mismatch', 'GOLDEN_PAYLOAD_DIGEST_MISMATCH', 'canonical payload digest does not match provenance', {
-      expectedSha256: envelope.provenance.outputArtifact.sha256,
-      actualSha256: payloadSha256,
-    });
+  let authenticatedCompactIdentity: DigestSubject | undefined;
+  const compressedPayload = options.kind === 'packets' && isRecord(envelope.payload) &&
+    envelope.payload.schema === COMPRESSED_GOLDEN_ARTIFACT_SCHEMA;
+  if (compressedPayload) {
+    try {
+      const decoded = await decodeCompressedGoldenArtifact(envelope.payload);
+      authenticatedCompactIdentity = decoded.decodedIdentity;
+      envelope = { ...envelope, payload: decoded.value };
+    } catch (error) {
+      const detail = errorMessage(error);
+      const identityFailure = /decoded (?:digest|size) does not match|expanded beyond/.test(detail);
+      return unavailable(
+        withProvenance,
+        identityFailure ? 'digest-mismatch' : 'schema-invalid',
+        identityFailure
+          ? 'GOLDEN_COMPRESSED_PAYLOAD_IDENTITY_MISMATCH'
+          : 'GOLDEN_COMPRESSED_PAYLOAD_INVALID',
+        detail,
+      );
+    }
+  }
+  const compactPayload = options.kind === 'packets' && isRecord(envelope.payload) &&
+    envelope.payload.schema === COMPACT_GOLDEN_PACKETS_SCHEMA;
+  if (compressedPayload && !compactPayload) {
+    return unavailable(
+      withProvenance,
+      'schema-invalid',
+      'GOLDEN_COMPRESSED_PAYLOAD_INVALID',
+      'compressed packet transport did not decode to the canonical compact packet schema',
+    );
+  }
+  if (compactPayload) {
+    try {
+      validateCompactGoldenPacketPayload(envelope.payload);
+    } catch (error) {
+      return unavailable(withProvenance, 'schema-invalid', 'GOLDEN_PAYLOAD_SCHEMA_INVALID', errorMessage(error));
+    }
+    if (envelope.provenance.outputArtifact.digestScope !== 'canonical-payload') {
+      return unavailable(withProvenance, 'schema-invalid', 'GOLDEN_PROVENANCE_INVALID', 'compact payload digest scope is not canonical-payload');
+    }
+    let payloadIdentity = authenticatedCompactIdentity;
+    if (!payloadIdentity) {
+      try {
+        payloadIdentity = canonicalJsonIdentityStreaming(envelope.payload);
+      } catch (error) {
+        return unavailable(withProvenance, 'schema-invalid', 'GOLDEN_PAYLOAD_SCHEMA_INVALID', errorMessage(error));
+      }
+    }
+    if (payloadIdentity.sha256 !== normalizeHex(envelope.provenance.outputArtifact.sha256) ||
+        payloadIdentity.sizeBytes !== envelope.provenance.outputArtifact.sizeBytes) {
+      return unavailable(withProvenance, 'digest-mismatch', 'GOLDEN_PAYLOAD_DIGEST_MISMATCH',
+        'streamed canonical compact payload identity does not match provenance', {
+          expectedSha256: envelope.provenance.outputArtifact.sha256,
+          actualSha256: payloadIdentity.sha256,
+        });
+    }
+  } else {
+    let canonicalPayloadBytes;
+    try {
+      canonicalPayloadBytes = new TextEncoder().encode(canonicalizeJson(envelope.payload));
+    } catch (error) {
+      return unavailable(withProvenance, 'schema-invalid', 'GOLDEN_PAYLOAD_SCHEMA_INVALID', errorMessage(error));
+    }
+    const payloadSha256 = sha256Hex(canonicalPayloadBytes);
+    if (payloadSha256 !== normalizeHex(envelope.provenance.outputArtifact.sha256) ||
+        canonicalPayloadBytes.byteLength !== envelope.provenance.outputArtifact.sizeBytes) {
+      return unavailable(withProvenance, 'digest-mismatch', 'GOLDEN_PAYLOAD_DIGEST_MISMATCH', 'canonical payload digest does not match provenance', {
+        expectedSha256: envelope.provenance.outputArtifact.sha256,
+        actualSha256: payloadSha256,
+      });
+    }
   }
   if (envelope.availability.state === 'pending') {
     return unavailable(withProvenance, 'pending', envelope.availability.reasonCode ?? 'GOLDEN_PENDING', envelope.availability.detail ?? 'golden production is pending');
@@ -314,13 +395,14 @@ function validateProvenance(value: unknown, kind: GoldenArtifactKind, assetId: s
   if (!isDigestSubject(value.sourceMedia) || value.sourceMedia.sha256 !== source.sha256 || value.sourceMedia.sizeBytes !== source.sizeBytes) {
     issues.push('provenance source identity mismatch');
   }
-  if (!isRecord(value.buildDefinition) || typeof value.buildDefinition.recipe !== 'string' || !isSha(value.buildDefinition.normalizedArgumentsSha256) || !Array.isArray(value.buildDefinition.dependencies)) {
+  if (!isRecord(value.buildDefinition) || typeof value.buildDefinition.recipe !== 'string' || !value.buildDefinition.recipe || !isSha(value.buildDefinition.normalizedArgumentsSha256) || !Array.isArray(value.buildDefinition.dependencies)) {
     issues.push('provenance build definition is incomplete');
   }
-  if (!isRecord(value.runDetails) || typeof value.runDetails.baker !== 'string' || !isRecord(value.runDetails.perimeter) || !validIso(value.runDetails.startedAtIso) || !validIso(value.runDetails.finishedAtIso)) {
+  if (!isRecord(value.runDetails) || typeof value.runDetails.baker !== 'string' || !value.runDetails.baker || !isRecord(value.runDetails.perimeter) || !validIso(value.runDetails.startedAtIso) || !validIso(value.runDetails.finishedAtIso)) {
     issues.push('provenance run details are incomplete');
   }
   if (!isDigestSubject(value.outputArtifact)) issues.push('provenance output artifact is invalid');
+  issues.push(...validateGoldenProvenanceCrossFields(value, { canonicalSha256: canonicalJsonSha256 }));
   return issues;
 }
 

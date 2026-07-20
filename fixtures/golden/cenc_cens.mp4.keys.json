@@ -1,7 +1,0 @@
-{
-  "$note": "Decrypt-oracle ground truth (key/KID/IV) baked offline. Browser decrypt output is compared bit-exact against the golden frames decoded from the cleartext.",
-  "assetId": "cenc_cens.mp4",
-  "keyHex": "000102030405060708090a0b0c0d0e0f",
-  "kid": "00112233445566778899aabbccddeeff",
-  "scheme": "cenc-cens"
-}

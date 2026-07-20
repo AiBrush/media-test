@@ -5,7 +5,7 @@
  */
 
 import type { OracleId } from './scenario.ts';
-import { sha256Hex } from './seeded-rng.ts';
+import { Sha256, sha256Hex } from './seeded-rng.ts';
 
 export const CATALOG_SCHEMA_VERSION = 'media-candidate-catalog@1' as const;
 export const BAKED_CORPUS_SCHEMA_VERSION = 'baked-corpus@1' as const;
@@ -460,6 +460,52 @@ export interface VerifiedContent {
   actualSizeBytes: number;
 }
 
+/**
+ * Digest-bound, non-retained content evidence for large immutable URL inputs.
+ *
+ * `chunkSha256` is an authenticated snapshot of the exact body observed during admission. A URL
+ * reader must validate every block it delivers against this map; the overall digest alone is not a
+ * license to re-fetch an unguarded mutable URL after preflight.
+ */
+export interface VerifiedStreamContent {
+  state: 'VERIFIED_STREAM';
+  identity: ContentIdentity;
+  actualSha256: string;
+  actualSizeBytes: number;
+  chunkSizeBytes: number;
+  chunkSha256: readonly string[];
+  retainedBytes: 0;
+}
+
+export const VERIFIED_STREAM_CHUNK_SIZE_BYTES = 1024 * 1024;
+
+export const CORPUS_DELIVERY_INTEGRITY_ERROR_KIND = 'media-test/corpus-delivery-integrity-error@1' as const;
+
+/** A realm-safe signal that a post-admission range no longer matches the authenticated snapshot. */
+export class CorpusDeliveryIntegrityError {
+  readonly kind = CORPUS_DELIVERY_INTEGRITY_ERROR_KIND;
+  readonly name = 'CorpusDeliveryIntegrityError' as const;
+  readonly message: string;
+
+  constructor(
+    readonly reasonCode: string,
+    readonly logicalPath: string,
+    readonly detail: string,
+  ) {
+    this.message = detail;
+  }
+}
+
+export function isCorpusDeliveryIntegrityError(value: unknown): value is CorpusDeliveryIntegrityError {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Record<string, unknown>;
+  return item.kind === CORPUS_DELIVERY_INTEGRITY_ERROR_KIND &&
+    item.name === 'CorpusDeliveryIntegrityError' &&
+    typeof item.reasonCode === 'string' && item.reasonCode.length > 0 &&
+    typeof item.logicalPath === 'string' && item.logicalPath.length > 0 &&
+    typeof item.detail === 'string' && item.detail.length > 0;
+}
+
 export interface RejectedContent {
   state: 'REJECTED';
   identity: ContentIdentity;
@@ -468,6 +514,110 @@ export interface RejectedContent {
 
 export type ContentVerificationResult = VerifiedContent | RejectedContent;
 export type ByteSource = Uint8Array | ArrayBuffer | Blob;
+export type StreamSource = ReadableStream<Uint8Array>;
+
+/**
+ * Incrementally verify a body while retaining only one fixed-size block and its digest map.
+ * The returned block map is later enforced by an adapter-owned range fetcher, closing the TOCTOU
+ * gap between admission and URL-backed operation execution.
+ */
+export async function verifyContentStream(
+  identity: ContentIdentity,
+  load: () => Promise<StreamSource>,
+  chunkSizeBytes = VERIFIED_STREAM_CHUNK_SIZE_BYTES,
+): Promise<VerifiedStreamContent | RejectedContent> {
+  if (!Number.isSafeInteger(chunkSizeBytes) || chunkSizeBytes <= 0) {
+    throw new RangeError('verifyContentStream chunkSizeBytes must be a positive safe integer');
+  }
+  let stream: StreamSource;
+  try {
+    stream = await load();
+  } catch (error) {
+    return deepFreeze({
+      state: 'REJECTED',
+      identity,
+      issue: corpusIssue('CORPUS_FETCH_FAILED', `failed to fetch '${identity.logicalPath}': ${errorMessage(error)}`, identity),
+    });
+  }
+
+  const overall = new Sha256();
+  let chunk = new Sha256();
+  let chunkBytes = 0;
+  let actualSizeBytes = 0;
+  const chunkSha256: string[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      const value = next.value;
+      if (!(value instanceof Uint8Array)) {
+        throw new TypeError('content stream yielded a non-Uint8Array chunk');
+      }
+      overall.update(value);
+      actualSizeBytes += value.byteLength;
+      if (!Number.isSafeInteger(actualSizeBytes)) throw new RangeError('content stream exceeds safe byte length');
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const take = Math.min(chunkSizeBytes - chunkBytes, value.byteLength - offset);
+        chunk.update(value.subarray(offset, offset + take));
+        chunkBytes += take;
+        offset += take;
+        if (chunkBytes === chunkSizeBytes) {
+          chunkSha256.push(chunk.hex());
+          chunk = new Sha256();
+          chunkBytes = 0;
+        }
+      }
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    return deepFreeze({
+      state: 'REJECTED',
+      identity,
+      issue: corpusIssue('CORPUS_FETCH_FAILED', `failed to stream '${identity.logicalPath}': ${errorMessage(error)}`, identity),
+    });
+  } finally {
+    reader.releaseLock();
+  }
+  if (chunkBytes > 0) chunkSha256.push(chunk.hex());
+
+  if (actualSizeBytes !== identity.sizeBytes) {
+    return deepFreeze({
+      state: 'REJECTED',
+      identity,
+      issue: {
+        ...corpusIssue(
+          'CORPUS_SIZE_MISMATCH',
+          `size mismatch for '${identity.logicalPath}': expected ${identity.sizeBytes}, got ${actualSizeBytes}`,
+          identity,
+        ),
+        actualSizeBytes,
+      },
+    });
+  }
+  const actualSha256 = overall.hex();
+  if (actualSha256 !== identity.sha256) {
+    return deepFreeze({
+      state: 'REJECTED',
+      identity,
+      issue: {
+        ...corpusIssue('CORPUS_DIGEST_MISMATCH', `SHA-256 mismatch for '${identity.logicalPath}'`, identity),
+        actualSha256,
+        actualSizeBytes,
+      },
+    });
+  }
+  return deepFreeze({
+    state: 'VERIFIED_STREAM',
+    identity: { ...identity },
+    actualSha256,
+    actualSizeBytes,
+    chunkSizeBytes,
+    chunkSha256,
+    retainedBytes: 0,
+  });
+}
 
 /** Hash and size-check the exact bytes that the runner will later expose to an adapter. */
 export async function verifyContentBytes(

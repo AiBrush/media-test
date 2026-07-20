@@ -54,6 +54,7 @@ import viteConfig, {
   SAVE_ENDPOINT_MAX_BYTES,
   createSaveEndpointHandler,
   inspectSaveRequest,
+  staticContentType,
 } from '../vite.config.mjs';
 
 const ROOT = resolve(import.meta.dir, '..');
@@ -662,10 +663,36 @@ describe('REQ-UI-16: loopback and opt-in save boundary', () => {
     expect(viteConfig.plugins.map((plugin: { name: string }) => plugin.name)).toEqual([
       'cross-origin-isolation', 'ffmpeg-vendor-static', 'save-results', 'fixtures-static',
     ]);
+    expect(staticContentType(join(ROOT, 'fixtures/lib/lossless-json-columnar-validator.mjs')))
+      .toBe('text/javascript; charset=utf-8');
+    expect(staticContentType(join(ROOT, 'fixtures/media/h264_ts.ts'))).toBe('video/mp2t');
+    expect(staticContentType(join(ROOT, 'fixtures/media/hls_aes128/enc.key'))).toBe('application/octet-stream');
   });
 });
 
 describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () => {
+  test('the launcher-ready boundary follows asynchronous cached-run restoration', () => {
+    const app = readFileSync(join(ROOT, 'src/app/main.ts'), 'utf8');
+    const launcher = readFileSync(join(ROOT, 'scripts/launch.mjs'), 'utf8');
+    const restoreIndex = app.indexOf('const restored = await restoreLatestCachedRun();');
+    const publishIndex = app.indexOf('window.__SUITE__ = {');
+    const readyIndex = app.indexOf('ready: true', publishIndex);
+    const restoreFunctionIndex = app.indexOf('async function restoreLatestCachedRun()');
+    const restoreFunctionEnd = app.indexOf('\nfunction startRunFromFilter(', restoreFunctionIndex);
+
+    expect(launcher).toContain('window.__SUITE__?.ready === true');
+    expect(restoreIndex).toBeGreaterThan(-1);
+    expect(publishIndex).toBeGreaterThan(restoreIndex);
+    expect(readyIndex).toBeGreaterThan(publishIndex);
+    const restoreBody = app.slice(restoreFunctionIndex, restoreFunctionEnd);
+    expect(restoreBody).not.toContain('window.__RUN_DONE__ = true');
+    expect(launcher).toContain('window.__SUITE__.start(requestId, filter)');
+    expect(launcher).toContain('isLauncherRunDone(handshake, launchRequestId)');
+    expect(launcher).toContain('let lastLog = started');
+    expect(launcher).toContain('isLauncherRunPending(pageDiagnostic.handshake, launchRequestId)');
+    expect(launcher).toContain('info.handshakeSchema !== LAUNCHER_RUN_HANDSHAKE_SCHEMA');
+  });
+
   test('the document exposes native progress/status controls, every legend state, and honest reference copy', () => {
     const html = readFileSync(join(ROOT, 'index.html'), 'utf8');
     expect(html).toMatch(/<progress id="run-progress"[^>]*min="0"[^>]*max="1"/);

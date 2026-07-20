@@ -85,12 +85,15 @@ export class Sha256 {
       this.#blockLength += take;
       offset = take;
       if (this.#blockLength === 64) {
-        this.#compress(this.#block);
+        this.#compress(this.#block, 0);
         this.#blockLength = 0;
       }
     }
     while (offset + 64 <= bytes.byteLength) {
-      this.#compress(bytes.subarray(offset, offset + 64));
+      // Pass the source offset directly. Creating one subarray view per compression block makes a
+      // 1 GiB streaming admission allocate ~16.8 million short-lived objects before any adapter is
+      // called, despite SHA-256 needing only indexed reads from the original view.
+      this.#compress(bytes, offset);
       offset += 64;
     }
     if (offset < bytes.byteLength) {
@@ -108,14 +111,14 @@ export class Sha256 {
     this.#block[used] = 0x80;
     this.#block.fill(0, used + 1);
     if (used >= 56) {
-      this.#compress(this.#block);
+      this.#compress(this.#block, 0);
       this.#block.fill(0);
     }
     const bitHigh = Math.floor(this.#totalBytes / 0x20000000) >>> 0;
     const bitLow = (this.#totalBytes * 8) >>> 0;
     writeUint32Be(this.#block, 56, bitHigh);
     writeUint32Be(this.#block, 60, bitLow);
-    this.#compress(this.#block);
+    this.#compress(this.#block, 0);
 
     const output = new Uint8Array(32);
     for (let i = 0; i < this.#state.length; i++) writeUint32Be(output, i * 4, this.#state[i]!);
@@ -126,10 +129,10 @@ export class Sha256 {
     return bytesToLowerHex(this.digest());
   }
 
-  #compress(block: Uint8Array): void {
+  #compress(block: Uint8Array, blockOffset: number): void {
     const w = this.#words;
     for (let i = 0; i < 16; i++) {
-      const offset = i * 4;
+      const offset = blockOffset + i * 4;
       w[i] = (
         (block[offset]! << 24) |
         (block[offset + 1]! << 16) |

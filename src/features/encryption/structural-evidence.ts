@@ -28,6 +28,8 @@ export interface IsoEncryptionEvidence {
   readonly encryptionSampleGroups: number;
 }
 
+export type FragmentedCencCtrInitialIvMap = Readonly<Record<1 | 2, string>>;
+
 export type IsoEncryptionReadResult =
   | IsoEncryptionEvidence
   | { readonly state: 'MALFORMED'; readonly reasonCode: string; readonly detail: string };
@@ -105,6 +107,96 @@ export function inspectIsoBmffEncryption(bytes: Uint8Array): IsoEncryptionReadRe
   } catch (error) {
     return malformed('ENCRYPTION_ISOBMFF_MALFORMED', errorMessage(error));
   }
+}
+
+/**
+ * Fail-closed authoring admission for the probe-owned fragmented CENC-CTR representation.
+ * Bento4 accepts an 8-byte initial IV per track, then stores the first per-sample counter as that
+ * domain followed by eight zero bytes. This binds the authored bytes, rather than only the command
+ * arguments, to both deterministic IV domains.
+ */
+export function assertFragmentedCencCtrStructure(
+  bytes: Uint8Array,
+  kidHex: string,
+  initialIvHexByTrack: FragmentedCencCtrInitialIvMap,
+  label = 'fragmented CENC-CTR output',
+): IsoEncryptionEvidence {
+  if (!(bytes instanceof Uint8Array)) throw new TypeError(`${label}: protected output must be bytes`);
+  if (!/^[0-9a-f]{32}$/u.test(kidHex)) {
+    throw new TypeError(`${label}: KID must be lowercase 16-byte hex`);
+  }
+  for (const trackId of [1, 2] as const) {
+    if (!/^[0-9a-f]{16}$/u.test(initialIvHexByTrack?.[trackId] ?? '')) {
+      throw new TypeError(`${label}: track ${trackId} IV must be lowercase 8-byte hex`);
+    }
+  }
+
+  const evidence = inspectIsoBmffEncryption(bytes);
+  if (evidence.state !== 'OK') {
+    throw new Error(`${label}: ${evidence.reasonCode}: ${evidence.detail}`);
+  }
+  const mediaTracks = evidence.tracks.filter((track) => track.type === 'video' || track.type === 'audio');
+  const byId = new Map(mediaTracks.map((track) => [track.trackId, track]));
+  const video = byId.get(1);
+  const audio = byId.get(2);
+  if (mediaTracks.length !== 2 || !video || video.type !== 'video' || !audio || audio.type !== 'audio') {
+    throw new Error(`${label}: expected exactly protected video track 1 and audio track 2`);
+  }
+  for (const track of [video, audio]) {
+    if (!track.protected || track.scheme !== 'cenc' || track.defaultKid !== kidHex) {
+      throw new Error(`${label}: track ${track.trackId} must declare cenc with catalog KID ${kidHex}`);
+    }
+  }
+
+  const fragments = readBoxes(bytes, 0, bytes.byteLength).filter((box) => box.type === 'moof');
+  if (fragments.length === 0) {
+    throw new Error(`${label}: protected output contains no top-level moof fragment`);
+  }
+
+  const firstIvByTrack: Partial<Record<1 | 2, string>> = {};
+  const sencCountByTrack: Record<1 | 2, number> = { 1: 0, 2: 0 };
+  for (const fragment of fragments) {
+    const fragmentChildren = readBoxes(bytes, fragment.bodyStart, fragment.end);
+    for (const traf of fragmentChildren.filter((box) => box.type === 'traf')) {
+      const children = readBoxes(bytes, traf.bodyStart, traf.end);
+      const trackHeaders = children.filter((box) => box.type === 'tfhd');
+      if (trackHeaders.length !== 1 || trackHeaders[0]!.bodyStart + 8 > trackHeaders[0]!.end) {
+        throw new Error(`${label}: fragment traf must contain exactly one complete tfhd`);
+      }
+      const trackId = u32(bytes, trackHeaders[0]!.bodyStart + 4);
+      if (trackId !== 1 && trackId !== 2) continue;
+      const sampleEncryption = children.filter((box) => box.type === 'senc');
+      if (sampleEncryption.length !== 1) {
+        throw new Error(`${label}: fragment track ${trackId} must contain exactly one senc box`);
+      }
+      sencCountByTrack[trackId]++;
+      const track = trackId === 1 ? video : audio;
+      const firstIv = firstFragmentSampleIvHex(
+        bytes,
+        sampleEncryption[0]!,
+        track.perSampleIvSize,
+        `${label} track ${trackId}`,
+      );
+      firstIvByTrack[trackId] ??= firstIv;
+    }
+  }
+
+  for (const trackId of [1, 2] as const) {
+    if (sencCountByTrack[trackId] === 0) {
+      throw new Error(`${label}: protected fragments contain no senc box for track ${trackId}`);
+    }
+    const expectedIv = `${initialIvHexByTrack[trackId]}${'0'.repeat(16)}`;
+    if (firstIvByTrack[trackId] !== expectedIv) {
+      throw new Error(
+        `${label}: track ${trackId} first sample IV ${firstIvByTrack[trackId] ?? '<missing>'} ` +
+        `does not equal deterministic initial IV ${expectedIv}`,
+      );
+    }
+  }
+  if (evidence.sampleEncryptionBoxes !== sencCountByTrack[1] + sencCountByTrack[2]) {
+    throw new Error(`${label}: sample encryption boxes are not bound to protected tracks 1 and 2`);
+  }
+  return evidence;
 }
 
 /**
@@ -825,6 +917,35 @@ function fullBoxFlags(bytes: Uint8Array, box: Box): number {
   return ((bytes[box.bodyStart + 1] ?? 0) << 16) |
     ((bytes[box.bodyStart + 2] ?? 0) << 8) |
     (bytes[box.bodyStart + 3] ?? 0);
+}
+
+function firstFragmentSampleIvHex(
+  bytes: Uint8Array,
+  senc: Box,
+  defaultIvSize: number | undefined,
+  label: string,
+): string {
+  if (senc.bodyStart + 8 > senc.end) throw new Error(`${label}: senc header is truncated`);
+  const flags = ((bytes[senc.bodyStart + 1] ?? 0) << 16) |
+    ((bytes[senc.bodyStart + 2] ?? 0) << 8) |
+    (bytes[senc.bodyStart + 3] ?? 0);
+  let offset = senc.bodyStart + 4;
+  let ivSize = defaultIvSize;
+  if ((flags & 0x000001) !== 0) {
+    if (offset + 20 > senc.end) throw new Error(`${label}: senc override parameters are truncated`);
+    ivSize = bytes[offset + 3];
+    offset += 20;
+  }
+  if (ivSize !== 16) {
+    throw new Error(`${label}: senc per-sample IV size ${ivSize ?? '?'} is not 16 bytes`);
+  }
+  if (offset + 4 > senc.end) throw new Error(`${label}: senc sample count is truncated`);
+  const sampleCount = u32(bytes, offset);
+  offset += 4;
+  if (sampleCount < 1 || offset + ivSize > senc.end) {
+    throw new Error(`${label}: senc has no complete first sample IV`);
+  }
+  return hex(bytes.subarray(offset, offset + ivSize));
 }
 
 function requireBytes(offset: number, length: number, end: number, label: string): void {

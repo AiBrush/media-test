@@ -33,9 +33,15 @@ const MIME = {
   '.webp': 'image/webp',
   '.json': 'application/json',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.wasm': 'application/wasm',
   '.key': 'application/octet-stream', // HLS AES-128 key
 };
+
+/** Resolve the explicit MIME policy shared by every raw static-file boundary. */
+export function staticContentType(filePath) {
+  return MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
+}
 
 function parseByteRange(range, size) {
   const m = /^bytes=(\d*)-(\d*)$/.exec(String(range || '').trim());
@@ -134,7 +140,7 @@ function fixturesStatic() {
           return res.end('fixtures: is a directory');
         }
 
-        const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
+        const type = staticContentType(filePath);
         // Under COEP: require-corp, every subresource needs a CORP header to be loadable.
         return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
       });
@@ -155,7 +161,7 @@ function fixturesStatic() {
           return res.end('fixtures: is a directory');
         }
 
-        const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
+        const type = staticContentType(filePath);
         return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
       });
     },
@@ -211,7 +217,7 @@ function ffmpegVendorStatic() {
       return res.end('ffmpeg vendor: is a directory');
     }
 
-    const type = MIME[extname(filePath).toLowerCase()] || 'application/octet-stream';
+    const type = staticContentType(filePath);
     return streamStaticFile(req, res, filePath, st, type, 'same-origin');
   };
 

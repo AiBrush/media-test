@@ -57,6 +57,8 @@ export const ROBUSTNESS_VARIANT_SELECTION_CONTRACT = deepFreeze({
 } as const);
 
 const LOWER_SHA256 = /^[0-9a-f]{64}$/;
+const CENC_128_BIT_HEX = /^[0-9a-f]{32}$/;
+const CENC_IV_HEX = /^(?:[0-9a-f]{16}|[0-9a-f]{32})$/;
 const CENC_MP4_SCHEMES = new Set(['cenc-ctr', 'cenc-cbcs', 'cenc-cens']);
 const GOLDEN_ORACLES = new Set<OracleId>([
   'golden-metadata',
@@ -671,12 +673,46 @@ function assessDerivedCencEligibility(scenario: Scenario, file: SourceFileRecord
     rejection: rejection(scenario.id, file.file, reasonCode, detail),
   });
   const keys = file.keys;
-  if (!keys?.keyHex || !keys.kid || !CENC_MP4_SCHEMES.has(keys.scheme)) {
+  if (
+    !keys ||
+    !CENC_128_BIT_HEX.test(keys.keyHex) ||
+    !keys.kid ||
+    !CENC_128_BIT_HEX.test(keys.kid) ||
+    (keys.ivHex !== undefined && !CENC_IV_HEX.test(keys.ivHex)) ||
+    !CENC_MP4_SCHEMES.has(keys.scheme)
+  ) {
     return reject('CENC_KEY_MATERIAL_INCOMPLETE', 'CENC candidate needs scheme, keyHex, and kid');
   }
   const base = file.cleartextBase;
   if (!base || normalizeRelativePath(base.poolPath) !== base.poolPath || !LOWER_SHA256.test(base.sha256)) {
     return reject('CENC_CLEARTEXT_BASE_INCOMPLETE', 'CENC candidate needs a normalized base path and full base digest');
+  }
+  if (isProtectedProbeCencScenario(scenario)) {
+    if (!(scenario.requires.encryption ?? []).some((scheme) => scheme === keys.scheme)) {
+      return reject(
+        'CENC_PROBE_SCHEME_MISMATCH',
+        `protected probe candidate declares '${keys.scheme}' outside the scenario scheme contract`,
+      );
+    }
+    const declaration = file.evidence;
+    const available = new Set(declaration?.available ?? []);
+    if (
+      !declaration ||
+      declaration.sourceSha256 !== file.sha256 ||
+      !available.has('SOURCE_GOLDEN') ||
+      !available.has('CANDIDATE_DECODE') ||
+      !declaration.requiredOracles?.includes('golden-metadata') ||
+      !declaration.sufficientOracleSets.some((set) => set.length === 1 && set[0] === 'golden-metadata')
+    ) {
+      return reject(
+        'CENC_PROBE_EVIDENCE_INCOMPLETE',
+        'protected probe candidate needs source-bound metadata and decoded semantic evidence',
+      );
+    }
+    return {
+      eligible: true,
+      evidencePlan: buildCandidateEvidencePlan(scenario, file.sha256, declaration),
+    };
   }
   if (!isPositiveSourceEquivalenceScenario(scenario)) {
     return reject(
@@ -1112,7 +1148,9 @@ function makeSelection(
   const effectiveScenario = isBaked
     ? { ...scenario }
     : candidate.sourceClass === 'DERIVED' && candidate.sourceFile
-      ? deriveCencEffectiveScenario(scenario, candidate.inputs[0]!.id, candidate.sourceFile)
+      ? isProtectedProbeCencScenario(scenario)
+        ? { ...scenario, input: candidate.inputs[0]!.id }
+        : deriveCencEffectiveScenario(scenario, candidate.inputs[0]!.id, candidate.sourceFile)
       : { ...scenario, input: candidate.inputs[0]!.id };
   return {
     scenarioId: scenario.id,
@@ -1289,6 +1327,12 @@ function requiredMinDurationSec(scenario: Scenario): number {
 function isRotatableCencMp4(row: ScenarioSourceRow): boolean {
   if (row.requires.container !== 'mp4') return false;
   return row.files.some((file) => file.keys?.scheme !== undefined && CENC_MP4_SCHEMES.has(file.keys.scheme));
+}
+
+function isProtectedProbeCencScenario(scenario: Scenario): boolean {
+  return scenario.family === 'probe' &&
+    scenario.op === 'probe' &&
+    (scenario.requires.encryption ?? []).some((scheme) => CENC_MP4_SCHEMES.has(scheme));
 }
 
 function candidateIdentity(scenarioId: string, inputs: readonly ContentIdentity[]): string {

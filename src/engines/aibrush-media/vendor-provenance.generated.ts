@@ -6,7 +6,7 @@ export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {
   packageVersion: '0.0.0',
   sourceRevision: 'a6a3cda5c3cf3100050740d876703d5576c65333',
   sourceTreeDigest: '6db18a7f0a0c1a544ebf48e8273ea2aa867c3a471cff3a456280dba6cc1602b4',
-  dirtyState: 'clean',
+  dirtyState: 'dirty',
   buildFlags: [
     'bun run build',
     'bun run vendor-wasm',

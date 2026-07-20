@@ -5,6 +5,11 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RUN_OPTION_DEFINITIONS, RUN_OPTION_LIMITS } from '../src/app/options.ts';
+import {
+  isLauncherRunDone,
+  isLauncherRunPending,
+  LAUNCHER_RUN_HANDSHAKE_SCHEMA,
+} from '../src/app/launcher-handshake.ts';
 import { validateCanonicalRunArtifact, withLauncherProvenance } from '../src/app/run-artifact.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -110,6 +115,7 @@ try {
 
 const pageUrl = `${opts.baseUrl.replace(/\/$/, '')}/index.html?autorun=0`;
 const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
+const launchRequestId = `launcher-${runStamp}-${process.pid}`;
 const launchOptions = { headless: false };
 if (browserDefinition.executablePath) launchOptions.executablePath = browserDefinition.executablePath;
 console.log(`[launch] ${opts.browser} (visible browser window) → ${pageUrl}`);
@@ -142,7 +148,14 @@ try {
   const info = await page.evaluate(() => ({
     engineCount: window.__SUITE__.engineIds.length,
     scenarioCount: window.__SUITE__.scenarioIds.length,
+    handshakeSchema: window.__SUITE__.handshakeSchema,
   }));
+  if (info.handshakeSchema !== LAUNCHER_RUN_HANDSHAKE_SCHEMA) {
+    throw new Error(
+      `suite launcher handshake protocol mismatch: expected ${LAUNCHER_RUN_HANDSHAKE_SCHEMA}, ` +
+      `received ${String(info.handshakeSchema)}`,
+    );
+  }
   console.log(`[launch] booted ${info.engineCount} scored engines and ${info.scenarioCount} scenarios`);
 
   activeFilter = {
@@ -160,19 +173,22 @@ try {
     ...(opts.exhaustive ? { exhaustiveMedia: true } : {}),
   };
   if (!opts.reuseData) console.log('[launch] forced-fresh policy enabled');
-  await page.evaluate((filter) => {
-    window.__RUN_DONE__ = false;
-    window.__SUITE__.run(filter).catch((error) => {
-      window.__SUITE_ERROR__ = String(error?.message || error);
-      window.__RUN_DONE__ = true;
-    });
-  }, activeFilter);
+  await page.evaluate(({ requestId, filter }) => {
+    window.__SUITE__.start(requestId, filter);
+  }, { requestId: launchRequestId, filter: activeFilter });
+
+  const acceptedHandshake = await page.evaluate(() => window.__RUN_HANDSHAKE__ ?? null);
+  if (acceptedHandshake?.requestId !== launchRequestId ||
+      !['started', 'done'].includes(acceptedHandshake?.state)) {
+    throw new Error(`suite did not accept launcher run request ${launchRequestId}`);
+  }
 
   const started = Date.now();
-  let lastLog = 0;
+  let lastLog = started;
   let lastSnapshotCount = -1;
   for (;;) {
-    if (await page.evaluate(() => window.__RUN_DONE__ === true)) break;
+    const handshake = await page.evaluate(() => window.__RUN_HANDSHAKE__ ?? null);
+    if (isLauncherRunDone(handshake, launchRequestId)) break;
     const now = Date.now();
     if (now - started > opts.timeoutMs) {
       await saveResultsPayload(page, `launcher timeout after ${opts.timeoutMs} ms`, {
@@ -186,7 +202,7 @@ try {
         snapshot: true,
         quiet: true,
       });
-      if (snapshot.results.length !== lastSnapshotCount) {
+      if (snapshot && snapshot.results.length !== lastSnapshotCount) {
         console.log(`[launch] snapshot: ${snapshot.results.length} results → ${snapshot.outPath.replace(`${ROOT}/`, '')}`);
         lastSnapshotCount = snapshot.results.length;
       }
@@ -224,7 +240,27 @@ async function saveResultsPayload(page, partialReason, options = {}) {
     if (!window.__SUITE__) throw new Error('suite control surface is unavailable');
     return await window.__SUITE__.snapshot(completionState, reason);
   }, { completionState: options.completionState, reason: partialReason });
-  if (!pageArtifact) throw new Error('page has no run artifact to save');
+  if (!pageArtifact) {
+    const pageDiagnostic = await page.evaluate(() => ({
+      runError: window.__SUITE_ERROR__ ?? null,
+      handshake: window.__RUN_HANDSHAKE__ ?? null,
+      validation: document.getElementById('validation-message')?.textContent?.trim() ?? '',
+      status: document.getElementById('run-status')?.textContent?.trim() ?? '',
+    }));
+    // A launcher request is accepted synchronously, but the app still needs to resolve concrete
+    // engine identities and the initial cache manifest before it can construct an ActiveRun and a
+    // canonical partial artifact. An incremental snapshot during that bounded pre-run phase is
+    // simply not ready yet; it must not abort the accepted request.
+    if (options.snapshot && options.quiet &&
+        isLauncherRunPending(pageDiagnostic.handshake, launchRequestId)) {
+      return undefined;
+    }
+    const detail = pageDiagnostic.runError || pageDiagnostic.validation || pageDiagnostic.status;
+    throw new Error(
+      `page has no run artifact to save${detail ? `: ${detail}` : ''}; ` +
+      `handshake=${JSON.stringify(pageDiagnostic.handshake)}`,
+    );
+  }
   const validated = validateCanonicalRunArtifact(pageArtifact);
   const payload = withLauncherProvenance(validated, {
     playwrightBrowser: opts.browser,

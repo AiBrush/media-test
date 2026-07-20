@@ -15,12 +15,22 @@ import {
   type OracleContext,
 } from '../src/core/oracles.ts';
 import { readOutputPacketsResult, readOutputStructure } from '../src/core/box-readers.ts';
+import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
 
 test('neutral MP4 structure duration does not truncate a complete media timeline behind a short mvhd', async () => {
   const bytes = new Uint8Array(await Bun.file('fixtures/media/cenc_ctr_clear.mp4').arrayBuffer());
   const structure = readOutputStructure(bytes, 'mp4');
   expect(structure?.durationSec).toBeGreaterThan(5);
   expect(structure?.tracks.map((track) => track.type)).toEqual(['video', 'audio']);
+});
+
+test.each([
+  ['cenc_ctr.mp4', ['cenc', 'cenc']],
+  ['cenc_cbcs.mp4', ['cbcs']],
+] as const)('neutral MP4 structure exposes the declared protection scheme for %s', async (name, expected) => {
+  const bytes = new Uint8Array(await Bun.file(`fixtures/media/${name}`).arrayBuffer());
+  const structure = readOutputStructure(bytes, 'mp4');
+  expect(structure?.tracks.map((track) => track.protectionScheme).filter(Boolean)).toEqual([...expected]);
 });
 
 const input: MediaInput = {
@@ -136,6 +146,47 @@ describe('REQ-ORAC-01 semantic golden metadata', () => {
     expect(out.detail).toContain('logical track reordered');
     expect(out.detail).toContain('measuredIndex');
     expect(out.detail).toContain('goldenIndex');
+  });
+
+  test('an explicit media-track policy excludes auxiliary data tracks from semantic and declared-field matching', async () => {
+    const got: NormalizedMetadata = {
+      container: 'mov', durationSec: 10,
+      tracks: [
+        video('h264', { language: 'eng' }),
+        audio('aac', 48_000, 2, { language: 'eng' }),
+      ],
+    };
+    const want: NormalizedMetadata = {
+      container: 'mov', durationSec: 10,
+      tracks: [
+        video('h264', { language: 'eng' }),
+        { type: 'other', codec: '', language: 'eng' } as any,
+        audio('aac', 48_000, 2, { language: 'eng' }),
+      ],
+    };
+    const scopedScenario = scenario('probe', 'golden-metadata', {
+      metadataTrackTypes: ['video', 'audio'],
+      robustness: {
+        probe: {
+          metadataFieldPolicy: defineProbeMetadataFieldPolicy({ fields: ['track.language'] }),
+        },
+      },
+    });
+    const compareScoped = (metadata: NormalizedMetadata) => runOracle('golden-metadata', context({
+      scenario: scopedScenario, metadata, golden: golden(want),
+    }));
+    const out = await compareScoped(got);
+    expect(verdict(out)).toBe('PASS');
+    expect(out.measurements).toMatchObject({ measuredTracks: 2, goldenTracks: 2, matchedTracks: 2 });
+    expect(out.detail).toContain('PROBE_DECLARED_METADATA_FIELDS_MATCH');
+    expect(out.detail).not.toContain('declared track fields have 2 matched track(s) for 3 golden track(s)');
+
+    const wrongLanguage = await compareScoped({
+      ...got,
+      tracks: [got.tracks[0]!, { ...got.tracks[1]!, language: 'fra' }],
+    });
+    expect(verdict(wrongLanguage)).toBe('FAIL');
+    expect(wrongLanguage.detail).toContain("audio measured[1]↔golden[1].language 'fra' vs golden 'eng'");
   });
 
   test('full semantic and relevant raw agreement remains PASS', async () => {

@@ -25,6 +25,12 @@ import {
 } from './options.ts';
 import type { FrozenRunConfiguration, SuiteRunFilter } from './options.ts';
 import {
+  finishLauncherRunHandshake,
+  LAUNCHER_RUN_HANDSHAKE_SCHEMA,
+  startLauncherRunHandshake,
+} from './launcher-handshake.ts';
+import type { LauncherRunHandshake } from './launcher-handshake.ts';
+import {
   buildAppReportArtifacts,
   createCanonicalRunArtifact,
   createRunManifest,
@@ -80,6 +86,7 @@ const BUILD_REVISION = ((import.meta as ImportMeta & { env?: Record<string, stri
 
 interface SuiteControl {
   run(filter?: SuiteRunFilter): Promise<ScenarioResult[]>;
+  start(requestId: string, filter?: SuiteRunFilter): void;
   snapshot(completionState?: RunCompletionState, partialReason?: string): Promise<CanonicalRunArtifact | undefined>;
   importCache(value: unknown, sourceLabel?: string): Promise<number>;
   env: EnvInfo;
@@ -89,6 +96,7 @@ interface SuiteControl {
   featureIds: ScenarioFamily[];
   scenarioIds: string[];
   optionSchema: typeof RUN_OPTION_DEFINITIONS;
+  handshakeSchema: typeof LAUNCHER_RUN_HANDSHAKE_SCHEMA;
   ready: true;
 }
 
@@ -99,6 +107,7 @@ declare global {
     __RUN_ARTIFACT__?: CanonicalRunArtifact;
     __RUN_HISTORY__?: CanonicalRunArtifact[];
     __RUN_DONE__?: boolean;
+    __RUN_HANDSHAKE__?: LauncherRunHandshake;
     __SUITE_ERROR__?: string;
   }
 }
@@ -183,8 +192,18 @@ async function boot(): Promise<void> {
   await refreshCacheStatus();
   installFrameBakeControl();
 
+  const restored = await restoreLatestCachedRun();
+  setRunState('idle');
+  if (!restored) {
+    setRunStatus(lastCacheWarning ??
+      `idle · ${listScoredEngines().length} scored engines · ${registration.scenarioCount} scenarios`);
+  }
+  // The launcher treats `ready` as the boundary after which it may start a run immediately. Publish
+  // the control surface only after cached-run restoration has finished so that late restoration
+  // cannot clear the new run's artifact or flip __RUN_DONE__ underneath it.
   window.__SUITE__ = {
     run: runFromFilter,
+    start: startRunFromFilter,
     snapshot: snapshotRun,
     importCache: importCacheBundle,
     env,
@@ -194,14 +213,9 @@ async function boot(): Promise<void> {
     featureIds: scenarioGroups.map((group) => group.id),
     scenarioIds: listScenarios().map((scenario) => scenario.id),
     optionSchema: RUN_OPTION_DEFINITIONS,
+    handshakeSchema: LAUNCHER_RUN_HANDSHAKE_SCHEMA,
     ready: true,
   };
-  const restored = await restoreLatestCachedRun();
-  setRunState('idle');
-  if (!restored) {
-    setRunStatus(lastCacheWarning ??
-      `idle · ${listScoredEngines().length} scored engines · ${registration.scenarioCount} scenarios`);
-  }
   if (shouldAutoStart()) window.setTimeout(() => { void runFromUi(); }, 0);
 }
 
@@ -221,7 +235,6 @@ async function restoreLatestCachedRun(): Promise<boolean> {
     currentArtifact = undefined;
     window.__RUN_ARTIFACT__ = undefined;
     window.__RESULTS__ = [...view.results];
-    window.__RUN_DONE__ = true;
     delete window.__SUITE_ERROR__;
     renderRunManifest(undefined);
     hideProgress();
@@ -243,6 +256,34 @@ async function restoreLatestCachedRun(): Promise<boolean> {
     lastCacheWarning = `Cached results could not be displayed: ${error instanceof Error ? error.message : String(error)}`;
     return false;
   }
+}
+
+function startRunFromFilter(requestId: string, filter: SuiteRunFilter = {}): void {
+  if (activeRun) {
+    throw new Error(`cannot accept launcher run request ${requestId}: another run is active`);
+  }
+  if (window.__RUN_HANDSHAKE__?.state === 'started') {
+    throw new Error(`launcher run request ${window.__RUN_HANDSHAKE__.requestId} is already active`);
+  }
+  const started = startLauncherRunHandshake(requestId);
+  delete window.__SUITE_ERROR__;
+  window.__RUN_HANDSHAKE__ = started;
+  void runFromFilter(filter, started.requestId).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    window.__SUITE_ERROR__ = message;
+    window.__RUN_DONE__ = true;
+    finishLauncherRequest(started.requestId, message);
+  });
+}
+
+function finishLauncherRequest(requestId: string, error?: string): void {
+  const started = window.__RUN_HANDSHAKE__;
+  if (started?.requestId !== requestId || started.state !== 'started') return;
+  window.__RUN_HANDSHAKE__ = finishLauncherRunHandshake(
+    started,
+    window.__RUN_ARTIFACT__?.runId,
+    error,
+  );
 }
 
 function wireControls(): void {
@@ -339,8 +380,14 @@ async function runFromUi(): Promise<ScenarioResult[]> {
   });
 }
 
-async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResult[]> {
+async function runFromFilter(
+  filter: SuiteRunFilter = {},
+  launcherRequestId?: string,
+): Promise<ScenarioResult[]> {
   if (activeRun) {
+    if (launcherRequestId) {
+      throw new Error(`[LAUNCH_REQUEST_CONFLICT] another run is already active`);
+    }
     if (activeRun.state === 'running') stopActiveRun('A second run request asked the active run to stop.');
     return [...activeRun.evidence.results];
   }
@@ -405,6 +452,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
   } catch (error) {
     handleValidationError(error);
     window.__RUN_DONE__ = true;
+    if (launcherRequestId) finishLauncherRequest(launcherRequestId);
     return [];
   }
 
@@ -621,6 +669,7 @@ async function runFromFilter(filter: SuiteRunFilter = {}): Promise<ScenarioResul
     }
     setCurrentWork(`Last completed run: ${currentManifest.runId}; ${currentManifest.observedCellCount} of ${currentManifest.expectedCellCount} cells observed.`);
     focusRunControl();
+    if (launcherRequestId) finishLauncherRequest(launcherRequestId);
   }
   return currentArtifact?.results ?? [...(window.__RESULTS__ ?? [])];
 }

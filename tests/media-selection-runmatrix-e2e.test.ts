@@ -7,6 +7,7 @@ import type {
   MediaInput,
   NormalizedMetadata,
 } from '../src/core/engine.ts';
+import { AUTHENTICATED_RANGE_PROBE_FEATURE } from '../src/core/engine.ts';
 import type { ActiveFixtureRuntime } from '../src/core/fixture-integrity.ts';
 import { sha256Hex } from '../src/core/media-selection.ts';
 import { registerEngine, registerScenario } from '../src/core/registry.ts';
@@ -145,6 +146,366 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
       benchOptions: { ...baseOptions.benchOptions, warmup: 2 },
     });
     expect(mediaBodyFetches).toBeGreaterThan(fetchesAfterFirstExhaustive);
+  });
+
+  test('scale-probe preflight blocks seeded and exhaustive whole-file rows before media operations', async () => {
+    const engineId = 'selection-scale-preflight-engine@1.0.0';
+    const scenarioId = 'probe/selection-scale-preflight';
+    const bakedId = 'selection-scale-preflight-baked.mp4';
+    const identities = new Map<string, { sha256: string; sizeBytes: number }>([
+      [bakedId, { sha256: '0'.repeat(64), sizeBytes: 1_000_000_000 }],
+      ['01.mp4', { sha256: '1'.repeat(64), sizeBytes: 1_100_000_000 }],
+      ['02.mp4', { sha256: '2'.repeat(64), sizeBytes: 1_200_000_000 }],
+      ['03.mp4', { sha256: '3'.repeat(64), sizeBytes: 1_300_000_000 }],
+    ]);
+    let mediaAssetRequests = 0;
+    let goldenRequests = 0;
+    let supportsCalls = 0;
+    let initCalls = 0;
+    let probeCalls = 0;
+
+    registerEngine(engineId, async (): Promise<MediaEngine> => ({
+      id: engineId,
+      capabilities: (): CapabilitySet => ({
+        operations: { probe: true },
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        audioCodecs: [],
+        encryption: [],
+        features: ['webcodecs:independent'],
+        probeReadModes: ['whole-file'],
+      }),
+      supports: async () => {
+        supportsCalls += 1;
+        return { supported: true };
+      },
+      init: async () => {
+        initCalls += 1;
+      },
+      probe: async () => {
+        probeCalls += 1;
+        return structuredClone(exactMetadata);
+      },
+      demux: async () => ({ packets: [], tracks: [], ordering: 'decode' }),
+      remux: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      transcode: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      decodeFrames: async () => ({ frames: [] }),
+      seek: async () => ({
+        landedPtsUs: 0,
+        frame: { index: 0, ptsUs: 0, sha256: '0'.repeat(64) },
+      }),
+      trim: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+    }));
+    registerScenario(defineScenario({
+      id: scenarioId,
+      op: 'probe',
+      input: bakedId,
+      options: {
+        robustness: {
+          probe: {
+            schema: 'media-test/probe-scenario-contract@1',
+            probeBudget: {
+              schema: 'media-test/probe-budget@1',
+              scale: 'massive',
+              allowedReadModes: ['range', 'progressive'],
+              maxBytesRead: 32 * 1024 * 1024,
+              maxReadFraction: 0.04,
+              maxPeakMemoryDeltaBytes: 128 * 1024 * 1024,
+            },
+          },
+        },
+      },
+      requires: { operations: ['probe'], containersIn: ['mp4'] },
+      oracles: ['golden-metadata'],
+      metrics: [],
+    }));
+
+    const sourceFiles = [...identities.entries()].slice(1).map(([file, identity]) => ({
+      file,
+      container: 'mp4',
+      videoCodecs: ['h264'],
+      audioCodecs: [],
+      ...identity,
+      provider: 'selection-scale-preflight',
+      sourcePageUrl: 'https://example.test/selection-scale-preflight',
+      downloadUrl: `https://example.test/${file}`,
+      probedWith: 'selection-scale-preflight@1',
+    }));
+    const catalog = JSON.stringify({
+      scenarioId,
+      class: 'REAL',
+      requires: { container: 'mp4', video: true, videoCodecs: ['h264'], audioCodecs: [] },
+      files: sourceFiles,
+    });
+    const bakedIdentity = identities.get(bakedId)!;
+    const manifest = {
+      suiteCorpusVersion: 'selection-scale-preflight-v1',
+      assets: [{
+        id: bakedId,
+        ...bakedIdentity,
+        source: 'declared-only scale preflight fixture',
+        family: 'probe',
+        container: 'mp4',
+        codecs: ['h264'],
+        sizeBucket: 'huge',
+        genMethod: 'selection-scale-preflight@1',
+      }],
+    };
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/fixtures/media/scenarios/_sources.ndjson')) {
+        return new Response(catalog, { status: 200, headers: { 'content-type': 'application/x-ndjson' } });
+      }
+      if (url.includes('/fixtures/manifest.json')) return Response.json(manifest);
+      if (url.includes('/fixtures/media/')) {
+        mediaAssetRequests += 1;
+        return new Response(null, { status: 500, statusText: 'media body must not be requested' });
+      }
+      if (url.includes('/fixtures/golden/')) {
+        goldenRequests += 1;
+        return new Response(null, { status: 500, statusText: 'golden must not be requested' });
+      }
+      return new Response(null, { status: 404, statusText: 'Not Found' });
+    }) as typeof fetch;
+
+    const baseOptions = {
+      browser: 'chromium' as const,
+      engineIds: [engineId],
+      scenarioIds: [scenarioId],
+      pillar: 'all' as const,
+      randomSeed: 'selection-scale-preflight-seed-v1',
+      fixtureIntegrityRuntime: fakeFixtureRuntime,
+    };
+    const seeded = await runMatrix({ ...baseOptions, exhaustiveMedia: false });
+    expect(seeded).toHaveLength(1);
+    expect(seeded[0]).toMatchObject({
+      status: 'NA_ENGINE',
+      reason: expect.stringContaining('PROBE_BOUNDED_READ_MODE_UNAVAILABLE'),
+    });
+    expect(identities.get(seeded[0]!.selection!.file)).toMatchObject({
+      sha256: seeded[0]!.selection!.sha256,
+    });
+    expect(seeded[0]?.selection?.candidateIdentity).toHaveLength(64);
+    expect({ mediaAssetRequests, goldenRequests, supportsCalls, initCalls, probeCalls }).toEqual({
+      mediaAssetRequests: 0,
+      goldenRequests: 0,
+      supportsCalls: 0,
+      initCalls: 0,
+      probeCalls: 0,
+    });
+
+    const exhaustive = await runMatrix({ ...baseOptions, exhaustiveMedia: true });
+    expect(exhaustive).toHaveLength(1);
+    expect(exhaustive[0]).toMatchObject({
+      status: 'NA_ENGINE',
+      reason: expect.stringContaining('PROBE_BOUNDED_READ_MODE_UNAVAILABLE'),
+      coverage: { grade: 'none', valid: 0, total: 4, counts: { naEngine: 4, total: 4 } },
+      selection: { candidateCount: 4 },
+    });
+    expect(exhaustive[0]?.selection?.candidateIdentity).toHaveLength(64);
+    expect(exhaustive[0]?.selection?.executedInputDigest).toHaveLength(64);
+    expect(exhaustive[0]?.exhaustive).toHaveLength(4);
+    expect(exhaustive[0]?.exhaustive?.map((entry) => entry.file).sort()).toEqual([...identities.keys()].sort());
+    expect(exhaustive[0]?.exhaustive?.every((entry) =>
+      entry.status === 'NA_ENGINE' &&
+      entry.sha256 === identities.get(entry.file)?.sha256 &&
+      entry.selection?.candidateIdentity?.length === 64 &&
+      entry.selection?.executedInputDigest?.length === 64
+    )).toBe(true);
+    expect({ mediaAssetRequests, goldenRequests, supportsCalls, initCalls, probeCalls }).toEqual({
+      mediaAssetRequests: 0,
+      goldenRequests: 0,
+      supportsCalls: 0,
+      initCalls: 0,
+      probeCalls: 0,
+    });
+  });
+
+  test('range-capable scale rows stream-attest once, receive the original URL, and quarantine corruption', async () => {
+    const engineId = 'selection-scale-range-engine@1.0.0';
+    const unauthenticatedEngineId = 'selection-scale-remotion-like-engine@1.0.0';
+    const scenarioId = 'probe/selection-scale-range';
+    const assetId = 'selection-scale-range.mp4';
+    const logicalPath = `scenarios/${scenarioId}/${assetId}`;
+    const admitted = encoder.encode('authenticated-scale-selection');
+    const identity = { sha256: sha256Hex(admitted), sizeBytes: admitted.byteLength };
+    let served = admitted.slice();
+    let bodyFetches = 0;
+    let probeCalls = 0;
+    let memorySamples = 0;
+    let unauthenticatedProbeCalls = 0;
+    let observedInput: MediaInput | undefined;
+
+    registerEngine(engineId, async (): Promise<MediaEngine> => ({
+      id: engineId,
+      capabilities: (): CapabilitySet => ({
+        operations: { probe: true },
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        audioCodecs: [],
+        encryption: [],
+        features: ['webcodecs:independent', AUTHENTICATED_RANGE_PROBE_FEATURE],
+        probeReadModes: ['range', 'whole-file'],
+      }),
+      supports: async () => ({ supported: true }),
+      probe: async (input) => {
+        probeCalls += 1;
+        observedInput = input;
+        expect(input.url).toEndWith(`/fixtures/media/${logicalPath}`);
+        expect(input.url.startsWith('blob:')).toBe(false);
+        expect(input.contentAttestation).toMatchObject({
+          logicalPath,
+          sha256: identity.sha256,
+          sizeBytes: identity.sizeBytes,
+        });
+        await expect(input.arrayBuffer()).rejects.toThrow('ATTESTED_URL_WHOLE_FILE_FORBIDDEN');
+        return {
+          container: 'mp4', durationSec: 1, tracks: [],
+          telemetry: { bytesRead: 1 }, probeEvidence: { readMode: 'range' },
+        };
+      },
+      demux: async () => ({ packets: [], tracks: [], ordering: 'decode' }),
+      remux: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      transcode: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      decodeFrames: async () => ({ frames: [] }),
+      seek: async () => ({ landedPtsUs: 0, frame: { index: 0, ptsUs: 0, sha256: '0'.repeat(64) } }),
+      trim: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+    }));
+    registerEngine(unauthenticatedEngineId, async (): Promise<MediaEngine> => ({
+      id: unauthenticatedEngineId,
+      capabilities: (): CapabilitySet => ({
+        operations: { probe: true },
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        audioCodecs: [],
+        encryption: [],
+        features: ['webcodecs:independent'],
+        probeReadModes: ['range', 'progressive'],
+      }),
+      supports: async () => ({ supported: true }),
+      probe: async () => {
+        unauthenticatedProbeCalls += 1;
+        return {
+          container: 'mp4', durationSec: 1, tracks: [],
+          telemetry: { bytesRead: 1 }, probeEvidence: { readMode: 'range' },
+        };
+      },
+      demux: async () => ({ packets: [], tracks: [], ordering: 'decode' }),
+      remux: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      transcode: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      decodeFrames: async () => ({ frames: [] }),
+      seek: async () => ({ landedPtsUs: 0, frame: { index: 0, ptsUs: 0, sha256: '0'.repeat(64) } }),
+      trim: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+    }));
+    registerScenario(defineScenario({
+      id: scenarioId,
+      op: 'probe',
+      input: assetId,
+      options: {
+        robustness: {
+          probe: {
+            schema: 'media-test/probe-scenario-contract@1',
+            probeBudget: {
+              schema: 'media-test/probe-budget@1',
+              scale: 'large',
+              allowedReadModes: ['range'],
+              maxBytesRead: admitted.byteLength,
+              maxReadFraction: 1,
+              maxPeakMemoryDeltaBytes: 1024,
+            },
+          },
+        },
+      },
+      requires: { operations: ['probe'], containersIn: ['mp4'] },
+      oracles: ['golden-metadata'],
+      metrics: ['wall', 'peakMemory'],
+    }));
+
+    const manifest = {
+      suiteCorpusVersion: 'selection-scale-range-v1',
+      assets: [{
+        id: assetId,
+        ...identity,
+        source: 'stream attestation test',
+        family: 'probe',
+        container: 'mp4',
+        codecs: ['h264'],
+        sizeBucket: 'large',
+        genMethod: 'selection-scale-range@1',
+      }],
+    };
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/fixtures/media/scenarios/_sources.ndjson')) {
+        return new Response(null, { status: 404, statusText: 'catalog intentionally absent' });
+      }
+      if (url.includes('/fixtures/manifest.json')) return Response.json(manifest);
+      if (url.endsWith(`/fixtures/media/${logicalPath}`)) {
+        bodyFetches += 1;
+        return new Response(served.slice(), { status: 200 });
+      }
+      if (url.endsWith(`fixtures/golden/${assetId}.meta.json`)) {
+        return Response.json({ container: 'mp4', durationSec: 1, tracks: [] });
+      }
+      return new Response(null, { status: 404, statusText: 'Not Found' });
+    }) as typeof fetch;
+
+    const memoryDescriptor = Object.getOwnPropertyDescriptor(performance, 'measureUserAgentSpecificMemory');
+    const isolationDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crossOriginIsolated');
+    Object.defineProperty(performance, 'measureUserAgentSpecificMemory', {
+      configurable: true,
+      value: async () => ({ bytes: 100 + ++memorySamples }),
+    });
+    Object.defineProperty(globalThis, 'crossOriginIsolated', { configurable: true, value: true });
+    try {
+      const options = {
+        browser: 'chromium' as const,
+        engineIds: [engineId],
+        scenarioIds: [scenarioId],
+        pillar: 'performance' as const,
+        randomSeed: 'selection-scale-range-seed-v1',
+        rotateMedia: false,
+        fixtureIntegrityRuntime: fakeFixtureRuntime,
+      };
+      const rejected = await runMatrix({
+        ...options,
+        engineIds: [unauthenticatedEngineId],
+      });
+      expect(rejected[0]).toMatchObject({
+        status: 'NA_ENGINE',
+        reason: expect.stringContaining('PROBE_AUTHENTICATED_RANGE_TRANSPORT_UNAVAILABLE'),
+      });
+      expect(bodyFetches).toBe(0);
+      expect(unauthenticatedProbeCalls).toBe(0);
+
+      const accepted = await runMatrix(options);
+      expect(accepted[0]).toMatchObject({ status: 'PASS' });
+      expect(accepted[0]?.measurement).toMatchObject({ state: 'AVAILABLE' });
+      expect(accepted[0]?.bench?.wall?.n).toBe(5);
+      expect(bodyFetches).toBe(1);
+      expect(probeCalls).toBe(8); // functional + warmup + calibration + five measured repetitions
+      expect(memorySamples).toBe(18); // 3 functional + 3 × five retained benchmark repetitions
+      expect(observedInput?.contentAttestation?.sha256).toBe(identity.sha256);
+
+      served = admitted.slice();
+      served[0] ^= 0xff;
+      const corrupt = await runMatrix(options);
+      expect(corrupt[0]).toMatchObject({
+        status: 'NA_ASSET',
+        reason: expect.stringContaining('CORPUS_DIGEST_MISMATCH'),
+      });
+      expect(bodyFetches).toBe(2);
+      expect(probeCalls).toBe(8);
+      expect(memorySamples).toBe(18);
+    } finally {
+      if (memoryDescriptor) Object.defineProperty(performance, 'measureUserAgentSpecificMemory', memoryDescriptor);
+      else Reflect.deleteProperty(performance, 'measureUserAgentSpecificMemory');
+      if (isolationDescriptor) Object.defineProperty(globalThis, 'crossOriginIsolated', isolationDescriptor);
+      else Reflect.deleteProperty(globalThis, 'crossOriginIsolated');
+    }
   });
 });
 
