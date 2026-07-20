@@ -89,6 +89,7 @@ import {
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   captureConfigUsedSnapshot,
+  createMalformedInputError,
   createNotApplicableError,
   validateAdapterResult,
   validateEncodedTracks,
@@ -275,6 +276,7 @@ interface EsdsBoxNode extends BoxNode {
 
 interface AudioSampleEntryNode extends BoxNode {
   version?: number;
+  channel_count?: number;
   extensions?: unknown;
   esds?: EsdsBoxNode;
   wave?: BoxNode & { esds?: EsdsBoxNode };
@@ -419,9 +421,9 @@ function rotationFromMatrix(
   const d = f(matrix[4]);
   const eq = (x: number, y: number) => Math.abs(x - y) < 0.01;
   if (eq(a, 1) && eq(b, 0) && eq(c, 0) && eq(d, 1)) return 0;
-  if (eq(a, 0) && eq(b, 1) && eq(c, -1) && eq(d, 0)) return 90;
+  if (eq(a, 0) && eq(b, -1) && eq(c, 1) && eq(d, 0)) return 90;
   if (eq(a, -1) && eq(b, 0) && eq(c, 0) && eq(d, -1)) return 180;
-  if (eq(a, 0) && eq(b, -1) && eq(c, 1) && eq(d, 0)) return 270;
+  if (eq(a, 0) && eq(b, 1) && eq(c, -1) && eq(d, 0)) return 270;
   return undefined;
 }
 
@@ -433,6 +435,21 @@ function rotationFromMatrix(
 function canonicalContainer(brands: string[] | undefined): string {
   if (brands && brands.some((b) => b === 'qt  ' || b === 'qt')) return 'mov';
   return 'mp4';
+}
+
+/**
+ * mp4box applies the ISO 639 packed-language decoder to every mdhd value. Legacy QuickTime-style
+ * files use numeric language id 0 for English, which that decoder renders as three backticks.
+ * Preserve real elng/ISO strings, but translate this one evidenced legacy sentinel.
+ */
+function normalizedTrackLanguage(file: Mp4ISOFile, track: Mp4Track): string | null {
+  const native = file.getTrackById(track.id)?.mdia;
+  const extended = native?.elng?.extended_language?.trim();
+  if (extended) return extended === 'und' ? null : extended;
+  if (native?.mdhd?.language === 0) return 'eng';
+  const language = track.language?.trim();
+  if (!language || language === 'und') return null;
+  return /^[a-z]{3}$/.test(language) ? language : null;
 }
 
 function validAudioSampleRate(value: number | undefined): value is number {
@@ -501,10 +518,29 @@ function audioParamsFromSampleEntry(
     if (!entry) return {};
     const qtV2 = quickTimeV2AudioParams(entry);
     const aac = parseAacAudioSpecificConfig(audioSpecificConfigFromEntry(entry));
+    const entryChannels = validAudioChannels(entry.channel_count) ? entry.channel_count : undefined;
+    const aacChannels = aac?.presentationChannels;
+    // One corpus HE-AAC stream has an ASC that proves a mono core + SBR but omits the in-band PS
+    // needed to explain its stereo sample entry. Preserve that observed presentation without using
+    // channel-count magnitude as a generic confidence rule; otherwise a proven ASC view wins.
+    const unresolvedImplicitHeStereo = entryChannels === 2
+      && aac?.codedChannels === 1
+      && aac.presentationChannels === 1
+      && aac.sbrPresent
+      && !aac.psPresent;
+    const channels = qtV2.channels
+      ?? (unresolvedImplicitHeStereo ? entryChannels : aacChannels ?? entryChannels);
+    // A conflicting ASC is still useful coded/core evidence, but it does not prove the rendered
+    // view represented by the sample entry. Avoid publishing two contradictory presentation fields.
+    let normalizedAac = aac;
+    if (aac?.presentationChannels !== undefined && channels !== aac.presentationChannels) {
+      const { presentationChannels: _conflictingPresentation, ...codedAac } = aac;
+      normalizedAac = codedAac;
+    }
     return {
       sampleRate: qtV2.sampleRate ?? aac?.presentationSampleRate,
-      channels: qtV2.channels ?? aac?.presentationChannels,
-      ...(aac ? { aac } : {}),
+      ...(channels !== undefined ? { channels } : {}),
+      ...(normalizedAac ? { aac: normalizedAac } : {}),
     };
   } catch {
     return {};
@@ -563,7 +599,7 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
   const tracks: NormalizedTrack[] = info.tracks.map((t): NormalizedTrack => {
     const type = trackType(t);
     const trackDurSec = t.timescale > 0 ? t.duration / t.timescale : 0;
-    const lang = t.language && t.language !== 'und' ? t.language : null;
+    const lang = normalizedTrackLanguage(file, t);
     // Unwrap CENC-protected sample entries ('encv'/'enca') to their original four-cc before
     // canonicalizing; non-encrypted tracks pass `t.codec` straight through.
     const rawCodec = unwrapEncryptedCodec(file, t.id, t.codec) ?? t.codec;
@@ -639,9 +675,14 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
   const meta: NormalizedMetadata = {
     container: canonicalContainer(info.brands),
     durationSec,
+    // The movie/fragment duration is the file-wide presentation timeline. Track durations can
+    // legitimately differ (for example, shorter VFR video beside longer audio), so expose it.
+    ...(durationSec !== null ? { presentationDurationSec: durationSec } : {}),
     tracks,
   };
   const tags: Record<string, string> = {};
+  const majorBrand = file.ftyp?.major_brand ?? info.brands?.[0];
+  if (typeof majorBrand === 'string' && majorBrand.length) tags.major_brand = majorBrand;
   if (info.brands && info.brands.length) tags.brands = info.brands.join(',');
   if (info.isFragmented) tags.fragmented = 'true';
   if (info.mime) tags.mime = info.mime;
@@ -1487,7 +1528,16 @@ export class Mp4boxEngine implements MediaEngine {
       file.flush();
       throwIfAborted(context.signal);
       if (operationError !== undefined) throw operationError;
-      if (!info) throw new Error('mp4box: moov not found (not an ISO-BMFF/MP4 file, or moov truncated)');
+      if (!info) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          context.request.operation,
+          'parse',
+          'mp4box: moov not found (not an ISO-BMFF/MP4 file, or moov truncated)',
+          'MP4BOX_MOOV_NOT_FOUND',
+          input.id,
+        );
+      }
       return {
         file,
         info,

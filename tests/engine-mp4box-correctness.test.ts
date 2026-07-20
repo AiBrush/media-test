@@ -4,6 +4,7 @@ import * as MP4Box from 'mp4box';
 
 import {
   CONCRETE_OPERATION_PROTOCOL,
+  isMalformedInputError,
   isNotApplicableError,
   validateAdapterConformanceSurface,
   validateAdapterFactory,
@@ -263,7 +264,7 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
     }))).toMatchObject({ supported: false, reasonCode: 'MP4BOX_MUX_ESSENCE_CHANGE_UNSUPPORTED' });
   });
 
-  test('runtime unsupported shape throws the shared structured NA while corrupt supported input is an ordinary error', async () => {
+  test('runtime unsupported shape is structured NA while corrupt supported input is structured malformed media', async () => {
     await withEngine(async (engine) => {
       const input = await fixtureInput('micro_h264_1frame.mp4');
       let unsupported: unknown;
@@ -286,6 +287,14 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
         corrupt = error;
       }
       expect(corrupt).toBeDefined();
+      expect(isMalformedInputError(corrupt)).toBe(true);
+      expect(corrupt).toMatchObject({
+        reasonCode: 'MP4BOX_MOOV_NOT_FOUND',
+        operation: 'probe',
+        stage: 'parse',
+        engineId: 'mp4box@2.3.0',
+        inputId: 'corrupt.mp4',
+      });
       expect(isNotApplicableError(corrupt)).toBe(false);
     });
   });
@@ -315,6 +324,46 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
 });
 
 describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence', () => {
+  test('normalizes real probe header evidence into the suite presentation view', async () => {
+    await withEngine(async (engine) => {
+      const tiny = await engine.probe(await fixtureInput(
+        'scenarios/probe/tiny_h264_360p_2s/02.mp4',
+      ));
+      expect(tiny.tracks.find((track) => track.type === 'audio')).toMatchObject({
+        sampleRate: 48_000,
+        channels: 2,
+        codedSampleRate: 24_000,
+        presentationSampleRate: 48_000,
+        codedChannels: 1,
+        sbrPresent: true,
+        psPresent: false,
+      });
+      expect(tiny.tracks.find((track) => track.type === 'audio')).not.toHaveProperty(
+        'presentationChannels',
+      );
+
+      const legacyMov = await engine.probe(await fixtureInput(
+        'scenarios/probe/h264_1080p_5s/02.mov',
+        'video/quicktime',
+      ));
+      expect(legacyMov.tracks.map((track) => track.language)).toEqual(['eng', 'eng']);
+
+      const tagged = await engine.probe(await fixtureInput(
+        'scenarios/probe/h264_1080p_30s/01.mp4',
+      ));
+      expect(tagged.tags?.major_brand).toBe('mp42');
+
+      const rotated = await engine.probe(await fixtureInput('h264_rotated90.mp4'));
+      expect(rotated.tracks.find((track) => track.type === 'video')?.rotation).toBe(90);
+
+      const vfr = await engine.probe(await fixtureInput(
+        'scenarios/probe/h264_vfr/02.mp4',
+      ));
+      expect(vfr.presentationDurationSec).toBeCloseTo(200.973, 3);
+      expect(vfr.tracks.map((track) => track.language)).toEqual(['eng', 'eng']);
+    });
+  });
+
   test('parses AAC-LC, explicit HE-AAC v1, explicit HE-AAC v2/PS, and implicit SBR views', () => {
     expect(parseAacAudioSpecificConfig(new Uint8Array([0x12, 0x10]))).toMatchObject({
       audioObjectType: 2,
@@ -359,6 +408,16 @@ describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence
       codedSampleRate: 24_000,
       presentationSampleRate: 48_000,
       sbrPresent: true,
+    });
+
+    expect(parseAacAudioSpecificConfig(new Uint8Array([0x13, 0x08, 0x56, 0xe5, 0x98]))).toMatchObject({
+      audioObjectType: 2,
+      codedSampleRate: 24_000,
+      presentationSampleRate: 48_000,
+      codedChannels: 1,
+      presentationChannels: 1,
+      sbrPresent: true,
+      psPresent: false,
     });
   });
 
