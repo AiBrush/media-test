@@ -6,6 +6,7 @@ import {
   aacAudioConfigFromAdts,
   aacAudioConfigFromMpegTs,
   normalizeWebDemuxerRotation,
+  normalizeIsoPacketKeyframes,
   normalizeWebDemuxerStream,
   probeMetadataWithByteEvidence,
   tsVideoFrameRateFromMpegTs,
@@ -77,6 +78,25 @@ describe('REQ-ENG-27: representation-aware web-demuxer packet evidence', () => {
     });
   });
 
+  test('uses an owned AVC configuration record before scanning slice bytes for incidental start codes', async () => {
+    const accumulator = createTrackEvidenceAccumulator(0, 'video', 'h264', stream({
+      index: 7,
+      codec_string: 'avc1.640028',
+      extradata: new Uint8Array([1, 100, 0, 40, 0xff]),
+    }));
+    const first = packet(new Uint8Array([0, 0, 0, 2, 0x65, 0x01]));
+    const embeddedStartCode = packet(new Uint8Array([0, 0, 0, 5, 0x41, 0, 0, 1, 2]));
+
+    const firstEvidence = await packetEvidenceFromWebPacket(first, accumulator);
+    expect(firstEvidence.framing).toBe('avc');
+    expect(firstEvidence.decoderConfig).toEqual(new Uint8Array([1, 100, 0, 40, 0xff]));
+    expect((await packetEvidenceFromWebPacket(embeddedStartCode, accumulator)).framing).toBe('avc');
+    expect(finishTrackRepresentation(accumulator)).toMatchObject({
+      framing: 'avc',
+      descriptionRecord: 'avc-decoder-configuration-record',
+    });
+  });
+
   test('changes semantic identity for a corrupt slice NAL and preserves real random-access meaning', async () => {
     const first = createTrackEvidenceAccumulator(0, 'video', 'h264', stream());
     const corrupt = createTrackEvidenceAccumulator(0, 'video', 'h264', stream());
@@ -97,6 +117,25 @@ describe('REQ-ENG-27: representation-aware web-demuxer packet evidence', () => {
     expect(merged.map((item) => item.index)).toEqual([9, 3]);
     expect(streamIndexToTrackIndex(merged)).toEqual(new Map([[9, 0], [3, 1]]));
     expect(() => streamIndexToTrackIndex([stream({ index: 4 }), stream({ index: 4 })])).toThrow('duplicate');
+  });
+
+  test('uses ISO sync flags only after every package packet has an exact source-table binding', () => {
+    const packagePackets = [
+      { trackIndex: 0, ptsUs: 2_000, size: 9, keyframe: false },
+      { trackIndex: 0, ptsUs: 1_000, size: 7, keyframe: true },
+    ];
+    const sourcePackets = [
+      { trackIndex: 0, ptsUs: 1_001, size: 7, keyframe: false },
+      { trackIndex: 0, ptsUs: 2_000, size: 9, keyframe: true },
+    ];
+    expect(normalizeIsoPacketKeyframes(packagePackets, sourcePackets)).toEqual([
+      { ...packagePackets[0], keyframe: true, randomAccessKind: 'sample-table-sync' },
+      { ...packagePackets[1], keyframe: false, randomAccessKind: 'non-sync' },
+    ]);
+    expect(normalizeIsoPacketKeyframes(packagePackets, [
+      sourcePackets[0]!,
+      { trackIndex: 0, ptsUs: 9_999, size: 9, keyframe: true },
+    ])).toEqual(packagePackets);
   });
 
   test('records average versus nominal FPS provenance without presenting a guess as observation', () => {

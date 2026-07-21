@@ -340,6 +340,7 @@ function inspectMp3(bytes: Uint8Array): AudioContainerReadResult {
   let samplesPerFrame = 0;
   let delay = 0;
   let padding = 0;
+  let declaredFrameCount: number | undefined;
   while (offset + 4 <= bytes.byteLength) {
     if (isTrailingMp3Tag(bytes, offset)) break;
     const parsed = mp3FrameHeader(bytes, offset);
@@ -361,12 +362,19 @@ function inspectMp3(bytes: Uint8Array): AudioContainerReadResult {
       const gapless = readMp3LameGapless(bytes.subarray(offset, offset + parsed.frameBytes), parsed);
       delay = gapless.delay;
       padding = gapless.padding;
+      declaredFrameCount = gapless.frameCount;
     }
     frames++;
     offset += parsed.frameBytes;
   }
   if (frames === 0) return problem('UNSUPPORTED_FORMAT', 'MP3_FRAMES_MISSING', 'no MPEG audio frames were found');
-  const coded = frames * samplesPerFrame;
+  if (declaredFrameCount !== undefined && (declaredFrameCount <= 0 || declaredFrameCount > frames)) {
+    return problem('MALFORMED', 'MP3_XING_FRAME_COUNT_INVALID', `Xing frame count ${declaredFrameCount} exceeds ${frames} physical frames`);
+  }
+  // A Xing/Info header can occupy a physical MPEG frame that is not a coded program packet. Its
+  // frame-count field is the authoritative program-frame total used by demuxers and gapless decode.
+  const programFrames = declaredFrameCount ?? frames;
+  const coded = programFrames * samplesPerFrame;
   if (delay + padding >= coded) return problem('MALFORMED', 'MP3_GAPLESS_VALUES_INVALID', 'MP3 delay/padding consume the complete coded stream');
   return ok({
     container: 'mp3', codec: 'mp3', sampleRate, channels,
@@ -374,8 +382,8 @@ function inspectMp3(bytes: Uint8Array): AudioContainerReadResult {
     presentationSampleFrames: coded - delay - padding,
     primingSampleFrames: delay,
     endTrimSampleFrames: padding,
-    precision: delay || padding ? 'exact' : 'coded-frame-estimate',
-    packetOrFrameCount: frames,
+    precision: declaredFrameCount !== undefined || delay || padding ? 'exact' : 'coded-frame-estimate',
+    packetOrFrameCount: programFrames,
   });
 }
 
@@ -490,7 +498,10 @@ function mp3FrameHeader(bytes: Uint8Array, offset: number): Mp3Header | undefine
   };
 }
 
-function readMp3LameGapless(frame: Uint8Array, header: Mp3Header): { delay: number; padding: number } {
+function readMp3LameGapless(
+  frame: Uint8Array,
+  header: Mp3Header,
+): { delay: number; padding: number; frameCount?: number } {
   if (header.layer !== 3) return { delay: 0, padding: 0 };
   const sideInfo = header.version === 1
     ? (header.channels === 1 ? 17 : 32)
@@ -499,15 +510,22 @@ function readMp3LameGapless(frame: Uint8Array, header: Mp3Header): { delay: numb
   if (!['Xing', 'Info'].includes(ascii(frame, xing, 4)) || xing + 8 > frame.byteLength) return { delay: 0, padding: 0 };
   const flags = u32be(frame, xing + 4);
   let cursor = xing + 8;
+  const frameCount = flags & 1 && cursor + 4 <= frame.byteLength ? u32be(frame, cursor) : undefined;
   if (flags & 1) cursor += 4;
   if (flags & 2) cursor += 4;
   if (flags & 4) cursor += 100;
   if (flags & 8) cursor += 4;
-  if (cursor + 24 > frame.byteLength || !/^(LAME|Lavc|Lavf)/.test(ascii(frame, cursor, 4))) return { delay: 0, padding: 0 };
+  if (cursor + 24 > frame.byteLength || !/^(LAME|Lavc|Lavf)/.test(ascii(frame, cursor, 4))) {
+    return { delay: 0, padding: 0, ...(frameCount !== undefined ? { frameCount } : {}) };
+  }
   const a = frame[cursor + 21]!;
   const b = frame[cursor + 22]!;
   const c = frame[cursor + 23]!;
-  return { delay: (a << 4) | (b >> 4), padding: ((b & 0x0f) << 8) | c };
+  return {
+    delay: (a << 4) | (b >> 4),
+    padding: ((b & 0x0f) << 8) | c,
+    ...(frameCount !== undefined ? { frameCount } : {}),
+  };
 }
 
 function skipId3v2(bytes: Uint8Array): number {

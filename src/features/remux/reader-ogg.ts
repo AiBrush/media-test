@@ -212,8 +212,28 @@ export function readOggProgram(bytes: Uint8Array): RemuxReadResult {
     }
     const tracks = [...streams.values()].map(logicalTrack).filter((track): track is RemuxTrackEvidence => !!track);
     if (tracks.length === 0) return { state: 'UNSUPPORTED_STRUCTURE', reasonCode: 'REMUX_OGG_CODEC_UNSUPPORTED', evidence };
-    const durationUs = Math.max(0, ...tracks.flatMap((track) => track.samples.map((sample) =>
-      sample.ptsUs !== undefined && sample.durationUs !== undefined ? sample.ptsUs + sample.durationUs : 0)));
+    let observedDurationUs = 0;
+    for (const track of tracks) {
+      for (const sample of track.samples) {
+        if (sample.ptsUs !== undefined && sample.durationUs !== undefined) {
+          observedDurationUs = Math.max(observedDurationUs, sample.ptsUs + sample.durationUs);
+        }
+      }
+    }
+    // The final Ogg granule is the container-authored presentation endpoint. In particular, Opus
+    // may discard part of its final coded packet, so summing full packet durations overstates the
+    // playable program even though every coded payload was copied intact.
+    let granuleDurationUs = 0;
+    for (const track of tracks) {
+      const serial = Number(track.id.slice('ogg:'.length));
+      const stream = Number.isInteger(serial) ? streams.get(serial) : undefined;
+      if (stream?.eosGranule === undefined || !track.sampleRate) continue;
+      granuleDurationUs = Math.max(
+        granuleDurationUs,
+        Math.round((stream.eosGranule / track.sampleRate) * 1_000_000),
+      );
+    }
+    const durationUs = granuleDurationUs > 0 ? granuleDurationUs : observedDurationUs;
     const parsedSamples = tracks.reduce((sum, track) => sum + track.samples.length, 0);
     const value: RemuxProgramEvidence = {
       schema: 'media-test/remux-program@1', container: 'ogg', byteLength: bytes.byteLength,

@@ -6,9 +6,14 @@ import {
 } from '../src/engines/ffmpeg-wasm/codecs.ts';
 import {
   applyObservedFrameCadence,
+  audioSpecificConfigFromEsds,
+  avcDecoderConfigFromAnnexB,
   containerFromFfmpegLog,
+  normalizeSyntheticLeadingEbmlDts,
+  parseDemuxTimestampLog,
   parseFfprobeFramesJson,
   parseFfprobeJson,
+  parseFrameChecksumPackets,
   parseMp3XingDurationSec,
   parseTracksFromLog,
   representationForTracks,
@@ -214,6 +219,86 @@ describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
 });
 
 describe('REQ-ENG-13/18: exact runtime-build parsers', () => {
+  test('builds an AVCDecoderConfigurationRecord from mixed Annex-B start codes', () => {
+    const annexB = Uint8Array.of(
+      0x00, 0x00, 0x01, 0x06, 0x05,
+      0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1f, 0xaa,
+      0x00, 0x00, 0x01, 0x68, 0xee, 0x3c,
+      0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1f, 0xaa,
+    );
+    expect(avcDecoderConfigFromAnnexB(annexB)).toEqual(Uint8Array.of(
+      0x01, 0x64, 0x00, 0x1f, 0xff, 0xe1,
+      0x00, 0x05, 0x67, 0x64, 0x00, 0x1f, 0xaa,
+      0x01, 0x00, 0x03, 0x68, 0xee, 0x3c,
+    ));
+    expect(avcDecoderConfigFromAnnexB(Uint8Array.of(
+      0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1f,
+    ))).toBeUndefined();
+  });
+
+  test('extracts the AudioSpecificConfig from an ES descriptor', () => {
+    expect(audioSpecificConfigFromEsds(Uint8Array.of(
+      0x00, 0x00, 0x00, 0x00,
+      0x03, 0x03, 0x00, 0x01, 0x00,
+      0x05, 0x02, 0x12, 0x10,
+    ))).toEqual(Uint8Array.of(0x12, 0x10));
+    expect(audioSpecificConfigFromEsds(Uint8Array.of(0, 0, 0, 0, 0x05, 0x7f))).toBeUndefined();
+  });
+
+  test('parses source demux timestamps before the output muxer repairs them', () => {
+    expect(parseDemuxTimestampLog(
+      'demuxer -> ist_index:0:2 type:video pkt_pts:126000 pkt_pts_time:1.4 ' +
+      'pkt_dts:NOPTS pkt_dts_time:NOPTS duration:3000 duration_time:0.0333333 off:0 off_time:0',
+    )).toEqual({ trackIndex: 2, ptsUs: 1_400_000, durationUs: 33_333 });
+    expect(parseDemuxTimestampLog(
+      'demuxer -> ist_index:0:0 type:video pkt_pts:9000 pkt_pts_time:0.1 ' +
+      'pkt_dts:6000 pkt_dts_time:0.0666667 duration:3000 duration_time:0.0333333',
+    )).toEqual({ trackIndex: 0, ptsUs: 100_000, dtsUs: 66_667, durationUs: 33_333 });
+    expect(parseDemuxTimestampLog(
+      'demuxer -> ist_index:1 type:audio pkt_pts:9216 pkt_pts_time:0.192 ' +
+      'pkt_dts:9216 pkt_dts_time:0.192 duration:1024 duration_time:0.0213333',
+    )).toEqual({ trackIndex: 1, ptsUs: 192_000, dtsUs: 192_000, durationUs: 21_333 });
+    expect(parseDemuxTimestampLog('muxer <- type:video pkt_pts_time:0.1')).toBeUndefined();
+  });
+
+  test('normalizes only framecrc synthetic negative DTS for leading EBML packets', () => {
+    const packets = [
+      { trackIndex: 0, size: 10, ptsUs: 0, dtsUs: -33_000, keyframe: true },
+      { trackIndex: 0, size: 5, ptsUs: 167_000, dtsUs: 0, keyframe: false },
+      { trackIndex: 1, size: 4, ptsUs: 0, dtsUs: 0, keyframe: true },
+    ];
+    normalizeSyntheticLeadingEbmlDts(packets);
+    expect(packets.map((packet) => packet.dtsUs)).toEqual([0, 0, 0]);
+  });
+
+  test('retains framehash payload identity while overlaying source timestamps by track', () => {
+    const sha = '0123456789abcdef'.repeat(4);
+    const rows = [
+      '#format: frame checksums',
+      '#version: 2',
+      '#hash: SHA256',
+      '#tb 0: 1/90000',
+      `0, 9000, 12000, 3000, 4217, ${sha}, F=0x0`,
+    ].join('\n');
+    expect(parseFrameChecksumPackets(rows, new Map([[0, [{
+      trackIndex: 0, ptsUs: 88_000, dtsUs: 44_000, durationUs: 33_000,
+    }]]]))).toEqual([{
+      trackIndex: 0,
+      size: 4217,
+      ptsUs: 88_000,
+      dtsUs: 44_000,
+      durationUs: 33_000,
+      payloadDigest: sha,
+      keyframe: false,
+    }]);
+  });
+
+  test('keeps checksum DTS when the source debug row reports NOPTS', () => {
+    const rows = ['#tb 0: 1/1000', '0, 7, 9, 2, 4, 0x00000000'].join('\n');
+    expect(parseFrameChecksumPackets(rows, new Map([[0, [{ trackIndex: 0, ptsUs: 9_000 }]]]))[0])
+      .toMatchObject({ ptsUs: 9_000, dtsUs: 7_000, durationUs: 2_000 });
+  });
+
   test('parses the loaded core stream prefix with source index and timebase diagnostics', () => {
     const log = [
       "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'op1.in':",

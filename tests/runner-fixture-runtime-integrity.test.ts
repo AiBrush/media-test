@@ -436,6 +436,19 @@ describe('REQ-FIX-08/09 active-generation runtime integrity', () => {
     expect(publication.requestedUrls.filter((url) => url.includes('/generations/'))).toHaveLength(2);
   });
 
+  test('candidate-boundary release drops byte graphs but preserves the frozen generation index', async () => {
+    const publication = buildPublication();
+    expect((await publication.runtime.resolveMedia(assetId)).state).toBe('ready');
+    expect(await publication.runtime.loadGoldenEvidence(assetId, 'metadata', (payload) => payload)).toBeDefined();
+    publication.runtime.releaseMaterializedData();
+    expect((await publication.runtime.resolveMedia(assetId)).state).toBe('ready');
+    expect(await publication.runtime.loadGoldenEvidence(assetId, 'metadata', (payload) => payload)).toBeDefined();
+
+    expect(publication.indexRequests()).toBe(1);
+    expect(publication.hashCount(`media/${assetId}`)).toBe(2);
+    expect(publication.hashCount(`golden/${assetId}.meta.json`)).toBe(2);
+  });
+
   test('materialized media is verified from the ignored media path and ready evidence may bind to it', async () => {
     const publication = buildPublication({ materializedMedia: 'ready' });
     const observed = counters();

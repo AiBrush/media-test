@@ -762,23 +762,24 @@ async function snapshotRun(
   completionState?: RunCompletionState,
   partialReason?: string,
 ): Promise<CanonicalRunArtifact | undefined> {
-  if (!activeRun) return currentArtifact;
-  const state = completionState ?? activeRun.state;
-  const cache = await cacheSnapshot(!activeRun.configuration.reuseData);
+  const run = activeRun;
+  if (!run) return currentArtifact;
+  const state = completionState ?? run.state;
+  const cache = await cacheSnapshot(!run.configuration.reuseData);
   const manifest = finalizeRunManifest(
-    activeRun.baseManifest,
-    activeRun.evidence.results,
+    run.baseManifest,
+    run.evidence.results,
     state,
     new Date().toISOString(),
     cache,
-    state === 'completed' ? undefined : partialReason ?? activeRun.stopReason ?? 'Run snapshot before completion.',
+    state === 'completed' ? undefined : partialReason ?? run.stopReason ?? 'Run snapshot before completion.',
   );
   return createCanonicalRunArtifact({
     manifest,
     registration,
     env,
     support,
-    results: activeRun.evidence.results,
+    results: run.evidence.results,
     scenarioIdentity,
   });
 }

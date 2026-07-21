@@ -169,6 +169,9 @@ export async function packetEvidenceFromWebPacket(
     ...(payloadDigest ? { payloadDigest } : {}),
     ...(representation.framing ? { framing: representation.framing } : {}),
     ...(representation.nalLengthSize !== undefined ? { nalLengthSize: representation.nalLengthSize } : {}),
+    ...(accumulator.packetCount === 1 && accumulator.description?.byteLength
+      ? { decoderConfig: accumulator.description.slice() }
+      : {}),
     randomAccessKind: representation.randomAccessKind ?? (packet.keyframe === 1 ? 'container-sync' : 'non-sync'),
   };
 }
@@ -258,10 +261,17 @@ export function detectCodedRepresentation(
       randomAccess: codec === 'aac' ? true : undefined,
     };
   }
-  const annexB = splitAnnexB(payload);
   const descriptionNalLength = nalLengthSizeFromDescription(codec, description);
-  const lengthSize = descriptionNalLength ?? findValidNalLengthSize(payload);
-  const units = annexB ?? (lengthSize ? splitLengthPrefixed(payload, lengthSize) : undefined);
+  // A length-prefixed NAL payload may legitimately contain 00 00 01 inside a slice. When an
+  // avcC/hvcC record supplies the authoritative length size, parse that representation first;
+  // scanning for Annex-B start codes first would misclassify such packets mid-track.
+  const describedUnits = descriptionNalLength
+    ? splitLengthPrefixed(payload, descriptionNalLength)
+    : undefined;
+  const annexB = describedUnits ? undefined : splitAnnexB(payload);
+  const inferredLengthSize = describedUnits || annexB ? undefined : findValidNalLengthSize(payload);
+  const lengthSize = describedUnits ? descriptionNalLength : inferredLengthSize;
+  const units = describedUnits ?? annexB ?? (lengthSize ? splitLengthPrefixed(payload, lengthSize) : undefined);
   if (!units) throw new Error(`${codec} packet has neither valid Annex-B nor length-prefixed framing`);
   const types = units.filter((unit) => unit.byteLength > 0).map((unit) => nalType(codec, unit));
   const isParameter = (type: number): boolean =>

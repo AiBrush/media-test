@@ -22,6 +22,10 @@ export type RemuxFraming =
 export interface RemuxSampleEvidence {
   /** Complete coded sample bytes; views may reference the reader input and must be treated readonly. */
   readonly payload: Uint8Array;
+  /** Source-container bytes when transport framing is stripped from `payload` (for example ADTS). */
+  readonly sourcePayload?: Uint8Array;
+  /** On-disk source span when container framing is stripped from `payload`. */
+  readonly sourceByteLength?: number;
   readonly ptsUs?: number;
   readonly dtsUs?: number;
   readonly durationUs?: number;

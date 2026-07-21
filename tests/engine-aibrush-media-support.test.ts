@@ -87,6 +87,26 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     const malformed = request('remux', 'jpeg', [], { outputContainer: 'unknown', mutated: true });
     expect(decideAibrushSupport(malformed)).toEqual({ supported: true });
   });
+
+  test('declares demux scale rows NA when no first-packet boundary is observable', () => {
+    expect(decideAibrushSupport(request('demux', 'mp4', [VIDEO, AUDIO], {
+      options: { invariant: 'demux-scale-budgets' },
+    }))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+    });
+  });
+
+  test('declares source layouts with unrepresentable demux tracks NA', () => {
+    expect(decideAibrushSupport(request('demux', 'mkv', [VIDEO, AUDIO, {
+      type: 'other', codec: 'attachment',
+    }]))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
+    });
+  });
 });
 
 describe('REQ-ENG-32: exact framework error taxonomy', () => {

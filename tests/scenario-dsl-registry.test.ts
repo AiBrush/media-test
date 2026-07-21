@@ -608,6 +608,8 @@ describe('REQ-DSL-07: explicit input identity and partial coverage', () => {
     }> = [
       { statuses: ['PASS', 'FAIL'], status: 'FAIL', grade: 'partial', valid: 1 },
       { statuses: ['PASS', 'PASS'], status: 'PASS', grade: 'full', valid: 2 },
+      { statuses: ['PASS', 'NA_ENGINE'], status: 'PASS', grade: 'full', valid: 1 },
+      { statuses: ['NA_ENGINE', 'NA_ENGINE'], status: 'NA_ENGINE', grade: 'none', valid: 0 },
       { statuses: ['NA_BROWSER', 'PASS'], status: 'PASS', grade: 'partial', valid: 1 },
       { statuses: ['NA_BROWSER', 'NA_ASSET'], status: 'NA_BROWSER', grade: 'none', valid: 0 },
     ];
@@ -647,6 +649,33 @@ describe('REQ-DSL-07: explicit input identity and partial coverage', () => {
     expect(parsed.results[0]!.status).not.toBe('ERROR');
     expect(parsed.results[0]!.reason).toContain('01.mp4(PASS)');
     expect(parsed.results[0]!.reason).toContain('02.mp4(FAIL)');
+  });
+
+  test('intrinsically unsupported variants preserve full executable coverage at the strict v2 boundary', () => {
+    const reduction = reduceExhaustiveStatuses(['PASS', 'NA_ENGINE']);
+    const source = resultV2('PASS', [verdicts.pass], {
+      reason: 'coverage full 1/1 executable variants; 01.mp4(PASS); attachment.mov(NA_ENGINE)',
+      exhaustive: [
+        {
+          file: '01.mp4', sha256: SHA_A, isBaked: false, status: 'PASS',
+          oracleOutcomes: [verdicts.pass], measurement: { state: 'NOT_REQUESTED' },
+          operationEvidence, executed: true,
+        },
+        {
+          file: 'attachment.mov', sha256: SHA_B, isBaked: false, status: 'NA_ENGINE',
+          reason: '[MEDIABUNNY_TRACK_TYPE_UNSUPPORTED] attachment tracks are outside the demux API',
+          oracleOutcomes: [], measurement: { state: 'NOT_REQUESTED' },
+          operationEvidence, executed: true,
+        },
+      ],
+      coverage: reduction.coverage,
+    });
+
+    const parsed = readResultsEnvelope(envelope([source]));
+    expect(parsed.results[0]!.status).toBe('PASS');
+    expect(parsed.results[0]!.coverage).toEqual(reduction.coverage);
+    expect(parsed.results[0]!.coverage?.grade).toBe('full');
+    expect(parsed.results[0]!.coverage?.counts.naEngine).toBe(1);
   });
 });
 

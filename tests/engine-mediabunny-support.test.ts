@@ -236,6 +236,39 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
     expect(decideMediabunnySupport(value)).toEqual({ supported: true });
   });
 
+  test('demux admits A/V inputs but declares unexposed auxiliary tracks intrinsic NA_ENGINE', () => {
+    const av = request({ operation: 'demux', outputContainer: '', tracks: [VIDEO, AUDIO] });
+    delete av.output;
+    expect(decideMediabunnySupport(av)).toEqual({ supported: true });
+
+    const auxiliary = request({
+      operation: 'demux',
+      outputContainer: '',
+      tracks: [VIDEO, AUDIO, { type: 'other', codec: 'timecode' }],
+    });
+    delete auxiliary.output;
+    expect(decideMediabunnySupport(auxiliary)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.TRACK_TYPE,
+      reason: expect.stringContaining('Input.getTracks()/EncodedPacketSink'),
+    });
+  });
+
+  test('defers track-dependent remux checks until selected-source evidence resolves', () => {
+    const preliminary = request({ operation: 'remux', outputContainer: 'mkv', tracks: [] });
+    const unresolved: ConcreteOperationRequest = {
+      ...preliminary,
+      inputs: preliminary.inputs.map((input) => ({ ...input, sourceEvidence: 'UNRESOLVED' as const })),
+    };
+    expect(decideMediabunnySupport(unresolved)).toEqual({ supported: true });
+    expect(decideMediabunnySupport(preliminary)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.TRACK_COUNT,
+    });
+  });
+
   test('one unsupported fanout rung does not erase a supported sibling', () => {
     const decision = decideMediabunnySupport(request({
       operation: 'transcode',

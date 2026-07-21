@@ -1304,6 +1304,48 @@ describe('REQ-RUN-03 three-way performance admission', () => {
     expect(result.bench?.wall?.samples.every((value) => Number.isFinite(value) && value > 0)).toBe(true);
   });
 
+  test('adapter benchmark limits cap adaptive inner-loop reuse', async () => {
+    installCorpusFetch();
+    const engine = baseEngine('remux', {
+      benchmarkLimits: { maxInnerIterations: 2 },
+      supports: async () => ({ supported: true }),
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('performance/runner-adapter-inner-cap'),
+      metrics: ['wall'],
+      primaryMetric: 'wall',
+    });
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      benchOptions: { warmup: 0, iters: 1, minDurationMs: 100, maxInnerIterations: 64 },
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+    });
+    const timing = result.bench?.wall?.protocolEvidence?.timingProtocol as
+      | { innerIterations?: number }
+      | undefined;
+    expect(result.status).toBe('PASS');
+    expect(timing?.innerIterations).toBe(2);
+  });
+
+  test('external runtime errors are sanitized to valid I-JSON strings', async () => {
+    installCorpusFetch();
+    const engine = baseEngine('remux', {
+      supports: async () => ({ supported: true }),
+      remux: async () => { throw new Error('worker argv contains \ud800 corruption'); },
+    });
+    const result = await runOne(engine, remuxScenario('remux/runner-invalid-utf16-error'), browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+    });
+    expect(result.status).toBe('ERROR');
+    expect(result.reason).toContain('worker argv contains � corruption');
+    expect([...(result.reason ?? '')].some((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 0xd800 && code <= 0xdfff;
+    })).toBe(false);
+  });
+
   test('unsupported peak-memory preflight preserves correctness and does not rerun the operation', async () => {
     installCorpusFetch();
     let calls = 0;

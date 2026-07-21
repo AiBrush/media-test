@@ -527,6 +527,17 @@ export class ActiveFixtureRuntime {
     this.#integrity.clear();
   }
 
+  /**
+   * Release verified media/evidence byte graphs while preserving the run's frozen generation index.
+   * Exhaustive mode calls this at each candidate boundary so memory is proportional to one variant,
+   * not to every decoded packet golden and media body seen earlier in the run.
+   */
+  releaseMaterializedData(): void {
+    this.#media.clear();
+    this.#evidence.clear();
+    this.#integrity.clear();
+  }
+
   async #resolveMediaUncached(assetId: string): Promise<ActiveFixtureMediaResult> {
     if (!safeAssetId(assetId)) {
       return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_ASSET_ID_INVALID', detail: `'${assetId}' is not a safe canonical asset id` };

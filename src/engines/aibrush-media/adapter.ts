@@ -156,6 +156,14 @@ function isMalformedHarnessInput(input: MediaInput | undefined): boolean {
   return input.mutated === true || MALFORMED_INPUT_RE.test(input.id);
 }
 
+function isGracefulNegativeContext(context?: OperationContext): boolean {
+  if (context?.request.options.gracefulAllowOutput === true) return true;
+  const robustness = context?.request.options.robustness;
+  return typeof robustness === 'object' &&
+    robustness !== null &&
+    (robustness as { inputClass?: unknown }).inputClass === 'negative';
+}
+
 function isStillImageInput(input: MediaInput): boolean {
   const mime = input.mime.toLowerCase();
   const id = input.id.toLowerCase();
@@ -1118,8 +1126,9 @@ function demuxResultFromPacketInfo(
     },
     close: () => Promise.resolve(),
   };
+  const metadata = metadataFromDemuxed(input, demuxedView);
   return buildAibrushDemuxResult(
-    metadataFromDemuxed(input, demuxedView),
+    sourceBytes === undefined ? metadata : enrichAibrushProbeMetadata(metadata, sourceBytes),
     packetInfo.tracks,
     packetInfo.packets.map((packet) => {
       const inline = (packet as AibrushPacketInfoMetadata & { data?: Uint8Array }).data;
@@ -1495,7 +1504,9 @@ async function pcmPacketTable(input: MediaInput, metadata: NormalizedMetadata): 
   if (payloadBytes === undefined || payloadBytes <= 0) return [];
   const bytesPerFrame = bytesPerSample * channels;
   const totalFrames = Math.floor(payloadBytes / bytesPerFrame);
-  const chunkFrames = metadata.container === 'aiff' ? 1024 : 4096;
+  const chunkFrames = metadata.container === 'wav'
+    ? Math.max(1, 2 ** Math.floor(Math.log2(sampleRate / 10)))
+    : Math.max(1, Math.floor(4096 / bytesPerFrame));
   const packets: PacketInfo[] = [];
   for (let frame = 0; frame < totalFrames; frame += chunkFrames) {
     const frames = Math.min(chunkFrames, totalFrames - frame);
@@ -3593,6 +3604,13 @@ export function enrichAibrushProbeMetadata(
     .find((scheme): scheme is string => typeof scheme === 'string' && scheme.length > 0);
   const enriched: NormalizedMetadata = {
     ...metadata,
+    ...(structure !== null
+      ? {
+          container: structure.container === 'mp4'
+            ? (metadata.container === 'mov' ? 'mov' : 'mp4')
+            : (metadata.container === 'mkv' ? 'mkv' : 'webm'),
+        }
+      : {}),
     tracks,
     ...(majorBrand !== undefined
       ? { tags: { ...(metadata.tags ?? {}), major_brand: majorBrand } }
@@ -4417,22 +4435,12 @@ export class AibrushMediaEngine implements MediaEngine {
     return this.#run('demux', 'framework.demux+packet-info', context, async (signal) => {
       try {
         const container = containerFromInput(input);
-        if (container === 'wav' && !isMalformedHarnessInput(input)) {
-          const packetInfo = await this.#driverCore().wavPacketInfoFromUrl(input.url, {
-            mime: input.mime,
-            ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
-            signal,
-          });
-          return demuxResultFromPacketInfo(input, packetInfo);
-        }
-        if (container === 'aiff' && !isMalformedHarnessInput(input)) {
-          const packetInfo = await this.#driverCore().aiffPacketInfoFromUrl(input.url, {
-            mime: input.mime,
-            ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
-            signal,
-          });
-          return demuxResultFromPacketInfo(input, packetInfo);
-        }
+        const evidenceBytes =
+          input.sizeBytes !== undefined &&
+          input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES &&
+          !isHlsAsset(input)
+            ? await inputBytes(input)
+            : undefined;
         if (isPcmAggregateInput(input)) {
           const metadata = await this.probe(input, context);
           if (pcmTrack(metadata) === undefined) {
@@ -4446,7 +4454,7 @@ export class AibrushMediaEngine implements MediaEngine {
           input.sizeBytes !== undefined &&
           input.sizeBytes <= MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES
         ) {
-          const bytes = await inputBytes(input);
+          const bytes = evidenceBytes ?? await inputBytes(input);
           const packetInfo = await this.#driverCore().mp4PacketInfoFromBytes(bytes);
           if (packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo, bytes);
         }
@@ -4459,7 +4467,9 @@ export class AibrushMediaEngine implements MediaEngine {
             ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
             signal,
           });
-          if (packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo);
+          if (packetInfo.packets.length > 0) {
+            return demuxResultFromPacketInfo(input, packetInfo, evidenceBytes);
+          }
         }
         if (
           container === 'mp3' &&
@@ -4467,7 +4477,7 @@ export class AibrushMediaEngine implements MediaEngine {
           input.sizeBytes !== undefined &&
           input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES
         ) {
-          const bytes = await inputBytes(input);
+          const bytes = evidenceBytes ?? await inputBytes(input);
           const packetInfo = this.#driverCore().mp3PacketInfoFromBytes(bytes);
           if (packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo, bytes);
         }
@@ -4482,11 +4492,19 @@ export class AibrushMediaEngine implements MediaEngine {
           const engine = this.#engine();
           const src = await this.#src(engine, input);
           const packetInfo = await engine.packetInfo?.(src, { signal, container });
-          if (packetInfo !== undefined && packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo);
+          if (packetInfo !== undefined && packetInfo.packets.length > 0) {
+            return demuxResultFromPacketInfo(input, packetInfo, evidenceBytes);
+          }
         }
         const engine = this.#engine();
-        const demuxed = await engine.demux(await this.#src(engine, input), { signal });
-        const metadata = metadataFromDemuxed(input, demuxed);
+        const source = isMalformedHarnessInput(input) && !input.mutated
+          ? engine.from(evidenceBytes ?? await inputBytes(input))
+          : await this.#src(engine, input);
+        const demuxed = await engine.demux(source, { signal });
+        const rawMetadata = metadataFromDemuxed(input, demuxed);
+        const metadata = evidenceBytes === undefined
+          ? rawMetadata
+          : enrichAibrushProbeMetadata(rawMetadata, evidenceBytes);
         let packets: PacketInfo[] = [];
         let packetTableFastPath = false;
         try {
@@ -4561,7 +4579,14 @@ export class AibrushMediaEngine implements MediaEngine {
         }
         return buildAibrushDemuxResult(metadata, demuxed.tracks, packets);
       } catch (e) {
-        return this.#naIfMiss('demux', e, input);
+        try {
+          return this.#naIfMiss('demux', e, input);
+        } catch (translated) {
+          if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+            throw new GracefulRejectionError('demux', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

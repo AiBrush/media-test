@@ -1519,8 +1519,15 @@ export function reduceExhaustiveStatuses(
   };
   const valid = counts.pass;
   const admissible = valid + counts.fail + counts.error;
+  const terminalIntrinsicCoverage =
+    counts.pass > 0 &&
+    counts.fail === 0 &&
+    counts.error === 0 &&
+    counts.naBrowser === 0 &&
+    counts.naAsset === 0 &&
+    counts.skipped === 0;
   const grade: ExhaustiveCoverage['grade'] =
-    counts.total > 0 && valid === counts.total ? 'full' : valid > 0 ? 'partial' : 'none';
+    terminalIntrinsicCoverage ? 'full' : valid > 0 ? 'partial' : 'none';
   const status: ResultStatus =
     counts.fail > 0 ? 'FAIL' :
     counts.error > 0 ? 'ERROR' :

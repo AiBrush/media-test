@@ -5,6 +5,7 @@ import type { MediaBytes, MediaInput } from '../src/core/engine.ts';
 import type { OracleOutcome } from '../src/core/scenario.ts';
 import {
   REMUX_ROUND_TRIP_LEG_ROLE,
+  aacLcChannelsFromEsds,
   auditRemuxAvailabilityAssertions,
   auditRemuxScenarioAvailability,
   classifyRejectedPartialRemux,
@@ -12,6 +13,7 @@ import {
   compareStrictRemuxPrograms,
   evaluateStrictStreamCopy,
   executeRemuxRoundTrip,
+  normalizeRemuxTrackForTest,
   readNeutralRemuxProgram,
   remuxFixtureAvailability,
   remuxRoundTripContractFromOptions,
@@ -174,9 +176,88 @@ describe('REQ-FEAT-07 strict stream-copy semantic oracle', () => {
     const remapped = program('mkv', [make('b', [0, 33_000, 67_000], [0, 33_000, 67_000])]);
     expect(oracleVerdict(compareStrictRemuxPrograms(source, remapped, { tolerance: { timestampUs: 500 } }).outcome)).toBe('FAIL');
   });
+
+  test('Opus pre-skip clipping and missing Matroska DTS stay representation differences', () => {
+    const payloads = [new Uint8Array([1]), new Uint8Array([2]), new Uint8Array([3])];
+    const opusTrack = (id: string, pts: number[]): RemuxTrackEvidence => ({
+      id, type: 'audio', codec: 'opus', sampleRate: 48_000, channels: 1,
+      samples: payloads.map((payload, index) => ({
+        payload,
+        ptsUs: pts[index]!,
+        ...(id === 'ogg' ? { durationUs: 60_000 } : {}),
+        keyframe: true,
+        framing: id === 'ogg' ? 'ogg-packet' : 'raw',
+      })),
+    });
+    const opus = compareStrictRemuxPrograms(
+      { ...program('ogg', [opusTrack('ogg', [-6_500, 53_500, 113_500])]), durationUs: 180_000 },
+      { ...program('webm', [opusTrack('webm', [0, 14_000, 74_000])]), durationUs: 180_000 },
+    );
+    expect(oracleVerdict(opus.outcome)).toBe('PASS');
+    expect(opus.representationDifferences.join(' ')).toContain('Opus pre-skip');
+
+    const videoTrack = (id: string, pts: number[], dts?: number[]): RemuxTrackEvidence => ({
+      id, type: 'video', codec: 'vp9', width: 640, height: 360,
+      samples: payloads.map((payload, index) => ({
+        payload,
+        ptsUs: pts[index]!,
+        ...(dts ? { dtsUs: dts[index]! } : {}),
+        durationUs: dts ? [33_003, 33_994, 33_003][index]! : 33_333,
+        keyframe: index === 0,
+        framing: 'raw',
+      })),
+    });
+    const dtsProvenance = compareStrictRemuxPrograms(
+      program('mkv', [videoTrack('mkv', [0, 133_000, 67_000])]),
+      program('mp4', [videoTrack('mp4', [0, 133_003, 66_997], [0, 33_003, 66_997])]),
+    );
+    expect(oracleVerdict(dtsProvenance.outcome)).toBe('PASS');
+    expect(dtsProvenance.representationDifferences.join(' ')).toContain('coded-duration provenance');
+  });
+
+  test('program duration accepts only evidenced metadata-prefix origin plus one missing terminal interval', () => {
+    const xing = new TextEncoder().encode('Xing-metadata-frame');
+    const media = [new Uint8Array([1]), new Uint8Array([2])];
+    const sourceTrack: RemuxTrackEvidence = {
+      id: 'mp3-source', type: 'audio', codec: 'mp3', sampleRate: 48_000, channels: 2,
+      samples: [xing, ...media].map((payload, index) => ({
+        payload, ptsUs: index * 26_000, dtsUs: index * 26_000, durationUs: 26_000,
+        keyframe: true, framing: 'mpeg-audio-frame',
+      })),
+    };
+    const outputTrack: RemuxTrackEvidence = {
+      id: 'mkv-output', type: 'audio', codec: 'mp3', sampleRate: 48_000, channels: 2,
+      samples: media.map((payload, index) => ({
+        payload, ptsUs: index * 26_000, keyframe: true, framing: 'raw',
+      })),
+    };
+    const explained = compareStrictRemuxPrograms(
+      { ...program('mp3', [sourceTrack]), durationUs: 78_000 },
+      { ...program('mkv', [outputTrack]), durationUs: 26_000 },
+    );
+    expect(oracleVerdict(explained.outcome)).toBe('PASS');
+    expect(explained.representationDifferences.join(' ')).toContain('origin/priming normalization');
+
+    const unexplained = compareStrictRemuxPrograms(
+      { ...program('mp3', [sourceTrack]), durationUs: 130_000 },
+      { ...program('mkv', [outputTrack]), durationUs: 26_000 },
+    );
+    expect(oracleVerdict(unexplained.outcome)).toBe('FAIL');
+  });
 });
 
 describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () => {
+  test('AAC-LC AudioSpecificConfig overrides a contradictory legacy sample-entry channel count', () => {
+    const esds = new Uint8Array([
+      0, 0, 0, 0,
+      3, 0x80, 0x80, 0x80, 34, 0, 0, 0,
+      4, 0x80, 0x80, 0x80, 20, 0x40, 0x15, 0, 0x18, 0, 0, 0, 0xfa, 0, 0, 0, 0xfa, 0,
+      5, 0x80, 0x80, 0x80, 2, 0x11, 0x88,
+      6, 0x80, 0x80, 0x80, 1, 2,
+    ]);
+    expect(aacLcChannelsFromEsds(esds)).toBe(1);
+  });
+
   test('reads every declared ordinary remux source format plus fragmented/live structures', () => {
     const cases = [
       ['micro_h264_1frame.mp4', 'mp4', 'h264'],
@@ -184,6 +265,7 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
       ['h264_in_mkv.mkv', 'mkv', 'h264'],
       ['tiny_vp9_360p_2s.webm', 'webm', 'vp9'],
       ['h264_ts.ts', 'ts', 'h264'],
+      ['ts_discontinuity.ts', 'ts', 'h264'],
       ['aac_adts.aac', 'adts', 'aac'],
       ['mp3_xing.mp3', 'mp3', 'mp3'],
       ['opus.ogg', 'ogg', 'opus'],
@@ -198,6 +280,67 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
       expect(result.value.tracks.some((track) => track.codec === codec && track.samples.length > 0), file).toBe(true);
       expect(result.evidence.parsedSamples, file).toBeGreaterThan(0);
     }
+  });
+
+  test('TS reader preserves concatenated-program PTS epochs and physical ADTS frame spans', () => {
+    const result = readNeutralRemuxProgram(bytesAt('fixtures/media/ts_discontinuity.ts'), 'ts');
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    const video = result.value.tracks.find((track) => track.type === 'video')!;
+    const audio = result.value.tracks.find((track) => track.type === 'audio')!;
+    expect([video.samples.length, audio.samples.length]).toEqual([120, 190]);
+    expect([video.samples[59]!.ptsUs, video.samples[60]!.ptsUs]).toEqual([3_388_000, 600_000_000]);
+    expect([audio.samples[94]!.ptsUs, audio.samples[95]!.ptsUs]).toEqual([3_405_333, 599_978_667]);
+    expect(audio.samples.every((sample) =>
+      sample.sourcePayload?.byteLength === sample.sourceByteLength &&
+      sample.sourceByteLength! > sample.payload.byteLength)).toBe(true);
+
+    const splitPes = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/demux/h264_ts/01.ts'),
+      'ts',
+    );
+    expect(splitPes.state).toBe('OK');
+    if (splitPes.state !== 'OK') return;
+    const splitVideo = splitPes.value.tracks.find((track) => track.type === 'video')!;
+    expect(splitVideo.samples.length).toBe(299);
+    expect(splitVideo.samples.slice(0, 3).map((sample) => sample.sourceByteLength)).toEqual([9_815, 814, 595]);
+  });
+
+  test('classic QuickTime version-0 ctts uses signed B-frame composition offsets', () => {
+    const result = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/h264_1080p_5s_mov_to_ts/03.mov'),
+      'mov',
+    );
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    const video = result.value.tracks.find((track) => track.type === 'video')!;
+    expect(video.samples.slice(0, 5).map((sample) => sample.ptsUs)).toEqual([
+      0, 133_333, 66_667, 266_667, 200_000,
+    ]);
+    expect(Math.max(...video.samples.map((sample) => sample.ptsUs ?? 0))).toBeLessThan(70_000_000);
+    expect(normalizeRemuxTrackForTest(video)?.parameterSets).toHaveLength(2);
+  });
+
+  test('complete EBML block timing overrides a contradictory declared Segment duration', () => {
+    const result = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/vp8_720p_10s_webm_to_mkv/02.webm'),
+      'webm',
+    );
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    expect(result.value.tracks.reduce((sum, track) => sum + track.samples.length, 0)).toBe(590);
+    expect(result.value.durationUs).toBe(7_777_000);
+  });
+
+  test('Ogg EOS granule materializes Opus terminal discard padding', () => {
+    const result = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/opus_ogg_to_mkv/02.ogg'),
+      'ogg',
+    );
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    expect(result.value.tracks[0]?.samples).toHaveLength(19);
+    expect(result.value.durationUs).toBe(1_106_500);
   });
 
   test('malformed candidate is FAIL; a reader implementation gap is ERROR, never NA_ASSET', () => {

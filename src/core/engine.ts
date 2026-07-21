@@ -1243,6 +1243,8 @@ export interface MediaEngine {
    * index signature; the runner serializes it for the report.
    */
   readonly configUsed?: object;
+  /** Optional safety cap for adaptive batches when a runtime cannot sustain unbounded main() reuse. */
+  readonly benchmarkLimits?: Readonly<{ maxInnerIterations?: number }>;
   /** Full-tuple support decision after selected input evidence is available. Scored adapters must implement it. */
   supports(request: ConcreteOperationRequest, context?: LifecycleContext): SupportDecision | Promise<SupportDecision>;
   init?(context?: LifecycleContext): Promise<void>;

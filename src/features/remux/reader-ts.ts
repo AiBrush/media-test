@@ -158,12 +158,91 @@ function timestampsFromPes(records: readonly PesRecord[], framing: 'annexb' | 'r
       : undefined;
     return {
       payload: record.payload,
+      sourceByteLength: record.payload.byteLength,
       ...(record.ptsUs !== undefined ? { ptsUs: record.ptsUs } : {}),
       ...(record.dtsUs !== undefined ? { dtsUs: record.dtsUs } : {}),
       ...(durationUs !== undefined ? { durationUs } : {}),
       fileOffset: record.fileOffset,
       framing,
     };
+  });
+}
+
+interface H264NalStart {
+  offset: number;
+  type: number;
+}
+
+function h264NalStarts(bytes: Uint8Array): H264NalStart[] {
+  const starts: H264NalStart[] = [];
+  for (let offset = 0; offset + 3 < bytes.byteLength; offset++) {
+    let prefix = 0;
+    if (
+      bytes[offset] === 0 && bytes[offset + 1] === 0 &&
+      bytes[offset + 2] === 0 && bytes[offset + 3] === 1
+    ) prefix = 4;
+    else if (bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) prefix = 3;
+    if (prefix === 0) continue;
+    const header = bytes[offset + prefix];
+    if (header !== undefined) starts.push({ offset, type: header & 0x1f });
+    offset += prefix - 1;
+  }
+  return starts;
+}
+
+function h264HasIdr(bytes: Uint8Array): boolean {
+  return h264NalStarts(bytes).some((nal) => nal.type === 5);
+}
+
+/** Reframe H.264 PES payloads at in-band AUD boundaries; PES may split or contain access units. */
+function deframeH264PesSamples(samples: readonly RemuxSampleEvidence[]): RemuxSampleEvidence[] {
+  if (samples.length === 0) return [];
+  const totalBytes = samples.reduce((sum, sample) => sum + sample.payload.byteLength, 0);
+  const joined = new Uint8Array(totalBytes);
+  const anchors: Array<{ offset: number; sample: RemuxSampleEvidence }> = [];
+  let writeOffset = 0;
+  for (const sample of samples) {
+    anchors.push({ offset: writeOffset, sample });
+    joined.set(sample.payload, writeOffset);
+    writeOffset += sample.payload.byteLength;
+  }
+  const nals = h264NalStarts(joined);
+  if (nals.length === 0 || !nals.some((nal) => nal.type === 9)) return [...samples];
+  const ranges: Array<{ start: number; end: number }> = [];
+  let accessUnitStart = nals[0]!.offset;
+  let sawVcl = false;
+  for (const nal of nals) {
+    if (nal.type === 9 && sawVcl) {
+      ranges.push({ start: accessUnitStart, end: nal.offset });
+      accessUnitStart = nal.offset;
+      sawVcl = false;
+    }
+    if (nal.type === 1 || nal.type === 5) sawVcl = true;
+  }
+  if (sawVcl) ranges.push({ start: accessUnitStart, end: joined.byteLength });
+  if (ranges.length === 0) return [...samples];
+
+  const out: RemuxSampleEvidence[] = [];
+  let anchorIndex = 0;
+  for (const range of ranges) {
+    while (anchorIndex + 1 < anchors.length && anchors[anchorIndex + 1]!.offset <= range.start) anchorIndex++;
+    const anchor = anchors[anchorIndex]!.sample;
+    const payload = joined.subarray(range.start, range.end);
+    out.push({
+      payload,
+      sourceByteLength: payload.byteLength,
+      ...(anchor.ptsUs !== undefined ? { ptsUs: anchor.ptsUs } : {}),
+      ...(anchor.dtsUs !== undefined ? { dtsUs: anchor.dtsUs } : {}),
+      keyframe: h264HasIdr(payload),
+      framing: 'annexb',
+    });
+  }
+  return out.map((sample, index) => {
+    const next = out[index + 1];
+    const durationUs = sample.ptsUs !== undefined && next?.ptsUs !== undefined && next.ptsUs > sample.ptsUs
+      ? next.ptsUs - sample.ptsUs
+      : undefined;
+    return durationUs === undefined ? sample : { ...sample, durationUs };
   });
 }
 
@@ -175,15 +254,35 @@ function audioFromPes(stream: TsStream, records: readonly PesRecord[]): RemuxTra
   if (read.state !== 'OK' || read.value.tracks.length !== 1) return undefined;
   const track = read.value.tracks[0]!;
   const originUs = records.find((record) => record.ptsUs !== undefined)?.ptsUs ?? 0;
+  const recordStarts: number[] = [];
+  let joinedOffset = 0;
+  for (const record of records) {
+    recordStarts.push(joinedOffset);
+    joinedOffset += record.payload.byteLength;
+  }
+  let recordIndex = 0;
+  const firstRelativePtsByRecord = new Map<number, number>();
   return {
     ...track,
     id: `ts:${stream.program}:${stream.pid}`,
-    samples: track.samples.map((sample) => ({
-      ...sample,
-      ...(sample.ptsUs !== undefined ? { ptsUs: sample.ptsUs + originUs } : {}),
-      ...(sample.dtsUs !== undefined ? { dtsUs: sample.dtsUs + originUs } : {}),
-      framing: sample.framing,
-    })),
+    samples: track.samples.map((sample) => {
+      while (
+        recordIndex + 1 < recordStarts.length &&
+        (sample.fileOffset ?? 0) >= recordStarts[recordIndex + 1]!
+      ) recordIndex++;
+      const record = records[recordIndex];
+      const relativePts = sample.ptsUs ?? 0;
+      const firstRelativePts = firstRelativePtsByRecord.get(recordIndex) ?? relativePts;
+      firstRelativePtsByRecord.set(recordIndex, firstRelativePts);
+      const anchorUs = record?.ptsUs ?? originUs;
+      const ptsUs = anchorUs + relativePts - firstRelativePts;
+      return {
+        ...sample,
+        ...(sample.ptsUs !== undefined ? { ptsUs } : {}),
+        ...(sample.dtsUs !== undefined ? { dtsUs: ptsUs } : {}),
+        framing: sample.framing,
+      };
+    }),
   };
 }
 
@@ -215,10 +314,22 @@ export function readTsProgram(bytes: Uint8Array): RemuxReadResult {
         if (payloadStart > packetStart + 188) return { state: 'MALFORMED', reasonCode: 'REMUX_TS_ADAPTATION_INVALID', evidence };
       }
       if (control === 2 || payloadStart === packetStart + 188) continue;
-      const priorCc = continuity.get(pid);
-      if (priorCc !== undefined && cc !== ((priorCc + 1) & 0x0f)) return { state: 'INCOMPLETE', reasonCode: 'REMUX_TS_CONTINUITY_GAP', evidence };
-      continuity.set(pid, cc);
       const payload = bytes.subarray(payloadStart, packetStart + 188);
+      const continuityRelevant = pid === 0 || pmtPids.has(pid) || streams.has(pid);
+      const priorCc = continuityRelevant ? continuity.get(pid) : undefined;
+      if (priorCc !== undefined && cc !== ((priorCc + 1) & 0x0f)) {
+        // Concatenated TS segments restart every PID's continuity counter after a fresh PAT. Accept
+        // that boundary only when the discontinuous packet is itself a complete, valid PAT; an
+        // arbitrary media-PID gap remains incomplete/corrupt input.
+        const restartedPat = pid === 0 && unitStart
+          ? completePsi(payload, true)
+          : undefined;
+        if (!restartedPat || !parsePat(restartedPat)) {
+          return { state: 'INCOMPLETE', reasonCode: 'REMUX_TS_CONTINUITY_GAP', evidence };
+        }
+        continuity.clear();
+      }
+      if (continuityRelevant) continuity.set(pid, cc);
       if (pid === 0) {
         const section = completePsi(payload, unitStart);
         if (section) {
@@ -276,18 +387,25 @@ export function readTsProgram(bytes: Uint8Array): RemuxReadResult {
         if (!track) return { state: 'UNSUPPORTED_STRUCTURE', reasonCode: 'REMUX_TS_AUDIO_FRAMING_UNSUPPORTED', evidence };
         tracks.push(track);
       } else {
+        const samples = timestampsFromPes(streamRecords, 'annexb');
         tracks.push({
           id: `ts:${stream.program}:${stream.pid}`, type: 'video', codec: stream.codec,
-          timescale: 90_000, samples: timestampsFromPes(streamRecords, 'annexb'),
+          timescale: 90_000,
+          samples: stream.codec === 'h264' ? deframeH264PesSamples(samples) : samples,
         });
       }
     }
     if (tracks.length === 0) return { state: 'MALFORMED', reasonCode: 'REMUX_TS_MEDIA_SAMPLES_MISSING', evidence };
     const parsedSamples = tracks.reduce((sum, track) => sum + track.samples.length, 0);
-    const allEnds = tracks.flatMap((track) => track.samples.map((sample) =>
-      sample.ptsUs !== undefined && sample.durationUs !== undefined ? sample.ptsUs + sample.durationUs : sample.ptsUs ?? 0));
-    const origin = Math.min(...tracks.flatMap((track) => track.samples.map((sample) => sample.ptsUs).filter((v): v is number => v !== undefined)));
-    const end = Math.max(...allEnds);
+    let origin = Number.POSITIVE_INFINITY;
+    let end = Number.NEGATIVE_INFINITY;
+    for (const track of tracks) {
+      for (const sample of track.samples) {
+        if (sample.ptsUs === undefined) continue;
+        origin = Math.min(origin, sample.ptsUs);
+        end = Math.max(end, sample.ptsUs + (sample.durationUs ?? 0));
+      }
+    }
     const value: RemuxProgramEvidence = {
       schema: 'media-test/remux-program@1', container: 'ts', byteLength: bytes.byteLength,
       ...(Number.isFinite(origin) && Number.isFinite(end) && end > origin ? { durationUs: end - origin } : {}),

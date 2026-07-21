@@ -127,6 +127,13 @@ import type {
 } from '../../core/engine.ts';
 import { CorpusDeliveryIntegrityError } from '../../core/selection-integrity.ts';
 import { readOutputStructure, type ReadStructure } from '../../core/box-readers.ts';
+import {
+  readIsoBmffPresentationTimeline,
+  smallTrailingIsoEditSampleIndices,
+  type IsoBmffPresentationTimeline,
+  type IsoBmffTrackTimeline,
+} from '../../features/trim/isobmff-timeline.ts';
+import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
 import type { StreamingRuntimeEvidence } from '../../features/streaming-output/runtime.ts';
 import type { StreamingRepresentation } from '../../features/streaming-output/contracts.ts';
 import {
@@ -278,6 +285,16 @@ function alphaModeFrom(opts?: Record<string, unknown>): AlphaMode | undefined {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isGracefulNegativeRequest(context?: OperationContext): boolean {
+  const options = context?.request.options;
+  const robustness = options?.robustness;
+  return options?.gracefulAllowOutput === true || (
+    isPlainObject(robustness) &&
+    robustness.schema === 'media-test/robustness-contract@1' &&
+    robustness.inputClass === 'negative'
+  );
 }
 
 function videoTransformExtrasFrom(opts?: Record<string, unknown>): VideoTransformExtras {
@@ -1361,6 +1378,66 @@ function applyNeutralTrackLanguageEvidence(
     const language = neutralStructure.tracks[matchIndex]?.language;
     if (language && language !== 'und') track.language = language;
   }
+}
+
+function matchIsoBmffTimelineTracks(
+  tracks: readonly NormalizedTrack[],
+  timeline: IsoBmffPresentationTimeline | undefined,
+): Map<number, IsoBmffTrackTimeline> {
+  const matches = new Map<number, IsoBmffTrackTimeline>();
+  if (!timeline) return matches;
+  const used = new Set<number>();
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex]!;
+    let timelineIndex = timeline.tracks.findIndex((candidate, index) =>
+      !used.has(index) && candidate.type === track.type && candidate.codec === track.codec);
+    if (timelineIndex < 0) {
+      timelineIndex = timeline.tracks.findIndex((candidate, index) =>
+        !used.has(index) && candidate.type === track.type);
+    }
+    if (timelineIndex < 0) continue;
+    used.add(timelineIndex);
+    const candidate = timeline.tracks[timelineIndex]!;
+    matches.set(trackIndex, candidate);
+    track.mediaTimescale = candidate.mediaTimescale;
+    track.rawMediaSpanSec = candidate.mediaDurationTicks / candidate.mediaTimescale;
+    track.presentationStartSec = candidate.presentationStartUs / 1_000_000;
+    track.presentationDurationSec = candidate.presentationEndUs / 1_000_000;
+    track.editListSpanSec = candidate.presentationEndUs / 1_000_000;
+    if (candidate.edits.length > 0) {
+      track.editList = candidate.edits.map((edit) => ({
+        segmentDuration: edit.segmentDurationMovieTicks,
+        mediaTime: edit.mediaTimeTicks,
+        mediaRateNumerator: edit.mediaRateInteger,
+        mediaRateDenominator: 1,
+        movieTimescale: timeline.movieTimescale,
+        mediaTimescale: candidate.mediaTimescale,
+      }));
+    }
+  }
+  return matches;
+}
+
+function applyExactMp3PresentationEvidence(
+  metadata: NormalizedMetadata,
+  bytes: Uint8Array | undefined,
+): void {
+  if (!bytes) return;
+  const inspected = inspectTrimAudioContainer(bytes, 'mp3');
+  if (inspected.state !== 'OK' || inspected.value.precision !== 'exact') return;
+  const evidence = inspected.value;
+  const rawMediaSpanSec = evidence.codedSampleFrames / evidence.sampleRate;
+  const presentationDurationSec = evidence.presentationSampleFrames / evidence.sampleRate;
+  metadata.rawMediaSpanSec = rawMediaSpanSec;
+  metadata.presentationDurationSec = presentationDurationSec;
+  metadata.durationSec = presentationDurationSec;
+  const audio = metadata.tracks.find((track) => track.type === 'audio' && track.codec === 'mp3');
+  if (!audio) return;
+  audio.rawMediaSpanSec = rawMediaSpanSec;
+  audio.presentationDurationSec = presentationDurationSec;
+  audio.primingSamples = evidence.primingSampleFrames;
+  audio.paddingSamples = evidence.endTrimSampleFrames;
+  audio.mediaTimescale = evidence.sampleRate;
 }
 
 /** Probe an already-opened Input into NormalizedMetadata. */
@@ -3267,10 +3344,17 @@ export class MediabunnyEngine implements MediaEngine {
     this.assertRuntimeSupport(context);
     const scaleContract = demuxScaleContractFromOptions(context?.request.options);
     const containerHint = context?.request.inputs[0]?.container;
-    const neutralStructure = !scaleContract && !isHlsAsset(input, containerHint) &&
-      /^(?:mp4|mov|mkv|webm)$/.test(containerHint ?? '')
-      ? readOutputStructure(new Uint8Array(await input.arrayBuffer()), containerHint) ?? undefined
+    const inspectionBytes = !scaleContract && !isHlsAsset(input, containerHint) &&
+      /^(?:mp4|mov|mkv|webm|mp3)$/.test(containerHint ?? '')
+      ? new Uint8Array(await input.arrayBuffer())
       : undefined;
+    const neutralStructure = inspectionBytes && /^(?:mp4|mov|mkv|webm)$/.test(containerHint ?? '')
+      ? readOutputStructure(inspectionBytes, containerHint) ?? undefined
+      : undefined;
+    const isoBmffRead = inspectionBytes && /^(?:mp4|mov)$/.test(containerHint ?? '')
+      ? readIsoBmffPresentationTimeline(inspectionBytes)
+      : undefined;
+    const isoBmffTimeline = isoBmffRead?.state === 'OK' ? isoBmffRead : undefined;
     const operationStart = nowMs();
     let sourceBytesRead = 0;
     const onSourceRead = scaleContract && context
@@ -3295,6 +3379,8 @@ export class MediabunnyEngine implements MediaEngine {
         ...(neutralStructure ? { neutralStructure } : {}),
       });
       const tracks = await mbInput.getTracks();
+      applyExactMp3PresentationEvidence(metadata, containerHint === 'mp3' ? inspectionBytes : undefined);
+      const isoBmffTracks = matchIsoBmffTimelineTracks(metadata.tracks, isoBmffTimeline);
       const packets: PacketInfo[] = [];
       const representations: NonNullable<DemuxResult['representations']> = [];
       let bytesRead = 0;
@@ -3328,11 +3414,13 @@ export class MediabunnyEngine implements MediaEngine {
         });
         const sink = new this.lib.EncodedPacketSink(track);
         const observedPackets: PacketInfo[] = [];
+        const presentedSampleIndices = smallTrailingIsoEditSampleIndices(isoBmffTracks.get(trackIndex));
         // verifyKeyPackets gives accurate keyframe flags. NOTE: mediabunny rejects metadataOnly +
         // verifyKeyPackets together, and the packet table needs byteLength, so we load full packets.
         for await (const pkt of sink.packets(undefined, undefined, {
           verifyKeyPackets: true,
         })) {
+          if (presentedSampleIndices && !presentedSampleIndices.has(pkt.sequenceNumber)) continue;
           const ptsUs = pkt.microsecondTimestamp;
           const payload = scaleContract ? undefined : copyBytes(pkt.data);
           const keyframe = normalized.codec === 'h264'
@@ -3448,6 +3536,19 @@ export class MediabunnyEngine implements MediaEngine {
         sourceTrackCount += prepared.sourceTrackCount;
         bytesRead += prepared.bytesRead;
         if (inputIndex === 0) metadataTags = prepared.metadataTags;
+      } catch (error) {
+        if (error instanceof this.lib.UnsupportedInputFormatError && isGracefulNegativeRequest(context)) {
+          throw createMalformedInputError(
+            this.id,
+            'remux',
+            'parse',
+            'Mediabunny rejected the declared malformed remux input',
+            'MEDIABUNNY_REMUX_INPUT_MALFORMED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
       } finally {
         unbindAbort();
         mbInput.dispose();

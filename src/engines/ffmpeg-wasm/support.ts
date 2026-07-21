@@ -90,6 +90,17 @@ export function decideFfmpegSupport(
   // launder malformed input into NA_ENGINE, which is forbidden by the benchmark contract.
   if (request.inputs.some((input) => input.mutated)) return { supported: true };
 
+  const robustness = asRecord(asRecord(request.options).robustness);
+  if (
+    request.operation === 'demux' &&
+    robustness.schema === 'media-test/demux-scale-contract@1'
+  ) {
+    return reject(
+      'FFMPEG_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+      'the ffmpeg.wasm CLI materializes framecrc as a completed batch and cannot expose a real first-packet boundary',
+    );
+  }
+
   const tracks = request.inputs.flatMap((input) => input.tracks);
   if (tracks.length > limits.maxTrackCount) {
     return reject('FFMPEG_TRACK_COUNT_LIMIT', `${tracks.length} tracks exceed adapter limit ${limits.maxTrackCount}`);

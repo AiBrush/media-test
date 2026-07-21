@@ -158,6 +158,18 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     expect(decideFfmpegSupport(malformed, RUNTIME)).toEqual({ supported: true });
   });
 
+  test('declares typed demux scale rows NA when packet-yield latency is unobservable', () => {
+    expect(reason(request('demux', 'mp4', av('h264', 'aac'), {
+      options: {
+        robustness: {
+          schema: 'media-test/demux-scale-contract@1',
+          bucket: 'large',
+          limits: { firstPacketMs: 10_000, lastPacketMs: 600_000 },
+        },
+      },
+    }))).toBe('FFMPEG_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE');
+  });
+
   test('retains the full rejected tuple summary', () => {
     const tuple = request('transcode', 'mp4', av('h264', 'aac'), {
       output: { container: 'webm', videoCodec: 'vp9', audioCodec: 'vorbis', width: 640, height: 360 },

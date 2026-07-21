@@ -146,6 +146,7 @@ interface Mp4boxConfigState {
   inputBytes: number;
   appendCount: number;
   releasedSamples: number;
+  presentationEditFilteredSamples: number;
   peakParserSampleBytes: number;
   peakOwnedSampleBytes: number;
   peakOutputTargetBytes: number;
@@ -178,6 +179,7 @@ function freshConfigState(): Mp4boxConfigState {
     inputBytes: 0,
     appendCount: 0,
     releasedSamples: 0,
+    presentationEditFilteredSamples: 0,
     peakParserSampleBytes: 0,
     peakOwnedSampleBytes: 0,
     peakOutputTargetBytes: 0,
@@ -564,6 +566,48 @@ function editPresentationSpanSec(track: Mp4Track): number | undefined {
   return ticks > 0 ? ticks / timescale : undefined;
 }
 
+/**
+ * Golden demux semantics retain coded priming packets before the presentation origin. The one
+ * bounded correction required for MOV packet parity is a short trailing edit that excludes a
+ * contiguous suffix of surplus coded samples. Mirror the neutral ISO BMFF timeline rule used by
+ * the Mediabunny adapter and decline every wider edit-list rewrite.
+ */
+function smallTrailingEditSampleNumbers(
+  track: Mp4Track,
+  samples: readonly Mp4Sample[],
+): Set<number> | undefined {
+  const edits = normalizedEdits(track);
+  if (
+    samples.length === 0
+    || edits.length === 0
+    || !(track.timescale > 0)
+    || !(track.movie_timescale > 0)
+    || !(track.duration > 0)
+  ) return undefined;
+
+  const presentationSpanSec = edits.reduce(
+    (sum, edit) => sum + Math.max(0, edit.segmentDuration),
+    0,
+  ) / track.movie_timescale;
+  const rawMediaSpanSec = track.duration / track.timescale;
+  const trailingEditSec = rawMediaSpanSec - presentationSpanSec;
+  if (!(trailingEditSec > 0 && trailingEditSec <= 0.1)) return undefined;
+
+  const included = samples.filter((sample) => edits.some((edit) => {
+    if (edit.mediaTime < 0 || edit.segmentDuration <= 0) return false;
+    const mediaStart = edit.mediaTime;
+    const mediaEnd = mediaStart + edit.segmentDuration * track.timescale / track.movie_timescale;
+    return Math.max(sample.cts, mediaStart) < Math.min(sample.cts + sample.duration, mediaEnd);
+  })).map((sample) => sample.number).sort((a, b) => a - b);
+
+  // Applying only to a zero-based contiguous prefix prevents this normalization from rewriting
+  // leading edits, repeated edits, gaps, or reordered sample membership.
+  if (included.length === 0 || included.some((sampleNumber, index) => sampleNumber !== index)) {
+    return undefined;
+  }
+  return new Set(included);
+}
+
 /** `Movie.tracks[].nb_samples` is an onReady snapshot and can be stale for progressive fMP4. */
 function trackSampleCount(file: Mp4ISOFile, track: Mp4Track): number {
   try {
@@ -851,7 +895,9 @@ export function mp4boxSampleEvidence(
   return {
     trackIndex,
     trackType: type,
-    codec,
+    // Canonical codec tokens are an audio/video semantic axis. Auxiliary ISO tracks (for example
+    // QuickTime `tmcd`) retain their track type and native metadata without inventing an AV codec.
+    ...(type === 'video' || type === 'audio' ? { codec } : {}),
     size: sample.size,
     ptsUs: (sample.cts * 1_000_000) / timescale,
     dtsUs: (sample.dts * 1_000_000) / timescale,
@@ -1599,11 +1645,22 @@ export class Mp4boxEngine implements MediaEngine {
       const packets: PacketInfo[] = [];
       const extractedCounts = new Map<number, number>();
       const idToIndex = new Map<number, number>();
+      const presentedSampleNumbers = new Map<number, Set<number>>();
       let readyMetadata: NormalizedMetadata | undefined;
       let ownedPacketBytes = 0;
+      let presentationEditFilteredSamples = 0;
       const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
         readyMetadata = toNormalizedMetadata(readyFile, readyInfo);
-        readyInfo.tracks.forEach((track, index) => idToIndex.set(track.id, index));
+        readyInfo.tracks.forEach((track, index) => {
+          idToIndex.set(track.id, index);
+          // Fragment callbacks may use fragment-local sample numbers, while getTrackSamplesInfo()
+          // exposes a synthesized global table. Restrict this table-membership correction to the
+          // non-fragmented MOV/MP4 sample tables for which the numbering identity is authoritative.
+          const filter = readyInfo.isFragmented
+            ? undefined
+            : smallTrailingEditSampleNumbers(track, readyFile.getTrackSamplesInfo(track.id));
+          if (filter) presentedSampleNumbers.set(track.id, filter);
+        });
         readyFile.onSamples = (id: number, _user: unknown, samples: Mp4Sample[]) => {
           throwIfError();
           const trackIndex = idToIndex.get(id);
@@ -1611,7 +1668,12 @@ export class Mp4boxEngine implements MediaEngine {
           const normalized = readyMetadata?.tracks[trackIndex];
           if (!normalized) throw new Error(`${ENGINE_ID}: missing track evidence for ${id}`);
           const entries = sampleEntriesForTrack(readyFile, id);
+          const presented = presentedSampleNumbers.get(id);
           for (const sample of samples) {
+            if (presented && !presented.has(sample.number)) {
+              presentationEditFilteredSamples++;
+              continue;
+            }
             if (!sample.data || sample.data.byteLength !== sample.size) {
               throw new Error(`${ENGINE_ID}: track ${id} sample ${sample.number} has incomplete mdat payload`);
             }
@@ -1676,6 +1738,7 @@ export class Mp4boxEngine implements MediaEngine {
             framing: representation.framing,
             descriptionBytes: representation.description?.byteLength ?? 0,
           })),
+          presentationEditFilteredSamples,
         };
         const telemetry = { bytesRead: this.configState.inputBytes, packetCount: packets.length };
         metadata.telemetry = telemetry;

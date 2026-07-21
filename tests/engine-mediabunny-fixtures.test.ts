@@ -682,6 +682,86 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
       });
     });
   });
+
+  test('demux applies ISO edit-list presentation membership to coded MOV packets', async () => {
+    const input = await fixture('scenarios/demux/h264_1080p_5s/01.mov');
+    const controller = new AbortController();
+    await withEngine(async (engine) => {
+      const result = await engine.demux(input, {
+        signal: controller.signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'demux/h264_1080p_5s',
+          operation: 'demux',
+          inputs: [{
+            id: input.id,
+            mime: 'video/quicktime',
+            container: 'mov',
+            mutated: false,
+            tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
+          }],
+          options: {},
+        },
+      });
+      expect(result.packets).toHaveLength(472);
+      expect(result.packets.filter((packet) => packet.trackIndex === 0)).toHaveLength(194);
+      const audioPackets = result.packets.filter((packet) => packet.trackIndex === 1);
+      expect(audioPackets).toHaveLength(278);
+      expect(audioPackets.at(-1)?.accessUnitId).toBe('1:277');
+      expect(result.metadata.tracks[1]).toMatchObject({
+        mediaTimescale: 441_000,
+        presentationDurationSec: 6.453696,
+        editList: [{
+          segmentDuration: 2_846_080,
+          mediaTime: 0,
+          mediaRateNumerator: 1,
+          mediaRateDenominator: 1,
+        }],
+      });
+      expect(result.metadata.tracks[1]?.rawMediaSpanSec).toBeCloseTo(6.501587301587301, 12);
+    });
+  });
+
+  test('demux reports exact LAME/Xing MP3 presentation duration with priming and padding evidence', async () => {
+    const input = await fixture('scenarios/demux/realworld_mdn_trex_mp3/realworld_mdn_trex.mp3');
+    const controller = new AbortController();
+    await withEngine(async (engine) => {
+      const result = await engine.demux(input, {
+        signal: controller.signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'demux/realworld_mdn_trex_mp3',
+          operation: 'demux',
+          inputs: [{
+            id: input.id,
+            mime: 'audio/mpeg',
+            container: 'mp3',
+            mutated: false,
+            tracks: [{ type: 'audio', codec: 'mp3' }],
+          }],
+          options: {},
+        },
+      });
+      expect(result.packets).toHaveLength(81);
+      expect(result.metadata.durationSec).toBeCloseTo(91_473 / 44_100, 9);
+      expect(result.metadata).toMatchObject({
+        presentationDurationSec: 91_473 / 44_100,
+        rawMediaSpanSec: 93_312 / 44_100,
+      });
+      expect(result.metadata.tracks[0]).toMatchObject({
+        primingSamples: 576,
+        paddingSamples: 1_263,
+        presentationDurationSec: 91_473 / 44_100,
+        rawMediaSpanSec: 93_312 / 44_100,
+      });
+    });
+  });
 });
 
 describe('Mediabunny HLS root classification', () => {
@@ -779,6 +859,45 @@ describe('Mediabunny HLS root classification', () => {
 });
 
 describe('REQ-ENG-02/04: strict packet-copy remux and mux contract', () => {
+  test('negative remux parser rejection uses the typed graceful-failure channel', async () => {
+    await withEngine(async (engine) => {
+      const input = memoryInput('zeroed.mp4', new Uint8Array(64), 'video/mp4');
+      await expect(engine.remux(input, { container: 'mkv' }, {
+        signal: new AbortController().signal,
+        phase: 'functional',
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: 'remux/negative-typed-test',
+          operation: 'remux',
+          inputs: [{
+            id: input.id,
+            mime: input.mime,
+            container: 'mp4',
+            mutated: false,
+            sourceEvidence: 'UNRESOLVED',
+            tracks: [],
+          }],
+          output: { container: 'mkv' },
+          options: {
+            container: 'mkv',
+            robustness: {
+              schema: 'media-test/robustness-contract@1',
+              inputClass: 'negative',
+              returnedOutputCheck: 'media-structure',
+              survivorOracles: ['graceful-failure'],
+              timeoutMs: 15_000,
+            },
+          },
+        },
+      })).rejects.toMatchObject({
+        reasonCode: 'MEDIABUNNY_REMUX_INPUT_MALFORMED',
+        operation: 'remux',
+      });
+    });
+  });
+
   test('one-frame MP4 remux preserves track accounting, codec config, and packet essence exactly', async () => {
     await withEngine(async (engine) => {
       const input = await fixture('micro_h264_1frame.mp4');

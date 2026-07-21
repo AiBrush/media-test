@@ -80,16 +80,6 @@ const FORCED_TIMEOUT_CELLS: readonly ForcedTimeoutCell[] = [];
  */
 const DISABLED_CELLS: readonly DisabledCell[] = [
   budget(
-    'demux/size_huge_huge_h264_1080p_600s',
-    'Full packet callbacks over the 600-second H.264 file exceed the practical shared-run budget.',
-    'Retest after a Remotion parser release adds bounded/random-access packet iteration.',
-  ),
-  budget(
-    'demux/size_massive_massive_h264_1080p_2h',
-    'The two-hour H.264 full demux does not complete within the matrix operation budget.',
-    'Retest after streaming packet iteration avoids a full-file scan.',
-  ),
-  budget(
     'performance/size-ladder-iterate-packets-huge',
     'Repeated full packet iteration of the huge file exceeded the 300-second benchmark watchdog.',
     'Retest when benchmark work can reuse a validated packet walk or parser throughput materially improves.',
@@ -108,16 +98,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'streaming-output/buffer_massive_h264_mp4',
     'A no-reuse Chromium run timed out buffering the two-hour MP4 through bufferWriter.',
     'Retest when the adapter exposes a bounded streaming target for this operation.',
-  ),
-  budget(
-    'demux/size_large_large_h264_1080p_120s',
-    'Correctness plus benchmark repetitions multiply a complete 120-second sample-callback walk.',
-    'Retest when the parser can expose packet tables incrementally or benchmark reuse is validated.',
-  ),
-  budget(
-    'demux/size_large_large_vp9_1080p_120s',
-    'Correctness plus benchmark repetitions multiply a complete 120-second sample-callback walk.',
-    'Retest when the parser can expose packet tables incrementally or benchmark reuse is validated.',
   ),
   budget(
     'performance/size-ladder-iterate-packets-large',

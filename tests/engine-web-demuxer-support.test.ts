@@ -72,6 +72,17 @@ describe('REQ-ENG-26: web-demuxer operation-scoped tuple support', () => {
     }
   });
 
+  test('declares demux scale rows unsupported without a real package first-packet boundary', () => {
+    const scaled = request('demux', 'mp4', [video('h264')], {
+      options: { invariant: 'demux-scale-budgets' },
+    });
+    expect(decideWebDemuxerSupport(scaled)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: WEB_DEMUXER_REASON.DEMUX_SCALE,
+    });
+  });
+
   test('decides selected-track, protection, data-track, and invalid cross-product misses', () => {
     expect(reason(request('decodeFrames', 'mp4', [audio('aac')]))).toBe(WEB_DEMUXER_REASON.VIDEO_REQUIRED);
     expect(reason(request('seek', 'mp4', [video('h264'), audio('aac')], {

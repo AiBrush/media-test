@@ -923,9 +923,15 @@ function validateCoverage(value: unknown, exhaustive: unknown, path: string, add
   }
   if (admissible !== value.admissible) add(`${path}.admissible`, 'COVERAGE_ADMISSIBLE_MISMATCH', 'must equal pass + fail + error');
   if (counts.total !== value.total) add(`${path}.total`, 'COVERAGE_TOTAL_MISMATCH', 'must equal counts.total');
-  const total = typeof value.total === 'number' ? value.total : Number.NaN;
   const validCount = typeof value.valid === 'number' ? value.valid : Number.NaN;
-  const expectedGrade = total > 0 && validCount === total ? 'full' : validCount > 0 ? 'partial' : 'none';
+  const terminalIntrinsicCoverage =
+    validCount > 0 &&
+    numberOrNaN(counts.fail) === 0 &&
+    numberOrNaN(counts.error) === 0 &&
+    numberOrNaN(counts.naBrowser) === 0 &&
+    numberOrNaN(counts.naAsset) === 0 &&
+    numberOrNaN(counts.skipped) === 0;
+  const expectedGrade = terminalIntrinsicCoverage ? 'full' : validCount > 0 ? 'partial' : 'none';
   if (value.grade !== expectedGrade) add(`${path}.grade`, 'COVERAGE_GRADE_MISMATCH', `must be '${expectedGrade}' for these counts`);
   if (Array.isArray(exhaustive)) {
     if (exhaustive.length !== value.total) add(`${path}.total`, 'COVERAGE_FILES_MISMATCH', 'must equal exhaustive.length');

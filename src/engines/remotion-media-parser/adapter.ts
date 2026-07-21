@@ -121,6 +121,7 @@ import {
   validateCapabilitySet,
   validateSupportDecision,
 } from '../../core/engine.ts';
+import { sha256Hex } from '../../core/canonical-json.ts';
 
 import {
   mpAudioToCanonical,
@@ -131,6 +132,15 @@ import {
   decideRemotionParserSupport,
 } from '../remotion/support.ts';
 import { parseAacAudioSpecificConfig } from '../mp4box/evidence.ts';
+import {
+  readIsoBmffPresentationTimeline,
+  smallTrailingIsoEditSampleIndices,
+  type IsoBmffPresentationTimeline,
+  type IsoBmffTrackTimeline,
+} from '../../features/trim/isobmff-timeline.ts';
+import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
+import { readTsProgram } from '../../features/remux/reader-ts.ts';
+import type { RemuxSampleEvidence, RemuxTrackEvidence } from '../../features/remux/types.ts';
 
 const ENGINE_ID = 'remotion-media-parser@4.0.479';
 
@@ -268,7 +278,6 @@ export class RemotionMediaParserEngine implements MediaEngine {
         'http-range', // webReader issues HTTP Range requests for URL sources (HLS path; dossier §A.1/§A.14)
         'streaming-read', // progressive parse, async-callback back-pressure
         'worker', // parseMediaOnWebWorker main-thread offload (when bundler allows)
-        'packets:dts', // sample.decodingTimestamp is surfaced separately from timestamp
         'webcodecs:samples', // emits EncodedVideoChunk/EncodedAudioChunk-compatible samples
       ],
       probeReadModes: ['range', 'progressive'],
@@ -470,7 +479,7 @@ export class RemotionMediaParserEngine implements MediaEngine {
       try {
         return validateAdapterResult(ENGINE_ID, 'probe', await this.probeImpl(input, call));
       } catch (error) {
-        if (call.request.options.gracefulAllowOutput === true && !isMalformedInputError(error)) {
+        if (isGracefulNegativeRequest(call.request) && !isMalformedInputError(error)) {
           throw createMalformedInputError(
             ENGINE_ID,
             'probe',
@@ -671,6 +680,58 @@ export class RemotionMediaParserEngine implements MediaEngine {
         return validateAdapterResult(ENGINE_ID, 'demux', await this.demuxImpl(input, call), {
           requireExplicitCodedRepresentation: true,
         });
+      } catch (error) {
+        if (isGracefulNegativeRequest(call.request) && !isMalformedInputError(error)) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'demux',
+            'parse',
+            describeError(error),
+            'REMOTION_DEMUX_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
+        }
+        if (!input.mutated && isTsInput(input) && /SPS not found/i.test(describeError(error))) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'demux',
+            'media-parser 4.0.479 cannot demux this valid TS stream because no SPS is available before its first parsed H.264 access unit',
+            {
+              inputContainers: call.request.inputs.map((entry) => entry.container),
+              inputCodecs: call.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+              options: { inputId: input.id },
+            },
+            'REMOTION_TS_DEMUX_SPS_REQUIRED',
+          );
+        }
+        if (!input.mutated && isAdtsInput(input) && /Unknown file format/i.test(describeError(error))) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'demux',
+            'media-parser 4.0.479 does not recognize the selected valid raw ADTS stream',
+            {
+              inputContainers: call.request.inputs.map((entry) => entry.container),
+              inputCodecs: call.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+              options: { inputId: input.id },
+            },
+            'REMOTION_ADTS_VARIANT_UNRECOGNIZED',
+          );
+        }
+        if (!input.mutated && isWavInput(input) && /(?:unknown|unsupported|invalid).*WAV|WAV.*(?:unknown|unsupported|invalid)/i.test(describeError(error))) {
+          throw createNotApplicableError(
+            ENGINE_ID,
+            'demux',
+            `media-parser 4.0.479 rejects the selected valid WAV structure: ${describeError(error)}`,
+            {
+              inputContainers: call.request.inputs.map((entry) => entry.container),
+              inputCodecs: call.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+              options: { inputId: input.id },
+            },
+            'REMOTION_WAV_STRUCTURE_UNSUPPORTED',
+          );
+        }
+        throw error;
       } finally {
         this.config = { ...this.config, cleanupComplete: this.activeControllers.size === 0 };
       }
@@ -680,23 +741,27 @@ export class RemotionMediaParserEngine implements MediaEngine {
   private async demuxImpl(input: MediaInput, context: OperationContext): Promise<DemuxResult> {
     // Packets are tagged with the parser's stable trackId, then mapped to declared track order.
     const tagged: TaggedPacket[] = [];
+    const sampleCountByTrackId = new Map<number, number>();
+
+    const addSample = (
+      trackId: number,
+      packet: PacketInfo,
+    ): void => {
+      const sampleIndex = sampleCountByTrackId.get(trackId) ?? 0;
+      sampleCountByTrackId.set(trackId, sampleIndex + 1);
+      tagged.push({ trackId, sampleIndex, packet });
+    };
 
     const onVideoTrack: MediaParserOnVideoTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserVideoSample) => {
-        tagged.push({
-          trackId,
-          packet: remotionParserSampleEvidence(sample, -1, track),
-        });
+        addSample(trackId, remotionParserSampleEvidence(sample, -1, track));
       };
     };
     const onAudioTrack: MediaParserOnAudioTrack = ({ track }) => {
       const trackId = track.trackId;
       return (sample: MediaParserAudioSample) => {
-        tagged.push({
-          trackId,
-          packet: remotionParserSampleEvidence(sample, -1, track),
-        });
+        addSample(trackId, remotionParserSampleEvidence(sample, -1, track));
       };
     };
 
@@ -733,14 +798,8 @@ export class RemotionMediaParserEngine implements MediaEngine {
     // Preserve the parser's declared track order. Cross-engine comparison is semantic/by-type; this
     // adapter must not reorder evidence merely to reproduce ffprobe stream indices.
     const frameworkIndexById = frameworkTrackIndexMap(result.tracks);
-    const packets: PacketInfo[] = tagged.map(({ trackId, packet }) => ({
-      ...packet,
-      // A trackId with no entry in tracks[] (shouldn't happen) sorts last but stays deterministic.
-      trackIndex: frameworkIndexById.get(trackId) ?? frameworkIndexById.size,
-    }));
-
     // Build metadata in the SAME declared order so PacketInfo.trackIndex indexes tracks[].
-    const metadata = await this.toNormalizedMetadata(
+    let metadata = await this.toNormalizedMetadata(
       {
         durationInSeconds: result.durationInSeconds,
         container: result.container,
@@ -753,9 +812,88 @@ export class RemotionMediaParserEngine implements MediaEngine {
       input,
     );
 
-    const representations = result.tracks.map((track) =>
-      trackRepresentation(track, frameworkIndexById.get(track.trackId) ?? frameworkIndexById.size, result.container),
-    );
+    const container = metadata.container;
+    const inspectWholeFile = !input.mutated && /^(?:mp4|mov|mp3)$/.test(container);
+    const inspectionBytes = inspectWholeFile
+      ? new Uint8Array(await input.arrayBuffer())
+      : undefined;
+    const headerMetadata = !input.mutated && /^(?:mkv|webm)$/.test(container)
+      ? await webmHeaderMetadata(input)
+      : null;
+    metadata = await enrichProbeMetadata(metadata, result.tracks, headerMetadata, input, () => undefined);
+
+    const timelineRead = inspectionBytes && /^(?:mp4|mov)$/.test(container)
+      ? readIsoBmffPresentationTimeline(inspectionBytes)
+      : undefined;
+    const timeline = timelineRead?.state === 'OK' ? timelineRead : undefined;
+    const timelineTracks = matchIsoBmffTimelineTracks(metadata.tracks, timeline);
+    const presentedByTrackIndex = new Map<number, Set<number>>();
+    const syncByTrackIndex = new Map<number, Map<number, boolean>>();
+    for (const [trackIndex, timelineTrack] of timelineTracks) {
+      const parserTrack = result.tracks.find((track) => frameworkIndexById.get(track.trackId) === trackIndex);
+      const extractedCount = parserTrack ? sampleCountByTrackId.get(parserTrack.trackId) ?? 0 : 0;
+      if (extractedCount !== timelineTrack.codedSampleCount) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'demux',
+          `media-parser 4.0.479 extracted ${extractedCount}/${timelineTrack.codedSampleCount} coded samples for ISO track ${timelineTrack.trackId}`,
+          {
+            inputContainers: context.request.inputs.map((entry) => entry.container),
+            inputCodecs: context.request.inputs.flatMap((entry) => entry.tracks.map((track) => track.codec)),
+            options: { inputId: input.id, trackId: timelineTrack.trackId },
+          },
+          'REMOTION_ISOBMFF_SAMPLE_EXTRACTION_INCOMPLETE',
+        );
+      }
+      const presented = smallTrailingIsoEditSampleIndices(timelineTrack);
+      if (presented) presentedByTrackIndex.set(trackIndex, presented);
+      syncByTrackIndex.set(
+        trackIndex,
+        new Map(timelineTrack.samples.map((sample) => [sample.sampleIndex, sample.sync])),
+      );
+    }
+
+    // media-parser lawfully rewrites MPEG-TS H.264 Annex-B to AVCC, strips ADTS headers, and rounds
+    // segment-local timestamps. Bind every emitted sample to the dependency-free source reader by
+    // coded essence before reporting the source-container packet view expected by the demux contract.
+    // The normalization is all-or-nothing: any count or payload-identity disagreement leaves the
+    // framework evidence untouched so an actual parser defect cannot be hidden by the neutral reader.
+    const transportSource = !input.mutated && (container === 'ts' || container === 'hls')
+      ? await transportSourceBindings(input, context.signal, result.tracks, frameworkIndexById, tagged)
+      : undefined;
+
+    const packets: PacketInfo[] = tagged.flatMap(({ trackId, sampleIndex, packet }) => {
+      const trackIndex = frameworkIndexById.get(trackId) ?? frameworkIndexById.size;
+      const presented = presentedByTrackIndex.get(trackIndex);
+      if (presented && !presented.has(sampleIndex)) return [];
+      const sync = syncByTrackIndex.get(trackIndex)?.get(sampleIndex);
+      const sourcePacket = sync === undefined ? packet : { ...packet, keyframe: sync };
+      const sourceTrack = transportSource?.get(trackIndex);
+      const sourceSample = sourceTrack?.samples[sampleIndex];
+      const indexed = sourceSample
+        ? normalizedTransportPacket(sourcePacket, trackIndex, sourceTrack, sourceSample)
+        : { ...sourcePacket, trackIndex };
+      const withDigest = indexed.payload
+        ? { ...indexed, payloadDigest: sha256Hex(indexed.payload) }
+        : indexed;
+      if (withDigest.dtsUs === undefined) return [withDigest];
+      const { dtsUs: _nonAuthoritativeDts, ...withoutDts } = withDigest;
+      return [withoutDts];
+    });
+
+    normalizeMp3PacketTimes(metadata, packets, container);
+    metadata = normalizePcmPacketTimes(metadata, packets, container);
+    metadata = withDurationFromPackets(metadata, packets);
+    metadata = withVideoFpsFromPackets(metadata, packets);
+    applyExactMp3PresentationEvidence(metadata, container === 'mp3' ? inspectionBytes : undefined);
+
+    const representations = result.tracks.map((track) => {
+      const trackIndex = frameworkIndexById.get(track.trackId) ?? frameworkIndexById.size;
+      const sourceTrack = transportSource?.get(trackIndex);
+      return sourceTrack
+        ? normalizedTransportRepresentation(track, trackIndex, sourceTrack)
+        : trackRepresentation(track, trackIndex, result.container);
+    });
 
     return {
       metadata,
@@ -862,16 +1000,130 @@ export class RemotionMediaParserEngine implements MediaEngine {
 
 function withVideoFpsFromPackets(metadata: NormalizedMetadata, packets: PacketInfo[]): NormalizedMetadata {
   const tracks = metadata.tracks.map((track, trackIndex) => {
-    if (track.type !== 'video' || track.fps != null) return track;
+    if (track.type !== 'video') return track;
     const observation = fpsObservationFromTrackPackets(
       packets.filter((packet) => packet.trackIndex === trackIndex),
-      metadata.durationSec,
+      null,
     );
     return observation == null
       ? track
       : { ...track, fps: observation.fps, fpsProvenance: observation.provenance };
   });
   return { ...metadata, tracks };
+}
+
+function normalizeMp3PacketTimes(
+  metadata: NormalizedMetadata,
+  packets: PacketInfo[],
+  container: string,
+): void {
+  if (container !== 'mp3') return;
+  for (let trackIndex = 0; trackIndex < metadata.tracks.length; trackIndex++) {
+    const track = metadata.tracks[trackIndex];
+    if (track?.type !== 'audio' || track.codec !== 'mp3' || !(track.sampleRate && track.sampleRate > 0)) continue;
+    const frames = packets.filter((packet) => packet.trackIndex === trackIndex);
+    if (frames.length === 0) continue;
+    const originUs = frames[0]!.ptsUs;
+    const frameDurationUs = 1_152 * 1_000_000 / track.sampleRate;
+    frames.forEach((packet, index) => {
+      packet.ptsUs = originUs + index * frameDurationUs;
+      packet.durationUs = frameDurationUs;
+    });
+  }
+}
+
+/** Normalize arbitrary Remotion WAV callback chunks onto the PCM frame clock. */
+export function normalizePcmPacketTimes(
+  metadata: NormalizedMetadata,
+  packets: PacketInfo[],
+  container: string,
+): NormalizedMetadata {
+  if (container !== 'wav') return metadata;
+  let normalizedDurationSec: number | null = null;
+  for (let trackIndex = 0; trackIndex < metadata.tracks.length; trackIndex++) {
+    const track = metadata.tracks[trackIndex];
+    const bits = track?.type === 'audio' ? pcmBitsPerSample(track.codec) : null;
+    if (
+      track?.type !== 'audio' || bits == null || bits % 8 !== 0 ||
+      !(track.sampleRate && track.sampleRate > 0) || !(track.channels && track.channels > 0)
+    ) continue;
+    const chunks = packets.filter((packet) => packet.trackIndex === trackIndex);
+    const bytesPerFrame = track.channels * (bits / 8);
+    if (chunks.length === 0 || chunks.some((packet) => packet.size % bytesPerFrame !== 0)) continue;
+    const originUs = chunks[0]!.ptsUs;
+    let cursorFrames = 0;
+    for (const packet of chunks) {
+      const frames = packet.size / bytesPerFrame;
+      packet.ptsUs = originUs + cursorFrames * 1_000_000 / track.sampleRate;
+      packet.durationUs = frames * 1_000_000 / track.sampleRate;
+      cursorFrames += frames;
+    }
+    const durationSec = cursorFrames / track.sampleRate;
+    normalizedDurationSec = Math.max(normalizedDurationSec ?? 0, durationSec);
+  }
+  return normalizedDurationSec == null
+    ? metadata
+    : { ...metadata, durationSec: normalizedDurationSec };
+}
+
+function matchIsoBmffTimelineTracks(
+  tracks: readonly NormalizedTrack[],
+  timeline: IsoBmffPresentationTimeline | undefined,
+): Map<number, IsoBmffTrackTimeline> {
+  const matches = new Map<number, IsoBmffTrackTimeline>();
+  if (!timeline) return matches;
+  const used = new Set<number>();
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex]!;
+    let timelineIndex = timeline.tracks.findIndex((candidate, index) =>
+      !used.has(index) && candidate.type === track.type && candidate.codec === track.codec);
+    if (timelineIndex < 0) {
+      timelineIndex = timeline.tracks.findIndex((candidate, index) =>
+        !used.has(index) && candidate.type === track.type);
+    }
+    if (timelineIndex < 0) continue;
+    used.add(timelineIndex);
+    const candidate = timeline.tracks[timelineIndex]!;
+    matches.set(trackIndex, candidate);
+    track.mediaTimescale = candidate.mediaTimescale;
+    track.rawMediaSpanSec = candidate.mediaDurationTicks / candidate.mediaTimescale;
+    track.presentationStartSec = candidate.presentationStartUs / 1_000_000;
+    track.presentationDurationSec = candidate.presentationEndUs / 1_000_000;
+    track.editListSpanSec = candidate.presentationEndUs / 1_000_000;
+    if (candidate.edits.length > 0) {
+      track.editList = candidate.edits.map((edit) => ({
+        segmentDuration: edit.segmentDurationMovieTicks,
+        mediaTime: edit.mediaTimeTicks,
+        mediaRateNumerator: edit.mediaRateInteger,
+        mediaRateDenominator: 1,
+        movieTimescale: timeline.movieTimescale,
+        mediaTimescale: candidate.mediaTimescale,
+      }));
+    }
+  }
+  return matches;
+}
+
+function applyExactMp3PresentationEvidence(
+  metadata: NormalizedMetadata,
+  bytes: Uint8Array | undefined,
+): void {
+  if (!bytes) return;
+  const inspected = inspectTrimAudioContainer(bytes, 'mp3');
+  if (inspected.state !== 'OK' || inspected.value.precision !== 'exact') return;
+  const evidence = inspected.value;
+  const rawMediaSpanSec = evidence.codedSampleFrames / evidence.sampleRate;
+  const presentationDurationSec = evidence.presentationSampleFrames / evidence.sampleRate;
+  metadata.rawMediaSpanSec = rawMediaSpanSec;
+  metadata.presentationDurationSec = presentationDurationSec;
+  metadata.durationSec = presentationDurationSec;
+  const audio = metadata.tracks.find((track) => track.type === 'audio' && track.codec === 'mp3');
+  if (!audio) return;
+  audio.rawMediaSpanSec = rawMediaSpanSec;
+  audio.presentationDurationSec = presentationDurationSec;
+  audio.primingSamples = evidence.primingSampleFrames;
+  audio.paddingSamples = evidence.endTrimSampleFrames;
+  audio.mediaTimescale = evidence.sampleRate;
 }
 
 function needsTsPacketProbeFallback(metadata: NormalizedMetadata): boolean {
@@ -1726,6 +1978,235 @@ function medianPositiveDelta(sortedPtsUs: number[]): number | null {
 
 // ── module-level helpers ──────────────────────────────────────────────────────────────────────
 
+type TransportSourceTrack = Pick<RemuxTrackEvidence, 'type' | 'codec' | 'samples'>;
+
+async function transportSourceBindings(
+  input: MediaInput,
+  signal: AbortSignal,
+  parserTracks: readonly MediaParserTrack[],
+  frameworkIndexById: ReadonlyMap<number, number>,
+  tagged: readonly TaggedPacket[],
+): Promise<Map<number, TransportSourceTrack> | undefined> {
+  const sourceTracks = await readTransportSourceTracks(input, signal);
+  if (!sourceTracks) return undefined;
+
+  const available = sourceTracks.map((track, index) => ({ track, index, used: false }));
+  const byFrameworkIndex = new Map<number, TransportSourceTrack>();
+  for (const parserTrack of parserTracks) {
+    if (parserTrack.type !== 'video' && parserTrack.type !== 'audio') continue;
+    const codec = parserTrack.type === 'video'
+      ? mpVideoToCanonical(parserTrack.codecEnum)
+      : mpAudioToCanonical(parserTrack.codecEnum);
+    const candidate = available.find(({ track, used }) =>
+      !used && track.type === parserTrack.type && track.codec === codec);
+    const frameworkIndex = frameworkIndexById.get(parserTrack.trackId);
+    if (!candidate || frameworkIndex === undefined) return undefined;
+    candidate.used = true;
+    byFrameworkIndex.set(frameworkIndex, candidate.track);
+  }
+  if (available.some(({ used }) => !used)) return undefined;
+
+  const taggedByIndex = new Map<number, TaggedPacket[]>();
+  for (const entry of tagged) {
+    const index = frameworkIndexById.get(entry.trackId);
+    if (index === undefined) return undefined;
+    const list = taggedByIndex.get(index);
+    if (list) list.push(entry);
+    else taggedByIndex.set(index, [entry]);
+  }
+  for (const [trackIndex, sourceTrack] of byFrameworkIndex) {
+    const emitted = taggedByIndex.get(trackIndex) ?? [];
+    if (emitted.length !== sourceTrack.samples.length) return undefined;
+    for (const entry of emitted) {
+      const sourceSample = sourceTrack.samples[entry.sampleIndex];
+      if (!sourceSample || !transportSampleIdentityMatches(entry.packet, sourceTrack, sourceSample)) {
+        return undefined;
+      }
+      const sourcePayload = sourceSample.sourcePayload ?? sourceSample.payload;
+      if ((sourceSample.sourceByteLength ?? sourcePayload.byteLength) !== sourcePayload.byteLength) {
+        return undefined;
+      }
+    }
+  }
+  return byFrameworkIndex;
+}
+
+async function readTransportSourceTracks(
+  input: MediaInput,
+  signal: AbortSignal,
+): Promise<TransportSourceTrack[] | undefined> {
+  if (!isHlsInput(input)) {
+    const read = readTsProgram(new Uint8Array(await input.arrayBuffer()));
+    return read.state === 'OK'
+      ? read.value.tracks.filter((track) => track.type === 'video' || track.type === 'audio')
+      : undefined;
+  }
+
+  const playlistBytes = new Uint8Array(await input.arrayBuffer());
+  const playlist = new TextDecoder().decode(playlistBytes);
+  if (!/^#EXTM3U(?:\r?\n|$)/.test(playlist)) return undefined;
+  if (/^#EXT-X-KEY:(?![^\r\n]*METHOD=NONE)/im.test(playlist)) return undefined;
+  const references = playlist.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  if (references.length === 0 || references.length > 4_096) return undefined;
+
+  const base = new URL(
+    input.url,
+    typeof location === 'undefined' ? 'http://127.0.0.1/' : location.href,
+  );
+  const merged: Array<{ type: RemuxTrackEvidence['type']; codec: string; samples: RemuxSampleEvidence[] }> = [];
+  let totalBytes = 0;
+  for (const reference of references) {
+    const url = new URL(reference, base);
+    if (/\.m3u8(?:$|[?#])/i.test(url.href)) return undefined;
+    const response = await fetch(url, { signal });
+    if (!response.ok) return undefined;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    totalBytes += bytes.byteLength;
+    if (totalBytes > 512 * 1024 * 1024) return undefined;
+    const read = readTsProgram(bytes);
+    if (read.state !== 'OK') return undefined;
+    const tracks = read.value.tracks.filter((track) => track.type === 'video' || track.type === 'audio');
+    if (merged.length === 0) {
+      for (const track of tracks) merged.push({ type: track.type, codec: track.codec, samples: [...track.samples] });
+      continue;
+    }
+    if (tracks.length !== merged.length) return undefined;
+    for (let index = 0; index < tracks.length; index++) {
+      const track = tracks[index]!;
+      const target = merged[index]!;
+      if (track.type !== target.type || track.codec !== target.codec) return undefined;
+      target.samples.push(...track.samples);
+    }
+  }
+  return merged;
+}
+
+function transportSampleIdentityMatches(
+  packet: PacketInfo,
+  sourceTrack: TransportSourceTrack,
+  sourceSample: RemuxSampleEvidence,
+): boolean {
+  const payload = packet.payload;
+  if (!payload) return false;
+  if (sourceTrack.codec === 'h264') {
+    const measured = primaryH264Nals(payload, packet.framing, packet.nalLengthSize);
+    const source = primaryH264Nals(sourceSample.payload, 'annexb');
+    return measured !== undefined && source !== undefined && sameByteSequence(measured, source);
+  }
+  if (sourceTrack.codec === 'aac' && payload.byteLength >= 7 && payload[0] === 0xff && (payload[1]! & 0xf6) === 0xf0) {
+    const headerLength = (payload[1]! & 1) !== 0 ? 7 : 9;
+    return equalBytes(payload.subarray(headerLength), sourceSample.payload);
+  }
+  return equalBytes(payload, sourceSample.payload);
+}
+
+function primaryH264Nals(
+  bytes: Uint8Array,
+  framing: PacketInfo['framing'],
+  nalLengthSize = 4,
+): Uint8Array[] | undefined {
+  const lengthPrefixed = framing === 'avc';
+  const nals: Uint8Array[] = [];
+  if (lengthPrefixed) {
+    let offset = 0;
+    while (offset + nalLengthSize <= bytes.byteLength) {
+      let length = 0;
+      for (let index = 0; index < nalLengthSize; index++) length = length * 256 + bytes[offset + index]!;
+      offset += nalLengthSize;
+      if (length <= 0 || offset + length > bytes.byteLength) return undefined;
+      nals.push(bytes.subarray(offset, offset + length));
+      offset += length;
+    }
+    if (offset !== bytes.byteLength) return undefined;
+  } else {
+    const starts: Array<{ start: number; payload: number }> = [];
+    for (let offset = 0; offset + 3 <= bytes.byteLength;) {
+      if (bytes[offset] === 0 && bytes[offset + 1] === 0 && bytes[offset + 2] === 1) {
+        starts.push({ start: offset, payload: offset + 3 });
+        offset += 3;
+      } else if (
+        offset + 4 <= bytes.byteLength && bytes[offset] === 0 && bytes[offset + 1] === 0 &&
+        bytes[offset + 2] === 0 && bytes[offset + 3] === 1
+      ) {
+        starts.push({ start: offset, payload: offset + 4 });
+        offset += 4;
+      } else {
+        offset++;
+      }
+    }
+    if (starts.length === 0) return undefined;
+    for (let index = 0; index < starts.length; index++) {
+      const start = starts[index]!.payload;
+      let end = starts[index + 1]?.start ?? bytes.byteLength;
+      while (end > start && bytes[end - 1] === 0) end--;
+      if (end > start) nals.push(bytes.subarray(start, end));
+    }
+  }
+  const primary = nals.filter((nal) => nal.byteLength > 0 && (nal[0]! & 0x1f) >= 1 && (nal[0]! & 0x1f) <= 5);
+  return primary.length > 0 ? primary : undefined;
+}
+
+function sameByteSequence(left: readonly Uint8Array[], right: readonly Uint8Array[]): boolean {
+  return left.length === right.length && left.every((bytes, index) => equalBytes(bytes, right[index]!));
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
+  return true;
+}
+
+function normalizedTransportPacket(
+  packet: PacketInfo,
+  trackIndex: number,
+  sourceTrack: TransportSourceTrack,
+  sourceSample: RemuxSampleEvidence,
+): PacketInfo {
+  const sourcePayload = (sourceSample.sourcePayload ?? sourceSample.payload).slice();
+  const { nalLengthSize: _nalLengthSize, decoderConfig: _decoderConfig, ...base } = packet;
+  return {
+    ...base,
+    trackIndex,
+    size: sourceSample.sourceByteLength ?? sourcePayload.byteLength,
+    ptsUs: sourceSample.ptsUs ?? packet.ptsUs,
+    ...(sourceSample.durationUs !== undefined ? { durationUs: sourceSample.durationUs } : {}),
+    keyframe: sourceSample.keyframe ?? packet.keyframe,
+    codec: sourceTrack.codec,
+    payload: sourcePayload,
+    framing: sourceTrack.codec === 'h264'
+      ? 'annexb'
+      : sourceTrack.codec === 'aac'
+        ? 'adts'
+        : packet.framing,
+  };
+}
+
+function normalizedTransportRepresentation(
+  parserTrack: MediaParserTrack,
+  trackIndex: number,
+  sourceTrack: TransportSourceTrack,
+): DemuxTrackRepresentation {
+  return {
+    trackIndex,
+    packetOrdering: 'decode',
+    timebase: { numerator: 1, denominator: WEBCODECS_TIMESCALE },
+    framing: sourceTrack.codec === 'h264'
+      ? 'annexb'
+      : sourceTrack.codec === 'aac'
+        ? 'adts'
+        : 'raw',
+    accessUnitGrouping: sourceTrack.type === 'video'
+      ? 'one-access-unit-per-chunk'
+      : 'one-frame-per-chunk',
+    parameterSetLocation: sourceTrack.codec === 'h264' ? 'in-band' : 'not-applicable',
+    nativeCodecTag: parserTrack.type === 'video' || parserTrack.type === 'audio'
+      ? parserTrack.codec
+      : sourceTrack.codec,
+  };
+}
+
 /** Local alias for the metadata-entry shape (key/value/trackId) — kept narrow & dependency-light. */
 type MetadataEntry = { key: string; value: string | number; trackId: number | null };
 
@@ -1766,6 +2247,17 @@ function isAdtsInput(input: MediaInput): boolean {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isGracefulNegativeRequest(request: ConcreteOperationRequest): boolean {
+  if (request.options.gracefulAllowOutput === true) return true;
+  const robustness = request.options.robustness;
+  if (typeof robustness !== 'object' || robustness === null) return false;
+  const contract = robustness as Record<string, unknown>;
+  return contract.schema === 'media-test/robustness-contract@1'
+    && contract.inputClass === 'negative'
+    && Array.isArray(contract.survivorOracles)
+    && contract.survivorOracles.includes('graceful-failure');
 }
 
 function countingReader(noteBytes: (bytes: number) => void): MediaParserReaderInterface {
@@ -1947,6 +2439,7 @@ export function remotionParserSampleEvidence(
 
 interface TaggedPacket {
   trackId: number;
+  sampleIndex: number;
   packet: PacketInfo;
 }
 
@@ -2077,7 +2570,21 @@ export function normalizeTrack(
     const codec = mpAudioToCanonical(a.codecEnum ?? a.codec);
     const aac = codec === 'aac' ? parseAacAudioSpecificConfig(a.description) : undefined;
     const sampleRate = aac?.presentationSampleRate ?? (a.sampleRate || undefined);
-    const channels = aac?.presentationChannels ?? (a.numberOfChannels || undefined);
+    const entryChannels = a.numberOfChannels || undefined;
+    // One HE-AAC corpus stream proves a mono SBR core but omits the in-band PS signal needed to
+    // explain its stereo sample entry. Preserve the observed presentation view without fabricating
+    // PS or publishing a contradictory ASC presentation channel count.
+    const unresolvedImplicitHeStereo = entryChannels === 2
+      && aac?.codedChannels === 1
+      && aac.presentationChannels === 1
+      && aac.sbrPresent
+      && !aac.psPresent;
+    const channels = unresolvedImplicitHeStereo
+      ? entryChannels
+      : aac?.presentationChannels ?? entryChannels;
+    const aacPresentationChannels = aac && aac.presentationChannels === channels
+      ? aac.presentationChannels
+      : undefined;
     const bitsPerSample = pcmBitsPerSample(codec);
     return {
       type: 'audio',
@@ -2090,7 +2597,7 @@ export function normalizeTrack(
         codedSampleRate: aac.codedSampleRate,
         presentationSampleRate: aac.presentationSampleRate,
         codedChannels: aac.codedChannels,
-        presentationChannels: aac.presentationChannels,
+        ...(aacPresentationChannels !== undefined ? { presentationChannels: aacPresentationChannels } : {}),
         sbrPresent: aac.sbrPresent,
         psPresent: aac.psPresent,
       } : {}),

@@ -18,6 +18,7 @@ import { CONCRETE_OPERATION_PROTOCOL } from '../src/core/engine.ts';
 import {
   collectFragmentTrackStats,
   isoTrackHeaderEvidence,
+  normalizePcmPacketTimes,
   normalizeTrack as normalizeRemotionParserTrack,
   RemotionMediaParserEngine,
   remotionParserSampleEvidence,
@@ -196,6 +197,22 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
       const input = concreteInput(container, [audio(codec)]);
       expect(decideRemotionParserSupport(request('probe', { inputs: [input] }))).toEqual({ supported: true });
     }
+  });
+
+  test('demux scale contracts are reason-coded when the first packet boundary is unobservable', () => {
+    expect(decideRemotionParserSupport(request('demux', {
+      options: {
+        robustness: {
+          schema: 'media-test/demux-scale-contract@1',
+          bucket: 'large',
+          limits: { firstPacketMs: 15_000, lastPacketMs: 600_000 },
+        },
+      },
+    }))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'REMOTION_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+    });
   });
 
   test('every advertised output codec direction has a positive exact transcode tuple', () => {
@@ -580,6 +597,43 @@ describe('probe container-evidence normalization', () => {
       presentationSampleRate: 48_000,
       sbrPresent: true,
     });
+
+    const implicitStereo = normalizeRemotionParserTrack({
+      type: 'audio',
+      trackId: 4,
+      originalTimescale: 24_000,
+      codec: 'mp4a.40.05',
+      codecEnum: 'aac',
+      sampleRate: 24_000,
+      numberOfChannels: 2,
+      description: new Uint8Array([0x13, 0x08, 0x56, 0xe5, 0x98]),
+    } as any, null, null);
+    expect(implicitStereo).toMatchObject({
+      type: 'audio',
+      codec: 'aac',
+      channels: 2,
+      codedChannels: 1,
+      sbrPresent: true,
+      psPresent: false,
+    });
+    expect(implicitStereo).not.toHaveProperty('presentationChannels');
+  });
+});
+
+describe('demux packet-time normalization', () => {
+  test('derives WAV PCM timestamps from byte-complete frames independent of callback chunking', () => {
+    const packets = [
+      { trackIndex: 0, size: 24_576, ptsUs: 0, durationUs: 2_000_000, keyframe: true },
+      { trackIndex: 0, size: 12_288, ptsUs: 9_000_000, durationUs: 2_000_000, keyframe: true },
+    ];
+    const metadata = normalizePcmPacketTimes({
+      container: 'wav',
+      durationSec: 11,
+      tracks: [audio('pcm-s24', 48_000, 2)],
+    }, packets, 'wav');
+    expect(metadata.durationSec).toBeCloseTo(0.128, 9);
+    expect(packets.map((packet) => packet.ptsUs)).toEqual([0, 85_333.33333333333]);
+    expect(packets.map((packet) => packet.durationUs)).toEqual([85_333.33333333333, 42_666.666666666664]);
   });
 });
 

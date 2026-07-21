@@ -90,6 +90,7 @@ import {
 import { digestImageData, hasWebCryptoDigest } from './digest.ts';
 import {
   demuxProgressiveMp4SampleTable,
+  parseProgressiveMp4SampleTableBytes,
   shouldUseProgressiveMp4SampleTableFastPath,
 } from './mp4-sample-table.ts';
 import {
@@ -1225,7 +1226,7 @@ export class WebDemuxerEngine implements MediaEngine {
       return normalized;
     } catch (error) {
       if (
-        context?.request.options.gracefulAllowOutput === true &&
+        isGracefulNegativeContext(context) &&
         !isMalformedInputError(error) &&
         !mustPreserveError(error)
       ) {
@@ -1269,6 +1270,29 @@ export class WebDemuxerEngine implements MediaEngine {
    * evidence but are not retained in the normalized row.
    */
   async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    try {
+      return await this.demuxUnchecked(input, context);
+    } catch (error) {
+      if (
+        isGracefulNegativeContext(context) &&
+        !isMalformedInputError(error) &&
+        !mustPreserveError(error)
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'demux',
+          'parse',
+          describeError(error),
+          'WEB_DEMUXER_DEMUX_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async demuxUnchecked(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
     if (shouldUseProgressiveMp4SampleTableFastPath(input)) {
       this.configUsed.lastDemuxBackend = 'iso-bmff-sample-table';
       return demuxProgressiveMp4SampleTable(input, {
@@ -1283,8 +1307,31 @@ export class WebDemuxerEngine implements MediaEngine {
     const info = await raceAbort(d.getMediaInfo(), context?.signal, () => this.destroyDemuxer());
     const supplementalStreams = await raceAbort(d.getAVStreams(), context?.signal, () => this.destroyDemuxer());
     const streams = mergeNormalizedStreams(info.streams ?? [], supplementalStreams);
-    const metadata = toNormalizedMetadata({ ...info, streams }, input);
+    let metadata = toNormalizedMetadata({ ...info, streams }, input);
     const indexMap = streamIndexToTrackIndex(streams);
+
+    // web-demuxer occasionally omits ISO codec extradata from both stream views even though the
+    // source sample entry carries it. Recover only that owned configuration-record evidence from
+    // the bounded ISO sample-table reader; packet payload/timing remains package-produced below.
+    let isoRepresentations: DemuxResult['representations'];
+    let isoPackets: PacketInfo[] | undefined;
+    if (!input.mutated && (metadata.container === 'mp4' || metadata.container === 'mov')) {
+      try {
+        const bytes = new Uint8Array(await raceAbort(
+          input.arrayBuffer(),
+          context?.signal,
+          () => this.destroyDemuxer(),
+        ));
+        const isoEvidence = parseProgressiveMp4SampleTableBytes(bytes);
+        isoRepresentations = isoEvidence.representations;
+        isoPackets = isoEvidence.packets;
+        metadata = probeMetadataWithByteEvidence(metadata, bytes);
+      } catch (error) {
+        if (isNamedError(error, 'AbortError')) throw error;
+        // Fragmented and unusual valid ISO layouts can be outside the bounded supplemental reader;
+        // the package packet path remains independently usable without that optional evidence.
+      }
+    }
 
     // readAVPacket bounds are SECONDS of media time; an end past the duration drains to EOF.
     const endSec = Number.isFinite(info.duration) && info.duration > 0 ? info.duration + 1 : 1e9;
@@ -1324,7 +1371,11 @@ export class WebDemuxerEngine implements MediaEngine {
       if (trackIndex === undefined) throw new Error(`${ENGINE_ID}: stream ${stream.index} has no normalized track mapping`);
       const codec = metadata.tracks[trackIndex]?.codec;
       if (!codec) throw new Error(`${ENGINE_ID}: normalized track ${trackIndex} has no codec`);
-      const accumulator = createTrackEvidenceAccumulator(trackIndex, type, codec, stream);
+      const isoRepresentation = isoRepresentations?.find((item) => item.trackIndex === trackIndex);
+      const evidenceStream = !stream.extradata?.byteLength && isoRepresentation?.description?.byteLength
+        ? { ...stream, extradata: isoRepresentation.description.slice() }
+        : stream;
+      const accumulator = createTrackEvidenceAccumulator(trackIndex, type, codec, evidenceStream);
       const reader = d.readAVPacket(0, endSec, avType, stream.index).getReader();
       let completed = false;
       let primaryError: unknown;
@@ -1361,13 +1412,16 @@ export class WebDemuxerEngine implements MediaEngine {
       if (representation) representations.push(representation);
     }
 
-    // Stable presentation ordering. The package exposes no DTS; absence remains explicit.
-    packets.sort((a, b) => a.ptsUs - b.ptsUs || a.trackIndex - b.trackIndex);
+    // Stable presentation ordering. The package exposes no DTS; absence remains explicit. For ISO,
+    // stss is the source-authoritative sync flag. Apply it only after every package row binds uniquely
+    // to one sample-table row by track, PTS, and physical size.
+    const normalizedPackets = normalizeIsoPacketKeyframes(packets, isoPackets);
+    normalizedPackets.sort((a, b) => a.ptsUs - b.ptsUs || a.trackIndex - b.trackIndex);
     const telemetry = { bytesRead: packetBytes, packetCount: packets.length };
     metadata.telemetry = telemetry;
     return {
       metadata,
-      packets,
+      packets: normalizedPackets,
       packetOrdering: 'presentation',
       representations,
       telemetry,
@@ -1877,6 +1931,38 @@ export class WebDemuxerEngine implements MediaEngine {
   }
 }
 
+export function normalizeIsoPacketKeyframes(
+  packets: readonly PacketInfo[],
+  sourcePackets: readonly PacketInfo[] | undefined,
+): PacketInfo[] {
+  if (!sourcePackets || packets.length !== sourcePackets.length) return [...packets];
+  const sourceByIdentity = new Map<string, PacketInfo[]>();
+  for (const packet of sourcePackets) {
+    const key = `${packet.trackIndex}:${packet.size}`;
+    const bucket = sourceByIdentity.get(key) ?? [];
+    bucket.push(packet);
+    sourceByIdentity.set(key, bucket);
+  }
+  const matched: PacketInfo[] = [];
+  for (const packet of packets) {
+    const key = `${packet.trackIndex}:${packet.size}`;
+    const bucket = sourceByIdentity.get(key);
+    const candidates = bucket?.flatMap((source, index) =>
+      Math.abs(source.ptsUs - packet.ptsUs) <= 1 ? [{ source, index }] : []
+    ) ?? [];
+    if (candidates.length !== 1) return [...packets];
+    const { source, index } = candidates[0]!;
+    bucket!.splice(index, 1);
+    matched.push({
+      ...packet,
+      keyframe: source.keyframe,
+      randomAccessKind: source.keyframe ? 'sample-table-sync' : 'non-sync',
+    });
+  }
+  if ([...sourceByIdentity.values()].some((bucket) => bucket.length > 0)) return [...packets];
+  return matched;
+}
+
 async function fetchSameOriginWasm(url: string, signal?: AbortSignal): Promise<Uint8Array> {
   const response = await raceAbort(fetch(url, { credentials: 'same-origin', signal }), signal);
   if (!response.ok) throw new Error(`failed to materialize web-demuxer WASM: HTTP ${response.status}`);
@@ -2052,6 +2138,14 @@ function mustPreserveError(error: unknown): boolean {
     return true;
   }
   return error instanceof AggregateError && error.errors.some((item) => mustPreserveError(item));
+}
+
+function isGracefulNegativeContext(context?: OperationContext): boolean {
+  if (context?.request.options.gracefulAllowOutput === true) return true;
+  const robustness = context?.request.options.robustness;
+  return typeof robustness === 'object'
+    && robustness !== null
+    && (robustness as { inputClass?: unknown }).inputClass === 'negative';
 }
 
 function isNamedError(error: unknown, name: string): boolean {

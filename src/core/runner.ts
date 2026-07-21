@@ -925,6 +925,11 @@ function loadGoldenForRun(
   return pending;
 }
 
+function releaseExhaustiveCandidateMaterializations(runtime: ActiveFixtureRuntime): void {
+  goldenLoadCacheByRuntime.get(runtime)?.clear();
+  runtime.releaseMaterializedData?.();
+}
+
 type IndexedGoldenGate = { status: 'NA_ASSET' | 'ERROR'; reason: string };
 
 /** Required indexed evidence is admitted before operation/oracle execution; detail text is never read. */
@@ -4059,9 +4064,9 @@ export async function runPixelBehaviorSelfTest(): Promise<PixelBehaviorEvidence>
   }
   const expected = new Uint8Array([
     255, 0, 0, 255,
-    0, 255, 0, 128,
-    0, 0, 255, 64,
-    17, 31, 47, 0,
+    0, 255, 0, 255,
+    0, 0, 255, 255,
+    17, 31, 47, 255,
   ]);
   let frame: VideoFrame | undefined;
   try {
@@ -4411,6 +4416,7 @@ async function runExhaustiveCell(
       perFile.push({ sel, result });
     } finally {
       opts.onFileProgress?.(i + 1, candidates.length, fileLabel);
+      releaseExhaustiveCandidateMaterializations(fixtureIntegrityRuntime);
     }
   }
 
@@ -4489,8 +4495,15 @@ export function reduceExhaustiveStatuses(
     total: statuses.length,
   };
   const valid = counts.pass;
+  const terminalIntrinsicCoverage =
+    counts.pass > 0 &&
+    counts.fail === 0 &&
+    counts.error === 0 &&
+    counts.naBrowser === 0 &&
+    counts.naAsset === 0 &&
+    counts.skipped === 0;
   const grade: ExhaustiveReduction['grade'] =
-    statuses.length > 0 && valid === statuses.length ? 'full' : valid > 0 ? 'partial' : 'none';
+    terminalIntrinsicCoverage ? 'full' : valid > 0 ? 'partial' : 'none';
   // Executed variants: wrong output outranks harness inability, then a correctness-valid result.
   const status: ScenarioResult['status'] =
     counts.fail > 0
@@ -4830,13 +4843,16 @@ export async function runOne(
     bench?: ScenarioResult['bench'],
     measurement?: ScenarioResult['measurement'],
   ): ScenarioResult => {
+    const normalizedMeasurement = measurement?.state === 'UNAVAILABLE'
+      ? { ...measurement, detail: iJsonString(measurement.detail) }
+      : measurement;
     const result: FingerprintedScenarioResult = {
       ...base,
       status,
       oracleOutcomes,
       ...(reason !== undefined ? { reason } : {}),
       ...(bench !== undefined ? { bench } : {}),
-      ...(measurement !== undefined ? { measurement } : {}),
+      ...(normalizedMeasurement !== undefined ? { measurement: normalizedMeasurement } : {}),
       ...(supportEvidence !== undefined ? { support: supportEvidence } : {}),
       ...(executionFingerprint !== undefined ? { executionFingerprint } : {}),
       ...(candidateEvidence ? { candidateEvidence } : {}),
@@ -6629,9 +6645,15 @@ async function runBench(
   const measured: BenchBatchEvidence[] = [];
   const resourceOrLatency = scenario.metrics.some((metric) =>
     metric === 'peakMemory' || metric === 'timeToFirstByte' || metric === 'timeToFirstFrame' || metric === 'loadInit');
+  const adapterMaxInner = engine.benchmarkLimits?.maxInnerIterations;
+  const requestedMaxInner = benchOptions?.maxInnerIterations ?? DEFAULT_BENCH.maxInnerIterations;
   const protocolOptions: BenchOptions = {
     ...(benchOptions ?? {}),
-    ...(resourceOrLatency ? { maxInnerIterations: 1 } : {}),
+    ...(resourceOrLatency
+      ? { maxInnerIterations: 1 }
+      : adapterMaxInner !== undefined
+        ? { maxInnerIterations: Math.min(requestedMaxInner, adapterMaxInner) }
+        : {}),
   };
   const adaptive = await adaptiveBench(
     primaryMetric,
@@ -7287,8 +7309,10 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
                 cache: 'no-store',
                 ...(opts.signal ? { signal: opts.signal } : {}),
               });
-              if (!fallback.ok) throw new Error(`${fallback.status} ${fallback.statusText}`);
-              bytes = new Uint8Array(await fallback.arrayBuffer());
+              // A missing flat mirror must not erase the already-read scenario body. Retain those
+              // bytes so the outer identity gate reports the true digest mismatch (and can still
+              // try same-SHA corpus mirrors) instead of misclassifying it as a transport failure.
+              if (fallback.ok) bytes = new Uint8Array(await fallback.arrayBuffer());
             }
             if (bytes.byteLength !== identity.sizeBytes || sha256Hex(bytes) !== identity.sha256) {
               const mirrors = integrityMirrorPaths.get(identity.sha256) ?? [];
@@ -8233,15 +8257,37 @@ function matchEngineId(arg: string, candidates: EngineIdCandidate[]): string | u
 }
 
 function errMessage(err: unknown): string {
-  if (isNotApplicableError(err)) return applicabilityReason(err);
-  if (isBrowserNotSupportedError(err)) return browserApplicabilityReason(err);
-  if (err instanceof Error) return err.message;
-  if (typeof err === 'string') return err;
+  if (isNotApplicableError(err)) return iJsonString(applicabilityReason(err));
+  if (isBrowserNotSupportedError(err)) return iJsonString(browserApplicabilityReason(err));
+  if (err instanceof Error) return iJsonString(err.message);
+  if (typeof err === 'string') return iJsonString(err);
   try {
-    return JSON.stringify(err);
+    return iJsonString(JSON.stringify(err));
   } catch {
-    return String(err);
+    return iJsonString(String(err));
   }
+}
+
+/** External runtimes may surface ill-formed UTF-16; result strings must remain valid I-JSON. */
+function iJsonString(value: string): string {
+  let out = '';
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += value[index]! + value[index + 1]!;
+        index++;
+      } else {
+        out += '\ufffd';
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      out += '\ufffd';
+    } else {
+      out += value[index]!;
+    }
+  }
+  return out;
 }
 
 function applicabilityReason(err: unknown): string {

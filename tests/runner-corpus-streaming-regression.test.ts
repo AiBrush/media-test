@@ -87,6 +87,12 @@ describe('runner demand-driven corpus preparation regression', () => {
     const operationStarted = [deferred(), deferred(), deferred()];
     const releaseOperation = [deferred(), deferred(), deferred()];
     let operationCalls = 0;
+    let releaseCalls = 0;
+    const releasingFixtureRuntime = {
+      resolveMedia: fixtureRuntime.resolveMedia.bind(fixtureRuntime),
+      loadGoldenEvidence: fixtureRuntime.loadGoldenEvidence.bind(fixtureRuntime),
+      releaseMaterializedData: () => { releaseCalls += 1; },
+    } as unknown as ActiveFixtureRuntime;
 
     registerEngine(engineId, async () => remuxEngine(engineId, async () => {
       const index = operationCalls++;
@@ -116,7 +122,7 @@ describe('runner demand-driven corpus preparation regression', () => {
       scenarioIds: [scenarioId],
       pillar: 'functional',
       exhaustiveMedia: true,
-      fixtureIntegrityRuntime: fixtureRuntime,
+      fixtureIntegrityRuntime: releasingFixtureRuntime,
       playbackSmoke: async () => true,
     });
 
@@ -141,6 +147,7 @@ describe('runner demand-driven corpus preparation regression', () => {
     const results = await running;
     if (assertionError) throw assertionError;
     expect(operationCalls).toBe(3);
+    expect(releaseCalls).toBe(3);
     expect(new Set(fetchedBodies).size).toBe(3);
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({

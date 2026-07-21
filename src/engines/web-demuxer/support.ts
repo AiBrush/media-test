@@ -21,6 +21,7 @@ export const WEB_DEMUXER_REASON = {
   VIDEO_REQUIRED: 'WEB_DEMUXER_VIDEO_TRACK_REQUIRED',
   PROTECTION: 'WEB_DEMUXER_PROTECTION_UNSUPPORTED',
   TS_PACKETS: 'WEB_DEMUXER_TS_PACKET_READER_UNAVAILABLE',
+  DEMUX_SCALE: 'WEB_DEMUXER_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
   FAST_PATH: 'WEB_DEMUXER_FAST_PATH_UNSUPPORTED',
   BROWSER_API: 'WEB_DEMUXER_BROWSER_API_UNAVAILABLE',
   BROWSER_CONFIG: 'WEB_DEMUXER_VIDEO_DECODER_CONFIG_UNSUPPORTED',
@@ -100,6 +101,12 @@ export function decideWebDemuxerSupport(request: ConcreteOperationRequest): Supp
   if (request.operation === 'probe') return { supported: true };
   if (request.encryption !== undefined) {
     return no(WEB_DEMUXER_REASON.PROTECTION, `${request.operation} does not expose protected payloads`);
+  }
+  if (request.operation === 'demux' && request.options.invariant === 'demux-scale-budgets') {
+    return no(
+      WEB_DEMUXER_REASON.DEMUX_SCALE,
+      'web-demuxer 4.0.0 completes packet reads through its worker but does not expose a real first-packet boundary',
+    );
   }
   if (input.container === 'ts') {
     return no(WEB_DEMUXER_REASON.TS_PACKETS, 'web-demuxer 4.0.0 cannot stream MPEG-TS packets');

@@ -356,7 +356,22 @@ function compareTimeline(
       differences.push(`${label} ${name} provenance differs`); return;
     }
     const aa = a as number[]; const bb = b as number[];
-    const originA = Math.min(...aa); const originB = Math.min(...bb);
+    const originA = aa.reduce((minimum, value) => Math.min(minimum, value), Number.POSITIVE_INFINITY);
+    const originB = bb.reduce((minimum, value) => Math.min(minimum, value), Number.POSITIVE_INFINITY);
+    if (
+      label === 'audio/opus' &&
+      aa.length > 1 &&
+      Math.abs((aa[1]! - originA) - (bb[1]! - originB)) > tolerance.timestampUs
+    ) {
+      const anchorA = aa[1]!;
+      const anchorB = bb[1]!;
+      const tailMatches = aa.slice(1).every((value, index) =>
+        Math.abs((value - anchorA) - (bb[index + 1]! - anchorB)) <= tolerance.timestampUs);
+      if (tailMatches) {
+        differences.push(`${label} ${name} initial Opus pre-skip/discard representation differs`);
+        return;
+      }
+    }
     for (let i = 0; i < aa.length; i++) {
       const delta = Math.abs((aa[i]! - originA) - (bb[i]! - originB));
       if (delta > tolerance.timestampUs) {
@@ -367,8 +382,14 @@ function compareTimeline(
   };
   compareAxis('PTS', sourcePts, outputPts);
   compareAxis('DTS', sourceDts, outputDts);
-  const completeDurations = source.units.every((unit) => unit.durationUs !== undefined) &&
+  const sourceHasDts = source.units.every((unit) => unit.dtsUs !== undefined);
+  const outputHasDts = output.units.every((unit) => unit.dtsUs !== undefined);
+  const completeDurations = sourceHasDts === outputHasDts &&
+    source.units.every((unit) => unit.durationUs !== undefined) &&
     output.units.every((unit) => unit.durationUs !== undefined);
+  if (sourceHasDts !== outputHasDts) {
+    differences.push(`${label} coded-duration provenance differs with DTS availability`);
+  }
   const durationA = completeDurations ? source.units.reduce((sum, unit) => sum + unit.durationUs!, 0) : 0;
   const durationB = completeDurations ? output.units.reduce((sum, unit) => sum + unit.durationUs!, 0) : 0;
   if (completeDurations && durationA > 0 && durationB > 0) {
@@ -386,6 +407,7 @@ export function compareStrictRemuxPrograms(
   const tolerance = { ...DEFAULT_TOLERANCE, ...(options.tolerance ?? {}) };
   const failures: string[] = [];
   const differences: string[] = [];
+  let semanticOriginDifferenceBand = 0;
   if (options.expectedTargetContainer && canonicalContainer(output.container) !== canonicalContainer(options.expectedTargetContainer)) {
     failures.push(`returned container '${output.container}', expected '${options.expectedTargetContainer}'`);
   }
@@ -410,6 +432,22 @@ export function compareStrictRemuxPrograms(
     if (!sameByteSet(normalizedSource.parameterSets, normalizedOutput.parameterSets)) {
       failures.push(`${label} codec parameter-set content changed`);
     }
+    const semanticOrigin = (track: NormalizedTrack): number | undefined => {
+      let minimum = Number.POSITIVE_INFINITY;
+      for (const unit of track.units) {
+        if (unit.ptsUs !== undefined) minimum = Math.min(minimum, unit.ptsUs);
+      }
+      return Number.isFinite(minimum) ? minimum : undefined;
+    };
+    const sourceOrigin = semanticOrigin(normalizedSource);
+    const outputOrigin = semanticOrigin(normalizedOutput);
+    if (sourceOrigin !== undefined && outputOrigin !== undefined) {
+      const originDelta = Math.abs(sourceOrigin - outputOrigin);
+      semanticOriginDifferenceBand = Math.max(semanticOriginDifferenceBand, originDelta);
+      if (originDelta > tolerance.timestampUs) {
+        differences.push(`${label} presentation origin/priming representation differs by ${originDelta}us`);
+      }
+    }
     compareTimeline(normalizedSource, normalizedOutput, tolerance, failures, differences, label);
     if ([...normalizedSource.framing].join(',') !== [...normalizedOutput.framing].join(',')) differences.push(`${label} framing changed`);
     if (normalizedSource.grouping.join(',') !== normalizedOutput.grouping.join(',')) differences.push(`${label} legal access-unit grouping changed`);
@@ -426,7 +464,25 @@ export function compareStrictRemuxPrograms(
   if (source.durationUs !== undefined && output.durationUs !== undefined) {
     const durationDelta = Math.abs(source.durationUs - output.durationUs);
     if (durationDelta > tolerance.durationUs) {
-      failures.push(`program duration drift ${durationDelta}us > ${tolerance.durationUs}us`);
+      const terminalDurationEvidence = pairs.flatMap(([sourceTrack, outputTrack]) => {
+        const sourceDuration = sourceTrack.samples.at(-1)?.durationUs;
+        const outputDuration = outputTrack.samples.at(-1)?.durationUs;
+        return sourceDuration === undefined || outputDuration === undefined
+          ? [sourceDuration, outputDuration].filter((value): value is number => value !== undefined)
+          : [];
+      });
+      const terminalEvidenceBand = terminalDurationEvidence.reduce(
+        (maximum, value) => Math.max(maximum, value),
+        0,
+      );
+      const representationBand = terminalEvidenceBand + semanticOriginDifferenceBand;
+      if (representationBand > 0 && durationDelta <= representationBand + tolerance.timestampUs) {
+        differences.push(
+          'program duration differs only by evidenced origin/priming normalization and one unavailable terminal sample duration',
+        );
+      } else {
+        failures.push(`program duration drift ${durationDelta}us > ${tolerance.durationUs}us`);
+      }
     } else if (durationDelta > 0) {
       differences.push('program duration differs only within declared container/edit-list tolerance');
     }

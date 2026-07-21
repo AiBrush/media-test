@@ -679,6 +679,8 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     const readyIndex = app.indexOf('ready: true', publishIndex);
     const restoreFunctionIndex = app.indexOf('async function restoreLatestCachedRun()');
     const restoreFunctionEnd = app.indexOf('\nfunction startRunFromFilter(', restoreFunctionIndex);
+    const snapshotStart = app.indexOf('async function snapshotRun(');
+    const snapshotEnd = app.indexOf('\nfunction scenarioIdentity(', snapshotStart);
 
     expect(launcher).toContain('window.__SUITE__?.ready === true');
     expect(restoreIndex).toBeGreaterThan(-1);
@@ -691,6 +693,10 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(launcher).toContain('let lastLog = started');
     expect(launcher).toContain('isLauncherRunPending(pageDiagnostic.handshake, launchRequestId)');
     expect(launcher).toContain('info.handshakeSchema !== LAUNCHER_RUN_HANDSHAKE_SCHEMA');
+    const snapshotBody = app.slice(snapshotStart, snapshotEnd);
+    expect(snapshotBody).toContain('const run = activeRun;');
+    expect(snapshotBody.indexOf('const run = activeRun;')).toBeLessThan(snapshotBody.indexOf('await cacheSnapshot'));
+    expect(snapshotBody.slice(snapshotBody.indexOf('await cacheSnapshot'))).not.toContain('activeRun.');
   });
 
   test('the document exposes native progress/status controls, every legend state, and honest reference copy', () => {

@@ -79,6 +79,14 @@ const ENCODE_AUDIO_BY_CONTAINER: Readonly<Record<string, readonly string[]>> = {
 
 const MAX_BUFFER_WRITER_INPUT_BYTES = 512 * 1024 * 1024;
 
+function isDemuxScaleRequest(request: ConcreteOperationRequest): boolean {
+  const robustness = request.options.robustness;
+  return request.operation === 'demux'
+    && typeof robustness === 'object'
+    && robustness !== null
+    && (robustness as Record<string, unknown>).schema === 'media-test/demux-scale-contract@1';
+}
+
 export function remotionTupleSummary(request: ConcreteOperationRequest): ApplicabilityTupleSummary {
   return {
     inputContainers: request.inputs.map((input) => input.container),
@@ -106,6 +114,12 @@ export function remotionTupleSummary(request: ConcreteOperationRequest): Applica
 export function decideRemotionParserSupport(request: ConcreteOperationRequest): SupportDecision {
   if (request.operation !== 'probe' && request.operation !== 'demux') {
     return no('REMOTION_PARSER_OPERATION_UNDECLARED', `media-parser cannot execute ${request.operation}`);
+  }
+  if (isDemuxScaleRequest(request)) {
+    return no(
+      'REMOTION_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+      'media-parser 4.0.479 completes its full sample-callback walk before returning and cannot expose the scale contract\'s observable first-packet boundary',
+    );
   }
   return decideReadableInputs(request.inputs);
 }

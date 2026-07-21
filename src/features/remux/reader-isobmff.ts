@@ -139,7 +139,17 @@ function handlerType(bytes: Uint8Array, hdlr: Box): TrackTables['type'] | undefi
 function entryChildren(bytes: Uint8Array, entry: Box, type: TrackTables['type']): Box[] | undefined {
   const header = type === 'video' ? 78 : type === 'audio' ? 28 : 8;
   if (entry.body + header > entry.end) return undefined;
-  return boxes(bytes, entry.body + header, entry.end);
+  const start = entry.body + header;
+  const exact = boxes(bytes, start, entry.end);
+  if (exact) return exact;
+  // QuickTime permits zero padding after the final sample-entry extension. Keep the enclosing file
+  // parser strict while accepting only a bounded all-zero suffix here, so avcC/hvcC evidence is not
+  // discarded merely because four alignment bytes follow the last child box.
+  let trimmedEnd = entry.end;
+  while (trimmedEnd > start && entry.end - trimmedEnd < 16 && bytes[trimmedEnd - 1] === 0) {
+    trimmedEnd--;
+  }
+  return trimmedEnd < entry.end ? boxes(bytes, start, trimmedEnd) : undefined;
 }
 
 function parseSampleEntry(
@@ -166,6 +176,9 @@ function parseSampleEntry(
     const objectType = esdsObjectType(codecPrivate);
     if (objectType === 0x69 || objectType === 0x6b) codec = 'mp3';
     else if (objectType === 0x40 || objectType === 0x66 || objectType === 0x67 || objectType === 0x68) codec = 'aac';
+  }
+  if (codec === 'aac' && codecPrivate) {
+    channels = aacLcChannelsFromEsds(codecPrivate) ?? channels;
   }
   const nalLengthSize = codec === 'h264' && codecPrivate && codecPrivate.byteLength >= 5
     ? (codecPrivate[4]! & 3) + 1
@@ -196,6 +209,37 @@ function esdsObjectType(bytes: Uint8Array): number | undefined {
     if (octets > 0 && length > 0 && cursor < bytes.byteLength) return bytes[cursor];
   }
   return undefined;
+}
+
+function decoderSpecificInfoFromEsds(bytes: Uint8Array): Uint8Array | undefined {
+  for (let offset = 4; offset + 2 <= bytes.byteLength; offset++) {
+    if (bytes[offset] !== 0x05) continue;
+    let length = 0;
+    let cursor = offset + 1;
+    let complete = false;
+    for (let octet = 0; octet < 4 && cursor < bytes.byteLength; octet++) {
+      const value = bytes[cursor++]!;
+      length = (length << 7) | (value & 0x7f);
+      if ((value & 0x80) === 0) {
+        complete = true;
+        break;
+      }
+    }
+    if (complete && length > 0 && length <= 64 && cursor + length <= bytes.byteLength) {
+      return bytes.subarray(cursor, cursor + length);
+    }
+  }
+  return undefined;
+}
+
+/** AAC-LC has no SBR/PS channel expansion, so its ASC channelConfiguration is authoritative. */
+export function aacLcChannelsFromEsds(bytes: Uint8Array): number | undefined {
+  const asc = decoderSpecificInfoFromEsds(bytes);
+  if (!asc || asc.byteLength !== 2) return undefined;
+  const audioObjectType = asc[0]! >> 3;
+  if (audioObjectType !== 2) return undefined;
+  const configuration = (asc[1]! >> 3) & 0x0f;
+  return [undefined, 1, 2, 3, 4, 5, 6, 8][configuration];
 }
 
 function parseEdit(bytes: Uint8Array, trak: Box, movieTimescale: number): EditTiming | undefined {
@@ -357,7 +401,11 @@ function classicSamples(bytes: Uint8Array, track: TrackTables, mdats: readonly B
   const durations = expandedRunTable(bytes, stts, false);
   if (!durations || durations.length !== sizes.length) return undefined;
   const ctts = child(bytes, track.stbl, 'ctts');
-  const offsets = ctts ? expandedRunTable(bytes, ctts, fullBoxVersion(bytes, ctts) === 1) : new Array(sizes.length).fill(0);
+  // QuickTime/MOV and FFmpeg commonly store negative B-frame offsets as two's-complement int32 in
+  // version-0 ctts despite ISO BMFF nominally declaring that version unsigned. Treat both classic
+  // versions as signed, matching ffprobe and the suite's independent packet reader; a genuine
+  // positive offset >= 2^31 ticks would imply an implausible multi-day presentation displacement.
+  const offsets = ctts ? expandedRunTable(bytes, ctts, true) : new Array(sizes.length).fill(0);
   const positions = sampleOffsets(bytes, track.stbl, sizes);
   const sync = syncSamples(bytes, track.stbl, sizes.length);
   if (!offsets || offsets.length !== sizes.length || !positions) return undefined;
@@ -509,9 +557,18 @@ export function readIsoBmffProgram(bytes: Uint8Array, hint = 'mp4'): RemuxReadRe
         ...(table.codecPrivate ? { codecPrivate: table.codecPrivate } : {}), samples,
       });
     }
-    const times = tracks.flatMap((track) => track.samples.flatMap((sample) =>
-      sample.ptsUs !== undefined ? [sample.ptsUs, sample.ptsUs + (sample.durationUs ?? 0)] : []));
-    const durationUs = times.length ? Math.max(...times) - Math.min(...times) : undefined;
+    let minimumPtsUs = Number.POSITIVE_INFINITY;
+    let maximumEndUs = Number.NEGATIVE_INFINITY;
+    for (const track of tracks) {
+      for (const sample of track.samples) {
+        if (sample.ptsUs === undefined) continue;
+        minimumPtsUs = Math.min(minimumPtsUs, sample.ptsUs);
+        maximumEndUs = Math.max(maximumEndUs, sample.ptsUs + (sample.durationUs ?? 0));
+      }
+    }
+    const durationUs = Number.isFinite(minimumPtsUs) && Number.isFinite(maximumEndUs)
+      ? maximumEndUs - minimumPtsUs
+      : undefined;
     const parsedSamples = tracks.reduce((sum, track) => sum + track.samples.length, 0);
     const value: RemuxProgramEvidence = {
       schema: 'media-test/remux-program@1', container, byteLength: bytes.byteLength,

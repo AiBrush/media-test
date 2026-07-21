@@ -17,6 +17,7 @@ import {
 import { readOutputPacketsResult, readOutputStructure } from '../src/core/box-readers.ts';
 import { sha256Hex as sha256HexSync } from '../src/core/canonical-json.ts';
 import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
+import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
 
 test('neutral MP4 structure duration does not truncate a complete media timeline behind a short mvhd', async () => {
   const bytes = new Uint8Array(await Bun.file('fixtures/media/cenc_ctr_clear.mp4').arrayBuffer());
@@ -110,6 +111,80 @@ function context(overrides: Partial<OracleContext>): OracleContext {
 function verdict(outcome: OracleOutcome): string {
   return outcome.state === 'VERDICT' ? outcome.verdict : outcome.status ?? outcome.state;
 }
+
+describe('REQ-ORAC-09 executable remux invariants', () => {
+  test('two-leg reference re-import expects the return container', async () => {
+    const bytes = new Uint8Array(await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer());
+    const remuxInput: MediaInput = {
+      id: 'micro_h264_1frame.mp4',
+      url: '/micro_h264_1frame.mp4',
+      mime: 'video/mp4',
+      sizeBytes: bytes.byteLength,
+      async blob() { return new Blob([bytes.slice()], { type: 'video/mp4' }); },
+      async arrayBuffer() { return bytes.slice().buffer as ArrayBuffer; },
+    };
+    const outcome = await runOracle('reference-reimport', context({
+      scenario: scenario('remux', 'reference-reimport', {
+        container: 'mkv',
+        roundTrip: ['mkv', 'mp4'],
+      }),
+      input: remuxInput,
+      output: { bytes, mime: 'video/mp4', container: 'mp4' },
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+  });
+
+  test('decode-remux falls back to same-browser source decode when frame cache is pending', async () => {
+    const source = new Uint8Array([1, 2, 3]);
+    const remuxInput: MediaInput = {
+      id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    let decodes = 0;
+    const outcome = await runOracle('property-invariant', context({
+      scenario: scenario('remux', 'property-invariant', {
+        container: 'mkv',
+        invariant: 'decode(remux(x))==decode(x)',
+      }),
+      input: remuxInput,
+      output: { bytes: new Uint8Array([4, 5, 6]), mime: 'video/x-matroska', container: 'mkv' },
+      decodeWithPlatform: async () => {
+        decodes += 1;
+        return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
+      },
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodes).toBe(2);
+  });
+
+  test('headerless remux duration derives source truth from the neutral packet timeline', async () => {
+    const bytes = new Uint8Array(await Bun.file('fixtures/media/recorder_headerless.webm').arrayBuffer());
+    const remuxInput: MediaInput = {
+      id: 'recorder_headerless.webm', url: '/recorder_headerless.webm', mime: 'video/webm',
+      sizeBytes: bytes.byteLength,
+      async blob() { return new Blob([bytes.slice()], { type: 'video/webm' }); },
+      async arrayBuffer() { return bytes.slice().buffer as ArrayBuffer; },
+    };
+    const outcome = await runOracle('property-invariant', context({
+      scenario: scenario('remux', 'property-invariant', {
+        container: 'webm',
+        invariant: 'probe-duration',
+      }),
+      input: remuxInput,
+      output: { bytes, mime: 'video/webm', container: 'webm' },
+      golden: golden({ container: 'webm', durationSec: null, tracks: [] }),
+      decodeWithPlatform: async () => ({
+        frames: [
+          { index: 0, ptsUs: 0, sha256: '01'.repeat(32) },
+          { index: 1, ptsUs: 2_980_000, sha256: '02'.repeat(32) },
+        ],
+      }),
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(outcome.measurements).toMatchObject({ goldenDurationSec: 2.98, outDurationSec: 2.98 });
+  });
+});
 
 describe('REQ-ORAC-01 semantic golden metadata', () => {
   const video = (codec: string, extra: Record<string, unknown> = {}) =>
@@ -292,6 +367,67 @@ describe('REQ-ORAC-01 semantic golden metadata', () => {
     expect(verdict(vfr)).not.toBe('FAIL');
   });
 
+  test('exact golden packet cadence overrides materially contradictory nominal carrier rates', async () => {
+    const want: NormalizedMetadata = {
+      container: 'webm', durationSec: 10,
+      tracks: [video('vp8', { fps: 1000 })],
+    };
+    const packets: PacketInfo[] = [0, 33_000, 66_000, 132_000].map((ptsUs, index) => ({
+      trackIndex: 0,
+      size: 1,
+      ptsUs,
+      keyframe: index === 0,
+    }));
+    const observed: NormalizedMetadata = {
+      container: 'webm', durationSec: 10,
+      tracks: [video('vp8', {
+        fps: undefined,
+        fpsProvenance: {
+          source: 'observed', cadence: 'VFR', sampleCount: 4, observedIntervalUs: 132_000,
+          envelope: { minFps: 1_000_000 / 66_000, maxFps: 1_000_000 / 33_000 },
+        },
+      })],
+    };
+    const exact = await runOracle('golden-metadata', context({
+      metadata: observed,
+      golden: golden(want, packets),
+    }));
+    expect(verdict(exact)).toBe('PASS');
+    expect(exact.reasonCode).toBe('ORACLE_REPRESENTATION_DIFF');
+    expect(exact.detail).toContain('contradicted by exact packet timeline');
+
+    const moderatePackets: PacketInfo[] = [0, 33_333, 66_667, 100_000].map((ptsUs, index) => ({
+      trackIndex: 0, size: 1, ptsUs, keyframe: index === 0,
+    }));
+    const moderate = await runOracle('golden-metadata', context({
+      metadata: {
+        container: 'mov', durationSec: 1,
+        tracks: [video('h264', {
+          fps: undefined,
+          fpsProvenance: {
+            source: 'observed', cadence: 'CFR', sampleCount: 3, observedIntervalUs: 100_000,
+            envelope: { minFps: 29.999, maxFps: 30.001 },
+          },
+        })],
+      },
+      golden: golden({ container: 'mov', durationSec: 1, tracks: [video('h264', { fps: 20.5 })] }, moderatePackets),
+    }));
+    expect(verdict(moderate)).toBe('PASS');
+    expect(moderate.detail).toContain('contradicted by exact packet timeline');
+
+    const wrong = await runOracle('golden-metadata', context({
+      metadata: {
+        ...observed,
+        tracks: [video('vp8', {
+          fps: undefined,
+          fpsProvenance: { source: 'observed', cadence: 'CFR', sampleCount: 60, observedIntervalUs: 1_000_000 },
+        })],
+      },
+      golden: golden(want, packets),
+    }));
+    expect(verdict(wrong)).toBe('FAIL');
+  });
+
   test('legacy rational/timestamp cadence fields remain backward-compatible', async () => {
     const ntsc = await compare(
       { container: 'mp4', durationSec: 1, tracks: [video('h264', { fps: 29.97 })] },
@@ -379,6 +515,35 @@ describe('REQ-ORAC-02 semantic packets', () => {
       golden: golden(wantMeta, want),
     }), { seekToleranceUs: 1000 });
   }
+
+  test('typed demux scale mode gates exact rows while treating payload retention as representation-only', async () => {
+    const measured: PacketInfo[] = [
+      { trackIndex: 0, size: 4, ptsUs: 0, dtsUs: 0, durationUs: 33_333, keyframe: true },
+      { trackIndex: 0, size: 3, ptsUs: 33_333, dtsUs: 33_333, durationUs: 33_333, keyframe: false },
+    ];
+    const committed: PacketInfo[] = measured.map((row, index) => ({
+      ...row,
+      payloadDigest: String(index + 1).repeat(64),
+    }));
+    const scaleScenario = scenario('demux', 'golden-packets', {
+      invariant: 'demux-scale-budgets',
+      robustness: defineDemuxScaleContract('massive'),
+    });
+    const runScale = (packets: PacketInfo[]) => runOracle('golden-packets', context({
+      scenario: scaleScenario,
+      demux: { metadata: meta, packets },
+      golden: golden(meta, committed),
+    }), { seekToleranceUs: 1000 });
+
+    const exact = await runScale(measured);
+    expect(verdict(exact)).toBe('PASS');
+    expect(exact.reasonCode).toBe('ORACLE_REPRESENTATION_DIFF');
+    expect(exact.detail).toContain('scale-mode metadata-only packets');
+
+    const wrong = structuredClone(measured);
+    wrong[1]!.size += 1;
+    expect(verdict(await runScale(wrong))).toBe('FAIL');
+  });
 
   test('Annex B vs length-prefix and inline vs out-of-band SPS/PPS are DIFF', async () => {
     const want = [packet(annex([0x67, 1], [0x68, 2], [0x65, 0xaa]), { framing: 'annex-b' })];

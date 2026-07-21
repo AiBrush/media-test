@@ -113,6 +113,18 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     }
   }
 
+  if (request.operation === 'demux') {
+    const unsupportedInputTrack = request.inputs
+      .flatMap((input) => input.tracks)
+      .find((track) => track.type !== 'video' && track.type !== 'audio');
+    if (unsupportedInputTrack) {
+      return no(
+        MEDIABUNNY_REASON.TRACK_TYPE,
+        `Mediabunny 1.48.0 Input.getTracks()/EncodedPacketSink does not expose demux packets for '${unsupportedInputTrack.type}' tracks`,
+      );
+    }
+  }
+
   if (!request.output) return { supported: true };
   const outputContainer = request.operation === 'decrypt' ? 'mp4' : request.output.container;
   if (!outputContainer) return no(MEDIABUNNY_REASON.CONTAINER, 'an output container is required');
@@ -178,17 +190,21 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
   }
 
   const tracks = concreteTracks(request);
-  // Concrete requests are built after selected-source evidence, so an empty track list is a real
-  // zero-track tuple rather than an unknown wildcard.
+  const hasUnresolvedInputEvidence = request.inputs.some((input) => input.sourceEvidence === 'UNRESOLVED');
+  // The runner first asks about a source before its selected bytes/goldens have been resolved. Preserve
+  // intrinsic container/option checks above, but defer track-dependent cardinality and containability
+  // until the evidence-rich support pass. A resolved empty track list remains a real zero-track tuple.
   const variants = Array.isArray(request.options.variants)
     ? request.options.variants.filter(isRecord)
     : [];
-  if (request.operation === 'transcode' && variants.length > 0) {
-    const decisions = variants.map((variant) => decideTrackTuple(requestWithVariant(request, variant), format, tracks));
-    if (decisions.every((decision) => decision !== undefined)) return decisions[0]!;
-  } else {
-    const intrinsic = decideTrackTuple(request, format, tracks);
-    if (intrinsic) return intrinsic;
+  if (!hasUnresolvedInputEvidence) {
+    if (request.operation === 'transcode' && variants.length > 0) {
+      const decisions = variants.map((variant) => decideTrackTuple(requestWithVariant(request, variant), format, tracks));
+      if (decisions.every((decision) => decision !== undefined)) return decisions[0]!;
+    } else {
+      const intrinsic = decideTrackTuple(request, format, tracks);
+      if (intrinsic) return intrinsic;
+    }
   }
 
   if (request.timingMode === 'timestamped' && !format.supportsTimestampedMediaData) {

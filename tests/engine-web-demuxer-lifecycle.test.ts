@@ -116,6 +116,33 @@ describe('REQ-ENG-30: observable web-demuxer lifecycle and cancellation', () => 
     await engine.dispose(lifecycle());
   });
 
+  test('turns graceful demux parser rejection into the typed malformed-input channel', async () => {
+    plan.mediaInfoError = 'get_media_info failed: undefined';
+    const engine = makeEngine();
+    await engine.init(lifecycle());
+    const context = operationContext('demux');
+    const gracefulContext: OperationContext = {
+      ...context,
+      request: {
+        ...context.request,
+        options: {
+          ...context.request.options,
+          robustness: {
+            schema: 'media-test/robustness-contract@1',
+            inputClass: 'negative',
+          },
+        },
+      },
+    };
+    await expect(engine.demux(input(), gracefulContext)).rejects.toMatchObject({
+      name: 'MalformedInputError',
+      reasonCode: 'WEB_DEMUXER_DEMUX_MALFORMED_INPUT_REJECTED',
+      operation: 'demux',
+      stage: 'parse',
+    });
+    await engine.dispose(lifecycle());
+  });
+
   test('does not relabel cancellation as malformed input in a graceful probe row', async () => {
     plan.mediaInfoError = abortError('cancel probe');
     const engine = makeEngine();

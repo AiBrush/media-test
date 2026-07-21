@@ -6,6 +6,7 @@ import type {
   PacketInfo,
   TrackType,
 } from '../../core/engine.ts';
+import { sha256Hex } from '../../core/seeded-rng.ts';
 
 export interface AibrushObservedTrack {
   readonly id: number;
@@ -120,6 +121,7 @@ export function buildAibrushDemuxResult(
   rawPackets: readonly AibrushRawPacket[],
 ): DemuxResult {
   const packets: PacketInfo[] = rawPackets.map((packet) => {
+    const payload = packet.payload?.byteLength === packet.size ? packet.payload : undefined;
     const track = tracks[packet.trackIndex];
     const codec = track === undefined
       ? metadata.tracks[packet.trackIndex]?.codec
@@ -136,8 +138,8 @@ export function buildAibrushDemuxResult(
       keyframe: packet.keyframe,
       ...(track !== undefined ? { trackType: track.mediaType as TrackType } : {}),
       ...(codec !== undefined ? { codec } : {}),
-      ...(packet.payload !== undefined
-        ? { payload: packet.payload.slice(), payloadDigest: fnv1a32(packet.payload) }
+      ...(payload !== undefined
+        ? { payload: payload.slice(), payloadDigest: sha256Hex(payload) }
         : {}),
       ...(representation !== undefined ? { framing: representation.framing } : {}),
       ...(track !== undefined && nalLengthSize(track) !== undefined ? { nalLengthSize: nalLengthSize(track) } : {}),
@@ -167,8 +169,23 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
   const tracks = metadata.tracks.map((track, trackIndex): NormalizedTrack => {
     if (track.type !== 'video') return { ...track };
     const videoPackets = packets.filter((packet) => packet.trackIndex === trackIndex);
-    if (videoPackets.length < 2) return { ...track };
+    if (videoPackets.length === 0) return { ...track };
     const ordered = [...videoPackets].sort((a, b) => a.ptsUs - b.ptsUs);
+    if (ordered.length === 1) {
+      const durationUs = ordered[0]!.durationUs;
+      if (durationUs === undefined || durationUs <= 0) return { ...track };
+      return {
+        ...track,
+        fps: 1_000_000 / durationUs,
+        fpsProvenance: {
+          source: 'observed',
+          cadence: 'CFR',
+          sampleCount: 1,
+          observedIntervalUs: durationUs,
+          envelope: { minFps: 1_000_000 / durationUs, maxFps: 1_000_000 / durationUs },
+        },
+      };
+    }
     const startUs = ordered[0]!.ptsUs;
     const endUs = ordered.reduce(
       (end, packet) => Math.max(end, packet.ptsUs + Math.max(0, packet.durationUs ?? 0)),
@@ -181,11 +198,10 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
       const interval = ordered[index]!.ptsUs - ordered[index - 1]!.ptsUs;
       if (interval > 0) intervals.push(interval);
     }
-    const fps = ordered.length * 1_000_000 / observedIntervalUs;
     if (intervals.length === 0) {
       return {
         ...track,
-        fps,
+        fps: ordered.length * 1_000_000 / observedIntervalUs,
         fpsProvenance: {
           source: 'observed',
           cadence: 'UNKNOWN',
@@ -197,6 +213,8 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
     const minInterval = Math.min(...intervals);
     const maxInterval = Math.max(...intervals);
     const meanInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
+    const fps = 1_000_000 / meanInterval;
+    const cadenceObservedIntervalUs = ordered.length * meanInterval;
     return {
       ...track,
       fps,
@@ -204,7 +222,7 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
         source: 'observed',
         cadence: maxInterval - minInterval <= Math.max(2, meanInterval * 0.001) ? 'CFR' : 'VFR',
         sampleCount: ordered.length,
-        observedIntervalUs,
+        observedIntervalUs: cadenceObservedIntervalUs,
         envelope: { minFps: 1_000_000 / maxInterval, maxFps: 1_000_000 / minInterval },
       },
     };
@@ -227,13 +245,4 @@ function nalLengthSize(track: AibrushObservedTrack): number | undefined {
   if (codec === 'h264' && bytes.byteLength > 4) return (bytes[4]! & 0x03) + 1;
   if (codec === 'hevc' && bytes.byteLength > 21) return (bytes[21]! & 0x03) + 1;
   return undefined;
-}
-
-function fnv1a32(bytes: Uint8Array): string {
-  let hash = 0x811c9dc5;
-  for (const byte of bytes) {
-    hash ^= byte;
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }

@@ -3,6 +3,7 @@ import { readAdtsProgram } from './reader-adts.ts';
 import { readEbmlProgram } from './reader-ebml.ts';
 import { readFlacProgram } from './reader-flac.ts';
 import { readIsoBmffProgram } from './reader-isobmff.ts';
+export { aacLcChannelsFromEsds } from './reader-isobmff.ts';
 import { readMp3Program } from './reader-mp3.ts';
 import { readOggProgram } from './reader-ogg.ts';
 import { readTsProgram } from './reader-ts.ts';

@@ -57,6 +57,8 @@ export function readAdtsProgram(bytes: Uint8Array): RemuxReadResult {
       const durationUs = Math.round((frames / sampleRate) * 1_000_000);
       samples.push({
         payload: bytes.subarray(offset + headerLength, offset + frameLength),
+        sourcePayload: bytes.subarray(offset, offset + frameLength),
+        sourceByteLength: frameLength,
         ptsUs,
         dtsUs: ptsUs,
         durationUs,

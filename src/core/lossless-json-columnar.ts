@@ -213,23 +213,47 @@ function decodeHexStrings(value: JsonRecord): string[] {
   return out;
 }
 
-function decodeBase64(value: unknown): Uint8Array {
-  if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+/** Decode canonical RFC 4648 base64 without a whole-input regexp or re-encoding allocation. */
+export function decodeCanonicalBase64(value: unknown): Uint8Array {
+  if (typeof value !== 'string' || value.length % 4 !== 0) {
     throw new TypeError('invalid canonical base64');
   }
+  let padding = 0;
+  if (value.endsWith('==')) padding = 2;
+  else if (value.endsWith('=')) padding = 1;
+  const contentLength = value.length - padding;
+  for (let index = 0; index < contentLength; index++) {
+    if (base64Sextet(value.charCodeAt(index)) < 0) throw new TypeError('invalid canonical base64');
+  }
+  for (let index = contentLength; index < value.length; index++) {
+    if (value.charCodeAt(index) !== 0x3d) throw new TypeError('invalid canonical base64');
+  }
+  // RFC 4648 canonical form requires unused bits in the final sextet to be zero. Checking those
+  // bits directly avoids materializing a second base64 string merely to compare a round-trip.
+  if (padding === 2 && (contentLength < 2 || (base64Sextet(value.charCodeAt(contentLength - 1)) & 0x0f) !== 0)) {
+    throw new TypeError('non-canonical base64');
+  }
+  if (padding === 1 && (contentLength < 3 || (base64Sextet(value.charCodeAt(contentLength - 1)) & 0x03) !== 0)) {
+    throw new TypeError('non-canonical base64');
+  }
+  if (padding === 0 && contentLength % 4 !== 0) throw new TypeError('invalid canonical base64');
   const binary = atob(value);
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  if (encodeBase64(bytes) !== value) throw new TypeError('non-canonical base64');
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }
 
-function encodeBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunk, bytes.length)));
-  }
-  return btoa(binary);
+function decodeBase64(value: unknown): Uint8Array {
+  return decodeCanonicalBase64(value);
+}
+
+function base64Sextet(code: number): number {
+  if (code >= 0x41 && code <= 0x5a) return code - 0x41;
+  if (code >= 0x61 && code <= 0x7a) return code - 0x61 + 26;
+  if (code >= 0x30 && code <= 0x39) return code - 0x30 + 52;
+  if (code === 0x2b) return 62;
+  if (code === 0x2f) return 63;
+  return -1;
 }
 
 function isRecord(value: unknown): value is JsonRecord {

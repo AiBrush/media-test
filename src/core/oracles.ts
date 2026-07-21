@@ -80,9 +80,10 @@ import {
   evaluateStrictStreamCopy,
   normalizeRemuxTrackForTest,
   readNeutralRemuxProgram,
+  remuxRoundTripContractFromOptions,
   validateReturnedPartialRemux,
 } from '../features/remux/index.ts';
-import { assessDemuxDts } from '../features/demux/index.ts';
+import { assessDemuxDts, demuxScaleContractFromOptions } from '../features/demux/index.ts';
 import {
   TRIM_AUDIO_CONTENT_INVARIANT,
   TRIM_BOUNDARY_EVIDENCE_SCHEMA,
@@ -1235,9 +1236,9 @@ interface MetadataDiagnostics {
 function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): OracleOutcome {
   const oracle: OracleId = 'golden-metadata';
   const got = ctx.metadata;
-  const want = ctx.golden.meta;
+  const committedWant = ctx.golden.meta;
   if (!got) return fail(oracle, 'no probe metadata on ctx.metadata');
-  if (!want) return missingGoldenOutcome(ctx.golden, 'meta', oracle, 'golden metadata is unavailable');
+  if (!committedWant) return missingGoldenOutcome(ctx.golden, 'meta', oracle, 'golden metadata is unavailable');
 
   const failures: string[] = [];
   const normalizations: string[] = [];
@@ -1251,6 +1252,9 @@ function goldenMetadata(ctx: OracleContext, t: Required<OracleTolerances>): Orac
     normalizations,
     representationDifferences,
   };
+  const packetCadence = normalizeContradictedGoldenCadence(committedWant, ctx.golden.packets);
+  const want = packetCadence.metadata;
+  representationDifferences.push(...packetCadence.representationDifferences);
 
   // container
   if (normStr(got.container) !== normStr(want.container)) {
@@ -1908,6 +1912,70 @@ function metadataTracksForScenario(ctx: OracleContext, tracks: NormalizedTrack[]
   return tracks;
 }
 
+/**
+ * Some ffprobe/container nominal-rate fields are known to be carrier ticks rather than frame rate
+ * (for example a WebM DefaultDuration omission reported as 1000 fps). When the same committed
+ * golden includes an exact packet table, replace a materially contradictory nominal video rate
+ * with cadence derived from those timestamps. Near rates remain gated as ordinary disagreements.
+ */
+function normalizeContradictedGoldenCadence(
+  metadata: NormalizedMetadata,
+  packets: readonly PacketInfo[] | undefined,
+): { metadata: NormalizedMetadata; representationDifferences: string[] } {
+  if (!packets || packets.length < 2) return { metadata, representationDifferences: [] };
+  const tracks = metadata.tracks.map((track) => ({ ...track }));
+  const representationDifferences: string[] = [];
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
+    const track = tracks[trackIndex]!;
+    if (track.type !== 'video') continue;
+    const declared = cadenceEvidence(track as SemanticMetadataTrack).center;
+    if (!(declared !== undefined && declared > 0)) continue;
+    const timeline = packets
+      .filter((packet) => packet.trackIndex === trackIndex && Number.isFinite(packet.ptsUs))
+      .sort((a, b) => a.ptsUs - b.ptsUs);
+    if (timeline.length < 2) continue;
+    const startUs = timeline[0]!.ptsUs;
+    const endUs = timeline.reduce(
+      (end, packet) => Math.max(end, packet.ptsUs + Math.max(0, packet.durationUs ?? 0)),
+      startUs,
+    );
+    const observedIntervalUs = endUs - startUs;
+    if (!(observedIntervalUs > 0)) continue;
+    const includesTerminalDuration = timeline.some((packet) => (packet.durationUs ?? 0) > 0);
+    const observedPeriods = includesTerminalDuration ? timeline.length : timeline.length - 1;
+    const observed = observedPeriods * 1_000_000 / observedIntervalUs;
+    // The packet inventory is exact source evidence, while nominal container fields are hints. A 5%
+    // conflict is large enough to exclude rational/tick spelling noise without privileging a stale
+    // avg_frame_rate-style carrier value over the committed packet timeline.
+    if (Math.abs(declared - observed) / Math.min(declared, observed) <= 0.05) continue;
+    const intervals: number[] = [];
+    for (let index = 1; index < timeline.length; index++) {
+      const interval = timeline[index]!.ptsUs - timeline[index - 1]!.ptsUs;
+      if (interval > 0) intervals.push(interval);
+    }
+    if (intervals.length === 0) continue;
+    const minInterval = Math.min(...intervals);
+    const maxInterval = Math.max(...intervals);
+    const meanInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
+    const cadence = maxInterval - minInterval <= Math.max(2, meanInterval * 0.001) ? 'CFR' : 'VFR';
+    track.fps = observed;
+    track.fpsProvenance = {
+      source: 'observed',
+      cadence,
+      sampleCount: observedPeriods,
+      observedIntervalUs,
+      envelope: { minFps: 1_000_000 / maxInterval, maxFps: 1_000_000 / minInterval },
+    };
+    representationDifferences.push(
+      `golden video[${trackIndex}] nominal cadence ${declared}fps contradicted by exact packet timeline ` +
+        `${observed.toFixed(6)}fps; packet cadence is authoritative`,
+    );
+  }
+  return representationDifferences.length > 0
+    ? { metadata: { ...metadata, tracks }, representationDifferences }
+    : { metadata, representationDifferences };
+}
+
 // ── golden-packets ───────────────────────────────────────────────────────────────────────────
 
 interface PacketTableComparison {
@@ -2098,6 +2166,26 @@ function compareSemanticPacketEvidence(
     !!packet.accessUnitId;
   const measuredHasSemanticEvidence = got.some(carriesSemanticEvidence);
   const goldenHasSemanticEvidence = want.some(carriesSemanticEvidence);
+  if (goldenHasSemanticEvidence && !measuredHasSemanticEvidence && demuxScaleContractFromOptions(ctx.scenario.options)) {
+    // At-scale demux deliberately uses metadata-only packets: retaining up to a source-sized second
+    // payload graph would invalidate the very memory budget this scenario measures. The committed
+    // golden still gates the complete packet inventory, track layout, sizes, key flags, and timing.
+    // This exception is closed to the typed scale contract and remains FAIL on any row mismatch.
+    if (!raw.ok) {
+      return {
+        state: 'FAIL',
+        detail: `scale-mode structural packet rows differ: ${raw.diffs.join('; ')}`,
+        measurements: raw.measurements,
+      };
+    }
+    return {
+      state: 'DIFF',
+      detail:
+        `scale-mode metadata-only packets match all ${got.length} exact structural golden rows; ` +
+        'payload identity is a declared representation omission under the demux scale contract',
+      measurements: raw.measurements,
+    };
+  }
   if (!goldenHasSemanticEvidence && measuredHasSemanticEvidence) {
     // Legacy ffprobe tables intentionally bind the complete exact row inventory but do not retain
     // payload bytes. Extra adapter payloads must not make scoring stricter than an adapter that
@@ -3204,7 +3292,8 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
   if (ctx.scenario.op === 'remux') {
     const source = new Uint8Array(await ctx.input.arrayBuffer());
     const sourceContainer = ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
-    const expectedTarget = readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
+    const expectedTarget = remuxRoundTripContractFromOptions(ctx.scenario.options)?.backTo ??
+      readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
     const structural = evaluateStrictStreamCopy(
       source,
       sourceContainer,
@@ -6043,12 +6132,39 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   if (which.includes('decode') || which.includes('remux')) {
-    // decode(remux(x)) == decode(x): output frame digests must equal golden source-decode digests.
+    // decode(remux(x)) == decode(x): prefer committed source-decode digests, but remux properties
+    // remain executable when that optional cache is pending by decoding the verified source and
+    // candidate through the same independent browser path.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const golden = await frameComparisonGolden(ctx);
-    const want = golden.frames;
+    let want = golden.frames;
     if (!want || !want.length) {
-      return missingGoldenOutcome(golden, 'frames', oracle, `[${which}] source decode frame evidence is unavailable`);
+      if (ctx.scenario.op !== 'remux') {
+        return missingGoldenOutcome(golden, 'frames', oracle, `[${which}] source decode frame evidence is unavailable`);
+      }
+      const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+      const sourceMedia: MediaBytes = {
+        bytes: sourceBytes,
+        mime: ctx.input.mime,
+        container: golden.meta?.container ?? resolveContainer(undefined, ctx.input.id),
+      };
+      try {
+        const sourceSink = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 60 });
+        want = sourceSink?.frames ?? [];
+      } catch (err) {
+        const classified = classifyReferenceDecodeFailure(oracle, 'source', err, sourceMedia);
+        return {
+          ...classified,
+          detail: `[${which}] ${classified.detail ?? 'source reference decode failed'}`,
+        };
+      }
+      if (!want.length) {
+        return oracleError(
+          oracle,
+          'REFERENCE_SOURCE_DECODE_EMPTY',
+          `[${which}] browser source reference decode produced no frames`,
+        );
+      }
     }
     let sink: FrameSink | null | undefined;
     try {
@@ -6076,7 +6192,15 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     // probe(out).dur ≈ probe(x).dur (golden) across containers. No scored engine: byte-reader
     // container duration, else the decoded frame-pts span, else a simple PCM (wav/aiff) parse.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
-    const goldenDur = ctx.golden.meta?.durationSec ?? ctx.metadata?.durationSec ?? null;
+    let goldenDur = ctx.golden.meta?.durationSec ?? ctx.metadata?.durationSec ?? null;
+    if (goldenDur == null && ctx.scenario.op === 'remux') {
+      const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+      const sourceContainer = ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
+      const sourceRead = readNeutralRemuxProgram(sourceBytes, sourceContainer);
+      if (sourceRead.state === 'OK' && sourceRead.value.durationUs !== undefined) {
+        goldenDur = sourceRead.value.durationUs / 1_000_000;
+      }
+    }
     if (goldenDur == null) {
       return missingGoldenOutcome(ctx.golden, 'meta', oracle, `[${which}] source duration evidence is unavailable`);
     }

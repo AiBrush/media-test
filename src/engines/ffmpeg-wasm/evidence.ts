@@ -115,6 +115,192 @@ export interface StructuredProbeResult {
   rawDigestInput: string;
 }
 
+export interface DemuxTimestampEvidence {
+  trackIndex: number;
+  ptsUs: number;
+  dtsUs?: number;
+  durationUs?: number;
+}
+
+/** AV_NOPTS_VALUE (INT64_MIN) — framecrc/framehash prints it for packets with no pts/dts. */
+const AV_NOPTS = -9223372036854775808;
+
+/** One parsed framecrc/framehash data row → packet timing plus an optional SHA-256 payload identity. */
+export function parseFrameChecksumPackets(
+  out: string,
+  sourceTimestamps?: ReadonlyMap<number, readonly DemuxTimestampEvidence[]>,
+): PacketInfo[] {
+  const timebase = new Map<number, number>();
+  const sourceCursor = new Map<number, number>();
+  const packets: PacketInfo[] = [];
+  for (const raw of out.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line) continue;
+    if (line.charCodeAt(0) === 35 /* '#' */) {
+      const tb = /^#tb (\d+):\s*(\d+)\/(\d+)/.exec(line);
+      if (tb) {
+        const num = Number(tb[2]);
+        const den = Number(tb[3]);
+        timebase.set(Number(tb[1]), den !== 0 ? num / den : 0);
+      }
+      continue;
+    }
+    const parts = line.split(',').map((part) => part.trim());
+    if (parts.length < 5) continue;
+    const trackIndex = Number(parts[0]);
+    const dtsTicks = Number(parts[1]);
+    const ptsTicks = Number(parts[2]);
+    const size = Number(parts[4]);
+    if (!Number.isFinite(trackIndex) || !Number.isFinite(size)) continue;
+
+    let hasFlags = false;
+    let flags = 0;
+    for (let index = 5; index < parts.length; index++) {
+      const match = /^F=0x([0-9A-Fa-f]+)$/.exec(parts[index]!);
+      if (!match) continue;
+      hasFlags = true;
+      flags = parseInt(match[1]!, 16);
+      break;
+    }
+    const keyframe = !hasFlags || (flags & 1) === 1;
+
+    const secondsPerTick = timebase.get(trackIndex) ?? 0;
+    const toUs = (ticks: number): number | null =>
+      Number.isFinite(ticks) && ticks !== AV_NOPTS
+        ? Math.round(ticks * secondsPerTick * 1_000_000)
+        : null;
+    let ptsUs = toUs(ptsTicks) ?? 0;
+    let dtsUs = toUs(dtsTicks);
+    let durationUs = toUs(Number(parts[3]));
+    const sourceRows = sourceTimestamps?.get(trackIndex);
+    if (sourceRows) {
+      const cursor = sourceCursor.get(trackIndex) ?? 0;
+      const source = sourceRows[cursor];
+      sourceCursor.set(trackIndex, cursor + 1);
+      if (source) {
+        ptsUs = source.ptsUs;
+        // A NOPTS source field means this axis was unavailable, not that the checksum muxer's
+        // independently observed fallback should be erased. Preserve that fallback so adapters
+        // advertising DTS do not create a coverage hole for one leading transport packet.
+        dtsUs = source.dtsUs ?? dtsUs;
+        durationUs = source.durationUs ?? durationUs;
+      }
+    }
+    const payloadDigest = parts.find((part) => /^[0-9a-f]{64}$/i.test(part));
+    packets.push({
+      trackIndex,
+      size,
+      ptsUs,
+      ...(dtsUs !== null ? { dtsUs } : {}),
+      ...(durationUs !== null && durationUs >= 0 ? { durationUs } : {}),
+      ...(payloadDigest ? { payloadDigest: payloadDigest.toLowerCase() } : {}),
+      keyframe,
+    });
+  }
+  return packets;
+}
+
+/** Parse one `-debug_ts` demuxer line before any output muxer timestamp repair is applied. */
+export function parseDemuxTimestampLog(message: string): DemuxTimestampEvidence | undefined {
+  if (!message.includes('demuxer ->')) return undefined;
+  // FFmpeg commonly prints `ist_index:0`; some builds prefix the input index and print
+  // `ist_index:0:0`. Accept both forms and always retain the final stream index.
+  const track = /ist_index:(?:\d+:)?(\d+)/.exec(message);
+  const pts = /pkt_pts_time:(\S+)/.exec(message);
+  const dts = /pkt_dts_time:(\S+)/.exec(message);
+  const duration = /duration_time:(\S+)/.exec(message);
+  const trackIndex = track ? Number(track[1]) : Number.NaN;
+  const ptsSec = pts && pts[1] !== 'NOPTS' ? Number(pts[1]) : Number.NaN;
+  if (!Number.isSafeInteger(trackIndex) || trackIndex < 0 || !Number.isFinite(ptsSec)) return undefined;
+  const dtsSec = dts && dts[1] !== 'NOPTS' ? Number(dts[1]) : Number.NaN;
+  const durationSec = duration ? Number(duration[1]) : Number.NaN;
+  return {
+    trackIndex,
+    ptsUs: Math.round(ptsSec * 1_000_000),
+    ...(Number.isFinite(dtsSec) ? { dtsUs: Math.round(dtsSec * 1_000_000) } : {}),
+    ...(Number.isFinite(durationSec) && durationSec >= 0
+      ? { durationUs: Math.round(durationSec * 1_000_000) }
+      : {}),
+  };
+}
+
+/**
+ * Remove framecrc's synthetic negative DTS for leading reordered EBML packets. Matroska/WebM does
+ * not store an independent DTS for these rows; the committed ffprobe evidence represents that
+ * unavailable value with its established PTS fallback.
+ */
+export function normalizeSyntheticLeadingEbmlDts(packets: PacketInfo[]): void {
+  for (const packet of packets) {
+    if (packet.dtsUs !== undefined && packet.dtsUs < 0) packet.dtsUs = packet.ptsUs;
+  }
+}
+
+/**
+ * Build the exact AVCDecoderConfigurationRecord fields observable in an Annex-B key packet.
+ * FFmpeg's `h264_mp4toannexb` filter prepends the source SPS/PPS, providing a bounded fallback when
+ * the bundled browser ffprobe entry point cannot return `extradata`.
+ */
+export function avcDecoderConfigFromAnnexB(bytes: Uint8Array): Uint8Array | undefined {
+  const nals = annexBNalUnits(bytes);
+  const unique = (type: number): Uint8Array[] => {
+    const out: Uint8Array[] = [];
+    const seen = new Set<string>();
+    for (const nal of nals) {
+      if (nal.byteLength === 0 || (nal[0]! & 0x1f) !== type) continue;
+      const identity = Array.from(nal, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      out.push(nal);
+    }
+    return out;
+  };
+  const sps = unique(7);
+  const pps = unique(8);
+  if (sps.length === 0 || pps.length === 0 || sps.length > 31 || pps.length > 255 || sps[0]!.byteLength < 4) {
+    return undefined;
+  }
+  const size = 6 + sps.reduce((total, nal) => total + 2 + nal.byteLength, 0) +
+    1 + pps.reduce((total, nal) => total + 2 + nal.byteLength, 0);
+  const out = new Uint8Array(size);
+  out.set([1, sps[0]![1]!, sps[0]![2]!, sps[0]![3]!, 0xff, 0xe0 | sps.length], 0);
+  let offset = 6;
+  for (const nal of sps) {
+    out[offset++] = (nal.byteLength >>> 8) & 0xff;
+    out[offset++] = nal.byteLength & 0xff;
+    out.set(nal, offset);
+    offset += nal.byteLength;
+  }
+  out[offset++] = pps.length;
+  for (const nal of pps) {
+    out[offset++] = (nal.byteLength >>> 8) & 0xff;
+    out[offset++] = nal.byteLength & 0xff;
+    out.set(nal, offset);
+    offset += nal.byteLength;
+  }
+  return out;
+}
+
+/** Extract the MPEG-4 DecoderSpecificInfo (AudioSpecificConfig) from an `esds` full-box body. */
+export function audioSpecificConfigFromEsds(esdsBody: Uint8Array): Uint8Array | undefined {
+  for (let offset = 4; offset + 2 <= esdsBody.byteLength; offset++) {
+    if (esdsBody[offset] !== 0x05) continue;
+    let length = 0;
+    let cursor = offset + 1;
+    let lengthBytes = 0;
+    for (; lengthBytes < 4 && cursor < esdsBody.byteLength; lengthBytes++, cursor++) {
+      const byte = esdsBody[cursor]!;
+      length = (length << 7) | (byte & 0x7f);
+      if ((byte & 0x80) === 0) {
+        cursor++;
+        break;
+      }
+    }
+    if (lengthBytes >= 4 || length <= 0 || length > 64 || cursor + length > esdsBody.byteLength) continue;
+    return esdsBody.slice(cursor, cursor + length);
+  }
+  return undefined;
+}
+
 /**
  * Parse tracks from the first `Input #` block of an `ffmpeg -i` log. The loaded
  * wasm core includes source-index and timebase diagnostics between the optional
@@ -590,6 +776,22 @@ function parseFfprobeHexDump(value: string | undefined): Uint8Array | undefined 
     bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
   }
   return bytes;
+}
+
+function annexBNalUnits(bytes: Uint8Array): Uint8Array[] {
+  const starts: Array<{ start: number; payload: number }> = [];
+  for (let index = 0; index + 3 <= bytes.byteLength; index++) {
+    if (bytes[index] !== 0 || bytes[index + 1] !== 0) continue;
+    if (bytes[index + 2] === 1) {
+      starts.push({ start: index, payload: index + 3 });
+      index += 2;
+    } else if (index + 4 <= bytes.byteLength && bytes[index + 2] === 0 && bytes[index + 3] === 1) {
+      starts.push({ start: index, payload: index + 4 });
+      index += 3;
+    }
+  }
+  return starts.map((entry, index) =>
+    bytes.subarray(entry.payload, starts[index + 1]?.start ?? bytes.byteLength));
 }
 
 function rotationFromStream(stream: Record<string, unknown>): number | undefined {

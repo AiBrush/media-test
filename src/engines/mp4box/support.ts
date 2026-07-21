@@ -31,6 +31,14 @@ function option(request: ConcreteOperationRequest, key: string): unknown {
   return request.options[key];
 }
 
+function isDemuxScaleRequest(request: ConcreteOperationRequest): boolean {
+  const robustness = option(request, 'robustness');
+  return !!robustness
+    && typeof robustness === 'object'
+    && !Array.isArray(robustness)
+    && (robustness as Record<string, unknown>).schema === 'media-test/demux-scale-contract@1';
+}
+
 function inputTupleDecision(inputs: ConcreteInputRequest[]): SupportDecision {
   if (inputs.length !== 1) {
     return no('MP4BOX_INPUT_CARDINALITY_UNSUPPORTED', 'probe, demux, and remux consume exactly one ISO BMFF input');
@@ -106,7 +114,16 @@ export function decideMp4boxSupport(request: ConcreteOperationRequest): SupportD
     }
   }
 
-  if (operation === 'probe' || operation === 'demux') return yes();
+  if (operation === 'probe') return yes();
+  if (operation === 'demux') {
+    if (isDemuxScaleRequest(request)) {
+      return no(
+        'MP4BOX_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+        'MP4Box extraction completes as one adapter operation and does not expose a real first-packet event',
+      );
+    }
+    return yes();
+  }
   if (operation !== 'remux' && operation !== 'mux') {
     return no('MP4BOX_OPERATION_UNDECLARED', `MP4Box does not implement '${operation}'`);
   }

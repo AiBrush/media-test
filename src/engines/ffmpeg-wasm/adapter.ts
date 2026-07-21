@@ -113,7 +113,6 @@ import type {
   NormalizedTrack,
   OperationContext,
   OperationFinalCounters,
-  PacketInfo,
   SupportDecision,
   TranscodeOptions,
 } from '../../core/engine.ts';
@@ -130,19 +129,26 @@ import {
 import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/index.ts';
 import {
   applyObservedFrameCadence,
+  audioSpecificConfigFromEsds,
+  avcDecoderConfigFromAnnexB,
   containerFromFfmpegLog,
   FfmpegFsLedger,
+  parseDemuxTimestampLog,
   parseFfprobeFramesJson,
   parseFfprobeJson,
+  parseFrameChecksumPackets,
   parseMp3XingDurationSec,
   parseTracksFromLog,
+  normalizeSyntheticLeadingEbmlDts,
   representationForTracks,
   splitAdtsFrames,
   splitPreparedBytes,
   type FfmpegOperationPhase,
   type FfmpegPhaseEvidence,
+  type DemuxTimestampEvidence,
   type StructuredProbeResult,
 } from './evidence.ts';
+import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
 import { FfmpegLifecycleGate, FfmpegWorkerStateError } from './lifecycle.ts';
 import {
   classifyHlsDecryptApplicability,
@@ -180,6 +186,8 @@ const CORE_ST_INTEGRITY = 'sha512-dzNplnn2Nxle2c2i2rrDhqcB19q9cglCkWnoMTDN9Q9l3P
 const CORE_MT_INTEGRITY = 'sha512-atyRTOpa58bLCIgd6GXBZAXWyWD3AUoQyzxqjvGhp9MuSzdILtOTI62ffLswBsCnLq15lQ8IETHUpm1oe4V9FQ==';
 const WORKERFS_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const WRAPPER_HEAP_ESTIMATE_BYTES = 32 * 1024 * 1024;
+/** The vendored ST core corrupts argv after ~140 repeated main() calls; recycle with a safety margin. */
+const MAX_EXECS_PER_WORKER = 96;
 
 interface ActiveOperationEvidence {
   startedAtMs: number;
@@ -236,6 +244,8 @@ export interface FfmpegWasmConfig {
   userAgent: string;
   hardwareConcurrency: number;
   workerTimeoutMs: number;
+  workerRecycleLimit: number;
+  workerGeneration: number;
   policyReasonCodes: string[];
   encoderNondeterministic: true;
 }
@@ -470,9 +480,6 @@ function ffmpegToneMapAlgorithm(value: string | undefined): string {
 //
 // Both parsers are pure string logic (no library types), kept here so the FFmpeg call sites stay thin.
 
-/** AV_NOPTS_VALUE (INT64_MIN) — framecrc prints it for packets with no pts/dts. */
-const AV_NOPTS = -9223372036854775808;
-
 /**
  * In-engine per-exec timeout (ms) for the READ paths that ingest UNTRUSTED bytes — runInfo()'s
  * `ffmpeg -i` and demux()'s `-c copy -f framecrc`. The robustness dimension feeds fuzzed/truncated
@@ -526,66 +533,6 @@ function parseTagsFromLog(log: string): Record<string, string> {
     }
   }
   return tags;
-}
-
-/** One parsed framecrc data row → a PacketInfo (timestamps converted via the per-stream timebase). */
-function parseFramecrcPackets(out: string): PacketInfo[] {
-  const timebase = new Map<number, number>(); // streamIndex → seconds-per-tick
-  const packets: PacketInfo[] = [];
-  for (const raw of out.split('\n')) {
-    const line = raw.replace(/\r$/, '');
-    if (!line) continue;
-    if (line.charCodeAt(0) === 35 /* '#' */) {
-      const tb = /^#tb (\d+):\s*(\d+)\/(\d+)/.exec(line);
-      if (tb) {
-        const num = Number(tb[2]);
-        const den = Number(tb[3]);
-        timebase.set(Number(tb[1]), den !== 0 ? num / den : 0);
-      }
-      continue;
-    }
-    // stream, dts, pts, duration, size, 0xCRC[, F=0x<flags>][, S=<n>, ...]
-    const parts = line.split(',').map((s) => s.trim());
-    if (parts.length < 5) continue;
-    const trackIndex = Number(parts[0]);
-    const dtsTicks = Number(parts[1]);
-    const ptsTicks = Number(parts[2]);
-    const size = Number(parts[4]);
-    if (!Number.isFinite(trackIndex) || !Number.isFinite(size)) continue;
-
-    // Flags column is optional. The framecrc muxer OMITS `F=` when the only flag is KEY, prints
-    // `F=0x0` for a non-keyframe, and `F=0x<bits>` when extra flags are set (KEY = bit 0). So a packet
-    // is a keyframe when there is no F= field, OR the field's low bit is set.
-    let hasFlags = false;
-    let flags = 0;
-    for (let i = 5; i < parts.length; i++) {
-      const fm = /^F=0x([0-9A-Fa-f]+)$/.exec(parts[i]!);
-      if (fm) {
-        hasFlags = true;
-        flags = parseInt(fm[1]!, 16);
-        break;
-      }
-    }
-    const keyframe = !hasFlags || (flags & 1) === 1;
-
-    const spt = timebase.get(trackIndex) ?? 0;
-    const toUs = (ticks: number): number | null =>
-      Number.isFinite(ticks) && ticks !== AV_NOPTS ? Math.round(ticks * spt * 1_000_000) : null;
-    const ptsUs = toUs(ptsTicks) ?? 0;
-    const dtsUs = toUs(dtsTicks);
-    const durationTicks = Number(parts[3]);
-    const durationUs = toUs(durationTicks);
-
-    packets.push({
-      trackIndex,
-      size,
-      ptsUs,
-      ...(dtsUs !== null ? { dtsUs } : {}),
-      ...(durationUs !== null && durationUs >= 0 ? { durationUs } : {}),
-      keyframe,
-    });
-  }
-  return packets;
 }
 
 // ── Bitstream reconstruction for mux() (pure byte logic; no library types) ─────────────────────────
@@ -740,6 +687,22 @@ function aacParamsFromAsc(
   if (channelConfig <= 0) channelConfig = 2;
   if (objectType <= 0) objectType = 2;
   return { objectType, freqIndex, channelConfig };
+}
+
+/** Minimal two-byte AudioSpecificConfig for MPEG-4 AAC object types carried by the request facts. */
+function aacAudioSpecificConfig(
+  objectType: number,
+  sampleRate: number,
+  channels: number,
+): Uint8Array | undefined {
+  const frequencyIndex = AAC_SAMPLE_RATES.indexOf(sampleRate);
+  if (objectType < 1 || objectType > 4 || frequencyIndex < 0 || channels < 1 || channels > 15) {
+    return undefined;
+  }
+  return Uint8Array.of(
+    (objectType << 3) | (frequencyIndex >>> 1),
+    ((frequencyIndex & 1) << 7) | (channels << 3),
+  );
 }
 
 /**
@@ -1034,6 +997,7 @@ interface WrittenInput {
   name: string;
   cleanupPaths: string[];
   inputOptions: string[];
+  workerFs?: true;
 }
 
 function isHlsPlaylistInput(input: MediaInput, bytes?: Uint8Array): boolean {
@@ -1528,11 +1492,14 @@ function describeError(e: unknown): string {
  */
 export class FfmpegWasmEngine implements MediaEngine {
   readonly id = ENGINE_ID;
+  readonly benchmarkLimits = Object.freeze({ maxInnerIterations: 6 });
 
   /** Loaded lazily in init(); FFmpeg instance backed by a dedicated worker. */
   private ff: FFmpeg | null = null;
   /** Monotonic counter so successive ops never collide on MEMFS filenames within one instance. */
   private seq = 0;
+  private execsSinceLoad = 0;
+  private workerGeneration = 0;
   /** Recent stdout/stderr lines, surfaced in thrown errors for diagnosis. */
   private logTail: string[] = [];
   /** Capability set built from the runtime probe in init(). */
@@ -1547,6 +1514,8 @@ export class FfmpegWasmEngine implements MediaEngine {
   private activeConfig: FfmpegWasmConfig | null = null;
   private mountedWorkerFs = new Set<string>();
   private lastStructuredProbe: StructuredProbeResult | null = null;
+  private demuxTimestampCapture: Map<number, DemuxTimestampEvidence[]> | null = null;
+  private demuxMetadataLogCapture: string[] | null = null;
 
   constructor(options: { limits?: Partial<FfmpegAdapterLimits> } = {}) {
     this.limits = { ...DEFAULT_FFMPEG_LIMITS, ...options.limits };
@@ -1681,6 +1650,8 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     this.fsLedger.reset();
     this.mountedWorkerFs.clear();
+    this.execsSinceLoad = 0;
+    this.workerGeneration++;
 
     let mod: typeof import('@ffmpeg/ffmpeg');
     try {
@@ -1696,6 +1667,8 @@ export class FfmpegWasmEngine implements MediaEngine {
       if (this.ff === ff) this.ff = null;
     });
     ff.on('log', ({ message }) => {
+      this.captureDemuxTimestamp(message);
+      this.captureDemuxMetadataLog(message);
       this.logTail.push(message);
       if (this.logTail.length > 4000) this.logTail.shift();
     });
@@ -1747,6 +1720,8 @@ export class FfmpegWasmEngine implements MediaEngine {
       userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unavailable',
       hardwareConcurrency: hwThreads,
       workerTimeoutMs: READ_EXEC_TIMEOUT_MS,
+      workerRecycleLimit: MAX_EXECS_PER_WORKER,
+      workerGeneration: this.workerGeneration,
       policyReasonCodes: [],
       encoderNondeterministic: true as const,
     };
@@ -1869,6 +1844,8 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (this.ff === ff2) this.ff = null;
       });
       ff2.on('log', ({ message }) => {
+        this.captureDemuxTimestamp(message);
+        this.captureDemuxMetadataLog(message);
         this.logTail.push(message);
         if (this.logTail.length > 4000) this.logTail.shift();
       });
@@ -1911,6 +1888,8 @@ export class FfmpegWasmEngine implements MediaEngine {
         await ff.exec(args, undefined, { signal });
       } catch {
         /* listing commands may set a nonzero ret; the log is what we want regardless */
+      } finally {
+        this.execsSinceLoad++;
       }
       return this.logTail.join('\n');
     };
@@ -2054,6 +2033,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     this.logTail = [];
     this.recordCommand(args);
     const code = await ff.exec(args, READ_EXEC_TIMEOUT_MS, { signal });
+    this.execsSinceLoad++;
     try {
       if (code === 0) await ff.deleteFile(out, { signal });
     } catch {
@@ -2153,6 +2133,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     const startedAt = nowMs();
     try {
       const code = await ff.exec(args, timeoutMs, { signal });
+      this.execsSinceLoad++;
       this.throwIfTimedOut(code, timeoutMs, nowMs() - startedAt, 'ffmpeg');
       return code;
     } catch (error) {
@@ -2179,6 +2160,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     const startedAt = nowMs();
     try {
       const code = await this.requireFf().ffprobe(args, timeoutMs, { signal });
+      this.execsSinceLoad++;
       this.throwIfTimedOut(code, timeoutMs, nowMs() - startedAt, 'ffprobe');
       return code;
     } catch (error) {
@@ -2239,14 +2221,14 @@ export class FfmpegWasmEngine implements MediaEngine {
     ));
   }
 
-  private async readBinary(path: string): Promise<Uint8Array> {
+  private async readBinary(path: string, countAsOutput = true): Promise<Uint8Array> {
     const signal = this.activeOperation?.context.signal ?? this.fallbackAbort.signal;
     this.recordPhase('read');
     const data = await this.requireFf().readFile(path, 'binary', { signal });
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : copyBytes(data);
     if (!this.fsLedger.snapshot().livePaths.includes(path)) this.fsLedger.add(path, bytes.byteLength, 'MEMFS');
     this.fsLedger.addJsCopy(bytes.byteLength);
-    this.recordOutputBytes(bytes.byteLength);
+    if (countAsOutput) this.recordOutputBytes(bytes.byteLength);
     return bytes;
   }
 
@@ -2323,7 +2305,12 @@ export class FfmpegWasmEngine implements MediaEngine {
           this.mountedWorkerFs.add(mountPoint);
           this.fsLedger.add(mountPoint, blob.size, 'WORKERFS');
           this.recordInputBytes(blob.size);
-          return { name: `${mountPoint}/${fileName}`, cleanupPaths: [mountPoint], inputOptions: [] };
+          return {
+            name: `${mountPoint}/${fileName}`,
+            cleanupPaths: [mountPoint],
+            inputOptions: [],
+            workerFs: true,
+          };
         } catch (error) {
           try {
             await this.requireFf().deleteDir(mountPoint, { signal });
@@ -2550,6 +2537,9 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     return this.lifecycle.operation(context.signal, async () => {
       this.fsLedger.assertEmpty();
+      if (this.execsSinceLoad >= MAX_EXECS_PER_WORKER) {
+        await this.loadWorker(context.signal);
+      }
       this.fsLedger.reset();
       this.fsLedger.setWrapperHeapEstimate(WRAPPER_HEAP_ESTIMATE_BYTES);
       this.activeOperation = {
@@ -2616,6 +2606,24 @@ export class FfmpegWasmEngine implements MediaEngine {
     if (!active || bytes <= 0) return;
     active.bytesOut += bytes;
     active.context.emit({ type: 'bytes-written', atMs: nowMs() - active.startedAtMs, bytes: active.bytesOut });
+  }
+
+  private captureDemuxTimestamp(message: string): void {
+    if (!this.demuxTimestampCapture) return;
+    const timestamp = parseDemuxTimestampLog(message);
+    if (!timestamp) return;
+    const rows = this.demuxTimestampCapture.get(timestamp.trackIndex) ?? [];
+    rows.push(timestamp);
+    this.demuxTimestampCapture.set(timestamp.trackIndex, rows);
+  }
+
+  private captureDemuxMetadataLog(message: string): void {
+    const capture = this.demuxMetadataLogCapture;
+    if (!capture || capture.length >= 512) return;
+    const trimmed = message.trim();
+    if (capture.length === 0 && !/^Input #\d+/.test(trimmed)) return;
+    if (capture.some((row) => /^(Output #|Stream mapping:|Press \[q\])/.test(row.trim()))) return;
+    capture.push(message);
   }
 
   // ── probe ────────────────────────────────────────────────────────────────────────────────────
@@ -2812,79 +2820,265 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── demux ────────────────────────────────────────────────────────────────────────────────────
 
-  private async demuxImpl(input: MediaInput): Promise<DemuxResult> {
-    const base = this.scratch();
-    const crcName = `${base}.framecrc.txt`;
-    const written = await this.writeInput(input, `${base}.in`);
-    try {
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
-      if (structured) {
-        const observed = await this.observedFrameTimeline(written.name, written.inputOptions, 10);
-        applyObservedFrameCadence(structured.metadata, observed);
-      }
+  private demuxScaleDeadlineMs(): number | undefined {
+    const robustness = this.activeOperation?.context.request.options.robustness;
+    if (!robustness || typeof robustness !== 'object' || Array.isArray(robustness)) return undefined;
+    const record = robustness as Record<string, unknown>;
+    if (record.schema !== 'media-test/demux-scale-contract@1') return undefined;
+    const limits = record.limits;
+    if (!limits || typeof limits !== 'object' || Array.isArray(limits)) return undefined;
+    const lastPacketMs = (limits as Record<string, unknown>).lastPacketMs;
+    return typeof lastPacketMs === 'number' && Number.isFinite(lastPacketMs) && lastPacketMs > 0
+      ? lastPacketMs
+      : undefined;
+  }
 
-      // ONE pass does both jobs: `-map 0 -c copy -f framecrc` re-packetizes nothing (stream copy) and
-      // writes a per-COPIED-packet table to crcName, while the SAME run prints the Input block to the
-      // log so we can build metadata from it (no ffprobe). The explicit `-map 0` is required because
-      // FFmpeg's default stream selection keeps only one stream per type, which would silently drop
-      // secondary audio/subtitle/data tracks from multi-track packet walks. framecrc enumerates the real
-      // container packets, so its row count + sizes + keyframe flags match an ffprobe `-show_packets`
-      // walk for compressed bitstreams. (Verified byte-for-byte vs golden for mp4/mov/webm/mkv/ts/ogg.)
-      let exitCode: number | null = null;
-      exitCode = await this.execObserved(
-        [
+  private async completeDemuxDecoderConfigs(
+    input: MediaInput,
+    written: WrittenInput,
+    metadata: NormalizedMetadata,
+    existing: ReadonlyMap<number, Uint8Array>,
+    sourceTrackIndexes: readonly number[],
+    timeoutMs: number,
+    allowWholeFileRead: boolean,
+  ): Promise<{
+    configs: Map<number, Uint8Array>;
+    packetDigests: Map<number, Array<{ size: number; ptsUs?: number; digest: string }>>;
+  }> {
+    const configs = new Map<number, Uint8Array>(existing);
+    const packetDigests = new Map<number, Array<{ size: number; ptsUs?: number; digest: string }>>();
+    const container = metadata.container;
+    if (container === 'ts' || container === 'hls') return { configs, packetDigests };
+
+    if (allowWholeFileRead) {
+      const bytes = new Uint8Array(await input.arrayBuffer());
+      this.fsLedger.addJsCopy(bytes.byteLength);
+      this.recordInputBytes(bytes.byteLength);
+      try {
+        const read = readNeutralRemuxProgram(bytes, container);
+        if (read.state === 'OK') {
+          const claimed = new Set<number>();
+          for (let trackIndex = 0; trackIndex < metadata.tracks.length; trackIndex++) {
+            const track = metadata.tracks[trackIndex]!;
+            const sourceTrackIndex = sourceTrackIndexes[trackIndex] ?? trackIndex;
+            if (configs.has(sourceTrackIndex)) continue;
+            const matchIndex = read.value.tracks.findIndex((candidate, index) =>
+              !claimed.has(index) && candidate.type === track.type && candidate.codec === track.codec);
+            if (matchIndex < 0) continue;
+            claimed.add(matchIndex);
+            const matchedTrack = read.value.tracks[matchIndex]!;
+            const codecPrivate = matchedTrack.codecPrivate;
+            const config = codecPrivate
+              ? track.codec === 'aac'
+                ? audioSpecificConfigFromEsds(codecPrivate)
+                : codecPrivate
+              : undefined;
+            if (config) configs.set(sourceTrackIndex, new Uint8Array(config));
+            if (track.codec === 'aac' || track.codec === 'h264' || track.codec === 'hevc') {
+              packetDigests.set(trackIndex, await Promise.all(matchedTrack.samples.map(async (sample) => ({
+                size: sample.payload.byteLength,
+                ...(sample.ptsUs !== undefined ? { ptsUs: sample.ptsUs } : {}),
+                digest: await sha256Hex(sample.payload),
+              }))));
+            }
+          }
+        }
+      } finally {
+        this.fsLedger.releaseJsCopy(bytes.byteLength);
+      }
+    }
+
+    const declaredAudio = this.activeOperation?.context.request.inputs[0]?.tracks
+      ?.filter((track) => track.type === 'audio') ?? [];
+    let audioOrdinal = 0;
+    for (let trackIndex = 0; trackIndex < metadata.tracks.length; trackIndex++) {
+      const track = metadata.tracks[trackIndex]!;
+      if (track.type !== 'audio') continue;
+      const declared = declaredAudio[audioOrdinal++];
+      const sourceTrackIndex = sourceTrackIndexes[trackIndex] ?? trackIndex;
+      if (track.codec !== 'aac' || configs.has(sourceTrackIndex)) continue;
+      const config = aacAudioSpecificConfig(
+        declared?.audioObjectType ?? track.audioObjectType ?? 2,
+        declared?.sampleRate ?? track.sampleRate ?? 0,
+        declared?.channels ?? track.channels ?? 0,
+      );
+      if (config) configs.set(sourceTrackIndex, config);
+    }
+
+    let videoOrdinal = 0;
+    for (let trackIndex = 0; trackIndex < metadata.tracks.length; trackIndex++) {
+      const track = metadata.tracks[trackIndex]!;
+      if (track.type !== 'video') continue;
+      const ordinal = videoOrdinal++;
+      const sourceTrackIndex = sourceTrackIndexes[trackIndex] ?? trackIndex;
+      if (track.codec !== 'h264' || configs.has(sourceTrackIndex)) continue;
+      const outName = `${this.scratch()}.first.h264`;
+      try {
+        await this.run([
           '-hide_banner',
           ...written.inputOptions,
+          '-i', written.name,
+          '-map', `0:v:${ordinal}`,
+          '-c:v', 'copy',
+          '-frames:v', '1',
+          '-bsf:v', 'h264_mp4toannexb',
+          '-f', 'h264',
+          outName,
+        ], timeoutMs);
+        const bytes = await this.readBinary(outName, false);
+        try {
+          const config = avcDecoderConfigFromAnnexB(bytes);
+          if (!config) throw new Error('bounded H.264 extraction did not expose SPS/PPS');
+          configs.set(sourceTrackIndex, config);
+        } finally {
+          this.fsLedger.releaseJsCopy(bytes.byteLength);
+        }
+      } finally {
+        await this.cleanup([outName]);
+      }
+    }
+
+    return { configs, packetDigests };
+  }
+
+  private wavDemuxPacketBytes(request: ConcreteOperationRequest | undefined): number {
+    const audio = request?.inputs[0]?.tracks?.find((track) => track.type === 'audio');
+    const channels = audio?.channels ?? 1;
+    const bytesPerSample = audio?.codec === 'pcm-s24' ? 3 : audio?.codec === 'pcm-f32' ? 4 : 2;
+    const sampleRate = audio?.sampleRate ?? 48_000;
+    const packetSampleFrames = 2 ** Math.max(0, Math.floor(Math.log2(sampleRate / 10)));
+    return packetSampleFrames * channels * bytesPerSample;
+  }
+
+  private async demuxImpl(input: MediaInput): Promise<DemuxResult> {
+    const base = this.scratch();
+    const request = this.activeOperation?.context.request;
+    const scaleDeadlineMs = this.demuxScaleDeadlineMs();
+    const checksumName = `${base}.framecrc.txt`;
+    const inspectMp3 = containerFromInput(input) === 'mp3';
+    let preloadedBytes = inspectMp3 ? copyBytes(await input.arrayBuffer()) : undefined;
+    const mp3DurationSec = preloadedBytes ? parseMp3XingDurationSec(preloadedBytes) : null;
+    const written = await this.writeInput(input, `${base}.in`, preloadedBytes);
+    preloadedBytes = undefined;
+    try {
+      try {
+      // The bundled browser ffprobe entry point is unreliable and can consume the full scale budget
+      // before returning no JSON. Demux uses the loaded ffmpeg program plus bounded container readers.
+      // ONE stream-copy pass writes framecrc timing/size/flag evidence without re-packetizing, while
+      // the SAME run prints the Input block to the
+      // log so we can build metadata from it (no ffprobe). The explicit `-map 0` is required because
+      // FFmpeg's default stream selection keeps only one stream per type, which would silently drop
+      // secondary audio/subtitle/data tracks from multi-track packet walks. The checksum muxers enumerate the real
+      // container packets, so its row count + sizes + keyframe flags match an ffprobe `-show_packets`
+      // walk for compressed bitstreams. (Verified byte-for-byte vs golden for mp4/mov/webm/mkv/ts/ogg.)
+      const container = containerFromInput(input);
+      const preserveDemuxTimestamps = container === 'ts' || container === 'hls';
+      const sourceTimestamps = preserveDemuxTimestamps
+        ? new Map<number, DemuxTimestampEvidence[]>()
+        : undefined;
+      this.demuxTimestampCapture = sourceTimestamps ?? null;
+      const metadataLogRows: string[] = [];
+      this.demuxMetadataLogCapture = metadataLogRows;
+      let exitCode: number | null = null;
+      try {
+        exitCode = await this.execObserved(
+        [
+          '-hide_banner',
+          ...(preserveDemuxTimestamps ? ['-debug_ts', '-copyts'] : []),
+          ...written.inputOptions,
+          ...(container === 'wav' ? ['-max_size', String(this.wavDemuxPacketBytes(request))] : []),
           '-i',
           written.name,
           '-map',
           '0',
           '-c',
           'copy',
+          ...(preserveDemuxTimestamps ? ['-copyinkf'] : []),
           '-f',
           'framecrc',
-          crcName,
+          checksumName,
         ],
-        READ_EXEC_TIMEOUT_MS,
-      );
-      const log = this.logTail.join('\n');
+        Math.max(READ_EXEC_TIMEOUT_MS, scaleDeadlineMs ?? 0),
+        );
+      } finally {
+        this.demuxTimestampCapture = null;
+        this.demuxMetadataLogCapture = null;
+      }
+      const logTail = this.logTail.join('\n');
+      const log = metadataLogRows.length > 0 ? metadataLogRows.join('\n') : logTail;
       this.logTail = [];
 
-      if (!/^Input #\d+/m.test(log)) {
+      if (exitCode !== 0 && !/^Input #\d+/m.test(log)) {
         throw new Error(
           `${ENGINE_ID}: demux failed to open input (framecrc exit ${exitCode}). ` +
-            `Log: ${log.split('\n').slice(-8).join(' | ')}`,
+            `Log: ${logTail.split('\n').slice(-8).join(' | ')}`,
         );
       }
 
-      const metadata = structured?.metadata ?? this.metadataFromLog(log, input);
+      const metadata = this.metadataFromLog(log, input);
+      this.attachMp3Duration(metadata, mp3DurationSec);
 
-      let crc: string;
+      let checksum: string;
       try {
-        crc = await this.readText(crcName);
+        checksum = await this.readText(checksumName);
       } catch (e) {
         throw new Error(
           `${ENGINE_ID}: demux produced no framecrc output (exit ${exitCode}): ${describeError(e)}. ` +
-            `Log: ${log.split('\n').slice(-8).join(' | ')}`,
+            `Log: ${logTail.split('\n').slice(-8).join(' | ')}`,
         );
       }
 
-      const packets = parseFramecrcPackets(crc);
+      const packets = parseFrameChecksumPackets(checksum, sourceTimestamps);
+      if (container === 'mkv' || container === 'webm') {
+        normalizeSyntheticLeadingEbmlDts(packets);
+      }
+      const sourceTrackIndexes = metadata.tracks.map((_, index) => index);
+      const decoderEvidence = await this.completeDemuxDecoderConfigs(
+        input,
+        written,
+        metadata,
+        new Map(),
+        sourceTrackIndexes,
+        Math.max(READ_EXEC_TIMEOUT_MS, scaleDeadlineMs ?? 0),
+        scaleDeadlineMs === undefined,
+      );
+      const decoderConfigs = decoderEvidence.configs;
+      for (const [trackIndex, digests] of decoderEvidence.packetDigests) {
+        const trackPackets = packets.filter((packet) => packet.trackIndex === trackIndex);
+        if (trackPackets.length !== digests.length) continue;
+        for (let index = 0; index < trackPackets.length; index++) {
+          const packet = trackPackets[index]!;
+          const digest = digests[index]!;
+          if (
+            packet.size === digest.size &&
+            (digest.ptsUs === undefined || packet.ptsUs === digest.ptsUs)
+          ) {
+            packet.payloadDigest = digest.digest;
+          }
+        }
+      }
       const representations = representationForTracks(
         metadata.container,
         metadata.tracks,
-        structured?.decoderConfigs ?? new Map(),
-        structured?.timebases ?? new Map(),
-        structured?.trackIndexes ?? metadata.tracks.map((_, index) => index),
+        decoderConfigs,
+        new Map(),
+        sourceTrackIndexes,
       );
+      const configuredTracks = new Set<number>();
       for (const packet of packets) {
         const track = metadata.tracks[packet.trackIndex];
         const representation = representations.find((item) => item.trackIndex === packet.trackIndex);
+        const sourceTrackIndex = sourceTrackIndexes[packet.trackIndex] ?? packet.trackIndex;
+        const decoderConfig = decoderConfigs.get(sourceTrackIndex);
         if (track) {
           packet.trackType = track.type;
-          packet.codec = track.codec;
+          if (track.type === 'video' || track.type === 'audio') packet.codec = track.codec;
         }
         if (representation) packet.framing = representation.framing;
+        if (decoderConfig && !configuredTracks.has(packet.trackIndex)) {
+          packet.decoderConfig = new Uint8Array(decoderConfig);
+          configuredTracks.add(packet.trackIndex);
+        }
         packet.randomAccessKind = packet.keyframe ? 'ffmpeg-packet-key-flag' : 'non-random-access';
       }
       packets.sort(
@@ -2902,12 +3096,54 @@ export class FfmpegWasmEngine implements MediaEngine {
           muxer: 'framecrc',
           bitstreamFilters: [],
           command: redactFfmpegCommand([
-            '-hide_banner', ...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy', '-f', 'framecrc', crcName,
+            '-hide_banner',
+            ...(preserveDemuxTimestamps ? ['-debug_ts', '-copyts'] : []),
+            ...written.inputOptions,
+            ...(container === 'wav' ? ['-max_size', String(this.wavDemuxPacketBytes(request))] : []),
+            '-i', written.name, '-map', '0', '-c', 'copy',
+            ...(preserveDemuxTimestamps ? ['-copyinkf'] : []),
+            '-f', 'framecrc',
+            checksumName,
           ]),
         },
       } as DemuxResult;
+      } catch (error) {
+        if (
+          written.workerFs &&
+          ((error instanceof DOMException && error.name === 'NotReadableError') ||
+            /FileReaderSync|requested file could not be read/i.test(describeError(error)))
+        ) {
+          throw this.applicabilityMiss(
+            'FFMPEG_WORKERFS_BLOB_UNREADABLE',
+            `${input.sizeBytes ?? 'large'}-byte input could not be read through the browser WORKERFS bridge`,
+          );
+        }
+        const robustness = request?.options.robustness;
+        const deliberateMalformed = robustness !== null && typeof robustness === 'object' &&
+          !Array.isArray(robustness) &&
+          (robustness as Record<string, unknown>).schema === 'media-test/robustness-contract@1';
+        if (
+          deliberateMalformed &&
+          !this.lifecycle.reason &&
+          !this.activeOperation?.context.signal.aborted &&
+          !(error instanceof FfmpegWorkerStateError)
+        ) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'demux',
+            'parse',
+            describeError(error),
+            'FFMPEG_DEMUX_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
+      }
     } finally {
-      await this.cleanup([...written.cleanupPaths, crcName]);
+      this.demuxTimestampCapture = null;
+      this.demuxMetadataLogCapture = null;
+      await this.cleanup([...written.cleanupPaths, checksumName]);
     }
   }
 
@@ -3844,7 +4080,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           const bytes = await this.readBinary(outName);
           if (bytes.length === 0) continue;
           await this.run(['-i', outName, '-map', '0', '-c', 'copy', '-f', 'framecrc', packetName], READ_EXEC_TIMEOUT_MS);
-          const packetRows = parseFramecrcPackets(await this.readText(packetName));
+          const packetRows = parseFrameChecksumPackets(await this.readText(packetName));
           const slices = prep.format === 'adts'
             ? splitAdtsFrames(bytes)
             : splitPreparedBytes(bytes, packetRows);

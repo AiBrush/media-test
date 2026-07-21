@@ -21,6 +21,7 @@ export interface IsoBmffTrackTimeline {
   readonly codec: string | null;
   readonly mediaTimescale: number;
   readonly mediaDurationTicks: number;
+  readonly codedSampleCount: number;
   readonly edits: readonly IsoBmffEdit[];
   readonly samples: readonly IsoBmffSampleInterval[];
   readonly emptyLeadingEditUs: number;
@@ -36,6 +37,25 @@ export interface IsoBmffPresentationTimeline {
   readonly movieHeaderDurationTicks: number;
   readonly presentationDurationUs: number;
   readonly tracks: readonly IsoBmffTrackTimeline[];
+}
+
+/**
+ * Return the exact coded-sample prefix retained by a short trailing ISO edit.
+ *
+ * Golden packet semantics intentionally retain coded priming before the presentation origin. This
+ * helper therefore declines leading, repeated, gapped, or broad edit rewrites and only recognizes a
+ * zero-based contiguous prefix with at most 100 ms of excluded coded tail.
+ */
+export function smallTrailingIsoEditSampleIndices(
+  track: IsoBmffTrackTimeline | undefined,
+): Set<number> | undefined {
+  if (!track || track.samples.length === 0) return undefined;
+  const indices = [...new Set(track.samples.map((sample) => sample.sampleIndex))].sort((a, b) => a - b);
+  if (indices[0] !== 0 || indices.at(-1) !== indices.length - 1) return undefined;
+  const rawMediaSpanSec = track.mediaDurationTicks / track.mediaTimescale;
+  const trailingEditSec = rawMediaSpanSec - track.presentationEndUs / 1_000_000;
+  if (!(trailingEditSec > 0 && trailingEditSec <= 0.1)) return undefined;
+  return new Set(indices);
 }
 
 export interface IsoBmffTrimWindow {
@@ -197,6 +217,7 @@ function parseTrack(bytes: Uint8Array, trak: Box, movieTimescale: number): IsoBm
     codec,
     mediaTimescale: mediaHeader.timescale,
     mediaDurationTicks: mediaHeader.duration,
+    codedSampleCount: rawSamples.length,
     edits: Object.freeze(edits),
     samples: Object.freeze(mapped),
     emptyLeadingEditUs: ticksToUs(emptyLeadingEditTicks, movieTimescale),

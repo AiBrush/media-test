@@ -264,6 +264,23 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
     }))).toMatchObject({ supported: false, reasonCode: 'MP4BOX_MUX_ESSENCE_CHANGE_UNSUPPORTED' });
   });
 
+  test('declares demux scale contracts unavailable when first-packet timing is unobservable', () => {
+    expect(decideMp4boxSupport(request({
+      operation: 'demux',
+      options: {
+        robustness: {
+          schema: 'media-test/demux-scale-contract@1',
+          bucket: 'large',
+          limits: { firstPacketMs: 15_000, lastPacketMs: 600_000 },
+        },
+      },
+    }))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'MP4BOX_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
+    });
+  });
+
   test('runtime unsupported shape is structured NA while corrupt supported input is structured malformed media', async () => {
     await withEngine(async (engine) => {
       const input = await fixtureInput('micro_h264_1frame.mp4');
@@ -479,6 +496,25 @@ describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence
     expect(packet.decoderConfig).toEqual(new Uint8Array([1, 100, 0, 31]));
   });
 
+  test('auxiliary packet evidence does not publish a noncanonical AV codec token', () => {
+    const packet = mp4boxSampleEvidence({
+      size: 4,
+      data: new Uint8Array([0, 0, 0, 0]),
+      cts: 0,
+      dts: 0,
+      duration: 1,
+      timescale: 30,
+      is_sync: true,
+    } as unknown as import('mp4box').Sample, 1, 'other', 'tmcd', {
+      nativeCodecTag: 'tmcd',
+      framing: 'raw',
+      accessUnitGrouping: 'one-frame-per-chunk',
+      parameterSetLocation: 'not-applicable',
+    } as never);
+    expect(packet.trackType).toBe('other');
+    expect(packet).not.toHaveProperty('codec');
+  });
+
   test('real demux is decode-ordered and auditable; the unobservable WebCodecs token is removed', async () => {
     await withEngine(async (engine) => {
       expect(engine.capabilities().features).not.toContain('webcodecs:demux-feed');
@@ -499,6 +535,20 @@ describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence
         codec: 'h264',
         nativeCodecTag: expect.stringContaining('avc1'),
       });
+    });
+  });
+
+  test('real demux omits only the short trailing AAC suffix excluded by a MOV edit', async () => {
+    await withEngine(async (engine) => {
+      const result = await engine.demux(await fixtureInput(
+        'scenarios/demux/h264_1080p_5s/01.mov',
+        'video/quicktime',
+      ));
+      const videoTrack = result.metadata.tracks.findIndex((track) => track.type === 'video');
+      const audioTrack = result.metadata.tracks.findIndex((track) => track.type === 'audio');
+      expect(result.packets.filter((packet) => packet.trackIndex === videoTrack)).toHaveLength(194);
+      expect(result.packets.filter((packet) => packet.trackIndex === audioTrack)).toHaveLength(278);
+      expect(engine.configUsed).toMatchObject({ presentationEditFilteredSamples: 2 });
     });
   });
 });

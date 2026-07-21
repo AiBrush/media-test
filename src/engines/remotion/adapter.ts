@@ -132,8 +132,10 @@ export class RemotionEngine implements MediaEngine {
       probeReadModes: parser.probeReadModes ? [...parser.probeReadModes] : undefined,
       features: union(parser.features, webcodecs.features).filter(
         // Neither package exposes public decrypt/protected-track normalization. Do not advertise an
-        // adapter-side MP4 fallback as framework support.
-        (feature) => feature !== 'metadata:protected-tracks',
+        // adapter-side MP4 fallback as framework support. media-parser's `decodingTimestamp` also
+        // proves non-authoritative across MP3, TS/HLS, Matroska, and PCM packet groupings, so the
+        // unified read column must not inherit the WebCodecs child's flat DTS capability token.
+        (feature) => feature !== 'metadata:protected-tracks' && feature !== 'packets:dts',
       ),
     };
     return validateCapabilitySet(this, capabilities);

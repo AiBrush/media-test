@@ -64,11 +64,54 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     expect(result.packets[0]).toMatchObject({
       trackType: 'video', codec: 'h264', framing: 'avc', randomAccessKind: 'sync-sample',
       payload: new Uint8Array([1, 2, 3, 4]),
+      payloadDigest: '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a',
     });
     expect(result.packets[0]?.dtsUs).toBeUndefined();
     expect(result.metadata.tracks[0]).toMatchObject({
       codec: 'h264', nativeCodecTag: 'avc1.640028', fps: 25,
       fpsProvenance: { source: 'observed', cadence: 'CFR', sampleCount: 2, observedIntervalUs: 80_000 },
+    });
+  });
+
+  test('omits transformed payload bytes when they do not match the authoritative packet size', () => {
+    const track = { id: 1, mediaType: 'audio' as const, codec: 'aac' };
+    const result = buildAibrushDemuxResult(
+      { container: 'hls', durationSec: 1, tracks: [normalizeAibrushTrack(track)] },
+      [track],
+      [{ trackIndex: 0, size: 310, ptsUs: 0, keyframe: true, payload: new Uint8Array([1, 2, 3]) }],
+    );
+    expect(result.packets[0]).toMatchObject({ size: 310 });
+    expect(result.packets[0]?.payload).toBeUndefined();
+    expect(result.packets[0]?.payloadDigest).toBeUndefined();
+  });
+
+  test('derives single-packet video cadence from an observed packet duration', () => {
+    const track = { id: 1, mediaType: 'video' as const, codec: 'h264' };
+    const result = buildAibrushDemuxResult(
+      { container: 'mp4', durationSec: 1, tracks: [normalizeAibrushTrack(track)] },
+      [track],
+      [{ trackIndex: 0, size: 1, ptsUs: 0, durationUs: 1_000_000, keyframe: true }],
+    );
+    expect(result.metadata.tracks[0]).toMatchObject({
+      fps: 1,
+      fpsProvenance: { source: 'observed', cadence: 'CFR', sampleCount: 1, observedIntervalUs: 1_000_000 },
+    });
+  });
+
+  test('includes an inferred terminal interval in cadence evidence when the last duration is absent', () => {
+    const track = { id: 1, mediaType: 'video' as const, codec: 'h264' };
+    const result = buildAibrushDemuxResult(
+      { container: 'ts', durationSec: 0.1, tracks: [normalizeAibrushTrack(track)] },
+      [track],
+      [
+        { trackIndex: 0, size: 1, ptsUs: 0, keyframe: true },
+        { trackIndex: 0, size: 1, ptsUs: 33_333, keyframe: false },
+        { trackIndex: 0, size: 1, ptsUs: 66_667, keyframe: false },
+      ],
+    );
+    expect(result.metadata.tracks[0]?.fpsProvenance).toMatchObject({
+      sampleCount: 3,
+      observedIntervalUs: 100_000.5,
     });
   });
 

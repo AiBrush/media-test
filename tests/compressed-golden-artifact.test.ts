@@ -24,7 +24,10 @@ import {
   validateCompressedGoldenArtifact,
 } from '../src/core/compressed-golden-artifact.ts';
 import { readGoldenEvidenceBytesV1 } from '../src/core/golden-evidence.ts';
-import { readCompactGoldenPacketRows } from '../src/core/lossless-json-columnar.ts';
+import {
+  decodeCanonicalBase64,
+  readCompactGoldenPacketRows,
+} from '../src/core/lossless-json-columnar.ts';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -32,6 +35,15 @@ afterEach(() => {
 });
 
 describe('deterministic compressed packet-golden transport', () => {
+  test('canonical base64 validation remains allocation-bounded for production-size columns', () => {
+    const encoded = 'AAAA'.repeat(2_000_000);
+    expect(decodeCanonicalBase64(encoded).byteLength).toBe(6_000_000);
+    expect([...decodeCanonicalBase64('AQIDBA==')]).toEqual([1, 2, 3, 4]);
+    expect(() => decodeCanonicalBase64('AR==')).toThrow(/non-canonical/);
+    expect(() => decodeCanonicalBase64('AQJ=')).toThrow(/non-canonical/);
+    expect(() => decodeCanonicalBase64('AAAA=AAA')).toThrow(/invalid canonical/);
+  });
+
   test('browser decoder streams directly from decompressed bytes into one fatal UTF-8 decoder', () => {
     const source = readFileSync(
       join(import.meta.dir, '..', 'src', 'core', 'compressed-golden-artifact.ts'),

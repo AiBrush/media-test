@@ -389,13 +389,50 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
     if (outputTracks.some((track) => track.type === 'video' || track.type === 'audio' ? track.samples.length === 0 : false)) {
       return { state: 'INCOMPLETE', reasonCode: 'REMUX_EBML_TRACK_SAMPLES_MISSING', evidence };
     }
-    const times = outputTracks.flatMap((track) => track.samples.flatMap((sample) =>
-      sample.ptsUs !== undefined ? [sample.ptsUs, sample.ptsUs + (sample.durationUs ?? 0)] : []));
-    const observedDurationUs = times.length ? Math.max(...times) - Math.min(...times) : undefined;
+    let minimumPtsUs = Number.POSITIVE_INFINITY;
+    let maximumEndUs = Number.NEGATIVE_INFINITY;
+    for (const track of outputTracks) {
+      for (const sample of track.samples) {
+        if (sample.ptsUs === undefined) continue;
+        minimumPtsUs = Math.min(minimumPtsUs, sample.ptsUs);
+        maximumEndUs = Math.max(maximumEndUs, sample.ptsUs + (sample.durationUs ?? 0));
+      }
+    }
+    const observedDurationUs = Number.isFinite(minimumPtsUs) && Number.isFinite(maximumEndUs)
+      ? maximumEndUs - minimumPtsUs
+      : undefined;
+    let terminalIntervalUs = 0;
+    let terminalDurationMissing = false;
+    for (const track of outputTracks) {
+      const timed = track.samples
+        .filter((sample): sample is RemuxSampleEvidence & { ptsUs: number } => sample.ptsUs !== undefined)
+        .sort((a, b) => a.ptsUs - b.ptsUs);
+      const terminal = timed.at(-1);
+      if (terminal && terminal.durationUs === undefined) terminalDurationMissing = true;
+      if (timed.length >= 2) {
+        terminalIntervalUs = Math.max(
+          terminalIntervalUs,
+          timed[timed.length - 1]!.ptsUs - timed[timed.length - 2]!.ptsUs,
+        );
+      }
+    }
+    const declaredMaterializesTerminalDuration =
+      terminalDurationMissing &&
+      declaredDurationUs !== undefined &&
+      observedDurationUs !== undefined &&
+      Math.abs(declaredDurationUs - observedDurationUs) <= Math.max(50_000, terminalIntervalUs) + 1_000;
+    // A complete block walk is stronger stream-copy evidence than the optional Segment Duration
+    // scalar, which real WebM files can carry stale or deliberately contradictory values for. A
+    // nearby declaration can, however, materialize the unavailable duration of a terminal block.
+    const durationUs = declaredMaterializesTerminalDuration
+      ? declaredDurationUs
+      : observedDurationUs !== undefined && observedDurationUs > 0
+      ? observedDurationUs
+      : declaredDurationUs;
     const parsedSamples = outputTracks.reduce((sum, track) => sum + track.samples.length, 0);
     const value: RemuxProgramEvidence = {
       schema: 'media-test/remux-program@1', container, byteLength: bytes.byteLength,
-      ...(declaredDurationUs ?? observedDurationUs) !== undefined ? { durationUs: declaredDurationUs ?? observedDurationUs } : {},
+      ...(durationUs !== undefined ? { durationUs } : {}),
       tracks: outputTracks,
       representation: { lacing, unknownSizeSegment: segment.unknown },
     };
