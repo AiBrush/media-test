@@ -6,6 +6,7 @@ import type {
   NormalizedTrack,
   SupportDecision,
 } from '../../core/engine.ts';
+import type { RemuxProgramEvidence } from '../../features/remux/types.ts';
 
 /** Parsed facts from the exact loaded core, or the explicitly marked pre-load fallback. */
 export interface FfmpegRuntimeBuild {
@@ -36,6 +37,16 @@ export const DEFAULT_FFMPEG_LIMITS: FfmpegAdapterLimits = Object.freeze({
   maxEncodePixels: 1920 * 1080,
 });
 
+export function isWorkerFsBlobUnreadableError(error: unknown): boolean {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : '';
+  return (error instanceof DOMException && error.name === 'NotReadableError') ||
+    /FileReaderSync|requested file could not be read/i.test(message);
+}
+
 const FILTER_FEATURES: ReadonlyArray<[string, string]> = [
   ['crop', 'crop'],
   ['pad', 'pad'],
@@ -43,6 +54,82 @@ const FILTER_FEATURES: ReadonlyArray<[string, string]> = [
   ['colorspace', 'colorspace'],
   ['tonemap', 'tonemap'],
 ];
+
+const ISO_BMFF_CONTAINERS = new Set(['mp4', 'mov']);
+const TS_SIGNED_CTS_COPY_TARGETS = new Set(['mp4', 'mov', 'mkv']);
+/** Ordinary codec preroll is a few frames; a longer negative decode origin denotes an edit span. */
+const MAX_STREAM_COPY_PREROLL_US = 500_000;
+/** Ignore only sub-tick rounding when deciding whether the source requires signed CTS offsets. */
+const SIGNED_CTS_ROUNDING_US = 2_000;
+
+/**
+ * Candidate-byte policy for limitations that the static tuple cannot express. The vendored FFmpeg
+ * 5.1 ISO stream-copy path demonstrably drops/retimes access units for long ISO edit-list preroll,
+ * and when signed CTS offsets are copied from MPEG-TS into ISO-BMFF. Keep those concrete candidates
+ * honest as NA_ENGINE while admitting ordinary preroll and timestamp-monotonic TS inputs.
+ */
+export function decideFfmpegRemuxProgramSupport(
+  sourceContainer: string,
+  targetContainer: string,
+  program: RemuxProgramEvidence,
+): SupportDecision {
+  const reject = (reasonCode: string, reason: string): SupportDecision => ({
+    supported: false,
+    status: 'NA_ENGINE',
+    reasonCode,
+    reason,
+  });
+  const source = sourceContainer.trim().toLowerCase();
+  const target = targetContainer.trim().toLowerCase();
+  const mediaTracks = program.tracks.filter((track) => track.type === 'video' || track.type === 'audio');
+
+  if (ISO_BMFF_CONTAINERS.has(source)) {
+    let minimumDtsUs = Number.POSITIVE_INFINITY;
+    for (const track of mediaTracks) {
+      for (const sample of track.samples) {
+        if (sample.dtsUs !== undefined && Number.isFinite(sample.dtsUs)) {
+          minimumDtsUs = Math.min(minimumDtsUs, sample.dtsUs);
+        }
+      }
+    }
+    if (minimumDtsUs < -MAX_STREAM_COPY_PREROLL_US) {
+      return reject(
+        'FFMPEG_COMPLEX_EDIT_PREROLL_UNSUPPORTED',
+        `source ISO-BMFF timeline begins at DTS ${minimumDtsUs}us; the FFmpeg 5.1 stream-copy path ` +
+          'does not preserve long edit-list preroll without dropping or retiming access units',
+      );
+    }
+  }
+
+  if (source === 'ts' && TS_SIGNED_CTS_COPY_TARGETS.has(target)) {
+    let minimumCompositionOffsetUs = Number.POSITIVE_INFINITY;
+    for (const track of mediaTracks) {
+      if (track.type !== 'video') continue;
+      for (const sample of track.samples) {
+        if (
+          sample.ptsUs !== undefined &&
+          sample.dtsUs !== undefined &&
+          Number.isFinite(sample.ptsUs) &&
+          Number.isFinite(sample.dtsUs)
+        ) {
+          minimumCompositionOffsetUs = Math.min(
+            minimumCompositionOffsetUs,
+            sample.ptsUs - sample.dtsUs,
+          );
+        }
+      }
+    }
+    if (minimumCompositionOffsetUs < -SIGNED_CTS_ROUNDING_US) {
+      return reject(
+        'FFMPEG_TS_SIGNED_CTS_COPY_UNSUPPORTED',
+        `source MPEG-TS requires signed CTS offsets down to ${minimumCompositionOffsetUs}us; ` +
+          `the FFmpeg 5.1 ${target.toUpperCase()} stream-copy path rewrites that decode timeline`,
+      );
+    }
+  }
+
+  return { supported: true };
+}
 
 export function tupleSummary(request: ConcreteOperationRequest): ApplicabilityTupleSummary {
   return {
@@ -155,7 +242,9 @@ export function decideFfmpegSupport(
   }
 
   const effectiveTracks = outputTracks(tracks, outputVideo, outputAudio, request.operation);
-  if (outputContainer) {
+  // Empty inferred tracks mean the catalog could not resolve this candidate's streams. That is an
+  // unknown tuple, not proof of an illegal one; let the exact parser/muxer invocation decide it.
+  if (outputContainer && effectiveTracks.length > 0) {
     const legality = muxLegality(effectiveTracks, outputContainer);
     if (legality !== undefined) return reject('FFMPEG_MUX_TUPLE_ILLEGAL', legality);
   }

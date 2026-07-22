@@ -22,6 +22,101 @@ afterEach(() => {
 });
 
 describe('production transcode oracle integration', () => {
+  test('multitrack quality evidence is NA_ASSET when the selected source has one audio track', async () => {
+    const bytes = await fixtureBytes('tiny_h264_360p_2s.mp4');
+    const pixels = rgba([
+      255, 0, 0, 255, 0, 255, 0, 255,
+      0, 0, 255, 255, 255, 255, 0, 255,
+    ], 2, 2);
+    const scenario = defineScenario({
+      id: 'transcode/multitrack_select_default_audio',
+      op: 'transcode',
+      input: 'source.mp4',
+      options: { container: 'mp4', video: { codec: 'h264' }, audio: { codec: 'aac' } },
+      requires: { operations: ['transcode'] },
+      oracles: ['ssim-psnr'],
+      metrics: ['wall'],
+    });
+    const golden = emptyGoldenStore();
+    golden.meta = {
+      container: 'mp4',
+      durationSec: 1,
+      tracks: [
+        { type: 'video', codec: 'h264', width: 2, height: 2 },
+        { type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 },
+      ],
+    };
+    const outcome = await runOracle('ssim-psnr', {
+      scenario,
+      input: inputFromBytes(bytes, 'source.mp4', 'video/mp4'),
+      output: media(bytes, 'mp4'),
+      golden,
+      decodeWithPlatform: async () => sink(pixels),
+      playbackSmoke: async () => true,
+    });
+    expect(outcome).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_ASSET',
+      reasonCode: 'TRANSCODE_MULTITRACK_SOURCE_EVIDENCE_MISSING',
+    });
+  });
+
+  test('fragmented-MP4 SSIM samples candidate and source uniformly', async () => {
+    const bytes = await fixtureBytes('tiny_h264_360p_2s.mp4');
+    const pixels = rgba([
+      255, 0, 0, 255, 0, 255, 0, 255,
+      0, 0, 255, 255, 255, 255, 0, 255,
+    ], 2, 2);
+    const scenario = defineScenario({
+      id: 'transcode/h264_to_fragmented_mp4',
+      op: 'transcode',
+      input: 'source.mp4',
+      options: { container: 'mp4', video: { codec: 'h264' }, fastStart: 'fragmented' },
+      requires: { operations: ['transcode'] },
+      oracles: ['ssim-psnr'],
+      metrics: ['wall'],
+      tolerances: { ssimMin: 0.96 },
+    });
+    const sampling: Array<string | undefined> = [];
+    const outcome = await runOracle('ssim-psnr', {
+      scenario,
+      input: inputFromBytes(bytes, 'source.mp4', 'video/mp4'),
+      output: media(bytes, 'mp4'),
+      golden: emptyGoldenStore(),
+      decodeWithPlatform: async (_media, options) => {
+        sampling.push(options?.sampling);
+        return sink(pixels);
+      },
+      playbackSmoke: async () => true,
+    });
+    expect(outcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    expect(sampling).toEqual(['uniform', 'uniform']);
+  });
+
+  test('REQ-FEAT-20 transcode output metadata reuses strict MPEG-TS program evidence', async () => {
+    const bytes = await fixtureBytes('h264_ts.ts');
+    const scenario = defineScenario({
+      id: 'transcode/h264_to_ts',
+      op: 'transcode',
+      input: 'source.mp4',
+      options: { container: 'ts', video: { codec: 'h264' }, invariant: 'transcode-output-metadata' },
+      requires: { operations: ['transcode'] },
+      oracles: ['property-invariant'],
+      metrics: ['wall'],
+    });
+    const outcome = await runOracle('property-invariant', {
+      scenario,
+      input: inputFromBytes(bytes, 'source.mp4', 'video/mp4'),
+      output: media(bytes, 'ts', 'video/mp2t'),
+      golden: emptyGoldenStore(),
+      decodeWithPlatform: async () => ({ frames: [] }),
+      playbackSmoke: async () => true,
+    });
+    expect(outcome).toMatchObject({
+      state: 'VERDICT', verdict: 'PASS', reasonCode: 'ORACLE_MATCH',
+    });
+  });
+
   test('REQ-FEAT-20 rotation no-op fails even when output is structurally valid and playable', async () => {
     const bytes = await fixtureBytes('tiny_h264_360p_2s.mp4');
     const sourcePixels = rgba([
@@ -112,6 +207,32 @@ describe('production transcode oracle integration', () => {
     const excessOutcome = await runOracle('property-invariant', audioContext(scenario, exact, excess, 'wav'));
     expect(excessOutcome).toMatchObject({
       state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_EXCESS_SAMPLES',
+    });
+  });
+
+  test('AAC-to-PCM reports browser reference resampling instead of failing a native-rate candidate', async () => {
+    const source = await fixtureBytes('gapless_aac.m4a');
+    const output = wave([0.25, -0.25, 0.5, -0.5], 2, 44_100);
+    const scenario = audioScenario('aac_to_pcm_wav_extract', 'wav', 'pcm-s16');
+    const golden = emptyGoldenStore();
+    golden.meta = {
+      container: 'mp4',
+      durationSec: 1,
+      tracks: [{ type: 'audio', codec: 'aac', sampleRate: 44_100, channels: 2 }],
+    };
+    installFakeAudioContext([0.25, -0.25, 0.5, -0.5], 2, 2, 48_000);
+    const outcome = await runOracle('property-invariant', {
+      scenario,
+      input: inputFromBytes(source, 'source.m4a', 'audio/mp4'),
+      output: media(output, 'wav', 'audio/wav'),
+      golden,
+      decodeWithPlatform: async () => ({ frames: [] }),
+      playbackSmoke: async () => true,
+    });
+    expect(outcome).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_BROWSER',
+      reasonCode: 'TRANSCODE_AUDIO_REFERENCE_RESAMPLED',
     });
   });
 

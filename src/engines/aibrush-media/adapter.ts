@@ -60,6 +60,12 @@ import {
 } from '../../core/engine.ts';
 import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
+import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
+import type {
+  RemuxProgramEvidence,
+  RemuxSampleEvidence,
+  RemuxTrackEvidence,
+} from '../../features/remux/types.ts';
 import {
   type AibrushErrorClasses,
   translateAibrushFrameworkError,
@@ -696,6 +702,11 @@ interface AibrushTrackInfo {
   mediaType: 'video' | 'audio';
   codec?: string;
   durationSec?: number;
+  gapless?: {
+    readonly leadingSamples?: number;
+    readonly trailingSamples?: number;
+    readonly totalSamples?: number;
+  };
   config?: {
     codec?: string;
     codedWidth?: number;
@@ -3147,6 +3158,860 @@ async function prepareMultiSourceWebmMux(
   return preparedTracks === undefined ? undefined : { tracks, preparedTracks };
 }
 
+// ── strict-copy remux repairs at the framework packet boundary ─────────────────────────────────
+
+// These byte-table repairs are deliberately bounded. They correct representation/timeline facts the
+// public framework currently loses on a few otherwise-supported container seams, while large/streaming
+// rows retain the framework's native lazy paths.
+const STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES = 128 * 1024 * 1024;
+const FINITE_WEBM_CLUSTER_REPAIR_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
+
+interface PreparedAibrushPacketTrack {
+  readonly track: AibrushTrackInfo;
+  readonly packets: readonly AibrushPacket[];
+}
+
+function plainBufferedPreparedRemux(opts: RemuxOptions): boolean {
+  const trackSelect = (opts as { trackSelect?: unknown }).trackSelect;
+  return (
+    !wantsStreamTarget(opts) &&
+    !wantsAppendOnly(opts) &&
+    !wantsFragmented(opts) &&
+    opts.tags === undefined &&
+    (!Array.isArray(trackSelect) || trackSelect.length === 0)
+  );
+}
+
+function mediaEvidenceTracks(program: RemuxProgramEvidence): readonly RemuxTrackEvidence[] | undefined {
+  const tracks = program.tracks.filter(
+    (track): track is RemuxTrackEvidence & { readonly type: 'video' | 'audio' } =>
+      track.type === 'video' || track.type === 'audio',
+  );
+  return tracks.length === program.tracks.length && tracks.length > 0 ? tracks : undefined;
+}
+
+function matchAibrushTrack(
+  tracks: readonly AibrushTrackInfo[],
+  evidence: RemuxTrackEvidence,
+  used: Set<number>,
+): { readonly index: number; readonly track: AibrushTrackInfo } | undefined {
+  for (let index = 0; index < tracks.length; index++) {
+    const track = tracks[index];
+    if (
+      track !== undefined &&
+      !used.has(index) &&
+      track.mediaType === evidence.type &&
+      canonicalCodec(track.codec ?? track.config?.codec ?? '') === canonicalCodec(evidence.codec)
+    ) {
+      used.add(index);
+      return { index, track };
+    }
+  }
+  return undefined;
+}
+
+function finiteRounded(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) ? Math.round(value) : undefined;
+}
+
+function packetFromRemuxEvidence(
+  sample: RemuxSampleEvidence,
+  data: Uint8Array,
+  fallback?: {
+    readonly ptsUs?: number;
+    readonly dtsUs?: number;
+    readonly durationUs?: number | null;
+    readonly keyframe?: boolean;
+  },
+): AibrushPacket | undefined {
+  if (data.byteLength === 0) return undefined;
+  const ptsUs = finiteRounded(sample.ptsUs ?? fallback?.ptsUs);
+  const dtsUs = finiteRounded(sample.dtsUs ?? fallback?.dtsUs ?? ptsUs);
+  const durationUs = finiteRounded(sample.durationUs ?? fallback?.durationUs ?? undefined);
+  if (
+    ptsUs === undefined ||
+    dtsUs === undefined ||
+    (durationUs !== undefined && durationUs < 0)
+  ) {
+    return undefined;
+  }
+  const keyframe = sample.keyframe ?? fallback?.keyframe ?? sample.framing !== 'length-prefixed';
+  const chunk: AibrushChunk = {
+    byteLength: data.byteLength,
+    timestamp: ptsUs,
+    ...(durationUs !== undefined ? { duration: durationUs } : {}),
+    type: keyframe ? 'key' : 'delta',
+    copyTo(destination: BufferSource): void {
+      bufferSourceBytes(destination).set(data);
+    },
+  };
+  return { chunk, data, dtsUs, sizeBytes: data.byteLength };
+}
+
+function packetsFromEvidenceTrack(
+  track: RemuxTrackEvidence,
+  mapData: (sample: RemuxSampleEvidence) => Uint8Array | undefined = (sample) => sample.payload,
+): AibrushPacket[] | undefined {
+  const packets: AibrushPacket[] = [];
+  for (const sample of track.samples) {
+    const data = mapData(sample);
+    if (data === undefined) return undefined;
+    const packet = packetFromRemuxEvidence(sample, data);
+    if (packet === undefined) return undefined;
+    packets.push(packet);
+  }
+  return packets.length > 0 ? packets : undefined;
+}
+
+interface AibrushIsoBox {
+  readonly type: string;
+  readonly offset: number;
+  readonly body: number;
+  readonly end: number;
+}
+
+function aibrushIsoChildren(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): AibrushIsoBox[] | undefined {
+  if (start < 0 || end < start || end > bytes.byteLength) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const boxes: AibrushIsoBox[] = [];
+  let offset = start;
+  while (offset < end) {
+    if (offset + 8 > end) return undefined;
+    let size = view.getUint32(offset);
+    let headerSize = 8;
+    if (size === 1) {
+      if (offset + 16 > end) return undefined;
+      const large = view.getBigUint64(offset + 8);
+      if (large > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+      size = Number(large);
+      headerSize = 16;
+    } else if (size === 0) {
+      size = end - offset;
+    }
+    if (size < headerSize || offset + size > end) return undefined;
+    const type = String.fromCharCode(
+      bytes[offset + 4]!,
+      bytes[offset + 5]!,
+      bytes[offset + 6]!,
+      bytes[offset + 7]!,
+    );
+    boxes.push({ type, offset, body: offset + headerSize, end: offset + size });
+    offset += size;
+  }
+  return offset === end ? boxes : undefined;
+}
+
+function aibrushIsoDurationLayout(
+  bytes: Uint8Array,
+  box: AibrushIsoBox,
+  kind: 'mvhd' | 'tkhd' | 'mdhd',
+): { readonly version: 0 | 1; readonly timescaleOffset?: number; readonly durationOffset: number } | undefined {
+  const version = bytes[box.body];
+  if (version !== 0 && version !== 1) return undefined;
+  const timescaleOffset = kind === 'tkhd'
+    ? undefined
+    : box.body + (version === 1 ? 20 : 12);
+  const durationOffset = box.body + (
+    kind === 'tkhd'
+      ? version === 1 ? 28 : 20
+      : version === 1 ? 24 : 16
+  );
+  const durationBytes = version === 1 ? 8 : 4;
+  return durationOffset + durationBytes <= box.end &&
+    (timescaleOffset === undefined || timescaleOffset + 4 <= box.end)
+    ? { version, ...(timescaleOffset !== undefined ? { timescaleOffset } : {}), durationOffset }
+    : undefined;
+}
+
+function writeAibrushIsoDuration(
+  bytes: Uint8Array,
+  layout: NonNullable<ReturnType<typeof aibrushIsoDurationLayout>>,
+  durationSec: number,
+  timescale: number,
+): boolean {
+  if (!Number.isSafeInteger(timescale) || timescale <= 0 || !Number.isFinite(durationSec) || durationSec <= 0) {
+    return false;
+  }
+  const ticks = Math.round(durationSec * timescale);
+  if (!Number.isSafeInteger(ticks) || ticks <= 0) return false;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (layout.version === 0) {
+    if (ticks > 0xffff_ffff) return false;
+    view.setUint32(layout.durationOffset, ticks);
+  } else {
+    view.setBigUint64(layout.durationOffset, BigInt(ticks));
+  }
+  return true;
+}
+
+/**
+ * Preserve the complete MP3 coded sample table while exposing its Xing/LAME presentation span in
+ * MP4/MOV duration headers. The framework's prepared MP3 mux correctly retains every frame but uses
+ * their raw coded span for mdhd/tkhd/mvhd; its ordinary gapless path instead clips coded frames. This
+ * bounded header repair is admitted only after a neutral before/after proof shows identical media.
+ */
+export function materializeAibrushMp3PresentationDuration(
+  bytes: Uint8Array,
+  container: 'mp4' | 'mov',
+  durationSec: number,
+): Uint8Array | undefined {
+  const top = aibrushIsoChildren(bytes, 0, bytes.byteLength);
+  const moov = top?.filter((box) => box.type === 'moov');
+  if (moov?.length !== 1) return undefined;
+  const moovChildren = aibrushIsoChildren(bytes, moov[0]!.body, moov[0]!.end);
+  const mvhd = moovChildren?.filter((box) => box.type === 'mvhd');
+  const traks = moovChildren?.filter((box) => box.type === 'trak');
+  if (mvhd?.length !== 1 || traks?.length !== 1) return undefined;
+  const mvhdLayout = aibrushIsoDurationLayout(bytes, mvhd[0]!, 'mvhd');
+  if (mvhdLayout?.timescaleOffset === undefined) return undefined;
+  const sourceView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const movieTimescale = sourceView.getUint32(mvhdLayout.timescaleOffset);
+  const trakChildren = aibrushIsoChildren(bytes, traks[0]!.body, traks[0]!.end);
+  const tkhd = trakChildren?.filter((box) => box.type === 'tkhd');
+  const mdia = trakChildren?.filter((box) => box.type === 'mdia');
+  if (tkhd?.length !== 1 || mdia?.length !== 1) return undefined;
+  const mdiaChildren = aibrushIsoChildren(bytes, mdia[0]!.body, mdia[0]!.end);
+  const mdhd = mdiaChildren?.filter((box) => box.type === 'mdhd');
+  if (mdhd?.length !== 1) return undefined;
+  const tkhdLayout = aibrushIsoDurationLayout(bytes, tkhd[0]!, 'tkhd');
+  const mdhdLayout = aibrushIsoDurationLayout(bytes, mdhd[0]!, 'mdhd');
+  if (tkhdLayout === undefined || mdhdLayout?.timescaleOffset === undefined) return undefined;
+  const mediaTimescale = sourceView.getUint32(mdhdLayout.timescaleOffset);
+  const output = bytes.slice();
+  if (
+    !writeAibrushIsoDuration(output, mvhdLayout, durationSec, movieTimescale) ||
+    !writeAibrushIsoDuration(output, tkhdLayout, durationSec, movieTimescale) ||
+    !writeAibrushIsoDuration(output, mdhdLayout, durationSec, mediaTimescale)
+  ) {
+    return undefined;
+  }
+  const before = readNeutralRemuxProgram(bytes, container);
+  const after = readNeutralRemuxProgram(output, container);
+  return before.state === 'OK' && after.state === 'OK' && sameRemuxProgramMedia(before.value, after.value)
+    ? output
+    : undefined;
+}
+
+function aibrushOggCrc(bytes: Uint8Array, pageStart: number, pageEnd: number): number {
+  let crc = 0;
+  for (let index = pageStart; index < pageEnd; index++) {
+    const byte = index >= pageStart + 22 && index < pageStart + 26 ? 0 : bytes[index]!;
+    crc ^= byte << 24;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = ((crc << 1) ^ ((crc & 0x8000_0000) !== 0 ? 0x04c1_1db7 : 0)) >>> 0;
+    }
+  }
+  return crc >>> 0;
+}
+
+/**
+ * Clear only demonstrably-spurious Ogg continuation bits and refresh those pages' CRCs. The framework
+ * can mark a fresh FLAC packet page as continued after the previous page already terminated its packet;
+ * payload bytes, lacing, granules, serials, and sequence numbers are otherwise intact. Fail closed on
+ * every other page inconsistency and require the neutral reader to accept the repaired result.
+ */
+export function repairAibrushOggContinuationFlags(bytes: Uint8Array): Uint8Array | undefined {
+  const before = readNeutralRemuxProgram(bytes, 'ogg');
+  if (before.state !== 'INCOMPLETE' || before.reasonCode !== 'REMUX_OGG_CONTINUATION_INVALID') {
+    return undefined;
+  }
+  const output = bytes.slice();
+  const streams = new Map<number, { sequence: number; pending: boolean }>();
+  let offset = 0;
+  let patched = 0;
+  while (offset < output.byteLength) {
+    if (
+      offset + 27 > output.byteLength ||
+      output[offset] !== 0x4f ||
+      output[offset + 1] !== 0x67 ||
+      output[offset + 2] !== 0x67 ||
+      output[offset + 3] !== 0x53 ||
+      output[offset + 4] !== 0
+    ) {
+      return undefined;
+    }
+    const segmentCount = output[offset + 26]!;
+    const headerEnd = offset + 27 + segmentCount;
+    if (headerEnd > output.byteLength) return undefined;
+    let bodyBytes = 0;
+    for (let index = 0; index < segmentCount; index++) bodyBytes += output[offset + 27 + index]!;
+    const pageEnd = headerEnd + bodyBytes;
+    if (pageEnd > output.byteLength || aibrushOggCrc(output, offset, pageEnd) !== u32le(output, offset + 22)) {
+      return undefined;
+    }
+    const serial = u32le(output, offset + 14);
+    const sequence = u32le(output, offset + 18);
+    const prior = streams.get(serial);
+    if (prior !== undefined && sequence !== ((prior.sequence + 1) >>> 0)) return undefined;
+    const pending = prior?.pending ?? false;
+    const continued = (output[offset + 5]! & 1) !== 0;
+    if (continued !== pending) {
+      // A missing continuation bit would splice two packets and is not safely inferable here. The known
+      // framework defect is the inverse: an extra bit before a page whose first lacing segment is fresh.
+      if (!continued || pending) return undefined;
+      output[offset + 5] = output[offset + 5]! & ~1;
+      writeU32le(output, offset + 22, aibrushOggCrc(output, offset, pageEnd));
+      patched++;
+    }
+    streams.set(serial, {
+      sequence,
+      pending: segmentCount === 0
+        ? pending
+        : output[offset + 27 + segmentCount - 1] === 255,
+    });
+    offset = pageEnd;
+  }
+  if (patched === 0 || offset !== output.byteLength) return undefined;
+  return readNeutralRemuxProgram(output, 'ogg').state === 'OK' ? output : undefined;
+}
+
+/** Add one representation-only AVC access-unit delimiter before a length-prefixed MP4 sample. */
+export function prependAibrushMpegTsH264Aud(
+  sample: Uint8Array,
+  description: BufferSource,
+): Uint8Array | undefined {
+  const avcC = bufferSourceBytes(description);
+  if (avcC.byteLength < 5 || avcC[0] !== 1) return undefined;
+  const lengthSize = (avcC[4]! & 3) + 1;
+  const audLength = 2;
+  if (lengthSize < 1 || lengthSize > 4 || audLength >= 2 ** (lengthSize * 8)) return undefined;
+  const output = new Uint8Array(lengthSize + audLength + sample.byteLength);
+  let remaining = audLength;
+  for (let index = lengthSize - 1; index >= 0; index--) {
+    output[index] = remaining & 0xff;
+    remaining >>>= 8;
+  }
+  output[lengthSize] = 0x09; // access_unit_delimiter_rbsp
+  output[lengthSize + 1] = 0xf0; // primary_pic_type=7 + rbsp stop bit
+  output.set(sample, lengthSize + audLength);
+  return output;
+}
+
+async function tryPreparedMp3Remux(
+  core: AibrushCore,
+  input: MediaInput,
+  target: string,
+  opts: RemuxOptions,
+): Promise<Uint8Array | undefined> {
+  if (target !== 'mp4' && target !== 'mov' && target !== 'mkv') return undefined;
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, 'mp3');
+  if (read.state !== 'OK' || read.value.durationUs === undefined) return undefined;
+  const sourceTrack = read.value.tracks[0];
+  if (
+    read.value.tracks.length !== 1 ||
+    sourceTrack === undefined ||
+    sourceTrack.type !== 'audio' ||
+    canonicalCodec(sourceTrack.codec) !== 'mp3'
+  ) {
+    return undefined;
+  }
+  const table = core.mp3PacketInfoFromBytes(bytes);
+  const frameworkTrack = table.tracks[0];
+  if (table.tracks.length !== 1 || frameworkTrack === undefined) return undefined;
+  const presentationDurationSec = frameworkTrack.durationSec;
+  // The framework's MP3 demux surface intentionally hides the Xing/Info metadata frame and carries
+  // gapless presentation metadata instead. A strict stream-copy must retain every coded MPEG frame, so
+  // feed the neutral complete frame table and remove the presentation-only trim from this copy track.
+  const { gapless: sourceGapless, ...trackWithoutGapless } = frameworkTrack;
+  const sampleRate = frameworkTrack.config?.sampleRate;
+  const totalSamples = sourceGapless?.totalSamples;
+  const codedSamples = sampleRate !== undefined && Number.isFinite(sampleRate) && sampleRate > 0
+    ? Math.round((read.value.durationUs * sampleRate) / 1_000_000)
+    : undefined;
+  const retainedGapless =
+    sourceGapless !== undefined &&
+    totalSamples !== undefined &&
+    Number.isFinite(totalSamples) &&
+    totalSamples > 0 &&
+    codedSamples !== undefined &&
+    codedSamples >= totalSamples
+      ? {
+          ...sourceGapless,
+          // Put the complete coded-padding span before the presentation window. The framework mux
+          // then emits an edit whose end equals the raw sample-table end, so it retains every frame.
+          leadingSamples: codedSamples - totalSamples,
+          trailingSamples: 0,
+        }
+      : undefined;
+  const track: AibrushTrackInfo = {
+    ...trackWithoutGapless,
+    durationSec: read.value.durationUs / 1_000_000,
+    ...(retainedGapless !== undefined ? { gapless: retainedGapless } : {}),
+  };
+  const packets = packetsFromEvidenceTrack(sourceTrack);
+  if (packets === undefined) return undefined;
+  if (target === 'mkv') {
+    return core.muxPreparedWebmPacketTracks({ tracks: [{ track, packets }], container: target });
+  }
+  const output = core.muxPreparedMp4PacketTrack({
+    track,
+    packets,
+    container: target,
+    faststart: faststartFrom(opts),
+    fragmented: false,
+  });
+  if (presentationDurationSec === undefined || !Number.isFinite(presentationDurationSec)) return output;
+  const presentationOutput = materializeAibrushMp3PresentationDuration(
+    output,
+    target,
+    presentationDurationSec,
+  );
+  if (presentationOutput === undefined) {
+    throw new Error('aibrush MP3 presentation-duration repair failed its neutral media proof');
+  }
+  return presentationOutput;
+}
+
+async function tryPreparedIsoToMpegTsRemux(
+  core: AibrushCore,
+  input: MediaInput,
+  sourceContainer: string,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, sourceContainer);
+  if (read.state !== 'OK') return undefined;
+  const evidenceTracks = mediaEvidenceTracks(read.value);
+  if (evidenceTracks === undefined) return undefined;
+  const table = await core.mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
+  const used = new Set<number>();
+  const tracks: PreparedAibrushPacketTrack[] = [];
+  for (const evidenceTrack of evidenceTracks) {
+    const codec = canonicalCodec(evidenceTrack.codec);
+    if (codec !== 'h264' && codec !== 'aac') return undefined;
+    const matched = matchAibrushTrack(table.tracks, evidenceTrack, used);
+    if (matched === undefined) return undefined;
+    const description = matched.track.config?.description;
+    const packets = packetsFromEvidenceTrack(evidenceTrack, (sample) => {
+      if (codec !== 'h264') return sample.payload;
+      return description === undefined
+        ? undefined
+        : prependAibrushMpegTsH264Aud(sample.payload, description);
+    });
+    if (packets === undefined) return undefined;
+    tracks.push({ track: matched.track, packets });
+  }
+  return tracks.length === table.tracks.length
+    ? core.muxPreparedMpegTsPacketTracks({ tracks, container: 'ts' })
+    : undefined;
+}
+
+async function tryPreparedMovToMatroskaRemux(
+  core: AibrushCore,
+  input: MediaInput,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, 'mov');
+  if (read.state !== 'OK') return undefined;
+  const evidenceTracks = mediaEvidenceTracks(read.value);
+  if (evidenceTracks === undefined) return undefined;
+  const table = await core.mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
+  const used = new Set<number>();
+  const tracks: PreparedAibrushPacketTrack[] = [];
+  for (const evidenceTrack of evidenceTracks) {
+    const codec = canonicalCodec(evidenceTrack.codec);
+    if (codec !== 'h264' && codec !== 'aac') return undefined;
+    const matched = matchAibrushTrack(table.tracks, evidenceTrack, used);
+    const packets = packetsFromEvidenceTrack(evidenceTrack);
+    if (matched === undefined || packets === undefined) return undefined;
+    tracks.push({ track: matched.track, packets });
+  }
+  signal.throwIfAborted();
+  return tracks.length === table.tracks.length
+    ? core.muxPreparedWebmPacketTracks({ tracks, container: 'mkv' })
+    : undefined;
+}
+
+async function tryPreparedMatroskaToContainerRemux(
+  core: AibrushCore,
+  input: MediaInput,
+  target: string,
+  opts: RemuxOptions,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  if (target !== 'mp4' && target !== 'mov' && target !== 'ts') return undefined;
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, 'mkv');
+  if (read.state !== 'OK') return undefined;
+  const evidenceTracks = mediaEvidenceTracks(read.value);
+  if (evidenceTracks === undefined) return undefined;
+  const table = core.webmPacketPayloadInfoFromBytes(bytes);
+  const used = new Set<number>();
+  const tracks: PreparedAibrushPacketTrack[] = [];
+  for (const evidenceTrack of evidenceTracks) {
+    const codec = canonicalCodec(evidenceTrack.codec);
+    if (codec !== 'h264' && codec !== 'aac') return undefined;
+    const matched = matchAibrushTrack(table.tracks, evidenceTrack, used);
+    if (matched === undefined) return undefined;
+    const packets: AibrushPacket[] = [];
+    let decodeTimeUs = 0;
+    const sampleRate = matched.track.config?.sampleRate;
+    const aacDurationUs = codec === 'aac' && sampleRate !== undefined && sampleRate > 0
+      ? (1_024 * 1_000_000) / sampleRate
+      : undefined;
+    const fallbackDurationUs = evidenceTrack.samples.find(
+      (sample) => sample.durationUs !== undefined && sample.durationUs > 0,
+    )?.durationUs ?? aacDurationUs;
+    for (const sample of evidenceTrack.samples) {
+      const usesCodedDecodeClock = evidenceTrack.type === 'video' || aacDurationUs !== undefined;
+      const packetSample = aacDurationUs === undefined
+        ? sample
+        : { ...sample, durationUs: aacDurationUs };
+      const packet = packetFromRemuxEvidence(packetSample, sample.payload, {
+        // Matroska stores presentation timestamps but no decode axis. Its physical block order is the
+        // coded decode order, so synthesize a monotonic DTS from that order instead of feeding B-frame
+        // PTS back as DTS (which makes the target muxer reorder access units). AAC has a normative
+        // 1,024-sample cadence; carrying that exact decode cadence also avoids accumulating one rounded
+        // Matroska-millisecond delta per packet when the ISO muxer authors its integer sample timescale.
+        dtsUs: usesCodedDecodeClock ? decodeTimeUs : sample.ptsUs,
+        ...(aacDurationUs !== undefined ? { durationUs: aacDurationUs } : {}),
+      });
+      if (packet === undefined) return undefined;
+      packets.push(packet);
+      if (usesCodedDecodeClock) {
+        const durationUs = aacDurationUs ?? sample.durationUs ?? fallbackDurationUs;
+        if (durationUs === undefined || !Number.isFinite(durationUs) || durationUs <= 0) return undefined;
+        decodeTimeUs += durationUs;
+      }
+    }
+    tracks.push({ track: matched.track, packets });
+  }
+  if (tracks.length !== table.tracks.length) return undefined;
+  signal.throwIfAborted();
+  return target === 'ts'
+    ? core.muxPreparedMpegTsPacketTracks({ tracks, container: target })
+    : core.muxPreparedMp4PacketTracks({
+        tracks,
+        container: target,
+        faststart: faststartFrom(opts),
+        fragmented: false,
+      });
+}
+
+async function packetsWithCorrectedTsTimeline(
+  demuxed: AibrushDemuxed,
+  track: AibrushTrackInfo,
+  evidence: RemuxTrackEvidence,
+): Promise<AibrushPacket[] | undefined> {
+  const reader = demuxed.packets(track.id).getReader();
+  const packets: AibrushPacket[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const sample = evidence.samples[packets.length];
+      if (sample === undefined) return undefined;
+      const data = packetPayloadBytes(value);
+      const packet = packetFromRemuxEvidence(sample, data, {
+        ptsUs: value.chunk.timestamp,
+        dtsUs: value.dtsUs,
+        durationUs: value.chunk.duration,
+        keyframe: value.chunk.type === 'key',
+      });
+      if (packet === undefined) return undefined;
+      packets.push(packet);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return packets.length === evidence.samples.length && packets.length > 0 ? packets : undefined;
+}
+
+async function tryPreparedMpegTsToContainerRemux(
+  core: AibrushCore,
+  engine: AibrushEngine,
+  input: MediaInput,
+  target: string,
+  opts: RemuxOptions,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  if (target !== 'mp4' && target !== 'mov' && target !== 'mkv') return undefined;
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, 'ts');
+  if (read.state !== 'OK') return undefined;
+  const evidenceTracks = mediaEvidenceTracks(read.value);
+  if (evidenceTracks === undefined) return undefined;
+  const demuxed = await engine.demux(
+    engine.from(bytes, { mime: input.mime, size: bytes.byteLength }),
+    { signal },
+  );
+  try {
+    const used = new Set<number>();
+    const tracks: PreparedAibrushPacketTrack[] = [];
+    for (const evidenceTrack of evidenceTracks) {
+      const matched = matchAibrushTrack(demuxed.tracks, evidenceTrack, used);
+      if (matched === undefined) return undefined;
+      const packets = await packetsWithCorrectedTsTimeline(demuxed, matched.track, evidenceTrack);
+      if (packets === undefined) return undefined;
+      tracks.push({ track: matched.track, packets });
+    }
+    if (tracks.length !== demuxed.tracks.length) return undefined;
+    signal.throwIfAborted();
+    const intermediateTarget = target === 'mkv' ? 'mp4' : target;
+    const intermediate = core.muxPreparedMp4PacketTracks({
+      tracks,
+      container: intermediateTarget,
+      faststart: target === 'mkv' ? true : faststartFrom(opts),
+      fragmented: false,
+    });
+    if (target !== 'mkv') return intermediate;
+    // Matroska requires length-prefixed AVC plus avcC. The corrected intermediate has both, and the
+    // framework's MP4→Matroska stream-copy path is independently exercised/proven by the ordinary rows.
+    const output = await engine.remux(
+      engine.from(intermediate, { mime: 'video/mp4', size: intermediate.byteLength }),
+      { to: 'mkv', faststart: true, fragmented: false },
+      { signal },
+    );
+    return (await toMediaBytes(output, 'mkv')).bytes;
+  } finally {
+    await demuxed.close();
+  }
+}
+
+async function tryStrictPreparedAibrushRemux(
+  core: AibrushCore,
+  engine: AibrushEngine,
+  input: MediaInput,
+  opts: RemuxOptions,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  if (input.mutated || !plainBufferedPreparedRemux(opts)) return undefined;
+  const source = containerFromInput(input);
+  const target = opts.container.toLowerCase();
+  if (source === 'mp3') return tryPreparedMp3Remux(core, input, target, opts);
+  if ((source === 'mp4' || source === 'mov') && target === 'ts') {
+    return tryPreparedIsoToMpegTsRemux(core, input, source, signal);
+  }
+  if (source === 'mov' && target === 'mkv') {
+    return tryPreparedMovToMatroskaRemux(core, input, signal);
+  }
+  if (source === 'mkv') {
+    return tryPreparedMatroskaToContainerRemux(core, input, target, opts, signal);
+  }
+  if (source === 'ts') {
+    return tryPreparedMpegTsToContainerRemux(core, engine, input, target, opts, signal);
+  }
+  return undefined;
+}
+
+interface AibrushEbmlVint {
+  readonly value: number;
+  readonly length: number;
+  readonly unknown: boolean;
+}
+
+interface AibrushEbmlElement {
+  readonly id: number;
+  readonly body: number;
+  readonly end: number;
+  readonly sizeOffset: number;
+  readonly sizeLength: number;
+  readonly unknown: boolean;
+}
+
+function aibrushEbmlVint(bytes: Uint8Array, offset: number, keepMarker: boolean): AibrushEbmlVint | undefined {
+  const first = bytes[offset];
+  if (first === undefined) return undefined;
+  let marker = 0x80;
+  let length = 1;
+  while (length <= 8 && (first & marker) === 0) {
+    marker >>>= 1;
+    length++;
+  }
+  if (length > 8 || offset + length > bytes.byteLength) return undefined;
+  let value = keepMarker ? first : first & (marker - 1);
+  let unknown = !keepMarker && (first & (marker - 1)) === marker - 1;
+  for (let index = 1; index < length; index++) {
+    const byte = bytes[offset + index]!;
+    value = value * 256 + byte;
+    if (unknown && byte !== 0xff) unknown = false;
+  }
+  // An unknown-size eight-byte vint has a 56-bit all-ones payload, which is intentionally outside
+  // JavaScript's safe-integer range. Its numeric value is never consumed; retain only the fact that
+  // it is unknown so Segment and Cluster traversal can still proceed.
+  if (!keepMarker && unknown) return { value: 0, length, unknown: true };
+  return Number.isSafeInteger(value) ? { value, length, unknown } : undefined;
+}
+
+function aibrushEbmlElement(
+  bytes: Uint8Array,
+  offset: number,
+  parentEnd: number,
+): AibrushEbmlElement | undefined {
+  const id = aibrushEbmlVint(bytes, offset, true);
+  const size = id === undefined ? undefined : aibrushEbmlVint(bytes, offset + id.length, false);
+  if (id === undefined || size === undefined) return undefined;
+  const body = offset + id.length + size.length;
+  const end = size.unknown ? parentEnd : body + size.value;
+  if (!Number.isSafeInteger(end) || end < body || end > parentEnd) return undefined;
+  return {
+    id: id.value,
+    body,
+    end,
+    sizeOffset: offset + id.length,
+    sizeLength: size.length,
+    unknown: size.unknown,
+  };
+}
+
+const AIBRUSH_EBML_SEGMENT_ID = 0x18538067;
+const AIBRUSH_EBML_CLUSTER_ID = 0x1f43b675;
+const AIBRUSH_EBML_LEVEL_ONE_IDS = new Set([
+  0x114d9b74, // SeekHead
+  0x1549a966, // Info
+  0x1654ae6b, // Tracks
+  AIBRUSH_EBML_CLUSTER_ID,
+  0x1c53bb6b, // Cues
+  0x1941a469, // Attachments
+  0x1043a770, // Chapters
+  0x1254c367, // Tags
+]);
+
+function nextAibrushEbmlLevelOne(bytes: Uint8Array, start: number, end: number): number | undefined {
+  for (let offset = start; offset + 4 <= end; offset++) {
+    const id =
+      bytes[offset]! * 0x1000000 +
+      (bytes[offset + 1]! << 16) +
+      (bytes[offset + 2]! << 8) +
+      bytes[offset + 3]!;
+    if (!AIBRUSH_EBML_LEVEL_ONE_IDS.has(id)) continue;
+    const candidate = aibrushEbmlElement(bytes, offset, end);
+    if (candidate !== undefined && AIBRUSH_EBML_LEVEL_ONE_IDS.has(candidate.id)) return offset;
+  }
+  return undefined;
+}
+
+function writeAibrushEbmlSize(
+  bytes: Uint8Array,
+  offset: number,
+  length: number,
+  value: number,
+): boolean {
+  if (!Number.isSafeInteger(value) || value < 0 || length < 1 || length > 8) return false;
+  const maximum = (1n << BigInt(length * 7)) - 2n;
+  let remaining = BigInt(value);
+  if (remaining > maximum) return false;
+  for (let index = length - 1; index >= 0; index--) {
+    bytes[offset + index] = Number(remaining & 0xffn);
+    remaining >>= 8n;
+  }
+  bytes[offset] = bytes[offset]! | (1 << (8 - length));
+  return true;
+}
+
+function sameRemuxProgramMedia(left: RemuxProgramEvidence, right: RemuxProgramEvidence): boolean {
+  if (left.tracks.length !== right.tracks.length) return false;
+  for (let trackIndex = 0; trackIndex < left.tracks.length; trackIndex++) {
+    const a = left.tracks[trackIndex];
+    const b = right.tracks[trackIndex];
+    if (
+      a === undefined ||
+      b === undefined ||
+      a.type !== b.type ||
+      canonicalCodec(a.codec) !== canonicalCodec(b.codec) ||
+      a.samples.length !== b.samples.length
+    ) {
+      return false;
+    }
+    for (let sampleIndex = 0; sampleIndex < a.samples.length; sampleIndex++) {
+      const x = a.samples[sampleIndex];
+      const y = b.samples[sampleIndex];
+      if (
+        x === undefined ||
+        y === undefined ||
+        x.ptsUs !== y.ptsUs ||
+        x.dtsUs !== y.dtsUs ||
+        x.durationUs !== y.durationUs ||
+        x.keyframe !== y.keyframe ||
+        x.payload.byteLength !== y.payload.byteLength
+      ) {
+        return false;
+      }
+      for (let byteIndex = 0; byteIndex < x.payload.byteLength; byteIndex++) {
+        if (x.payload[byteIndex] !== y.payload[byteIndex]) return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Replace only unknown-size top-level Cluster size vints with their observed finite spans. MediaRecorder
+ * commonly emits several such sibling Clusters; the framework currently lets the first consume the
+ * Segment remainder. The proof read before/after guarantees this header-only rewrite preserves every
+ * coded block and timestamp before it is admitted.
+ */
+export function materializeFiniteAibrushWebmClusters(bytes: Uint8Array): Uint8Array | undefined {
+  let topOffset = 0;
+  let segment: AibrushEbmlElement | undefined;
+  while (topOffset < bytes.byteLength) {
+    const item = aibrushEbmlElement(bytes, topOffset, bytes.byteLength);
+    if (item === undefined || item.end <= topOffset) return undefined;
+    if (item.id === AIBRUSH_EBML_SEGMENT_ID) {
+      segment = item;
+      break;
+    }
+    topOffset = item.end;
+  }
+  if (segment === undefined) return undefined;
+  const output = bytes.slice();
+  let offset = segment.body;
+  let patched = 0;
+  while (offset < segment.end) {
+    const item = aibrushEbmlElement(output, offset, segment.end);
+    if (item === undefined) return undefined;
+    if (item.unknown) {
+      if (item.id !== AIBRUSH_EBML_CLUSTER_ID) return undefined;
+      const next = nextAibrushEbmlLevelOne(output, item.body, segment.end) ?? segment.end;
+      if (next <= item.body || !writeAibrushEbmlSize(output, item.sizeOffset, item.sizeLength, next - item.body)) {
+        return undefined;
+      }
+      patched++;
+      offset = next;
+    } else {
+      if (item.end <= offset) return undefined;
+      offset = item.end;
+    }
+  }
+  if (patched === 0) return undefined;
+  const before = readNeutralRemuxProgram(bytes, 'webm');
+  const after = readNeutralRemuxProgram(output, 'webm');
+  return before.state === 'OK' && after.state === 'OK' && sameRemuxProgramMedia(before.value, after.value)
+    ? output
+    : undefined;
+}
+
+async function finiteWebmClusterSource(
+  engine: AibrushEngine,
+  input: MediaInput,
+): Promise<unknown | undefined> {
+  const container = containerFromInput(input);
+  if (
+    input.mutated ||
+    (container !== 'webm' && container !== 'mkv') ||
+    input.sizeBytes === undefined ||
+    input.sizeBytes > FINITE_WEBM_CLUSTER_REPAIR_MAX_SOURCE_BYTES
+  ) {
+    return undefined;
+  }
+  const bytes = await inputBytes(input);
+  const repaired = materializeFiniteAibrushWebmClusters(bytes);
+  return repaired === undefined
+    ? undefined
+    : engine.from(repaired, { mime: input.mime, size: repaired.byteLength });
+}
+
 // ── remux output-shape knobs (streaming-output family forwards them via RemuxOptions) ──────────────
 
 /**
@@ -4645,8 +5510,15 @@ export class AibrushMediaEngine implements MediaEngine {
           emit: context?.emit,
           resolvedRepresentation: resolvedStreamingRepresentation(target, opts, fragmented),
         });
-        const out = await engine.remux(
-          await this.#src(engine, input),
+        const prepared = await tryStrictPreparedAibrushRemux(
+          this.#driverCore(),
+          engine,
+          input,
+          opts,
+          signal,
+        );
+        const out = prepared ?? await engine.remux(
+          (await finiteWebmClusterSource(engine, input)) ?? await this.#src(engine, input),
           {
             to: opts.container,
             faststart: faststartFrom(opts),
@@ -4657,7 +5529,14 @@ export class AibrushMediaEngine implements MediaEngine {
           { signal },
         );
         const media = await telemetry.mediaBytes(out, opts.container);
-        return verifyRequestedIsoShape(media, opts, fragmented);
+        const repairedOgg = target === 'ogg'
+          ? repairAibrushOggContinuationFlags(media.bytes)
+          : undefined;
+        return verifyRequestedIsoShape(
+          repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },
+          opts,
+          fragmented,
+        );
       } catch (e) {
         if (e instanceof AibrushPositionedWriteUnsupportedError) {
           throw createNotApplicableError(
@@ -4669,7 +5548,14 @@ export class AibrushMediaEngine implements MediaEngine {
             e,
           );
         }
-        return this.#naIfMiss('remux', e, input);
+        try {
+          return this.#naIfMiss('remux', e, input);
+        } catch (translated) {
+          if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+            throw new GracefulRejectionError('remux', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

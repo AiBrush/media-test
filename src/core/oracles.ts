@@ -696,7 +696,10 @@ export interface OracleContext {
   /** Current browser, when the runner provides it. Used only for browser-baked frame-golden sidecars. */
   browser?: BrowserName;
   /** injected by runner: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
-  decodeWithPlatform: (bytes: MediaBytes, opts?: { maxFrames?: number }) => Promise<FrameSink>;
+  decodeWithPlatform: (
+    bytes: MediaBytes,
+    opts?: { maxFrames?: number; sampling?: 'prefix' | 'uniform' },
+  ) => Promise<FrameSink>;
   /** injected by runner: <video> playback smoke test → resolves true if it plays a few frames */
   playbackSmoke: (bytes: MediaBytes) => Promise<boolean>;
   /** Optional native-rate audio instrument. Web Audio playback-rate evidence is never accepted. */
@@ -4307,6 +4310,19 @@ function classifyReferenceDecodeFailure(
 async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'ssim-psnr';
 
+  if (
+    ctx.scenario.id === 'transcode/multitrack_select_default_audio' &&
+    ctx.golden.meta &&
+    ctx.golden.meta.tracks.filter((track) => track.type === 'audio').length < 2
+  ) {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRANSCODE_MULTITRACK_SOURCE_EVIDENCE_MISSING',
+      'selected source exposes fewer than two audio tracks, so default-track selection cannot be exercised',
+    );
+  }
+
   if (ctx.decodeTrackSelection && ctx.decodeTrackSelection.verdict !== 'PASS') {
     return decodeSeekOracleOutcome(oracle, ctx.decodeTrackSelection);
   }
@@ -4335,12 +4351,19 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   // decode failure or null/empty result as a clean FAIL with a clear detail rather than throwing.
   let sink: FrameSink | null | undefined;
   let candidateUsesReferenceDecoder = false;
+  const transcodeOptions: Record<string, unknown> = isObject(ctx.scenario.options)
+    ? ctx.scenario.options
+    : {};
+  const uniformSampling = transcodeOptions.fastStart === 'fragmented' || transcodeOptions.fragmented === true;
   if (ctx.frames) {
     sink = ctx.frames;
   } else if (ctx.output) {
     candidateUsesReferenceDecoder = true;
     try {
-      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames });
+      sink = await ctx.decodeWithPlatform(ctx.output, {
+        maxFrames,
+        ...(uniformSampling ? { sampling: 'uniform' as const } : {}),
+      });
     } catch (err) {
       return classifyReferenceDecodeFailure(oracle, 'candidate', err, ctx.output);
     }
@@ -4587,7 +4610,14 @@ async function ssimVsReferenceSource(
   const sample = Math.min(candCount, 8);
   let srcSink: FrameSink | null | undefined;
   try {
-    srcSink = await ctx.decodeWithPlatform(srcBytes, { maxFrames: sample });
+    const options: Record<string, unknown> = isObject(ctx.scenario.options)
+      ? ctx.scenario.options
+      : {};
+    const uniformSampling = options.fastStart === 'fragmented' || options.fragmented === true;
+    srcSink = await ctx.decodeWithPlatform(srcBytes, {
+      maxFrames: sample,
+      ...(uniformSampling ? { sampling: 'uniform' as const } : {}),
+    });
   } catch (err) {
     return classifyReferenceDecodeFailure(oracle, 'source', err, srcBytes);
   }
@@ -8376,6 +8406,21 @@ async function transcodeAudioContentInvariant(ctx: OracleContext): Promise<Oracl
       `neutral browser PCM decode failed after structural validation: ${message}`,
     );
   }
+  const declaredSourceRate = ctx.golden.meta?.tracks.find((track) => track.type === 'audio')?.sampleRate;
+  if (
+    canonicalTranscodeAudioCodec(structure.value.codec).startsWith('pcm-') &&
+    declaredSourceRate !== undefined &&
+    candidateSignal.sampleRate === declaredSourceRate &&
+    sourceSignal.sampleRate !== declaredSourceRate
+  ) {
+    return unavailable(
+      oracle,
+      'NA_BROWSER',
+      'TRANSCODE_AUDIO_REFERENCE_RESAMPLED',
+      `AudioContext resampled the encoded source from ${declaredSourceRate}Hz to ${sourceSignal.sampleRate}Hz ` +
+        `while the native PCM candidate correctly remains ${candidateSignal.sampleRate}Hz`,
+    );
+  }
   return transcodeDecisionOutcome(oracle, evaluateTranscodeRuntimeInvariant({
     invariant: TRANSCODE_AUDIO_CONTENT_INVARIANT,
     scenarioId: ctx.scenario.id,
@@ -8508,19 +8553,41 @@ async function transcodeOutputMetadataInvariant(
   const structureRead = readOutputStructureResult(ctx.output.bytes, ctx.output.container);
   const structure = structureRead.state === 'OK' ? structureRead.value : undefined;
   let meta: NormalizedMetadata | null = structure ? structureToMetadata(structure) : null;
+  const outputContainer = normStr(ctx.output.container);
+  const neutralProgram = !meta && (expectedContainer === 'ts' || outputContainer === 'ts')
+    ? readNeutralRemuxProgram(ctx.output.bytes, 'ts')
+    : undefined;
+  if (!meta && neutralProgram?.state === 'OK') {
+    meta = {
+      container: neutralProgram.value.container,
+      durationSec: neutralProgram.value.durationUs !== undefined
+        ? neutralProgram.value.durationUs / 1_000_000
+        : null,
+      tracks: neutralProgram.value.tracks.map((track) => ({
+        type: track.type,
+        codec: track.codec,
+        ...(track.width !== undefined ? { width: track.width } : {}),
+        ...(track.height !== undefined ? { height: track.height } : {}),
+        ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
+        ...(track.channels !== undefined ? { channels: track.channels } : {}),
+        language: track.language ?? null,
+      })),
+    };
+  }
   if (!meta && (expectedContainer === 'aiff' || normStr(ctx.output.container) === 'aiff')) {
     meta = parseAiffMetadata(ctx.output.bytes);
   }
   if (!meta) {
-    const detail = `[${which}] transcode output metadata reader ${structureRead.state} ` +
-      `${structureRead.state === 'OK' ? '' : `[${structureRead.reasonCode}] `}` +
-      `(container '${normStr(ctx.output.container)}')`;
-    if (structureRead.state === 'MALFORMED' || structureRead.state === 'INCOMPLETE') {
+    const failedRead = neutralProgram ?? structureRead;
+    const detail = `[${which}] transcode output metadata reader ${failedRead.state} ` +
+      `${failedRead.state === 'OK' ? '' : `[${failedRead.reasonCode}] `}` +
+      `(container '${outputContainer}')`;
+    if (failedRead.state === 'MALFORMED' || failedRead.state === 'INCOMPLETE') {
       return fail(oracle, detail);
     }
     return oracleError(
       oracle,
-      structureRead.state === 'OK' ? 'ORACLE_METADATA_READER_UNAVAILABLE' : structureRead.reasonCode,
+      failedRead.state === 'OK' ? 'ORACLE_METADATA_READER_UNAVAILABLE' : failedRead.reasonCode,
       detail,
     );
   }

@@ -758,13 +758,26 @@ export function buildCandidateEvidencePlan(
 ): CandidateOracleEvidencePlan {
   const declaredOracles = forcedOracles ? [...forcedOracles] : [...scenario.oracles];
   const declaredSet = new Set(declaredOracles);
+  // Negative/boundary contracts with survivor oracles have two legitimate, mutually exclusive
+  // execution branches: a clean typed rejection is fully decided by graceful-failure, while a
+  // returned partial must be decided by every declared survivor oracle. Encoding those branches as
+  // alternatives prevents a clean rejection from becoming NA_ASSET merely because no output existed
+  // on which to run the survivor oracle.
+  const conditionalGracefulFailure = !forcedOracles &&
+    declaredSet.has('graceful-failure') &&
+    declaredOracles.length > 1;
+  const survivorOracles = declaredOracles.filter((oracle) => oracle !== 'graceful-failure');
   const requiredOracles = declaration?.requiredOracles?.length
     ? declaration.requiredOracles.filter((oracle) => declaredSet.has(oracle))
-    : declaredOracles;
+    : conditionalGracefulFailure
+      ? []
+      : declaredOracles;
   const sufficientOracleSets = declaration?.sufficientOracleSets?.length
     ? declaration.sufficientOracleSets
       .map((set) => [...new Set(set.filter((oracle) => declaredSet.has(oracle)))].sort())
       .filter((set) => set.length > 0)
+    : conditionalGracefulFailure
+      ? [['graceful-failure' as const], survivorOracles.sort()]
     : declaredOracles.length > 0
       ? [[...declaredOracles].sort()]
       : [];

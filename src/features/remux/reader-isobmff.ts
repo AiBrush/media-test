@@ -9,6 +9,7 @@ import {
   u64beSafe,
 } from './binary.ts';
 import type { RemuxProgramEvidence, RemuxReadResult, RemuxSampleEvidence, RemuxTrackEvidence } from './types.ts';
+import { mp3FrameAudioConfig } from './reader-mp3.ts';
 
 interface Box {
   type: string;
@@ -21,6 +22,7 @@ interface Box {
 interface EditTiming {
   mediaStart: number;
   presentationStartUs: number;
+  presentationDurationUs: number;
 }
 
 interface TrackTables {
@@ -136,27 +138,89 @@ function handlerType(bytes: Uint8Array, hdlr: Box): TrackTables['type'] | undefi
   return 'other';
 }
 
+export function parseIsoAudioSampleEntryHeader(
+  bytes: Uint8Array,
+  bodyStart: number,
+  bodyEnd: number,
+): { headerBytes: number; sampleRate?: number; channels?: number } | undefined {
+  if (bodyStart < 0 || bodyEnd > bytes.byteLength || bodyStart + 28 > bodyEnd) return undefined;
+  const version = u16be(bytes, bodyStart + 8);
+  let headerBytes = 28;
+  let channels = u16be(bytes, bodyStart + 16) || undefined;
+  let sampleRate = (u32be(bytes, bodyStart + 24) >>> 16) || undefined;
+
+  if (version === 1) {
+    headerBytes = 44;
+  } else if (version === 2) {
+    // QuickTime AudioSampleEntry v2 replaces the legacy 16.16 rate/channel placeholders with a
+    // 64-bit float rate and a 32-bit channel count in its 36-byte extension.
+    headerBytes = 64;
+    if (bodyStart + headerBytes > bodyEnd) return undefined;
+    const view = new DataView(bytes.buffer, bytes.byteOffset + bodyStart + 32, 8);
+    const extendedRate = view.getFloat64(0, false);
+    const extendedChannels = u32be(bytes, bodyStart + 40);
+    sampleRate = Number.isFinite(extendedRate) && extendedRate > 0 && extendedRate <= 1_000_000
+      ? Math.round(extendedRate)
+      : undefined;
+    channels = extendedChannels > 0 && extendedChannels <= 256 ? extendedChannels : undefined;
+  } else if (version !== 0) {
+    return undefined;
+  }
+
+  if (bodyStart + headerBytes > bodyEnd) return undefined;
+  return {
+    headerBytes,
+    ...(sampleRate ? { sampleRate } : {}),
+    ...(channels ? { channels } : {}),
+  };
+}
+
+export function parseIsoVisualSampleEntryHeader(
+  bytes: Uint8Array,
+  bodyStart: number,
+  bodyEnd: number,
+): { headerBytes: 78; width?: number; height?: number } | undefined {
+  const headerBytes = 78 as const;
+  if (bodyStart < 0 || bodyEnd > bytes.byteLength || bodyStart + headerBytes > bodyEnd) return undefined;
+  const width = u16be(bytes, bodyStart + 24) || undefined;
+  const height = u16be(bytes, bodyStart + 26) || undefined;
+  return {
+    headerBytes,
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+  };
+}
+
+function paddedChildBoxes(bytes: Uint8Array, start: number, end: number): Box[] | undefined {
+  const exact = boxes(bytes, start, end);
+  if (exact) return exact;
+  let trimmedEnd = end;
+  while (trimmedEnd > start && end - trimmedEnd < 16 && bytes[trimmedEnd - 1] === 0) {
+    trimmedEnd--;
+  }
+  return trimmedEnd < end ? boxes(bytes, start, trimmedEnd) : undefined;
+}
+
 function entryChildren(bytes: Uint8Array, entry: Box, type: TrackTables['type']): Box[] | undefined {
-  const header = type === 'video' ? 78 : type === 'audio' ? 28 : 8;
+  const header = type === 'video'
+    ? parseIsoVisualSampleEntryHeader(bytes, entry.body, entry.end)?.headerBytes
+    : type === 'audio'
+      ? parseIsoAudioSampleEntryHeader(bytes, entry.body, entry.end)?.headerBytes
+      : 8;
+  if (header === undefined) return undefined;
   if (entry.body + header > entry.end) return undefined;
   const start = entry.body + header;
-  const exact = boxes(bytes, start, entry.end);
-  if (exact) return exact;
   // QuickTime permits zero padding after the final sample-entry extension. Keep the enclosing file
   // parser strict while accepting only a bounded all-zero suffix here, so avcC/hvcC evidence is not
   // discarded merely because four alignment bytes follow the last child box.
-  let trimmedEnd = entry.end;
-  while (trimmedEnd > start && entry.end - trimmedEnd < 16 && bytes[trimmedEnd - 1] === 0) {
-    trimmedEnd--;
-  }
-  return trimmedEnd < entry.end ? boxes(bytes, start, trimmedEnd) : undefined;
+  return paddedChildBoxes(bytes, start, entry.end);
 }
 
 function parseSampleEntry(
   bytes: Uint8Array,
   stsd: Box,
   type: TrackTables['type'],
-): Pick<TrackTables, 'codec' | 'sampleRate' | 'channels' | 'codecPrivate' | 'nalLengthSize'> | undefined {
+): Pick<TrackTables, 'codec' | 'sampleRate' | 'channels' | 'width' | 'height' | 'codecPrivate' | 'nalLengthSize'> | undefined {
   if (stsd.body + 8 > stsd.end || u32be(bytes, stsd.body + 4) < 1) return undefined;
   const entries = boxes(bytes, stsd.body + 8, stsd.end);
   const entry = entries?.[0];
@@ -164,13 +228,25 @@ function parseSampleEntry(
   let codec = canonicalCodec(entry.type);
   let channels: number | undefined;
   let sampleRate: number | undefined;
+  let width: number | undefined;
+  let height: number | undefined;
+  if (type === 'video') {
+    const header = parseIsoVisualSampleEntryHeader(bytes, entry.body, entry.end);
+    width = header?.width;
+    height = header?.height;
+  }
   if (type === 'audio' && entry.body + 28 <= entry.end) {
-    channels = u16be(bytes, entry.body + 16) || undefined;
-    sampleRate = (u32be(bytes, entry.body + 24) >>> 16) || undefined;
+    const header = parseIsoAudioSampleEntryHeader(bytes, entry.body, entry.end);
+    channels = header?.channels;
+    sampleRate = header?.sampleRate;
   }
   const sub = entryChildren(bytes, entry, type);
   const configType = codec === 'h264' ? 'avcC' : codec === 'hevc' ? 'hvcC' : codec === 'av1' ? 'av1C' : codec === 'vp9' ? 'vpcC' : codec === 'opus' ? 'dOps' : codec === 'flac' ? 'dfLa' : codec === 'aac' ? 'esds' : undefined;
-  const config = configType ? sub?.find((box) => box.type === configType) : undefined;
+  const wave = sub?.find((box) => box.type === 'wave');
+  const waveChildren = wave ? paddedChildBoxes(bytes, wave.body, wave.end) : undefined;
+  const config = configType
+    ? [...(sub ?? []), ...(waveChildren ?? [])].find((box) => box.type === configType)
+    : undefined;
   const codecPrivate = config ? bytes.subarray(config.body, config.end) : undefined;
   if (entry.type === 'mp4a' && codecPrivate) {
     const objectType = esdsObjectType(codecPrivate);
@@ -189,6 +265,8 @@ function parseSampleEntry(
     codec,
     ...(sampleRate ? { sampleRate } : {}),
     ...(channels ? { channels } : {}),
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
     ...(codecPrivate ? { codecPrivate } : {}),
     ...(nalLengthSize ? { nalLengthSize } : {}),
   };
@@ -232,6 +310,78 @@ function decoderSpecificInfoFromEsds(bytes: Uint8Array): Uint8Array | undefined 
   return undefined;
 }
 
+const AAC_SAMPLE_RATES = [
+  96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000,
+  22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
+] as const;
+
+export interface AacAudioSpecificConfig {
+  readonly audioObjectType: number;
+  readonly coreSampleRate: number;
+  readonly presentationSampleRate: number;
+  readonly channelConfiguration: number;
+  readonly sbrPresent: boolean;
+  readonly psPresent: boolean;
+}
+
+/** Reads the explicit AAC/SBR rate relationship carried by an ISO-BMFF esds descriptor. */
+export function aacAudioSpecificConfigFromEsds(bytes: Uint8Array): AacAudioSpecificConfig | undefined {
+  const asc = decoderSpecificInfoFromEsds(bytes);
+  if (!asc) return undefined;
+  let bitOffset = 0;
+  const bits = (count: number): number | undefined => {
+    if (count < 1 || bitOffset + count > asc.byteLength * 8) return undefined;
+    let value = 0;
+    for (let index = 0; index < count; index++) {
+      value = value * 2 + ((asc[bitOffset >> 3]! >> (7 - (bitOffset & 7))) & 1);
+      bitOffset++;
+    }
+    return value;
+  };
+  const objectType = (): number | undefined => {
+    const base = bits(5);
+    if (base === undefined) return undefined;
+    if (base !== 31) return base;
+    const extension = bits(6);
+    return extension === undefined ? undefined : 32 + extension;
+  };
+  const sampleRate = (): number | undefined => {
+    const index = bits(4);
+    if (index === undefined) return undefined;
+    if (index === 15) {
+      const explicit = bits(24);
+      return explicit && explicit <= 1_000_000 ? explicit : undefined;
+    }
+    return AAC_SAMPLE_RATES[index];
+  };
+
+  const signaledObjectType = objectType();
+  const signaledRate = sampleRate();
+  const channelConfiguration = bits(4);
+  if (!signaledObjectType || !signaledRate || channelConfiguration === undefined) return undefined;
+  if (signaledObjectType === 5 || signaledObjectType === 29) {
+    const presentationSampleRate = sampleRate();
+    const coreObjectType = objectType();
+    if (!presentationSampleRate || !coreObjectType) return undefined;
+    return {
+      audioObjectType: coreObjectType,
+      coreSampleRate: signaledRate,
+      presentationSampleRate,
+      channelConfiguration,
+      sbrPresent: true,
+      psPresent: signaledObjectType === 29,
+    };
+  }
+  return {
+    audioObjectType: signaledObjectType,
+    coreSampleRate: signaledRate,
+    presentationSampleRate: signaledRate,
+    channelConfiguration,
+    sbrPresent: false,
+    psPresent: false,
+  };
+}
+
 /** AAC-LC has no SBR/PS channel expansion, so its ASC channelConfiguration is authoritative. */
 export function aacLcChannelsFromEsds(bytes: Uint8Array): number | undefined {
   const asc = decoderSpecificInfoFromEsds(bytes);
@@ -244,11 +394,14 @@ export function aacLcChannelsFromEsds(bytes: Uint8Array): number | undefined {
 
 function parseEdit(bytes: Uint8Array, trak: Box, movieTimescale: number): EditTiming | undefined {
   const elst = findPath(bytes, trak, ['edts', 'elst']);
-  if (!elst || elst.body + 8 > elst.end) return undefined;
+  if (!elst || elst.body + 8 > elst.end || movieTimescale <= 0) return undefined;
   const version = bytes[elst.body]!;
   const count = u32be(bytes, elst.body + 4);
+  if ((version !== 0 && version !== 1) || count === 0 || count > 10_000) return undefined;
   let at = elst.body + 8;
-  let presentationStartUs = 0;
+  let presentationTicks = 0;
+  let presentationStartUs: number | undefined;
+  let mediaStart: number | undefined;
   for (let index = 0; index < count; index++) {
     const wide = version === 1;
     const entrySize = wide ? 20 : 12;
@@ -259,11 +412,26 @@ function parseEdit(bytes: Uint8Array, trak: Box, movieTimescale: number): EditTi
     const mediaTime = wide
       ? mediaRaw >= 2 ** 63 ? mediaRaw - 2 ** 64 : mediaRaw
       : mediaRaw >= 0x8000_0000 ? mediaRaw - 0x1_0000_0000 : mediaRaw;
-    if (mediaTime === -1) presentationStartUs += Math.round((segmentDuration / movieTimescale) * 1_000_000);
-    else if (mediaTime >= 0) return { mediaStart: mediaTime, presentationStartUs };
+    const rateOffset = at + (wide ? 16 : 8);
+    if (u16be(bytes, rateOffset) !== 1 || u16be(bytes, rateOffset + 2) !== 0) return undefined;
+    if (mediaTime < -1) return undefined;
+    if (mediaTime >= 0) {
+      // A single media edit, optionally preceded by an empty edit, is the lossless presentation mapping
+      // this reader can apply to every coded sample without inventing concatenation semantics.
+      if (mediaStart !== undefined) return undefined;
+      mediaStart = mediaTime;
+      presentationStartUs = Math.round((presentationTicks / movieTimescale) * 1_000_000);
+    }
+    presentationTicks += segmentDuration;
     at += entrySize;
   }
-  return undefined;
+  return mediaStart !== undefined && presentationStartUs !== undefined && presentationTicks > 0
+    ? {
+        mediaStart,
+        presentationStartUs,
+        presentationDurationUs: Math.round((presentationTicks / movieTimescale) * 1_000_000),
+      }
+    : undefined;
 }
 
 function parseTracks(bytes: Uint8Array, moov: Box): TrackTables[] | undefined {
@@ -288,8 +456,8 @@ function parseTracks(bytes: Uint8Array, moov: Box): TrackTables[] | undefined {
     out.push({
       id: tk.id, type, timescale: md.timescale, stbl,
       ...(md.language ? { language: md.language } : {}),
-      ...(tk.width ? { width: tk.width } : {}),
-      ...(tk.height ? { height: tk.height } : {}),
+      ...(sample.width ?? tk.width ? { width: sample.width ?? tk.width } : {}),
+      ...(sample.height ?? tk.height ? { height: sample.height ?? tk.height } : {}),
       ...sample,
       ...(parseEdit(bytes, trak, movieTimescale) ? { edit: parseEdit(bytes, trak, movieTimescale) } : {}),
     });
@@ -549,11 +717,16 @@ export function readIsoBmffProgram(bytes: Uint8Array, hint = 'mp4'): RemuxReadRe
     for (const table of tables) {
       const samples = fragmented ? fragments?.get(table.id) : classicSamples(bytes, table, mdats);
       if (!samples || samples.length === 0) return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_SAMPLES_INCOMPLETE', evidence };
+      // MPEG audio headers carry the authoritative channel mode and rate. Some muxers write a
+      // contradictory generic mp4a channel field while preserving mono MP3 frames byte-for-byte.
+      const mp3Config = table.codec === 'mp3' ? mp3FrameAudioConfig(samples[0]!.payload) : undefined;
+      const sampleRate = mp3Config?.sampleRate ?? table.sampleRate;
+      const channels = mp3Config?.channels ?? table.channels;
       tracks.push({
         id: `isobmff:${table.id}`, type: table.type, codec: table.codec, timescale: table.timescale,
         ...(table.language ? { language: table.language } : {}),
         ...(table.width ? { width: table.width } : {}), ...(table.height ? { height: table.height } : {}),
-        ...(table.sampleRate ? { sampleRate: table.sampleRate } : {}), ...(table.channels ? { channels: table.channels } : {}),
+        ...(sampleRate ? { sampleRate } : {}), ...(channels ? { channels } : {}),
         ...(table.codecPrivate ? { codecPrivate: table.codecPrivate } : {}), samples,
       });
     }
@@ -566,9 +739,25 @@ export function readIsoBmffProgram(bytes: Uint8Array, hint = 'mp4'): RemuxReadRe
         maximumEndUs = Math.max(maximumEndUs, sample.ptsUs + (sample.durationUs ?? 0));
       }
     }
-    const durationUs = Number.isFinite(minimumPtsUs) && Number.isFinite(maximumEndUs)
+    const codedDurationUs = Number.isFinite(minimumPtsUs) && Number.isFinite(maximumEndUs)
       ? maximumEndUs - minimumPtsUs
       : undefined;
+    // ISO edit lists define the presentation program span independently of the raw final stts delta.
+    // Some valid MOV files retain a multi-second terminal coded delta while presenting a much shorter
+    // movie; carrying that raw span across containers is not a remux-duration requirement.
+    const editedDurationUs = tables
+      .map((table) => table.edit?.presentationDurationUs)
+      .filter((duration): duration is number => duration !== undefined && duration >= 0)
+      .reduce<number | undefined>(
+        (maximum, duration) => maximum === undefined ? duration : Math.max(maximum, duration),
+        undefined,
+      );
+    const durationUs =
+      editedDurationUs !== undefined &&
+      codedDurationUs !== undefined &&
+      Math.abs(editedDurationUs - codedDurationUs) > 50_000
+        ? editedDurationUs
+        : codedDurationUs ?? editedDurationUs;
     const parsedSamples = tracks.reduce((sum, track) => sum + track.samples.length, 0);
     const value: RemuxProgramEvidence = {
       schema: 'media-test/remux-program@1', container, byteLength: bytes.byteLength,

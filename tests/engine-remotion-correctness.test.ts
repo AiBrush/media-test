@@ -354,6 +354,48 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
 });
 
 describe('REQ-ENG-09: copy-only remux', () => {
+  test('uses a chunked reader over digest-verified object-URL bytes and keeps HTTP on webReader', async () => {
+    const engine = new RemotionWebcodecsEngine();
+    installPrivateWebcodecsLib(engine);
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    let fullBodyReads = 0;
+    const input = mediaInput({
+      url: 'blob:http://127.0.0.1:5151/verified-fixture',
+      blob: async () => { throw new Error('Blob path must not be used'); },
+      arrayBuffer: async () => {
+        fullBodyReads++;
+        return bytes.buffer;
+      },
+    });
+    const objectOptions = await (engine as any).sourceOptions(input);
+    await (engine as any).sourceOptions(input);
+    expect(objectOptions.src).toBe(input.url);
+    expect(objectOptions.reader).toBeDefined();
+    expect(fullBodyReads).toBe(1);
+
+    const read = await objectOptions.reader.read({ range: [1, 2] });
+    const first = await read.reader.reader.read();
+    const done = await read.reader.reader.read();
+    expect(Array.from(first.value ?? [])).toEqual([2, 3]);
+    expect(done.done).toBe(true);
+    expect(read).toMatchObject({
+      contentLength: 4,
+      contentType: 'video/mp4',
+      name: 'fixture.mp4',
+      supportsContentRange: true,
+      needsContentRange: true,
+    });
+    expect(engine.configUsed).toMatchObject({
+      readerMode: 'verified-buffer',
+      sourceReader: 'verified-buffer',
+    });
+
+    const httpOptions = await (engine as any).sourceOptions(mediaInput());
+    expect(httpOptions.src).toBe('https://fixtures.invalid/fixture.mp4');
+    expect(httpOptions.reader).toBeDefined();
+    expect(engine.configUsed).toMatchObject({ readerMode: 'webReader', sourceReader: 'webReader' });
+  });
+
   test('compatible MP4/WebM and multi-audio tuples pass; cross-copy and WAV tuples are NA_ENGINE', () => {
     const compatible = [
       request('remux', {
@@ -371,6 +413,11 @@ describe('REQ-ENG-09: copy-only remux', () => {
     ];
     for (const concrete of compatible) expect(decideRemotionWebcodecsSupport(concrete)).toEqual({ supported: true });
 
+    expect(decideRemotionWebcodecsSupport(request('remux', {
+      inputs: [concreteInput('mov', [])],
+      output: { container: 'mp4' },
+    }))).toEqual({ supported: true });
+
     expectNa(request('remux', {
       inputs: [concreteInput('mp4', [video('h264'), audio('aac')])],
       output: { container: 'webm' },
@@ -378,6 +425,10 @@ describe('REQ-ENG-09: copy-only remux', () => {
     expectNa(request('remux', {
       inputs: [concreteInput('wav', [audio('pcm-s16')])],
       output: { container: 'wav' },
+    }), 'REMOTION_REMUX_COPY_INCOMPATIBLE');
+    expectNa(request('remux', {
+      inputs: [concreteInput('ts', [])],
+      output: { container: 'mp4' },
     }), 'REMOTION_REMUX_COPY_INCOMPATIBLE');
     expectNa(request('remux', {
       inputs: [concreteInput('mp4', [video('h264')]), concreteInput('mp4', [audio('aac')])],
@@ -447,6 +498,41 @@ describe('REQ-ENG-09: copy-only remux', () => {
       { trackId: 9, type: 'audio', decision: 'reject', reasonCode: 'REMOTION_REMUX_COPY_INCOMPATIBLE' },
     ]);
     expect(engine.configUsed.outputBytes).toBe(0);
+  });
+
+  test('rejects an ISO copy when the pinned parser extracts an incomplete coded-sample table', async () => {
+    const bytes = new Uint8Array(await Bun.file(
+      'fixtures/media/scenarios/remux/h264_1080p_5s_mov_to_mp4/02.mov',
+    ).arrayBuffer());
+    const blob = new Blob([bytes], { type: 'video/quicktime' });
+    const input = mediaInput({
+      id: '02.mov',
+      url: 'blob:http://127.0.0.1:5151/remotion-incomplete-aac',
+      mime: 'video/quicktime',
+      sizeBytes: bytes.byteLength,
+      blob: async () => blob,
+      arrayBuffer: async () => bytes.buffer,
+    });
+    const engine = new RemotionWebcodecsEngine();
+    await engine.init();
+    let thrown: unknown;
+    try {
+      await (engine as any).copyOnlyTrackHandlers(
+        input,
+        'mp4',
+        context(request('remux', {
+          inputs: [concreteInput('mov', [])],
+          output: { container: 'mp4' },
+        })),
+      );
+    } catch (error) {
+      thrown = error;
+    } finally {
+      await engine.dispose();
+    }
+    expect(isNotApplicableError(thrown)).toBe(true);
+    expect(thrown).toMatchObject({ reasonCode: 'REMOTION_REMUX_SAMPLE_EXTRACTION_INCOMPLETE' });
+    expect((thrown as Error).message).toContain('1/1755 coded samples');
   });
 });
 
@@ -986,6 +1072,43 @@ describe('REQ-ENG-12: lifecycle, worker isolation, cleanup, telemetry, conforman
       outputBytes: 0,
       activeControllers: 0,
       activeWriterBuffers: 0,
+      cleanupComplete: true,
+    });
+  });
+
+  test('returns direct writer bytes without a save-time Blob copy', async () => {
+    let saveCalls = 0;
+    const engine = new RemotionWebcodecsEngine();
+    installPrivateWebcodecsLib(engine, {
+      convertMedia: async (options) => {
+        const output = await options.writer.createContent({
+          filename: 'output.mp4',
+          mimeType: 'video/mp4',
+          logLevel: 'error',
+        });
+        await output.write(new Uint8Array([0, 2, 3]));
+        await output.updateDataAt(0, new Uint8Array([1]));
+        await output.finish();
+        return {
+          finalState: finalConvertState(3),
+          save: async () => {
+            saveCalls++;
+            throw new Error('save() must not be called for a captured direct buffer');
+          },
+          remove: () => output.remove(),
+        };
+      },
+    });
+    const result = await (engine as any).convert(
+      mediaInput({ sizeBytes: 256 * 1024 * 1024 }),
+      { container: 'mp4' },
+      context(request('transcode', { output: { container: 'mp4' } })),
+    );
+    expect(result.bytes).toEqual(new Uint8Array([1, 2, 3]));
+    expect(saveCalls).toBe(0);
+    expect(engine.configUsed).toMatchObject({
+      writerMode: 'directArrayBufferWriter',
+      outputBytes: 3,
       cleanupComplete: true,
     });
   });

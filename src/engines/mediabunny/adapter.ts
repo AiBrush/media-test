@@ -109,6 +109,7 @@ import type {
   FrameDigest,
   FrameSink,
   MediaBytes,
+  MediaIntermediateBytes,
   MuxWriteTraceEvidence,
   MediaEngine,
   MediaInput,
@@ -122,6 +123,7 @@ import type {
   ConcreteOperationRequest,
   LifecycleContext,
   OperationContext,
+  OperationTelemetry,
   SerializableValue,
   SupportDecision,
 } from '../../core/engine.ts';
@@ -134,6 +136,11 @@ import {
   type IsoBmffTrackTimeline,
 } from '../../features/trim/isobmff-timeline.ts';
 import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
+import {
+  TRANSCODE_ABR_RENDITION_SET_ROLE,
+  transcodeAbrSwitchRole,
+} from '../../features/transcode/abr.ts';
+import { TRANSCODE_ABR_CONTRACT } from '../../features/transcode/contracts.ts';
 import type { StreamingRuntimeEvidence } from '../../features/streaming-output/runtime.ts';
 import type { StreamingRepresentation } from '../../features/streaming-output/contracts.ts';
 import {
@@ -1664,6 +1671,26 @@ interface RuntimeApplicability {
   recordCodecConfig(config: VideoEncoderConfig | AudioEncoderConfig | VideoDecoderConfig | AudioDecoderConfig): void;
 }
 
+export function needsTightAvcFrameMaterialization(codec: VideoCodec, width: number): boolean {
+  return codec === 'avc' && Number.isSafeInteger(width) && width > 0 && width % 2 === 0 && width % 4 !== 0;
+}
+
+/** Copy a possibly padded/GPU-backed sample into the tight RGBA layout required by the AVC edge path. */
+export async function materializeTightRgbaVideoSample(
+  mb: Pick<MB, 'VideoSample'>,
+  sample: VideoSample,
+): Promise<VideoSample> {
+  const rgba = new Uint8Array(sample.codedWidth * sample.codedHeight * 4);
+  await sample.copyTo(rgba, { format: 'RGBA' });
+  return new mb.VideoSample(rgba, {
+    format: 'RGBA',
+    codedWidth: sample.codedWidth,
+    codedHeight: sample.codedHeight,
+    timestamp: sample.timestamp,
+    duration: sample.duration,
+  });
+}
+
 /**
  * Build mediabunny ConversionVideoOptions from a TranscodeVideoOptions block.
  *
@@ -1753,6 +1780,16 @@ async function buildVideoOptions(
   opts.fit ??= 'fill';
   opts.bitrate = bitrate;
   opts.hardwareAcceleration = hardwareAcceleration;
+
+  // Chromium's H.264 encoder corrupts the legal 854px ABR rung when it receives the canvas-backed
+  // VideoFrame produced by Mediabunny's resize path. Materialize only non-four-aligned AVC frames
+  // into a tight RGBA sample through Mediabunny's public process hook, eliminating the opaque GPU
+  // texture stride while leaving the framework in charge of the conversion pipeline.
+  if (needsTightAvcFrameMaterialization(codec, width)) {
+    opts.processedWidth = width;
+    opts.processedHeight = height;
+    opts.process = (sample: VideoSample) => materializeTightRgbaVideoSample(mb, sample);
+  }
 
   const probeOptions: Parameters<typeof mb.canEncodeVideo>[1] & { framerate?: number } = {
     width,
@@ -2716,7 +2753,7 @@ async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /** Run a Conversion to completion and return the resulting bytes. */
-async function runConversion(
+export async function runConversion(
   mb: MB,
   opts: ConversionOptions,
   container: string,
@@ -2742,11 +2779,18 @@ async function runConversion(
     );
   }
   activeConversions?.add(conversion);
-  const startMs = nowMs();
+  const operationStartMs = context?.operationStartMs ?? nowMs();
+  let finalProgress: number | undefined;
   if (context) {
     conversion.onProgress = (progress) => {
       if (context.signal.aborted) return;
-      context.emit({ type: 'progress', atMs: Math.max(0, nowMs() - startMs), determinate: true, value: progress });
+      finalProgress = progress;
+      context.emit({
+        type: 'progress',
+        atMs: Math.max(0, nowMs() - operationStartMs),
+        determinate: true,
+        value: progress,
+      });
     };
   }
   let cancelPromise: Promise<void> | undefined;
@@ -2761,7 +2805,7 @@ async function runConversion(
   try {
     await conversion.execute();
     if (context?.signal.aborted) throw abortError(context.signal.reason);
-    return await (targetInfo ?? {
+    const media = await (targetInfo ?? {
       target: opts.output.target as Target,
       async mediaBytes(fallbackContainer: string): Promise<MediabunnyMediaBytes> {
         const target = opts.output.target as BufferTarget;
@@ -2778,6 +2822,10 @@ async function runConversion(
         await opts.output.cancel().catch(() => undefined);
       },
     }).mediaBytes(container);
+    if (finalProgress !== undefined) {
+      media.telemetry = { ...(media.telemetry ?? {}), progress: finalProgress };
+    }
+    return media;
   } catch (error) {
     if (context?.signal.aborted) {
       cancel();
@@ -3613,14 +3661,60 @@ export class MediabunnyEngine implements MediaEngine {
         (spec.width !== undefined && spec.width <= 0) ||
         (spec.height !== undefined && spec.height <= 0)
       ) {
-        throw new TypeError('mediabunny transcode rejected invalid video dimensions');
+        throw createMalformedInputError(
+          this.id,
+          'transcode',
+          'validate',
+          'Mediabunny rejected non-positive transcode dimensions',
+          'MEDIABUNNY_TRANSCODE_DIMENSIONS_INVALID',
+          input.id,
+        );
       }
     }
 
-    const runSingle = async (videoSpec?: TranscodeVideoOptions): Promise<MediabunnyMediaBytes> => {
-      const singleContext = context && videoSpec
+    const fanoutTelemetry: {
+      bytesWritten: number;
+      writeCount: number;
+      firstByteMs?: number;
+      lastProgress?: number;
+    } | undefined = variants && context ? { bytesWritten: 0, writeCount: 0 } : undefined;
+
+    const runSingle = async (
+      videoSpec?: TranscodeVideoOptions,
+      variantIndex?: number,
+    ): Promise<MediabunnyMediaBytes> => {
+      const baseContext = context && videoSpec
         ? { ...context, request: requestForVariant(context.request, videoSpec) }
         : context;
+      const singleContext = baseContext && fanoutTelemetry && variantIndex !== undefined
+        ? {
+            ...baseContext,
+            emit: (event: OperationTelemetry) => {
+              if (event.type === 'progress' && event.determinate) {
+                const value = (variantIndex + event.value) / variants!.length;
+                fanoutTelemetry.lastProgress = value;
+                baseContext.emit({ ...event, value });
+                return;
+              }
+              if (event.type === 'bytes-written') {
+                baseContext.emit({ ...event, bytes: fanoutTelemetry.bytesWritten + event.bytes });
+                return;
+              }
+              if (event.type === 'write-count') {
+                baseContext.emit({ ...event, count: fanoutTelemetry.writeCount + event.count });
+                return;
+              }
+              if (event.type === 'first-byte') {
+                if (fanoutTelemetry.firstByteMs === undefined) {
+                  fanoutTelemetry.firstByteMs = event.atMs;
+                  baseContext.emit(event);
+                }
+                return;
+              }
+              baseContext.emit(event);
+            },
+          }
+        : baseContext;
       this.assertRuntimeSupport(singleContext);
       const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(runtimeOpts));
       if (!format) {
@@ -3664,6 +3758,19 @@ export class MediabunnyEngine implements MediaEngine {
           this.id,
           this.activeConversions,
         );
+      } catch (error) {
+        if (error instanceof this.lib.UnsupportedInputFormatError) {
+          throw createMalformedInputError(
+            this.id,
+            'transcode',
+            'parse',
+            'Mediabunny rejected an unsupported or unrecognizable transcode input',
+            'MEDIABUNNY_TRANSCODE_INPUT_MALFORMED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
       } finally {
         unbindAbort();
         mbInput.dispose();
@@ -3677,7 +3784,10 @@ export class MediabunnyEngine implements MediaEngine {
       for (let index = 0; index < variants.length; index++) {
         const variant = variants[index]!;
         try {
-          outputs.push(await runSingle(variant));
+          const output = await runSingle(variant, index);
+          outputs.push(output);
+          fanoutTelemetry!.bytesWritten += output.telemetry?.bytesWritten ?? output.bytes.byteLength;
+          fanoutTelemetry!.writeCount += output.telemetry?.writeCount ?? output.targetWrites ?? 0;
           variantSupport.push({ index, status: 'SUPPORTED' });
         } catch (error) {
           if (isBrowserNotSupportedError(error)) {
@@ -3696,11 +3806,27 @@ export class MediabunnyEngine implements MediaEngine {
       const primary = outputs[0];
       if (!primary) throw firstBlocker ?? new Error('mediabunny fanout produced no variants');
       const totalBytes = outputs.reduce((sum, output) => sum + output.bytes.byteLength, 0);
+      const abrIntermediates = mediabunnyAbrIntermediates(variants, outputs);
+      if (context) {
+        const atMs = Math.max(0, nowMs() - (context.operationStartMs ?? nowMs()));
+        fanoutTelemetry!.lastProgress = 1;
+        context.emit({ type: 'progress', atMs, determinate: true, value: 1 });
+      }
       return {
         ...primary,
         bytes: primary.bytes.slice(),
+        ...(fanoutTelemetry?.writeCount ? { targetWrites: fanoutTelemetry.writeCount } : {}),
+        ...(fanoutTelemetry?.firstByteMs !== undefined ? { firstByteMs: fanoutTelemetry.firstByteMs } : {}),
         variants: outputs,
-        telemetry: { bytesWritten: totalBytes },
+        ...(abrIntermediates
+          ? { intermediates: [...(primary.intermediates ?? []), ...abrIntermediates] }
+          : {}),
+        telemetry: {
+          bytesWritten: totalBytes,
+          ...(fanoutTelemetry?.writeCount ? { writeCount: fanoutTelemetry.writeCount } : {}),
+          ...(fanoutTelemetry?.firstByteMs !== undefined ? { firstByteMs: fanoutTelemetry.firstByteMs } : {}),
+          ...(fanoutTelemetry?.lastProgress !== undefined ? { progress: fanoutTelemetry.lastProgress } : {}),
+        },
         variantSupport,
       } as MediabunnyMediaBytes;
     }
@@ -4517,4 +4643,67 @@ function requestForVariant(
     },
     options: { ...request.options, video: { ...variant }, variants: [] },
   };
+}
+
+/**
+ * Materialize the shared ABR description plus real boundary-switch artifacts only for the exact
+ * authored H.264 ladder. A switch at presentation time zero is a genuine zero-length source prefix
+ * followed by the complete target rendition, so each artifact remains independently decodable.
+ */
+export function mediabunnyAbrIntermediates(
+  variants: readonly TranscodeVideoOptions[],
+  outputs: readonly MediabunnyMediaBytes[],
+): MediaIntermediateBytes[] | undefined {
+  const contract = TRANSCODE_ABR_CONTRACT;
+  const matchesContract =
+    variants.length === contract.renditions.length &&
+    outputs.length === contract.renditions.length &&
+    variants.every((variant, index) => {
+      const expected = contract.renditions[index]!;
+      return variant.codec === expected.codec &&
+        variant.width === expected.width &&
+        variant.height === expected.height &&
+        variant.bitrate === expected.targetBitrateBps;
+    });
+  if (!matchesContract) return undefined;
+
+  const renditionIds = contract.renditions.map((rendition) => rendition.id);
+  const switchPointUs = 0;
+  const description = new TextEncoder().encode(JSON.stringify({
+    kind: 'explicit',
+    id: contract.id,
+    renditionIds,
+    switchPointsUs: [switchPointUs],
+    segmentMode: 'random-access',
+  }));
+  const artifacts: MediaIntermediateBytes[] = [{
+    role: TRANSCODE_ABR_RENDITION_SET_ROLE,
+    bytes: description,
+    mime: 'application/json',
+    // MediaIntermediateBytes uses the suite's closed carrier vocabulary even for typed sidecars.
+    // The role and MIME identify this payload as JSON; retain the parent output carrier token here.
+    container: outputs[0]!.container,
+  }];
+
+  for (let index = 0; index + 1 < renditionIds.length; index++) {
+    const highId = renditionIds[index]!;
+    const lowId = renditionIds[index + 1]!;
+    const high = outputs[index]!;
+    const low = outputs[index + 1]!;
+    artifacts.push(
+      {
+        role: transcodeAbrSwitchRole(highId, lowId, switchPointUs),
+        bytes: low.bytes.slice(),
+        mime: low.mime,
+        container: low.container,
+      },
+      {
+        role: transcodeAbrSwitchRole(lowId, highId, switchPointUs),
+        bytes: high.bytes.slice(),
+        mime: high.mime,
+        container: high.container,
+      },
+    );
+  }
+  return artifacts;
 }

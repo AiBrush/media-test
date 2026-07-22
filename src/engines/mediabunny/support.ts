@@ -40,6 +40,9 @@ export const MEDIABUNNY_REASON = {
   OUTPUT_MODE: 'MEDIABUNNY_OUTPUT_MODE_UNSUPPORTED',
   WRITE_GRANULARITY: 'MEDIABUNNY_EXACT_WRITE_GRANULARITY_UNSUPPORTED',
   RESERVE_PACKET_BOUND: 'MEDIABUNNY_RESERVE_PACKET_BOUND_UNSUPPORTED',
+  AUDIO_PRESENTATION_TIMING: 'MEDIABUNNY_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+  TRANSFORM_PIXEL_FIDELITY: 'MEDIABUNNY_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
+  ALPHA_OUTPUT_GEOMETRY: 'MEDIABUNNY_ALPHA_OUTPUT_GEOMETRY_UNSUPPORTED',
 } as const;
 
 const PCM_CODECS = new Set(['pcm-s16', 'pcm-s16be', 'pcm-s24', 'pcm-s24be', 'pcm-s32', 'pcm-s32be', 'pcm-f32', 'pcm-f32be', 'pcm-f64', 'pcm-f64be', 'pcm-u8', 'pcm-s8', 'ulaw', 'alaw']);
@@ -152,6 +155,40 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
   }
   if (request.options.fragmented === true && request.options.fastStart !== undefined) {
     return no(MEDIABUNNY_REASON.OUTPUT_MODE, 'fragmented and fastStart modes cannot be requested together');
+  }
+  if (
+    request.operation === 'transcode' &&
+    request.options.invariant === 'transcode-audio-content' &&
+    (request.output.audioCodec === 'aac' || request.output.audioCodec === 'opus')
+  ) {
+    return no(
+      MEDIABUNNY_REASON.AUDIO_PRESENTATION_TIMING,
+      `Mediabunny 1.48.0 cannot author the exact encoder delay/remainder evidence required for '${request.output.audioCodec}' program-window validation`,
+    );
+  }
+  if (
+    request.operation === 'transcode' &&
+    request.options.invariant === 'transcode-effect-aware' &&
+    (
+      request.transforms?.rotate !== undefined ||
+      request.transforms?.crop !== undefined ||
+      request.options.crop !== undefined
+    )
+  ) {
+    return no(
+      MEDIABUNNY_REASON.TRANSFORM_PIXEL_FIDELITY,
+      'Mediabunny 1.48.0 baked rotate/crop uses a lossy WebCodecs re-encode and cannot guarantee the required per-pixel maximum-error bound',
+    );
+  }
+  if (
+    request.operation === 'transcode' &&
+    request.options.invariant === 'transcode-effect-aware' &&
+    request.options.alpha === 'keep'
+  ) {
+    return no(
+      MEDIABUNNY_REASON.ALPHA_OUTPUT_GEOMETRY,
+      'Mediabunny 1.48.0 VP9 alpha re-encode does not preserve the requested visible frame geometry in Chromium',
+    );
   }
   if (request.options.appendOnly === true && target !== 'stream') {
     return no(MEDIABUNNY_REASON.OUTPUT_MODE, 'append-only output requires an observable stream target');
@@ -363,6 +400,17 @@ export function browserConfigsForRequest(request: ConcreteOperationRequest): Con
   // Fanout support is intentionally evaluated per variant during execution.  Returning all configs
   // here would let one unavailable rung erase supported siblings at runner preflight.
   if (Array.isArray(request.options.variants) && request.options.variants.length > 0) return [];
+  // Degenerate dimensions belong to the operation's typed malformed-input path. Do not send a
+  // knowingly invalid configuration to WebCodecs during browser applicability preflight: doing so
+  // would turn the authored graceful-failure row into a harness ERROR before the adapter can reject
+  // the request cleanly.
+  const requestedVideo = isRecord(request.options.video) ? request.options.video : undefined;
+  if (
+    [requestedVideo?.width, requestedVideo?.height, request.output?.width, request.output?.height]
+      .some((value) => typeof value === 'number' && value <= 0)
+  ) {
+    return [];
+  }
   const configs: ConcreteWebCodecsConfig[] = [];
   const videoPlan = videoEncodePlanForRequest(request);
   if (videoPlan) configs.push({ role: 'video-encoder', config: videoPlan.config });
@@ -383,8 +431,22 @@ export function videoEncodePlanForRequest(
   if (!canonicalCodec) return undefined;
   const codec = canonicalToMediabunnyVideo(canonicalCodec);
   if (!codec) return undefined;
-  const width = positiveInt(video?.width) ?? request.output?.width ?? source?.width ?? 1280;
-  const height = positiveInt(video?.height) ?? request.output?.height ?? source?.height ?? 720;
+  const explicitWidth = positiveInt(video?.width) ?? positiveInt(request.output?.width);
+  const explicitHeight = positiveInt(video?.height) ?? positiveInt(request.output?.height);
+  const sourceWidth = source?.width ?? 1280;
+  const sourceHeight = source?.height ?? 720;
+  const requestedRotation = typeof video?.rotate === 'number' && Number.isFinite(video.rotate)
+    ? video.rotate
+    : 0;
+  const totalRotation = normalizeDegrees((source?.rotation ?? 0) + requestedRotation);
+  const naturalWidth = totalRotation % 180 === 0 ? sourceWidth : sourceHeight;
+  const naturalHeight = totalRotation % 180 === 0 ? sourceHeight : sourceWidth;
+  const width = explicitWidth ?? (explicitHeight
+    ? evenDimension(Math.round(explicitHeight * naturalWidth / naturalHeight))
+    : naturalWidth);
+  const height = explicitHeight ?? (explicitWidth
+    ? evenDimension(Math.round(explicitWidth * naturalHeight / naturalWidth))
+    : naturalHeight);
   const bitrate = positiveInt(video?.bitrate) ?? defaultVideoBitrate(codec, width, height);
   // Preserve source VFR by leaving the rate unset unless the operation explicitly requests one.
   // Conversion otherwise derives cadence from input timestamps; probing a sampled source FPS here
@@ -416,7 +478,9 @@ export function audioEncodePlanForRequest(request: ConcreteOperationRequest): Me
 }
 
 export function defaultVideoBitrate(codec: VideoCodec, width: number, height: number): number {
-  const efficiency: Record<VideoCodec, number> = { avc: 1, hevc: 0.7, vp9: 0.8, av1: 0.6, vp8: 1.1 };
+  // Chromium's AV1 encoder needs the larger budget to keep high-motion 1080x1920@60 material above
+  // the suite's 0.97 SSIM gate; 37.3 Mb/s was the first verified passing point for that tuple.
+  const efficiency: Record<VideoCodec, number> = { avc: 1, hevc: 0.7, vp9: 0.8, av1: 1.8, vp8: 1.1 };
   return Math.max(300_000, Math.round(width * height * 10 * efficiency[codec]));
 }
 
@@ -570,6 +634,14 @@ function positiveNumber(value: unknown): number | undefined {
 
 function hardwareMode(value: unknown): HardwareAcceleration | undefined {
   return value === 'no-preference' || value === 'prefer-hardware' || value === 'prefer-software' ? value : undefined;
+}
+
+function normalizeDegrees(value: number): number {
+  return ((value % 360) + 360) % 360;
+}
+
+function evenDimension(value: number): number {
+  return Math.max(2, Math.ceil(value / 2) * 2);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

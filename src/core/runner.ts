@@ -2836,7 +2836,7 @@ export interface ExecutionFingerprintComponents {
   resultSchema: typeof EXECUTION_RESULT_SCHEMA;
   oracleModelVersion: typeof ORACLE_MODEL_VERSION;
   scenarioDefinition: unknown;
-  engine: { id: string; config?: unknown; capabilities?: unknown };
+  engine: { id: string; config?: unknown; capabilities?: unknown; benchmarkLimits?: unknown };
   browser: { family: BrowserName; version?: string; userAgent?: string; pixelBehavior?: PixelBehaviorEvidence };
   supportDecision: unknown;
   selectedAssets: Array<{
@@ -3015,6 +3015,7 @@ async function buildCellExecutionFingerprint(
       id: engine.id,
       ...(engine.configUsed !== undefined ? { config: engine.configUsed } : {}),
       capabilities: engine.capabilities(),
+      ...(engine.benchmarkLimits !== undefined ? { benchmarkLimits: engine.benchmarkLimits } : {}),
     },
     browser: {
       family: browser,
@@ -5528,7 +5529,15 @@ export async function runOne(
       }
     } catch (err) {
       if (err instanceof TimeoutError) {
-        return finalize('FAIL', [], `timeout: ${err.message}`);
+        const detail = `functional operation timeout: ${err.message}`;
+        const outcome: OracleOutcome = {
+          state: 'VERDICT',
+          oracle: scenario.oracles[0] ?? 'property-invariant',
+          verdict: 'FAIL',
+          reasonCode: 'OPERATION_TIMEOUT',
+          detail,
+        };
+        return finalize('FAIL', [outcome], `[${outcome.reasonCode}] ${detail}`);
       }
       if (err instanceof RunCancelledError) {
         return finalize('SKIPPED', [], `[RUN_CANCELLED] ${err.message}`);
@@ -6344,9 +6353,18 @@ async function runRobustness(
   const ctx = buildOracleContext(scenario, input, inputs, robustnessOpResult, golden, engine, opts);
 
   const oracleOutcomes: OracleOutcome[] = [];
-  // For negative/boundary rows the explicit survivor check replaces the old unconditional
-  // graceful-failure oracle. Hard-valid rows continue through their substantive declared oracles.
-  if (contract.inputClass !== 'hard-valid' && scenario.oracles.includes('graceful-failure')) {
+  const substantiveOracles = [...new Set([
+    ...scenario.oracles,
+    ...(encryptionNegative?.partialOutput.allowed ? encryptionNegative.returnedOutputOracles : []),
+  ])].filter((oracle) => !(oracle === 'graceful-failure' && contract.inputClass !== 'hard-valid'));
+  // A structural survivor is itself the graceful-failure verdict only when no stronger survivor
+  // oracle was declared. Otherwise the returned-output branch is decided by those substantive
+  // oracles; graceful-failure remains the distinct clean-rejection branch.
+  if (
+    contract.inputClass !== 'hard-valid' &&
+    scenario.oracles.includes('graceful-failure') &&
+    substantiveOracles.length === 0
+  ) {
     oracleOutcomes.push({
       state: 'VERDICT',
       oracle: 'graceful-failure',
@@ -6355,10 +6373,6 @@ async function runRobustness(
       detail: `${survivor.reasonCode}: ${survivor.detail}`,
     });
   }
-  const substantiveOracles = [...new Set([
-    ...scenario.oracles,
-    ...(encryptionNegative?.partialOutput.allowed ? encryptionNegative.returnedOutputOracles : []),
-  ])].filter((oracle) => !(oracle === 'graceful-failure' && contract.inputClass !== 'hard-valid'));
   for (const oracle of substantiveOracles) {
     try {
       oracleOutcomes.push(
@@ -6641,6 +6655,12 @@ async function runBench(
   const memorySampler = scenario.metrics.includes('peakMemory')
     ? requirePerformanceEvidence(memorySamplerEvidence ?? userAgentSpecificMemorySampler(), 'peakMemory')
     : undefined;
+  const effectiveMemoryWindowOptions = engine.benchmarkLimits?.memoryWindow || memoryWindowOptions
+    ? {
+        ...(engine.benchmarkLimits?.memoryWindow ?? {}),
+        ...(memoryWindowOptions ?? {}),
+      }
+    : undefined;
 
   const measured: BenchBatchEvidence[] = [];
   const resourceOrLatency = scenario.metrics.some((metric) =>
@@ -6671,7 +6691,7 @@ async function runBench(
         // expensive cross-process memory API around those phases multiplies overhead without adding
         // evidence. Every retained repetition below still owns an independent bounded window.
         batch.phase === 'measured' ? memorySampler : undefined,
-        memoryWindowOptions,
+        effectiveMemoryWindowOptions,
       );
       if (batch.phase === 'measured') measured.push(evidence);
       return evidence.sample;

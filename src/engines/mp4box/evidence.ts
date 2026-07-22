@@ -246,6 +246,37 @@ function directChildren(bytes: Uint8Array, box: IsoBox): IsoBox[] | undefined {
   return readBoxes(bytes, box.payloadStart, box.end);
 }
 
+/**
+ * mp4box.js 2.3.0 leaves generated `trun` boxes at version 0 even when a source sample has a
+ * negative composition offset. The payload bytes are already the correct two's-complement int32;
+ * changing only the FullBox version makes readers interpret them as signed, as ISO BMFF requires.
+ * The adapter calls this only for a fragment whose exact source sample range proves a negative
+ * `cts - dts`, so a legitimate large unsigned version-0 offset is never guessed to be negative.
+ */
+export function markFragmentSignedCompositionOffsets(bytes: Uint8Array): number {
+  const top = readBoxes(bytes);
+  if (!top) return 0;
+  let marked = 0;
+  for (const moof of top.filter((box) => box.type === 'moof')) {
+    const moofChildren = directChildren(bytes, moof);
+    for (const traf of moofChildren?.filter((box) => box.type === 'traf') ?? []) {
+      const trafChildren = directChildren(bytes, traf);
+      for (const trun of trafChildren?.filter((box) => box.type === 'trun') ?? []) {
+        if (trun.payloadStart + 4 > trun.end) continue;
+        const flags = ((bytes[trun.payloadStart + 1] ?? 0) << 16)
+          | ((bytes[trun.payloadStart + 2] ?? 0) << 8)
+          | (bytes[trun.payloadStart + 3] ?? 0);
+        if (!(flags & 0x000800)) continue;
+        const version = bytes[trun.payloadStart];
+        if (version !== 0 && version !== 1) continue;
+        bytes[trun.payloadStart] = 1;
+        marked++;
+      }
+    }
+  }
+  return marked;
+}
+
 function trunEvidence(bytes: Uint8Array, box: IsoBox): { sampleCount: number; sampleBytes: number } | undefined {
   if (box.payloadStart + 8 > box.end) return undefined;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);

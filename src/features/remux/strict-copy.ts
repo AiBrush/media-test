@@ -1,5 +1,6 @@
 import type { OracleOutcome } from '../../core/scenario.ts';
 import { bytesEqual, canonicalCodec, canonicalContainer } from './binary.ts';
+import { aacAudioSpecificConfigFromEsds } from './reader-isobmff.ts';
 import { readNeutralRemuxProgram } from './readers.ts';
 import type {
   RemuxProgramEvidence,
@@ -318,6 +319,7 @@ function trackFacts(
   output: RemuxTrackEvidence,
   representationDifferences: string[],
   label: string,
+  aacSbrRateRepresentation: boolean,
 ): string[] {
   const failures: string[] = [];
   for (const key of ['language', 'role', 'disposition'] as const) {
@@ -329,12 +331,69 @@ function trackFacts(
   }
   for (const key of ['sampleRate', 'channels', 'width', 'height'] as const) {
     if (source[key] !== undefined && output[key] !== undefined && source[key] !== output[key]) {
-      failures.push(`${key} changed ${source[key]} -> ${output[key]}`);
+      if (key === 'sampleRate' && aacSbrRateRepresentation) {
+        representationDifferences.push(
+          `${label} HE-AAC SBR presentation/core rates are represented differently across ADTS (${source.sampleRate}Hz -> ${output.sampleRate}Hz)`,
+        );
+      } else {
+        failures.push(`${key} changed ${source[key]} -> ${output[key]}`);
+      }
     } else if (source[key] !== undefined && output[key] === undefined) {
       representationDifferences.push(`${label} ${key} evidence is unavailable in the target reader`);
     }
   }
   return failures;
+}
+
+function explicitAacSbrAdtsRateRepresentation(
+  sourceProgram: RemuxProgramEvidence,
+  outputProgram: RemuxProgramEvidence,
+  sourceTrack: RemuxTrackEvidence,
+  outputTrack: RemuxTrackEvidence,
+): boolean {
+  if (canonicalCodec(sourceTrack.codec) !== 'aac') return false;
+  const sourceIsAdts = canonicalContainer(sourceProgram.container) === 'adts';
+  const outputIsAdts = canonicalContainer(outputProgram.container) === 'adts';
+  if (sourceIsAdts === outputIsAdts) return false;
+  const adtsTrack = sourceIsAdts ? sourceTrack : outputTrack;
+  const configuredTrack = sourceIsAdts ? outputTrack : sourceTrack;
+  if (!adtsTrack.sampleRate || !configuredTrack.sampleRate || !configuredTrack.codecPrivate) return false;
+  const config = aacAudioSpecificConfigFromEsds(configuredTrack.codecPrivate);
+  return config?.sbrPresent === true &&
+    config.coreSampleRate === adtsTrack.sampleRate &&
+    config.presentationSampleRate === configuredTrack.sampleRate;
+}
+
+function relativeAxisAligned(
+  source: Array<number | undefined>,
+  output: Array<number | undefined>,
+  toleranceUs: number,
+): boolean {
+  if (source.length !== output.length || source.some((value) => value === undefined) || output.some((value) => value === undefined)) {
+    return false;
+  }
+  const a = source as number[];
+  const b = output as number[];
+  let originA = Number.POSITIVE_INFINITY;
+  let originB = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < a.length; index++) {
+    originA = Math.min(originA, a[index]!);
+    originB = Math.min(originB, b[index]!);
+  }
+  return a.every((value, index) => Math.abs((value - originA) - (b[index]! - originB)) <= toleranceUs);
+}
+
+function presentationSpan(track: NormalizedTrack): number | undefined {
+  if (track.units.length === 0 || track.units.some((unit) => unit.ptsUs === undefined || unit.durationUs === undefined)) {
+    return undefined;
+  }
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const unit of track.units) {
+    start = Math.min(start, unit.ptsUs!);
+    end = Math.max(end, unit.ptsUs! + unit.durationUs!);
+  }
+  return end > start ? end - start : undefined;
 }
 
 function compareTimeline(
@@ -344,6 +403,7 @@ function compareTimeline(
   failures: string[],
   differences: string[],
   label: string,
+  allowEbmlDurationRematerialization: boolean,
 ): void {
   if (source.units.length !== output.units.length) return;
   const sourcePts = source.units.map((unit) => unit.ptsUs);
@@ -394,8 +454,18 @@ function compareTimeline(
   const durationB = completeDurations ? output.units.reduce((sum, unit) => sum + unit.durationUs!, 0) : 0;
   if (completeDurations && durationA > 0 && durationB > 0) {
     const delta = Math.abs(durationA - durationB);
-    if (delta > tolerance.durationUs) failures.push(`${label} coded duration drift ${delta}us > ${tolerance.durationUs}us`);
-    else if (delta > 0) differences.push(`${label} duration rounded within tolerance`);
+    if (delta > tolerance.durationUs) {
+      const sourceSpan = presentationSpan(source);
+      const outputSpan = presentationSpan(output);
+      const timestampSpanPreserved = sourceSpan !== undefined && outputSpan !== undefined &&
+        Math.abs(sourceSpan - outputSpan) <= tolerance.durationUs &&
+        relativeAxisAligned(sourcePts, outputPts, tolerance.timestampUs);
+      if (allowEbmlDurationRematerialization && timestampSpanPreserved) {
+        differences.push(`${label} EBML per-sample duration metadata was rematerialized while the coded timestamp span stayed preserved`);
+      } else {
+        failures.push(`${label} coded duration drift ${delta}us > ${tolerance.durationUs}us`);
+      }
+    } else if (delta > 0) differences.push(`${label} duration rounded within tolerance`);
   }
 }
 
@@ -416,7 +486,19 @@ export function compareStrictRemuxPrograms(
   const pairs = matched.pairs ?? [];
   for (const [sourceTrack, outputTrack] of pairs) {
     const label = `${sourceTrack.type}/${canonicalCodec(sourceTrack.codec)}`;
-    failures.push(...trackFacts(sourceTrack, outputTrack, differences, label).map((detail) => `${label} ${detail}`));
+    const aacSbrRateRepresentation = explicitAacSbrAdtsRateRepresentation(
+      source,
+      output,
+      sourceTrack,
+      outputTrack,
+    );
+    failures.push(...trackFacts(
+      sourceTrack,
+      outputTrack,
+      differences,
+      label,
+      aacSbrRateRepresentation,
+    ).map((detail) => `${label} ${detail}`));
     const normalizedSource = normalizeTrack(sourceTrack);
     const normalizedOutput = normalizeTrack(outputTrack);
     if (!normalizedSource || !normalizedOutput) {
@@ -448,7 +530,18 @@ export function compareStrictRemuxPrograms(
         differences.push(`${label} presentation origin/priming representation differs by ${originDelta}us`);
       }
     }
-    compareTimeline(normalizedSource, normalizedOutput, tolerance, failures, differences, label);
+    const ebmlContainers = new Set(['webm', 'mkv']);
+    const allowEbmlDurationRematerialization = ebmlContainers.has(canonicalContainer(source.container)) &&
+      ebmlContainers.has(canonicalContainer(output.container));
+    compareTimeline(
+      normalizedSource,
+      normalizedOutput,
+      tolerance,
+      failures,
+      differences,
+      label,
+      allowEbmlDurationRematerialization,
+    );
     if ([...normalizedSource.framing].join(',') !== [...normalizedOutput.framing].join(',')) differences.push(`${label} framing changed`);
     if (normalizedSource.grouping.join(',') !== normalizedOutput.grouping.join(',')) differences.push(`${label} legal access-unit grouping changed`);
     const sourceFlags = sourceTrack.samples.map((sample) => sample.keyframe);

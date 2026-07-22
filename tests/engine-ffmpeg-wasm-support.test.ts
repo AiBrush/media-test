@@ -7,11 +7,13 @@ import {
 } from '../src/core/engine.ts';
 import {
   DEFAULT_FFMPEG_LIMITS,
+  decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
   muxLegality,
   tupleSummary,
   type FfmpegRuntimeBuild,
 } from '../src/engines/ffmpeg-wasm/support.ts';
+import type { RemuxProgramEvidence } from '../src/features/remux/types.ts';
 
 const VIDEO = ['h264', 'hevc', 'vp8', 'vp9'];
 const AUDIO = ['aac', 'opus', 'mp3', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be', 'pcm-s24be'];
@@ -158,6 +160,13 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     expect(decideFfmpegSupport(malformed, RUNTIME)).toEqual({ supported: true });
   });
 
+  test('executes unresolved remux tuples instead of treating absent track facts as illegality', () => {
+    const unresolved = request('remux', 'flac', [], {
+      output: { container: 'ogg' },
+    });
+    expect(decideFfmpegSupport(unresolved, RUNTIME)).toEqual({ supported: true });
+  });
+
   test('declares typed demux scale rows NA when packet-yield latency is unobservable', () => {
     expect(reason(request('demux', 'mp4', av('h264', 'aac'), {
       options: {
@@ -168,6 +177,32 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
         },
       },
     }))).toBe('FFMPEG_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE');
+  });
+
+  test('classifies only the concrete remux timelines the FFmpeg 5.1 copy path cannot preserve', () => {
+    const longEdit = remuxProgram('mov', [
+      { ptsUs: 0, dtsUs: -3_000_000 },
+      { ptsUs: 33_333, dtsUs: -2_966_667 },
+    ]);
+    const ordinaryPreroll = remuxProgram('mov', [
+      { ptsUs: 0, dtsUs: -66_667 },
+      { ptsUs: 33_333, dtsUs: -33_334 },
+    ]);
+    const signedTs = remuxProgram('ts', [
+      { ptsUs: 10_000_000, dtsUs: 10_000_000 },
+      { ptsUs: 10_033_333, dtsUs: 10_066_667 },
+    ]);
+    const monotonicTs = remuxProgram('ts', [
+      { ptsUs: 1_400_000, dtsUs: 1_400_000 },
+      { ptsUs: 1_433_333, dtsUs: 1_433_333 },
+    ]);
+
+    expect(remuxProgramReason('mov', 'mp4', longEdit)).toBe('FFMPEG_COMPLEX_EDIT_PREROLL_UNSUPPORTED');
+    expect(decideFfmpegRemuxProgramSupport('mov', 'mp4', ordinaryPreroll)).toEqual({ supported: true });
+    expect(remuxProgramReason('ts', 'mov', signedTs)).toBe('FFMPEG_TS_SIGNED_CTS_COPY_UNSUPPORTED');
+    expect(remuxProgramReason('ts', 'mkv', signedTs)).toBe('FFMPEG_TS_SIGNED_CTS_COPY_UNSUPPORTED');
+    expect(decideFfmpegRemuxProgramSupport('ts', 'ts', signedTs)).toEqual({ supported: true });
+    expect(decideFfmpegRemuxProgramSupport('ts', 'mp4', monotonicTs)).toEqual({ supported: true });
   });
 
   test('retains the full rejected tuple summary', () => {
@@ -255,4 +290,38 @@ function sourceContainer(tracks: NormalizedTrack[]): string {
   if (codec === 'mp3' || codec === 'flac') return codec;
   if (codec === 'opus' || codec === 'vorbis') return 'ogg';
   return 'mp4';
+}
+
+function remuxProgram(
+  container: string,
+  timestamps: Array<{ ptsUs: number; dtsUs: number }>,
+): RemuxProgramEvidence {
+  return {
+    schema: 'media-test/remux-program@1',
+    container,
+    byteLength: 1_024,
+    tracks: [{
+      id: `${container}:video`,
+      type: 'video',
+      codec: 'h264',
+      samples: timestamps.map((timestamp, index) => ({
+        ...timestamp,
+        durationUs: 33_333,
+        keyframe: index === 0,
+        payload: Uint8Array.of(index),
+        framing: container === 'ts' ? 'annexb' : 'length-prefixed',
+      })),
+    }],
+    representation: {},
+  };
+}
+
+function remuxProgramReason(
+  sourceContainer: string,
+  targetContainer: string,
+  program: RemuxProgramEvidence,
+): string {
+  const decision = decideFfmpegRemuxProgramSupport(sourceContainer, targetContainer, program);
+  expect(decision.supported).toBe(false);
+  return decision.supported ? '' : decision.reasonCode;
 }

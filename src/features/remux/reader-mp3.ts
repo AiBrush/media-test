@@ -27,6 +27,28 @@ function firstAudioOffset(bytes: Uint8Array): number | undefined {
   return 0;
 }
 
+export function mp3FrameAudioConfig(
+  bytes: Uint8Array,
+  offset = 0,
+): { sampleRate: number; channels: number } | undefined {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset + 4 > bytes.byteLength) return undefined;
+  const header = ((bytes[offset]! * 0x1000000) +
+    (bytes[offset + 1]! << 16) +
+    (bytes[offset + 2]! << 8) +
+    bytes[offset + 3]!) >>> 0;
+  if (((header & 0xffe00000) >>> 0) !== 0xffe00000) return undefined;
+  const versionBits = (header >>> 19) & 3;
+  const layerBits = (header >>> 17) & 3;
+  const rateIndex = (header >>> 10) & 3;
+  if (versionBits === 1 || layerBits === 0 || rateIndex === 3) return undefined;
+  const version = versionBits === 3 ? 1 : versionBits === 2 ? 2 : 2.5;
+  const baseRates = [44_100, 48_000, 32_000] as const;
+  return {
+    sampleRate: Math.round(baseRates[rateIndex]! / (version === 1 ? 1 : version === 2 ? 2 : 4)),
+    channels: ((header >>> 6) & 3) === 3 ? 1 : 2,
+  };
+}
+
 export function readMp3Program(bytes: Uint8Array): RemuxReadResult {
   const evidence = { reader: 'mp3', byteLength: bytes?.byteLength ?? 0, detectedContainer: 'mp3' } as const;
   try {
@@ -52,10 +74,11 @@ export function readMp3Program(bytes: Uint8Array): RemuxReadResult {
       if (versionBits === 1 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 15 || rateIndex === 3) {
         return { state: 'MALFORMED', reasonCode: 'REMUX_MP3_HEADER_INVALID', evidence };
       }
+      const config = mp3FrameAudioConfig(bytes, offset);
+      if (!config) return { state: 'MALFORMED', reasonCode: 'REMUX_MP3_HEADER_INVALID', evidence };
       const version = versionBits === 3 ? 1 : versionBits === 2 ? 2 : 2.5;
       const layer = 4 - layerBits;
-      const baseRates = [44_100, 48_000, 32_000] as const;
-      const sampleRate = Math.round(baseRates[rateIndex]! / (version === 1 ? 1 : version === 2 ? 2 : 4));
+      const sampleRate = config.sampleRate;
       const bitrateTable = version === 1 ? V1_BITRATES[layer] : V2_BITRATES[layer];
       const bitrate = bitrateTable?.[bitrateIndex];
       if (!bitrate) return { state: 'MALFORMED', reasonCode: 'REMUX_MP3_BITRATE_INVALID', evidence };
@@ -66,7 +89,7 @@ export function readMp3Program(bytes: Uint8Array): RemuxReadResult {
       const frameSamples = layer === 1 ? 384 : layer === 2 ? 1152 : version === 1 ? 1152 : 576;
       if (frameLength < 4) return { state: 'MALFORMED', reasonCode: 'REMUX_MP3_FRAME_LENGTH_INVALID', evidence };
       if (offset + frameLength > end) return { state: 'INCOMPLETE', reasonCode: 'REMUX_MP3_FRAME_INCOMPLETE', evidence };
-      const channels = ((header >>> 6) & 3) === 3 ? 1 : 2;
+      const channels = config.channels;
       if ((canonicalRate && canonicalRate !== sampleRate) || (canonicalChannels && canonicalChannels !== channels)) {
         return { state: 'MALFORMED', reasonCode: 'REMUX_MP3_CONFIG_CHANGED_MIDSTREAM', evidence };
       }

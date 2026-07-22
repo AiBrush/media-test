@@ -115,11 +115,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'Retest after memory measurement can observe one validated packet walk.',
   ),
   budget(
-    'remux/huge_h264_1080p_600s_mov_to_mp4',
-    'The official conversion path parses and buffers the complete 600-second MOV output.',
-    'Retest when the official path supports bounded copy/remux streaming.',
-  ),
-  budget(
     'transcode/ladder_large_h264_1080p_120s_resize_720p',
     'Full 120-second decode, resize, and encode repeats for correctness and performance.',
     'Retest after hardware/backend throughput keeps the complete cell below the run budget.',

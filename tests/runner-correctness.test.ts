@@ -30,7 +30,11 @@ import {
 import type { ExecutionFingerprintComponents, PixelBehaviorEvidence } from '../src/core/runner.ts';
 import { defineScenario } from '../src/core/scenario.ts';
 import type { OracleOutcome, Scenario, ScenarioResult } from '../src/core/scenario.ts';
-import { CorpusDeliveryIntegrityError, sha256Hex } from '../src/core/media-selection.ts';
+import {
+  CorpusDeliveryIntegrityError,
+  buildCandidateEvidencePlan,
+  sha256Hex,
+} from '../src/core/media-selection.ts';
 import type {
   CandidateOracleEvidencePlan,
   ResolvedInput,
@@ -428,6 +432,57 @@ describe('REQ-RUN-01/02/04 staged concrete applicability', () => {
       disposition: 'clean-reject',
       stage: 'operation',
       nativeError: { name: 'MalformedInputError', code: 'TRUNCATED_MEDIA' },
+    });
+
+    const safePartialOrReject = defineScenario({
+      ...robustness,
+      id: 'remux/runner-safe-partial-or-reject',
+      family: 'remux',
+      options: {
+        container: 'mp4',
+        robustness: {
+          schema: 'media-test/robustness-contract@1',
+          inputClass: 'negative',
+          returnedOutputCheck: 'media-structure',
+          survivorOracles: ['graceful-failure', 'property-invariant'],
+          timeoutMs: 15_000,
+        },
+      },
+      oracles: ['graceful-failure', 'property-invariant'],
+    });
+    const conditionalPlan = buildCandidateEvidencePlan(
+      safePartialOrReject,
+      'ab'.repeat(32),
+    );
+    expect(conditionalPlan.requiredOracles).toEqual([]);
+    expect(conditionalPlan.sufficientOracleSets).toEqual([
+      ['graceful-failure'],
+      ['property-invariant'],
+    ]);
+    const conditional = await runOne(
+      baseEngine('remux', {
+        supports: async () => ({ supported: true }),
+        remux: rejecting.remux,
+      }),
+      safePartialOrReject,
+      browser,
+      support,
+      {
+        pixelBehavior: pixelPass,
+        selectionEvidencePlan: conditionalPlan,
+      },
+    );
+    expect(conditional.status).toBe('PASS');
+    expect(conditional.candidateEvidence).toMatchObject({
+      status: 'PASS',
+      applied: ['graceful-failure'],
+      unavailable: [{
+        oracle: 'property-invariant',
+        status: 'NA_ASSET',
+        reasonCode: 'EVIDENCE_OUTCOME_MISSING',
+      }],
+      sufficientSurvivorOracles: ['graceful-failure'],
+      sufficient: true,
     });
 
     const programmingFault = baseEngine('remux', {
@@ -1148,6 +1203,47 @@ describe('REQ-RUN-03 three-way performance admission', () => {
     }
   });
 
+  test('a functional operation timeout is a typed, writable FAIL verdict', async () => {
+    installCorpusFetch();
+    const engine = baseEngine('remux', {
+      supports: async () => ({ supported: true }),
+      remux: async () => new Promise<MediaBytes>(() => undefined),
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('remux/runner-operation-timeout'),
+      timeoutMs: 20,
+    });
+    const result = await runOne(engine, scenario, browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+    });
+    expect(result.status).toBe('FAIL');
+    expect(result.oracleOutcomes).toEqual([expect.objectContaining({
+      state: 'VERDICT',
+      oracle: 'playback-smoke',
+      verdict: 'FAIL',
+      reasonCode: 'OPERATION_TIMEOUT',
+    })]);
+
+    const inputSha256 = 'ab'.repeat(32);
+    const inputVariantId = 'selected:input.mp4';
+    expect(validateScenarioResultV2({
+      ...result,
+      schemaVersion: 2,
+      scenarioRevision: scenario.revision,
+      definitionHash: scenario.definitionHash,
+      inputVariantId,
+      inputSha256,
+      instance: {
+        scenarioId: scenario.id,
+        scenarioRevision: scenario.revision,
+        definitionHash: scenario.definitionHash,
+        inputVariantId,
+        inputSha256,
+      },
+    })).toEqual([]);
+  });
+
   test('a benchmark exception preserves the prior correctness PASS with unavailable measurement', async () => {
     installCorpusFetch();
     let calls = 0;
@@ -1326,6 +1422,61 @@ describe('REQ-RUN-03 three-way performance admission', () => {
       | undefined;
     expect(result.status).toBe('PASS');
     expect(timing?.innerIterations).toBe(2);
+  });
+
+  test('adapter memory-window limits bound expensive worker-backed sampling', async () => {
+    installCorpusFetch();
+    let samplerCalls = 0;
+    const engine = baseEngine('remux', {
+      benchmarkLimits: {
+        maxInnerIterations: 2,
+        memoryWindow: {
+          sampleImmediatelyDuringOperation: true,
+          maxOperationSamples: 1,
+          settleWindowMs: 0,
+        },
+      },
+      supports: async () => ({ supported: true }),
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('performance/runner-adapter-memory-window'),
+      metrics: ['wall', 'peakMemory'],
+      primaryMetric: 'wall',
+    });
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      benchOptions: {
+        warmup: 0,
+        iters: 5,
+        minDurationMs: 100,
+        maxInnerIterations: 1,
+      },
+      benchMemorySampler: {
+        state: 'AVAILABLE',
+        value: {
+          api: 'measureUserAgentSpecificMemory',
+          sample: async () => 4_000 + ++samplerCalls,
+        },
+      },
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+    });
+    const memory = result.bench?.wall?.protocolEvidence?.memory as Array<{
+      immediateOperationSample: boolean;
+      operationSampleLimit: number | null;
+      settleWindowMs: number;
+      samples: Array<{ phase: string }>;
+    }> | undefined;
+    expect(result.status).toBe('PASS');
+    expect(result.measurement).toMatchObject({ state: 'AVAILABLE' });
+    expect(memory).toHaveLength(5);
+    expect(memory?.every((entry) =>
+      entry.immediateOperationSample === true &&
+      entry.operationSampleLimit === 1 &&
+      entry.settleWindowMs === 0 &&
+      entry.samples.map((sample) => sample.phase).join(',') === 'baseline,operation,end'
+    )).toBe(true);
+    expect(samplerCalls).toBe(15);
   });
 
   test('external runtime errors are sanitized to valid I-JSON strings', async () => {

@@ -11,8 +11,8 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 |---|---:|---:|---:|---:|---:|---:|
 | probe | V | V | V | V | V | V |
 | demux | V | V | V | V | V | V |
-| remux | V | A | P | P | P | P |
-| transcode | P | P | P | P | P | P |
+| remux | V | V | V | V | V | V |
+| transcode | A | P | P | P | P | P |
 | decode-seek | P | P | P | P | P | P |
 | trim | P | P | P | P | P | P |
 | mux | P | P | P | P | P | P |
@@ -23,7 +23,7 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | robustness | P | P | P | P | P | P |
 | performance | P | P | P | P | P | P |
 
-Totals: 13 verified, 1 active, 64 pending.
+Totals: 18 verified, 1 active, 59 pending.
 
 ## Campaign invariants
 
@@ -46,8 +46,8 @@ Totals: 13 verified, 1 active, 64 pending.
 - Current regression gate (2026-07-21): Mediabunny, FFmpeg.wasm, MP4Box,
   Remotion, web-demuxer, and aibrush-media demux, compact-golden, oracle, runner
   integrity/streaming, exhaustive coverage, and strict result boundary
-  and remux regressions pass; full suite 1068 pass, 13850 assertions across 78 files,
-  typecheck clean,
+  and remux regressions pass; full suite 1087 pass, 13927 assertions across 79
+  files, typecheck clean,
   `git diff --check` clean.
 
 ## Verified cells
@@ -334,12 +334,198 @@ Totals: 13 verified, 1 active, 64 pending.
   `a2bb21d2c8c0c25652d42b5baf6851c2fee1c74f24313151f24f82444edccee6`.
 - Suggested commit message: `cell(remux × mediabunny): complete exhaustive remux evidence`
 
-## Active cell
-
 ### remux × ffmpeg-wasm
 
-- Scope lock: only FFmpeg.wasm remux adapter/support behavior and remux-owned
-  shared layers when independently proven necessary.
+- Quick: `results/raw/chromium-2026-07-21T19-24-31-404Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-21T21-33-14-863Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151`.
+- Quick terminal rows: 43 PASS, 6 NA_ENGINE; 49/49 scenarios observed.
+- Exhaustive coverage: 152 admissible candidates passed; all 178 candidates
+  executed. The remaining 26 candidates are exact NA_ENGINE results; all 161
+  executed oracle verdicts are PASS. Forty-seven supported aggregates are full
+  and two AV1 scenarios are unsupported across every candidate.
+- NA_ENGINE evidence is limited to declared AV1 remux feature gaps and concrete
+  candidate limitations: long ISO edit preroll, signed-CTS MPEG-TS inputs whose
+  samples FFmpeg drops when targeting ISO/Matroska, and MJPEG tuples unavailable
+  in the loaded FFmpeg.wasm build.
+- Fixes remain evidence-producing: bounded worker-backed benchmark sampling;
+  header-only structured output probing; optional video/audio mapping; typed
+  malformed-input, timeout, and WORKERFS failures; QuickTime AudioSampleEntry v2
+  parsing; coded visual dimensions; MP3 coded-header channel/rate truth; explicit
+  HE-AAC SBR core/presentation-rate handling; and strict EBML duration
+  rematerialization only when the complete relative PTS timeline is preserved.
+- Cross-engine spot-check:
+  `results/raw/chromium-2026-07-21T22-44-24-532Z.json` (Mediabunny, exhaustive:
+  VP8 WebM-to-MKV 4/4 PASS and timestamp-unrepresentable MP4-to-ADTS 4/4 concrete
+  NA_ENGINE; no adverse result).
+- Focused remux/FFmpeg/runner regressions: 96 pass. Cell boundary: full suite
+  1078 pass with 13884 assertions across 78 files, typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `068ad8d0690dbdfbf413c977c9d83c86d1486a9442db91ad4d531dc175f42a68`.
+- Exhaustive artifact content hash:
+  `c5d88a2e7010ea1d4943f2fbfc1761e4af35dc5689b8341940d0533fa58668bf`;
+  file SHA-256:
+  `33ec47dfb57b4576a5164ab0cbccc43faf4651f5e52be0834f488767c81c7158`.
+- Suggested commit message: `cell(remux × ffmpeg-wasm): complete exhaustive remux evidence`
+
+### remux × mp4box
+
+- Quick: `results/raw/chromium-2026-07-21T22-59-36-869Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-21T22-58-46-924Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `7da3abec-4560-4bc8-a188-85be5e74acd2`.
+- Quick terminal rows: 1 PASS, 48 NA_ENGINE; 49/49 scenarios observed.
+- Exhaustive coverage: all five admissible candidates passed; all 178 candidates
+  executed. The remaining 173 candidates are exact NA_ENGINE results; all five
+  executed oracle verdicts are PASS. Both supported aggregates are full and 47
+  scenarios are unsupported across every candidate.
+- NA_ENGINE evidence matches MP4Box 2.3.0's declared fragmenter surface: ISO
+  BMFF (MP4/MOV) input and fragmented MP4 output only. Three large real MOV
+  candidates additionally contain auxiliary tracks outside the adapter's
+  segmentable audio/video contract; the one admissible 447 MB candidate passes.
+- Fixes remain evidence-producing: fragments whose exact source sample range has
+  negative `cts-dts` now mark `trun` composition offsets as signed, eliminating
+  an observed 2^32/600-second wrap; and Chromium's deterministic large-Blob
+  `NotReadableError` falls back to the already digest-verified input buffer while
+  MP4Box continues parsing it in bounded chunks.
+- Targeted browser evidence:
+  `results/raw/chromium-2026-07-21T22-58-11-561Z.json` (signed-CTS catalog,
+  exhaustive 4/4 PASS) and
+  `results/raw/chromium-2026-07-21T22-58-18-937Z.json` (exact 447 MB baked MOV,
+  PASS).
+- Focused MP4Box/remux regressions: 72 pass with 5156 assertions. Cell boundary:
+  full suite 1080 pass with 13889 assertions across 78 files, typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `75fe7ad3344e5513cb2682303c53f1186e5ff872f210b1cec252eb82a9b1f6db`.
+- Exhaustive artifact content hash:
+  `cc519e9bcdc8bdd1942ac51f423ef56875ff171ba7908513e3cf14c21eb84bae`;
+  file SHA-256:
+  `afb29aebd9ca02ce7e085d011a3e105d527302f20da8c143b9b29cb26d550da8`.
+- Suggested commit message: `cell(remux × mp4box): complete exhaustive remux evidence`
+
+### remux × remotion
+
+- Quick: `results/raw/chromium-2026-07-21T23-24-50-411Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-21T23-25-03-003Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `bb312ec4-9a83-4c25-8511-c5e64f7e5c1d`.
+- Quick terminal rows: 2 PASS, 47 NA_ENGINE; 49/49 scenarios observed.
+- Exhaustive coverage: all eight admissible candidates passed; all 178
+  candidates executed. The remaining 170 candidates are exact NA_ENGINE
+  results; all eight executed oracle verdicts are PASS. Three supported
+  aggregates are full and 46 scenarios are unsupported across every candidate.
+- NA_ENGINE evidence matches Remotion 4.0.479's concrete copy surface. The
+  package can copy the admitted MOV/H.264/AAC-to-MP4 and WebM/VP9/Opus-to-WebM
+  tuples; other wrapper/codec combinations remain undeclared or reason-coded.
+  Within those rows, one valid MOV is exact NA because media-parser extracts
+  only 1/1755 AAC samples, two huge real MOVs contain unpreservable auxiliary
+  tracks, and the 725 MB MOV exceeds the declared 512 MiB in-memory policy.
+- Fixes remain evidence-producing: digest-verified object-URL inputs use a
+  chunked random-access reader over the exact authenticated bytes; compatible
+  unresolved wrappers reach runtime inspection; ISO copy preflight compares
+  every extracted sample count with the byte-authenticated sample table; and
+  256–512 MiB inputs use a direct resizable-buffer writer that avoids
+  Remotion's failing File/Blob copy. Normal outputs retain the package's stock
+  writer, preserving its exact WebM authoring behavior.
+- Targeted browser evidence:
+  `results/raw/chromium-2026-07-21T23-20-54-153Z.json` (exact 447 MB baked MOV,
+  PASS with 46,126/46,126 source/output samples) and
+  `results/raw/chromium-2026-07-21T23-24-39-941Z.json` (the previously adverse
+  `02.webm` candidate, PASS on the restored stock writer path).
+- Focused Remotion/remux/runner regressions: 100 pass with 658 assertions. Cell
+  boundary: full suite 1083 pass with 13902 assertions across 78 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `c09588658e0de05fba75bd72bc08ab2c56390af02c9da69586500f7b56149f88`;
+  file SHA-256:
+  `6aa74d5479f67c835e886f3c5a1b6b345ac7b087975c9b9bfabb91171e4a9e71`.
+- Exhaustive artifact content hash:
+  `fd5121a67b7c16ef94ab8e4c90db919f421b7cd0813989ee95db54e82fe4a668`;
+  file SHA-256:
+  `fadb3f9b22a331f4fdba2ba12421995659735d6ddc89ae83664a5b7b21120045`.
+- Suggested commit message: `cell(remux × remotion): complete exhaustive remux evidence`
+
+### remux × web-demuxer@4.0.0
+
+- Quick: `results/raw/chromium-2026-07-21T23-29-44-063Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-21T23-29-59-751Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `cd24d07a-04db-4a85-b956-fd2ce69cb048`.
+- Quick terminal rows: 49 NA_ENGINE; 49/49 scenarios observed.
+- Exhaustive coverage: all 178 candidate identities executed and all 178 are
+  exact NA_ENGINE results. No candidate is PASS, FAIL, ERROR, or SKIPPED; all
+  49 aggregates preserve the operation-wide unsupported boundary.
+- NA_ENGINE evidence is uniform and declared before lifecycle or asset work:
+  web-demuxer@4.0.0 exposes parser-only `probe`, `demux`, `decodeFrames`, and
+  `seek`, declares no output containers, and has no muxer API. Every row and
+  candidate therefore records `engine does not declare operation 'remux'`.
+  The adapter's throwing `remux()` stub remains only a fail-loud guard for a
+  mis-wired runner and was never invoked.
+- No implementation change was warranted. Focused web-demuxer/remux/runner
+  regressions: 113 pass with 669 assertions. Cell boundary: full suite 1083
+  pass with 13902 assertions across 78 files, typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `4d14f8124187b30a4a8b9f9e6f73a1de0f8905b0efa2d803fc799ff32bdc9a40`;
+  file SHA-256:
+  `af820390a6640400c855816e58bf20785b5058abc10a9807ee288bb84c88ad5b`.
+- Exhaustive artifact content hash:
+  `fd597d32c512497a80452d25c2a518fcdec78cdd02bc20080a4c63ceb08646de`;
+  file SHA-256:
+  `cb5130964ed8d256562cf8274638265430a44467f4cedb8590349cc5b3202758`.
+- Suggested commit message: `cell(remux × web-demuxer): verify operation-wide NA evidence`
+
+### remux × aibrush-media
+
+- Quick: `results/raw/chromium-2026-07-22T03-21-02-043Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-22T03-39-28-175Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `d6445c57-95ff-484a-bcc7-c4312e9f9c1b`.
+- Quick terminal rows: 49 PASS; 49/49 scenarios observed.
+- Exhaustive coverage: all 175 admissible candidates passed; all 178
+  candidates executed. The remaining three candidates are exact NA_ENGINE
+  results. All 49 aggregates have full coverage and terminal PASS status.
+- NA_ENGINE evidence is limited to the `03.mkv` mixed H.264/AAC/MJPEG input in
+  the MKV-to-MP4, MKV-to-MOV, and MKV-to-TS rows. The MJPEG track is outside
+  the target writers' declared copy surface and is rejected with
+  `AIBRUSH_CONTAINER_CODEC_ILLEGAL` before operation execution.
+- Fixes remain evidence-producing: strict MP3 frame/gapless preservation;
+  corrected TS decode timing and AVC access-unit delimiters; finite WebM
+  clusters; validated Ogg continuation-bit/CRC repair; prepared MOV/MKV packet
+  copy with exact AAC cadence; edit-list presentation duration used only for a
+  substantive coded-span divergence; and typed malformed/unsupported error
+  routing without widening strict-copy tolerances.
+- Targeted repaired-path evidence:
+  `results/raw/chromium-2026-07-22T03-01-01-162Z.json` (five formerly adverse
+  aggregates: 17 admissible candidates PASS and three exact NA_ENGINE).
+- Focused aibrush-media/remux/runner regressions: 108 pass with 558 assertions.
+  Cell boundary: full suite 1087 pass with 13927 assertions across 79 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `b0e33990b74359041a211c865f1998a120769ad7ea3a4f36e2b4435f540f2ce7`;
+  file SHA-256:
+  `a77687780e745c40dfc0bd3a35d7e13ac8b01874c64189f13de1f4fe121b020f`.
+- Exhaustive artifact content hash:
+  `13eaafff78cd4ae8486aee2869c746be1e48f84c07a340b47a8a0855809c49e0`;
+  file SHA-256:
+  `fbdc2f5161dbc7044738d4e9def0f1fe0f4d99036ae37d622683db2257910616`.
+- Suggested commit message: `cell(remux × aibrush-media): complete exhaustive remux evidence`
+
+## Active cell
+
+### transcode × mediabunny
+
+- Scope lock: only Mediabunny transcode adapter/support behavior and
+  transcode-owned shared layers when independently proven necessary.
 - Quick: pending.
 - Exhaustive: pending.
 - Boundary gates: pending.

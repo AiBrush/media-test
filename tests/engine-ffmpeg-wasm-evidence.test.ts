@@ -20,8 +20,17 @@ import {
   splitAdtsFrames,
   splitPreparedBytes,
 } from '../src/engines/ffmpeg-wasm/evidence.ts';
+import { isWorkerFsBlobUnreadableError } from '../src/engines/ffmpeg-wasm/support.ts';
 
 describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
+  test('recognizes only concrete browser WORKERFS read failures', () => {
+    expect(isWorkerFsBlobUnreadableError(new DOMException('blob read failed', 'NotReadableError'))).toBe(true);
+    expect(isWorkerFsBlobUnreadableError(new Error(
+      "Failed to execute 'readAsArrayBuffer' on 'FileReaderSync': The requested file could not be read",
+    ))).toBe(true);
+    expect(isWorkerFsBlobUnreadableError(new TypeError('adapter bug'))).toBe(false);
+  });
+
   test('preserves aliases, rational VFR evidence, edit origin, priming, and HE-AAC tools', () => {
     const parsed = parseFfprobeJson(JSON.stringify({
       format: {

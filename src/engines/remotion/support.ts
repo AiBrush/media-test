@@ -317,7 +317,6 @@ function decideCopyOnly(
   inputs: readonly ConcreteInputRequest[],
 ): SupportDecision {
   if (inputs.length !== 1) return no('REMOTION_REMUX_SINGLE_INPUT_ONLY', 'copy-only remux requires one input');
-  if (!tracks.length) return no('REMOTION_REMUX_TRACK_REQUIRED', 'copy-only remux requires at least one track');
   const inputContainer = inputs[0]!.container;
   if (!COPY_INPUT_CONTAINERS_BY_OUTPUT[outputContainer]?.includes(inputContainer)) {
     return no(
@@ -325,6 +324,10 @@ function decideCopyOnly(
       `${inputContainer} tracks cannot be copied by the pinned package into ${outputContainer}`,
     );
   }
+  // Empty runner metadata means the concrete track tuple is unresolved, not that the media was
+  // proven trackless. Admit compatible wrappers and let parseMedia + canCopyTrack decide from the
+  // actual file. A genuinely trackless input still receives REMOTION_REMUX_TRACK_REQUIRED at runtime.
+  if (!tracks.length) return yes();
   for (const track of tracks) {
     if (track.type === 'other' || track.type === 'subtitle') {
       return no('REMOTION_REMUX_NON_AV_TRACK_UNSUPPORTED', 'copy-only remux cannot preserve non-audio/video tracks');

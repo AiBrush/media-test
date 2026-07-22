@@ -170,7 +170,9 @@ import {
 } from './timed-mp4.ts';
 import {
   DEFAULT_FFMPEG_LIMITS,
+  decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
+  isWorkerFsBlobUnreadableError,
   muxLegality,
   tupleSummary,
   type FfmpegAdapterLimits,
@@ -1492,7 +1494,14 @@ function describeError(e: unknown): string {
  */
 export class FfmpegWasmEngine implements MediaEngine {
   readonly id = ENGINE_ID;
-  readonly benchmarkLimits = Object.freeze({ maxInnerIterations: 6 });
+  readonly benchmarkLimits = Object.freeze({
+    maxInnerIterations: 6,
+    memoryWindow: Object.freeze({
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+    }),
+  });
 
   /** Loaded lazily in init(); FFmpeg instance backed by a dedicated worker. */
   private ff: FFmpeg | null = null;
@@ -2632,12 +2641,13 @@ export class FfmpegWasmEngine implements MediaEngine {
     inName: string,
     inputOptions: string[],
     input: MediaInput,
+    options: { countFrames?: boolean } = {},
   ): Promise<StructuredProbeResult | null> {
     const outName = `${this.scratch()}.ffprobe.json`;
     const args = [
       '-v', 'error',
       ...inputOptions,
-      '-count_frames',
+      ...(options.countFrames === false ? [] : ['-count_frames']),
       '-show_format',
       '-show_streams',
       '-show_data',
@@ -3110,8 +3120,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       } catch (error) {
         if (
           written.workerFs &&
-          ((error instanceof DOMException && error.name === 'NotReadableError') ||
-            /FileReaderSync|requested file could not be read/i.test(describeError(error)))
+          isWorkerFsBlobUnreadableError(error)
         ) {
           throw this.applicabilityMiss(
             'FFMPEG_WORKERFS_BLOB_UNREADABLE',
@@ -3149,15 +3158,57 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   // ── remux ────────────────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Inspect only inputs that would already use MEMFS. This avoids a second materialization while
+   * exposing candidate-specific timing shapes that the static support tuple cannot carry.
+   */
+  private async inspectRemuxProgram(
+    input: MediaInput,
+    targetContainer: string,
+  ): Promise<Uint8Array | undefined> {
+    const sourceContainer = containerFromInput(input);
+    const sourceIsIso = sourceContainer === 'mp4' || sourceContainer === 'mov';
+    const targetNeedsSignedCtsInspection = targetContainer === 'mp4' ||
+      targetContainer === 'mov' ||
+      targetContainer === 'mkv';
+    const needsInspection = sourceIsIso || (sourceContainer === 'ts' && targetNeedsSignedCtsInspection);
+    if (
+      !needsInspection ||
+      input.sizeBytes === undefined ||
+      input.sizeBytes >= WORKERFS_THRESHOLD_BYTES
+    ) {
+      return undefined;
+    }
+
+    const bytes = copyBytes(await input.arrayBuffer());
+    const read = readNeutralRemuxProgram(bytes, sourceContainer);
+    if (read.state === 'OK') {
+      const decision = decideFfmpegRemuxProgramSupport(sourceContainer, targetContainer, read.value);
+      if (!decision.supported) {
+        throw this.applicabilityMiss(decision.reasonCode, decision.reason);
+      }
+    }
+    return bytes;
+  }
+
   private async remuxImpl(
     input: MediaInput,
     opts: { container: string; tags?: Record<string, string> } & Record<string, unknown>,
   ): Promise<MediaBytes> {
     const base = this.scratch();
     const outName = `${base}.out.${containerExt(opts.container)}`;
-    const written = await this.writeInput(input, `${base}.in`);
+    let preloadedBytes = await this.inspectRemuxProgram(input, opts.container);
+    const written = await this.writeInput(input, `${base}.in`, preloadedBytes);
+    preloadedBytes = undefined;
     try {
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      // Remux legality needs stream headers, not an O(duration) frame census. In particular,
+      // `-count_frames` scans multi-hour WORKERFS inputs before the copy command can even start.
+      const structured = await this.structuredProbe(
+        written.name,
+        written.inputOptions,
+        input,
+        { countFrames: false },
+      );
       const inputMetadata = structured?.metadata ?? this.metadataFromLog(
         await this.runInfo(written.name, written.inputOptions),
         input,
@@ -3183,9 +3234,16 @@ export class FfmpegWasmEngine implements MediaEngine {
         );
       }
 
-      // Stream copy: no re-encode, just rewrap. Explicitly map every input stream so ffmpeg's
-      // default "one stream per type" selection does not drop secondary audio tracks.
-      const args = [...written.inputOptions, '-i', written.name, '-map', '0', '-c', 'copy'];
+      // Stream copy the scored media tracks. Explicit type maps retain every video/audio stream
+      // while excluding auxiliary timecode/data tracks that the wasm MP4 muxer can abort on and
+      // that are outside the remux media-track contract.
+      const args = [
+        ...written.inputOptions,
+        '-i', written.name,
+        '-map', '0:v?',
+        '-map', '0:a?',
+        '-c', 'copy',
+      ];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (opts.fragmented === true || opts.fastStart === 'fragmented') {
           args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
@@ -3214,11 +3272,47 @@ export class FfmpegWasmEngine implements MediaEngine {
           muxer: opts.container,
           bitstreamFilters: [],
           command: redactFfmpegCommand(args),
-          codecTags: inputMetadata.tracks.map((track) => track.nativeCodecTag ?? track.codec),
-          extradataForms: inputMetadata.tracks.map((track) =>
-            track.codec === 'h264' ? 'avcC-or-in-band' : track.codec === 'hevc' ? 'hvcC-or-in-band' : 'codec-native'),
+          codecTags: inputMetadata.tracks
+            .filter((track) => track.type === 'video' || track.type === 'audio')
+            .map((track) => track.nativeCodecTag ?? track.codec),
+          extradataForms: inputMetadata.tracks
+            .filter((track) => track.type === 'video' || track.type === 'audio')
+            .map((track) =>
+              track.codec === 'h264'
+                ? 'avcC-or-in-band'
+                : track.codec === 'hevc'
+                  ? 'hvcC-or-in-band'
+                  : 'codec-native'),
         },
       } as MediaBytes;
+    } catch (error) {
+      if (written.workerFs && isWorkerFsBlobUnreadableError(error)) {
+        throw this.applicabilityMiss(
+          'FFMPEG_WORKERFS_BLOB_UNREADABLE',
+          `${input.sizeBytes ?? 'large'}-byte input could not be read through the browser WORKERFS bridge`,
+        );
+      }
+      const robustness = this.activeOperation?.context.request.options.robustness;
+      const deliberateMalformed = robustness !== null && typeof robustness === 'object' &&
+        !Array.isArray(robustness) &&
+        (robustness as Record<string, unknown>).schema === 'media-test/robustness-contract@1';
+      if (
+        deliberateMalformed &&
+        !this.lifecycle.reason &&
+        !this.activeOperation?.context.signal.aborted &&
+        !(error instanceof FfmpegWorkerStateError)
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'remux',
+          'parse',
+          describeError(error),
+          'FFMPEG_REMUX_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       await this.cleanup([...written.cleanupPaths, outName]);
     }

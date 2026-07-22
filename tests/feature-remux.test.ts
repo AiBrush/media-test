@@ -5,6 +5,7 @@ import type { MediaBytes, MediaInput } from '../src/core/engine.ts';
 import type { OracleOutcome } from '../src/core/scenario.ts';
 import {
   REMUX_ROUND_TRIP_LEG_ROLE,
+  aacAudioSpecificConfigFromEsds,
   aacLcChannelsFromEsds,
   auditRemuxAvailabilityAssertions,
   auditRemuxScenarioAvailability,
@@ -14,6 +15,9 @@ import {
   evaluateStrictStreamCopy,
   executeRemuxRoundTrip,
   normalizeRemuxTrackForTest,
+  mp3FrameAudioConfig,
+  parseIsoAudioSampleEntryHeader,
+  parseIsoVisualSampleEntryHeader,
   readNeutralRemuxProgram,
   remuxFixtureAvailability,
   remuxRoundTripContractFromOptions,
@@ -244,9 +248,118 @@ describe('REQ-FEAT-07 strict stream-copy semantic oracle', () => {
     );
     expect(oracleVerdict(unexplained.outcome)).toBe('FAIL');
   });
+
+  test('accepts explicit HE-AAC SBR presentation/core rates across an ADTS wrapper only when access units survive', () => {
+    const read = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/micro_audio_short_mp4_to_adts/01.mp4'),
+      'mp4',
+    );
+    expect(read.state).toBe('OK');
+    if (read.state !== 'OK') return;
+    const sourceTrack = read.value.tracks[0]!;
+    expect(aacAudioSpecificConfigFromEsds(sourceTrack.codecPrivate!)).toEqual({
+      audioObjectType: 2,
+      coreSampleRate: 22_050,
+      presentationSampleRate: 44_100,
+      channelConfiguration: 2,
+      sbrPresent: true,
+      psPresent: false,
+    });
+    const outputTrack: RemuxTrackEvidence = {
+      ...sourceTrack,
+      id: 'adts:0',
+      sampleRate: 22_050,
+      timescale: 22_050,
+      codecPrivate: undefined,
+      samples: sourceTrack.samples.map((entry) => ({ ...entry, framing: 'adts' as const })),
+    };
+    const output: RemuxProgramEvidence = { ...read.value, container: 'adts', tracks: [outputTrack] };
+    const preserved = compareStrictRemuxPrograms(read.value, output);
+    expect(oracleVerdict(preserved.outcome)).toBe('PASS');
+    expect(preserved.representationDifferences.join(' ')).toContain('HE-AAC SBR');
+
+    const corrupted = structuredClone(output) as RemuxProgramEvidence;
+    const payload = corrupted.tracks[0]!.samples[0]!.payload.slice();
+    payload[payload.length - 1] ^= 1;
+    (corrupted.tracks[0]!.samples[0] as { payload: Uint8Array }).payload = payload;
+    expect(oracleVerdict(compareStrictRemuxPrograms(read.value, corrupted).outcome)).toBe('FAIL');
+  });
+
+  test('accepts EBML duration rematerialization only when the complete timestamp span survives', () => {
+    const read = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/vp8_720p_10s_webm_to_mkv/02.webm'),
+      'webm',
+    );
+    expect(read.state).toBe('OK');
+    if (read.state !== 'OK') return;
+    const videoIndex = read.value.tracks.findIndex((track) => track.type === 'video');
+    const video = read.value.tracks[videoIndex]!;
+    const materialized: RemuxTrackEvidence = {
+      ...video,
+      id: 'mkv:video',
+      samples: video.samples.map((entry, index) => {
+        const next = video.samples[index + 1];
+        const interval = next?.ptsUs !== undefined && entry.ptsUs !== undefined
+          ? next.ptsUs - entry.ptsUs
+          : undefined;
+        return { ...entry, ...(interval && interval > 0 ? { durationUs: interval } : {}) };
+      }),
+    };
+    const output: RemuxProgramEvidence = {
+      ...read.value,
+      container: 'mkv',
+      tracks: read.value.tracks.map((track, index) => index === videoIndex ? materialized : track),
+    };
+    const preserved = compareStrictRemuxPrograms(read.value, output);
+    expect(oracleVerdict(preserved.outcome)).toBe('PASS');
+    expect(preserved.representationDifferences.join(' ')).toContain('duration metadata was rematerialized');
+
+    const stretched = structuredClone(output) as RemuxProgramEvidence;
+    (stretched.tracks[videoIndex]!.samples.at(-1) as { durationUs: number }).durationUs = 1_000_000;
+    expect(oracleVerdict(compareStrictRemuxPrograms(read.value, stretched).outcome)).toBe('FAIL');
+  });
 });
 
 describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () => {
+  test('uses codec-native MP3 channel mode instead of contradictory wrapper metadata', () => {
+    expect(mp3FrameAudioConfig(Uint8Array.of(0xff, 0xfb, 0x90, 0xc0))).toEqual({
+      sampleRate: 44_100,
+      channels: 1,
+    });
+    expect(mp3FrameAudioConfig(Uint8Array.of(0xff, 0xfb, 0x94, 0x00))).toEqual({
+      sampleRate: 48_000,
+      channels: 2,
+    });
+  });
+
+  test('reads coded dimensions from the ISO VisualSampleEntry rather than presentation tkhd', () => {
+    const body = new Uint8Array(78);
+    const view = new DataView(body.buffer);
+    view.setUint16(24, 600);
+    view.setUint16(26, 448);
+    expect(parseIsoVisualSampleEntryHeader(body, 0, body.byteLength)).toEqual({
+      headerBytes: 78,
+      width: 600,
+      height: 448,
+    });
+  });
+
+  test('reads QuickTime AudioSampleEntry v2 float rate and 32-bit channel fields', () => {
+    const body = new Uint8Array(64);
+    const view = new DataView(body.buffer);
+    view.setUint16(8, 2); // version
+    view.setUint16(16, 3); // legacy placeholder: not the channel count
+    view.setUint32(24, 1 << 16); // legacy placeholder: not the sample rate
+    view.setUint32(28, 72); // size of the version-2-only structure
+    view.setFloat64(32, 48_000, false);
+    view.setUint32(40, 6);
+    expect(parseIsoAudioSampleEntryHeader(body, 0, body.byteLength)).toEqual({
+      headerBytes: 64,
+      sampleRate: 48_000,
+      channels: 6,
+    });
+  });
+
   test('AAC-LC AudioSpecificConfig overrides a contradictory legacy sample-entry channel count', () => {
     const esds = new Uint8Array([
       0, 0, 0, 0,
@@ -280,6 +393,26 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
       expect(result.value.tracks.some((track) => track.codec === codec && track.samples.length > 0), file).toBe(true);
       expect(result.evidence.parsedSamples, file).toBeGreaterThan(0);
     }
+  });
+
+  test('uses an ISO edit-list presentation span instead of a long terminal coded delta', () => {
+    const result = readNeutralRemuxProgram(
+      bytesAt('fixtures/media/scenarios/remux/h264_1080p_5s_mov_to_mkv/01.mov'),
+      'mov',
+    );
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    expect(result.value.tracks.map((track) => track.samples.length)).toEqual([194, 280]);
+    expect(result.value.durationUs).toBe(6_466_710);
+    const video = result.value.tracks.find((track) => track.type === 'video')!;
+    const terminal = video.samples.at(-1)!;
+    expect(terminal.ptsUs! + terminal.durationUs!).toBeGreaterThan(9_000_000);
+
+    const ordinary = readNeutralRemuxProgram(bytesAt('fixtures/media/h264_1080p_30s.mp4'), 'mp4');
+    expect(ordinary.state).toBe('OK');
+    if (ordinary.state !== 'OK') return;
+    // A sub-tolerance edit adjustment does not replace the complete strict-copy coded span.
+    expect(ordinary.value.durationUs).toBe(30_021_333);
   });
 
   test('TS reader preserves concatenated-program PTS epochs and physical ADTS frame spans', () => {

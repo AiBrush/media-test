@@ -122,9 +122,22 @@ function demuxToDecodeInput(bytes: Uint8Array, container?: string): DecodeInput 
  *
  * Injected by the runner as `ctx.decodeWithPlatform`.
  */
-export async function decodeBytesToFrames(input: MediaBytes | Uint8Array, opts?: { maxFrames?: number }): Promise<FrameSink> {
+export async function decodeBytesToFrames(
+  input: MediaBytes | Uint8Array,
+  opts?: { maxFrames?: number; sampling?: 'prefix' | 'uniform' },
+): Promise<FrameSink> {
   const bytes = toBytes(input);
   const container = input instanceof Uint8Array ? undefined : input.container;
+
+  // Keep source and candidate sampling domains identical for comparisons involving formats that
+  // require the media-element path (notably fragmented MP4). Inline WebCodecs returns a prefix,
+  // whereas the media element samples uniformly across presentation time.
+  if (opts?.sampling === 'uniform' && hasDom()) {
+    const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
+    const fallbackOpts: { maxFrames?: number } = {};
+    if (opts.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+    return decodeWithVideoElement(blob, fallbackOpts);
+  }
 
   // demuxToDecodeInput only throws on a non-Unsupported parse error (a bug); a recognized-but-
   // unparseable container returns null. Guard it so any unexpected throw still routes to <video>.

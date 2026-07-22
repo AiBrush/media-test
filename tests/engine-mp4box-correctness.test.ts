@@ -596,6 +596,25 @@ describe('REQ-ENG-23: sample-entry configuration and presentation timeline prese
     });
   }
 
+  test('marks fragmented trun offsets signed when a MOV carries negative video composition offsets', async () => {
+    await withEngine(async (engine) => {
+      const source = await fixtureInput(
+        'scenarios/remux/h264_1080p_5s_mov_to_mp4/03.mov',
+        'video/quicktime',
+      );
+      const before = await engine.demux(source);
+      const output = await engine.remux(source, { container: 'mp4', fragmented: true });
+      expect(engine.configUsed).toMatchObject({ signedTrunVersionPatches: expect.any(Number) });
+      expect((engine.configUsed as { signedTrunVersionPatches: number }).signedTrunVersionPatches).toBeGreaterThan(0);
+      const after = await engine.demux(bytesInput('signed-trun.mp4', output.bytes));
+      const videoBefore = before.packets.filter((packet) => before.metadata.tracks[packet.trackIndex]?.type === 'video');
+      const videoAfter = after.packets.filter((packet) => after.metadata.tracks[packet.trackIndex]?.type === 'video');
+      expect(videoAfter.map((packet) => [packet.ptsUs, packet.dtsUs])).toEqual(
+        videoBefore.map((packet) => [packet.ptsUs, packet.dtsUs]),
+      );
+    });
+  });
+
   test('preserves a uniform non-default description index and reason-codes an actual switch', async () => {
     await withEngine(async (engine) => {
       const source = await fixtureInput('micro_h264_1frame.mp4');
@@ -704,6 +723,32 @@ describe('REQ-ENG-24: fragment and writer completion proof', () => {
 });
 
 describe('REQ-ENG-25: bounded progressive memory and deterministic cancellation/cleanup', () => {
+  test('falls back to the verified buffer when Chromium cannot read a Blob slice', async () => {
+    await withEngine(async (engine) => {
+      const source = await fixtureInput('micro_h264_1frame.mp4');
+      const bytes = new Uint8Array(await source.arrayBuffer());
+      const unreadableBlob = {
+        size: bytes.byteLength,
+        slice: () => ({
+          arrayBuffer: async () => {
+            throw new DOMException('fixture-backed Blob is unavailable', 'NotReadableError');
+          },
+        }),
+      } as unknown as Blob;
+      const input: MediaInput = {
+        ...source,
+        blob: async () => unreadableBlob,
+        arrayBuffer: async () => bytes.buffer,
+      };
+      const output = await engine.remux(input, { container: 'mp4', fragmented: true });
+      expect(validateFragmentedMp4(output.bytes, 1)).toMatchObject({ valid: true });
+      expect(engine.configUsed).toMatchObject({
+        readerMode: 'blob-progressive-slices+verified-array-buffer-fallback',
+        arrayBufferReadFallbacks: 1,
+      });
+    });
+  });
+
   test('large input uses progressive slices, bounded batches, immediate release, and one progressive target buffer', async () => {
     await withEngine(async (engine) => {
       const source = await fixtureInput('h264_bframes_1080p.mp4');

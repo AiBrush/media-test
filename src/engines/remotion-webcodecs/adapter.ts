@@ -13,8 +13,9 @@
  *   - Streaming, backpressure-throttled pipeline (parse -> decode -> encode), driven by the lib's
  *     waitForQueueToBeLessThan() — no fixed queue depth.
  *   - Pixel resize/rotate on OffscreenCanvas 2D (the lib's only pixel backend; no WebGPU/WebGL rung).
- *   - In-memory output via the bufferWriter (the suite's MediaBytes contract); OPFS webFsWriter is the
- *     lib's perf path for huge outputs but is disk-backed, so we force bufferWriter for determinism.
+ *   - In-memory output via the library's WriterInterface into one resizable ArrayBuffer (the suite's
+ *     MediaBytes contract). This preserves bufferWriter semantics without its save-time Blob copy;
+ *     OPFS webFsWriter is disk-backed and therefore not used for deterministic corpus results.
  *   - expectedDurationInSeconds / expectedFrameRate passed from the probe so the MP4 `moov` is sized
  *     in one pass.
  *
@@ -25,7 +26,7 @@
  *
  * Lib surface used (verified against the installed 4.0.479 .d.ts):
  *   @remotion/webcodecs:
- *     convertMedia, bufferWriter (./buffer), webcodecsController,
+ *     convertMedia, WriterInterface, webcodecsController,
  *     getAvailableContainers, getAvailableVideoCodecs, getAvailableAudioCodecs
  *   @remotion/media-parser:
  *     parseMedia, mediaParserController, MediaParserVideoTrack/AudioTrack/Track, sample callbacks
@@ -107,17 +108,22 @@ import {
   decideRemotionWebcodecsSupport,
   remotionTupleSummary,
 } from '../remotion/support.ts';
+import { readIsoBmffPresentationTimeline } from '../../features/trim/isobmff-timeline.ts';
 
 const ENGINE_ID = 'remotion-webcodecs@4.0.479';
 const PROTECTED_TRACK_METADATA_FEATURE = 'metadata:protected-tracks';
 const WEBM_HEADER_RANGE_BYTES = 64 * 1024;
+const VERIFIED_READER_CHUNK_BYTES = 1024 * 1024;
+const DIRECT_WRITER_INPUT_THRESHOLD_BYTES = 256 * 1024 * 1024;
 
 // ── Lazily-imported lib handles (loaded in init(), UNTIMED per §0.7). ───────────────────────────
 type WebcodecsModule = typeof import('@remotion/webcodecs');
 type BufferWriterModule = typeof import('@remotion/webcodecs/buffer');
 type MediaParserModule = typeof import('@remotion/media-parser');
 type WebReaderModule = typeof import('@remotion/media-parser/web');
-type SourceOptions = { src: string | Blob; reader?: WebReaderModule['webReader'] };
+type MediaParserReader = import('@remotion/media-parser').MediaParserReaderInterface;
+type MediaParserWriter = import('@remotion/media-parser').WriterInterface;
+type SourceOptions = { src: string | Blob; reader?: MediaParserReader };
 type AbortableController = { abort(reason?: unknown): void };
 
 interface IsolatedVideoDecoder {
@@ -150,8 +156,8 @@ export interface RemotionWebcodecsConfig extends AdapterConfigProfile {
   hardwareAcceleration: 'prefer-hardware-with-software-fallback';
   workerCount: 0;
   threadCount: 0;
-  readerMode: 'not-selected' | 'webReader' | 'blob';
-  writerMode: 'bufferWriter';
+  readerMode: 'not-selected' | 'webReader' | 'verified-buffer';
+  writerMode: 'not-selected' | 'bufferWriter' | 'directArrayBufferWriter';
   targetMode: 'in-memory-complete-output';
   codecConfigs: SerializableValue[];
   encoderNondeterministic: true;
@@ -160,7 +166,7 @@ export interface RemotionWebcodecsConfig extends AdapterConfigProfile {
   queueDepth: 'waitForQueueToBeLessThan';
   operation: 'none' | 'probe' | 'demux' | 'remux' | 'transcode' | 'decodeFrames' | 'seek';
   parsePath: 'not-selected' | 'main-thread';
-  sourceReader: 'not-selected' | 'webReader' | 'blob';
+  sourceReader: 'not-selected' | 'webReader' | 'verified-buffer';
   selectedTrackIds: number[];
   trackDecisions: Array<{ trackId: number; type: string; decision: string; reasonCode?: string }>;
   queueHighWaterMark: number;
@@ -185,7 +191,7 @@ export const CONFIG_USED: RemotionWebcodecsConfig = {
   workerCount: 0,
   threadCount: 0,
   readerMode: 'not-selected',
-  writerMode: 'bufferWriter',
+  writerMode: 'not-selected',
   targetMode: 'in-memory-complete-output',
   codecConfigs: [],
   encoderNondeterministic: true,
@@ -297,7 +303,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   /**
    * The best-path config this engine drives (§8.5). Surfaced so the runner records it in the report
    * (hardware WebCodecs + OffscreenCanvas-2D pixel backend + streaming/backpressure pipeline +
-   * in-memory bufferWriter). Previously CONFIG_USED was exported but never attached, so the report
+   * direct in-memory WriterInterface). Previously CONFIG_USED was exported but never attached, so the report
    * recorded `configUsed === undefined` for this engine.
    */
   private lib: LibHandle | null = null;
@@ -307,6 +313,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   private readonly controllerAbortBindings = new Map<AbortableController, { signal: AbortSignal; abort: () => void }>();
   private readonly activeDecoders = new Set<IsolatedVideoDecoder>();
   private readonly activeFrames = new Set<VideoFrame>();
+  private readonly verifiedSourceBytes = new WeakMap<MediaInput, Promise<Uint8Array>>();
   private activeWriterBuffers = 0;
   private config: RemotionWebcodecsConfig = structuredClone(CONFIG_USED);
 
@@ -416,14 +423,16 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   /**
    * Choose the native Remotion source for this MediaInput.
    *
-   * Normal corpus assets keep the URL + webReader path because that is the fast, range-friendly path
-   * and the only correct path for HLS sibling segment resolution. Mutated robustness inputs must use
-   * a Blob, because `input.url` still points at the pristine fixture while `blob()`/`arrayBuffer()`
-   * are where the runner applies the corruption/truncation.
+   * HTTP corpus assets keep the URL + webReader path because that is range-friendly and the only
+   * correct path for HLS sibling segment resolution. The runner's digest-verified single-file
+   * transport is a `blob:` URL; Remotion's fetch reader cannot establish its content length, while
+   * its Blob reader can fail partway through large browser-managed Blobs. Serve the runner's exact,
+   * already digest-verified bytes through a bounded-chunk random-access reader instead. Mutated
+   * robustness inputs use the same reader because their URL still points at the pristine fixture.
    */
   private async sourceOptions(input: MediaInput): Promise<SourceOptions> {
     const { webReader } = this.mustLib();
-    if (isHlsInput(input) || !input.mutated) {
+    if (isHlsInput(input) || (!input.mutated && !input.url.startsWith('blob:'))) {
       this.config = {
         ...this.config,
         readerMode: 'webReader',
@@ -432,13 +441,25 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       };
       return { src: input.url, reader: webReader };
     }
+    const bytes = await this.exactInputBytes(input);
     this.config = {
       ...this.config,
-      readerMode: 'blob',
-      sourceReader: 'blob',
+      readerMode: 'verified-buffer',
+      sourceReader: 'verified-buffer',
       parsePath: 'main-thread',
     };
-    return { src: await input.blob() };
+    return {
+      src: input.url,
+      reader: verifiedBufferReader(bytes, input.id, input.mime),
+    };
+  }
+
+  private exactInputBytes(input: MediaInput): Promise<Uint8Array> {
+    const cached = this.verifiedSourceBytes.get(input);
+    if (cached) return cached;
+    const pending = input.arrayBuffer().then((buffer) => new Uint8Array(buffer));
+    this.verifiedSourceBytes.set(input, pending);
+    return pending;
   }
 
   private async parse<F>(
@@ -647,8 +668,8 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   /**
    * Lossless container change: convertMedia copies encoded samples when the target container accepts
    * the source codecs. We do NOT force a codec, so the default track handler copies where it can and
-   * only re-encodes if the container cannot hold the source codec. Output goes to the in-memory
-   * bufferWriter so `save()` yields the bytes directly.
+   * only re-encodes if the container cannot hold the source codec. Output goes to the direct
+   * in-memory WriterInterface so the completed bytes do not need a save-time Blob round trip.
    */
   async remux(
     input: MediaInput,
@@ -902,6 +923,41 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       }
     }
 
+    const inputContainer = context.request.inputs[0]?.container;
+    if (inputContainer === 'mp4' || inputContainer === 'mov') {
+      const sampleCountByTrackId = new Map<number, number>();
+      const countSample = (trackId: number): void => {
+        sampleCountByTrackId.set(trackId, (sampleCountByTrackId.get(trackId) ?? 0) + 1);
+      };
+      await this.parse({
+        ...srcOptions,
+        acknowledgeRemotionLicense: true,
+        fields: { tracks: true },
+        onVideoTrack: ({ track }: { track: import('@remotion/media-parser').MediaParserVideoTrack }) =>
+          () => countSample(track.trackId),
+        onAudioTrack: ({ track }: { track: import('@remotion/media-parser').MediaParserAudioTrack }) =>
+          () => countSample(track.trackId),
+      }, context);
+      const timeline = readIsoBmffPresentationTimeline(new Uint8Array(await input.arrayBuffer()));
+      if (timeline.state === 'OK') {
+        for (const track of parsed.tracks) {
+          if (track.type !== 'video' && track.type !== 'audio') continue;
+          const expected = timeline.tracks.find((candidate) => candidate.trackId === track.trackId);
+          if (!expected) continue;
+          const observed = sampleCountByTrackId.get(track.trackId) ?? 0;
+          if (observed !== expected.codedSampleCount) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'remux',
+              `media-parser 4.0.479 extracted ${observed}/${expected.codedSampleCount} coded samples for ISO track ${track.trackId}`,
+              remotionTupleSummary(context.request),
+              'REMOTION_REMUX_SAMPLE_EXTRACTION_INCOMPLETE',
+            );
+          }
+        }
+      }
+    }
+
     return {
       onVideoTrack: ({ track, canCopyTrack }) => {
         if (!canCopyTrack || !copiedVideo.has(track.trackId)) {
@@ -1051,6 +1107,12 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   ): Promise<MediaBytes> {
     const { wc, bufferWriter } = this.mustLib();
     const srcOptions = await this.sourceOptions(input);
+    const useDirectWriter = (input.sizeBytes ?? 0) >= DIRECT_WRITER_INPUT_THRESHOLD_BYTES;
+    const outputWriter = useDirectWriter ? directArrayBufferWriter() : null;
+    this.config = {
+      ...this.config,
+      writerMode: useDirectWriter ? 'directArrayBufferWriter' : 'bufferWriter',
+    };
 
     // Probe (fast, header-only) to size the MP4 moov in one pass (dossier §4.6).
     let expectedDurationInSeconds: number | null = null;
@@ -1098,7 +1160,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
         onAudioTrack: opts.onAudioTrack,
         onVideoTrack: opts.onVideoTrack,
         controller,
-        writer: bufferWriter,
+        writer: outputWriter?.writer ?? bufferWriter,
         expectedDurationInSeconds,
         expectedFrameRate,
         onProgress: (state) => {
@@ -1126,8 +1188,15 @@ export class RemotionWebcodecsEngine implements MediaEngine {
         controllerFinalState: normalizeFinalState(result.finalState),
       };
 
-      const blob = await result.save();
-      const bytes = new Uint8Array(await blob.arrayBuffer());
+      // Remotion's stock bufferWriter getBlob() clones the complete resizable buffer into a File,
+      // after which Blob.arrayBuffer() clones it again. Large outputs can finish successfully and
+      // then fail only during those two redundant copies. Our WriterInterface exposes the finished
+      // buffer directly. Test doubles that do not invoke the supplied writer retain save() fallback.
+      let bytes = outputWriter?.bytes() ?? null;
+      if (bytes === null) {
+        const blob = await result.save();
+        bytes = new Uint8Array(await blob.arrayBuffer());
+      }
       const atMs = monotonicElapsed(started, lastAtMs);
       lastAtMs = atMs;
       context.emit({ type: 'first-byte', atMs });
@@ -1816,6 +1885,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       ...this.config,
       operation,
       readerMode: 'not-selected',
+      writerMode: 'not-selected',
       sourceReader: 'not-selected',
       parsePath: 'not-selected',
       codecConfigs: [],
@@ -3728,7 +3798,7 @@ function ensureSupportedTranscodeRequest(
     throw createNotApplicableError(
       ENGINE_ID,
       'transcode',
-      'input exceeds the adapter\'s 512MiB in-memory bufferWriter policy',
+      'input exceeds the adapter\'s 512MiB in-memory output policy',
       tuple,
       'REMOTION_BUFFER_WRITER_RESOURCE_LIMIT',
     );
@@ -3917,6 +3987,127 @@ function isHlsInput(input: MediaInput): boolean {
   }
   const u = (input.url || input.id || '').toLowerCase();
   return u.endsWith('.m3u8');
+}
+
+/**
+ * Random-access reader over the runner's authenticated bytes. Remotion ranges are inclusive at the
+ * upper bound; emitting small views keeps a whole-file read from becoming one enormous stream chunk.
+ */
+function verifiedBufferReader(
+  bytes: Uint8Array,
+  name: string,
+  contentType: string,
+): MediaParserReader {
+  return {
+    async read({ range }) {
+      const requestedStart = range === null ? 0 : typeof range === 'number' ? range : range[0];
+      const requestedEnd = range === null || typeof range === 'number' ? bytes.byteLength : range[1] + 1;
+      const start = Math.max(0, Math.min(bytes.byteLength, requestedStart));
+      const end = Math.max(start, Math.min(bytes.byteLength, requestedEnd));
+      let cursor = start;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (cursor >= end) {
+            controller.close();
+            return;
+          }
+          const next = Math.min(end, cursor + VERIFIED_READER_CHUNK_BYTES);
+          controller.enqueue(bytes.subarray(cursor, next));
+          cursor = next;
+        },
+      });
+      const reader = stream.getReader();
+      return {
+        reader: {
+          reader,
+          async abort() {
+            try {
+              await reader.cancel();
+            } catch {
+              // The parser may already have consumed and released the stream.
+            }
+          },
+        },
+        contentLength: bytes.byteLength,
+        contentType,
+        name,
+        supportsContentRange: true,
+        needsContentRange: true,
+      };
+    },
+    async readWholeAsText() {
+      return new TextDecoder().decode(bytes);
+    },
+    createAdjacentFileSource() {
+      throw new Error('verified single-file inputs cannot resolve adjacent resources');
+    },
+    preload() {
+      // Bytes are already resident and range reads are synchronous; no speculative preload needed.
+    },
+  };
+}
+
+function directArrayBufferWriter(): {
+  writer: MediaParserWriter;
+  bytes: () => Uint8Array | null;
+} {
+  type ResizableOutputBuffer = ArrayBuffer & {
+    resize(byteLength: number): void;
+    transferToFixedLength?: () => ArrayBuffer;
+  };
+  const ResizableArrayBuffer = ArrayBuffer as unknown as {
+    new(byteLength: number, options: { maxByteLength: number }): ResizableOutputBuffer;
+  };
+  let output: ResizableOutputBuffer | null = null;
+  let finalBytes: Uint8Array | null = null;
+  let removed = false;
+  let finished = false;
+  const writer: MediaParserWriter = {
+    async createContent({ filename, mimeType }) {
+      if (output !== null) throw new Error('directArrayBufferWriter supports one output per conversion');
+      const buffer = new ResizableArrayBuffer(0, { maxByteLength: 2_000_000_000 });
+      if (typeof buffer.resize !== 'function') {
+        throw new Error('Resizable ArrayBuffer is required for directArrayBufferWriter');
+      }
+      output = buffer;
+      return {
+        async write(data) {
+          const position = buffer.byteLength;
+          buffer.resize(position + data.byteLength);
+          new Uint8Array(buffer).set(data, position);
+        },
+        async finish() {
+          if (removed) throw new Error('Already called .remove() on the result');
+          finished = true;
+        },
+        getWrittenByteCount() {
+          return buffer.byteLength;
+        },
+        async updateDataAt(position, data) {
+          new Uint8Array(buffer).set(data, position);
+        },
+        async remove() {
+          removed = true;
+        },
+        async getBlob() {
+          if (!finished) throw new Error('Cannot save directArrayBufferWriter output before finish()');
+          return new File([new Uint8Array(buffer)], filename, { type: mimeType });
+        },
+      };
+    },
+  };
+  return {
+    writer,
+    bytes: () => {
+      if (finalBytes) return finalBytes;
+      if (output === null || !finished) return null;
+      const fixed = typeof output.transferToFixedLength === 'function'
+        ? output.transferToFixedLength()
+        : output;
+      finalBytes = new Uint8Array(fixed);
+      return finalBytes;
+    },
+  };
 }
 
 /** Flatten media-parser's metadata entries to a string map (best-effort, descriptive tags only). */

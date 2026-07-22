@@ -96,6 +96,7 @@ import {
 } from '../../core/engine.ts';
 import {
   fpsEvidenceFromSamples,
+  markFragmentSignedCompositionOffsets,
   parseAacAudioSpecificConfig,
   validateFragmentedMp4,
   type AacConfigEvidence,
@@ -145,6 +146,7 @@ interface Mp4boxConfigState {
   processBatchSamples: number;
   inputBytes: number;
   appendCount: number;
+  arrayBufferReadFallbacks: number;
   releasedSamples: number;
   presentationEditFilteredSamples: number;
   peakParserSampleBytes: number;
@@ -152,6 +154,7 @@ interface Mp4boxConfigState {
   peakOutputTargetBytes: number;
   outputBytes: number;
   outputWrites: number;
+  signedTrunVersionPatches: number;
   firstByteMs: number | null;
   lateErrorObserved: boolean;
   stopCalled: boolean;
@@ -178,6 +181,7 @@ function freshConfigState(): Mp4boxConfigState {
     processBatchSamples: PROCESS_BATCH_SAMPLES,
     inputBytes: 0,
     appendCount: 0,
+    arrayBufferReadFallbacks: 0,
     releasedSamples: 0,
     presentationEditFilteredSamples: 0,
     peakParserSampleBytes: 0,
@@ -185,6 +189,7 @@ function freshConfigState(): Mp4boxConfigState {
     peakOutputTargetBytes: 0,
     outputBytes: 0,
     outputWrites: 0,
+    signedTrunVersionPatches: 0,
     firstByteMs: null,
     lateErrorObserved: false,
     stopCalled: false,
@@ -780,6 +785,12 @@ function copyBytes(source: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): 
   const out = new Uint8Array(view.byteLength);
   out.set(view);
   return out;
+}
+
+function isBlobNotReadableError(error: unknown): boolean {
+  return !!error
+    && typeof error === 'object'
+    && (error as { name?: unknown }).name === 'NotReadableError';
 }
 
 function descriptionBoxesFromSampleEntry(entry: BoxNode | undefined): Mp4BoxKind[] {
@@ -1540,6 +1551,7 @@ export class Mp4boxEngine implements MediaEngine {
     try {
       throwIfAborted(context.signal);
       const blob = await raceAbort(input.blob(), context.signal);
+      let arrayBufferFallback: Uint8Array<ArrayBuffer> | undefined;
       let readBytes = this.configState.inputBytes;
       const ranges: ReadRange[] = [];
       let window = firstUnreadWindow(blob.size, ranges);
@@ -1547,7 +1559,27 @@ export class Mp4boxEngine implements MediaEngine {
       while (window) {
         if (++iterations > 1_000_000) throw new Error(`${ENGINE_ID}: progressive reader made no forward progress`);
         throwIfAborted(context.signal);
-        const chunk = await raceAbort(blob.slice(window.start, window.end).arrayBuffer(), context.signal);
+        let chunk: ArrayBuffer;
+        try {
+          chunk = await raceAbort(blob.slice(window.start, window.end).arrayBuffer(), context.signal);
+        } catch (error) {
+          if (!isBlobNotReadableError(error)) throw error;
+          if (!arrayBufferFallback) {
+            const full = await raceAbort(input.arrayBuffer(), context.signal);
+            if (full.byteLength !== blob.size) {
+              throw new Error(
+                `${ENGINE_ID}: array-buffer fallback size ${full.byteLength} != blob size ${blob.size}`,
+              );
+            }
+            arrayBufferFallback = new Uint8Array(full);
+            this.configState = {
+              ...this.configState,
+              readerMode: 'blob-progressive-slices+verified-array-buffer-fallback',
+              arrayBufferReadFallbacks: this.configState.arrayBufferReadFallbacks + 1,
+            };
+          }
+          chunk = arrayBufferFallback.slice(window.start, window.end).buffer;
+        }
         throwIfAborted(context.signal);
         const nextOffset = file.appendBuffer(this.makeBuffer(chunk, window.start), false);
         ranges.push(window);
@@ -1984,6 +2016,7 @@ export class Mp4boxEngine implements MediaEngine {
       const outputTarget = new ProgressiveByteSink();
       const completedTracks = new Set<number>();
       const nextSampleByTrack = new Map<number, number>();
+      const samplesByTrack = new Map<number, readonly Mp4Sample[]>();
       let outputBytes = 0;
       const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
         if (readyInfo.tracks.length === 0) throw new Error(`${ENGINE_ID}: remux found a genuinely trackless MP4`);
@@ -2013,6 +2046,7 @@ export class Mp4boxEngine implements MediaEngine {
           const entries = sampleEntriesForTrack(readyFile, track.id);
           if (entries.length === 0) throw new Error(`${ENGINE_ID}: track ${track.id} has no sample description`);
           assertMuxSampleEntries(entries, codec, 'remux', mp4boxTupleSummary(call.request));
+          samplesByTrack.set(track.id, readyFile.getTrackSamplesInfo(track.id));
         }
         this.configState = {
           ...this.configState,
@@ -2031,9 +2065,20 @@ export class Mp4boxEngine implements MediaEngine {
           throwIfError();
           if (buffer.byteLength === 0) throw new Error(`${ENGINE_ID}: empty media-segment callback for track ${id}`);
           const segment = new Uint8Array(buffer);
+          const previousNextSample = nextSampleByTrack.get(id) ?? 0;
+          const fragmentSamples = samplesByTrack.get(id)?.slice(previousNextSample, nextSample) ?? [];
+          if (fragmentSamples.some((sample) => sample.cts - sample.dts < 0)) {
+            const marked = markFragmentSignedCompositionOffsets(segment);
+            if (marked === 0) {
+              throw new Error(`${ENGINE_ID}: negative composition offsets were not represented by a writable trun`);
+            }
+            this.configState = {
+              ...this.configState,
+              signedTrunVersionPatches: this.configState.signedTrunVersionPatches + marked,
+            };
+          }
           outputTarget.write(segment);
           outputBytes = outputTarget.byteLength;
-          const previousNextSample = nextSampleByTrack.get(id) ?? 0;
           const releasedNow = Math.max(0, nextSample - previousNextSample);
           nextSampleByTrack.set(id, Math.max(previousNextSample, nextSample));
           if (last) completedTracks.add(id);

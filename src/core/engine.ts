@@ -1243,8 +1243,20 @@ export interface MediaEngine {
    * index signature; the runner serializes it for the report.
    */
   readonly configUsed?: object;
-  /** Optional safety cap for adaptive batches when a runtime cannot sustain unbounded main() reuse. */
-  readonly benchmarkLimits?: Readonly<{ maxInnerIterations?: number }>;
+  /** Optional safety/protocol limits for runtimes that cannot sustain the generic benchmark loop. */
+  readonly benchmarkLimits?: Readonly<{
+    maxInnerIterations?: number;
+    /**
+     * Adapter-owned bounds for the cross-process memory sampler. Worker-backed runtimes may make
+     * each `measureUserAgentSpecificMemory()` request expensive; an immediate in-operation sample
+     * plus the terminal endpoint remains a real observation without an unbounded settle burst.
+     */
+    memoryWindow?: Readonly<{
+      sampleImmediatelyDuringOperation?: boolean;
+      maxOperationSamples?: number;
+      settleWindowMs?: number;
+    }>;
+  }>;
   /** Full-tuple support decision after selected input evidence is available. Scored adapters must implement it. */
   supports(request: ConcreteOperationRequest, context?: LifecycleContext): SupportDecision | Promise<SupportDecision>;
   init?(context?: LifecycleContext): Promise<void>;
