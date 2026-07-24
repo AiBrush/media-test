@@ -23,6 +23,15 @@ describe('REQ-ENG-26: web-demuxer operation-scoped tuple support', () => {
   test('pins the scored identity, full WASM artifact, and operation-scoped discovery surface', () => {
     const engine = new WebDemuxerEngine();
     expect(engine.id).toBe('web-demuxer@4.0.0');
+    expect(engine.benchmarkLimits).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    });
     expect(engine.configUsed).toMatchObject({
       package: 'web-demuxer@4.0.0',
       lockIntegrity: 'sha512-QFsKe8SNjP6MDtAw2lWfyVmX2wXIpDUT+9p2KHXJb5OPWdhVbjBHcV06tDMXzuU1T6Y1P9TRm9bkeVXEwy0dVw==',

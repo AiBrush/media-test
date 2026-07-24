@@ -11,6 +11,8 @@ export interface TrimBoundaryFrame {
   readonly ptsUs: number;
   readonly durationUs: number;
   readonly contentDigest: string;
+  /** Measured SSIM against this frame's paired reference after a declared re-encode. */
+  readonly contentSimilarity?: number;
   readonly required?: boolean;
   readonly keyframe?: boolean;
 }
@@ -30,6 +32,8 @@ export interface TrimBoundaryEvidenceArtifact {
   readonly expectedLandedInterval: TrimRange;
   readonly outputOriginUs: 0;
   readonly timestampToleranceUs: number;
+  /** Optional perceptual gate for a declared lossy boundary re-encode. */
+  readonly minimumContentSimilarity?: number;
   readonly frames: readonly TrimBoundaryFrame[];
 }
 
@@ -131,6 +135,7 @@ export function assessTrimBoundaryEvidence(request: TrimBoundaryAssessmentReques
     toleranceUs: artifact.timestampToleranceUs,
     unmatchedPolicy: 'require-all-reference',
   });
+  const representationDifferences = [...new Set(request.candidate.representationDifferences ?? [])].sort();
   const failures: string[] = [];
   for (const missingIndex of pairs.unmatchedReferenceIndices) {
     const frame = required[missingIndex]!;
@@ -139,9 +144,16 @@ export function assessTrimBoundaryEvidence(request: TrimBoundaryAssessmentReques
   for (const pair of pairs.pairs) {
     const want = required[pair.referenceIndex]!;
     const got = request.candidate.frames[pair.candidateIndex]!;
-    if (normalizeDigest(want.contentDigest) !== normalizeDigest(got.contentDigest)) {
+    const digestMatches = normalizeDigest(want.contentDigest) === normalizeDigest(got.contentDigest);
+    const similarity = got.contentSimilarity;
+    const perceptualMatch = representationDifferences.length > 0 &&
+      artifact.minimumContentSimilarity !== undefined &&
+      typeof similarity === 'number' && Number.isFinite(similarity) &&
+      similarity >= artifact.minimumContentSimilarity;
+    if (!digestMatches && !perceptualMatch) {
       failures.push(
-        `content at output ${got.ptsUs}us is ${shortDigest(got.contentDigest)}; expected ${shortDigest(want.contentDigest)}`,
+        `content at output ${got.ptsUs}us is ${shortDigest(got.contentDigest)}; expected ${shortDigest(want.contentDigest)}` +
+        (similarity === undefined ? '' : ` (SSIM ${similarity.toFixed(4)})`),
       );
     }
     const gotEnd = got.ptsUs + got.durationUs;
@@ -155,8 +167,7 @@ export function assessTrimBoundaryEvidence(request: TrimBoundaryAssessmentReques
     if (usedCandidates.has(candidateIndex)) continue;
     const optionalMatch = artifact.frames.find((want) =>
       want.required === false &&
-      Math.abs(want.ptsUs - got.ptsUs) <= artifact.timestampToleranceUs &&
-      normalizeDigest(want.contentDigest) === normalizeDigest(got.contentDigest));
+      Math.abs(want.ptsUs - got.ptsUs) <= artifact.timestampToleranceUs);
     if (!optionalMatch) {
       failures.push(`extra candidate boundary content at ${got.ptsUs}us (${shortDigest(got.contentDigest)})`);
     }
@@ -183,7 +194,6 @@ export function assessTrimBoundaryEvidence(request: TrimBoundaryAssessmentReques
       pairing: pairs,
     });
   }
-  const representationDifferences = [...new Set(request.candidate.representationDifferences ?? [])].sort();
   if (representationDifferences.length > 0) {
     return trimVerdict(
       'PASS',

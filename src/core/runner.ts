@@ -5352,9 +5352,11 @@ export async function runOne(
       browserConfigs: concrete.browserConfigs,
       probes: concrete.probeStates,
     };
-    if (scenario.op === 'trim') {
+    if (scenario.op === 'trim' && !usesGracefulFailurePath) {
       // An invalid support protocol/probe is a harness/adapter ERROR. All normal tuple and exact
-      // config decisions pass through the trim-local ownership split below.
+      // config decisions pass through the trim-local ownership split below. Deliberately invalid
+      // robustness ranges must reach runRobustness(), where a clean rejection is the expected
+      // outcome; parsing them as a normal TrimContract here would turn that success into ERROR.
       if (concrete.blocker?.status === 'ERROR') {
         return finalize('ERROR', [], concrete.blocker.reason);
       }

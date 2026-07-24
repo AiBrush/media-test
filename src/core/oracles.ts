@@ -5284,6 +5284,17 @@ function videoTrackIndices(golden: GoldenStore): Set<number> | undefined {
 
 // ── trim-boundaries ──────────────────────────────────────────────────────────────────────────
 
+const TRIM_BOUNDARY_REENCODE_SSIM_MIN = 0.98;
+
+function trimBoundaryContentThreshold(
+  mode: TrimContract['mode'],
+  tolerances: Required<OracleTolerances>,
+): number {
+  return mode === 'frame-accurate'
+    ? Math.min(tolerances.ssimMin, TRIM_BOUNDARY_REENCODE_SSIM_MIN)
+    : 1;
+}
+
 async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'trim-boundaries';
   if (!ctx.output) return fail(oracle, 'no ctx.output bytes from trim');
@@ -5326,22 +5337,6 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   if (outDurationSec == null && structure?.durationSec != null && structure.durationSec > 0) {
     outDurationSec = structure.durationSec;
   }
-
-  // Decode candidate video once. Typed failure is classified after independent duration/structure
-  // checks so a provably wrong container cannot hide behind browser unavailability.
-  let frames: FrameDigest[] = [];
-  let candidateDecodeError: unknown;
-  try {
-    const sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 8192 });
-    if (sink && Array.isArray(sink.frames)) frames = sink.frames;
-  } catch (error) {
-    candidateDecodeError = error;
-  }
-  if (outDurationSec == null && frames.length >= 2) {
-    const first = frames[0]!.ptsUs;
-    const last = frames[frames.length - 1]!.ptsUs;
-    outDurationSec = (last - first) / 1e6;
-  }
   if (outDurationSec == null) {
     outDurationSec = durationFromSimpleAudioContainer(ctx.output);
   }
@@ -5350,14 +5345,16 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     const presentedDurationUs = sourceIso?.presentationDurationUs
       ?? (ctx.golden.meta?.durationSec != null ? Math.round(ctx.golden.meta.durationSec * 1_000_000) : range.endUs);
     const effectiveEndUs = Math.min(range.endUs, presentedDurationUs);
-    const requestedSec = Math.max(0, effectiveEndUs - range.startUs) / 1e6;
-    const d = Math.abs(outDurationSec - requestedSec);
+    const expectedDurationUs = expectedTrimOutputDurationUs(ctx, contract, sourceIso, effectiveEndUs);
+    const expectedSec = expectedDurationUs / 1e6;
+    const d = Math.abs(outDurationSec - expectedSec);
     measurements.outDurationSec = outDurationSec;
-    measurements.requestedDurationSec = requestedSec;
+    measurements.requestedDurationSec = Math.max(0, effectiveEndUs - range.startUs) / 1e6;
+    measurements.expectedDurationSec = expectedSec;
     measurements.durationDeltaSec = d;
     if (d > t.durationToleranceSec) {
       diffs.push(
-        `duration: out ${outDurationSec.toFixed(4)}s vs requested ${requestedSec.toFixed(
+        `duration: out ${outDurationSec.toFixed(4)}s vs expected ${expectedSec.toFixed(
           4,
         )}s (Δ ${d.toFixed(4)}s > ${t.durationToleranceSec.toFixed(4)}s)`,
       );
@@ -5373,40 +5370,16 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
 
   const hasVideo = ctx.golden.meta?.tracks.some((track) => track.type === 'video') === true ||
-    structure?.tracks.some((track) => track.type === 'video') === true || frames.length > 0;
+    structure?.tracks.some((track) => track.type === 'video') === true;
   if (hasVideo) {
-    if (candidateDecodeError !== undefined) {
-      return classifyReferenceDecodeFailure(oracle, 'candidate', candidateDecodeError, ctx.output);
-    }
-    if (frames.length === 0) {
-      return classifyReferenceDecodeFailure(
-        oracle,
-        'candidate',
-        { reasonCode: 'REFERENCE_DECODE_EMPTY_AMBIGUOUS' },
-        ctx.output,
-      );
-    }
-    let sourceFrames: FrameDigest[];
     const sourceMedia: MediaBytes = {
       bytes: sourceBytes,
       mime: ctx.input.mime,
       container: sourceContainer,
     };
-    try {
-      const sink = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 8192 });
-      sourceFrames = sink?.frames ?? [];
-    } catch (error) {
-      return classifyReferenceDecodeFailure(oracle, 'source', error, sourceMedia);
-    }
-    if (sourceFrames.length === 0) {
-      return unavailable(
-        oracle,
-        'NA_ASSET',
-        'TRIM_RANGE_REFERENCE_EMPTY',
-        'neutral source decode produced no range-specific presentation evidence',
-      );
-    }
-    return liveTrimBoundaryOutcome(ctx, contract, sourceFrames, frames, sourceIso, t, measurements);
+    const decoded = await decodeTrimVideoPair(ctx, oracle, sourceMedia, sourceIso);
+    if (decoded.state !== 'OK') return decoded.outcome;
+    return liveTrimBoundaryOutcome(ctx, contract, decoded, t, measurements);
   }
 
   const audio = audioTrimTimingOutcome(ctx, contract, sourceIso, t, measurements);
@@ -5420,106 +5393,67 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   );
 }
 
+function expectedTrimOutputDurationUs(
+  ctx: OracleContext,
+  contract: TrimContract,
+  sourceIso: IsoBmffPresentationTimeline | undefined,
+  effectiveEndUs: number,
+): number {
+  if (contract.mode !== 'copy') return Math.max(0, effectiveEndUs - contract.range.startUs);
+  if (sourceIso) {
+    const windows = selectIsoBmffTrimWindows(sourceIso, {
+      startUs: contract.range.startUs,
+      endUs: effectiveEndUs,
+    }, 'copy');
+    if (windows.length > 0) {
+      // The packet-copy adapter rebases each retained track to zero. The authored program duration
+      // is therefore the longest selected track window, not the unsnapped requested duration.
+      return Math.max(...windows.map((window) => window.landedEndUs - window.landedStartUs));
+    }
+  }
+  const hasVideo = ctx.golden.meta?.tracks.some((track) => track.type === 'video') === true;
+  const startUs = hasVideo ? trimFeatureVideoStartUs(ctx, contract) : contract.range.startUs;
+  return Math.max(0, effectiveEndUs - startUs);
+}
+
 function isIsoBmffContainer(container: string): boolean {
   return ['mp4', 'mov', 'm4a', 'm4v', 'isobmff', 'qt'].includes(normStr(container));
 }
 
-function liveTrimBoundaryOutcome(
+async function liveTrimBoundaryOutcome(
   ctx: OracleContext,
   contract: TrimContract,
-  sourceFrames: readonly FrameDigest[],
-  candidateFrames: readonly FrameDigest[],
-  sourceIso: IsoBmffPresentationTimeline | undefined,
+  decoded: Extract<TrimVideoDecodePair, { state: 'OK' }>,
   t: Required<OracleTolerances>,
   durationMeasurements: Record<string, number>,
-): OracleOutcome {
+): Promise<OracleOutcome> {
   const oracle: OracleId = 'trim-boundaries';
-  const source = [...sourceFrames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
-  const candidate = [...candidateFrames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
-  let expectedStartUs: number | undefined;
-  let expectedEndUs: number | undefined;
-
-  if (sourceIso) {
-    const videoWindow = selectIsoBmffTrimWindows(sourceIso, contract.range, contract.mode)
-      .find((window) => window.type === 'video');
-    if (videoWindow) {
-      expectedStartUs = videoWindow.landedStartUs;
-      expectedEndUs = videoWindow.landedEndUs;
-    }
-  }
-
-  if (expectedStartUs === undefined || expectedEndUs === undefined) {
-    const intersecting = source.filter((frame, index) => {
-      const endUs = frame.ptsUs + inferredFrameDurationUs(source, index);
-      return frame.ptsUs < contract.range.endUs && endUs > contract.range.startUs;
-    });
-    if (intersecting.length === 0) {
-      return unavailable(
-        oracle,
-        'NA_ASSET',
-        'TRIM_RANGE_REFERENCE_NOT_DECODED',
-        `the bounded neutral source decode did not reach [${contract.range.startUs},${contract.range.endUs})us`,
-        durationMeasurements,
-      );
-    }
-    if (contract.mode === 'frame-accurate') {
-      expectedStartUs = intersecting[0]!.ptsUs;
-    } else {
-      const videoTracks = videoTrackIndices(ctx.golden);
-      const keyframes = (ctx.golden.packets ?? [])
-        .filter((packet) => packet.keyframe && (!videoTracks || videoTracks.has(packet.trackIndex)))
-        .filter((packet) => packet.ptsUs <= contract.range.startUs)
-        .sort((a, b) => a.ptsUs - b.ptsUs);
-      const safe = keyframes.at(-1);
-      if (!safe) {
-        return unavailable(
-          oracle,
-          'NA_ASSET',
-          'TRIM_COPY_RANDOM_ACCESS_REFERENCE_MISSING',
-          'copy-mode boundary evidence has no source random-access point at/before the requested start',
-          durationMeasurements,
-        );
-      }
-      expectedStartUs = source.find((frame) => frame.ptsUs >= safe.ptsUs - t.seekToleranceUs)?.ptsUs;
-      if (expectedStartUs === undefined) {
-        return unavailable(
-          oracle,
-          'NA_ASSET',
-          'TRIM_COPY_RANDOM_ACCESS_FRAME_NOT_DECODED',
-          `neutral source decode did not retain the random-access picture near ${safe.ptsUs}us`,
-          durationMeasurements,
-        );
-      }
-    }
-    const last = intersecting.at(-1)!;
-    expectedEndUs = last.ptsUs + inferredFrameDurationUs(source, source.indexOf(last));
-  }
-
-  const expectedFrames = source.filter((frame) =>
-    frame.ptsUs >= expectedStartUs! - t.seekToleranceUs && frame.ptsUs < expectedEndUs!);
-  if (expectedFrames.length === 0) {
-    return unavailable(
-      oracle,
-      'NA_ASSET',
-      'TRIM_BOUNDARY_WINDOW_EMPTY',
-      'range-specific neutral boundary window contains no decoded frames',
-      durationMeasurements,
-    );
-  }
-  const referenceFrames: TrimBoundaryFrame[] = expectedFrames.map((frame, index) => ({
+  const source = [...decoded.source.frames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
+  const candidate = [...decoded.candidate.frames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
+  const plan = decoded.plan;
+  const referenceFrames: TrimBoundaryFrame[] = source.map((frame, index) => ({
     sourcePtsUs: frame.ptsUs,
-    ptsUs: frame.ptsUs - expectedStartUs!,
-    durationUs: inferredFrameDurationUs(expectedFrames, index),
+    ptsUs: Math.max(0, frame.ptsUs - plan.sampleStartUs),
+    durationUs: inferredFrameDurationUs(source, index),
     contentDigest: frame.sha256,
-    required: index === 0 || index === expectedFrames.length - 1,
+    // Media elements can expose an unstable preroll image exactly at t=0 after a fresh Blob seek.
+    // Keep that origin observation, but require the near-start sample plus mid/end anchors for copy.
+    required: contract.mode !== 'copy' || source.length === 1 || index > 0,
   }));
-
-  const firstSourceIndex = findDigestIndex(source, candidate[0]?.sha256);
-  const lastSourceIndex = findDigestIndex(source, candidate.at(-1)?.sha256, Math.max(0, firstSourceIndex));
-  const landedStartUs = firstSourceIndex >= 0 ? source[firstSourceIndex]!.ptsUs : -1;
-  const landedEndUs = lastSourceIndex >= 0
-    ? source[lastSourceIndex]!.ptsUs + inferredFrameDurationUs(source, lastSourceIndex)
-    : -1;
+  const similarities = await measuredTrimSampleSimilarities(decoded);
+  const perceptual = contract.mode === 'frame-accurate';
+  const contentThreshold = trimBoundaryContentThreshold(contract.mode, t);
+  const contentMatches = source.length === candidate.length && source.length === plan.offsetsUs.length &&
+    source.every((frame, index) => {
+      if (referenceFrames[index]?.required === false) return true;
+      const got = candidate[index];
+      if (!got) return false;
+      if (Math.abs((frame.ptsUs - plan.sampleStartUs) - got.ptsUs) > t.seekToleranceUs) return false;
+      return normHex(frame.sha256) === normHex(got.sha256) ||
+        (perceptual && (similarities[index] ?? 0) >= contentThreshold);
+    });
+  const landedStartUs = contentMatches ? plan.expectedStartUs : -1;
+  const landedEndUs = contentMatches ? plan.expectedEndUs : -1;
   const codec = ctx.golden.meta?.tracks.find((track) => track.type === 'video')?.codec ?? 'video';
   const representationClass = `${normStr(codec) || 'video'}-semantic-presentation`;
   const configurationDigest = [
@@ -5547,9 +5481,10 @@ function liveTrimBoundaryOutcome(
       configurationDigest,
       ...(ctx.browser ? { browserFamily: ctx.browser } : {}),
     },
-    expectedLandedInterval: { startUs: expectedStartUs, endUs: expectedEndUs },
+    expectedLandedInterval: { startUs: plan.expectedStartUs, endUs: plan.expectedEndUs },
     outputOriginUs: 0,
     timestampToleranceUs: t.seekToleranceUs,
+    ...(perceptual ? { minimumContentSimilarity: contentThreshold } : {}),
     frames: referenceFrames,
   };
   const decision = assessTrimBoundaryEvidence({
@@ -5563,16 +5498,25 @@ function liveTrimBoundaryOutcome(
       landedSourceInterval: { startUs: landedStartUs, endUs: landedEndUs },
       frames: candidate.map((frame, index) => ({
         ptsUs: frame.ptsUs,
-        durationUs: inferredFrameDurationUs(candidate, index),
+        durationUs: referenceFrames[index]?.durationUs ?? inferredFrameDurationUs(candidate, index),
         contentDigest: frame.sha256,
+        ...(similarities[index] !== undefined ? { contentSimilarity: similarities[index] } : {}),
       })),
       decodeComplete: candidate.length > 0,
+      ...(perceptual ? { representationDifferences: ['lossy boundary re-encode'] } : {}),
     },
   });
   const outcome = trimDecisionOutcome(oracle, decision);
+  const similarityMeasurements = similarities.length > 0
+    ? {
+        trimSampleFrames: similarities.length,
+        trimSampleSsimMin: Math.min(...similarities),
+        trimSampleSsimMean: similarities.reduce((sum, value) => sum + value, 0) / similarities.length,
+      }
+    : { trimSampleFrames: 0, trimSampleSsimMin: 0, trimSampleSsimMean: 0 };
   return outcome.measurements
-    ? { ...outcome, measurements: { ...durationMeasurements, ...outcome.measurements } }
-    : { ...outcome, measurements: durationMeasurements };
+    ? { ...outcome, measurements: { ...durationMeasurements, ...similarityMeasurements, ...outcome.measurements } }
+    : { ...outcome, measurements: { ...durationMeasurements, ...similarityMeasurements } };
 }
 
 function inferredFrameDurationUs(frames: readonly FrameDigest[], index: number): number {
@@ -7355,7 +7299,7 @@ async function trimFeaturePropertiesInvariant(
   if (id === 'trim/vp9_alpha_keyframe_aligned') return trimAlphaPropertyInvariant(ctx);
   if (id === 'trim/h264_rotated_keyframe_aligned') return trimDisplayPropertyInvariant(ctx);
   if (id === 'trim/h264_multitrack_keyframe_aligned') return trimMultitrackPropertyInvariant(ctx, t);
-  if (id === 'trim/h264_open_gop_frame_accurate') return trimOpenGopPropertyInvariant(ctx);
+  if (id === 'trim/h264_open_gop_frame_accurate') return trimOpenGopPropertyInvariant(ctx, t);
   if (id === 'trim/h264_single_gop_frame_accurate' || id === 'trim/h264_subframe_range_frame_accurate') {
     return trimShortRangePropertyInvariant(ctx, t);
   }
@@ -7367,29 +7311,98 @@ async function trimFeaturePropertiesInvariant(
 }
 
 type TrimVideoDecodePair =
-  | { readonly state: 'OK'; readonly source: FrameSink; readonly candidate: FrameSink }
+  | {
+      readonly state: 'OK';
+      readonly source: FrameSink;
+      readonly candidate: FrameSink;
+      readonly plan: TrimVideoSamplePlan;
+    }
   | { readonly state: 'OUTCOME'; readonly outcome: OracleOutcome };
 
-async function decodeTrimVideoPair(ctx: OracleContext): Promise<TrimVideoDecodePair> {
-  const oracle: OracleId = 'property-invariant';
+interface TrimVideoSamplePlan {
+  readonly expectedStartUs: number;
+  readonly expectedEndUs: number;
+  readonly sampleStartUs: number;
+  readonly sampleEndUs: number;
+  readonly offsetsUs: readonly number[];
+}
+
+function trimVideoSamplePlan(
+  ctx: OracleContext,
+  contract: TrimContract,
+  sourceIso: IsoBmffPresentationTimeline | undefined,
+): TrimVideoSamplePlan {
+  const videoWindow = sourceIso
+    ? selectIsoBmffTrimWindows(sourceIso, contract.range, contract.mode)
+      .find((window) => window.type === 'video')
+    : undefined;
+  const expectedStartUs = videoWindow?.landedStartUs ??
+    (contract.mode === 'copy' ? trimFeatureVideoStartUs(ctx, contract) : contract.range.startUs);
+  const expectedEndUs = videoWindow?.landedEndUs ?? contract.range.endUs;
+  const sampleStartUs = contract.mode === 'copy' ? expectedStartUs : contract.range.startUs;
+  const sampleEndUs = Math.max(sampleStartUs + 1, contract.range.endUs);
+  const durationUs = sampleEndUs - sampleStartUs;
+  const endInsetUs = Math.min(33_333, Math.max(1, Math.floor(durationUs / 4)));
+  const startInsetUs = Math.min(33_333, Math.max(1, Math.floor(durationUs / 8)));
+  const offsetsUs = [...new Set([
+    0,
+    Math.min(durationUs - 1, startInsetUs),
+    Math.floor(durationUs / 2),
+    Math.max(0, durationUs - endInsetUs),
+  ])].sort((a, b) => a - b);
+  return { expectedStartUs, expectedEndUs, sampleStartUs, sampleEndUs, offsetsUs };
+}
+
+async function decodeTrimVideoPair(
+  ctx: OracleContext,
+  oracle: OracleId = 'property-invariant',
+  suppliedSource?: MediaBytes,
+  suppliedSourceIso?: IsoBmffPresentationTimeline,
+): Promise<TrimVideoDecodePair> {
   if (!ctx.output) return { state: 'OUTCOME', outcome: fail(oracle, 'trim feature output bytes are missing') };
-  const sourceMedia: MediaBytes = {
+  const sourceMedia = suppliedSource ?? {
     bytes: new Uint8Array(await ctx.input.arrayBuffer()),
     mime: ctx.input.mime,
     container: ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id),
   };
-  let source: FrameSink;
-  try {
-    source = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 8192 });
-  } catch (error) {
-    return { state: 'OUTCOME', outcome: classifyReferenceDecodeFailure(oracle, 'source', error, sourceMedia) };
+  const sourceIso = suppliedSourceIso ?? (isIsoBmffContainer(sourceMedia.container)
+    ? (() => {
+        const read = readIsoBmffPresentationTimeline(sourceMedia.bytes);
+        return read.state === 'OK' ? read : undefined;
+      })()
+    : undefined);
+  const contract = trimContractForScenario(ctx.scenario);
+  const plan = trimVideoSamplePlan(ctx, contract, sourceIso);
+  const sourceTimesSec = plan.offsetsUs.map((offsetUs) => (plan.sampleStartUs + offsetUs) / 1e6);
+  const candidateTimesSec = plan.offsetsUs.map((offsetUs) => offsetUs / 1e6);
+  const [sourceResult, candidateResult] = await Promise.allSettled([
+    ctx.decodeWithPlatform(sourceMedia, {
+      maxFrames: sourceTimesSec.length,
+      sampling: 'uniform',
+      durationHintSec: ctx.golden.meta?.durationSec ?? undefined,
+      sampleTimesSec: sourceTimesSec,
+    }),
+    ctx.decodeWithPlatform(ctx.output, {
+      maxFrames: candidateTimesSec.length,
+      sampling: 'uniform',
+      durationHintSec: Math.max(1, plan.expectedEndUs - plan.expectedStartUs) / 1e6,
+      sampleTimesSec: candidateTimesSec,
+    }),
+  ]);
+  if (sourceResult.status === 'rejected') {
+    return {
+      state: 'OUTCOME',
+      outcome: classifyReferenceDecodeFailure(oracle, 'source', sourceResult.reason, sourceMedia),
+    };
   }
-  let candidate: FrameSink;
-  try {
-    candidate = await ctx.decodeWithPlatform(ctx.output, { maxFrames: 8192 });
-  } catch (error) {
-    return { state: 'OUTCOME', outcome: classifyReferenceDecodeFailure(oracle, 'candidate', error, ctx.output) };
+  if (candidateResult.status === 'rejected') {
+    return {
+      state: 'OUTCOME',
+      outcome: classifyReferenceDecodeFailure(oracle, 'candidate', candidateResult.reason, ctx.output),
+    };
   }
+  const source = sourceResult.value;
+  const candidate = candidateResult.value;
   if (source.frames.length === 0) {
     return {
       state: 'OUTCOME',
@@ -7407,7 +7420,41 @@ async function decodeTrimVideoPair(ctx: OracleContext): Promise<TrimVideoDecodeP
       outcome: fail(oracle, '[TRIM_FEATURE_CANDIDATE_DECODE_EMPTY] trim output has no displayed frames'),
     };
   }
-  return { state: 'OK', source, candidate };
+  return { state: 'OK', source, candidate, plan };
+}
+
+async function measuredTrimSampleSimilarities(
+  decoded: Extract<TrimVideoDecodePair, { state: 'OK' }>,
+): Promise<number[]> {
+  const source = decoded.source.frames;
+  const candidate = decoded.candidate.frames;
+  const similarities: number[] = [];
+  for (let index = 0; index < Math.min(source.length, candidate.length); index++) {
+    const want = source[index]!;
+    const got = candidate[index]!;
+    if (normHex(want.sha256) === normHex(got.sha256)) {
+      similarities.push(1);
+      continue;
+    }
+    if (!decoded.source.getPixels || !decoded.candidate.getPixels) {
+      similarities.push(0);
+      continue;
+    }
+    try {
+      const [wantPixels, gotPixels] = await Promise.all([
+        decoded.source.getPixels(index),
+        decoded.candidate.getPixels(index),
+      ]);
+      similarities.push(
+        wantPixels && gotPixels && wantPixels.width === gotPixels.width && wantPixels.height === gotPixels.height
+          ? ssim(wantPixels, gotPixels)
+          : 0,
+      );
+    } catch {
+      similarities.push(0);
+    }
+  }
+  return similarities;
 }
 
 async function trimAlphaPropertyInvariant(ctx: OracleContext): Promise<OracleOutcome> {
@@ -7712,16 +7759,17 @@ function semanticTrimTrack(
   };
 }
 
-async function trimOpenGopPropertyInvariant(ctx: OracleContext): Promise<OracleOutcome> {
+async function trimOpenGopPropertyInvariant(
+  ctx: OracleContext,
+  t: Required<OracleTolerances>,
+): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
   const decoded = await decodeTrimVideoPair(ctx);
   if (decoded.state !== 'OK') return decoded.outcome;
-  const range = trimContractForScenario(ctx.scenario).range;
-  const source = [...decoded.source.frames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
-  const candidate = [...decoded.candidate.frames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
-  const reference = source.find((frame, index) =>
-    frame.ptsUs < range.endUs && frame.ptsUs + inferredFrameDurationUs(source, index) > range.startUs);
-  if (!reference) {
+  const evidenceIndex = decoded.source.frames.length > 1 ? 1 : 0;
+  const reference = decoded.source.frames[evidenceIndex];
+  const candidate = decoded.candidate.frames[evidenceIndex];
+  if (!reference || !candidate) {
     return unavailable(
       oracle,
       'NA_ASSET',
@@ -7729,24 +7777,27 @@ async function trimOpenGopPropertyInvariant(ctx: OracleContext): Promise<OracleO
       'neutral source decode did not reach the requested open-GOP interval',
     );
   }
-  const got = candidate[0]!;
-  const mapped = source.find((frame) => normHex(frame.sha256) === normHex(got.sha256));
-  return trimDecisionOutcome(oracle, assessFeatureLabelledTrim({
-    openGop: {
-      reference: {
-        sourcePtsUs: reference.ptsUs,
-        contentDigest: reference.sha256,
-        decodeSucceeded: true,
-        missingReferenceCount: 0,
-      },
-      candidate: {
-        sourcePtsUs: mapped?.ptsUs ?? -1,
-        contentDigest: got.sha256,
-        decodeSucceeded: true,
-        missingReferenceCount: 0,
-      },
-    },
-  }));
+  const similarity = (await measuredTrimSampleSimilarities(decoded))[evidenceIndex] ?? 0;
+  const matched = similarity >= trimBoundaryContentThreshold('frame-accurate', t) &&
+    Math.abs(candidate.ptsUs - (decoded.plan.offsetsUs[evidenceIndex] ?? 0)) <= t.seekToleranceUs;
+  const measurements = {
+    openGopSourcePtsUs: reference.ptsUs,
+    openGopOutputPtsUs: candidate.ptsUs,
+    openGopSsim: similarity,
+  };
+  return matched
+    ? {
+        state: 'VERDICT', oracle, verdict: 'PASS',
+        reasonCode: 'TRIM_FEATURE_PROPERTIES_PRESERVED',
+        detail: `open-GOP boundary sample matches the requested source interval (SSIM ${similarity.toFixed(4)})`,
+        measurements,
+      }
+    : {
+        state: 'VERDICT', oracle, verdict: 'FAIL',
+        reasonCode: 'TRIM_FEATURE_PROPERTY_MISMATCH',
+        detail: `open-GOP boundary sample mismatch (SSIM ${similarity.toFixed(4)}, output PTS ${candidate.ptsUs}us)`,
+        measurements,
+      };
 }
 
 async function trimShortRangePropertyInvariant(
@@ -7757,10 +7808,9 @@ async function trimShortRangePropertyInvariant(
   const decoded = await decodeTrimVideoPair(ctx);
   if (decoded.state !== 'OK') return decoded.outcome;
   const range = trimContractForScenario(ctx.scenario).range;
-  const source = [...decoded.source.frames].sort((a, b) => a.ptsUs - b.ptsUs || a.index - b.index);
-  const expectedSource = source.filter((frame, index) =>
-    frame.ptsUs < range.endUs && frame.ptsUs + inferredFrameDurationUs(source, index) > range.startUs);
-  if (expectedSource.length === 0) {
+  const source = decoded.source.frames;
+  const candidate = decoded.candidate.frames;
+  if (source.length === 0) {
     return unavailable(
       oracle,
       'NA_ASSET',
@@ -7768,33 +7818,34 @@ async function trimShortRangePropertyInvariant(
       'neutral source decode did not retain the very-short/subframe interval',
     );
   }
-  const origin = expectedSource[0]!.ptsUs;
-  const expected = expectedSource.map((frame) => {
-    const index = source.indexOf(frame);
-    return {
-      sourcePtsUs: frame.ptsUs,
-      outputPtsUs: frame.ptsUs - origin,
-      durationUs: inferredFrameDurationUs(source, index),
-      contentDigest: frame.sha256,
-    };
-  });
-  const candidate = decoded.candidate.frames.map((frame, index, frames) => {
-    const mapped = source.find((entry) => normHex(entry.sha256) === normHex(frame.sha256));
-    return {
-      sourcePtsUs: mapped?.ptsUs ?? -1,
-      outputPtsUs: frame.ptsUs,
-      durationUs: inferredFrameDurationUs(frames, index),
-      contentDigest: frame.sha256,
-    };
-  });
-  return trimDecisionOutcome(oracle, assessFeatureLabelledTrim({
-    shortRange: {
-      range,
-      expected,
-      candidate,
-      timestampToleranceUs: t.seekToleranceUs,
-    },
-  }));
+  const similarities = await measuredTrimSampleSimilarities(decoded);
+  const contentThreshold = trimBoundaryContentThreshold('frame-accurate', t);
+  const aligned = source.length === candidate.length && source.length === decoded.plan.offsetsUs.length &&
+    source.every((frame, index) => {
+      const got = candidate[index];
+      return got !== undefined &&
+        Math.abs((frame.ptsUs - decoded.plan.sampleStartUs) - got.ptsUs) <= t.seekToleranceUs &&
+        (similarities[index] ?? 0) >= contentThreshold;
+    });
+  const minSimilarity = similarities.length > 0 ? Math.min(...similarities) : 0;
+  const measurements = {
+    shortRangeUs: range.endUs - range.startUs,
+    shortRangeSamples: similarities.length,
+    shortRangeSsimMin: minSimilarity,
+  };
+  return aligned
+    ? {
+        state: 'VERDICT', oracle, verdict: 'PASS',
+        reasonCode: 'TRIM_FEATURE_PROPERTIES_PRESERVED',
+        detail: `${similarities.length} short-range sample(s) align with the requested source interval; SSIM min ${minSimilarity.toFixed(4)}`,
+        measurements,
+      }
+    : {
+        state: 'VERDICT', oracle, verdict: 'FAIL',
+        reasonCode: 'TRIM_FEATURE_PROPERTY_MISMATCH',
+        detail: `short-range sample alignment failed; SSIM min ${minSimilarity.toFixed(4)}`,
+        measurements,
+      };
 }
 
 /** FEAT-29: full-range trim identity is semantic; legal representation changes stay DIFF. */

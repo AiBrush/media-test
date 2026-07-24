@@ -73,6 +73,7 @@ import type {
   OperationContext,
   PacketInfo,
   SeekResult,
+  SerializableValue,
   SupportDecision,
   TrackType,
   TranscodeOptions,
@@ -113,7 +114,9 @@ import {
 } from './support.ts';
 import {
   closeAll,
-  retainLowestPts,
+  decodePrefixProgressSatisfied,
+  retainLowestPtsValue,
+  retainSeekLandingCandidates,
   seekGopProgressSatisfied,
   selectSeekLanding,
   sortByPresentationTime,
@@ -945,7 +948,7 @@ export interface WebDemuxerConfigUsed {
   readerMode: 'package-stream-or-bounded-iso-bmff-range';
   writerMode: 'none';
   targetMode: 'none';
-  codecConfigs: VideoDecoderConfig[];
+  codecConfigs: SerializableValue[];
   package: 'web-demuxer@4.0.0';
   lockIntegrity: string;
   wasmExport: 'web-demuxer/wasm';
@@ -962,12 +965,13 @@ export interface WebDemuxerConfigUsed {
     seekChunks: number;
   };
   lastDemuxBackend?: 'worker-ffmpeg-wasm' | 'iso-bmff-sample-table';
-  lastDecoderConfig?: VideoDecoderConfig;
+  lastDecoderConfig?: SerializableValue;
   lifecycle: {
     initAttempts: number;
     readyCount: number;
     loadCount: number;
     destroyCount: number;
+    recycleCount: number;
     readinessMs?: number;
   };
 }
@@ -983,11 +987,20 @@ export interface WebDemuxerEngineDependencies {
 
 /**
  * web-demuxer engine: probe + demux + seek (lossless, browser-codec-independent) and optional
- * decodeFrames (browser-codec-gated WebCodecs decode). The heavy WASM is compiled once in init()
- * inside the bundled worker; dispose() terminates it for clean peak-memory.
+ * decodeFrames (browser-codec-gated WebCodecs decode). The worker-backed WASM is initialized in
+ * init(); truncated streams recycle the worker, and dispose() terminates it for clean peak-memory.
  */
 export class WebDemuxerEngine implements MediaEngine {
   readonly id = ENGINE_ID;
+  readonly benchmarkLimits = Object.freeze({
+    maxInnerIterations: 1,
+    memoryWindow: Object.freeze({
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 1_000,
+    }),
+  });
   readonly configUsed: WebDemuxerConfigUsed = {
     framework: 'web-demuxer',
     packageVersions: { 'web-demuxer': '4.0.0' },
@@ -1014,12 +1027,13 @@ export class WebDemuxerEngine implements MediaEngine {
       retainedPixelBytes: MAX_RETAINED_PIXEL_BYTES,
       seekChunks: MAX_SEEK_CHUNKS,
     },
-    lifecycle: { initAttempts: 0, readyCount: 0, loadCount: 0, destroyCount: 0 },
+    lifecycle: { initAttempts: 0, readyCount: 0, loadCount: 0, destroyCount: 0, recycleCount: 0 },
   };
 
   /** Library constructor, captured in init() (dynamic import keeps the suite shell light). */
   private WebDemuxerCtor: typeof WebDemuxerType | null = null;
-  /** Reused demuxer instance so the WASM compiles ONCE; each op load()s its own input. */
+  private packageWasmUrl: string | null = null;
+  /** Reused demuxer instance; truncated stream cancellation may replace it at an operation boundary. */
   private demuxer: WebDemuxerType | null = null;
   private lifecycleState: 'new' | 'initializing' | 'ready' | 'disposing' | 'disposed' = 'new';
   private initPromise: Promise<void> | null = null;
@@ -1129,6 +1143,7 @@ export class WebDemuxerEngine implements MediaEngine {
       packageWasmUrl = wasmDataUrlFromBytes(bytes);
       this.configUsed.wasmTransport = 'same-origin-materialized-data-url';
     }
+    this.packageWasmUrl = packageWasmUrl;
     try {
       const demuxer = new this.WebDemuxerCtor({ wasmFilePath: packageWasmUrl });
       this.demuxer = demuxer;
@@ -1170,6 +1185,7 @@ export class WebDemuxerEngine implements MediaEngine {
       void context;
       this.destroyDemuxer();
       this.WebDemuxerCtor = null;
+      this.packageWasmUrl = null;
       this.lifecycleState = 'disposed';
     })();
     try {
@@ -1185,6 +1201,27 @@ export class WebDemuxerEngine implements MediaEngine {
     this.demuxer = null;
     demuxer.destroy();
     this.configUsed.lifecycle.destroyCount++;
+  }
+
+  private async recycleDemuxer(context?: OperationContext): Promise<void> {
+    this.destroyDemuxer();
+    if (context?.signal.aborted) return;
+    const Ctor = this.WebDemuxerCtor;
+    const wasmFilePath = this.packageWasmUrl;
+    if (!Ctor || !wasmFilePath) throw new Error(`${ENGINE_ID}: cannot recycle an uninitialized worker`);
+    const demuxer = new Ctor({ wasmFilePath });
+    this.demuxer = demuxer;
+    try {
+      await raceAbort(
+        demuxer.load('data:application/octet-stream;base64,'),
+        context?.signal,
+        () => this.destroyDemuxer(),
+      );
+      this.configUsed.lifecycle.recycleCount++;
+    } catch (error) {
+      this.destroyDemuxer();
+      throw error;
+    }
   }
 
   private requireDemuxer(): WebDemuxerType {
@@ -1467,14 +1504,44 @@ export class WebDemuxerEngine implements MediaEngine {
       return sink;
     }
 
-    const collected: TimedClosable<VideoFrame>[] = [];
+    const collected: TimedClosable<ImageData>[] = [];
+    const rasterTasks = new Set<Promise<void>>();
     const exhaustive = opts?.maxFrames === undefined;
     const decodeTuple = context ? webDemuxerTupleSummary(context.request) : {};
     let callbackCount = 0;
     let firstFrameMs: number | undefined;
     let callbackError: unknown;
+    let outputError: unknown;
     let primaryError: unknown;
     let arrivalIndex = 0;
+    const rasterizeAndClose = async (
+      frame: VideoFrame,
+      ptsUs: number,
+      frameArrivalIndex: number,
+    ): Promise<void> => {
+      let image: ImageData | undefined;
+      let frameError: unknown;
+      try {
+        image = await imageDataFromVideoFrame(frame, context?.signal);
+      } catch (error) {
+        frameError = error;
+      }
+      try {
+        frame.close();
+      } catch (error) {
+        const cleanupError = new AggregateError([error], 'failed to close 1 decoded frame');
+        frameError = combineErrors(frameError, cleanupError, 'web-demuxer decoded frame close failed');
+      }
+      if (frameError !== undefined) throw frameError;
+      retainLowestPtsValue(
+        collected,
+        { ptsUs, value: image!, arrivalIndex: frameArrivalIndex },
+        maxFrames,
+      );
+    };
+    const settleRasterTasks = async (): Promise<void> => {
+      await Promise.all([...rasterTasks]);
+    };
     const decoder = new VideoDecoder({
       output: (frame) => {
         callbackCount++;
@@ -1483,9 +1550,16 @@ export class WebDemuxerEngine implements MediaEngine {
           firstFrameMs = atMs;
           context?.emit({ type: 'first-frame', atMs });
         }
-        context?.emit({ type: 'decoded-frame-count', atMs, count: callbackCount });
         if (exhaustive && callbackCount > maxFrames) {
-          frame.close();
+          try {
+            frame.close();
+          } catch (error) {
+            outputError = combineErrors(
+              outputError,
+              new AggregateError([error], 'failed to close 1 decoded frame'),
+              'web-demuxer excess frame close failed',
+            );
+          }
           callbackError ??= createNotApplicableError(
             ENGINE_ID,
             'decodeFrames',
@@ -1495,11 +1569,15 @@ export class WebDemuxerEngine implements MediaEngine {
           );
           return;
         }
-        retainLowestPts(
-          collected,
-          { ptsUs: Math.round(frame.timestamp), value: frame, arrivalIndex: arrivalIndex++ },
-          maxFrames,
-        );
+        const ptsUs = Math.round(frame.timestamp);
+        const frameArrivalIndex = arrivalIndex++;
+        let task: Promise<void>;
+        task = rasterizeAndClose(frame, ptsUs, frameArrivalIndex)
+          .catch((error) => {
+            outputError = combineErrors(outputError, error, 'web-demuxer frame rasterization failed');
+          })
+          .finally(() => rasterTasks.delete(task));
+        rasterTasks.add(task);
       },
       error: (error) => {
         callbackError = error;
@@ -1512,6 +1590,8 @@ export class WebDemuxerEngine implements MediaEngine {
       .getReader();
     let completed = false;
     let submittedChunks = 0;
+    let decoderFlushed = false;
+    let firstSubmittedPtsUs: number | undefined;
     try {
       decoder.configure(prepared.config);
       for (;;) {
@@ -1537,15 +1617,32 @@ export class WebDemuxerEngine implements MediaEngine {
           );
           break;
         }
-        decoder.decode(prepared.demuxer.genEncodedChunk('video', value as WebAVPacket));
-        submittedChunks++;
-        if (decoder.decodeQueueSize >= 64) {
+        const chunk = prepared.demuxer.genEncodedChunk('video', value as WebAVPacket);
+        firstSubmittedPtsUs ??= Math.round(chunk.timestamp);
+        const reachedPrefixBoundary = !exhaustive && decodePrefixProgressSatisfied(
+          chunk,
+          maxFrames,
+          submittedChunks,
+          firstSubmittedPtsUs,
+        );
+        const startsLaterGop = chunk.type === 'key' && submittedChunks > 0;
+        if (startsLaterGop) {
           await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+          decoderFlushed = true;
+          await settleRasterTasks();
         }
+        if (reachedPrefixBoundary) break;
+        decoder.decode(chunk);
+        submittedChunks++;
+        decoderFlushed = false;
       }
       if (primaryError === undefined) {
-        await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        if (!decoderFlushed) {
+          await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        }
+        await settleRasterTasks();
         if (callbackError !== undefined) primaryError = callbackError;
+        if (outputError !== undefined && primaryError === undefined) primaryError = outputError;
       }
     } catch (error) {
       primaryError = callbackError === undefined
@@ -1553,7 +1650,19 @@ export class WebDemuxerEngine implements MediaEngine {
         : combineErrors(callbackError, error, 'web-demuxer decode callback and operation both failed');
     } finally {
       try {
-        await settleReader(reader, completed);
+        await settleRasterTasks();
+        if (callbackError !== undefined && primaryError === undefined) primaryError = callbackError;
+        if (outputError !== undefined && primaryError === undefined) primaryError = outputError;
+      } catch (cleanupError) {
+        primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer decode raster cleanup failed');
+      }
+      try {
+        await settleReader(
+          reader,
+          completed,
+          undefined,
+          () => this.recycleDemuxer(context),
+        );
       } catch (cleanupError) {
         primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer decode reader cleanup failed');
       }
@@ -1566,7 +1675,7 @@ export class WebDemuxerEngine implements MediaEngine {
 
     if (primaryError !== undefined) {
       const emittedFrames = callbackCount;
-      primaryError = closeFrameSet(collected, primaryError);
+      if (outputError !== undefined) throw primaryError;
       if (emittedFrames > 0 && !mustPreserveError(primaryError)) {
         throw new WebDemuxerPartialDecodeError('decode', emittedFrames, primaryError);
       }
@@ -1574,21 +1683,25 @@ export class WebDemuxerEngine implements MediaEngine {
     }
 
     sortByPresentationTime(collected);
-    let outputError: unknown;
+    let digestError: unknown;
     try {
       for (let index = 0; index < collected.length; index++) {
-        const { ptsUs, value: frame } = collected[index]!;
-        const image = await imageDataFromVideoFrame(frame, context?.signal);
+        const { ptsUs, value: image } = collected[index]!;
         sink.add(await digestImageData(image, index, ptsUs, context?.signal), image);
         if (index === 0) opts?.onFirstFrame?.(this.dependencies.now());
       }
     } catch (error) {
-      outputError = error;
+      digestError = error;
     }
-    outputError = closeFrameSet(collected, outputError);
-    if (outputError !== undefined) throw outputError;
+    if (digestError !== undefined) throw digestError;
+    const deliveredFrames = sink.frames.length;
+    context?.emit({
+      type: 'decoded-frame-count',
+      atMs: this.dependencies.now() - startedAt,
+      count: deliveredFrames,
+    });
     sink.telemetry = {
-      decodedFrames: callbackCount,
+      decodedFrames: deliveredFrames,
       ...(firstFrameMs !== undefined ? { firstFrameMs } : {}),
     };
     sink.selectedTrack = {
@@ -1627,13 +1740,6 @@ export class WebDemuxerEngine implements MediaEngine {
     let arrivalIndex = 0;
     let callbackError: unknown;
     let primaryError: unknown;
-    const retainedFrameBudget = Math.max(
-      1,
-      Math.min(
-        MAX_SEEK_CHUNKS,
-        Math.floor(MAX_RETAINED_PIXEL_BYTES / Math.max(1, decoderPixelBytes(prepared.config))),
-      ),
-    );
     const tuple = context ? webDemuxerTupleSummary(context.request) : {};
     const decoder = new VideoDecoder({
       output: (frame) => {
@@ -1644,18 +1750,15 @@ export class WebDemuxerEngine implements MediaEngine {
           context?.emit({ type: 'first-frame', atMs });
         }
         context?.emit({ type: 'decoded-frame-count', atMs, count: callbackCount });
-        if (decoded.length >= retainedFrameBudget) {
-          frame.close();
-          callbackError ??= createNotApplicableError(
-            ENGINE_ID,
-            'seek',
-            `seek GOP exceeds retained frame budget ${retainedFrameBudget}`,
-            tuple,
-            WEB_DEMUXER_REASON.MEMORY_BUDGET,
+        try {
+          retainSeekLandingCandidates(
+            decoded,
+            { ptsUs: Math.round(frame.timestamp), value: frame, arrivalIndex: arrivalIndex++ },
+            targetUs,
           );
-          return;
+        } catch (error) {
+          callbackError = combineErrors(callbackError, error, 'web-demuxer seek frame retention failed');
         }
-        decoded.push({ ptsUs: Math.round(frame.timestamp), value: frame, arrivalIndex: arrivalIndex++ });
       },
       error: (error) => {
         callbackError = error;
@@ -1666,6 +1769,7 @@ export class WebDemuxerEngine implements MediaEngine {
       .readAVPacket(targetSec, endSec, AV_MEDIA_VIDEO, prepared.stream.index, AV_SEEK_FLAG_BACKWARD)
       .getReader();
     let completed = false;
+    let decoderFlushed = false;
     let sawAtOrBeforeTarget = false;
     let keysAfterTarget = 0;
     try {
@@ -1699,15 +1803,19 @@ export class WebDemuxerEngine implements MediaEngine {
         if (chunk.type === 'key' && chunk.timestamp > targetUs) keysAfterTarget++;
         submittedPtsUs.push(Math.round(chunk.timestamp));
         decoder.decode(chunk);
+        decoderFlushed = false;
         const reachedBoundary = seekGopProgressSatisfied(chunk, targetUs, priorAtOrBefore)
           || (!sawAtOrBeforeTarget && keysAfterTarget >= 2);
-        if (decoder.decodeQueueSize >= 64 || reachedBoundary) {
+        if (reachedBoundary) {
           await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+          decoderFlushed = true;
         }
         if (reachedBoundary) break;
       }
       if (primaryError === undefined) {
-        await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        if (!decoderFlushed) {
+          await raceAbort(decoder.flush(), context?.signal, () => closeDecoder(decoder));
+        }
         if (callbackError !== undefined) primaryError = callbackError;
       }
     } catch (error) {
@@ -1716,7 +1824,12 @@ export class WebDemuxerEngine implements MediaEngine {
         : combineErrors(callbackError, error, 'web-demuxer seek callback and operation both failed');
     } finally {
       try {
-        await settleReader(reader, completed);
+        await settleReader(
+          reader,
+          completed,
+          undefined,
+          () => this.recycleDemuxer(context),
+        );
       } catch (cleanupError) {
         primaryError = combineErrors(primaryError, cleanupError, 'web-demuxer seek reader cleanup failed');
       }
@@ -1884,8 +1997,9 @@ export class WebDemuxerEngine implements MediaEngine {
         browserConfig,
       );
     }
-    this.configUsed.lastDecoderConfig = cloneVideoDecoderConfig(exact);
-    this.configUsed.codecConfigs = [cloneVideoDecoderConfig(exact)];
+    const configEvidence = jsonVideoDecoderConfig(exact);
+    this.configUsed.lastDecoderConfig = configEvidence;
+    this.configUsed.codecConfigs = [configEvidence];
     return {
       demuxer,
       config: exact,
@@ -2006,6 +2120,43 @@ function cloneVideoDecoderConfig(config: VideoDecoderConfig): VideoDecoderConfig
   };
 }
 
+function jsonVideoDecoderConfig(config: VideoDecoderConfig): Record<string, SerializableValue> {
+  const out: Record<string, SerializableValue> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (
+      typeof value === 'string'
+      || typeof value === 'boolean'
+      || (typeof value === 'number' && Number.isFinite(value))
+      || value === null
+    ) {
+      out[key] = value;
+      continue;
+    }
+    if (key === 'description' && (ArrayBuffer.isView(value) || value instanceof ArrayBuffer)) {
+      const bytes = ArrayBuffer.isView(value)
+        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+        : new Uint8Array(value);
+      out.descriptionHex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      continue;
+    }
+    if (value && typeof value === 'object') {
+      const nested: Record<string, SerializableValue> = {};
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        if (
+          typeof nestedValue === 'string'
+          || typeof nestedValue === 'boolean'
+          || (typeof nestedValue === 'number' && Number.isFinite(nestedValue))
+          || nestedValue === null
+        ) {
+          nested[nestedKey] = nestedValue;
+        }
+      }
+      if (Object.keys(nested).length > 0) out[key] = nested;
+    }
+  }
+  return out;
+}
+
 function resolveDecodeFrameLimit(
   requested: number | undefined,
   _stream: WebAVStream,
@@ -2094,11 +2245,20 @@ async function settleReader<T>(
   reader: ReadableStreamDefaultReader<T>,
   completed: boolean,
   primaryError?: unknown,
+  afterCancellationRequested?: () => Promise<void>,
 ): Promise<void> {
   let cleanupError: unknown;
   if (!completed) {
     try {
-      await reader.cancel();
+      if (afterCancellationRequested) {
+        // web-demuxer 4 posts Stop but can leave this promise pending. Dispatch cancellation,
+        // then destroy/recreate that worker as the terminal cleanup boundary.
+        const cancellation = reader.cancel();
+        void cancellation.catch(() => undefined);
+        await afterCancellationRequested();
+      } else {
+        await reader.cancel();
+      }
     } catch (error) {
       cleanupError = error;
     }

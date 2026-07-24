@@ -13,8 +13,8 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | demux | V | V | V | V | V | V |
 | remux | V | V | V | V | V | V |
 | transcode | V | V | V | V | V | V |
-| decode-seek | V | V | V | V | A | P |
-| trim | P | P | P | P | P | P |
+| decode-seek | V | V | V | V | V | V |
+| trim | A | P | P | P | P | P |
 | mux | P | P | P | P | P | P |
 | encryption | P | P | P | P | P | P |
 | metadata | P | P | P | P | P | P |
@@ -23,7 +23,7 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | robustness | P | P | P | P | P | P |
 | performance | P | P | P | P | P | P |
 
-Totals: 28 verified, 1 active, 49 pending.
+Totals: 30 verified, 1 active, 47 pending.
 
 ## Campaign invariants
 
@@ -43,8 +43,8 @@ Totals: 28 verified, 1 active, 49 pending.
   `5773fa053a32f66ab871972183ceed4bf666f306c910adb6393c8ccf8fbba294`
 - Oracle definition digest:
   `be38bfb3dc2ba637c3ffa19a55bec738993945771dedb8aa99141ada123b53d6`
-- Current regression gate (2026-07-24): focused Remotion, decode-seek, and runner
-  regressions 102 pass with 721 assertions; full suite 1125 pass with 14092
+- Current regression gate (2026-07-24): focused aibrush-media and decode-seek
+  regressions 82 pass with 371 assertions; full suite 1129 pass with 14114
   assertions across 80 files on the same executable source; typecheck clean,
   `git diff --check` clean, and `git diff --cached --check` clean.
 
@@ -934,12 +934,99 @@ Totals: 28 verified, 1 active, 49 pending.
   `6233733280048e17114a124ea54723114025bc28f2b5bb88bbe3afabfb798f35`.
 - Suggested commit message: `cell(decode-seek × remotion): complete exhaustive decode evidence`
 
-## Active cell
-
 ### decode-seek × web-demuxer@4.0.0
 
-- Scope lock: only web-demuxer decode/seek adapter/support behavior and
-  decode-seek-owned shared layers when independently proven necessary.
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T15-44-35-630Z.json`. It completed in about
+  42 seconds with 24 PASS, 12 NA_ASSET, 6 NA_ENGINE, and four isolated adverse
+  rows. Focused fresh-browser proofs then passed the repaired reorder case in
+  `results/raw/chromium-2026-07-24T15-44-21-981Z.json` and all four remaining
+  adverse rows together in
+  `results/raw/chromium-2026-07-24T15-46-09-931Z.json`. The quick matrix was
+  not redundantly replayed because the immediately following exhaustive run
+  covered every quick row and selected candidate.
+- Authoritative exhaustive:
+  `results/raw/chromium-2026-07-24T15-46-23-887Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `40e3f8d3-a0e1-4403-ad68-ff69b49ea330`.
+- Exhaustive terminal rows: 40 PASS and 6 NA_ENGINE. Across 106 selected
+  candidates, 43 passed, 42 were NA_ASSET, and 21 were NA_ENGINE; coverage
+  grades were 26 full, 14 partial, and 6 none. There were no outer or nested
+  FAIL, ERROR, or SKIPPED outcomes.
+- Concrete NA_ENGINE evidence covers JPEG/PNG/WebP image decoding, the
+  decode-remux composition that requires an undeclared remux operation, VP9
+  alpha, and display-matrix rotation. Partial rows contain a passing committed
+  candidate plus generated candidates whose committed frame evidence is
+  unavailable; no executable admissible candidate failed.
+- Repairs make decoder-config evidence JSON-safe, bound benchmark repetition
+  and sampling, retain only bounded decode/seek surfaces, close rasterized
+  frames promptly, flush only at key-safe GOP boundaries, choose the nearest
+  real seek PTS with an earlier tie, and recycle the package worker when
+  web-demuxer 4 leaves its stream-cancellation promise pending.
+- Focused web-demuxer/decode-seek/conformance regressions: 76 pass with 432
+  assertions. Cell boundary: full suite 1128 pass with 14110 assertions across
+  80 files, typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Exhaustive artifact content hash:
+  `fd785808f2b71ff97ac390d7f0ed9bde3e9946493eea723b7c900a92e2e87871`;
+  file SHA-256:
+  `bd6a86b05959a0ae3122cb16bb2530acc24f05282b0d311eebc31ed8fc6750cd`.
+- Suggested commit message: `cell(decode-seek × web-demuxer): complete exhaustive decode evidence`
+
+### decode-seek × aibrush-media
+
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T15-57-36-508Z.json`. It completed in about
+  31 seconds with 27 PASS, 17 NA_ASSET, 1 NA_ENGINE, and one isolated failure:
+  `seek_vfr_arbitrary` returned 4433333 instead of the nearest real PTS
+  4233333 for target 4250000. The focused fresh-browser proof passed after the
+  seek repair in `results/raw/chromium-2026-07-24T16-04-34-590Z.json`; the
+  quick matrix was not redundantly replayed because exhaustive coverage
+  immediately superseded it.
+- The first exhaustive diagnostic,
+  `results/raw/chromium-2026-07-24T16-04-45-684Z.json`, isolated the remaining
+  admissible failure to the baked `decode_vp9_alpha` candidate. Its final
+  focused proof is
+  `results/raw/chromium-2026-07-24T16-17-20-113Z.json`: RGB SSIM mean/minimum
+  1.0 over eight frames and all 12 timestamp-keyed alpha planes exact. A
+  shared-path MediaBunny cross-check also passed in
+  `results/raw/chromium-2026-07-24T16-17-36-649Z.json`.
+- Authoritative exhaustive:
+  `results/raw/chromium-2026-07-24T16-18-58-098Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `96928afe-4825-42d4-a41d-4445478c849c`.
+- Exhaustive terminal rows: 44 PASS, 1 NA_ASSET, and 1 NA_ENGINE. Across 106
+  selected candidates, 50 passed, 55 were NA_ASSET, and 1 was NA_ENGINE;
+  coverage grades were 26 full, 18 partial, and 2 none. There were no outer,
+  nested, or oracle FAIL, ERROR, or SKIPPED outcomes.
+- Concrete NA_ENGINE evidence: the framework decode API exposes only primary
+  video track 0, so `decode_multitrack_select_video` cannot select requested
+  track 1. The sole whole-row NA_ASSET is rotated-display decoding while its
+  committed frame evidence remains unavailable. Other partial rows combine a
+  passing committed candidate with generated candidates lacking committed
+  evidence; no executable admissible candidate failed.
+- Repairs align seek requests to the framework's public packet table, choosing
+  the nearest observed PTS (earlier on ties, and keyframe-at-or-before when
+  requested). WebM alpha decoding now uses the framework's public color/alpha
+  packet seam with the shared WebCodecs decoder, and copies the decoder's
+  native alpha luma plane directly so RGBA premultiplication and range
+  conversion cannot corrupt exact alpha evidence.
+- Focused aibrush-media/decode-seek regressions: 82 pass with 371 assertions.
+  Cell boundary: full suite 1129 pass with 14114 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and `git diff --cached --check`
+  clean.
+- Exhaustive artifact content hash:
+  `6162b018d95d723ce6f20e4c1fc6a34e6a0d65f6d8ceb927fcd59eaf9fc6e223`;
+  file SHA-256:
+  `7ebee8d5d82303afb3c40ef25a30070877c048239cb590fe4e223fce29329510`.
+- Suggested commit message: `cell(decode-seek × aibrush-media): complete exhaustive decode evidence`
+
+## Active cell
+
+### trim × mediabunny
+
+- Scope lock: only Mediabunny trim adapter/support behavior and trim-owned
+  shared layers when independently proven necessary.
 - Quick: pending.
 - Exhaustive: pending.
 - Boundary gates: pending.

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import type { NormalizedMetadata } from '../src/core/engine.ts';
-import { enrichAibrushProbeMetadata } from '../src/engines/aibrush-media/adapter.ts';
+import {
+  enrichAibrushProbeMetadata,
+  selectAibrushSeekPacketPts,
+} from '../src/engines/aibrush-media/adapter.ts';
 import {
   buildAibrushDemuxResult,
   normalizeAibrushTrack,
@@ -8,6 +11,27 @@ import {
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('selects nearest real seek PTS with an earlier tie and keyframes at-or-before', () => {
+    const tracks = [
+      { mediaType: 'audio' },
+      { mediaType: 'video' },
+    ];
+    const packets = [
+      { trackIndex: 0, ptsUs: 4_250_000, keyframe: true },
+      { trackIndex: 1, ptsUs: 4_433_333, keyframe: false },
+      { trackIndex: 1, ptsUs: 4_233_333, keyframe: false },
+      { trackIndex: 1, ptsUs: 4_000_000, keyframe: true },
+      { trackIndex: 1, ptsUs: 5_000_000, keyframe: true },
+    ];
+    expect(selectAibrushSeekPacketPts(tracks, packets, 4_250_000, false)).toBe(4_233_333);
+    expect(selectAibrushSeekPacketPts(tracks, [
+      { trackIndex: 1, ptsUs: 4_200_000, keyframe: false },
+      { trackIndex: 1, ptsUs: 4_300_000, keyframe: false },
+    ], 4_250_000, false)).toBe(4_200_000);
+    expect(selectAibrushSeekPacketPts(tracks, packets, 4_250_000, true)).toBe(4_000_000);
+    expect(selectAibrushSeekPacketPts(tracks, packets, -1, true)).toBe(4_000_000);
+  });
+
   test('enriches probe metadata from selected bytes without inventing container facts', async () => {
     const mp4 = new Uint8Array(await Bun.file('fixtures/media/h264_1080p_30s.mp4').arrayBuffer());
     const branded = enrichAibrushProbeMetadata({

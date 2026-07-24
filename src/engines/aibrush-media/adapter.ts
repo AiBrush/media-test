@@ -93,6 +93,7 @@ import { takeFirstOwned } from './ownership.ts';
 // Byte-for-byte the SAME normalization the golden producer uses (platform engine). Reusing these (not
 // re-deriving them) is what makes aibrush-media's decode/seek frame digests comparable to golden.
 import { digestImageData, sha256Hex } from '../platform/digest.ts';
+import { decodeWithWebCodecs, type DecodeInput } from '../platform/decode.ts';
 import { imageDataFromVideoFrame } from '../platform/raster.ts';
 
 const ENGINE_ID = 'aibrush-media@dev'; // instance .id — the versioned id stamped on every result + report
@@ -290,6 +291,55 @@ interface AibrushPacketInfoTable {
   tracks: ReadonlyArray<AibrushTrackInfo>;
   packets: ReadonlyArray<AibrushPacketInfoMetadata>;
 }
+
+/**
+ * Resolve the packet PTS required by the suite's seek contract from the framework's own timeline.
+ * Ordinary seeks choose the nearest real presentation sample (earlier wins a tie); keyframe seeks
+ * choose the latest real sync sample at/before the target, falling forward only before the first sync.
+ */
+export function selectAibrushSeekPacketPts(
+  tracks: readonly { readonly mediaType: string }[],
+  packets: readonly {
+    readonly trackIndex: number;
+    readonly ptsUs: number;
+    readonly keyframe: boolean;
+  }[],
+  targetUs: number,
+  expectKeyframe: boolean,
+): number | undefined {
+  const videoTrackIndex = tracks.findIndex((track) => track.mediaType === 'video');
+  if (videoTrackIndex < 0) return undefined;
+  let best: number | undefined;
+  if (expectKeyframe) {
+    let firstAfter: number | undefined;
+    for (const packet of packets) {
+      const ptsUs = packet.ptsUs;
+      if (
+        packet.trackIndex !== videoTrackIndex ||
+        !packet.keyframe ||
+        !Number.isFinite(ptsUs)
+      ) continue;
+      if (ptsUs <= targetUs) {
+        if (best === undefined || ptsUs > best) best = ptsUs;
+      } else if (firstAfter === undefined || ptsUs < firstAfter) {
+        firstAfter = ptsUs;
+      }
+    }
+    return best ?? firstAfter;
+  }
+  let bestDelta = Number.POSITIVE_INFINITY;
+  for (const packet of packets) {
+    const ptsUs = packet.ptsUs;
+    if (packet.trackIndex !== videoTrackIndex || !Number.isFinite(ptsUs)) continue;
+    const delta = Math.abs(ptsUs - targetUs);
+    if (delta < bestDelta || (delta === bestDelta && (best === undefined || ptsUs < best))) {
+      best = ptsUs;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
 interface AibrushWebmPacketPayloadMetadata extends AibrushPacketInfoMetadata {
   readonly data: Uint8Array;
   readonly alpha?: Uint8Array;
@@ -3057,6 +3107,46 @@ function webmPayloadChunksForTrack(
   return chunks.length === 0 ? undefined : chunks;
 }
 
+function alphaDecodeInputFromWebmPayloadInfo(
+  table: AibrushWebmPacketPayloadInfoTable,
+): DecodeInput | undefined {
+  const trackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
+  const track = table.tracks[trackIndex];
+  const config = track?.config;
+  const codecString = config?.codec ?? track?.codec;
+  const codedWidth = config?.codedWidth;
+  const codedHeight = config?.codedHeight;
+  if (
+    trackIndex < 0 ||
+    typeof codecString !== 'string' ||
+    codedWidth === undefined ||
+    codedHeight === undefined ||
+    !Number.isSafeInteger(codedWidth) ||
+    !Number.isSafeInteger(codedHeight) ||
+    codedWidth <= 0 ||
+    codedHeight <= 0
+  ) {
+    return undefined;
+  }
+  const samples = table.packets
+    .filter((row) => row.trackIndex === trackIndex && row.data.byteLength > 0 && Number.isFinite(row.ptsUs))
+    .map((row) => ({
+      data: row.data,
+      ...(row.alpha !== undefined && row.alpha.byteLength > 0 ? { alpha: row.alpha } : {}),
+      ptsUs: Math.round(row.ptsUs),
+      dtsUs: Math.round(row.dtsUs ?? row.ptsUs),
+      keyframe: row.keyframe,
+    }));
+  if (samples.length === 0 || !samples.some((sample) => sample.alpha !== undefined)) return undefined;
+  return {
+    codecString,
+    codedWidth,
+    codedHeight,
+    ...(config?.description !== undefined ? { description: bufferBytes(config.description) } : {}),
+    samples,
+  };
+}
+
 function preparedWebmChunkTracksFromPayloadInfo(
   table: AibrushWebmPacketPayloadInfoTable,
 ): Array<{ readonly track: AibrushTrackInfo; readonly chunks: readonly AibrushPreparedWebmChunk[] }> | undefined {
@@ -4949,6 +5039,39 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   /**
+   * Preserve straight-alpha RGB at the adapter boundary. The framework's merged RGBA VideoFrame keeps
+   * its exact pixels in a private WeakMap; a second VideoFrame rasterization can premultiply transparent
+   * RGB. Its public core packet seam exposes the exact VPx colour/alpha payloads, so normalize the two
+   * decoded planes directly to ImageData before digesting, exactly like the committed golden producer.
+   */
+  async #tryDirectAlphaDecode(
+    input: MediaInput,
+    maxFrames: number,
+    signal: AbortSignal,
+    onFirstFrame?: () => void,
+  ): Promise<FrameSink | undefined> {
+    const container = containerFromInput(input);
+    if (
+      (container !== 'webm' && container !== 'mkv') ||
+      input.mutated ||
+      isMalformedHarnessInput(input)
+    ) return undefined;
+    const bytes =
+      input.sizeBytes !== undefined && input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES
+        ? await inputBytes(input)
+        : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
+    if (bytes === undefined) return undefined;
+    signal.throwIfAborted();
+    const decodeInput = alphaDecodeInputFromWebmPayloadInfo(
+      this.#driverCore().webmPacketPayloadInfoFromBytes(bytes),
+    );
+    if (decodeInput === undefined) return undefined;
+    const sink = await decodeWithWebCodecs(decodeInput, { maxFrames, onFirstFrame });
+    signal.throwIfAborted();
+    return sink;
+  }
+
+  /**
    * Decode the first `maxFrames` presentation frames of `rows` with the POOLED decoder and return a
    * RetainingFrameSink of their digests — the same (presentation-ordered, 0..N-1 re-indexed) shape the
    * streaming path produces, so the decoded-frames-bitexact oracle pairs frame[i]↔golden[i]. Every decoded
@@ -5104,6 +5227,42 @@ export class AibrushMediaEngine implements MediaEngine {
       return engine.from(await inputBytes(input), { mime: input.mime });
     }
     return this.#src(engine, input);
+  }
+
+  async #packetAlignedSeekTarget(
+    engine: AibrushEngine,
+    input: MediaInput,
+    targetUs: number,
+    signal: AbortSignal,
+  ): Promise<{ readonly targetUs: number; readonly usedPacketInfo: boolean }> {
+    if (
+      engine.packetInfo === undefined ||
+      input.mutated ||
+      isHlsAsset(input) ||
+      !Number.isFinite(targetUs)
+    ) {
+      return { targetUs, usedPacketInfo: false };
+    }
+    let table: AibrushPacketInfoTable;
+    try {
+      table = await engine.packetInfo(await this.#src(engine, input), {
+        signal,
+        container: containerFromInput(input),
+      });
+    } catch (error) {
+      signal.throwIfAborted();
+      if (this.#errorClasses !== undefined && error instanceof this.#errorClasses.CapabilityError) {
+        return { targetUs, usedPacketInfo: false };
+      }
+      throw error;
+    }
+    const selected = selectAibrushSeekPacketPts(
+      table.tracks,
+      table.packets,
+      targetUs,
+      this.#currentRequest?.options.expectKeyframe === true,
+    );
+    return { targetUs: selected ?? targetUs, usedPacketInfo: true };
   }
 
   capabilities(): CapabilitySet {
@@ -5702,6 +5861,23 @@ export class AibrushMediaEngine implements MediaEngine {
           return sink;
         };
 
+        if (this.#currentRequest?.options.alphaEvidence !== undefined) {
+          const directAlpha = await this.#tryDirectAlphaDecode(input, maxFrames, signal, onFirstFrame);
+          if (directAlpha !== undefined) {
+            this.#activeRoute = 'core.webm-alpha-packets+webcodecs';
+            this.#configEvidence.record({
+              operation: 'decodeFrames',
+              route: this.#activeRoute,
+              internalDriver: 'framework-router-unexposed',
+              readerMode: 'packet-info',
+              writerMode: 'framework-default',
+              targetMode: 'framework-default',
+              peakRetainedBytes: 0,
+              callbackWriteCount: 0,
+            });
+            return finish(directAlpha);
+          }
+        }
         if ((!selected || selected.presence.hasVideo) && canUseDirectBoundedDecode(input, maxFrames)) {
           try {
             const direct = await this.#tryDirectBoundedDecode(input, maxFrames, signal, onFirstFrame);
@@ -5745,11 +5921,9 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   /**
-   * Frame-accurate seek: the engine decodes from the keyframe at/before `tUs` and returns the single
-   * frame at/just-after it. We rasterize + digest that frame (golden-compatible path) and report its
-   * real presentation pts as the landed time, then close the frame exactly once. The `seek-accuracy`
-   * oracle gates on the landed pts (timestamps), and `decoded-frames-bitexact` (when seek-target golden
-   * exists) on the digest — both satisfied by returning `{ landedPtsUs, frame }`.
+   * Frame-accurate seek: packet-info first resolves the suite's nearest-real-sample/keyframe policy,
+   * then the engine decodes from the keyframe at/before that exact PTS. We rasterize + digest the frame
+   * (golden-compatible path), report its real presentation PTS, and close it exactly once.
    */
   async seek(
     input: MediaInput,
@@ -5764,9 +5938,23 @@ export class AibrushMediaEngine implements MediaEngine {
     return this.#run('seek', 'framework.seek', context, async (signal) => {
       try {
         const engine = this.#engine();
+        const planned = await this.#packetAlignedSeekTarget(engine, input, seekUs, signal);
+        if (planned.usedPacketInfo) {
+          this.#activeRoute = 'framework.packet-info+seek';
+          this.#configEvidence.record({
+            operation: 'seek',
+            route: this.#activeRoute,
+            internalDriver: 'framework-router-unexposed',
+            readerMode: 'packet-info+framework-source',
+            writerMode: 'framework-default',
+            targetMode: 'framework-default',
+            peakRetainedBytes: 0,
+            callbackWriteCount: 0,
+          });
+        }
         const frame = await engine.seek(
           await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
-          seekUs,
+          planned.targetUs,
           { signal },
         );
         try {

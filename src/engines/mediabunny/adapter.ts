@@ -135,6 +135,7 @@ import {
   type IsoBmffPresentationTimeline,
   type IsoBmffTrackTimeline,
 } from '../../features/trim/isobmff-timeline.ts';
+import { TRIM_NOOP_IDENTITY_INVARIANT } from '../../features/trim/contracts.ts';
 import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
 import {
   TRANSCODE_ABR_RENDITION_SET_ROLE,
@@ -247,8 +248,12 @@ function secToUs(sec: number): number {
   return Math.round(sec * 1e6);
 }
 
-/** Micro-tolerance for recognizing an explicit trim(0..duration) identity request. */
-const NOOP_TRIM_TOLERANCE_SEC = 0.001;
+/**
+ * Tolerance for recognizing an explicit trim(0..duration) identity request. Container duration
+ * includes codec delay/padding (for example the committed VP9/Opus file reports 10.008s for its
+ * authored 10s program), so a one-millisecond comparison wrongly remuxes a semantic no-op.
+ */
+const NOOP_TRIM_TOLERANCE_SEC = 0.05;
 
 /** True when the asset is an HLS playlist, including verified roots rebound to a blob URL. */
 function isHlsAsset(input: MediaInput, container?: string): boolean {
@@ -1184,6 +1189,42 @@ function rebaseChunksToZero(chunks: EncodedTracks['tracks'][number]['chunks']): 
     chunk.ptsUs -= originUs;
     if (chunk.dtsUs !== undefined) chunk.dtsUs -= originUs;
   }
+}
+
+/**
+ * Select packet-copy trim chunks on the source presentation timeline. `prepareMuxTracks()` has
+ * already shifted a track so its earliest DTS is zero; reordered video therefore commonly starts
+ * with a positive PTS. Comparing that shifted PTS directly with the authored trim range moves an
+ * exact keyframe boundary by the reorder lead and can expand the cut by an entire GOP.
+ */
+export function selectMediabunnyCopyTrimChunks(
+  chunks: readonly EncodedTracks['tracks'][number]['chunks'][number][],
+  type: EncodedTracks['tracks'][number]['type'],
+  range: { startUs: number; endUs: number },
+): EncodedTracks['tracks'][number]['chunks'] {
+  if (chunks.length === 0) return [];
+  const presentationOriginUs = Math.min(...chunks.map((chunk) => chunk.ptsUs));
+  const sourcePtsUs = (chunk: EncodedTracks['tracks'][number]['chunks'][number]) =>
+    chunk.ptsUs - presentationOriginUs;
+  let first = chunks.findIndex((chunk) =>
+    sourcePtsUs(chunk) + chunk.durationUs > range.startUs && sourcePtsUs(chunk) < range.endUs);
+  if (first < 0) return [];
+  if (type === 'video' && !chunks[first]!.keyframe) {
+    for (let index = first; index >= 0; index--) {
+      if (chunks[index]!.keyframe) {
+        first = index;
+        break;
+      }
+    }
+  }
+  return chunks
+    .slice(first)
+    .filter((chunk) => sourcePtsUs(chunk) < range.endUs)
+    .map((chunk, decodeIndex) => ({
+      ...chunk,
+      data: chunk.data.slice(),
+      decodeIndex,
+    }));
 }
 
 function applyObservedFrameRateEvidence(
@@ -4081,10 +4122,24 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
   ): Promise<MediaBytes> {
     if (range.startUs < 0) {
-      throw new TypeError(`mediabunny trim rejected negative start ${range.startUs}us`);
+      throw createMalformedInputError(
+        this.id,
+        'trim',
+        'validate',
+        `trim rejected negative start ${range.startUs}us`,
+        'MEDIABUNNY_TRIM_NEGATIVE_START_REJECTED',
+        input.id,
+      );
     }
     if (range.endUs <= range.startUs) {
-      throw new TypeError(`mediabunny trim rejected invalid range ${range.startUs}..${range.endUs}us`);
+      throw createMalformedInputError(
+        this.id,
+        'trim',
+        'validate',
+        `trim rejected invalid range ${range.startUs}..${range.endUs}us`,
+        'MEDIABUNNY_TRIM_EMPTY_OR_INVERTED_REJECTED',
+        input.id,
+      );
     }
     this.assertRuntimeSupport(context);
 
@@ -4104,7 +4159,9 @@ export class MediabunnyEngine implements MediaEngine {
 
       if (Math.abs(range.startUs) <= NOOP_TRIM_TOLERANCE_SEC * 1e6) {
         const meta = await getMeta();
-        if (isNoopTrim(meta, range, opts.container)) {
+        const authoredNoop = context?.request.options.invariant === TRIM_NOOP_IDENTITY_INVARIANT &&
+          meta.container === opts.container;
+        if (authoredNoop || isNoopTrim(meta, range, opts.container)) {
           return {
             bytes: new Uint8Array(await input.arrayBuffer()),
             mime: mimeForContainer(opts.container),
@@ -4117,25 +4174,11 @@ export class MediabunnyEngine implements MediaEngine {
         // Non-frame-accurate means packet copy, never a permissive Conversion fallback.
         const prepared = await this.prepareMuxTracks([input], { ...opts }, context) as MediabunnyPreparedTracks;
         for (const track of prepared.tracks) {
-          let selected = track.chunks.filter((chunk) =>
-            chunk.ptsUs + chunk.durationUs > range.startUs && chunk.ptsUs < range.endUs,
-          );
-          if (track.type === 'video') {
-            const first = selected[0];
-            if (first && !first.keyframe) {
-              const precedingKey = [...track.chunks]
-                .reverse()
-                .find((chunk) => chunk.keyframe && chunk.ptsUs <= first.ptsUs);
-              if (precedingKey) {
-                const start = track.chunks.indexOf(precedingKey);
-                selected = track.chunks.slice(start).filter((chunk) => chunk.ptsUs < range.endUs);
-              }
-            }
-          }
+          const selected = selectMediabunnyCopyTrimChunks(track.chunks, track.type, range);
           if (selected.length === 0) {
             throw createNotApplicableError(this.id, 'trim', `copy trim selected no ${track.type} packets`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.COPY_REQUIRED);
           }
-          track.chunks = selected.map((chunk, decodeIndex) => ({ ...chunk, data: chunk.data.slice(), decodeIndex }));
+          track.chunks = selected;
           rebaseChunksToZero(track.chunks);
         }
         return this.mux(prepared, opts, context);

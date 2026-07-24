@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import {
   CONCRETE_OPERATION_PROTOCOL,
+  captureConfigUsedSnapshot,
   isBrowserNotSupportedError,
   type ConcreteOperationRequest,
   type LifecycleContext,
@@ -28,7 +29,10 @@ beforeEach(() => {
   FakeWebDemuxer.instances.length = 0;
   FakeVideoDecoder.supportConfigs.length = 0;
   FakeVideoDecoder.configured.length = 0;
+  FakeVideoDecoder.flushCalls = 0;
   FakeVideoFrame.closed.length = 0;
+  FakeVideoFrame.liveCount = 0;
+  FakeVideoFrame.maxLiveCount = 0;
   plan = defaultPlan();
   decoderPlan = { outputOrder: 'input' };
 });
@@ -273,10 +277,13 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
     expect(FakeVideoDecoder.configured[0]).toEqual({
       codec: 'avc1.640028', codedWidth: 1, codedHeight: 1, description: new Uint8Array([1, 2, 3]),
     });
-    expect(engine.configUsed.lastDecoderConfig).toEqual(FakeVideoDecoder.configured[0]);
+    expect(engine.configUsed.lastDecoderConfig).toEqual({
+      codec: 'avc1.640028', codedWidth: 1, codedHeight: 1, descriptionHex: '010203',
+    });
+    expect(() => captureConfigUsedSnapshot(engine.id, engine.configUsed, { requireProfile: true })).not.toThrow();
     expect(FakeVideoFrame.closed.sort((a, b) => a - b)).toEqual([0, 100_000, 200_000, 300_000]);
-    expect(sink.telemetry).toMatchObject({ decodedFrames: 4 });
-    expect(events.filter((event) => event.type === 'decoded-frame-count').at(-1)).toMatchObject({ count: 4 });
+    expect(sink.telemetry).toMatchObject({ decodedFrames: 2 });
+    expect(events.filter((event) => event.type === 'decoded-frame-count').at(-1)).toMatchObject({ count: 2 });
     await engine.dispose(lifecycle());
   });
 
@@ -317,6 +324,20 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
     expect(FakeWebDemuxer.instances[0]!.decoderConfigStreamIndices).toEqual([12]);
     expect(FakeWebDemuxer.instances[0]!.reads[0]?.streamIndex).toBe(12);
     expect(FakeVideoDecoder.supportConfigs[0]).toMatchObject({ codec: 'avc1.4d401f' });
+    await engine.dispose(lifecycle());
+  });
+
+  test('rasterizes linear decode at key-safe boundaries and closes decoder surfaces promptly', async () => {
+    installWebCodecs();
+    plan.packets = Array.from({ length: 10 }, (_, index) => packet(index / 30, index === 0 || index === 6 ? 1 : 0));
+    const engine = makeEngine();
+    await engine.init(lifecycle());
+    const sink = await engine.decodeFrames(input(), { maxFrames: 3 }, operationContext('decodeFrames'));
+    expect(sink.frames).toHaveLength(3);
+    expect(FakeVideoFrame.liveCount).toBe(0);
+    expect(FakeVideoFrame.closed).toHaveLength(6);
+    expect(FakeWebDemuxer.instances).toHaveLength(2);
+    expect(engine.configUsed.lifecycle.recycleCount).toBe(1);
     await engine.dispose(lifecycle());
   });
 
@@ -418,6 +439,7 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
 
   test('seek reads to a real next-GOP boundary beyond 0.75s and lands by sorted real PTS', async () => {
     installWebCodecs();
+    plan.streamCancelGate = new Promise<void>(() => undefined);
     plan.info = mediaInfo({ duration: 4 });
     plan.packets = [
       packet(0, 1),
@@ -435,8 +457,13 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
       start: 1, end: 5, streamIndex: 9, seekFlag: 1,
     });
     expect(FakeWebDemuxer.instances[0]!.streamCancelCalls).toBe(1);
+    expect(FakeWebDemuxer.instances[0]!.destroyCalls).toBe(1);
+    expect(FakeWebDemuxer.instances).toHaveLength(2);
+    expect(engine.configUsed.lifecycle.recycleCount).toBe(1);
+    expect(FakeVideoDecoder.flushCalls).toBe(1);
     expect(FakeVideoFrame.closed.sort((a, b) => a - b)).toEqual([0, 800_000, 1_200_000, 2_000_000]);
     await engine.dispose(lifecycle());
+    expect(FakeWebDemuxer.instances[1]!.destroyCalls).toBe(1);
   });
 });
 
@@ -449,6 +476,7 @@ interface FakePlan {
   packets: WebAVPacket[];
   packetsByStream?: Map<number, WebAVPacket[]>;
   streamFactory?: () => ReadableStream<WebAVPacket>;
+  streamCancelGate?: Promise<void>;
 }
 
 interface DecoderPlan {
@@ -521,8 +549,9 @@ class FakeWebDemuxer {
         if (value) controller.enqueue(value);
         else controller.close();
       },
-      cancel: () => {
+      cancel: async () => {
         this.streamCancelCalls++;
+        await plan.streamCancelGate;
       },
     });
   }
@@ -531,6 +560,7 @@ class FakeWebDemuxer {
 class FakeVideoDecoder {
   static supportConfigs: VideoDecoderConfig[] = [];
   static configured: VideoDecoderConfig[] = [];
+  static flushCalls = 0;
   state: CodecState = 'unconfigured';
   decodeQueueSize = 0;
   private readonly queued: EncodedVideoChunk[] = [];
@@ -554,6 +584,7 @@ class FakeVideoDecoder {
   }
 
   async flush(): Promise<void> {
+    FakeVideoDecoder.flushCalls++;
     const queued = this.queued.splice(0);
     this.decodeQueueSize = 0;
     const ordered = decoderPlan.outputOrder === 'input'
@@ -577,12 +608,19 @@ class FakeVideoDecoder {
 
 class FakeVideoFrame {
   static closed: number[] = [];
+  static liveCount = 0;
+  static maxLiveCount = 0;
   readonly codedWidth = 1;
   readonly codedHeight = 1;
   readonly displayWidth = 1;
   readonly displayHeight = 1;
 
-  constructor(readonly timestamp: number) {}
+  private isClosed = false;
+
+  constructor(readonly timestamp: number) {
+    FakeVideoFrame.liveCount++;
+    FakeVideoFrame.maxLiveCount = Math.max(FakeVideoFrame.maxLiveCount, FakeVideoFrame.liveCount);
+  }
 
   async copyTo(destination: AllowSharedBufferSource): Promise<PlaneLayout[]> {
     decoderPlan.copyStarted?.resolve();
@@ -597,6 +635,9 @@ class FakeVideoFrame {
   }
 
   close(): void {
+    if (this.isClosed) return;
+    this.isClosed = true;
+    FakeVideoFrame.liveCount--;
     FakeVideoFrame.closed.push(this.timestamp);
     if (decoderPlan.closeErrorTimestamp === this.timestamp) throw new Error(`close failed at ${this.timestamp}`);
   }

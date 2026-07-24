@@ -163,8 +163,7 @@ export async function decodeWithWebCodecs(input: DecodeInput, opts?: DecodeOptio
       let img = await imageDataFromVideoFrame(frame);
       const alphaFrame = alphaByPts.get(ptsUs);
       if (alphaFrame) {
-        const alphaImg = await imageDataFromVideoFrame(alphaFrame);
-        img = mergeAlphaPlane(img, alphaImg);
+        img = mergeAlphaPlane(img, await alphaLumaPlaneFromVideoFrame(alphaFrame, img.width, img.height));
       }
       const digest = await digestImageData(img, i, ptsUs);
       sink.add(digest, img);
@@ -241,15 +240,45 @@ async function collectDecodedFrames<T extends { ptsUs: number; keyframe: boolean
   return prefix;
 }
 
-function mergeAlphaPlane(color: ImageData, alpha: ImageData): ImageData {
-  if (color.width !== alpha.width || color.height !== alpha.height) {
+async function alphaLumaPlaneFromVideoFrame(
+  frame: VideoFrame,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
+  if (frame.displayWidth !== width || frame.displayHeight !== height) {
     throw new Error(
-      `alpha plane dimensions ${alpha.width}x${alpha.height} do not match color frame ` +
-        `${color.width}x${color.height}`,
+      `alpha plane dimensions ${frame.displayWidth}x${frame.displayHeight} do not match color frame ` +
+        `${width}x${height}`,
+    );
+  }
+  // Matroska VPx alpha stores opacity as a grayscale VPx elementary stream. Its decoded Y samples are
+  // the alpha bytes; rasterizing that frame as RGBA first applies video-range Y→RGB expansion and changes
+  // the plane. Copy the decoder's native planar layout and tighten plane 0; Chromium may reject an
+  // explicit I420 conversion even though its native VPx output exposes the same luma plane.
+  const storage = new Uint8Array(frame.allocationSize());
+  const layout = await frame.copyTo(storage);
+  const y = layout[0];
+  if (y === undefined || y.offset < 0 || y.stride < width) {
+    throw new Error('decoded VPx alpha frame has no valid I420 luma plane');
+  }
+  const alpha = new Uint8Array(width * height);
+  for (let row = 0; row < height; row++) {
+    const start = y.offset + row * y.stride;
+    const end = start + width;
+    if (end > storage.byteLength) throw new Error('decoded VPx alpha luma plane is truncated');
+    alpha.set(storage.subarray(start, end), row * width);
+  }
+  return alpha;
+}
+
+function mergeAlphaPlane(color: ImageData, alpha: Uint8Array): ImageData {
+  if (alpha.byteLength !== color.width * color.height) {
+    throw new Error(
+      `alpha plane has ${alpha.byteLength} bytes for color frame ${color.width}x${color.height}`,
     );
   }
   for (let i = 0; i < color.data.length; i += 4) {
-    color.data[i + 3] = alpha.data[i] as number;
+    color.data[i + 3] = alpha[i / 4] as number;
   }
   return color;
 }

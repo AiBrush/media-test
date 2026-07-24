@@ -27,7 +27,9 @@ import {
 } from '../src/engines/web-demuxer/mp4-sample-table.ts';
 import {
   closeAll,
+  decodePrefixProgressSatisfied,
   retainLowestPts,
+  retainSeekLandingCandidates,
   seekGopProgressSatisfied,
   selectSeekLanding,
   sortByPresentationTime,
@@ -261,13 +263,28 @@ describe('REQ-ENG-28: deterministic temporal helpers', () => {
     expect(closed.sort((a, b) => a - b)).toEqual([10, 20, 50, 80, 90]);
   });
 
-  test('selects max real PTS <= target, falls forward before zero, and proves demux timing', () => {
+  test('selects the nearest real PTS with an earlier tie, falls forward before zero, and proves timing', () => {
     const values = [300, 100, 200].map((ptsUs, arrivalIndex) => ({
       ptsUs, arrivalIndex, value: { close: () => undefined },
     }));
     expect(selectSeekLanding(values, 250, [100, 200, 300])?.ptsUs).toBe(200);
+    expect(selectSeekLanding(values, 280, [100, 200, 300])?.ptsUs).toBe(300);
     expect(selectSeekLanding(values, -1, [100, 200, 300])?.ptsUs).toBe(100);
     expect(() => selectSeekLanding(values, 250, [100, 300])).toThrow('absent from submitted');
+  });
+
+  test('retains only the nearest seek candidates and closes superseded decoder surfaces', () => {
+    const closed: number[] = [];
+    const retained: Array<{ ptsUs: number; arrivalIndex: number; value: { close(): void } }> = [];
+    for (const [arrivalIndex, ptsUs] of [2_000_000, 1_200_000, 0, 800_000, 1_500_000].entries()) {
+      retainSeekLandingCandidates(retained, {
+        ptsUs,
+        arrivalIndex,
+        value: { close: () => closed.push(ptsUs) },
+      }, 1_000_000);
+    }
+    expect(retained.map((item) => item.ptsUs).sort((a, b) => a - b)).toEqual([800_000, 1_200_000]);
+    expect(closed.sort((a, b) => a - b)).toEqual([0, 1_500_000, 2_000_000]);
   });
 
   test('uses a next-key GOP boundary rather than a fixed time window and exposes partial failure', () => {
@@ -278,6 +295,18 @@ describe('REQ-ENG-28: deterministic temporal helpers', () => {
     expect(new WebDemuxerPartialDecodeError('seek', 3, new Error('truncated'))).toMatchObject({
       name: 'WebDemuxerPartialDecodeError', reasonCode: 'WEB_DEMUXER_PARTIAL_DECODE', emittedFrames: 3,
     });
+  });
+
+  test('closes a leading decode prefix only at a later keyframe after the requested count', () => {
+    expect(decodePrefixProgressSatisfied(
+      { type: 'key', timestamp: 0 } as EncodedVideoChunk, 1, 1, 0,
+    )).toBe(false);
+    expect(decodePrefixProgressSatisfied(
+      { type: 'delta', timestamp: 2_000_000 } as EncodedVideoChunk, 3, 60, 0,
+    )).toBe(false);
+    expect(decodePrefixProgressSatisfied(
+      { type: 'key', timestamp: 2_000_000 } as EncodedVideoChunk, 3, 61, 0,
+    )).toBe(true);
   });
 });
 

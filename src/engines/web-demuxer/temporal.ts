@@ -31,27 +31,59 @@ export function retainLowestPts<T extends Closable>(
   candidate: TimedClosable<T>,
   limit: number,
 ): void {
+  retainLowestPtsValue(retained, candidate, limit)?.value.close();
+}
+
+/** Keep the lowest presentation-time values and return the evicted value to its owner. */
+export function retainLowestPtsValue<T>(
+  retained: TimedClosable<T>[],
+  candidate: TimedClosable<T>,
+  limit: number,
+): TimedClosable<T> | undefined {
   if (limit <= 0) {
-    candidate.value.close();
-    return;
+    return candidate;
   }
   retained.push(candidate);
-  if (retained.length <= limit) return;
+  if (retained.length <= limit) return undefined;
   let largest = 0;
   for (let index = 1; index < retained.length; index++) {
     if (compareTimed(retained[index]!, retained[largest]!) > 0) largest = index;
   }
   const [removed] = retained.splice(largest, 1);
-  removed?.value.close();
+  return removed;
 }
 
 export function sortByPresentationTime<T>(values: TimedClosable<T>[]): TimedClosable<T>[] {
   return values.sort(compareTimed);
 }
 
+/** Keep only the two frames sufficient for the seek rule, independent of callback ordering. */
+export function retainSeekLandingCandidates<T extends Closable>(
+  retained: TimedClosable<T>[],
+  candidate: TimedClosable<T>,
+  targetUs: number,
+): void {
+  const beforeTarget = candidate.ptsUs <= targetUs;
+  const index = retained.findIndex((item) => (item.ptsUs <= targetUs) === beforeTarget);
+  if (index < 0) {
+    retained.push(candidate);
+    return;
+  }
+  const current = retained[index]!;
+  const preferred = beforeTarget
+    ? candidate.ptsUs > current.ptsUs
+    : candidate.ptsUs < current.ptsUs;
+  if (!preferred) {
+    candidate.value.close();
+    return;
+  }
+  retained[index] = candidate;
+  current.value.close();
+}
+
 /**
- * Deterministic seek rule: greatest real decoded PTS <= target; if no preceding frame exists, the
- * earliest following frame. The selected PTS must also exist in the submitted demux evidence.
+ * Deterministic seek rule: nearest real decoded PTS to the target, with the earlier frame winning
+ * an exact tie. The selected PTS must also exist in the submitted demux evidence.
  */
 export function selectSeekLanding<T>(
   decoded: TimedClosable<T>[],
@@ -62,9 +94,10 @@ export function selectSeekLanding<T>(
   if (!decoded.length) return undefined;
   const ordered = [...decoded].sort(compareTimed);
   let landed = ordered[0]!;
-  for (const candidate of ordered) {
-    if (candidate.ptsUs <= targetUs) landed = candidate;
-    else break;
+  for (const candidate of ordered.slice(1)) {
+    const candidateDistance = Math.abs(candidate.ptsUs - targetUs);
+    const landedDistance = Math.abs(landed.ptsUs - targetUs);
+    if (candidateDistance < landedDistance) landed = candidate;
   }
   const observed = submittedPtsUs.some((ptsUs) => Math.abs(ptsUs - landed.ptsUs) <= toleranceUs);
   if (!observed) {
@@ -82,6 +115,19 @@ export function seekGopProgressSatisfied(
   hasSubmittedAtOrBeforeTarget: boolean,
 ): boolean {
   return hasSubmittedAtOrBeforeTarget && chunk.type === 'key' && chunk.timestamp > targetUs;
+}
+
+/** A later keyframe closes the presentation-reorder window for a requested leading-N prefix. */
+export function decodePrefixProgressSatisfied(
+  chunk: Pick<EncodedVideoChunk, 'timestamp' | 'type'>,
+  requestedFrames: number,
+  submittedChunks: number,
+  firstSubmittedPtsUs: number | undefined,
+): boolean {
+  return submittedChunks >= requestedFrames
+    && firstSubmittedPtsUs !== undefined
+    && chunk.type === 'key'
+    && chunk.timestamp > firstSubmittedPtsUs;
 }
 
 export function closeAll<T extends Closable>(values: readonly TimedClosable<T>[]): void {
