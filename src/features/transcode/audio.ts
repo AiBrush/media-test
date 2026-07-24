@@ -1,6 +1,10 @@
 import { readOutputStructureResult } from '../../core/box-readers.ts';
 import { decodeNativePcm, readPcmStructure } from '../audio-dsp/index.ts';
-import { demuxMp4GaplessAudio, demuxMp4Tracks } from '../../engines/platform/demux-mp4.ts';
+import {
+  demuxMp4GaplessAudio,
+  demuxMp4Tracks,
+  type Mp4GaplessAudioTrack,
+} from '../../engines/platform/demux-mp4.ts';
 import { demuxWebmTracks } from '../../engines/platform/demux-webm.ts';
 import { readFlacProgram } from '../remux/reader-flac.ts';
 import { readOggProgram } from '../remux/reader-ogg.ts';
@@ -92,7 +96,26 @@ export interface LossyAudioContract {
   readonly channelTransform?: 'stereo-to-mono-average';
 }
 
-export type TranscodeAudioContentContract = LosslessAudioContract | LossyAudioContract;
+export interface DecoderEquivalentAudioContract {
+  /**
+   * Compares independent decoders of the same lossy source. Sparse implementation-specific
+   * transients are admitted only inside a narrow maximum-error band, while aggregate fidelity
+   * remains protected by the SNR, RMS, and correlation bounds.
+   */
+  readonly kind: 'decoder-equivalent';
+  readonly minimumSnrDb: number;
+  readonly maximumRmsError: number;
+  readonly maximumAbsoluteError: number;
+  readonly minimumChannelCorrelation: number;
+  readonly sampleFrameTolerance: number;
+  readonly requireExplicitTimeline: boolean;
+  readonly channelTransform?: 'stereo-to-mono-average';
+}
+
+export type TranscodeAudioContentContract =
+  | LosslessAudioContract
+  | LossyAudioContract
+  | DecoderEquivalentAudioContract;
 
 /** Neutral structural coverage for every audio write target used by the transcode family. */
 export function readTranscodeAudioStructure(
@@ -135,6 +158,96 @@ export function decodedPcmFromContainer(
     timeline: {
       kind: 'whole-program' as const,
       presentationSampleFrames: decoded.value.decodedSampleFrames,
+    },
+  });
+}
+
+/** Decode ISO-BMFF AAC in its coded/native domain so edit-list priming and remainder stay explicit. */
+export async function decodedAacPcmFromMp4(bytes: Uint8Array): Promise<DecodedAudioSignal | undefined> {
+  if (typeof AudioDecoder === 'undefined' || typeof EncodedAudioChunk === 'undefined') return undefined;
+  let track: Mp4GaplessAudioTrack;
+  try {
+    track = demuxMp4GaplessAudio(bytes);
+  } catch {
+    return undefined;
+  }
+  const config: AudioDecoderConfig = {
+    codec: track.config.codecString,
+    sampleRate: track.config.sampleRate,
+    numberOfChannels: track.config.channels,
+    ...(track.config.description ? { description: track.config.description.slice() } : {}),
+  };
+  const support = await AudioDecoder.isConfigSupported(config);
+  if (!support.supported) return undefined;
+
+  const blocks: Array<{ frames: number; channels: number; planes: Float32Array[] }> = [];
+  let callbackError: DOMException | undefined;
+  const decoder = new AudioDecoder({
+    output(data) {
+      try {
+        const planes: Float32Array[] = [];
+        for (let channel = 0; channel < data.numberOfChannels; channel++) {
+          const plane = new Float32Array(data.numberOfFrames);
+          data.copyTo(plane, { planeIndex: channel, format: 'f32-planar' });
+          planes.push(plane);
+        }
+        blocks.push({ frames: data.numberOfFrames, channels: data.numberOfChannels, planes });
+      } catch (error) {
+        callbackError = error instanceof DOMException
+          ? error
+          : new DOMException(error instanceof Error ? error.message : String(error), 'DataError');
+      } finally {
+        data.close();
+      }
+    },
+    error(error) {
+      callbackError = error;
+    },
+  });
+  try {
+    decoder.configure(config);
+    for (const sample of track.samples) {
+      decoder.decode(new EncodedAudioChunk({
+        type: 'key',
+        timestamp: sample.ptsUs,
+        duration: Math.max(1, sample.durationUs),
+        data: sample.data,
+      }));
+    }
+    await decoder.flush();
+    if (callbackError) throw callbackError;
+  } finally {
+    decoder.close();
+  }
+  const channels = blocks[0]?.channels ?? 0;
+  if (channels <= 0 || blocks.some((block) => block.channels !== channels)) {
+    throw new DOMException('AAC decoder emitted no stable channel layout', 'DataError');
+  }
+  const sampleFrames = blocks.reduce((sum, block) => sum + block.frames, 0);
+  const samples = new Float64Array(sampleFrames * channels);
+  let frameOffset = 0;
+  for (const block of blocks) {
+    for (let frame = 0; frame < block.frames; frame++) {
+      for (let channel = 0; channel < channels; channel++) {
+        samples[(frameOffset + frame) * channels + channel] = block.planes[channel]![frame]!;
+      }
+    }
+    frameOffset += block.frames;
+  }
+  return Object.freeze({
+    sampleRate: track.config.sampleRate,
+    channels,
+    sampleFrames,
+    samples,
+    timelineDomain: 'coded' as const,
+    timeline: {
+      kind: 'aac-isobmff' as const,
+      codedSampleFrames: track.codedSampleFrames,
+      primingFrames: track.primingFrames,
+      remainderFrames: track.remainderFrames,
+      presentationSampleFrames: track.presentationSampleFrames,
+      editListMediaStartFrame: track.editListMediaStartFrame,
+      timingSource: track.timingSource,
     },
   });
 }
@@ -263,11 +376,27 @@ export function evaluateTranscodedAudioContent(
           measurements,
         );
   }
+  const decoderEquivalentMaximumExceeded = contract.kind === 'decoder-equivalent' &&
+    maximumAbsoluteError > contract.maximumAbsoluteError;
   if (
     snrDb < contract.minimumSnrDb ||
     rmsError > contract.maximumRmsError ||
-    minimumChannelCorrelation < contract.minimumChannelCorrelation
+    minimumChannelCorrelation < contract.minimumChannelCorrelation ||
+    decoderEquivalentMaximumExceeded
   ) {
+    if (contract.kind === 'decoder-equivalent') {
+      return transcodeVerdict(
+        'FAIL',
+        'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MISMATCH',
+        `independent decoded programs have SNR=${formatFinite(snrDb)}dB, ` +
+          `RMS error=${formatFinite(rmsError)}, maximum error=${formatFinite(maximumAbsoluteError)}, ` +
+          `and minimum channel correlation=${formatFinite(minimumChannelCorrelation)}; required ` +
+          `SNR>=${contract.minimumSnrDb}, RMS<=${contract.maximumRmsError}, ` +
+          `maximum error<=${contract.maximumAbsoluteError}, ` +
+          `correlation>=${contract.minimumChannelCorrelation}`,
+        measurements,
+      );
+    }
     return transcodeVerdict(
       'FAIL',
       'TRANSCODE_AUDIO_LOSSY_CONTENT_MISMATCH',
@@ -275,6 +404,14 @@ export function evaluateTranscodedAudioContent(
         `minimum channel correlation=${formatFinite(minimumChannelCorrelation)}; required ` +
         `SNR>=${contract.minimumSnrDb}, RMS<=${contract.maximumRmsError}, ` +
         `correlation>=${contract.minimumChannelCorrelation}`,
+      measurements,
+    );
+  }
+  if (contract.kind === 'decoder-equivalent') {
+    return transcodeVerdict(
+      'PASS',
+      'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MATCH',
+      `${comparedFrames} sample frame(s) satisfy the documented independent-decoder equivalence contract`,
       measurements,
     );
   }
@@ -377,6 +514,24 @@ function readOgg(bytes: Uint8Array): TranscodeAudioStructureResult {
 }
 
 function readMp4(bytes: Uint8Array): TranscodeAudioStructureResult {
+  // The platform's compact MP4 demuxer intentionally treats every `mp4a` entry as AAC. FFmpeg also
+  // writes standards-signalled MP3 as `mp4a` with OTI 0x69/0x6b, so inspect that independent OTI
+  // first and keep MP3 out of the AAC gapless-timing path.
+  const genericEntry = readMp4AudioSampleEntry(bytes);
+  if (genericEntry && genericEntry.codec !== 'aac') {
+    const structure = readOutputStructureResult(bytes, 'mp4');
+    const durationSec = structure.state === 'OK' ? structure.value.durationSec : undefined;
+    const sampleFrames = durationSec === undefined ? undefined : Math.round(durationSec * genericEntry.sampleRate);
+    return ok({
+      container: 'mp4', codec: genericEntry.codec, sampleRate: genericEntry.sampleRate,
+      channels: genericEntry.channels,
+      ...(sampleFrames !== undefined ? {
+        sampleFrames,
+        timeline: { kind: 'whole-program' as const, presentationSampleFrames: sampleFrames },
+      } : {}),
+      reader: 'transcode/mp4-audio-sample-entry',
+    });
+  }
   try {
     const track = demuxMp4GaplessAudio(bytes);
     const timing: AudioTimelineEvidence = {
@@ -410,7 +565,6 @@ function readMp4(bytes: Uint8Array): TranscodeAudioStructureResult {
       // Typed structure fallback below distinguishes malformed from merely unsupported sample entries.
     }
   }
-  const genericEntry = readMp4AudioSampleEntry(bytes);
   if (genericEntry) {
     const structure = readOutputStructureResult(bytes, 'mp4');
     const durationSec = structure.state === 'OK' ? structure.value.durationSec : undefined;
@@ -741,7 +895,20 @@ function presentationWindow(
     }
     return { state: 'OK', startFrame: 0, endFrame: presentationFrames };
   }
-  if (timing.kind !== 'whole-program' && signal.sampleFrames !== timing.codedSampleFrames) {
+  if (timing.kind === 'whole-program') {
+    if (signal.sampleFrames < presentationFrames) {
+      return {
+        state: 'BLOCKED',
+        decision: transcodeVerdict(
+          'FAIL',
+          'TRANSCODE_AUDIO_DECODED_PROGRAM_TRUNCATED',
+          `decoded coded domain ends at ${signal.sampleFrames}; presentation window requires ${presentationFrames}`,
+        ),
+      };
+    }
+    return { state: 'OK', startFrame: 0, endFrame: presentationFrames };
+  }
+  if (signal.sampleFrames !== timing.codedSampleFrames) {
     return {
       state: 'BLOCKED',
       decision: transcodeVerdict(

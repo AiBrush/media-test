@@ -1255,6 +1255,8 @@ export interface MediaEngine {
       sampleImmediatelyDuringOperation?: boolean;
       maxOperationSamples?: number;
       settleWindowMs?: number;
+      /** Per cross-process sample deadline; timeout remains explicit unavailable evidence. */
+      sampleTimeoutMs?: number;
     }>;
   }>;
   /** Full-tuple support decision after selected input evidence is available. Scored adapters must implement it. */

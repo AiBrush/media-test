@@ -90,11 +90,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'Retest after a streaming parser path no longer retains the complete packet walk.',
   ),
   budget(
-    'decode-seek/decode_size_huge_h264_600s',
-    'Decode setup performs the same full-file scan as the 600-second demux rung and exceeds 120 seconds.',
-    'Retest after decoder setup becomes incremental/random-access.',
-  ),
-  budget(
     'streaming-output/buffer_massive_h264_mp4',
     'A no-reuse Chromium run timed out buffering the two-hour MP4 through bufferWriter.',
     'Retest when the adapter exposes a bounded streaming target for this operation.',
@@ -113,26 +108,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'performance/size-ladder-demux-peak-memory-large',
     'Repeated full demux of the 120-second rung exceeds the shared measurement allocation.',
     'Retest after memory measurement can observe one validated packet walk.',
-  ),
-  budget(
-    'transcode/ladder_large_h264_1080p_120s_resize_720p',
-    'Full 120-second decode, resize, and encode repeats for correctness and performance.',
-    'Retest after hardware/backend throughput keeps the complete cell below the run budget.',
-  ),
-  budget(
-    'transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
-    'Full 120-second VP9 decode and H.264 encode repeats for correctness and performance.',
-    'Retest after hardware/backend throughput keeps the complete cell below the run budget.',
-  ),
-  budget(
-    'decode-seek/decode_size_large_h264_120s',
-    'Decode setup/sample traversal of the 120-second rung exceeds the shared operation allocation.',
-    'Retest after decoder setup becomes incremental/random-access.',
-  ),
-  budget(
-    'decode-seek/decode_size_large_vp9_120s',
-    'Decode setup/sample traversal of the 120-second rung exceeds the shared operation allocation.',
-    'Retest after decoder setup becomes incremental/random-access.',
   ),
   budget(
     'audio-dsp/edge_longform_audio_resample_16k',

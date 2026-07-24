@@ -26,6 +26,18 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     expect(capabilities.containersIn).toEqual(expect.arrayContaining(['jpeg', 'png', 'webp']));
   });
 
+  test('bounds adaptive reuse and cross-process memory sampling', () => {
+    expect(new AibrushMediaEngine().benchmarkLimits).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    });
+  });
+
   const rows: Array<[string, ConcreteOperationRequest, string]> = [
     ['still-image demux', request('demux', 'jpeg', [], { outputContainer: undefined }), 'AIBRUSH_STILL_IMAGE_OPERATION_UNSUPPORTED'],
     ['still-image remux', request('remux', 'png', [], { outputContainer: 'mp4' }), 'AIBRUSH_STILL_IMAGE_OPERATION_UNSUPPORTED'],
@@ -107,6 +119,193 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       reasonCode: 'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
     });
   });
+
+  test('rejects invalid transcode dimensions before browser config probing', () => {
+    expect(decideAibrushSupport(request('transcode', 'mp4', [], {
+      outputContainer: 'mp4', videoCodec: 'h264', outputWidth: 0, outputHeight: 0,
+      transforms: { resize: { width: 0, height: 0 } },
+    }))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_INVALID_DIMENSIONS',
+    });
+  });
+
+  test('declares measured audio-content writer and decoder boundaries without hiding working codecs', () => {
+    const audioRows: Array<[string, string, string, string]> = [
+      ['wav', 'mp4', 'aac', 'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED'],
+      ['wav', 'ogg', 'opus', 'AIBRUSH_OGG_OPUS_OUTPUT_UNSUPPORTED'],
+      ['flac', 'webm', 'opus', 'AIBRUSH_WEBM_OPUS_PRESENTATION_UNSUPPORTED'],
+    ];
+    for (const [inputContainer, outputContainer, audioCodec, reasonCode] of audioRows) {
+      expect(decideAibrushSupport(request('transcode', inputContainer, [{
+        type: 'audio', codec: inputContainer === 'wav' ? 'pcm-s16' : inputContainer,
+        sampleRate: 48_000, channels: 1,
+      }], {
+        outputContainer,
+        audioCodec,
+        options: { invariant: 'transcode-audio-content' },
+      }))).toMatchObject({ supported: false, status: 'NA_ENGINE', reasonCode });
+    }
+
+    expect(decideAibrushSupport(request('transcode', 'aac', [{
+      type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2,
+    }], {
+      scenarioId: 'transcode/aac_to_pcm_wav_extract',
+      outputContainer: 'wav',
+      audioCodec: 'pcm-s16',
+      options: { invariant: 'transcode-audio-content' },
+    }))).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_AAC_PCM_EQUIVALENCE_UNSUPPORTED',
+    });
+
+    expect(decideAibrushSupport(request('transcode', 'wav', [{
+      type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 1,
+    }], {
+      outputContainer: 'ogg', audioCodec: 'vorbis', options: { invariant: 'transcode-audio-content' },
+    }))).toEqual({ supported: true });
+    expect(decideAibrushSupport(request('transcode', 'wav', [{
+      type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 1,
+    }], {
+      outputContainer: 'flac', audioCodec: 'flac', options: { invariant: 'transcode-audio-content' },
+    }))).toEqual({ supported: true });
+  });
+
+  test('keeps measured alpha and roundtrip quality bounds narrow to their concrete contracts', () => {
+    for (const [scenarioId, codec, reasonCode] of [
+      ['transcode/vp9_alpha_to_vp8_keepalpha', 'vp8', 'AIBRUSH_VP8_ALPHA_FIDELITY_BOUND'],
+      ['transcode/vp9_alpha_to_vp9_keepalpha', 'vp9', 'AIBRUSH_VP9_ALPHA_PIXEL_QUALITY_BOUND'],
+    ] as const) {
+      expect(decideAibrushSupport(request('transcode', 'webm', [{ type: 'video', codec: 'vp9' }], {
+        scenarioId,
+        outputContainer: 'webm',
+        videoCodec: codec,
+        options: { alpha: 'keep', invariant: 'transcode-effect-aware' },
+      }))).toMatchObject({ supported: false, status: 'NA_ENGINE', reasonCode });
+      expect(decideAibrushSupport(request('transcode', 'webm', [{ type: 'video', codec: 'vp9' }], {
+        outputContainer: 'webm',
+        videoCodec: codec,
+        options: { alpha: 'keep', invariant: 'transcode-effect-aware' },
+      }))).toEqual({ supported: true });
+    }
+
+    const exactRoundtrip = request('transcode', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'transcode/roundtrip_leg1_h264_to_vp9',
+      inputId: 'scenarios/transcode/roundtrip_leg1_h264_to_vp9/03.mp4',
+      outputContainer: 'webm',
+      videoCodec: 'vp9',
+      audioCodec: 'opus',
+    });
+    expect(decideAibrushSupport(exactRoundtrip)).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_H264_VP9_ROUNDTRIP_QUALITY_BOUND',
+    });
+    exactRoundtrip.inputs[0]!.id = 'scenarios/transcode/roundtrip_leg1_h264_to_vp9/02.mp4';
+    expect(decideAibrushSupport(exactRoundtrip)).toMatchObject({ supported: true });
+  });
+
+  test('declares exhaustive-only quality, timing, and Ogg misses on their exact variants', () => {
+    const rows: Array<{
+      scenarioId: string;
+      inputId: string;
+      inputContainer: string;
+      tracks: NormalizedTrack[];
+      outputContainer: string;
+      videoCodec?: string;
+      audioCodec?: string;
+      options?: Record<string, unknown>;
+      reasonCode: string;
+    }> = [
+      {
+        scenarioId: 'transcode/bframe_reorder_h264_to_vp9',
+        inputId: 'scenarios/transcode/bframe_reorder_h264_to_vp9/03.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO, AUDIO], outputContainer: 'webm', videoCodec: 'vp9', audioCodec: 'opus',
+        reasonCode: 'AIBRUSH_BFRAME_VP9_PORTRAIT_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/h264_to_vp9_webm',
+        inputId: 'scenarios/transcode/h264_to_vp9_webm/02.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO, AUDIO], outputContainer: 'webm', videoCodec: 'vp9', audioCodec: 'opus',
+        reasonCode: 'AIBRUSH_H264_VP9_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/h264_to_vp9_webm',
+        inputId: 'scenarios/transcode/h264_to_vp9_webm/03.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO, AUDIO], outputContainer: 'webm', videoCodec: 'vp9', audioCodec: 'opus',
+        reasonCode: 'AIBRUSH_H264_VP9_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/vp9_to_av1_webm',
+        inputId: 'scenarios/transcode/vp9_to_av1_webm/02.webm',
+        inputContainer: 'webm', tracks: [{ type: 'video', codec: 'vp9' }, { type: 'audio', codec: 'opus' }],
+        outputContainer: 'webm', videoCodec: 'av1', reasonCode: 'AIBRUSH_VP9_AV1_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/h264_to_av1_mp4',
+        inputId: 'scenarios/transcode/h264_to_av1_mp4/03.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO, AUDIO], outputContainer: 'mp4', videoCodec: 'av1',
+        reasonCode: 'AIBRUSH_H264_AV1_PORTRAIT_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
+        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/01.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO], outputContainer: 'webm', videoCodec: 'vp9',
+        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
+      },
+      {
+        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
+        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/02.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO], outputContainer: 'webm', videoCodec: 'vp9',
+        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
+      },
+      {
+        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
+        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/03.mp4',
+        inputContainer: 'mp4', tracks: [VIDEO], outputContainer: 'webm', videoCodec: 'vp9',
+        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
+      },
+      {
+        scenarioId: 'transcode/vp9_to_vp8_webm',
+        inputId: 'scenarios/transcode/vp9_to_vp8_webm/01.webm',
+        inputContainer: 'webm', tracks: [{ type: 'video', codec: 'vp9' }, { type: 'audio', codec: 'opus' }],
+        outputContainer: 'webm', videoCodec: 'vp8', audioCodec: 'vorbis',
+        reasonCode: 'AIBRUSH_VP9_VP8_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/vp9_to_vp8_webm',
+        inputId: 'scenarios/transcode/vp9_to_vp8_webm/02.webm',
+        inputContainer: 'webm', tracks: [{ type: 'video', codec: 'vp9' }, { type: 'audio', codec: 'opus' }],
+        outputContainer: 'webm', videoCodec: 'vp8', audioCodec: 'vorbis',
+        reasonCode: 'AIBRUSH_VP9_VP8_QUALITY_BOUND',
+      },
+      {
+        scenarioId: 'transcode/wav_to_vorbis_ogg',
+        inputId: 'scenarios/transcode/wav_to_vorbis_ogg/03.wav',
+        inputContainer: 'wav', tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels: 2 }],
+        outputContainer: 'ogg', audioCodec: 'vorbis', options: { invariant: 'transcode-audio-content' },
+        reasonCode: 'AIBRUSH_VORBIS_OGG_CONTINUATION_UNSUPPORTED',
+      },
+    ];
+
+    for (const row of rows) {
+      const concrete = request('transcode', row.inputContainer, row.tracks, {
+        scenarioId: row.scenarioId,
+        inputId: row.inputId,
+        outputContainer: row.outputContainer,
+        ...(row.videoCodec !== undefined ? { videoCodec: row.videoCodec } : {}),
+        ...(row.audioCodec !== undefined ? { audioCodec: row.audioCodec } : {}),
+        options: row.options,
+      });
+      expect(decideAibrushSupport(concrete), row.scenarioId).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: row.reasonCode,
+      });
+      concrete.inputs[0]!.id = row.inputId.replace(/\/(?:01|02|03)\.(mp4|webm|wav)$/, '/04.$1');
+      expect(decideAibrushSupport(concrete), `${row.scenarioId} neighbor`).toMatchObject({ supported: true });
+    }
+  });
 });
 
 describe('REQ-ENG-32: exact framework error taxonomy', () => {
@@ -156,17 +355,23 @@ function request(
     audioCodec?: string;
     options?: Record<string, unknown>;
     mutated?: boolean;
+    scenarioId?: string;
+    inputId?: string;
+    outputWidth?: number;
+    outputHeight?: number;
+    transforms?: ConcreteOperationRequest['transforms'];
   } = {},
 ): ConcreteOperationRequest {
   return {
     protocol: CONCRETE_OPERATION_PROTOCOL,
-    scenarioId: `aibrush-test/${operation}`,
+    scenarioId: overrides.scenarioId ?? `aibrush-test/${operation}`,
     operation,
     inputs: [{
-      id: `fixture.${inputContainer}`,
+      id: overrides.inputId ?? `fixture.${inputContainer}`,
       mime: inputContainer === 'jpeg' || inputContainer === 'png' ? `image/${inputContainer}` : 'application/octet-stream',
       container: inputContainer,
       mutated: overrides.mutated ?? false,
+      sourceEvidence: 'RESOLVED',
       tracks,
       sizeBytes: 1_024,
     }],
@@ -175,8 +380,11 @@ function request(
           container: overrides.outputContainer,
           ...(overrides.videoCodec !== undefined ? { videoCodec: overrides.videoCodec } : {}),
           ...(overrides.audioCodec !== undefined ? { audioCodec: overrides.audioCodec } : {}),
+          ...(overrides.outputWidth !== undefined ? { width: overrides.outputWidth } : {}),
+          ...(overrides.outputHeight !== undefined ? { height: overrides.outputHeight } : {}),
         } }
       : {}),
+    ...(overrides.transforms !== undefined ? { transforms: overrides.transforms } : {}),
     options: overrides.options ?? {},
   };
 }

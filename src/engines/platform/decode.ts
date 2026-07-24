@@ -24,6 +24,19 @@ export interface DecodeInput {
   selectedTrack?: FrameSink['selectedTrack'];
 }
 
+/** Sort decoded output into a deterministic leading presentation-time prefix. */
+export function leadingPresentationFramePrefix<T extends { ptsUs: number }>(
+  input: readonly T[],
+  maxFrames: number,
+): T[] {
+  const sorted = input
+    .map((entry, decodeIndex) => ({ entry, decodeIndex }))
+    .sort((a, b) => a.entry.ptsUs - b.entry.ptsUs || a.decodeIndex - b.decodeIndex)
+    .map(({ entry }) => entry);
+  if (!Number.isFinite(maxFrames)) return sorted;
+  return sorted.slice(0, Math.max(0, Math.floor(maxFrames)));
+}
+
 /** A frame sink that also retains ImageData for getPixels (SSIM/PSNR oracles need raw pixels). */
 class RetainingFrameSink implements FrameSink {
   frames: FrameDigest[] = [];
@@ -178,11 +191,6 @@ async function collectDecodedFrames<T extends { ptsUs: number; keyframe: boolean
 
   const decoder = new VideoDecoder({
     output: (frame) => {
-      // Stop retaining once we have enough; close extras immediately.
-      if (collected.length >= maxFrames) {
-        frame.close();
-        return;
-      }
       collected.push({ ptsUs: frame.timestamp, frame });
     },
     error: (e) => {
@@ -223,8 +231,14 @@ async function collectDecodedFrames<T extends { ptsUs: number; keyframe: boolean
     throw decodeError;
   }
 
-  collected.sort((a, b) => a.ptsUs - b.ptsUs);
-  return collected;
+  // Decoder output order is not necessarily presentation order. Retaining only the first
+  // maxFrames callbacks can therefore discard an earlier B/VFR frame that is emitted later. The
+  // submitted set is already bounded to maxFrames + reorder look-ahead, so sort that bounded set,
+  // retain the true presentation prefix, and close only the surplus frames afterwards.
+  const prefix = leadingPresentationFramePrefix(collected, maxFrames);
+  const retained = new Set(prefix);
+  closeCollectedFrames(collected.filter((entry) => !retained.has(entry)));
+  return prefix;
 }
 
 function mergeAlphaPlane(color: ImageData, alpha: ImageData): ImageData {
@@ -257,7 +271,13 @@ function closeCollectedFrames(frames: Array<{ frame: VideoFrame }>): void {
  */
 export async function decodeWithVideoElement(
   blob: Blob,
-  opts?: DecodeOptions & { perFrameTimeoutMs?: number; selectedTrack?: FrameSink['selectedTrack'] },
+  opts?: DecodeOptions & {
+    perFrameTimeoutMs?: number;
+    selectedTrack?: FrameSink['selectedTrack'];
+    durationHintSec?: number;
+    /** Explicit presentation instants for paired source/candidate comparisons. */
+    sampleTimesSec?: readonly number[];
+  },
 ): Promise<FrameSink> {
   if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
     throw new Error('<video> fallback requires a DOM (page main thread)');
@@ -279,10 +299,19 @@ export async function decodeWithVideoElement(
     // Ensure at least one frame is decodable.
     await waitForReadyState(video, 2, perFrameTimeoutMs);
 
-    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : NaN;
-    // Choose sample timestamps: spread across duration, or step from 0 if duration unknown.
+    const duration = typeof opts?.durationHintSec === 'number' &&
+        Number.isFinite(opts.durationHintSec) && opts.durationHintSec > 0
+      ? opts.durationHintSec
+      : Number.isFinite(video.duration) && video.duration > 0 ? video.duration : NaN;
+    // Choose sample timestamps: use caller-provided anchored instants when present, otherwise spread
+    // across duration (or step from zero if duration is unknown).
     const times: number[] = [];
-    if (Number.isFinite(duration)) {
+    const explicitTimes = opts?.sampleTimesSec
+      ?.filter((time) => typeof time === 'number' && Number.isFinite(time) && time >= 0)
+      .slice(0, maxFrames);
+    if (explicitTimes?.length) {
+      times.push(...explicitTimes);
+    } else if (Number.isFinite(duration)) {
       for (let i = 0; i < maxFrames; i++) {
         times.push((duration * i) / Math.max(1, maxFrames));
       }

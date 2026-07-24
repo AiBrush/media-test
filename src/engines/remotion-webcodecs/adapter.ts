@@ -82,8 +82,11 @@ import {
   DECODE_TRACK_SELECTOR_SCHEMA,
   captureConfigUsedSnapshot,
   createBrowserNotSupportedError,
+  createMalformedInputError,
   createNotApplicableError,
   isBrowserNotSupportedError,
+  isMalformedInputError,
+  isNotApplicableError,
   validateAdapterResult,
   validateCapabilitySet,
   validateSupportDecision,
@@ -115,6 +118,7 @@ const PROTECTED_TRACK_METADATA_FEATURE = 'metadata:protected-tracks';
 const WEBM_HEADER_RANGE_BYTES = 64 * 1024;
 const VERIFIED_READER_CHUNK_BYTES = 1024 * 1024;
 const DIRECT_WRITER_INPUT_THRESHOLD_BYTES = 256 * 1024 * 1024;
+const SEEK_DECODE_REORDER_LOOKAHEAD_SAMPLES = 32;
 
 // ── Lazily-imported lib handles (loaded in init(), UNTIMED per §0.7). ───────────────────────────
 type WebcodecsModule = typeof import('@remotion/webcodecs');
@@ -740,6 +744,24 @@ export class RemotionWebcodecsEngine implements MediaEngine {
         }
         const output = await this.transcodeImpl(input, opts, call);
         return validateAdapterResult(ENGINE_ID, 'transcode', output);
+      } catch (error) {
+        if (
+          isGracefulTranscodeNegative(call.request) &&
+          !isMalformedInputError(error) &&
+          !isNotApplicableError(error) &&
+          !isBrowserNotSupportedError(error)
+        ) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'transcode',
+            'parse',
+            describeError(error),
+            'REMOTION_TRANSCODE_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
       } finally {
         this.updateResourceConfig(this.allResourcesClosed());
       }
@@ -1168,9 +1190,14 @@ export class RemotionWebcodecsEngine implements MediaEngine {
           lastAtMs = atMs;
           if (state.overallProgress == null) {
             context.emit({ type: 'progress', atMs, determinate: false });
-          } else if (state.overallProgress >= lastProgress) {
-            lastProgress = state.overallProgress;
-            context.emit({ type: 'progress', atMs, determinate: true, value: state.overallProgress });
+          } else if (Number.isFinite(state.overallProgress)) {
+            // Remotion can transiently report values above 1 while mux finalization catches up.
+            // Normalize that framework-local estimate to the adapter telemetry contract.
+            const progress = Math.min(1, Math.max(0, state.overallProgress));
+            if (progress >= lastProgress) {
+              lastProgress = progress;
+              context.emit({ type: 'progress', atMs, determinate: true, value: progress });
+            }
           }
           if (state.decodedVideoFrames > decodedFrames) {
             decodedFrames = state.decodedVideoFrames;
@@ -1420,8 +1447,9 @@ export class RemotionWebcodecsEngine implements MediaEngine {
   // ── seek ─────────────────────────────────────────────────────────────────────────────────────
   /**
    * Seek to tUs: drive media-parser with a controller `.seek(tInSeconds)` so the parser jumps to the
-   * best keyframe <= t, then decode forward until we reach the frame visible at t (last frame with
-   * pts <= t). Returns that frame's landed pts + digest. Uses the same native decoder path as
+   * best keyframe <= t, then decode forward through the first sample after t and choose the nearest
+   * real presentation sample (earlier on an exact tie). Returns that frame's landed pts + digest.
+   * Uses the same native decoder path as
    * decodeFrames.
    */
   async seek(
@@ -1457,6 +1485,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
     const decoderState: { value: IsolatedVideoDecoder | null } = { value: null };
     let decoderPromise: Promise<IsolatedVideoDecoder> | null = null;
     let done = false;
+    let samplesPastTarget = 0;
     let parserController: ReturnType<MediaParserModule['mediaParserController']> | null = null;
     let decodedFrames = 0;
     let firstFrameMs: number | undefined;
@@ -1488,9 +1517,7 @@ export class RemotionWebcodecsEngine implements MediaEngine {
               }
               context.emit({ type: 'decoded-frame-count', atMs, count: decodedFrames });
               const ptsUs = Math.round(frame.timestamp);
-              let keep = false;
-              if (ptsUs <= targetUs) keep = !best || ptsUs > best.ptsUs;
-              else if (!best) keep = true;
+              const keep = shouldReplaceRemotionSeekSample(ptsUs, best?.ptsUs, targetUs);
               if (keep) {
                 this.activeFrames.add(frame);
                 this.updateResourceConfig(false);
@@ -1528,8 +1555,14 @@ export class RemotionWebcodecsEngine implements MediaEngine {
               data: sample.data,
             });
             if (sample.timestamp > targetUs) {
-              done = true;
-              return () => undefined;
+              // Encoded sample timestamps may arrive before their reordered VideoFrame output.
+              // Retain a bounded coded lookahead so the nearest earlier VFR/B-frame cannot remain
+              // buffered when the first encoded sample crosses the target.
+              samplesPastTarget++;
+              if (samplesPastTarget >= SEEK_DECODE_REORDER_LOOKAHEAD_SAMPLES) {
+                done = true;
+                return () => undefined;
+              }
             }
           };
         },
@@ -2202,6 +2235,20 @@ function concreteConfig(
     case 'audio-encoder':
       return { role, trackIndex, config: config as AudioEncoderConfig };
   }
+}
+
+/** Nearest real presentation sample, with the suite's deterministic earlier-PTS tie break. */
+export function shouldReplaceRemotionSeekSample(
+  candidatePtsUs: number,
+  currentPtsUs: number | undefined,
+  targetUs: number,
+): boolean {
+  if (!Number.isFinite(candidatePtsUs)) return false;
+  if (currentPtsUs === undefined || !Number.isFinite(currentPtsUs)) return true;
+  const candidateDelta = Math.abs(candidatePtsUs - targetUs);
+  const currentDelta = Math.abs(currentPtsUs - targetUs);
+  return candidateDelta < currentDelta ||
+    (candidateDelta === currentDelta && candidatePtsUs < currentPtsUs);
 }
 
 export function remotionVideoEncoderConfigCandidates(
@@ -3877,6 +3924,16 @@ function ensureSupportedTranscodeRequest(
       'REMOTION_RESIZE_BOX_NOT_EXACT',
     );
   }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isGracefulTranscodeNegative(request: ConcreteOperationRequest): boolean {
+  return request.options.gracefulAllowOutput === true ||
+    request.scenarioId.startsWith('transcode/malformed_') ||
+    request.scenarioId.startsWith('transcode/mismatch_');
 }
 
 function fpsFromTrackPackets(packets: PacketInfo[], durationSec: number | null): number | null {

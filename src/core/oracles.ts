@@ -160,6 +160,7 @@ import {
   TRANSCODE_AUDIO_CONTENT_INVARIANT,
   TRANSCODE_EFFECT_INVARIANT,
   collectAbrRenditionEvidence,
+  decodedAacPcmFromMp4,
   decodedPcmFromContainer,
   evaluateAbrSwitchability,
   evaluateTranscodeRuntimeInvariant,
@@ -698,7 +699,12 @@ export interface OracleContext {
   /** injected by runner: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
   decodeWithPlatform: (
     bytes: MediaBytes,
-    opts?: { maxFrames?: number; sampling?: 'prefix' | 'uniform' },
+    opts?: {
+      maxFrames?: number;
+      sampling?: 'prefix' | 'uniform';
+      durationHintSec?: number;
+      sampleTimesSec?: readonly number[];
+    },
   ) => Promise<FrameSink>;
   /** injected by runner: <video> playback smoke test → resolves true if it plays a few frames */
   playbackSmoke: (bytes: MediaBytes) => Promise<boolean>;
@@ -4328,10 +4334,25 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   }
 
   const golden = ctx.golden;
-  const want = golden.frames;
+  // decodeFrames is explicitly a leading-N operation when maxFrames is present. Comparing that
+  // bounded candidate against the remainder of a longer committed golden creates a false
+  // presentation-window failure even though the requested prefix is complete. Bytes-producing
+  // operations still compare against the full committed presentation.
+  const want = ctx.scenario.op === 'decodeFrames' && golden.frames
+    ? goldenFramesForDecodeCompare(ctx, golden.frames)
+    : golden.frames;
   const refSigs = golden.ssimRef;
   const useReferenceSource = usesTransformReference(ctx);
-  const haveGolden = !useReferenceSource && ((!!want && want.length > 0) || (!!refSigs && refSigs.length > 0));
+  const transcodeOptions: Record<string, unknown> = isObject(ctx.scenario.options)
+    ? ctx.scenario.options
+    : {};
+  const uniformSampling = transcodeOptions.fastStart === 'fragmented' || transcodeOptions.fragmented === true;
+  // Committed frame goldens are deliberately prefix samples. A uniformly sampled fragmented output
+  // spans the whole presentation window, so pairing it to that prefix is a domain mismatch. Use the
+  // uniformly decoded immutable source as the reference for this case, even when a prefix golden is
+  // available.
+  const haveGolden = !useReferenceSource && !uniformSampling &&
+    ((!!want && want.length > 0) || (!!refSigs && refSigs.length > 0));
 
   // When there is NO committed golden (a resize/transcode case, or golden pending the in-browser
   // frame-bake), §5.2 says validate against REFERENCE frames, not golden: decode the SOURCE in-browser
@@ -4351,10 +4372,10 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   // decode failure or null/empty result as a clean FAIL with a clear detail rather than throwing.
   let sink: FrameSink | null | undefined;
   let candidateUsesReferenceDecoder = false;
-  const transcodeOptions: Record<string, unknown> = isObject(ctx.scenario.options)
-    ? ctx.scenario.options
-    : {};
-  const uniformSampling = transcodeOptions.fastStart === 'fragmented' || transcodeOptions.fragmented === true;
+  const goldenDurationSec = ctx.golden.meta?.durationSec;
+  const durationHintSec = typeof goldenDurationSec === 'number' && Number.isFinite(goldenDurationSec) && goldenDurationSec > 0
+    ? goldenDurationSec
+    : undefined;
   if (ctx.frames) {
     sink = ctx.frames;
   } else if (ctx.output) {
@@ -4362,7 +4383,10 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     try {
       sink = await ctx.decodeWithPlatform(ctx.output, {
         maxFrames,
-        ...(uniformSampling ? { sampling: 'uniform' as const } : {}),
+        ...(uniformSampling ? {
+          sampling: 'uniform' as const,
+          ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+        } : {}),
       });
     } catch (err) {
       return classifyReferenceDecodeFailure(oracle, 'candidate', err, ctx.output);
@@ -4380,8 +4404,8 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
         )
       : fail(oracle, 'candidate engine returned no decoded sink');
   }
-  const candFrames = Array.isArray(sink.frames) ? sink.frames : [];
-  if (!candFrames.length) {
+  const decodedCandidateFrames = Array.isArray(sink.frames) ? sink.frames : [];
+  if (!decodedCandidateFrames.length) {
     return candidateUsesReferenceDecoder && ctx.output
       ? classifyReferenceDecodeFailure(
           oracle,
@@ -4391,6 +4415,13 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
         )
       : fail(oracle, 'candidate engine decoded 0 frames');
   }
+  // Committed decode goldens are intentionally short prefixes (currently 12 frames), while a
+  // scenario may request a larger maxFrames value for throughput measurement. Quality can only be
+  // scored over the committed prefix: trailing candidate frames are valid measured output, not
+  // missing reference coverage. Prefix indices remain unchanged for sink.getPixels below.
+  const candFrames = ctx.scenario.op === 'decodeFrames' && want?.length
+    ? decodedCandidateFrames.slice(0, want.length)
+    : decodedCandidateFrames;
 
   const displayContract = displayTransformFromOptions(ctx.scenario.options);
   if (displayContract) {
@@ -4614,9 +4645,17 @@ async function ssimVsReferenceSource(
       ? ctx.scenario.options
       : {};
     const uniformSampling = options.fastStart === 'fragmented' || options.fragmented === true;
+    const goldenDurationSec = ctx.golden.meta?.durationSec;
+    const durationHintSec = typeof goldenDurationSec === 'number' &&
+        Number.isFinite(goldenDurationSec) && goldenDurationSec > 0
+      ? goldenDurationSec
+      : undefined;
     srcSink = await ctx.decodeWithPlatform(srcBytes, {
       maxFrames: sample,
-      ...(uniformSampling ? { sampling: 'uniform' as const } : {}),
+      ...(uniformSampling ? {
+        sampling: 'uniform' as const,
+        ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+      } : {}),
     });
   } catch (err) {
     return classifyReferenceDecodeFailure(oracle, 'source', err, srcBytes);
@@ -5897,6 +5936,47 @@ function gracefulAllowsReturnedOutput(ctx: OracleContext): boolean {
 // ── property-invariant (metamorphic, §11) ──────────────────────────────────────────────────────
 
 /**
+ * Choose presentation times safely inside source video-frame intervals. Remux containers commonly
+ * quantize timestamps (Matroska's usual 1 ms timecode scale is coarser than MP4), so sampling on an
+ * interval boundary can select adjacent frames even when coded essence is unchanged. Normalizing
+ * the first source PTS to zero also mirrors the remux adapters' presentation-timeline rebasing.
+ */
+function anchoredRemuxSampleTimesSec(
+  program: RemuxProgramEvidence,
+  maxFrames: number,
+): number[] {
+  const video = program.tracks.find((track) => track.type === 'video');
+  if (!video) return [];
+  const samples = video.samples
+    .filter((sample) => typeof sample.ptsUs === 'number' && Number.isFinite(sample.ptsUs))
+    .slice()
+    .sort((a, b) => a.ptsUs! - b.ptsUs!);
+  if (!samples.length) return [];
+
+  const limit = Math.max(1, Math.floor(maxFrames));
+  const count = Math.min(limit, samples.length);
+  const originUs = samples[0]!.ptsUs!;
+  const times: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const index = Math.min(samples.length - 1, Math.floor(((i + 0.5) * samples.length) / count));
+    const sample = samples[index]!;
+    const next = samples[index + 1];
+    const durationUs = typeof sample.durationUs === 'number' && Number.isFinite(sample.durationUs) &&
+        sample.durationUs > 0
+      ? sample.durationUs
+      : undefined;
+    const nextDeltaUs = next && next.ptsUs! > sample.ptsUs! ? next.ptsUs! - sample.ptsUs! : undefined;
+    const intervalUs = durationUs !== undefined && nextDeltaUs !== undefined
+      ? Math.min(durationUs, nextDeltaUs)
+      : durationUs ?? nextDeltaUs;
+    if (intervalUs === undefined || intervalUs <= 0) continue;
+    const timeSec = (sample.ptsUs! - originUs + intervalUs / 2) / 1_000_000;
+    if (Number.isFinite(timeSec) && timeSec >= 0) times.push(timeSec);
+  }
+  return times;
+}
+
+/**
  * Compute a metamorphic invariant in-browser using the injected helpers + frame digests. The
  * specific invariant is selected by scenario.options.invariant (or notes):
  *   - 'decode-remux'     : decode(remux(x)) == decode(x)            (frame digests equal)
@@ -6168,18 +6248,53 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const golden = await frameComparisonGolden(ctx);
     let want = golden.frames;
+    let liveReferenceDecodeOptions:
+      | {
+          maxFrames: number;
+          sampling: 'uniform';
+          durationHintSec?: number;
+          sampleTimesSec?: readonly number[];
+        }
+      | undefined;
     if (!want || !want.length) {
       if (ctx.scenario.op !== 'remux') {
         return missingGoldenOutcome(golden, 'frames', oracle, `[${which}] source decode frame evidence is unavailable`);
       }
       const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+      const sourceContainer = golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
       const sourceMedia: MediaBytes = {
         bytes: sourceBytes,
         mime: ctx.input.mime,
-        container: golden.meta?.container ?? resolveContainer(undefined, ctx.input.id),
+        container: sourceContainer,
+      };
+      const goldenDurationSec = golden.meta?.durationSec;
+      let durationHintSec = typeof goldenDurationSec === 'number' &&
+          Number.isFinite(goldenDurationSec) && goldenDurationSec > 0
+        ? goldenDurationSec
+        : undefined;
+      const sourceRead = readNeutralRemuxProgram(sourceBytes, sourceContainer);
+      if (durationHintSec === undefined) {
+        const durationUs = sourceRead.state === 'OK' ? sourceRead.value.durationUs : undefined;
+        if (durationUs !== undefined && Number.isFinite(durationUs) && durationUs > 0) {
+          durationHintSec = durationUs / 1_000_000;
+        }
+      }
+      const sampleTimesSec = sourceRead.state === 'OK'
+        ? anchoredRemuxSampleTimesSec(sourceRead.value, 60)
+        : [];
+      // Inline WebCodecs decoding yields a leading prefix, while the HTMLVideoElement fallback
+      // samples uniformly across presentation time. A source and remux target can take different
+      // decode paths even though their essence is identical (for example an edit-list MP4 source
+      // and an inline-demuxable Matroska output). Force both sides onto one presentation-time
+      // domain whenever the committed source-frame cache is unavailable.
+      liveReferenceDecodeOptions = {
+        maxFrames: sampleTimesSec.length || 60,
+        sampling: 'uniform',
+        ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+        ...(sampleTimesSec.length ? { sampleTimesSec } : {}),
       };
       try {
-        const sourceSink = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 60 });
+        const sourceSink = await ctx.decodeWithPlatform(sourceMedia, liveReferenceDecodeOptions);
         want = sourceSink?.frames ?? [];
       } catch (err) {
         const classified = classifyReferenceDecodeFailure(oracle, 'source', err, sourceMedia);
@@ -6198,7 +6313,10 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     }
     let sink: FrameSink | null | undefined;
     try {
-      sink = await ctx.decodeWithPlatform(ctx.output, { maxFrames: want.length });
+      sink = await ctx.decodeWithPlatform(
+        ctx.output,
+        liveReferenceDecodeOptions ?? { maxFrames: want.length },
+      );
     } catch (err) {
       const classified = classifyReferenceDecodeFailure(oracle, 'candidate', err, ctx.output);
       return {
@@ -6950,7 +7068,7 @@ async function decodeAudioSampleCount(out: MediaBytes): Promise<{ samples: numbe
   return { samples: audio.length, sampleRate: audio.sampleRate, channels: audio.numberOfChannels };
 }
 
-async function decodeAudioBuffer(out: MediaBytes): Promise<AudioBuffer> {
+async function decodeAudioBuffer(out: MediaBytes, sampleRate?: number): Promise<AudioBuffer> {
   const global = globalThis as typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
   };
@@ -6958,9 +7076,13 @@ async function decodeAudioBuffer(out: MediaBytes): Promise<AudioBuffer> {
   let ctx: BaseAudioContext | undefined;
   try {
     if (AudioContextCtor) {
-      ctx = new AudioContextCtor();
+      ctx = new AudioContextCtor(
+        sampleRate !== undefined && Number.isFinite(sampleRate) && sampleRate > 0
+          ? { sampleRate }
+          : undefined,
+      );
     } else if (typeof OfflineAudioContext !== 'undefined') {
-      ctx = new OfflineAudioContext(1, 1, 44100);
+      ctx = new OfflineAudioContext(1, 1, sampleRate ?? 44_100);
     } else {
       throw new Error('AudioContext/OfflineAudioContext unavailable');
     }
@@ -8385,9 +8507,14 @@ async function transcodeAudioContentInvariant(ctx: OracleContext): Promise<Oracl
   let sourceSignal: DecodedAudioSignal;
   let candidateSignal: DecodedAudioSignal;
   try {
+    const sourceStructure = readTranscodeAudioStructure(source.bytes, source.container);
+    const sourceTimeline = sourceStructure.state === 'OK' &&
+      sourceStructure.value.timeline?.kind === 'aac-isobmff'
+      ? sourceStructure.value.timeline
+      : undefined;
     [sourceSignal, candidateSignal] = await Promise.all([
-      decodeTranscodeAudioSignal(source),
-      decodeTranscodeAudioSignal(output, structure.value.timeline),
+      decodeTranscodeAudioSignal(source, sourceTimeline, structure.value.sampleRate),
+      decodeTranscodeAudioSignal(output, structure.value.timeline, structure.value.sampleRate),
     ]);
   } catch (error) {
     const name = isObject(error) && typeof error.name === 'string' ? error.name : '';
@@ -8453,10 +8580,14 @@ function validateRequestedTranscodeAudioShape(
       `candidate codec '${structure.codec}' vs requested '${expectedCodec}'`);
   }
   const expectedSampleRate = audio && readNumberOption(audio, ['sampleRate']);
-  if (expectedSampleRate !== undefined && structure.sampleRate !== expectedSampleRate) {
+  const sourceSampleRate = ctx.golden.meta?.tracks.find((track) => track.type === 'audio')?.sampleRate;
+  const requiredSampleRate = expectedSampleRate ?? sourceSampleRate;
+  if (requiredSampleRate !== undefined && structure.sampleRate !== requiredSampleRate) {
     return transcodeVerdict(
       'FAIL', 'TRANSCODE_AUDIO_REQUESTED_SAMPLE_RATE_MISMATCH',
-      `candidate ${structure.sampleRate}Hz vs requested ${expectedSampleRate}Hz`);
+      expectedSampleRate !== undefined
+        ? `candidate ${structure.sampleRate}Hz vs requested ${expectedSampleRate}Hz`
+        : `candidate ${structure.sampleRate}Hz vs source program ${sourceSampleRate}Hz`);
   }
   const expectedChannels = audio && readNumberOption(audio, ['channels']);
   if (expectedChannels !== undefined && structure.channels !== expectedChannels) {
@@ -8480,10 +8611,15 @@ function canonicalTranscodeAudioCodec(value: string): string {
 async function decodeTranscodeAudioSignal(
   media: MediaBytes,
   timeline?: AudioTimelineEvidence,
+  sampleRate?: number,
 ): Promise<DecodedAudioSignal> {
   const native = decodedPcmFromContainer(media.bytes, media.container);
   if (native) return native;
-  const decoded = await decodeAudioBuffer(media);
+  if (timeline?.kind === 'aac-isobmff') {
+    const decodedAac = await decodedAacPcmFromMp4(media.bytes);
+    if (decodedAac) return decodedAac;
+  }
+  const decoded = await decodeAudioBuffer(media, sampleRate);
   const samples = new Float64Array(decoded.length * decoded.numberOfChannels);
   for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
     const plane = new Float32Array(decoded.length);
@@ -8492,12 +8628,19 @@ async function decodeTranscodeAudioSignal(
       samples[frame * decoded.numberOfChannels + channel] = plane[frame] ?? 0;
     }
   }
+  const declaredPresentationFrames = timeline?.presentationSampleFrames;
+  const timelineDomain =
+    timeline?.kind === 'whole-program' &&
+    declaredPresentationFrames !== undefined &&
+    decoded.length >= declaredPresentationFrames
+      ? 'coded' as const
+      : 'presentation' as const;
   return Object.freeze({
     sampleRate: decoded.sampleRate,
     channels: decoded.numberOfChannels,
     sampleFrames: decoded.length,
     samples,
-    timelineDomain: 'presentation' as const,
+    timelineDomain,
     timeline: timeline ?? {
       kind: 'whole-program' as const,
       presentationSampleFrames: decoded.length,

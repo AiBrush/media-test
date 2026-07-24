@@ -12,7 +12,10 @@ import {
   type Operation,
 } from '../src/core/engine.ts';
 import { evaluateConcreteSupport } from '../src/core/runner.ts';
-import { MediabunnyEngine } from '../src/engines/mediabunny/adapter.ts';
+import {
+  MediabunnyEngine,
+  nearestPresentationSampleIndex,
+} from '../src/engines/mediabunny/adapter.ts';
 import {
   MEDIABUNNY_REASON,
   audioEncodePlanForRequest,
@@ -100,6 +103,30 @@ async function fixtureInput(name: string, mime = 'video/mp4'): Promise<MediaInpu
 }
 
 describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
+  test('selects the nearest seek sample with an earlier-PTS tie break', () => {
+    expect(nearestPresentationSampleIndex([
+      { microsecondTimestamp: 7_300_000 },
+      { microsecondTimestamp: 7_333_333 },
+    ], 7_333_000)).toBe(1);
+    expect(nearestPresentationSampleIndex([
+      { microsecondTimestamp: 4_200_000 },
+      { microsecondTimestamp: 4_300_000 },
+    ], 4_250_000)).toBe(0);
+    expect(nearestPresentationSampleIndex([], 0)).toBe(-1);
+  });
+
+  test('bounds adaptive reuse and cross-process memory sampling', () => {
+    expect(new MediabunnyEngine().benchmarkLimits).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    });
+  });
+
   test('declares authenticated range transport only alongside bounded probe modes', () => {
     const capabilities = new MediabunnyEngine().capabilities();
     expect(capabilities.features).toContain(AUTHENTICATED_RANGE_PROBE_FEATURE);

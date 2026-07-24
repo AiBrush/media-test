@@ -10,6 +10,8 @@ import {
   avcDecoderConfigFromAnnexB,
   containerFromFfmpegLog,
   normalizeSyntheticLeadingEbmlDts,
+  nearestObservedFrame,
+  observedFrameTimelineFromProgram,
   parseDemuxTimestampLog,
   parseFfprobeFramesJson,
   parseFfprobeJson,
@@ -21,6 +23,7 @@ import {
   splitPreparedBytes,
 } from '../src/engines/ffmpeg-wasm/evidence.ts';
 import { isWorkerFsBlobUnreadableError } from '../src/engines/ffmpeg-wasm/support.ts';
+import type { RemuxProgramEvidence } from '../src/features/remux/types.ts';
 
 describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
   test('recognizes only concrete browser WORKERFS read failures', () => {
@@ -178,6 +181,48 @@ describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
       source: 'observed', cadence: 'VFR', sampleCount: 3, observedIntervalUs: 180_000,
       rational: { numerator: 30_000, denominator: 1001 },
     });
+  });
+
+  test('neutral frame timelines are presentation-sorted, zero-based, and seek real samples', () => {
+    const program: RemuxProgramEvidence = {
+      schema: 'media-test/remux-program@1',
+      container: 'mp4',
+      byteLength: 3,
+      durationUs: 100_000,
+      representation: {},
+      tracks: [{
+        id: 'video-0',
+        type: 'video',
+        codec: 'h264',
+        samples: [
+          {
+            payload: new Uint8Array([2]),
+            ptsUs: 66_733,
+            durationUs: 33_367,
+            keyframe: false,
+            framing: 'length-prefixed',
+          },
+          {
+            payload: new Uint8Array([1]),
+            ptsUs: 33_366,
+            durationUs: 33_367,
+            keyframe: true,
+            framing: 'length-prefixed',
+          },
+        ],
+      }],
+    };
+    const timeline = observedFrameTimelineFromProgram(program);
+    expect(timeline).toEqual([
+      { ptsUs: 0, durationUs: 33_367, keyframe: true },
+      { ptsUs: 33_367, durationUs: 33_367, keyframe: false },
+    ]);
+    expect(nearestObservedFrame(timeline, 16_683)?.ptsUs).toBe(0);
+    expect(nearestObservedFrame(timeline, 33_000)?.ptsUs).toBe(33_367);
+    expect(observedFrameTimelineFromProgram({ ...program, container: 'webm' })).toEqual([
+      { ptsUs: 33_366, durationUs: 33_367, keyframe: true },
+      { ptsUs: 66_733, durationUs: 33_367, keyframe: false },
+    ]);
   });
 
   test('does not mistake NTSC timestamp rounding for VFR', () => {

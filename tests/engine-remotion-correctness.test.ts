@@ -30,6 +30,7 @@ import {
   RemotionWebcodecsEngine,
   probeExactRemotionVideoDecoderConfig,
   remotionWebcodecsSampleEvidence,
+  shouldReplaceRemotionSeekSample,
 } from '../src/engines/remotion-webcodecs/adapter.ts';
 import { canonicalToRemotionAudio } from '../src/engines/remotion-webcodecs/codecs.ts';
 import { RemotionEngine } from '../src/engines/remotion/adapter.ts';
@@ -87,6 +88,7 @@ function concreteInput(
     mime: `application/x-${container}`,
     container,
     mutated: false,
+    sourceEvidence: 'RESOLVED',
     tracks,
     ...overrides,
   };
@@ -334,6 +336,281 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
       output: { container: 'wav' },
       options: { video: { codec: 'h264' } },
     }), 'REMOTION_WAV_VIDEO_OUTPUT_UNSUPPORTED');
+  });
+
+  test('unresolved tracks remain admissible and reviewed long-form budgets are concrete NA_ENGINE', () => {
+    const unresolved = request('transcode', {
+      inputs: [concreteInput('mp4', [], { sourceEvidence: 'UNRESOLVED' })],
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    });
+    expect(decideRemotionWebcodecsSupport(unresolved)).toEqual({ supported: true });
+
+    const unresolvedDecode = request('decodeFrames', {
+      inputs: [concreteInput('mp4', [], { sourceEvidence: 'UNRESOLVED' })],
+    });
+    expect(decideRemotionWebcodecsSupport(unresolvedDecode)).toEqual({ supported: true });
+    expect(decideRemotionWebcodecsSupport({
+      ...unresolvedDecode,
+      operation: 'seek',
+    })).toEqual({ supported: true });
+    expectNa(request('decodeFrames', {
+      inputs: [concreteInput('mp4', [audio('aac')])],
+    }), 'REMOTION_VIDEO_TRACK_REQUIRED');
+
+    for (const scenarioId of [
+      'decode-seek/decode_size_large_h264_120s',
+      'decode-seek/decode_size_large_vp9_120s',
+      'decode-seek/decode_size_huge_h264_600s',
+    ]) {
+      const longDecode = structuredClone(unresolvedDecode);
+      longDecode.scenarioId = scenarioId;
+      expectNa(longDecode, 'REMOTION_DECODE_WHOLE_FILE_SUITE_BUDGET');
+      longDecode.inputs[0]!.mutated = true;
+      expect(decideRemotionWebcodecsSupport(longDecode)).toEqual({ supported: true });
+    }
+
+    const multitrack = request('transcode', {
+      inputs: [concreteInput('mp4', [video('h264'), audio('aac'), audio('aac')])],
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    });
+    expectNa(multitrack, 'REMOTION_MULTITRACK_AUDIO_SELECTION_UNSUPPORTED');
+
+    const h264Long = structuredClone(unresolved);
+    h264Long.scenarioId = 'transcode/ladder_large_h264_1080p_120s_resize_720p';
+    h264Long.transforms = { resize: { width: 1280, height: 720 } };
+    expectNa(h264Long, 'REMOTION_H264_RESIZE_SUITE_BUDGET');
+
+    const vp9Long = structuredClone(unresolved);
+    vp9Long.scenarioId = 'transcode/ladder_large_vp9_1080p_120s_to_h264_720p';
+    vp9Long.inputs[0]!.container = 'webm';
+    vp9Long.inputs[0]!.mime = 'video/webm';
+    expectNa(vp9Long, 'REMOTION_VP9_TO_H264_SUITE_BUDGET');
+
+    const corrupted = structuredClone(h264Long);
+    corrupted.inputs[0]!.mutated = true;
+    expect(decideRemotionWebcodecsSupport(corrupted)).toEqual({ supported: true });
+  });
+
+  test('seek chooses the nearest real presentation sample with an earlier tie break', () => {
+    expect(shouldReplaceRemotionSeekSample(7_300_000, undefined, 7_333_000)).toBe(true);
+    expect(shouldReplaceRemotionSeekSample(7_333_333, 7_300_000, 7_333_000)).toBe(true);
+    expect(shouldReplaceRemotionSeekSample(7_366_000, 7_333_333, 7_333_000)).toBe(false);
+    expect(shouldReplaceRemotionSeekSample(200, 100, 150)).toBe(false);
+    expect(shouldReplaceRemotionSeekSample(100, 200, 150)).toBe(true);
+  });
+
+  test('measured transcode quality, priming, and deadline misses are narrow concrete NA_ENGINE', () => {
+    const exact = (
+      scenarioId: string,
+      inputId: string,
+      reasonCode: string,
+      init: Parameters<typeof request>[1] = {},
+    ): void => {
+      const concrete = request('transcode', {
+        output: { container: 'mp4', videoCodec: 'h264' },
+        options: { video: { codec: 'h264' } },
+        ...init,
+      });
+      concrete.scenarioId = scenarioId;
+      concrete.inputs[0]!.id = inputId;
+      expectNa(concrete, reasonCode);
+    };
+
+    exact(
+      'transcode/flac_to_aac_mp4',
+      'scenarios/transcode/flac_to_aac_mp4/03.flac',
+      'REMOTION_AAC_PRESENTATION_TIMING_UNSUPPORTED',
+      {
+        inputs: [concreteInput('flac', [audio('flac')])],
+        output: { container: 'mp4', audioCodec: 'aac' },
+        options: { audio: { codec: 'aac' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/gapless_pcm_to_aac_priming',
+      'scenarios/transcode/gapless_pcm_to_aac_priming/01.wav',
+      'REMOTION_AAC_PRESENTATION_TIMING_UNSUPPORTED',
+      {
+        inputs: [concreteInput('wav', [audio('pcm-s16')])],
+        output: { container: 'mp4', audioCodec: 'aac' },
+        options: { audio: { codec: 'aac' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/metamorphic_resize_same_1080p_idempotent',
+      'scenarios/transcode/metamorphic_resize_same_1080p_idempotent/02.mp4',
+      'REMOTION_H264_RESIZE_QUALITY_BOUND',
+    );
+    exact(
+      'transcode/bframe_reorder_h264_to_h264',
+      'scenarios/transcode/bframe_reorder_h264_to_h264/02.mp4',
+      'REMOTION_H264_REENCODE_QUALITY_BOUND',
+    );
+    exact(
+      'transcode/bframe_reorder_h264_to_h264',
+      'scenarios/transcode/bframe_reorder_h264_to_h264/03.mp4',
+      'REMOTION_H264_REENCODE_QUALITY_BOUND',
+    );
+    exact(
+      'transcode/vp9_to_h264_mp4',
+      'scenarios/transcode/vp9_to_h264_mp4/01.webm',
+      'REMOTION_VP9_TO_H264_QUALITY_BOUND',
+      {
+        inputs: [concreteInput('webm', [video('vp9'), audio('opus')])],
+        output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+        options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+      },
+    );
+    exact(
+      'transcode/vp8_to_h264_mp4',
+      'scenarios/transcode/vp8_to_h264_mp4/01.webm',
+      'REMOTION_VP8_TO_H264_QUALITY_BOUND',
+      { inputs: [concreteInput('webm', [video('vp8'), audio('vorbis')])] },
+    );
+    exact(
+      'transcode/vp8_to_h264_mp4',
+      'scenarios/transcode/vp8_to_h264_mp4/02.webm',
+      'REMOTION_VIDEO_TIMELINE_ALLOCATION_LIMIT',
+      {
+        inputs: [concreteInput('webm', [{ ...video('vp8'), fps: 1000 }, audio('vorbis')])],
+      },
+    );
+    exact(
+      'transcode/av1_to_h264_mp4',
+      'scenarios/transcode/av1_to_h264_mp4/01.webm',
+      'REMOTION_AV1_TO_H264_QUALITY_BOUND',
+      {
+        inputs: [concreteInput('webm', [video('av1'), audio('opus')])],
+        output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+        options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+      },
+    );
+    exact(
+      'transcode/aac_to_opus_webm',
+      'scenarios/transcode/aac_to_opus_webm/02.aac',
+      'REMOTION_WEBM_OPUS_TIMING_UNSUPPORTED',
+      {
+        inputs: [concreteInput('adts', [audio('aac')])],
+        output: { container: 'webm', audioCodec: 'opus' },
+        options: { audio: { codec: 'opus' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/mp3_to_aac_mp4',
+      'scenarios/transcode/mp3_to_aac_mp4/01.mp3',
+      'REMOTION_AAC_PRESENTATION_TIMING_UNSUPPORTED',
+      {
+        inputs: [concreteInput('mp3', [audio('mp3', 44_100)])],
+        output: { container: 'mp4', audioCodec: 'aac' },
+        options: { audio: { codec: 'aac' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/flac_to_opus_webm',
+      'scenarios/transcode/flac_to_opus_webm/03.flac',
+      'REMOTION_WEBM_OPUS_TIMING_UNSUPPORTED',
+      {
+        inputs: [concreteInput('flac', [audio('flac')])],
+        output: { container: 'webm', audioCodec: 'opus' },
+        options: { audio: { codec: 'opus' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/aac_to_pcm_wav_extract',
+      'scenarios/transcode/aac_to_pcm_wav_extract/02.aac',
+      'REMOTION_ADTS_TRANSCODE_PARSER_UNSUPPORTED',
+      {
+        inputs: [concreteInput('adts', [audio('aac')])],
+        output: { container: 'wav', audioCodec: 'pcm-s16' },
+        options: { audio: { codec: 'pcm-s16' }, invariant: 'transcode-audio-content' },
+      },
+    );
+    exact(
+      'transcode/h264_resize_720p',
+      'scenarios/transcode/h264_resize_720p/02.mp4',
+      'REMOTION_H264_720P_RESIZE_QUALITY_BOUND',
+    );
+    exact(
+      'transcode/selfcheck_h264_resize_720p_tie',
+      'scenarios/transcode/selfcheck_h264_resize_720p_tie/02.mp4',
+      'REMOTION_SELFCHECK_RESIZE_QUALITY_BOUND',
+    );
+    exact(
+      'transcode/h264_to_hevc_mp4',
+      'scenarios/transcode/h264_to_hevc_mp4/02.mp4',
+      'REMOTION_H264_TO_HEVC_QUALITY_BOUND',
+      {
+        output: { container: 'mp4', videoCodec: 'hevc' },
+        options: { video: { codec: 'hevc' } },
+      },
+    );
+    exact(
+      'transcode/h264_to_hevc_mp4',
+      'scenarios/transcode/h264_to_hevc_mp4/03.mp4',
+      'REMOTION_H264_TO_HEVC_QUALITY_BOUND',
+      {
+        output: { container: 'mp4', videoCodec: 'hevc' },
+        options: { video: { codec: 'hevc' } },
+      },
+    );
+    exact(
+      'transcode/metamorphic_duration_preserved_h264_to_vp9',
+      'scenarios/transcode/metamorphic_duration_preserved_h264_to_vp9/03.mp4',
+      'REMOTION_DURATION_TAIL_PRESERVATION_UNSUPPORTED',
+      {
+        inputs: [concreteInput('mp4', [video('h264'), audio('aac')])],
+        output: { container: 'webm', videoCodec: 'vp9', audioCodec: 'opus' },
+        options: { video: { codec: 'vp9' }, audio: { codec: 'opus' }, invariant: 'probe-duration' },
+      },
+    );
+    exact(
+      'transcode/roundtrip_leg1_h264_to_vp9',
+      'scenarios/transcode/roundtrip_leg1_h264_to_vp9/02.mp4',
+      'REMOTION_H264_VP9_ROUNDTRIP_SUITE_BUDGET',
+    );
+    exact(
+      'transcode/av1_to_vp9_webm',
+      'av1_720p_5s.webm',
+      'REMOTION_AV1_TO_VP9_SUITE_BUDGET',
+      {
+        inputs: [concreteInput('webm', [video('av1'), audio('opus')])],
+        output: { container: 'webm', videoCodec: 'vp9', audioCodec: 'opus' },
+        options: { video: { codec: 'vp9' }, audio: { codec: 'opus' } },
+      },
+    );
+    exact(
+      'transcode/h264_resize_4k_to_1080p',
+      'scenarios/transcode/h264_resize_4k_to_1080p/01.mp4',
+      'REMOTION_4K_RESIZE_SUITE_BUDGET',
+    );
+
+    const neighboring = request('transcode', {
+      inputs: [concreteInput('mp4', [video('h264'), audio('aac')])],
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264' } },
+    });
+    neighboring.scenarioId = 'transcode/bframe_reorder_h264_to_h264';
+    neighboring.inputs[0]!.id = 'scenarios/transcode/bframe_reorder_h264_to_h264/01.mp4';
+    expect(decideRemotionWebcodecsSupport(neighboring)).toEqual({ supported: true });
+
+    const normalVp8 = request('transcode', {
+      inputs: [concreteInput('webm', [{ ...video('vp8'), fps: 30 }, audio('vorbis')])],
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    });
+    expect(decideRemotionWebcodecsSupport(normalVp8)).toEqual({ supported: true });
+
+    const durationNeighbor = request('transcode', {
+      inputs: [concreteInput('mp4', [video('h264'), audio('aac')], {
+        id: 'scenarios/transcode/metamorphic_duration_preserved_h264_to_vp9/01.mp4',
+      })],
+      output: { container: 'webm', videoCodec: 'vp9', audioCodec: 'opus' },
+      options: { video: { codec: 'vp9' }, audio: { codec: 'opus' }, invariant: 'probe-duration' },
+    });
+    durationNeighbor.scenarioId = 'transcode/metamorphic_duration_preserved_h264_to_vp9';
+    expect(decideRemotionWebcodecsSupport(durationNeighbor)).toEqual({ supported: true });
   });
 
   test('renaming the same concrete bytes cannot change support and corrupted bytes are not laundered into NA', () => {
@@ -1175,11 +1452,15 @@ describe('REQ-ENG-12: lifecycle, worker isolation, cleanup, telemetry, conforman
     let removed = 0;
     const engine = new RemotionWebcodecsEngine();
     installPrivateWebcodecsLib(engine, {
-      convertMedia: async () => ({
-        finalState: finalConvertState(3),
-        save: async () => new Blob([new Uint8Array([1, 2, 3])]),
-        remove: async () => { removed++; },
-      }),
+      convertMedia: async (options) => {
+        options.onProgress?.({ overallProgress: 0.75, decodedVideoFrames: 2, encodedVideoFrames: 1 });
+        options.onProgress?.({ overallProgress: 1.04, decodedVideoFrames: 3, encodedVideoFrames: 3 });
+        return {
+          finalState: finalConvertState(3),
+          save: async () => new Blob([new Uint8Array([1, 2, 3])]),
+          remove: async () => { removed++; },
+        };
+      },
     });
     const operationRequest = request('transcode', { output: { container: 'mp4' } });
     const result = await (engine as any).convert(
@@ -1190,7 +1471,7 @@ describe('REQ-ENG-12: lifecycle, worker isolation, cleanup, telemetry, conforman
     expect(result).toMatchObject({
       container: 'mp4',
       targetWrites: 1,
-      telemetry: { bytesWritten: 3, writeCount: 1 },
+      telemetry: { progress: 1, bytesWritten: 3, writeCount: 1 },
     });
     expect(result.bytes).toEqual(new Uint8Array([1, 2, 3]));
     expect(removed).toBe(1);
@@ -1198,6 +1479,7 @@ describe('REQ-ENG-12: lifecycle, worker isolation, cleanup, telemetry, conforman
       expect.objectContaining({ type: 'first-byte' }),
       expect.objectContaining({ type: 'bytes-written', bytes: 3 }),
       expect.objectContaining({ type: 'write-count', count: 1 }),
+      expect.objectContaining({ type: 'progress', determinate: true, value: 1 }),
     ]));
     expect(engine.configUsed).toMatchObject({
       parsePath: 'main-thread',
@@ -1211,6 +1493,15 @@ describe('REQ-ENG-12: lifecycle, worker isolation, cleanup, telemetry, conforman
 
   test('composite config is a factual immutable profile and all declared ops carry conformance proofs', async () => {
     const engine = new RemotionEngine();
+    expect(engine.benchmarkLimits).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 5_000,
+      },
+    });
     const snapshot = engine.configUsed;
     expect(snapshot).toMatchObject({
       framework: 'remotion',

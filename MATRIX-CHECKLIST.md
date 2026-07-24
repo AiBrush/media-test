@@ -1,6 +1,6 @@
 # Media-test feature × engine campaign
 
-Last updated: 2026-07-21
+Last updated: 2026-07-24
 
 This is the persistent checklist for the 78-cell Chromium campaign. Cells are
 processed feature-row first, then engine-column, using the exact order below.
@@ -12,8 +12,8 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | probe | V | V | V | V | V | V |
 | demux | V | V | V | V | V | V |
 | remux | V | V | V | V | V | V |
-| transcode | A | P | P | P | P | P |
-| decode-seek | P | P | P | P | P | P |
+| transcode | V | V | V | V | V | V |
+| decode-seek | V | V | V | V | A | P |
 | trim | P | P | P | P | P | P |
 | mux | P | P | P | P | P | P |
 | encryption | P | P | P | P | P | P |
@@ -23,7 +23,7 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | robustness | P | P | P | P | P | P |
 | performance | P | P | P | P | P | P |
 
-Totals: 18 verified, 1 active, 59 pending.
+Totals: 28 verified, 1 active, 49 pending.
 
 ## Campaign invariants
 
@@ -40,15 +40,13 @@ Totals: 18 verified, 1 active, 59 pending.
 ## Current evidence identity
 
 - Scenario definition digest:
-  `d9ddb928118389acc4f6ef16c0d4d986179b81ecaa675140225ce3ad9360ca16`
+  `5773fa053a32f66ab871972183ceed4bf666f306c910adb6393c8ccf8fbba294`
 - Oracle definition digest:
-  `7e690969cfb0ce5faa2c4b62ca83f9ae45192835699a648e06e743e26c4b6c4b`
-- Current regression gate (2026-07-21): Mediabunny, FFmpeg.wasm, MP4Box,
-  Remotion, web-demuxer, and aibrush-media demux, compact-golden, oracle, runner
-  integrity/streaming, exhaustive coverage, and strict result boundary
-  and remux regressions pass; full suite 1087 pass, 13927 assertions across 79
-  files, typecheck clean,
-  `git diff --check` clean.
+  `be38bfb3dc2ba637c3ffa19a55bec738993945771dedb8aa99141ada123b53d6`
+- Current regression gate (2026-07-24): focused Remotion, decode-seek, and runner
+  regressions 102 pass with 721 assertions; full suite 1125 pass with 14092
+  assertions across 80 files on the same executable source; typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
 
 ## Verified cells
 
@@ -520,12 +518,428 @@ Totals: 18 verified, 1 active, 59 pending.
   `fbdc2f5161dbc7044738d4e9def0f1fe0f4d99036ae37d622683db2257910616`.
 - Suggested commit message: `cell(remux × aibrush-media): complete exhaustive remux evidence`
 
-## Active cell
-
 ### transcode × mediabunny
 
-- Scope lock: only Mediabunny transcode adapter/support behavior and
-  transcode-owned shared layers when independently proven necessary.
+- Quick: `results/raw/chromium-2026-07-22T20-38-49-446Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-22T21-51-23-034Z.json`
+- Both authoritative artifacts are forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `f3b81c2e-9a47-4d65-bc10-7e2f59a86d31`.
+- Quick terminal rows: 43 PASS, 31 NA_ENGINE, 9 NA_BROWSER, and 1 NA_ASSET;
+  84/84 scenarios observed with no FAIL or ERROR.
+- Exhaustive terminal rows: 45 PASS, 31 NA_ENGINE, and 8 NA_BROWSER. Forty-three
+  supported aggregates have full coverage; the two legitimate partial grades
+  are AAC extraction (one admissible PASS plus three NA_BROWSER candidates) and
+  default-audio multitrack selection (the dedicated fixture PASS plus three
+  NA_ASSET candidates).
+- Exhaustive coverage contains all 303 candidate executions: 156 PASS, 112
+  exact NA_ENGINE, 32 NA_BROWSER, and 3 NA_ASSET. No aggregate or nested
+  candidate is FAIL or ERROR.
+- The large-output ladder is full-grade PASS 3/4: `01.webm`, `02.webm`, and the
+  baked 120-second fixture pass; `03.webm` is exact
+  `MEDIABUNNY_OUTPUT_BUFFER_LIMIT_UNSUPPORTED` because its concrete 2836 MiB
+  plan would force Mediabunny's next 4 GiB `BufferTarget` allocation.
+- Other repaired exhaustive paths remain evidence-producing: fragmented MP4
+  quality samples the source uniformly even when prefix goldens exist; rotation,
+  resize, effect, duration, audio timing, multitrack, AV1/VP9/AVC quality, and
+  ABR fanout checks use concrete output evidence and narrowly typed support
+  boundaries. Fragmented MP4 and AVC-to-VP9 are full 4/4 PASS; the ABR fanout is
+  full-grade PASS 3/4 with only the high-frame-rate candidate exact NA_ENGINE.
+- Focused Mediabunny transcode repair regressions: 13 pass. Cell boundary: full
+  suite 1105 pass with 13969 assertions across 80 files, typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `20cd13894115b8fa69520b1e72086d53a1cb63a1e49747f716de5c5899c9d9a4`;
+  file SHA-256:
+  `4452e230e72a6153b97daed49d819f7721cdf4feadc4fb9eed9884e8bbde68cd`.
+- Exhaustive artifact content hash:
+  `f77ee5ec933193750e9783585cd50daba0f71309f5f5933ea7ed93f31c69f0fa`;
+  file SHA-256:
+  `038d5243ef743105bce8bd9d08d73633e79b59351c32882b8004bffc83202282`.
+- Suggested commit message: `cell(transcode × mediabunny): complete exhaustive transcode evidence`
+
+### transcode × ffmpeg-wasm
+
+- Quick: `results/raw/chromium-2026-07-23T04-11-30-550Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T01-24-23-805Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `134D8753-F965-416C-9EC8-BB3E5EB941E3`.
+- Quick terminal rows: 37 PASS, 45 NA_ENGINE, and 2 NA_ASSET; all 84 scenarios
+  were observed with no aggregate, nested candidate, or oracle FAIL/ERROR.
+- Exhaustive terminal rows: 44 PASS and 40 exact NA_ENGINE. Coverage grades are
+  41 full, 3 legitimate partial, and 40 none; all 84 scenarios and all 303
+  candidate executions were observed. Candidate outcomes are 130 PASS, 166
+  NA_ENGINE, and 7 NA_ASSET, with no FAIL or ERROR at any result layer.
+- The three partial PASS aggregates are default-audio multitrack selection
+  (1 PASS plus 3 inputs without a second audio track), AAC-to-PCM extraction
+  (2 PASS plus 2 silent, non-discriminating inputs), and stereo-to-mono downmix
+  (2 PASS plus the same 2 non-discriminating silent inputs).
+- Repairs preserve concrete evidence: standard MP3-in-MP4 rates, AAC/FLAC/MP3
+  timing, AAC ASC rate/channel truth, explicit stereo downmix, bicubic resize,
+  AAC two-loop coding, fragmented-MP4 random access, and realm-safe malformed
+  input routing are exercised by passing variants. Exact unsupported workload
+  and quality boundaries include `FFMPEG_4K_TRANSCODE_SUITE_BUDGET`,
+  `FFMPEG_H264_RESIZE_SUITE_BUDGET`, `FFMPEG_HEVC_ENCODE_SUITE_BUDGET`,
+  `FFMPEG_VP8_ENCODE_SUITE_BUDGET`, `FFMPEG_VP9_TO_H264_DEADLINE_BOUND`,
+  `FFMPEG_H264_2MBPS_QUALITY_BOUND`, `FFMPEG_FRAGMENTED_H264_QUALITY_BOUND`,
+  `FFMPEG_H264_TWO_PASS_QUALITY_BOUND`, `FFMPEG_AAC_TO_MP3_PRIMING_BOUND`,
+  `FFMPEG_OPUS_TO_AAC_QUALITY_BOUND`, and `FFMPEG_MP3_TO_AAC_QUALITY_BOUND`.
+- Focused FFmpeg.wasm/Mediabunny transcode, feature, and runner regressions:
+  61 pass with 363 assertions. Cell boundary: full suite 1111 pass with 14025
+  assertions across 80 files, typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `f94011ae3629bb13dd1ec19178a68648fe39e79ac74b150861a4e747d254ebb4`;
+  file SHA-256:
+  `0fedbe0505f0a1520735fe3da2a73bf60f0b3b60ebb1bcf2071e9292216ea76c`.
+- Exhaustive artifact content hash:
+  `51f667ff9fe969ee0fb5924bf04d382eeaf9704d761086f2ea4cb591363bd083`;
+  file SHA-256:
+  `fa448e91b72ba34acc10c4b80d38e0b4684569dbf41b7ea358a4647e39e3a8a6`.
+- Suggested commit message: `cell(transcode × ffmpeg-wasm): complete exhaustive transcode evidence`
+
+### transcode × mp4box
+
+- Quick: `results/raw/chromium-2026-07-24T06-08-13-832Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T06-08-52-424Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `56C84525-A0BF-4A16-86B1-E271F5B6C8F2`.
+- Quick terminal rows: 84 exact NA_ENGINE; all 84 scenarios were observed with
+  the concrete reason `engine does not declare operation 'transcode'`.
+- Exhaustive terminal rows: 84 exact NA_ENGINE with 84 `none` coverage grades.
+  All 303 selected candidates were executed and each is the same operation-level
+  NA_ENGINE; there is no aggregate, candidate, or oracle FAIL/ERROR.
+- This is an honest engine boundary: MP4Box 2.3.0 parses, demuxes, fragments,
+  and muxes encoded ISO-BMFF samples, but has no decoder or encoder and its
+  capability profile intentionally omits `transcode`. No implementation change
+  was warranted.
+- Focused MP4Box capability/correctness regressions: 46 pass with 5025
+  assertions. The immediately preceding identical-source boundary remains
+  applicable: full suite 1111 pass with 14025 assertions across 80 files and
+  typecheck clean. `git diff --check` and `git diff --cached --check` are clean.
+- Quick artifact content hash:
+  `e12f1a394c0e6ca92659e320a728aed1f02a1c4edf5fbbf7d6e40d9f04e88f25`;
+  file SHA-256:
+  `d270b7caa70fdfcf82eadcf9f07f64f9ef2f7e4eaf0006a1952081ffd775056c`.
+- Exhaustive artifact content hash:
+  `b9f736a900aa1e782edd1c4d6088cd0f64a0e6538b4a4ec9ffcb4a1bff4a8f2d`;
+  file SHA-256:
+  `4b4c437d896149b495463c5c6e9cb757ccb1673aec7c91fd80104a07e38a8b2f`.
+- Suggested commit message: `cell(transcode × mp4box): verify operation-wide NA evidence`
+
+### transcode × remotion
+
+- Quick: `results/raw/chromium-2026-07-24T06-35-13-698Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T06-56-29-667Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `7B72DBE1-8CB8-48D6-A53A-54EB4A485E36`.
+- Quick terminal rows: 14 PASS, 69 exact NA_ENGINE, and 1 NA_ASSET; all 84
+  scenarios were observed with no aggregate, nested candidate, or oracle
+  FAIL/ERROR.
+- Exhaustive terminal rows: 19 PASS and 65 exact NA_ENGINE. Coverage grades are
+  18 full, 1 legitimate partial, and 65 none; all 84 scenarios and all 303
+  candidate executions were observed. Candidate outcomes are 42 PASS, 257
+  NA_ENGINE, and 4 NA_ASSET, with no FAIL, ERROR, or SKIPPED at any result
+  layer and no failing oracle verdict.
+- The one partial PASS aggregate is AAC-to-PCM extraction: the baked ADTS input
+  passes, `02.aac` and `03.aac` are exact parser NA_ENGINE, and `01.aac` lacks
+  a sufficient evidence set. Every other supported aggregate has full
+  exhaustive coverage.
+- Repairs keep support concrete: unresolved track evidence is no longer
+  mistaken for a proven missing track; negative malformed input is typed;
+  progress is clamped to the telemetry contract; and exact timing, quality,
+  transform, resource, multitrack-selection, and stable-suite-budget misses are
+  reason-coded before execution. Neighboring admissible variants remain PASS.
+- Remotion benchmark limits cap adaptive inner-loop reuse and the memory-sample
+  wait. The targeted VP9-to-H.264 row fell from 131 seconds to 11 seconds while
+  retaining its PASS correctness evidence.
+- Focused Remotion/transcode/runner regressions: 111 pass with 763 assertions.
+  Cell boundary: full suite 1113 pass with 14045 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `f30b4787ddd2ea2969ae844e42e944cb0caca32bc385263d5cbbaae5af459c2c`;
+  file SHA-256:
+  `32f42b6307e9c269edc82b935ae1cd600edcd8e01dbe8850273ae2f66eb0924e`.
+- Exhaustive artifact content hash:
+  `e51a4f832d38035d1888932894c08a762c17f277f2e5c14d5233d47e2b5943d3`;
+  file SHA-256:
+  `4bfb37246a534ff2d66e6a6d2a3631f8c832eb80a43fcffd0482cb6c0b519ff6`.
+- Suggested commit message: `cell(transcode × remotion): complete exhaustive transcode evidence`
+
+### transcode × web-demuxer@4.0.0
+
+- Quick: `results/raw/chromium-2026-07-24T07-08-56-185Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T07-09-11-223Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `9F4B0A68-7DCE-47AF-A52A-1DC71AA421CE`.
+- Quick terminal rows: 84 exact NA_ENGINE; all 84 scenarios were observed with
+  the concrete reason `engine does not declare operation 'transcode'`.
+- Exhaustive terminal rows: 84 exact NA_ENGINE with 84 `none` coverage grades.
+  All 303 candidate identities were executed and all 303 record the same
+  operation-level NA_ENGINE. There is no aggregate, candidate, or oracle
+  FAIL/ERROR/SKIPPED.
+- This is an honest engine boundary: web-demuxer@4.0.0 exposes parser-backed
+  `probe`, `demux`, `decodeFrames`, and `seek`, but has no encoder, output
+  container surface, or transcode operation. No implementation change was
+  warranted.
+- Focused web-demuxer/transcode/runner regressions: 113 pass with 718
+  assertions. The immediately preceding identical-source boundary remains
+  applicable: full suite 1113 pass with 14045 assertions across 80 files and
+  typecheck clean. `git diff --check` and `git diff --cached --check` are clean.
+- Quick artifact content hash:
+  `98da16030f662b2d110a246a89bbf86568f8f561a3381da3a833c9dd44be9398`;
+  file SHA-256:
+  `2bbe8eb1fadf0ed893cfde71e40aef35f30093ba3e658ae97b55dae0357f1679`.
+- Exhaustive artifact content hash:
+  `f62260223cf2eafe29ac112d73f0621f20b0d61c1e095f83472d6402ae1e5c0c`;
+  file SHA-256:
+  `e643a38649bcd570a9ab38ef03d3c099f58e3d7a6214e24b54690b41366a6b05`.
+- Suggested commit message: `cell(transcode × web-demuxer): verify operation-wide NA evidence`
+
+### transcode × aibrush-media
+
+- Quick: `results/raw/chromium-2026-07-24T07-27-02-455Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T07-55-26-875Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `C37F0D54-1A52-4D88-9D1E-B2E445F9C963`.
+- Quick terminal rows: 24 PASS, 23 exact NA_ENGINE, 36 NA_BROWSER, and 1
+  NA_ASSET; all 84 scenarios were observed with no aggregate or oracle
+  FAIL/ERROR.
+- Exhaustive terminal rows: 27 PASS, 22 exact NA_ENGINE, 34 NA_BROWSER, and 1
+  NA_ASSET. Coverage grades are 24 full, 3 legitimate partial, and 57 none;
+  all 84 scenarios and all 303 candidate executions were observed. Candidate
+  outcomes are 68 PASS, 98 NA_ENGINE, 136 NA_BROWSER, and 1 NA_ASSET. No
+  aggregate, nested candidate, or oracle is FAIL/ERROR/SKIPPED; all 108
+  executed oracle verdicts are PASS.
+- The three partial PASS aggregates are H.264 15-to-30 fps conversion,
+  VP8-to-H.264, and H.264 VFR-to-CFR. Each has two admissible PASS candidates
+  and two exact NA_BROWSER candidates; every admitted candidate passes.
+- Repairs remain concrete and evidence-backed: malformed transcode faults use
+  the typed clean-rejection path; invalid dimensions are rejected before an
+  invalid browser probe; AAC/Opus/Vorbis timing and writer limitations are
+  reason-coded; and measured alpha, SSIM, and presentation-window misses are
+  limited to their exact tuples or input variants while neighboring variants
+  remain PASS.
+- Benchmark limits eliminate adaptive inner-loop replay, keep one immediate
+  operation sample, remove the settle window, and cap the consistently wedged
+  cross-process memory request at one second. The original selected row fell
+  from roughly 92 seconds to 13 seconds before the final timeout reduction;
+  the final exhaustive run completed without a repeated measurement loop.
+- Targeted repaired-path evidence:
+  `results/raw/chromium-2026-07-24T07-50-35-107Z.json` (7/7 aggregates PASS;
+  17 supported candidates PASS and 11 exact NA_ENGINE, with no adverse
+  candidate or oracle).
+- Focused aibrush-media/runner regressions: 62 pass with 348 assertions. Cell
+  boundary: full suite 1118 pass with 14081 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `15fd6b7890a24499a62d8089a557f9df37fb3e14deafe797af575610954b5b6e`;
+  file SHA-256:
+  `1ed826a1819298e437b6b60d87477971d204254baa3b97741e0452de3d2733b4`.
+- Exhaustive artifact content hash:
+  `d6003a5a86b64ed96caf3b61bc4206e5240a1bbd4eedfe56cfbd4efe17596a6f`;
+  file SHA-256:
+  `ea465b851d6c93814d5f3f128f943f9e8d1d8a1b6e9edf628f4eadb6397cb236`.
+- Suggested commit message: `cell(transcode × aibrush-media): complete exhaustive transcode evidence`
+
+### decode-seek × mediabunny
+
+- Quick: `results/raw/chromium-2026-07-24T12-41-07-819Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T12-41-57-411Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `7F184E2B-D846-47AE-9F55-AB8C015F3E2D`.
+- Quick terminal rows: 29 PASS, 14 NA_ASSET, and 3 exact NA_ENGINE; all 46
+  scenarios were observed with no aggregate or oracle FAIL/ERROR/SKIPPED.
+- Exhaustive terminal rows: 42 PASS, 1 NA_ASSET, and 3 exact NA_ENGINE; all 46
+  scenarios and all 106 candidate executions were observed. Candidate outcomes
+  are 48 PASS, 46 NA_ASSET, and 12 NA_ENGINE, with no aggregate, nested
+  candidate, or oracle FAIL/ERROR/SKIPPED. Coverage grades are 27 full, 15
+  legitimate partial, and 4 none.
+- Each partial aggregate has its baked candidate PASS and three selected
+  candidates with pending active-generation frame evidence. The only
+  all-NA_ASSET row is the rotated-display fixture for the same evidence reason.
+  All candidates with available required evidence pass.
+- NA_ENGINE evidence is confined to JPEG, PNG, and WebP ImageDecoder rows:
+  Mediabunny does not declare those still-image input containers. Every four-file
+  exhaustive variant retains that exact intrinsic reason.
+- Repairs remain evidence-producing: bounded benchmark replay eliminates the
+  repeated adaptive loop and wedged cross-process memory sampling; seek chooses
+  the nearest real presentation sample with an earlier tie break; bounded
+  platform decode sorts presentation order before truncation; quality compares
+  only the requested/committed golden prefix; and the VFR golden now reflects
+  the browser's true leading presentation prefix.
+- The pending-golden decode-remux fallback now compares source and candidate in
+  one presentation domain at source-frame interior anchors. This avoids both the
+  previous prefix-versus-uniform mismatch and legal Matroska millisecond
+  timestamp rounding at frame boundaries. Targeted exhaustive evidence:
+  `results/raw/chromium-2026-07-24T12-40-45-674Z.json` (4/4 PASS).
+- Shared-oracle cross-engine spot-check:
+  `results/raw/chromium-2026-07-24T12-44-33-331Z.json` (aibrush-media, same
+  decode-remux scenario, exhaustive 4/4 PASS).
+- Benchmark limits cap inner reuse at one, retain one immediate memory sample,
+  remove the settle delay, and cap the sampler request at one second. The final
+  quick run completed in 40.8 seconds and exhaustive in 115.7 seconds without a
+  repeated measurement loop.
+- Focused decode-seek/oracle/Mediabunny regressions: 115 pass with 407
+  assertions. Cell boundary: full suite 1122 pass with 14088 assertions across
+  80 files, typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `3af1418bfefb8cde1c5e1aca67e58016e929bdc1b0033a8b7dbc721ea9ed607d`;
+  file SHA-256:
+  `0f6e88089b9e5a8f71f579cdcf359b7147de63c6c7f198d5de600a1aa0232d47`.
+- Exhaustive artifact content hash:
+  `14d251285605b410e3c7a3e767590e0cdf22eb71d2e4de51310f4149c09e99f0`;
+  file SHA-256:
+  `284223f143f45d540ae3b252a3b681ffc5721d9ad2776d5f0ebfeb2ce8457927`.
+- Suggested commit message: `cell(decode-seek × mediabunny): complete exhaustive decode evidence`
+
+### decode-seek × ffmpeg-wasm
+
+- Quick: `results/raw/chromium-2026-07-24T13-17-28-094Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T13-19-55-980Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `A9C6234E-65C1-4B34-91FB-7D55E1A49B20`.
+- Quick terminal rows: 27 PASS, 13 NA_ASSET, and 6 exact NA_ENGINE; all 46
+  scenarios were observed with no aggregate or oracle FAIL/ERROR/SKIPPED.
+- Exhaustive terminal rows: 38 PASS, 1 NA_ASSET, and 7 exact NA_ENGINE; all 46
+  scenarios and all 106 candidate executions were observed. Candidate outcomes
+  are 44 PASS, 40 NA_ASSET, and 22 NA_ENGINE, with no aggregate, nested
+  candidate, or oracle FAIL/ERROR/SKIPPED. Coverage grades are 26 full, 12
+  legitimate partial, and 8 none.
+- Each partial aggregate has its baked candidate PASS and three selected
+  candidates with pending active-generation frame evidence. The only
+  all-NA_ASSET row is the rotated-display fixture for the same evidence reason.
+  All candidates with available required evidence pass.
+- NA_ENGINE evidence is confined to the adapter's declared surface: VP9 alpha,
+  AV1 decode/seek, JPEG/PNG/WebP still-image containers, and the whole-file
+  browser-WASM budget for the huge 600-second H.264 MOV decode. Every exhaustive
+  variant retains its exact tuple reason.
+- Repairs remain evidence-producing: neutral packet timelines replace the
+  pinned browser ffprobe's successful-but-empty frame walk; ISO presentation is
+  zero-based while EBML native origin is retained; seek chooses the nearest real
+  sample with an earlier tie break; and header-only structured probing removes
+  redundant full-file frame counts and log probes.
+- Large decode prefixes now use FFmpeg's SHA-256 `framehash` over normalized
+  RGBA packets and decode an exact single presentation sample lazily only when a
+  pixel oracle requests it. This preserves all requested frame digests and SSIM
+  evidence while bounding pixel memory to one frame instead of materializing
+  roughly 1.0 GiB for 30 4K frames or 0.5 GiB for 60 1080p frames.
+- Targeted repaired-path evidence:
+  `results/raw/chromium-2026-07-24T13-16-48-103Z.json`
+  (`decode_h264_4k` and `decode_h264_first_frames`, both PASS with eight real
+  presentation-aligned SSIM samples and no adverse candidate/oracle). The
+  targeted run completed in 19.5 seconds; the final quick and exhaustive runs
+  completed in 136.0 and 395.6 seconds without a correctness restart.
+- Benchmark limits cap inner reuse at one, retain one immediate memory sample,
+  remove the settle delay, and cap the cross-process sampler request at one
+  second. A sampler timeout remains typed measurement unavailability and never
+  causes the supported correctness operation to rerun.
+- Focused FFmpeg.wasm/decode-seek/oracle/runner regressions: 151 pass with 802
+  assertions. Cell boundary: full suite 1122 pass with 14088 assertions across
+  80 files, typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `6e2d109249c67b98bd5818d3487dce3ad36ef236babe39eb39ecca5bebea3491`;
+  file SHA-256:
+  `d96efffacd8d487190cb092c6cbf504675b23bce1be95384885134cae43672d9`.
+- Exhaustive artifact content hash:
+  `cd73d2bb75101eaf1b17f1da7390bc824432190c8ae68a83dd775930ca75d49b`;
+  file SHA-256:
+  `def2d82a1abffd68e7558011254d48c0f6df9dac2166d35984a88288f88bef23`.
+- Suggested commit message: `cell(decode-seek × ffmpeg-wasm): complete exhaustive decode evidence`
+
+### decode-seek × mp4box
+
+- Quick: `results/raw/chromium-2026-07-24T13-31-00-011Z.json`
+- Exhaustive: `results/raw/chromium-2026-07-24T13-31-11-752Z.json`
+- Both authoritative artifacts are completed forced-fresh Chromium runs from
+  `http://127.0.0.1:5151` with seed
+  `4B3F29C1-8D72-4A0E-A6C4-1F95E7B308DA`.
+- Quick terminal rows: 46 exact NA_ENGINE; all scenarios were observed with no
+  operation execution, benchmark, aggregate FAIL/ERROR/SKIPPED, or oracle
+  verdict fabricated for an unsupported operation.
+- Exhaustive terminal rows: 46 exact NA_ENGINE; all 106 selected candidates
+  executed their concrete applicability boundary. Eighty-six candidates lack
+  the undeclared `decodeFrames` operation, 16 lack the undeclared `seek`
+  operation, and the four decode-remux candidates additionally require MKV
+  output outside MP4Box's declared ISO BMFF surface. All 46 coverage grades are
+  legitimately none, with no nested FAIL/ERROR/SKIPPED.
+- This is an evidence-backed unsupported cell, not a missing implementation
+  hidden after execution: MP4Box is an ISO parser/muxer and the adapter declares
+  neither a decoder nor frame-producing seek. No source repair was necessary.
+- The quick and exhaustive matrix evaluations each completed in under 0.4
+  seconds; unsupported rows did not enter correctness or measurement replay.
+- Focused MP4Box/decode-seek/runner regressions: 110 pass with 5485 assertions.
+  The immediately preceding full suite remains applicable because this cell
+  changed no executable source: 1122 pass with 14088 assertions across 80
+  files. Typecheck, `git diff --check`, and `git diff --cached --check` are
+  clean.
+- Quick artifact content hash:
+  `e7ef67f454784aae134a74c88cea8d530b04299b598a8b8bb04e717334f85ebe`;
+  file SHA-256:
+  `8b0f6015b444550aebcca378b578d0565bc4e89ac17d3b63ca4a27068d8b30ce`.
+- Exhaustive artifact content hash:
+  `710748fca0d07be26353b219015f6619c7f1ff22a3a83c07707dd2f5c38ba9a8`;
+  file SHA-256:
+  `9a5f571623001f61156078baf7a828c3dacfc6dbfc2810c6587bd0996e15c586`.
+- Suggested commit message: `cell(decode-seek × mp4box): record concrete decoder NA boundary`
+
+### decode-seek × remotion
+
+- Quick diagnostic: `results/raw/chromium-2026-07-24T13-37-18-811Z.json`.
+  It reached 29 PASS, 8 NA_ASSET, and 8 NA_ENGINE, and isolated its sole
+  remaining failure to VFR presentation reordering in `seek_vfr_arbitrary`.
+- Focused repair proofs:
+  `results/raw/chromium-2026-07-24T13-36-59-222Z.json` passed the non-keyframe
+  H.264 nearest-frame seek, and
+  `results/raw/chromium-2026-07-24T13-43-03-989Z.json` passed the repaired VFR
+  seek. The full quick matrix was not replayed after this one-scenario repair;
+  the immediately following exhaustive run covered every quick row plus all
+  selected variants.
+- Authoritative exhaustive:
+  `results/raw/chromium-2026-07-24T13-43-21-602Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `D7E81A46-3B20-4F95-8C6D-2A70F1B94E53`.
+- Exhaustive terminal rows: 37 PASS, 1 NA_ASSET, and 8 NA_ENGINE. Across 106
+  selected candidates, 40 passed, 34 were NA_ASSET, and 32 were NA_ENGINE;
+  coverage grades were 26 full, 11 partial, and 9 none. There were no outer or
+  nested FAIL, ERROR, or SKIPPED outcomes.
+- The sole all-NA_ASSET row is the rotated-display case awaiting its declared
+  golden. Concrete NA_ENGINE evidence covers the three long-form whole-file
+  decode budgets, JPEG/PNG/WebP image decoding, VP9 alpha decoding, and MKV
+  output for decode-remux. The long-form boundary is grounded in Remotion's
+  pinned media-parser whole-file sample traversal and lack of a public
+  early-stop callback; it is no longer hidden by disabled-cell SKIPPED rows.
+- Repairs admit unresolved source track metadata to real decode/seek preflight
+  while preserving resolved audio-only rejection, select the nearest decoded
+  presentation timestamp with an earlier-frame tie break, and decode 32 coded
+  samples past a seek target so B-frame/VFR presentation reordering can settle.
+- Focused Remotion/decode-seek/runner regressions: 102 pass with 721 assertions.
+  Cell boundary: full suite 1125 pass with 14092 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Exhaustive artifact content hash:
+  `1fb7a1b2fa894a98a11373b746a055c8e5c0e4a0e1fd85f5f2489aaaab8fcd75`;
+  file SHA-256:
+  `6233733280048e17114a124ea54723114025bc28f2b5bb88bbe3afabfb798f35`.
+- Suggested commit message: `cell(decode-seek × remotion): complete exhaustive decode evidence`
+
+## Active cell
+
+### decode-seek × web-demuxer@4.0.0
+
+- Scope lock: only web-demuxer decode/seek adapter/support behavior and
+  decode-seek-owned shared layers when independently proven necessary.
 - Quick: pending.
 - Exhaustive: pending.
 - Boundary gates: pending.

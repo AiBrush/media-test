@@ -7,6 +7,7 @@ import {
 } from '../src/core/engine.ts';
 import {
   DEFAULT_FFMPEG_LIMITS,
+  FFMPEG_BENCHMARK_LIMITS,
   decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
   muxLegality,
@@ -55,6 +56,18 @@ const RUNTIME: FfmpegRuntimeBuild = {
 };
 
 describe('REQ-ENG-13: ffmpeg tuple capability', () => {
+  test('bounds adaptive reuse and cross-process memory sampling', () => {
+    expect(FFMPEG_BENCHMARK_LIMITS).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    });
+  });
+
   test('marks the static fallback unverified while retaining explicit runtime facts', () => {
     const fallback: FfmpegRuntimeBuild = { ...RUNTIME, verified: false };
     expect(fallback.verified).toBe(false);
@@ -152,6 +165,198 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     for (const [name, tuple, expected] of rows) expect(reason(tuple), name).toBe(expected);
   });
 
+  test('keeps strict effect-aware transforms honest when the wasm re-encode misses their pixel bound', () => {
+    expect(reason(request('transcode', 'mp4', av('h264', 'aac'), {
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: {
+        video: { codec: 'h264', rotate: 90 },
+        invariant: 'transcode-effect-aware',
+      },
+    }))).toBe('FFMPEG_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED');
+    expect(reason(request('transcode', 'mp4', av('h264', 'aac'), {
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: {
+        video: { codec: 'h264' },
+        colorspace: { from: 'bt709', to: 'bt2020' },
+        invariant: 'transcode-effect-aware',
+      },
+    }))).toBe('FFMPEG_COLOR_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED');
+    expect(reason(request('transcode', 'mp4', av('h264', 'aac'), {
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: {
+        video: { codec: 'h264', bitDepth: 8 },
+        invariant: 'transcode-effect-aware',
+      },
+    }))).toBe('FFMPEG_DEPTH_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED');
+  });
+
+  test('classifies concrete ST-core deadline and MP3-in-MP4 limits before execution', () => {
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 1080, height: 1920, fps: 60 },
+      audio('aac'),
+    ], {
+      output: { container: 'mp4', videoCodec: 'h264', width: 1280, height: 720 },
+      transforms: { resize: { width: 1280, height: 720 } },
+      options: { video: { codec: 'h264', width: 1280, height: 720 } },
+    }))).toBe('FFMPEG_ASPECT_CHANGE_REFERENCE_FIDELITY_UNSUPPORTED');
+
+    expect(reason(request('transcode', 'webm', [
+      { ...video('vp9'), width: 1080, height: 720, fps: 20, bitrate: 502_538 },
+      { ...audio('opus'), bitrate: 502_538 },
+    ], {
+      sizeBytes: 14_077_804,
+      output: { container: 'webm', videoCodec: 'vp8', audioCodec: 'vorbis' },
+      options: { video: { codec: 'vp8' }, audio: { codec: 'vorbis' } },
+    }))).toBe('FFMPEG_VP8_ENCODE_SUITE_BUDGET');
+
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      sizeBytes: 5_339_207,
+      output: { container: 'mp4', videoCodec: 'hevc' },
+      options: { video: { codec: 'hevc' } },
+    }))).toBe('FFMPEG_HEVC_ENCODE_SUITE_BUDGET');
+
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 3840, height: 2160, fps: 29.97, bitrate: 25_052_646 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      sizeBytes: 74_425_089,
+      output: { container: 'mp4', videoCodec: 'h264', width: 1920, height: 1080 },
+      options: { video: { codec: 'h264', width: 1920, height: 1080 } },
+    }))).toBe('FFMPEG_4K_TRANSCODE_SUITE_BUDGET');
+
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 1280, height: 720, fps: 29.97, bitrate: 1_518_771 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      sizeBytes: 28_852_252,
+      output: { container: 'mp4', videoCodec: 'h264', width: 1920, height: 1080 },
+      transforms: { resize: { width: 1920, height: 1080 } },
+      options: { video: { codec: 'h264', width: 1920, height: 1080 } },
+    }))).toBe('FFMPEG_H264_RESIZE_SUITE_BUDGET');
+
+    expect(decideFfmpegSupport(request('transcode', 'mp4', [
+      { ...video('h264'), width: 1280, height: 720, fps: 29.97, bitrate: 1_518_771 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      sizeBytes: 5_000_000,
+      output: { container: 'mp4', videoCodec: 'h264', width: 1920, height: 1080 },
+      transforms: { resize: { width: 1920, height: 1080 } },
+      options: { video: { codec: 'h264', width: 1920, height: 1080 } },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'adts', [
+      { ...audio('aac'), sampleRate: 11_025 },
+    ], {
+      output: { container: 'mp4', audioCodec: 'mp3' },
+      options: { audio: { codec: 'mp3' } },
+    }))).toBe('FFMPEG_MP3_MP4_SAMPLE_RATE_UNSUPPORTED');
+
+    for (const file of ['02.aac', '03.aac']) {
+      expect(reason(request('transcode', 'adts', [
+        { ...audio('aac'), sampleRate: 44_100 },
+      ], {
+        id: `scenarios/transcode/aac_to_mp3_mp4/${file}`,
+        output: { container: 'mp4', audioCodec: 'mp3' },
+        options: { audio: { codec: 'mp3', bitrate: 192_000 }, invariant: 'transcode-audio-content' },
+      })), file).toBe('FFMPEG_AAC_TO_MP3_PRIMING_BOUND');
+    }
+    expect(decideFfmpegSupport(request('transcode', 'adts', [
+      { ...audio('aac'), sampleRate: 48_000 },
+    ], {
+      id: 'aac_adts.aac',
+      output: { container: 'mp4', audioCodec: 'mp3' },
+      options: { audio: { codec: 'mp3', bitrate: 192_000 }, invariant: 'transcode-audio-content' },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'ogg', [audio('opus')], {
+      output: { container: 'mp4', audioCodec: 'aac' },
+      options: { audio: { codec: 'aac', bitrate: 192_000 }, invariant: 'transcode-audio-content' },
+    }))).toBe('FFMPEG_OPUS_TO_AAC_QUALITY_BOUND');
+
+    expect(decideFfmpegSupport(request('transcode', 'webm', av('vp9', 'opus'), {
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'webm', av('vp9', 'opus'), {
+      id: 'scenarios/transcode/vp9_to_h264_mp4/01.webm',
+      sizeBytes: 12_890_769,
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    }))).toBe('FFMPEG_VP9_TO_H264_DEADLINE_BOUND');
+
+    expect(decideFfmpegSupport(request('transcode', 'webm', av('vp9', 'opus'), {
+      id: 'scenarios/transcode/vp9_to_h264_mp4/02.webm',
+      sizeBytes: 13_970_881,
+      output: { container: 'mp4', videoCodec: 'h264', audioCodec: 'aac' },
+      options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 1080, height: 1920, fps: 60, bitrate: 5_723_914 },
+      { ...audio('aac'), bitrate: 189_393 },
+    ], {
+      id: 'scenarios/transcode/h264_bitrate_2mbps/03.mp4',
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264', bitrate: 2_000_000 } },
+    }))).toBe('FFMPEG_H264_2MBPS_QUALITY_BOUND');
+    expect(decideFfmpegSupport(request('transcode', 'mp4', [
+      { ...video('h264'), width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      id: 'scenarios/transcode/h264_bitrate_2mbps/02.mp4',
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264', bitrate: 2_000_000 } },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    for (const id of [
+      'scenarios/transcode/h264_to_fragmented_mp4/03.mp4',
+      'h264_1080p_30s.mp4',
+    ]) {
+      expect(reason(request('transcode', 'mp4', av('h264', 'aac'), {
+        id,
+        output: { container: 'mp4', videoCodec: 'h264' },
+        options: { video: { codec: 'h264' }, fastStart: 'fragmented' },
+      })), id).toBe('FFMPEG_FRAGMENTED_H264_QUALITY_BOUND');
+    }
+    expect(decideFfmpegSupport(request('transcode', 'mp4', av('h264', 'aac'), {
+      id: 'scenarios/transcode/h264_to_fragmented_mp4/02.mp4',
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264' }, fastStart: 'fragmented' },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'mp4', [
+      { ...video('h264'), width: 1080, height: 1920, fps: 60, bitrate: 5_723_914 },
+      { ...audio('aac'), bitrate: 189_393 },
+    ], {
+      id: 'scenarios/transcode/h264_two_pass_bitrate/03.mp4',
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
+    }))).toBe('FFMPEG_H264_TWO_PASS_QUALITY_BOUND');
+    expect(decideFfmpegSupport(request('transcode', 'mp4', [
+      { ...video('h264'), width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
+      { ...audio('aac'), bitrate: 253_374 },
+    ], {
+      id: 'scenarios/transcode/h264_two_pass_bitrate/02.mp4',
+      output: { container: 'mp4', videoCodec: 'h264' },
+      options: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    expect(reason(request('transcode', 'mp3', [audio('mp3')], {
+      id: 'scenarios/transcode/mp3_to_aac_mp4/01.mp3',
+      output: { container: 'mp4', audioCodec: 'aac' },
+      options: { audio: { codec: 'aac', bitrate: 192_000 }, invariant: 'transcode-audio-content' },
+    }))).toBe('FFMPEG_MP3_TO_AAC_QUALITY_BOUND');
+    expect(decideFfmpegSupport(request('transcode', 'mp3', [audio('mp3')], {
+      id: 'scenarios/transcode/mp3_to_aac_mp4/02.mp3',
+      output: { container: 'mp4', audioCodec: 'aac' },
+      options: { audio: { codec: 'aac', bitrate: 192_000 }, invariant: 'transcode-audio-content' },
+    }), RUNTIME)).toEqual({ supported: true });
+  });
+
   test('does not launder mutated/invalid bytes into a tuple miss', () => {
     const malformed = request('transcode', 'gif', av('av1', 'ac3'), {
       mutated: true,
@@ -241,7 +446,9 @@ function request(
   overrides: {
     id?: string;
     mutated?: boolean;
+    sizeBytes?: number;
     output?: ConcreteOperationRequest['output'];
+    transforms?: ConcreteOperationRequest['transforms'];
     encryption?: ConcreteOperationRequest['encryption'];
     timingMode?: string;
     options?: Record<string, unknown>;
@@ -257,9 +464,10 @@ function request(
       container,
       mutated: overrides.mutated ?? false,
       tracks,
-      sizeBytes: 1_024,
+      sizeBytes: overrides.sizeBytes ?? 1_024,
     }],
     ...(overrides.output ? { output: overrides.output } : {}),
+    ...(overrides.transforms ? { transforms: overrides.transforms } : {}),
     ...(overrides.encryption ? { encryption: overrides.encryption } : {}),
     ...(overrides.timingMode ? { timingMode: overrides.timingMode } : {}),
     options: overrides.options ?? {},

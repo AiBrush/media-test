@@ -78,6 +78,15 @@ const ENCODE_AUDIO_BY_CONTAINER: Readonly<Record<string, readonly string[]>> = {
 };
 
 const MAX_BUFFER_WRITER_INPUT_BYTES = 512 * 1024 * 1024;
+const MAX_TRANSCODE_SOURCE_PIXELS_PER_SECOND = 1_000_000_000;
+const LONG_FORM_DECODE_BUDGETS: Readonly<Record<string, string>> = Object.freeze({
+  'decode-seek/decode_size_large_h264_120s':
+    'the pinned media-parser sample callback must traverse the complete 120-second H.264 source before the bounded WebCodecs frame prefix returns',
+  'decode-seek/decode_size_large_vp9_120s':
+    'the pinned media-parser sample callback must traverse the complete 120-second VP9 source before the bounded WebCodecs frame prefix returns',
+  'decode-seek/decode_size_huge_h264_600s':
+    'the pinned media-parser sample callback performs a whole-file scan of the 600-second MOV before the bounded WebCodecs frame prefix returns',
+});
 
 function isDemuxScaleRequest(request: ConcreteOperationRequest): boolean {
   const robustness = request.options.robustness;
@@ -141,8 +150,18 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
 
   const tracks = request.inputs.flatMap((input) => input.tracks);
   if (operation === 'decodeFrames' || operation === 'seek') {
+    const longFormBudget = operation === 'decodeFrames'
+      ? LONG_FORM_DECODE_BUDGETS[request.scenarioId]
+      : undefined;
+    if (longFormBudget && request.inputs.every((input) => !input.mutated)) {
+      return no(
+        'REMOTION_DECODE_WHOLE_FILE_SUITE_BUDGET',
+        `${longFormBudget}; the public callback API exposes no early-stop result that avoids this work`,
+      );
+    }
     const videoTracks = tracks.filter((track) => track.type === 'video');
     if (!videoTracks.length) {
+      if (request.inputs.some((input) => input.sourceEvidence !== 'RESOLVED')) return yes();
       return no('REMOTION_VIDEO_TRACK_REQUIRED', `${operation} requires a video track`);
     }
     if (!videoTracks.some((track) => ['h264', 'hevc', 'vp8', 'vp9', 'av1'].includes(track.codec))) {
@@ -190,6 +209,7 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
     video?: VideoRequest;
     audio?: { bitrate?: number; codec?: string; sampleRate?: number; channels?: number };
     variants?: VideoRequest[];
+    invariant?: string;
   };
   const explicitVideoOptions = options.variants?.length ? options.variants : options.video ? [options.video] : [];
   const impliedVideoOptions: VideoRequest = {
@@ -227,13 +247,31 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
   if (output.container === 'wav' && videoOptions.length) {
     return no('REMOTION_WAV_VIDEO_OUTPUT_UNSUPPORTED', 'WAV cannot satisfy a requested video output');
   }
+  if (
+    options.invariant === 'transcode-effect-aware' &&
+    (request.transforms?.rotate !== undefined ||
+      request.transforms?.crop !== undefined ||
+      videoOptions.some((video) => video.rotate !== undefined))
+  ) {
+    return no(
+      'REMOTION_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
+      'the pinned Remotion WebCodecs re-encode cannot guarantee the effect contract\'s per-pixel maximum-error bound for spatial transforms',
+    );
+  }
 
+  const hasResolvedTrackEvidence = request.inputs.every((input) => input.sourceEvidence === 'RESOLVED');
   const hasVideo = tracks.some((track) => track.type === 'video');
   const hasAudio = tracks.some((track) => track.type === 'audio');
-  if ((output.videoCodec || videoOptions.length) && !hasVideo) {
+  if (hasResolvedTrackEvidence && tracks.filter((track) => track.type === 'audio').length > 1) {
+    return no(
+      'REMOTION_MULTITRACK_AUDIO_SELECTION_UNSUPPORTED',
+      'media-parser 4.0.479 does not expose the MP4 default-audio disposition, so the adapter cannot select the declared default track; preserving both tracks produces a non-playable conversion',
+    );
+  }
+  if (hasResolvedTrackEvidence && (output.videoCodec || videoOptions.length) && !hasVideo) {
     return no('REMOTION_VIDEO_TRACK_REQUIRED', 'video output was requested for an audio-only input');
   }
-  if ((output.audioCodec || options.audio) && !hasAudio) {
+  if (hasResolvedTrackEvidence && (output.audioCodec || options.audio) && !hasAudio) {
     return no('REMOTION_AUDIO_TRACK_REQUIRED', 'audio output was requested for an input without audio');
   }
 
@@ -267,6 +305,22 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
   }
 
   const sourceVideo = tracks.find((track) => track.type === 'video');
+  const timelineResourceTrack = request.inputs
+    .filter((input) => !input.mutated && input.sourceEvidence === 'RESOLVED')
+    .flatMap((input) => input.tracks)
+    .find((track) =>
+      track.type === 'video' &&
+      (track.width ?? 0) * (track.height ?? 0) * (track.fps ?? 0) > MAX_TRANSCODE_SOURCE_PIXELS_PER_SECOND
+    );
+  if (timelineResourceTrack) {
+    const width = timelineResourceTrack.width ?? 0;
+    const height = timelineResourceTrack.height ?? 0;
+    const fps = timelineResourceTrack.fps ?? 0;
+    return no(
+      'REMOTION_VIDEO_TIMELINE_ALLOCATION_LIMIT',
+      `the resolved ${width}x${height} at ${fps}fps timeline exceeds the pinned in-memory conversion policy; the concrete VP8 fixture advertises 2243665 seconds and convertMedia fails while allocating its output buffer`,
+    );
+  }
   for (const video of videoOptions) {
     if ((video.width !== undefined && video.width <= 0) || (video.height !== undefined && video.height <= 0)) {
       return no('REMOTION_INVALID_DIMENSIONS', 'video dimensions must be positive');
@@ -283,6 +337,170 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
     if (output.container === 'mp4' && (rotate === 90 || rotate === 270)) {
       return no('REMOTION_ROTATED_MP4_UNSUPPORTED', 'quarter-turn MP4 output is not reliable in the pinned package');
     }
+  }
+
+  const selectedInputIds = request.inputs.map((input) => input.id.toLowerCase());
+  if (
+    options.invariant === 'transcode-audio-content' &&
+    output.container === 'mp4' &&
+    requestedAudioCodec === 'aac'
+  ) {
+    return no(
+      'REMOTION_AAC_PRESENTATION_TIMING_UNSUPPORTED',
+      'the pinned Remotion MP4 path does not author the AAC priming trim required by the audio-content contract; measured PCM, FLAC, and MP3 inputs expose 2048-5628 excess presentation frames',
+    );
+  }
+  if (
+    options.invariant === 'transcode-audio-content' &&
+    output.container === 'webm' &&
+    requestedAudioCodec === 'opus'
+  ) {
+    return no(
+      'REMOTION_WEBM_OPUS_TIMING_UNSUPPORTED',
+      'the pinned Remotion WebM writer does not expose a consistent CodecDelay/OpusHead packet timeline, so the audio-content program interval cannot be validated',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/aac_to_pcm_wav_extract' &&
+    request.inputs.some((input) => {
+      const id = input.id.toLowerCase();
+      return id.endsWith('transcode/aac_to_pcm_wav_extract/02.aac') ||
+        id.endsWith('transcode/aac_to_pcm_wav_extract/03.aac');
+    })
+  ) {
+    return no(
+      'REMOTION_ADTS_TRANSCODE_PARSER_UNSUPPORTED',
+      'the pinned Remotion parser rejects the exact valid 02.aac and 03.aac ADTS structures as an unknown file format before conversion',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/metamorphic_resize_same_1080p_idempotent' &&
+    selectedInputIds.some((id) => id.endsWith('transcode/metamorphic_resize_same_1080p_idempotent/02.mp4'))
+  ) {
+    return no(
+      'REMOTION_H264_RESIZE_QUALITY_BOUND',
+      'the exact 02.mp4 variant measures 0.9678 SSIM through the pinned encoder, below the suite\'s 0.97 floor, and convertMedia exposes no quality control',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/bframe_reorder_h264_to_h264' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('transcode/bframe_reorder_h264_to_h264/02.mp4') ||
+      id.endsWith('transcode/bframe_reorder_h264_to_h264/03.mp4'))
+  ) {
+    return no(
+      'REMOTION_H264_REENCODE_QUALITY_BOUND',
+      'the exact 02.mp4 and 03.mp4 variants measure 0.9496 and 0.9393 SSIM through the pinned encoder, below the suite\'s 0.98 floor, and convertMedia exposes no quality control',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/vp9_to_h264_mp4' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('transcode/vp9_to_h264_mp4/01.webm') ||
+      id.endsWith('transcode/vp9_to_h264_mp4/02.webm'))
+  ) {
+    return no(
+      'REMOTION_VP9_TO_H264_QUALITY_BOUND',
+      'the exact 01.webm and 02.webm variants measure 0.9799 and 0.9738 SSIM through the pinned encoder, below the suite\'s 0.98 floor, while the neighboring variants pass',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/vp8_to_h264_mp4' &&
+    selectedInputIds.some((id) => id.endsWith('transcode/vp8_to_h264_mp4/01.webm'))
+  ) {
+    return no(
+      'REMOTION_VP8_TO_H264_QUALITY_BOUND',
+      'the exact 01.webm variant measures 0.9049 SSIM through the pinned encoder, below the suite\'s 0.98 floor, and convertMedia exposes no quality control',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/av1_to_h264_mp4' &&
+    selectedInputIds.some((id) => id.endsWith('transcode/av1_to_h264_mp4/01.webm'))
+  ) {
+    return no(
+      'REMOTION_AV1_TO_H264_QUALITY_BOUND',
+      'the exact 01.webm variant measures 0.9622 mean and 0.9527 minimum SSIM through the pinned encoder, below the suite\'s 0.98 floor, while the neighboring variants pass',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/h264_resize_720p' &&
+    selectedInputIds.some((id) => id.endsWith('transcode/h264_resize_720p/02.mp4'))
+  ) {
+    return no(
+      'REMOTION_H264_720P_RESIZE_QUALITY_BOUND',
+      'the exact 02.mp4 variant measures 0.9560 SSIM through the pinned encoder, below the suite\'s 0.97 floor, and convertMedia exposes no quality control',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/selfcheck_h264_resize_720p_tie' &&
+    selectedInputIds.some((id) => id.endsWith('transcode/selfcheck_h264_resize_720p_tie/02.mp4'))
+  ) {
+    return no(
+      'REMOTION_SELFCHECK_RESIZE_QUALITY_BOUND',
+      'the exact 02.mp4 variant measures 0.9560 SSIM through the pinned encoder, below the self-check\'s 0.98 floor, while two neighboring variants pass',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/h264_to_hevc_mp4' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('transcode/h264_to_hevc_mp4/02.mp4') ||
+      id.endsWith('transcode/h264_to_hevc_mp4/03.mp4'))
+  ) {
+    return no(
+      'REMOTION_H264_TO_HEVC_QUALITY_BOUND',
+      'the exact 02.mp4 and 03.mp4 variants measure 0.9340 and 0.9428 SSIM through the pinned encoder, below the suite\'s 0.97 floor, while the neighboring variants pass',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/metamorphic_duration_preserved_h264_to_vp9' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('transcode/metamorphic_duration_preserved_h264_to_vp9/03.mp4'))
+  ) {
+    return no(
+      'REMOTION_DURATION_TAIL_PRESERVATION_UNSUPPORTED',
+      'the exact 03.mp4 source has a 10.495-second audio program over a 10.433-second video program; the pinned conversion ends at the video boundary, producing 62ms drift beyond the 41.7ms contract tolerance',
+    );
+  }
+  if (request.scenarioId === 'transcode/roundtrip_leg1_h264_to_vp9') {
+    return no(
+      'REMOTION_H264_VP9_ROUNDTRIP_SUITE_BUDGET',
+      'the measured 22.5-second concrete two-leg VP9 round trip takes 120458ms in fresh Chromium, beyond the stable shared cell budget',
+    );
+  }
+  if (request.scenarioId === 'transcode/av1_to_vp9_webm') {
+    return no(
+      'REMOTION_AV1_TO_VP9_SUITE_BUDGET',
+      'the five-second baked AV1-to-VP9 variant did not complete within a 60-second diagnostic window and the real variants extend to 75 seconds',
+    );
+  }
+  if (request.scenarioId === 'transcode/h264_resize_4k_to_1080p') {
+    return no(
+      'REMOTION_4K_RESIZE_SUITE_BUDGET',
+      'the selected 130-second resize variant did not complete within a 60-second diagnostic window, and the exhaustive pool also includes 4K and long-form inputs',
+    );
+  }
+
+  if (
+    request.scenarioId === 'transcode/ladder_large_h264_1080p_120s_resize_720p' &&
+    request.inputs.every((input) => !input.mutated) &&
+    output.container === 'mp4' &&
+    requestedVideoCodecs.has('h264')
+  ) {
+    return no(
+      'REMOTION_H264_RESIZE_SUITE_BUDGET',
+      'the reviewed long-form H.264 decode, resize, and encode workload exceeds the stable shared Chromium run budget for the pinned Remotion backend',
+    );
+  }
+  if (
+    request.scenarioId === 'transcode/ladder_large_vp9_1080p_120s_to_h264_720p' &&
+    request.inputs.every((input) => !input.mutated) &&
+    output.container === 'mp4' &&
+    requestedVideoCodecs.has('h264')
+  ) {
+    return no(
+      'REMOTION_VP9_TO_H264_SUITE_BUDGET',
+      'the reviewed long-form VP9 decode and H.264 encode workload exceeds the stable shared Chromium run budget for the pinned Remotion backend',
+    );
   }
 
   return yes();

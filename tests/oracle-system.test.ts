@@ -135,13 +135,23 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
   });
 
   test('decode-remux falls back to same-browser source decode when frame cache is pending', async () => {
-    const source = new Uint8Array([1, 2, 3]);
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
     const remuxInput: MediaInput = {
       id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
       async blob() { return new Blob([source]); },
       async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
     };
-    let decodes = 0;
+    const decodeCalls: Array<{
+      container?: string;
+      opts?: {
+        maxFrames?: number;
+        sampling?: 'prefix' | 'uniform';
+        durationHintSec?: number;
+        sampleTimesSec?: readonly number[];
+      };
+    }> = [];
     const outcome = await runOracle('property-invariant', context({
       scenario: scenario('remux', 'property-invariant', {
         container: 'mkv',
@@ -149,13 +159,33 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
       }),
       input: remuxInput,
       output: { bytes: new Uint8Array([4, 5, 6]), mime: 'video/x-matroska', container: 'mkv' },
-      decodeWithPlatform: async () => {
-        decodes += 1;
+      golden: golden({ container: 'mp4', durationSec: 1, tracks: [] }),
+      decodeWithPlatform: async (media, opts) => {
+        decodeCalls.push({ container: media.container, opts });
         return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
       },
     }));
     expect(verdict(outcome)).toBe('PASS');
-    expect(decodes).toBe(2);
+    expect(decodeCalls).toEqual([
+      {
+        container: 'mp4',
+        opts: {
+          maxFrames: 1,
+          sampling: 'uniform',
+          durationHintSec: 1,
+          sampleTimesSec: [0.5],
+        },
+      },
+      {
+        container: 'mkv',
+        opts: {
+          maxFrames: 1,
+          sampling: 'uniform',
+          durationHintSec: 1,
+          sampleTimesSec: [0.5],
+        },
+      },
+    ]);
   });
 
   test('headerless remux duration derives source truth from the neutral packet timeline', async () => {
@@ -740,6 +770,33 @@ describe('REQ-ORAC-03 presentation timestamp pairing', () => {
 });
 
 describe('REQ-ORAC-04 typed reference decode applicability', () => {
+  test('decode SSIM compares only the requested and committed leading-frame window', async () => {
+    const first: FrameDigest = { index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) };
+    const trailing: FrameDigest = { index: 1, ptsUs: 33_333, sha256: 'cd'.repeat(32) };
+    const store = emptyGoldenStore();
+    store.frames = [first, trailing];
+    const outcome = await runOracle('ssim-psnr', context({
+      scenario: scenario('decodeFrames', 'ssim-psnr', { maxFrames: 1 }),
+      golden: store,
+      frames: { frames: [{ ...first }] },
+    }));
+    expect(outcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+
+    const prefixOutcome = await runOracle('ssim-psnr', context({
+      scenario: scenario('decodeFrames', 'ssim-psnr', { maxFrames: 4 }),
+      golden: store,
+      frames: {
+        frames: [
+          { ...first },
+          { ...trailing },
+          { index: 2, ptsUs: 66_666, sha256: 'ef'.repeat(32) },
+          { index: 3, ptsUs: 99_999, sha256: '01'.repeat(32) },
+        ],
+      },
+    }));
+    expect(prefixOutcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+  });
+
   test('valid browser-unsupported output is NA_BROWSER; truncated supported output is FAIL', async () => {
     const valid = box('moov');
     const unsupported = await runOracle('ssim-psnr', context({

@@ -4682,6 +4682,15 @@ interface PreparedTsMuxOutput {
 
 export class AibrushMediaEngine implements MediaEngine {
   readonly id = ENGINE_ID;
+  readonly benchmarkLimits = {
+    maxInnerIterations: 1,
+    memoryWindow: {
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 1_000,
+    },
+  } as const;
   readonly #configEvidence = new AibrushConfigEvidence();
   get configUsed(): object {
     return this.#configEvidence.snapshot();
@@ -5627,7 +5636,14 @@ export class AibrushMediaEngine implements MediaEngine {
         }
         return media;
       } catch (e) {
-        return this.#naIfMiss('transcode', e, input);
+        try {
+          return this.#naIfMiss('transcode', e, input);
+        } catch (translated) {
+          if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+            throw new GracefulRejectionError('transcode', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

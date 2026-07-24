@@ -309,12 +309,17 @@ function parseAudioStsd(
   const token = audioCodecTokenForEntry(entryType);
   if (!token) return undefined;
   const qtV2 = parseQuickTimeAudioV2(buf, entry);
-  const channels = qtV2?.channels ?? be16(buf, entry.bodyStart + 16);
+  const entryChannels = qtV2?.channels ?? be16(buf, entry.bodyStart + 16);
   // Version 0/1 samplerate is a 16.16 fixed-point value; QuickTime version 2 stores a Float64.
-  const sampleRate = qtV2?.sampleRate ?? (be32(buf, entry.bodyStart + 24) >>> 16);
+  const entrySampleRate = qtV2?.sampleRate ?? (be32(buf, entry.bodyStart + 24) >>> 16);
   const esds = findBox(buf, childStart, entry.bodyEnd, 'esds');
   const description = esds ? findAudioSpecificConfig(buf, esds.bodyStart + 4, esds.bodyEnd) : undefined;
   const audioObjectType = description ? audioObjectTypeFromAsc(description) : 2;
+  // FFmpeg may retain the legacy AudioSampleEntry channelcount while the AAC encoder writes a new
+  // mono/stereo AudioSpecificConfig. For AAC-LC the ASC is the authoritative decoder contract.
+  const lcConfig = description ? aacLcRateAndChannels(description) : undefined;
+  const sampleRate = lcConfig?.sampleRate ?? entrySampleRate;
+  const channels = lcConfig?.channels ?? entryChannels;
   const result: {
     token: string;
     codecString: string;
@@ -395,6 +400,18 @@ function audioObjectTypeFromAsc(asc: Uint8Array): number {
   let objectType = (asc[0]! >> 3) & 0x1f;
   if (objectType === 31 && asc.length >= 2) objectType = 32 + ((asc[0]! & 0x07) << 3) + (asc[1]! >> 5);
   return objectType > 0 ? objectType : 2;
+}
+
+function aacLcRateAndChannels(asc: Uint8Array): { sampleRate: number; channels: number } | undefined {
+  if (asc.byteLength < 2 || audioObjectTypeFromAsc(asc) !== 2) return undefined;
+  const sampleRateIndex = ((asc[0]! & 0x07) << 1) | (asc[1]! >> 7);
+  const channelConfiguration = (asc[1]! >> 3) & 0x0f;
+  const sampleRate = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000,
+    22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
+  ][sampleRateIndex];
+  const channels = [undefined, 1, 2, 3, 4, 5, 6, 8][channelConfiguration];
+  return sampleRate !== undefined && channels !== undefined ? { sampleRate, channels } : undefined;
 }
 
 function audioSampleEntryChildStart(bodyStart: number, version: number): number {

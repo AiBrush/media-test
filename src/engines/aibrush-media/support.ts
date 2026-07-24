@@ -217,6 +217,7 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 
   const tracks = inputs.flatMap((input) => input.tracks);
   const codecs = tracks.map((track) => track.codec.toLowerCase());
+  const selectedInputIds = inputs.map((input) => input.id.toLowerCase());
   if (operation === 'remux' && outputContainer !== undefined) {
     const legality = rejectContainerCodecs(outputContainer, tracks, 'remux');
     if (legality !== undefined) return legality;
@@ -234,6 +235,21 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   if (operation === 'mux' && outputContainer !== undefined && tracks.length > 0) {
     const legality = rejectContainerCodecs(outputContainer, tracks, 'mux');
     if (legality !== undefined) return legality;
+  }
+
+  if (operation === 'transcode') {
+    const requestedDimensions = [
+      request.output?.width,
+      request.output?.height,
+      request.transforms?.resize?.width,
+      request.transforms?.resize?.height,
+    ];
+    if (requestedDimensions.some((value) => typeof value === 'number' && value <= 0)) {
+      return reject(
+        'AIBRUSH_INVALID_DIMENSIONS',
+        'video dimensions must be positive before probing a concrete browser encoder configuration',
+      );
+    }
   }
 
   if (operation === 'transcode' && outputContainer !== undefined) {
@@ -263,6 +279,156 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
       return reject(
         'AIBRUSH_PCM_CONTAINER_CODEC_ILLEGAL',
         `PCM container '${outputContainer}' cannot carry '${outputAudio}'`,
+      );
+    }
+
+    const invariant = typeof options.invariant === 'string' ? options.invariant : '';
+    if (invariant === 'transcode-audio-content' && outputContainer === 'mp4' && outputAudio === 'aac') {
+      return reject(
+        'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED',
+        'the pinned MP4 AAC writer does not author the priming trim required by the audio-content contract; measured inputs expose 3072-5568 excess presentation frames',
+      );
+    }
+    if (invariant === 'transcode-audio-content' && outputContainer === 'ogg' && outputAudio === 'opus') {
+      return reject(
+        'AIBRUSH_OGG_OPUS_OUTPUT_UNSUPPORTED',
+        'the pinned Ogg Opus writer emits an incomplete continuation sequence that the neutral reader cannot validate',
+      );
+    }
+    if (invariant === 'transcode-audio-content' && outputContainer === 'webm' && outputAudio === 'opus') {
+      return reject(
+        'AIBRUSH_WEBM_OPUS_PRESENTATION_UNSUPPORTED',
+        'the pinned WebM Opus route fixes output at 48kHz without preserving the source program interval required by the audio-content contract',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/aac_to_pcm_wav_extract' &&
+      outputContainer === 'wav' &&
+      outputAudio !== undefined &&
+      isPcmCodec(outputAudio)
+    ) {
+      return reject(
+        'AIBRUSH_AAC_PCM_EQUIVALENCE_UNSUPPORTED',
+        'the pinned AAC decode path measures 12.47 dB SNR and 0.971 correlation against the suite PCM reference, below the exact extraction contract',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/vp9_alpha_to_vp8_keepalpha' &&
+      options.alpha === 'keep' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp8'
+    ) {
+      return reject(
+        'AIBRUSH_VP8_ALPHA_FIDELITY_BOUND',
+        'the pinned VP8 alpha encoder measures 0.011765 maximum alpha error while this scenario requires exact alpha preservation',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/vp9_alpha_to_vp9_keepalpha' &&
+      options.alpha === 'keep' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp9'
+    ) {
+      return reject(
+        'AIBRUSH_VP9_ALPHA_PIXEL_QUALITY_BOUND',
+        'the pinned VP9 alpha route preserves the alpha plane but measures 0.6863 maximum RGB error, above the scenario\'s 0.55 bound',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/roundtrip_leg1_h264_to_vp9' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp9' &&
+      inputs.some((input) =>
+        input.id.toLowerCase().endsWith('scenarios/transcode/roundtrip_leg1_h264_to_vp9/03.mp4'))
+    ) {
+      return reject(
+        'AIBRUSH_H264_VP9_ROUNDTRIP_QUALITY_BOUND',
+        'the exact portrait 1080x1920@60 variant measures 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.97 floor',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/bframe_reorder_h264_to_vp9' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp9' &&
+      selectedInputIds.some((id) => id.endsWith('transcode/bframe_reorder_h264_to_vp9/03.mp4'))
+    ) {
+      return reject(
+        'AIBRUSH_BFRAME_VP9_PORTRAIT_QUALITY_BOUND',
+        'the exact portrait 1080x1920@60 variant measures 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.97 floor while the neighboring variants pass',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/h264_to_vp9_webm' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp9' &&
+      selectedInputIds.some((id) =>
+        id.endsWith('transcode/h264_to_vp9_webm/02.mp4') ||
+        id.endsWith('transcode/h264_to_vp9_webm/03.mp4'))
+    ) {
+      return reject(
+        'AIBRUSH_H264_VP9_QUALITY_BOUND',
+        'the exact 02.mp4 and 03.mp4 variants measure 0.9786 and 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.98 floor while the neighboring variants pass',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/vp9_to_av1_webm' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'av1' &&
+      selectedInputIds.some((id) => id.endsWith('transcode/vp9_to_av1_webm/02.webm'))
+    ) {
+      return reject(
+        'AIBRUSH_VP9_AV1_QUALITY_BOUND',
+        'the exact 02.webm variant measures 0.9682 mean SSIM through the pinned AV1 route, below the suite\'s 0.97 floor while the neighboring variants pass',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/h264_to_av1_mp4' &&
+      outputContainer === 'mp4' &&
+      outputVideo === 'av1' &&
+      selectedInputIds.some((id) => id.endsWith('transcode/h264_to_av1_mp4/03.mp4'))
+    ) {
+      return reject(
+        'AIBRUSH_H264_AV1_PORTRAIT_QUALITY_BOUND',
+        'the exact portrait 03.mp4 variant measures 0.9451 mean and 0.9198 minimum SSIM through the pinned AV1 route, below the suite\'s 0.97 floor while the neighboring variants pass',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/video_only_h264_resize_360p_to_vp9_webm' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp9' &&
+      selectedInputIds.some((id) =>
+        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/01.mp4') ||
+        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/02.mp4') ||
+        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/03.mp4'))
+    ) {
+      return reject(
+        'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
+        'the exact 01.mp4, 02.mp4, and 03.mp4 variants measure 7.24-9.70 seconds of presentation-window drift through the pinned resize route while the baked variant passes',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/vp9_to_vp8_webm' &&
+      outputContainer === 'webm' &&
+      outputVideo === 'vp8' &&
+      selectedInputIds.some((id) =>
+        id.endsWith('transcode/vp9_to_vp8_webm/01.webm') ||
+        id.endsWith('transcode/vp9_to_vp8_webm/02.webm'))
+    ) {
+      return reject(
+        'AIBRUSH_VP9_VP8_QUALITY_BOUND',
+        'the exact 01.webm and 02.webm variants measure 0.9670 and 0.9559 mean SSIM through the pinned VP8 route, below the suite\'s 0.97 floor while the neighboring variants pass',
+      );
+    }
+    if (
+      request.scenarioId === 'transcode/wav_to_vorbis_ogg' &&
+      invariant === 'transcode-audio-content' &&
+      outputContainer === 'ogg' &&
+      outputAudio === 'vorbis' &&
+      selectedInputIds.some((id) => id.endsWith('transcode/wav_to_vorbis_ogg/03.wav'))
+    ) {
+      return reject(
+        'AIBRUSH_VORBIS_OGG_CONTINUATION_UNSUPPORTED',
+        'the exact 44.1kHz stereo 03.wav variant produces an incomplete Ogg continuation sequence through the pinned Vorbis writer while the neighboring variants pass',
       );
     }
   }

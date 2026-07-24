@@ -61,7 +61,7 @@ describe('production transcode oracle integration', () => {
     });
   });
 
-  test('fragmented-MP4 SSIM samples candidate and source uniformly', async () => {
+  test('fragmented-MP4 SSIM bypasses a prefix golden and samples candidate and source uniformly', async () => {
     const bytes = await fixtureBytes('tiny_h264_360p_2s.mp4');
     const pixels = rgba([
       255, 0, 0, 255, 0, 255, 0, 255,
@@ -77,20 +77,29 @@ describe('production transcode oracle integration', () => {
       metrics: ['wall'],
       tolerances: { ssimMin: 0.96 },
     });
-    const sampling: Array<string | undefined> = [];
+    const decodeOptions: Array<{
+      sampling?: 'prefix' | 'uniform';
+      durationHintSec?: number;
+    } | undefined> = [];
+    const golden = emptyGoldenStore();
+    golden.meta = { container: 'mp4', durationSec: 2, tracks: [] };
+    golden.frames = sink(pixels).frames;
     const outcome = await runOracle('ssim-psnr', {
       scenario,
       input: inputFromBytes(bytes, 'source.mp4', 'video/mp4'),
       output: media(bytes, 'mp4'),
-      golden: emptyGoldenStore(),
+      golden,
       decodeWithPlatform: async (_media, options) => {
-        sampling.push(options?.sampling);
+        decodeOptions.push(options);
         return sink(pixels);
       },
       playbackSmoke: async () => true,
     });
     expect(outcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
-    expect(sampling).toEqual(['uniform', 'uniform']);
+    expect(decodeOptions).toEqual([
+      { maxFrames: 8, sampling: 'uniform', durationHintSec: 2 },
+      { maxFrames: 1, sampling: 'uniform', durationHintSec: 2 },
+    ]);
   });
 
   test('REQ-FEAT-20 transcode output metadata reuses strict MPEG-TS program evidence', async () => {
@@ -190,7 +199,7 @@ describe('production transcode oracle integration', () => {
     )).toMatchObject({ state: 'OK', value: { alphaMode: 'straight' } });
   });
 
-  test('REQ-FEAT-21 lossless PCM is scored in the property oracle, including excess samples', async () => {
+  test('REQ-FEAT-21 decoded PCM equivalence is scored in the property oracle, including excess samples', async () => {
     const exact = wave([0.25, -0.25, 0.5, -0.5], 2, 48_000);
     const changed = wave([0.25, -0.25, 0.5, -0.25], 2, 48_000);
     const excess = wave([0.25, -0.25, 0.5, -0.5, 0.1, -0.1], 2, 48_000);
@@ -198,11 +207,11 @@ describe('production transcode oracle integration', () => {
 
     const passOutcome = await runOracle('property-invariant', audioContext(scenario, exact, exact, 'wav'));
     expect(passOutcome).toMatchObject({
-      state: 'VERDICT', verdict: 'PASS', reasonCode: 'TRANSCODE_AUDIO_LOSSLESS_MATCH',
+      state: 'VERDICT', verdict: 'PASS', reasonCode: 'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MATCH',
     });
     const changedOutcome = await runOracle('property-invariant', audioContext(scenario, exact, changed, 'wav'));
     expect(changedOutcome).toMatchObject({
-      state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_LOSSLESS_CONTENT_MISMATCH',
+      state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MISMATCH',
     });
     const excessOutcome = await runOracle('property-invariant', audioContext(scenario, exact, excess, 'wav'));
     expect(excessOutcome).toMatchObject({

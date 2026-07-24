@@ -139,7 +139,9 @@ import {
   parseFrameChecksumPackets,
   parseMp3XingDurationSec,
   parseTracksFromLog,
+  nearestObservedFrame,
   normalizeSyntheticLeadingEbmlDts,
+  observedFrameTimelineFromProgram,
   representationForTracks,
   splitAdtsFrames,
   splitPreparedBytes,
@@ -170,6 +172,7 @@ import {
 } from './timed-mp4.ts';
 import {
   DEFAULT_FFMPEG_LIMITS,
+  FFMPEG_BENCHMARK_LIMITS,
   decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
   isWorkerFsBlobUnreadableError,
@@ -187,6 +190,8 @@ const UTIL_VERSION = '0.12.2';
 const CORE_ST_INTEGRITY = 'sha512-dzNplnn2Nxle2c2i2rrDhqcB19q9cglCkWnoMTDN9Q9l3PvdjZWd1HfSPjCNWc/p8Q3CT+Es9fWOR0UhAeYQZA==';
 const CORE_MT_INTEGRITY = 'sha512-atyRTOpa58bLCIgd6GXBZAXWyWD3AUoQyzxqjvGhp9MuSzdILtOTI62ffLswBsCnLq15lQ8IETHUpm1oe4V9FQ==';
 const WORKERFS_THRESHOLD_BYTES = 8 * 1024 * 1024;
+/** Avoid a second full JS materialization for the long-form scale assets. */
+const NEUTRAL_FRAME_TIMELINE_CEILING_BYTES = 64 * 1024 * 1024;
 const WRAPPER_HEAP_ESTIMATE_BYTES = 32 * 1024 * 1024;
 /** The vendored ST core corrupts argv after ~140 repeated main() calls; recycle with a safety margin. */
 const MAX_EXECS_PER_WORKER = 96;
@@ -1494,14 +1499,7 @@ function describeError(e: unknown): string {
  */
 export class FfmpegWasmEngine implements MediaEngine {
   readonly id = ENGINE_ID;
-  readonly benchmarkLimits = Object.freeze({
-    maxInnerIterations: 6,
-    memoryWindow: Object.freeze({
-      sampleImmediatelyDuringOperation: true,
-      maxOperationSamples: 1,
-      settleWindowMs: 0,
-    }),
-  });
+  readonly benchmarkLimits = FFMPEG_BENCHMARK_LIMITS;
 
   /** Loaded lazily in init(); FFmpeg instance backed by a dedicated worker. */
   private ff: FFmpeg | null = null;
@@ -2708,6 +2706,32 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
   }
 
+  /**
+   * Prefer the suite's payload-bearing neutral reader over the browser ffprobe `-show_frames` path.
+   * The pinned browser ffprobe core can return a successful empty frame document for valid media;
+   * treating that as a real timeline caused requested seek times and nominal CFR timestamps to be
+   * reported as observations.
+   */
+  private async neutralObservedFrameTimeline(
+    input: MediaInput,
+    videoOrdinal = 0,
+  ): Promise<ReturnType<typeof parseFfprobeFramesJson>> {
+    if (typeof input.sizeBytes === 'number' &&
+        input.sizeBytes > NEUTRAL_FRAME_TIMELINE_CEILING_BYTES) {
+      return [];
+    }
+    try {
+      const bytes = new Uint8Array(await input.arrayBuffer());
+      const read = readNeutralRemuxProgram(bytes, containerFromInput(input));
+      return read.state === 'OK'
+        ? observedFrameTimelineFromProgram(read.value, videoOrdinal)
+        : [];
+    } catch (error) {
+      if (this.lifecycle.reason || this.activeOperation?.context.signal.aborted) throw error;
+      return [];
+    }
+  }
+
   private async probeImpl(input: MediaInput): Promise<NormalizedMetadata> {
     if (isStillImageInput(input)) {
       throw new Error(`${ENGINE_ID}: probe rejected still-image input; this suite probes media containers only`);
@@ -3432,14 +3456,36 @@ export class FfmpegWasmEngine implements MediaEngine {
   // ── transcode ────────────────────────────────────────────────────────────────────────────────
 
   private async transcodeImpl(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
+    const inputName = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
     if (isStillImageInput(input)) {
-      throw new Error(`${ENGINE_ID}: transcode rejected still-image input`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'transcode',
+        'validate',
+        'transcode requires a timed media stream, not a still-image input',
+        'FFMPEG_TRANSCODE_STILL_IMAGE_REJECTED',
+        input.id,
+      );
     }
     if (input.mutated) {
-      throw new Error(`${ENGINE_ID}: transcode rejected mutated/robustness input`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'transcode',
+        'parse',
+        'the mutated robustness input was rejected before encode',
+        'FFMPEG_TRANSCODE_MUTATED_INPUT_REJECTED',
+        input.id,
+      );
     }
-    if (input.id.includes('truncated')) {
-      throw new Error(`${ENGINE_ID}: transcode rejected known truncated input '${input.id}' before wasm encode`);
+    if (inputName.includes('truncated') || inputName.includes('zero_length')) {
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'transcode',
+        'parse',
+        `transcode rejected known malformed input '${input.id}' before wasm encode`,
+        'FFMPEG_TRANSCODE_MALFORMED_INPUT_REJECTED',
+        input.id,
+      );
     }
     const suiteBudgetNa = isSuiteBudgetTranscodeNa(input, opts);
     if (suiteBudgetNa) {
@@ -3455,7 +3501,14 @@ export class FfmpegWasmEngine implements MediaEngine {
       );
     }
     if (opts.video && ((opts.video.width !== undefined && opts.video.width <= 1) || (opts.video.height !== undefined && opts.video.height <= 1))) {
-      throw new Error(`${ENGINE_ID}: transcode rejected degenerate video dimensions`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'transcode',
+        'validate',
+        'transcode rejected degenerate video dimensions',
+        'FFMPEG_TRANSCODE_DIMENSIONS_REJECTED',
+        input.id,
+      );
     }
     if (opts.video?.fps !== undefined && opts.video.fps > 120) {
       throw createNotApplicableError(ENGINE_ID, 'transcode', `fps=${opts.video.fps} is too large for this wasm encode path`);
@@ -3480,13 +3533,27 @@ export class FfmpegWasmEngine implements MediaEngine {
       const hasVideo = inputMetadata.tracks.some((t) => t.type === 'video');
       const hasAudio = inputMetadata.tracks.some((t) => t.type === 'audio');
       // Track mismatch is a graceful-failure robustness case (mismatch_audio_only_to_video_target,
-      // mismatch_video_only_to_audio_target): a PLAIN throw = graceful reject = PASS, whereas a
-      // NotApplicableError would be mapped to NA_ENGINE and miss the graceful-reject assertion.
+      // mismatch_video_only_to_audio_target). The typed malformed-input channel proves a clean
+      // validation rejection without laundering arbitrary framework exceptions into PASS.
       if (opts.video && !hasVideo) {
-        throw new Error('requested a video output but the input has no video track');
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'transcode',
+          'validate',
+          'requested a video output but the input has no video track',
+          'FFMPEG_TRANSCODE_VIDEO_TRACK_MISSING',
+          input.id,
+        );
       }
       if (opts.audio && !hasAudio) {
-        throw new Error('requested an audio output but the input has no audio track');
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'transcode',
+          'validate',
+          'requested an audio output but the input has no audio track',
+          'FFMPEG_TRANSCODE_AUDIO_TRACK_MISSING',
+          input.id,
+        );
       }
 
       const audioRoundtripCodec = stringOption(plainObject(opts.audio), ['roundtrip']);
@@ -3600,9 +3667,18 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (flip === 'v' || flip === 'vertical' || flip === 'both' || flip === 'hv' || flip === 'vh') {
           filters.push('vflip');
         }
-        if (v.width && v.height) filters.push(`scale=${v.width}:${v.height}:flags=lanczos`);
-        else if (v.width) filters.push(`scale=${v.width}:-2:flags=lanczos`);
-        else if (v.height) filters.push(`scale=-2:${v.height}:flags=lanczos`);
+        const sourceVideo = inputMetadata.tracks.find((track) => track.type === 'video');
+        const changesAspect =
+          v.width !== undefined && v.height !== undefined &&
+          sourceVideo?.width !== undefined && sourceVideo.height !== undefined &&
+          Math.abs(v.width / v.height - sourceVideo.width / sourceVideo.height) > 0.001;
+        // OffscreenCanvas high-quality scaling (the independent reference path) tracks FFmpeg's
+        // bicubic kernel more closely for deliberate aspect changes; Lanczos remains the sharper
+        // same-aspect resize path used by the ordinary ladder rows.
+        const scaleFlags = changesAspect ? 'bicubic' : 'lanczos';
+        if (v.width && v.height) filters.push(`scale=${v.width}:${v.height}:flags=${scaleFlags}`);
+        else if (v.width) filters.push(`scale=${v.width}:-2:flags=${scaleFlags}`);
+        else if (v.height) filters.push(`scale=-2:${v.height}:flags=${scaleFlags}`);
         if (typeof v.rotate === 'number' && v.rotate !== 0) {
           const norm = ((v.rotate % 360) + 360) % 360;
           if (norm === 90) filters.push('transpose=1');
@@ -3754,6 +3830,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           throw createNotApplicableError(ENGINE_ID, 'transcode', `no encoder for audio codec '${a.codec}'`);
         }
         if (enc) args.push('-c:a', enc);
+        if (enc === 'aac') args.push('-aac_coder', 'twoloop');
         const audioFilters: string[] = [];
         const gain =
           typeof audioOpts.gainLinear === 'number'
@@ -3783,6 +3860,34 @@ export class FfmpegWasmEngine implements MediaEngine {
             }
           }
         }
+        const sourceAudio = inputMetadata.tracks.find((track) => track.type === 'audio');
+        if (a.channels === 1 && sourceAudio?.channels === 2) {
+          audioFilters.push('pan=mono|c0=0.5*c0+0.5*c1');
+          // AAC encodes complete 1024-frame packets. Without an explicit output duration FFmpeg
+          // exposes the final partial packet as presentation audio (for example 30.016s for an
+          // exact 30s source). Keep the coded packet intact while making the MP4 muxer author the
+          // source program duration as its end trim. `-shortest` is not equivalent: it undershoots
+          // this concrete path by one packet boundary. Use the audio track duration and an audio-
+          // rate movie timescale: the default 1 kHz MP4 movie clock loses sub-millisecond authored
+          // duration (12.841667s becomes 12.841s, for example).
+          const authoredAudioDurationSec = sourceAudio.mediaDurationSec ?? inputMetadata.durationSec;
+          if (
+            enc === 'aac' &&
+            authoredAudioDurationSec !== null &&
+            Number.isFinite(authoredAudioDurationSec) &&
+            authoredAudioDurationSec > 0
+          ) {
+            args.push('-t', authoredAudioDurationSec.toFixed(6));
+            if (
+              (opts.container === 'mp4' || opts.container === 'mov') &&
+              sourceAudio.sampleRate !== undefined &&
+              Number.isSafeInteger(sourceAudio.sampleRate) &&
+              sourceAudio.sampleRate > 0
+            ) {
+              args.push('-movie_timescale', String(sourceAudio.sampleRate));
+            }
+          }
+        }
         if (audioFilters.length) args.push('-af', audioFilters.join(','));
         if (a.sampleRate) args.push('-ar', String(a.sampleRate));
         if (a.channels) args.push('-ac', String(a.channels));
@@ -3800,6 +3905,9 @@ export class FfmpegWasmEngine implements MediaEngine {
 
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (extra.fastStart === 'fragmented' || extra.fragmented === true) {
+          // Each frame begins a fragment so HTMLVideoElement uniform seeking lands on the requested
+          // presentation frame instead of a fragment-dependent neighboring frame.
+          if (opts.video) args.push('-g', '1');
           args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);
         } else if (extra.fastStart !== false) {
           args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
@@ -3941,11 +4049,19 @@ export class FfmpegWasmEngine implements MediaEngine {
     }
     const base = this.scratch();
     const rawName = `${base}.rgba`;
+    const checksumName = `${base}.framehash.txt`;
     const written = await this.writeInput(input, `${base}.in`);
     try {
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
-      const inputLog = await this.runInfo(written.name, written.inputOptions);
-      const inputMetadata = structured?.metadata ?? this.metadataFromLog(inputLog, input);
+      // Decode performs its own bounded frame walk below; counting the entire source here repeats
+      // the dominant work once per functional/warmup/measured iteration.
+      const structured = await this.structuredProbe(
+        written.name,
+        written.inputOptions,
+        input,
+        { countFrames: false },
+      );
+      let inputLog = structured ? undefined : await this.runInfo(written.name, written.inputOptions);
+      const inputMetadata = structured?.metadata ?? this.metadataFromLog(inputLog!, input);
       const selected = resolveDecodeTrack(
         inputMetadata.tracks,
         opts?.track,
@@ -4010,19 +4126,28 @@ export class FfmpegWasmEngine implements MediaEngine {
           'FFMPEG_DECODE_TRACK_DIMENSIONS_UNAVAILABLE',
         );
       }
-      const v = structuredVideo ?? this.firstVideoTrack(inputLog, 'decodeFrames');
+      if (!structuredVideo && inputLog === undefined) {
+        inputLog = await this.runInfo(written.name, written.inputOptions);
+      }
+      const v = structuredVideo ?? this.firstVideoTrack(inputLog!, 'decodeFrames');
       const width = v.width;
       const height = v.height;
       const fps = v.fps && v.fps > 0 ? v.fps : 30;
       const maxFrames = opts?.maxFrames;
-      const observedTimeline = await this.observedFrameTimeline(
-        written.name,
-        written.inputOptions,
-        undefined,
-        selected.typeOrdinal,
-      );
+      const neutralTimeline = await this.neutralObservedFrameTimeline(input, selected.typeOrdinal);
+      const observedTimeline = neutralTimeline.length
+        ? neutralTimeline
+        : await this.observedFrameTimeline(
+            written.name,
+            written.inputOptions,
+            undefined,
+            selected.typeOrdinal,
+          );
 
-      // Decode to tight, straight-alpha, top-left RGBA rawvideo (frames back-to-back, no padding).
+      // Decode to tight, straight-alpha, top-left RGBA and let framehash digest each output packet.
+      // A single rawvideo file would be maxFrames*width*height*4 bytes (roughly 1 GiB for the 4K
+      // coverage case), and readFile() would duplicate that allocation in the browser. framehash
+      // walks the same normalized pixels once but retains only one SHA-256 row per frame.
       const args = [
         ...written.inputOptions,
         '-i', written.name,
@@ -4030,40 +4155,100 @@ export class FfmpegWasmEngine implements MediaEngine {
       ];
       if (maxFrames && maxFrames > 0) args.push('-frames:v', String(maxFrames));
       args.push('-vf', rawRgbaColorFilter(width, height));
-      args.push('-pix_fmt', 'rgba', '-f', 'rawvideo', rawName);
+      args.push('-pix_fmt', 'rgba', '-f', 'framehash', '-hash', 'sha256', checksumName);
       await this.run(args);
 
-      const raw = await this.readBinary(rawName);
-      const frameBytes = width * height * 4;
-      if (frameBytes <= 0) throw new Error(`${ENGINE_ID}: invalid frame size ${width}x${height}`);
-      const total = Math.floor(raw.byteLength / frameBytes);
-
-      const frames: FrameDigest[] = [];
-      // ImageData needs a Uint8ClampedArray over a plain ArrayBuffer (not SharedArrayBuffer).
-      const pixels: Uint8ClampedArray<ArrayBuffer>[] = [];
-      for (let i = 0; i < total; i++) {
-        const start = i * frameBytes;
-        const view = raw.subarray(start, start + frameBytes);
-        const sha256 = await sha256Hex(view);
+      const checksumRows = parseFrameChecksumPackets(await this.readText(checksumName));
+      const frames: FrameDigest[] = checksumRows.map((row, i) => {
+        if (!row.payloadDigest) {
+          throw new Error(`${ENGINE_ID}: framehash row ${i} did not contain a SHA-256 payload digest`);
+        }
         const ptsUs = observedTimeline[i]?.ptsUs ?? Math.round((i / fps) * 1_000_000);
-        frames.push({ index: i, ptsUs, sha256, width, height });
-        const clamped = new Uint8ClampedArray(frameBytes);
-        clamped.set(view);
-        pixels.push(clamped);
-        if (i === 0) opts?.onFirstFrame?.(nowMs());
-      }
+        return { index: i, ptsUs, sha256: row.payloadDigest, width, height };
+      });
+      if (frames.length > 0) opts?.onFirstFrame?.(nowMs());
 
       if (this.activeOperation) this.activeOperation.decodedFrames = frames.length;
 
+      // Correctness oracles normally consume the framehash digests directly. When perceptual
+      // evidence needs pixels, decode exactly the requested presentation sample in a fresh bounded
+      // operation. Keep only the most recently requested plane, so even 4K access remains O(1)
+      // frames of browser memory rather than retaining the entire decoded prefix.
+      let cachedIndex = -1;
+      let cachedPixels: ImageData | undefined;
       return {
         frames,
         selectedTrack: selectedEvidence,
-        async getPixels(i: number): Promise<ImageData> {
-          const buf = pixels[i];
-          if (!buf) throw new Error(`${ENGINE_ID}: frame ${i} out of range (have ${pixels.length})`);
-          return new ImageData(buf, width, height);
+        getPixels: async (i: number): Promise<ImageData> => {
+          const frame = frames[i];
+          if (!frame) throw new Error(`${ENGINE_ID}: frame ${i} out of range (have ${frames.length})`);
+          if (cachedIndex === i && cachedPixels) return cachedPixels;
+          cachedPixels = await this.decodeFramePixels(
+            input,
+            selected.sourceTrackIndex,
+            frame.ptsUs,
+            width,
+            height,
+          );
+          cachedIndex = i;
+          return cachedPixels;
         },
       };
+    } finally {
+      await this.cleanup([...written.cleanupPaths, rawName, checksumName]);
+    }
+  }
+
+  /** Decode one already-observed presentation sample for lazy FrameSink pixel access. */
+  private async decodeFramePixels(
+    input: MediaInput,
+    sourceTrackIndex: number,
+    ptsUs: number,
+    width: number,
+    height: number,
+  ): Promise<ImageData> {
+    const result = await this.executeOperation('decodeFrames', undefined, () =>
+      this.decodeFramePixelsImpl(input, sourceTrackIndex, ptsUs, width, height));
+    return result.pixels;
+  }
+
+  private async decodeFramePixelsImpl(
+    input: MediaInput,
+    sourceTrackIndex: number,
+    ptsUs: number,
+    width: number,
+    height: number,
+  ): Promise<{ pixels: ImageData }> {
+    const base = this.scratch();
+    const rawName = `${base}.rgba`;
+    const written = await this.writeInput(input, `${base}.in`);
+    try {
+      const args = [
+        ...written.inputOptions,
+        '-i', written.name,
+        '-map', `0:${sourceTrackIndex}`,
+      ];
+      if (ptsUs > 0) args.push('-ss', (ptsUs / 1_000_000).toFixed(6));
+      args.push(
+        '-frames:v', '1',
+        '-vf', rawRgbaColorFilter(width, height),
+        '-pix_fmt', 'rgba',
+        '-f', 'rawvideo',
+        rawName,
+      );
+      await this.run(args);
+      const raw = await this.readBinary(rawName);
+      const frameBytes = width * height * 4;
+      if (!Number.isSafeInteger(frameBytes) || frameBytes <= 0) {
+        throw new Error(`${ENGINE_ID}: invalid frame size ${width}x${height}`);
+      }
+      if (raw.byteLength < frameBytes) {
+        throw new Error(`${ENGINE_ID}: lazy pixel decode produced no frame at ${ptsUs}us`);
+      }
+      // ImageData requires a Uint8ClampedArray over a plain ArrayBuffer, not SharedArrayBuffer.
+      const pixels = new Uint8ClampedArray(frameBytes);
+      pixels.set(raw.subarray(0, frameBytes));
+      return { pixels: new ImageData(pixels, width, height) };
     } finally {
       await this.cleanup([...written.cleanupPaths, rawName]);
     }
@@ -4077,30 +4262,45 @@ export class FfmpegWasmEngine implements MediaEngine {
     const written = await this.writeInput(input, `${base}.in`);
     try {
       // Dimensions from the `ffmpeg -i` log (no ffprobe).
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
-      const log = await this.runInfo(written.name, written.inputOptions);
+      // Seeking decodes the selected sample below. Header-only probing avoids a redundant full-file
+      // frame count for every retained benchmark repetition.
+      const structured = await this.structuredProbe(
+        written.name,
+        written.inputOptions,
+        input,
+        { countFrames: false },
+      );
+      let log = structured ? undefined : await this.runInfo(written.name, written.inputOptions);
       const structuredVideo = structured?.metadata.tracks.find(
         (track): track is NormalizedTrack & { width: number; height: number } =>
           track.type === 'video' && track.width !== undefined && track.height !== undefined,
       );
-      const v = structuredVideo ?? this.firstVideoTrack(log, 'seek');
+      if (!structuredVideo && log === undefined) {
+        log = await this.runInfo(written.name, written.inputOptions);
+      }
+      const v = structuredVideo ?? this.firstVideoTrack(log!, 'seek');
       const width = v.width;
       const height = v.height;
-      const durationSec = parseDurationSecFromLog(log);
+      if (structured?.metadata.durationSec == null && log === undefined) {
+        log = await this.runInfo(written.name, written.inputOptions);
+      }
+      const durationSec = structured?.metadata.durationSec ?? parseDurationSecFromLog(log!);
       let tSec = Math.max(0, tUs / 1_000_000);
       if (durationSec != null && Number.isFinite(durationSec)) {
         const frameStepSec = v.fps && v.fps > 0 ? 1 / v.fps : 1 / 30;
         tSec = Math.min(tSec, Math.max(0, durationSec - frameStepSec));
       }
-      const timeline = await this.observedFrameTimeline(written.name, written.inputOptions);
+      const neutralTimeline = await this.neutralObservedFrameTimeline(input);
+      const timeline = neutralTimeline.length
+        ? neutralTimeline
+        : await this.observedFrameTimeline(written.name, written.inputOptions);
       const requestedUs = Math.round(tSec * 1_000_000);
-      const observed = timeline.find((frame) => frame.ptsUs >= requestedUs) ?? timeline.at(-1);
+      const observed = nearestObservedFrame(timeline, requestedUs);
       const landedPtsUs = observed?.ptsUs ?? requestedUs;
       const landedSec = landedPtsUs / 1_000_000;
 
-      // Decode-accurate seek: -ss AFTER -i decodes from the start and lands exactly on tSec, then
-      // grab a single frame. The output stream restarts its clock at 0, so we report the requested
-      // target as the landed presentation time.
+      // Decode-accurate seek: -ss AFTER -i decodes from the start to the selected real presentation
+      // sample. Rawvideo restarts its output clock, so retain that source-sample PTS explicitly.
       await this.run([
         ...written.inputOptions, '-i', written.name, '-ss', landedSec.toFixed(6), '-frames:v', '1', '-vf', rawRgbaColorFilter(width, height), '-pix_fmt', 'rgba', '-f', 'rawvideo', rawName,
       ]);

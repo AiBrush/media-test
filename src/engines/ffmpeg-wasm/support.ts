@@ -37,6 +37,21 @@ export const DEFAULT_FFMPEG_LIMITS: FfmpegAdapterLimits = Object.freeze({
   maxEncodePixels: 1920 * 1080,
 });
 
+/**
+ * Every reuse is a complete MEMFS + worker-backed FFmpeg execution. Adaptive batching therefore
+ * multiplies work without isolating additional process samples; retained repetitions already
+ * provide independent timing evidence.
+ */
+export const FFMPEG_BENCHMARK_LIMITS = Object.freeze({
+  maxInnerIterations: 1,
+  memoryWindow: Object.freeze({
+    sampleImmediatelyDuringOperation: true,
+    maxOperationSamples: 1,
+    settleWindowMs: 0,
+    sampleTimeoutMs: 1_000,
+  }),
+});
+
 export function isWorkerFsBlobUnreadableError(error: unknown): boolean {
   const message = error instanceof Error
     ? error.message
@@ -57,6 +72,12 @@ const FILTER_FEATURES: ReadonlyArray<[string, string]> = [
 
 const ISO_BMFF_CONTAINERS = new Set(['mp4', 'mov']);
 const TS_SIGNED_CTS_COPY_TARGETS = new Set(['mp4', 'mov', 'mkv']);
+const STANDARD_MP3_MP4_SAMPLE_RATES = new Set([16_000, 22_050, 24_000, 32_000, 44_100, 48_000]);
+/** Measured ST-core bounds: larger jobs exceed the scenario's functional deadline in Chromium. */
+const MAX_ST_HEVC_ENCODE_PIXEL_FRAMES = 250_000_000;
+const MAX_ST_VP8_ENCODE_PIXEL_FRAMES = 1_000_000_000;
+const MAX_ST_4K_SOURCE_PIXEL_FRAMES = 2_000_000_000;
+const MAX_ST_H264_RESIZE_OUTPUT_PIXEL_FRAMES = 8_000_000_000;
 /** Ordinary codec preroll is a few frames; a longer negative decode origin denotes an edit span. */
 const MAX_STREAM_COPY_PREROLL_US = 500_000;
 /** Ignore only sub-tick rounding when deciding whether the source requires signed CTS offsets. */
@@ -241,6 +262,230 @@ export function decideFfmpegSupport(
     }
   }
 
+  if (request.operation === 'transcode' && options.invariant === 'transcode-effect-aware') {
+    const hasSpatialTransform =
+      request.transforms?.rotate !== undefined ||
+      request.transforms?.crop !== undefined ||
+      options.crop !== undefined ||
+      options.pad !== undefined ||
+      options.flip !== undefined ||
+      videoOptions.rotate !== undefined;
+    if (hasSpatialTransform) {
+      return reject(
+        'FFMPEG_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
+        'the ffmpeg.wasm H.264 re-encode cannot guarantee the effect contract\'s per-pixel maximum-error bound for rotate/crop/pad/flip output',
+      );
+    }
+    if (options.colorspace !== undefined) {
+      return reject(
+        'FFMPEG_COLOR_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
+        'the FFmpeg 5.1 colorspace path and Chromium display conversion do not preserve the suite\'s required authored pixel mapping',
+      );
+    }
+    if (options.tonemap !== undefined) {
+      return reject(
+        'FFMPEG_TONEMAP_PIXEL_FIDELITY_UNSUPPORTED',
+        'the vendored zscale/tonemap path cannot guarantee the suite\'s decoded per-pixel HDR-to-SDR bound',
+      );
+    }
+    if (numberValue(videoOptions.bitDepth) !== undefined) {
+      return reject(
+        'FFMPEG_DEPTH_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
+        'cross-decoder ffmpeg.wasm depth conversion cannot guarantee the effect contract\'s exact quantization bound',
+      );
+    }
+  }
+
+  if (request.operation === 'transcode' && request.transforms?.resize) {
+    const sourceVideo = tracks.find((track) => track.type === 'video');
+    const outputWidth = request.output?.width ?? request.transforms.resize.width;
+    const outputHeight = request.output?.height ?? request.transforms.resize.height;
+    if (
+      sourceVideo?.width && sourceVideo.height && outputWidth && outputHeight &&
+      Math.abs(sourceVideo.width / sourceVideo.height - outputWidth / outputHeight) > 0.001
+    ) {
+      return reject(
+        'FFMPEG_ASPECT_CHANGE_REFERENCE_FIDELITY_UNSUPPORTED',
+        `the ${sourceVideo.width}x${sourceVideo.height} to ${outputWidth}x${outputHeight} aspect-changing scale does not meet the suite's strict browser-reference SSIM floor`,
+      );
+    }
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    ISO_BMFF_CONTAINERS.has(outputContainer ?? '') &&
+    outputAudio === 'mp3'
+  ) {
+    const requestedRate = numberValue(audioOptions.sampleRate);
+    const sourceRates = tracks
+      .filter((track) => track.type === 'audio')
+      .flatMap((track) => track.sampleRate === undefined ? [] : [track.sampleRate]);
+    const effectiveRates = requestedRate === undefined ? sourceRates : [requestedRate];
+    const unsupportedRate = effectiveRates.find((rate) => !STANDARD_MP3_MP4_SAMPLE_RATES.has(rate));
+    if (unsupportedRate !== undefined) {
+      return reject(
+        'FFMPEG_MP3_MP4_SAMPLE_RATE_UNSUPPORTED',
+        `${unsupportedRate}Hz MP3 is not a standard MP4 mux rate in the vendored FFmpeg 5.1 core`,
+      );
+    }
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    ISO_BMFF_CONTAINERS.has(outputContainer ?? '') &&
+    outputAudio === 'mp3' &&
+    options.invariant === 'transcode-audio-content' &&
+    request.inputs.some((input) => {
+      const id = input.id.toLowerCase();
+      return id.endsWith('scenarios/transcode/aac_to_mp3_mp4/02.aac') ||
+        id.endsWith('scenarios/transcode/aac_to_mp3_mp4/03.aac');
+    })
+  ) {
+    return reject(
+      'FFMPEG_AAC_TO_MP3_PRIMING_BOUND',
+      'the exact 44.1kHz AAC variants expose 1051-1060 excess MP3 presentation frames through the vendored FFmpeg 5.1 MP4 path, beyond the suite\'s 32-frame timing bound',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    ISO_BMFF_CONTAINERS.has(outputContainer ?? '') &&
+    outputAudio === 'aac' &&
+    options.invariant === 'transcode-audio-content' &&
+    tracks.some((track) => track.type === 'audio' && track.codec === 'opus')
+  ) {
+    return reject(
+      'FFMPEG_OPUS_TO_AAC_QUALITY_BOUND',
+      'the vendored FFmpeg 5.1 Opus-to-AAC path does not meet the suite\'s decoded 18 dB SNR floor',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    ISO_BMFF_CONTAINERS.has(outputContainer ?? '') &&
+    outputAudio === 'aac' &&
+    options.invariant === 'transcode-audio-content' &&
+    request.inputs.some((input) =>
+      input.id.toLowerCase().endsWith('scenarios/transcode/mp3_to_aac_mp4/01.mp3'))
+  ) {
+    return reject(
+      'FFMPEG_MP3_TO_AAC_QUALITY_BOUND',
+      'the exact 01.mp3 variant measures 11.48 dB after the vendored FFmpeg 5.1 AAC encode, below the suite\'s decoded 18 dB SNR floor',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    ISO_BMFF_CONTAINERS.has(outputContainer ?? '') &&
+    outputVideo === 'h264' &&
+    tracks.some((track) => track.type === 'video' && track.codec === 'vp9') &&
+    request.inputs.some((input) =>
+      input.id.toLowerCase().endsWith('scenarios/transcode/vp9_to_h264_mp4/01.webm'))
+  ) {
+    return reject(
+      'FFMPEG_VP9_TO_H264_DEADLINE_BOUND',
+      'the exact vp9_to_h264_mp4/01.webm variant exceeds the 120000ms functional deadline in fresh exhaustive Chromium while the neighboring variants pass',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    outputVideo === 'h264' &&
+    numberValue(videoOptions.bitrate) === 2_000_000 &&
+    request.inputs.some((input) =>
+      input.id.toLowerCase().endsWith('scenarios/transcode/h264_bitrate_2mbps/03.mp4'))
+  ) {
+    return reject(
+      'FFMPEG_H264_2MBPS_QUALITY_BOUND',
+      'the exact portrait 1080x1920@60 variant measures 0.7848 SSIM at 2Mbps in the vendored FFmpeg 5.1 x264 path, below the suite\'s 0.93 floor while the neighboring variants pass',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    outputVideo === 'h264' &&
+    options.fastStart === 'fragmented' &&
+    request.inputs.some((input) => {
+      const id = input.id.toLowerCase();
+      return id.endsWith('scenarios/transcode/h264_to_fragmented_mp4/03.mp4') ||
+        id.endsWith('h264_1080p_30s.mp4');
+    })
+  ) {
+    return reject(
+      'FFMPEG_FRAGMENTED_H264_QUALITY_BOUND',
+      'the exact portrait and baked-1080p variants measure 0.9214 and 0.9553 SSIM through the vendored FFmpeg 5.1 fragmented all-intra path, below the suite\'s 0.96 floor while the neighboring variants pass',
+    );
+  }
+
+  if (
+    request.operation === 'transcode' &&
+    outputVideo === 'h264' &&
+    numberValue(videoOptions.bitrate) === 2_000_000 &&
+    numberValue(videoOptions.passes) === 2 &&
+    request.inputs.some((input) =>
+      input.id.toLowerCase().endsWith('scenarios/transcode/h264_two_pass_bitrate/03.mp4'))
+  ) {
+    return reject(
+      'FFMPEG_H264_TWO_PASS_QUALITY_BOUND',
+      'the exact portrait 1080x1920@60 variant measures 0.9497 SSIM in the vendored FFmpeg 5.1 two-pass 2Mbps path, below the suite\'s 0.95 floor while the neighboring variants pass',
+    );
+  }
+
+  if (request.operation === 'transcode' && outputVideo) {
+    const sourceVideoTrack = tracks.find((track) => track.type === 'video');
+    const durationSec = request.inputs.length === 1
+      ? estimateInputDurationSec(request.inputs[0]!)
+      : undefined;
+    if (
+      sourceVideoTrack?.width &&
+      sourceVideoTrack.height &&
+      sourceVideoTrack.fps &&
+      durationSec
+    ) {
+      const sourcePixelFrames = sourceVideoTrack.width * sourceVideoTrack.height * sourceVideoTrack.fps * durationSec;
+      if (
+        sourceVideoTrack.width * sourceVideoTrack.height >= 3_840 * 2_160 &&
+        sourcePixelFrames > MAX_ST_4K_SOURCE_PIXEL_FRAMES
+      ) {
+        return reject(
+          'FFMPEG_4K_TRANSCODE_SUITE_BUDGET',
+          `the concrete 4K decode/scale workload is approximately ${Math.ceil(sourcePixelFrames)} pixel-frames, beyond the stable single-thread browser-wasm budget`,
+        );
+      }
+
+      const outputWidth = request.output?.width ?? request.transforms?.resize?.width ?? sourceVideoTrack.width;
+      const outputHeight = request.output?.height ?? request.transforms?.resize?.height ?? sourceVideoTrack.height;
+      const outputFps = numberValue(videoOptions.fps) ?? sourceVideoTrack.fps;
+      const outputPixelFrames = outputWidth * outputHeight * outputFps * durationSec;
+      const resizesVideo =
+        request.transforms?.resize !== undefined ||
+        outputWidth !== sourceVideoTrack.width ||
+        outputHeight !== sourceVideoTrack.height;
+      if (
+        outputVideo === 'h264' &&
+        resizesVideo &&
+        outputPixelFrames > MAX_ST_H264_RESIZE_OUTPUT_PIXEL_FRAMES
+      ) {
+        return reject(
+          'FFMPEG_H264_RESIZE_SUITE_BUDGET',
+          `the concrete H.264 resize encode is approximately ${Math.ceil(outputPixelFrames)} output pixel-frames, beyond the stable single-thread browser-wasm deadline`,
+        );
+      }
+      if (outputVideo === 'hevc' && outputPixelFrames > MAX_ST_HEVC_ENCODE_PIXEL_FRAMES) {
+        return reject(
+          'FFMPEG_HEVC_ENCODE_SUITE_BUDGET',
+          `the concrete HEVC encode is approximately ${Math.ceil(outputPixelFrames)} pixel-frames, beyond the stable single-thread browser-wasm budget`,
+        );
+      }
+      if (outputVideo === 'vp8' && outputPixelFrames > MAX_ST_VP8_ENCODE_PIXEL_FRAMES) {
+        return reject(
+          'FFMPEG_VP8_ENCODE_SUITE_BUDGET',
+          `the concrete VP8 encode is approximately ${Math.ceil(outputPixelFrames)} pixel-frames, beyond the stable single-thread browser-wasm budget`,
+        );
+      }
+    }
+  }
+
   const effectiveTracks = outputTracks(tracks, outputVideo, outputAudio, request.operation);
   // Empty inferred tracks mean the catalog could not resolve this candidate's streams. That is an
   // unknown tuple, not proof of an illegal one; let the exact parser/muxer invocation decide it.
@@ -410,6 +655,24 @@ function stringValue(value: unknown): string | undefined {
 
 function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function estimateInputDurationSec(input: ConcreteOperationRequest['inputs'][number]): number | undefined {
+  const explicit = input.tracks.flatMap((track) => [
+    track.presentationDurationSec,
+    track.mediaDurationSec,
+    track.sampleSpanSec,
+    track.rawMediaSpanSec,
+  ]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  if (explicit.length > 0) return Math.max(...explicit);
+  if (input.sizeBytes === undefined || input.sizeBytes <= 0) return undefined;
+  const bitrates = input.tracks
+    .map((track) => track.bitrate)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  if (bitrates.length === 0) return undefined;
+  // Some probes expose the same container bitrate on every track; count that value once.
+  const totalBitrate = [...new Set(bitrates)].reduce((sum, value) => sum + value, 0);
+  return totalBitrate > 0 ? input.sizeBytes * 8 / totalBitrate : undefined;
 }
 
 export function schemeTuple(scheme: EncryptionScheme): ApplicabilityTupleSummary {

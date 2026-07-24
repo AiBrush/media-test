@@ -124,7 +124,12 @@ function demuxToDecodeInput(bytes: Uint8Array, container?: string): DecodeInput 
  */
 export async function decodeBytesToFrames(
   input: MediaBytes | Uint8Array,
-  opts?: { maxFrames?: number; sampling?: 'prefix' | 'uniform' },
+  opts?: {
+    maxFrames?: number;
+    sampling?: 'prefix' | 'uniform';
+    durationHintSec?: number;
+    sampleTimesSec?: readonly number[];
+  },
 ): Promise<FrameSink> {
   const bytes = toBytes(input);
   const container = input instanceof Uint8Array ? undefined : input.container;
@@ -134,8 +139,14 @@ export async function decodeBytesToFrames(
   // whereas the media element samples uniformly across presentation time.
   if (opts?.sampling === 'uniform' && hasDom()) {
     const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
-    const fallbackOpts: { maxFrames?: number } = {};
+    const fallbackOpts: {
+      maxFrames?: number;
+      durationHintSec?: number;
+      sampleTimesSec?: readonly number[];
+    } = {};
     if (opts.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+    if (opts.durationHintSec !== undefined) fallbackOpts.durationHintSec = opts.durationHintSec;
+    if (opts.sampleTimesSec !== undefined) fallbackOpts.sampleTimesSec = opts.sampleTimesSec;
     return decodeWithVideoElement(blob, fallbackOpts);
   }
 
@@ -172,8 +183,14 @@ export async function decodeBytesToFrames(
     );
   }
   const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
-  const fallbackOpts: { maxFrames?: number } = {};
+  const fallbackOpts: {
+    maxFrames?: number;
+    durationHintSec?: number;
+    sampleTimesSec?: readonly number[];
+  } = {};
   if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
+  if (opts?.durationHintSec !== undefined) fallbackOpts.durationHintSec = opts.durationHintSec;
+  if (opts?.sampleTimesSec !== undefined) fallbackOpts.sampleTimesSec = opts.sampleTimesSec;
   return decodeWithVideoElement(blob, fallbackOpts);
 }
 

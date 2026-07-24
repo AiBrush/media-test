@@ -1675,6 +1675,27 @@ export function needsTightAvcFrameMaterialization(codec: VideoCodec, width: numb
   return codec === 'avc' && Number.isSafeInteger(width) && width > 0 && width % 2 === 0 && width % 4 !== 0;
 }
 
+/** Select the nearest real presentation sample, with the suite's deterministic earlier-PTS tie break. */
+export function nearestPresentationSampleIndex(
+  samples: readonly { readonly microsecondTimestamp: number }[],
+  targetUs: number,
+): number {
+  let bestIndex = -1;
+  let bestDelta = Number.POSITIVE_INFINITY;
+  let bestPtsUs = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < samples.length; index++) {
+    const ptsUs = samples[index]!.microsecondTimestamp;
+    if (!Number.isFinite(ptsUs)) continue;
+    const delta = Math.abs(ptsUs - targetUs);
+    if (delta < bestDelta || (delta === bestDelta && ptsUs < bestPtsUs)) {
+      bestIndex = index;
+      bestDelta = delta;
+      bestPtsUs = ptsUs;
+    }
+  }
+  return bestIndex;
+}
+
 /** Copy a possibly padded/GPU-backed sample into the tight RGBA layout required by the AVC edge path. */
 export async function materializeTightRgbaVideoSample(
   mb: Pick<MB, 'VideoSample'>,
@@ -3070,6 +3091,15 @@ function hasImplicitSequentialTiming(track: EncodedTracks['tracks'][number]): bo
  */
 export class MediabunnyEngine implements MediaEngine {
   readonly id: string;
+  readonly benchmarkLimits = {
+    maxInnerIterations: 1,
+    memoryWindow: {
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 1_000,
+    },
+  } as const;
 
   private codecConfigEvidence: SerializableValue[] = [];
   private activeConversions = new Set<Conversion>();
@@ -3992,8 +4022,9 @@ export class MediabunnyEngine implements MediaEngine {
   }
 
   // ── seek ───────────────────────────────────────────────────────────────────────────────────
-  /** Seek to tUs and return the landed frame's pts + digest. VideoSampleSink.getSample returns the
-   *  last frame with start ≤ t (presentation order), i.e. the frame visible at that timestamp. */
+  /** Seek to tUs and return the nearest real frame's PTS + digest. VideoSampleSink.samples(t)
+   *  yields the frame visible at t followed by the next presentation sample, which lets us apply
+   *  the family contract's nearest-PTS rule instead of getSample(t)'s floor-only rule. */
   async seek(
     input: MediaInput,
     tUs: number,
@@ -4010,9 +4041,19 @@ export class MediabunnyEngine implements MediaEngine {
 
       const applicability = context ? this.runtimeApplicability(context.request, 'seek') : undefined;
       const sink = new this.lib.VideoSampleSink(videoTrack, await videoDecoderOptionsForTrack(this.lib, videoTrack, applicability));
-      const targetSec = Math.max(0, tUs / 1e6);
-      const sample = await sink.getSample(targetSec);
+      const targetUs = Math.max(0, tUs);
+      const targetSec = targetUs / 1e6;
+      const nearbySamples: VideoSample[] = [];
+      for await (const sample of sink.samples(targetSec)) {
+        nearbySamples.push(sample);
+        if (nearbySamples.length === 2) break;
+      }
+      const selectedIndex = nearestPresentationSampleIndex(nearbySamples, targetUs);
+      const sample = selectedIndex >= 0 ? nearbySamples[selectedIndex] : undefined;
       if (!sample) throw new Error(`mediabunny seek: no frame at ${tUs}us`);
+      for (let index = 0; index < nearbySamples.length; index++) {
+        if (index !== selectedIndex) nearbySamples[index]!.close();
+      }
       try {
         const landedPtsUs = sample.microsecondTimestamp;
         const img = await imageDataFromVideoSample(sample);

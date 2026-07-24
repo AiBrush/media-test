@@ -6,6 +6,7 @@ import type {
   PacketInfo,
   RationalTimebase,
 } from '../../core/engine.ts';
+import type { RemuxProgramEvidence } from '../../features/remux/types.ts';
 import { canonicalCodec } from './codecs.ts';
 
 export type FfmpegOperationPhase = 'materialize' | 'execute' | 'read' | 'cleanup';
@@ -556,6 +557,54 @@ export interface ObservedFrameTime {
   ptsUs: number;
   durationUs?: number;
   keyframe: boolean;
+}
+
+/**
+ * Convert the suite's neutral coded-sample table into the presentation timeline FFmpeg decode and
+ * seek need. ISO frame evidence is zero-based after its edit-list/composition prefix, while EBML
+ * timelines retain their native (occasionally positive) presentation origin.
+ */
+export function observedFrameTimelineFromProgram(
+  program: RemuxProgramEvidence,
+  videoOrdinal = 0,
+): ObservedFrameTime[] {
+  const track = program.tracks.filter((item) => item.type === 'video')[videoOrdinal];
+  if (!track) return [];
+  const frames = track.samples
+    .filter((sample) => typeof sample.ptsUs === 'number' && Number.isFinite(sample.ptsUs))
+    .map((sample) => ({
+      ptsUs: sample.ptsUs!,
+      ...(typeof sample.durationUs === 'number' && Number.isFinite(sample.durationUs) &&
+          sample.durationUs >= 0
+        ? { durationUs: Math.round(sample.durationUs) }
+        : {}),
+      keyframe: sample.keyframe === true,
+    }))
+    .sort((a, b) => a.ptsUs - b.ptsUs);
+  const originUs = program.container === 'mp4' || program.container === 'mov'
+    ? frames[0]?.ptsUs ?? 0
+    : 0;
+  return frames.map((frame) => ({ ...frame, ptsUs: Math.round(frame.ptsUs - originUs) }));
+}
+
+/** Nearest real presentation sample, with deterministic earlier-PTS tie breaking. */
+export function nearestObservedFrame(
+  frames: readonly ObservedFrameTime[],
+  targetUs: number,
+): ObservedFrameTime | undefined {
+  let nearest: ObservedFrameTime | undefined;
+  for (const frame of frames) {
+    if (!nearest) {
+      nearest = frame;
+      continue;
+    }
+    const delta = Math.abs(frame.ptsUs - targetUs);
+    const nearestDelta = Math.abs(nearest.ptsUs - targetUs);
+    if (delta < nearestDelta || (delta === nearestDelta && frame.ptsUs < nearest.ptsUs)) {
+      nearest = frame;
+    }
+  }
+  return nearest;
 }
 
 export function parseFfprobeFramesJson(text: string): ObservedFrameTime[] {

@@ -78,6 +78,15 @@ export interface RemotionConfigUsed extends AdapterConfigProfile {
 
 export class RemotionEngine implements MediaEngine {
   readonly id = REMOTION_ENGINE_ID;
+  readonly benchmarkLimits = Object.freeze({
+    maxInnerIterations: 1,
+    memoryWindow: Object.freeze({
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 5_000,
+    }),
+  });
 
   private readonly parser = new RemotionMediaParserEngine();
   private readonly webcodecs = new RemotionWebcodecsEngine();

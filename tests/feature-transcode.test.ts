@@ -34,6 +34,18 @@ import {
 
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 
+describe('transcode exhaustive calibration bounds', () => {
+  test('VP9, 2 Mbps AVC, and 1 fps rows expose their measured semantic tolerances', () => {
+    const vp9 = transcodeScenarios.find((entry) => entry.id === 'transcode/h264_to_vp9_webm')!;
+    const lowBitrate = transcodeScenarios.find((entry) => entry.id === 'transcode/h264_bitrate_2mbps')!;
+    const oneFps = transcodeScenarios.find((entry) => entry.id === 'transcode/extreme_fps_1')!;
+
+    expect(vp9.tolerances?.ssimMin).toBe(0.98);
+    expect(lowBitrate.tolerances?.ssimMin).toBe(0.93);
+    expect(oneFps.tolerances?.durationToleranceSec).toBe(1);
+  });
+});
+
 describe('REQ-FEAT-20 effect-aware transform oracles', () => {
   test('rotation grades actual pixels and fails a playable/codec-correct no-op', () => {
     const contract = requiredTransform('h264_rotate_180');
@@ -152,6 +164,36 @@ describe('REQ-FEAT-21 decoded audio content and explicit priming', () => {
     const changed = audioSignal([0.25, -0.25, 0.5, -0.4], 2, 2);
     expect(evaluateTranscodedAudioContent(source, changed, contract))
       .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_LOSSLESS_CONTENT_MISMATCH' });
+
+    const browserFlac = requiredAudioContract('wav_to_flac');
+    const floatRounded = audioSignal([0.25 + 1 / 65_536, -0.25, 0.5, -0.5], 2, 2);
+    expect(evaluateTranscodedAudioContent(source, floatRounded, browserFlac))
+      .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+  });
+
+  test('AAC-to-PCM admits a sparse cross-decoder transient but rejects material corruption', () => {
+    const contract = requiredAudioContract('aac_to_pcm_wav_extract');
+    const sourceSamples = Array.from({ length: 20_000 }, (_, index) => Math.sin(index / 17) * 0.5);
+    const source = audioSignal(sourceSamples, 20_000, 1);
+    const equivalentSamples = [...sourceSamples];
+    equivalentSamples[10_000]! += 0.08;
+    expect(evaluateTranscodedAudioContent(
+      source,
+      audioSignal(equivalentSamples, 20_000, 1),
+      contract,
+    )).toMatchObject({
+      state: 'VERDICT', verdict: 'PASS', reasonCode: 'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MATCH',
+    });
+
+    const corruptedSamples = [...sourceSamples];
+    corruptedSamples[10_000]! += 0.2;
+    expect(evaluateTranscodedAudioContent(
+      source,
+      audioSignal(corruptedSamples, 20_000, 1),
+      contract,
+    )).toMatchObject({
+      state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_DECODER_EQUIVALENCE_MISMATCH',
+    });
   });
 
   test('legitimate AAC priming/remainder is trimmed, while excess/lost samples beyond the model fail', () => {
@@ -195,6 +237,60 @@ describe('REQ-FEAT-21 decoded audio content and explicit priming', () => {
       .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_LOSSY_CONTENT_MISMATCH' });
   });
 
+  test('whole-program granule timing trims coded decoder tail padding without hiding truncation', () => {
+    const source = audioSignal([0.2, -0.2, 0.4, -0.4], 4, 1);
+    const timeline = {
+      kind: 'whole-program' as const,
+      presentationSampleFrames: 4,
+    };
+    const contract = requiredAudioContract('wav_to_vorbis_ogg');
+    const padded = audioSignal([0.2, -0.2, 0.4, -0.4, 0.75], 5, 1, 'coded', timeline);
+    expect(evaluateTranscodedAudioContent(source, padded, contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    const truncated = audioSignal([0.2, -0.2, 0.4], 3, 1, 'coded', timeline);
+    expect(evaluateTranscodedAudioContent(source, truncated, contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_DECODED_PROGRAM_TRUNCATED' });
+  });
+
+  test('MP3-in-MP4 admits only the documented sub-millisecond sample-time rounding band', () => {
+    const source = audioSignal([0.2, -0.2, 0.4, -0.4], 4, 1);
+    const contract = requiredAudioContract('wav_to_mp3_mp4');
+    const rounded = audioSignal([0.2, -0.2, 0.4, -0.4, ...new Array(16).fill(0)], 20, 1);
+    expect(evaluateTranscodedAudioContent(source, rounded, contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    const excessive = audioSignal([0.2, -0.2, 0.4, -0.4, ...new Array(33).fill(0)], 37, 1);
+    expect(evaluateTranscodedAudioContent(source, excessive, contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_EXCESS_SAMPLES' });
+  });
+
+  test('AAC-in-MP4 admits sub-millisecond edit-list timescale rounding but not coded-frame drift', () => {
+    const sourceSamples = Array.from({ length: 64 }, (_, index) => index % 2 === 0 ? 0.25 : -0.25);
+    const source = audioSignal(sourceSamples, 64, 1);
+    const candidate = (extraFrames: number): DecodedAudioSignal => {
+      const sampleFrames = 64 + extraFrames;
+      return audioSignal(
+        [...sourceSamples, ...new Array(extraFrames).fill(0)],
+        sampleFrames,
+        1,
+        'coded',
+        {
+          kind: 'aac-isobmff',
+          codedSampleFrames: sampleFrames,
+          primingFrames: 0,
+          remainderFrames: 0,
+          presentationSampleFrames: sampleFrames,
+          editListMediaStartFrame: 0,
+          timingSource: 'edit-list',
+        },
+      );
+    };
+    const contract = requiredAudioContract('wav_to_aac_mp4');
+    expect(evaluateTranscodedAudioContent(source, candidate(32), contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    expect(evaluateTranscodedAudioContent(source, candidate(33), contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_EXCESS_SAMPLES' });
+  });
+
   test('the muxed stereo-to-mono row scores the declared channel transform, not metadata alone', () => {
     const source = audioSignal([0.8, -0.2, 0.4, -0.6, -0.6, 0.2, 0.2, 0.8], 4, 2);
     const timeline = {
@@ -208,11 +304,25 @@ describe('REQ-FEAT-21 decoded audio content and explicit priming', () => {
     };
     const mono = audioSignal([0.3, -0.1, -0.2, 0.5], 4, 1, 'presentation', timeline);
     const contract = requiredAudioContract('av_downmix_stereo_to_mono');
+    expect(contract.sampleFrameTolerance).toBe(96);
     expect(evaluateTranscodedAudioContent(source, mono, contract))
       .toMatchObject({ state: 'VERDICT', verdict: 'PASS', reasonCode: 'TRANSCODE_AUDIO_LOSSY_CONTENT_MATCH' });
     const silence = audioSignal([0, 0, 0, 0], 4, 1, 'presentation', timeline);
     expect(evaluateTranscodedAudioContent(source, silence, contract))
       .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_LOSSY_CONTENT_MISMATCH' });
+
+    const longSource = audioSignal(new Array(128).fill([0.8, -0.2]).flat(), 128, 2);
+    const candidate = (frames: number) => audioSignal(
+      new Array(frames).fill(0.3),
+      frames,
+      1,
+      'presentation',
+      { ...timeline, codedSampleFrames: frames, presentationSampleFrames: frames },
+    );
+    expect(evaluateTranscodedAudioContent(longSource, candidate(48), contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    expect(evaluateTranscodedAudioContent(longSource, candidate(31), contract))
+      .toMatchObject({ state: 'VERDICT', verdict: 'FAIL', reasonCode: 'TRANSCODE_AUDIO_LOST_SAMPLES' });
   });
 
   test('every registered audio-content contract is live on its scenario', () => {

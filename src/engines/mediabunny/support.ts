@@ -43,6 +43,8 @@ export const MEDIABUNNY_REASON = {
   AUDIO_PRESENTATION_TIMING: 'MEDIABUNNY_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
   TRANSFORM_PIXEL_FIDELITY: 'MEDIABUNNY_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
   ALPHA_OUTPUT_GEOMETRY: 'MEDIABUNNY_ALPHA_OUTPUT_GEOMETRY_UNSUPPORTED',
+  ABR_BITRATE_CONTROL: 'MEDIABUNNY_ABR_BITRATE_CONTROL_UNSUPPORTED',
+  OUTPUT_BUFFER_LIMIT: 'MEDIABUNNY_OUTPUT_BUFFER_LIMIT_UNSUPPORTED',
 } as const;
 
 const PCM_CODECS = new Set(['pcm-s16', 'pcm-s16be', 'pcm-s24', 'pcm-s24be', 'pcm-s32', 'pcm-s32be', 'pcm-f32', 'pcm-f32be', 'pcm-f64', 'pcm-f64be', 'pcm-u8', 'pcm-s8', 'ulaw', 'alaw']);
@@ -50,6 +52,12 @@ const NORMALIZED_METADATA_KEYS = new Set([
   'title', 'description', 'artist', 'album', 'albumArtist', 'trackNumber', 'tracksTotal',
   'discNumber', 'discsTotal', 'genre', 'date', 'lyrics', 'comment',
 ]);
+
+// Mediabunny BufferTarget starts at 2^16 bytes and doubles its backing ArrayBuffer. Once the final
+// extent exceeds 2 GiB, the next allocation is the library's 4 GiB maximum. Chromium cannot
+// materialize that allocation in this browser-only runner, and MediaBytes requires the complete
+// output as one Uint8Array even when the native target is streamed.
+const MAX_SAFE_MATERIALIZED_OUTPUT_BYTES = 2 ** 31;
 
 type ConcreteTrack = Pick<NormalizedTrack, 'type' | 'codec' | 'width' | 'height' | 'sampleRate' | 'channels' | 'rotation'>;
 
@@ -172,12 +180,13 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     (
       request.transforms?.rotate !== undefined ||
       request.transforms?.crop !== undefined ||
-      request.options.crop !== undefined
+      request.options.crop !== undefined ||
+      request.options.pad !== undefined
     )
   ) {
     return no(
       MEDIABUNNY_REASON.TRANSFORM_PIXEL_FIDELITY,
-      'Mediabunny 1.48.0 baked rotate/crop uses a lossy WebCodecs re-encode and cannot guarantee the required per-pixel maximum-error bound',
+      'Mediabunny 1.48.0 baked rotate/crop/pad uses a lossy WebCodecs re-encode and cannot guarantee the required per-pixel maximum-error bound',
     );
   }
   if (
@@ -188,6 +197,19 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     return no(
       MEDIABUNNY_REASON.ALPHA_OUTPUT_GEOMETRY,
       'Mediabunny 1.48.0 VP9 alpha re-encode does not preserve the requested visible frame geometry in Chromium',
+    );
+  }
+  const sourceVideo = request.inputs.flatMap((input) => input.tracks).find((track) => track.type === 'video');
+  if (
+    request.operation === 'transcode' &&
+    Array.isArray(request.options.variants) &&
+    request.options.variants.some((variant) => isRecord(variant) && positiveInt(variant.bitrate) !== undefined) &&
+    typeof sourceVideo?.fps === 'number' &&
+    sourceVideo.fps > 30
+  ) {
+    return no(
+      MEDIABUNNY_REASON.ABR_BITRATE_CONTROL,
+      'Mediabunny 1.48.0 Conversion does not expose WebCodecs bitrateMode and Chromium VBR cannot hold the requested ABR bitrate band for high-frame-rate inputs',
     );
   }
   if (request.options.appendOnly === true && target !== 'stream') {
@@ -235,6 +257,14 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     ? request.options.variants.filter(isRecord)
     : [];
   if (!hasUnresolvedInputEvidence) {
+    const estimatedOutputBytes = estimateMaterializedTranscodeBytes(request);
+    if (estimatedOutputBytes !== undefined && estimatedOutputBytes > MAX_SAFE_MATERIALIZED_OUTPUT_BYTES) {
+      return no(
+        MEDIABUNNY_REASON.OUTPUT_BUFFER_LIMIT,
+        `the concrete encode plan is estimated to produce ${Math.ceil(estimatedOutputBytes / 2 ** 20)} MiB; `
+          + 'Mediabunny BufferTarget would require its 4 GiB backing allocation once the final extent exceeds 2 GiB',
+      );
+    }
     if (request.operation === 'transcode' && variants.length > 0) {
       const decisions = variants.map((variant) => decideTrackTuple(requestWithVariant(request, variant), format, tracks));
       if (decisions.every((decision) => decision !== undefined)) return decisions[0]!;
@@ -259,6 +289,47 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
 
   const browserConfigs = browserConfigsForRequest(request);
   return browserConfigs.length ? { supported: true, browserConfigs } : { supported: true };
+}
+
+function estimateMaterializedTranscodeBytes(request: ConcreteOperationRequest): number | undefined {
+  if (request.operation !== 'transcode' || request.inputs.length !== 1) return undefined;
+  const input = request.inputs[0]!;
+  const explicitDurations = input.tracks.flatMap((track) => [
+    track.presentationDurationSec,
+    track.mediaDurationSec,
+    track.sampleSpanSec,
+    track.rawMediaSpanSec,
+  ]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+
+  let durationSec = explicitDurations.length > 0 ? Math.max(...explicitDurations) : undefined;
+  if (durationSec === undefined && typeof input.sizeBytes === 'number' && input.sizeBytes > 0) {
+    const bitrates = input.tracks
+      .map((track) => track.bitrate)
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0);
+    if (bitrates.length > 0) {
+      // Some normalized probes expose the container bitrate on every track. Count identical values
+      // once; genuinely distinct per-track rates are additive.
+      const distinctBitrates = [...new Set(bitrates)];
+      const sourceBitrate = distinctBitrates.length === 1
+        ? distinctBitrates[0]!
+        : distinctBitrates.reduce((sum, value) => sum + value, 0);
+      durationSec = input.sizeBytes * 8 / sourceBitrate;
+    }
+  }
+  if (durationSec === undefined) return undefined;
+
+  let outputBitrate = 0;
+  if (request.output?.videoCodec) {
+    const videoPlan = videoEncodePlanForRequest(request);
+    if (!videoPlan) return undefined;
+    outputBitrate += videoPlan.bitrate;
+  }
+  if (request.output?.audioCodec) {
+    const audioPlan = audioEncodePlanForRequest(request);
+    if (!audioPlan?.bitrate) return undefined;
+    outputBitrate += audioPlan.bitrate;
+  }
+  return outputBitrate > 0 ? durationSec * outputBitrate / 8 : undefined;
 }
 
 function requestWithVariant(
@@ -480,7 +551,9 @@ export function audioEncodePlanForRequest(request: ConcreteOperationRequest): Me
 export function defaultVideoBitrate(codec: VideoCodec, width: number, height: number): number {
   // Chromium's AV1 encoder needs the larger budget to keep high-motion 1080x1920@60 material above
   // the suite's 0.97 SSIM gate; 37.3 Mb/s was the first verified passing point for that tuple.
-  const efficiency: Record<VideoCodec, number> = { avc: 1, hevc: 0.7, vp9: 0.8, av1: 1.8, vp8: 1.1 };
+  // AVC resize and VP9 cross-codec rows retain a modest quality margin above Chromium's
+  // low-density defaults; exhaustive real-asset calibration covers both budgets.
+  const efficiency: Record<VideoCodec, number> = { avc: 1.5, hevc: 0.7, vp9: 1.2, av1: 1.8, vp8: 1.1 };
   return Math.max(300_000, Math.round(width * height * 10 * efficiency[codec]));
 }
 

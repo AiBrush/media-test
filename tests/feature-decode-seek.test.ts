@@ -35,6 +35,7 @@ import {
   type SelectedDecodeTrackEvidence,
 } from '../src/features/decode-seek/index.ts';
 import { decodeSeekScenarios } from '../src/scenarios/decode-seek/index.ts';
+import { leadingPresentationFramePrefix } from '../src/engines/platform/decode.ts';
 
 function jsonAt(path: string): unknown {
   return JSON.parse(readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')) as unknown;
@@ -62,6 +63,19 @@ function timeline(): SeekTimelinePoint[] {
     { ptsUs: 8_000_000, keyframe: true, frameSha256: digest('8') },
   ];
 }
+
+describe('REQ-FEAT-40 bounded platform decode presentation prefix', () => {
+  test('reorder look-ahead is sorted before maxFrames truncation', () => {
+    const decodeOrder = [
+      0, 33_333, 66_667, 133_333, 100_000, 166_667,
+      266_667, 233_333, 433_333, 333_333, 366_667, 533_333, 466_667,
+    ].map((ptsUs) => ({ ptsUs }));
+    expect(leadingPresentationFramePrefix(decodeOrder, 12).map((entry) => entry.ptsUs)).toEqual([
+      0, 33_333, 66_667, 100_000, 133_333, 166_667,
+      233_333, 266_667, 333_333, 366_667, 433_333, 466_667,
+    ]);
+  });
+});
 
 describe('REQ-FEAT-44 adapters return observed seek landing PTS', () => {
   test('a between-frame target must identify one real demux-table PTS', () => {

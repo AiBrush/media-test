@@ -109,6 +109,22 @@ describe('Mediabunny transcode boundary repairs', () => {
     });
   });
 
+  test('default AVC and VP9 plans carry strict perceptual-gate quality budgets', () => {
+    const avcRequest = request({ container: 'mp4', video: { codec: 'h264', width: 1280, height: 720 } });
+    expect(videoEncodePlanForRequest(avcRequest)).toMatchObject({
+      codec: 'avc', width: 1280, height: 720, bitrate: 13_824_000,
+    });
+
+    const vp9Request = request({ container: 'webm', video: { codec: 'vp9' } });
+    vp9Request.inputs[0]!.tracks[0] = {
+      ...vp9Request.inputs[0]!.tracks[0]!, width: 1080, height: 1920, fps: 60,
+    };
+    vp9Request.output = { container: 'webm', videoCodec: 'vp9' };
+    expect(videoEncodePlanForRequest(vp9Request)).toMatchObject({
+      codec: 'vp9', width: 1080, height: 1920, bitrate: 24_883_200,
+    });
+  });
+
   test('exact lossy-audio presentation contracts negotiate intrinsic NA_ENGINE', () => {
     const operationRequest = request({
       container: 'mp4',
@@ -138,6 +154,74 @@ describe('Mediabunny transcode boundary repairs', () => {
       status: 'NA_ENGINE',
       reasonCode: MEDIABUNNY_REASON.TRANSFORM_PIXEL_FIDELITY,
     });
+
+    const padRequest = request({
+      container: 'mp4',
+      video: { codec: 'h264' },
+      pad: { width: 1920, height: 1080 },
+      invariant: 'transcode-effect-aware',
+    });
+    expect(decideMediabunnySupport(padRequest)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.TRANSFORM_PIXEL_FIDELITY,
+    });
+  });
+
+  test('high-frame-rate bitrate-controlled fanout negotiates intrinsic NA_ENGINE', () => {
+    const operationRequest = request({
+      container: 'mp4',
+      video: { codec: 'h264' },
+      variants: [{ codec: 'h264', width: 1920, height: 1080, bitrate: 5_000_000 }],
+    });
+    operationRequest.inputs[0]!.tracks[0] = {
+      ...operationRequest.inputs[0]!.tracks[0]!, width: 1080, height: 1920, fps: 60,
+    };
+    expect(decideMediabunnySupport(operationRequest)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.ABR_BITRATE_CONTROL,
+    });
+  });
+
+  test('full-buffer transcodes reject only concrete plans that require a 4 GiB backing allocation', () => {
+    const operationRequest = request({
+      container: 'mp4',
+      video: { codec: 'h264', width: 1280, height: 720 },
+      audio: { codec: 'aac' },
+    });
+    operationRequest.output = {
+      container: 'mp4',
+      videoCodec: 'h264',
+      audioCodec: 'aac',
+      width: 1280,
+      height: 720,
+    };
+    operationRequest.inputs[0] = {
+      ...operationRequest.inputs[0]!,
+      id: 'long-vp9.webm',
+      mime: 'video/webm',
+      container: 'webm',
+      sizeBytes: 115_712_029,
+      tracks: [
+        { type: 'video', codec: 'vp9', width: 640, height: 480, fps: 25, bitrate: 545_405 },
+        { type: 'audio', codec: 'opus', sampleRate: 48_000, channels: 2, bitrate: 545_405 },
+      ],
+    };
+    expect(decideMediabunnySupport(operationRequest)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.OUTPUT_BUFFER_LIMIT,
+      reason: expect.stringContaining('4 GiB backing allocation'),
+    });
+
+    operationRequest.inputs[0] = {
+      ...operationRequest.inputs[0]!,
+      id: 'near-boundary-vp9.webm',
+      sizeBytes: 113_982_390,
+      tracks: operationRequest.inputs[0]!.tracks.map((track) => ({ ...track, bitrate: 1_494_243 })),
+    };
+    expect(decideMediabunnySupport(operationRequest)).toMatchObject({ supported: true });
   });
 
   test('VP9 alpha re-encode with exact visible geometry negotiates intrinsic NA_ENGINE', () => {

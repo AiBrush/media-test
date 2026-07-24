@@ -1499,7 +1499,7 @@
     {
       "id": "transcode/extreme_fps_1",
       "revision": 1,
-      "definitionHash": "63829b1fd6e32aadb1428a498d94bd6245cdd9f97051426a92358c36532945c3",
+      "definitionHash": "367209f6ec4b75411c23ef39b77dbb09d90e688d36ea1307a89496157771c3fa",
       "inputVariantIds": [
         "baked"
       ],
@@ -1603,7 +1603,7 @@
     {
       "id": "transcode/h264_bitrate_2mbps",
       "revision": 1,
-      "definitionHash": "81299406955ea9c7f71d5fa3c719eb2c9349be8c46fc27956c08bb978e995fa3",
+      "definitionHash": "693d46321546e294b08cf484a8fba77c16e1f1775c8ba6db9cff4f10ba780b93",
       "inputVariantIds": [
         "baked"
       ],
@@ -1810,7 +1810,7 @@
     {
       "id": "transcode/h264_to_vp9_webm",
       "revision": 1,
-      "definitionHash": "c663d54250740e01f824ed9504819b34939fa4f1f24ab51e27a10f8e01a965cd",
+      "definitionHash": "ae5723b4529938a4749ee5360e5bcd18539ac2751453c8627a9dd839949e328d",
       "inputVariantIds": [
         "baked"
       ],
