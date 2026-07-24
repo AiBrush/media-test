@@ -31,6 +31,7 @@ const PCM_CODECS = new Set([
 const VIDEO_ENCODERS = new Set(['h264', 'hevc', 'av1', 'vp8', 'vp9']);
 const AUDIO_ENCODERS = new Set(['aac', 'opus', 'flac', 'vorbis', ...PCM_CODECS]);
 const DEMUX_AUDIO_CODECS = new Set([...AUDIO_ENCODERS, 'mp3']);
+const LOSSY_TRIM_AUDIO_CODECS = new Set(['aac', 'mp3', 'opus']);
 
 interface Rejection {
   readonly reasonCode: string;
@@ -218,6 +219,18 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   const tracks = inputs.flatMap((input) => input.tracks);
   const codecs = tracks.map((track) => track.codec.toLowerCase());
   const selectedInputIds = inputs.map((input) => input.id.toLowerCase());
+  if (
+    operation === 'trim' &&
+    options.invariant === 'trim-audio-content' &&
+    tracks.length > 0 &&
+    tracks.every((track) => track.type === 'audio') &&
+    tracks.some((track) => LOSSY_TRIM_AUDIO_CODECS.has(track.codec.toLowerCase()))
+  ) {
+    return reject(
+      'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+      'the packet-copy trim surface cannot author the exact decoded presentation window for AAC, MP3, or Opus priming/padding',
+    );
+  }
   if (operation === 'remux' && outputContainer !== undefined) {
     const legality = rejectContainerCodecs(outputContainer, tracks, 'remux');
     if (legality !== undefined) return legality;

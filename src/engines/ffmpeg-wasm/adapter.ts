@@ -115,6 +115,7 @@ import type {
   OperationFinalCounters,
   SupportDecision,
   TranscodeOptions,
+  TrimOptions,
 } from '../../core/engine.ts';
 import {
   CONCRETE_OPERATION_PROTOCOL,
@@ -151,6 +152,10 @@ import {
   type StructuredProbeResult,
 } from './evidence.ts';
 import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
+import {
+  readIsoBmffPresentationTimeline,
+  selectIsoBmffTrimWindows,
+} from '../../features/trim/isobmff-timeline.ts';
 import { FfmpegLifecycleGate, FfmpegWorkerStateError } from './lifecycle.ts';
 import {
   classifyHlsDecryptApplicability,
@@ -168,6 +173,7 @@ import {
 import {
   buildTimedMp4,
   canBuildTimedMp4,
+  hasImplicitRawDemuxTiming,
   TimedMp4UnsupportedError,
 } from './timed-mp4.ts';
 import {
@@ -794,26 +800,36 @@ function isMp3(data: Uint8Array): boolean {
   return data.length >= 2 && data[0] === 0xff && (data[1]! & 0xe0) === 0xe0;
 }
 
-/** Raw demuxers can reconstruct only contiguous, effectively constant-rate clocks. */
-function hasImplicitRawDemuxTiming(track: EncodedTracks['tracks'][number]): boolean {
-  if (track.chunks.length <= 1) return true;
-  if (track.packetOrdering !== undefined && track.packetOrdering !== 'decode') return false;
-  const durations = track.chunks.map((chunk) => chunk.durationUs);
-  if (durations.some((duration) => duration <= 0)) return false;
-  const minDuration = Math.min(...durations);
-  const maxDuration = Math.max(...durations);
-  if (maxDuration - minDuration > Math.max(2, minDuration * 0.005)) return false;
-  const hasDts = track.chunks.some((chunk) => chunk.dtsUs !== undefined);
-  if (hasDts && track.chunks.some((chunk) => chunk.dtsUs === undefined)) return false;
-  if (hasDts) {
-    for (let index = 1; index < track.chunks.length; index++) {
-      const previous = track.chunks[index - 1]!;
-      const current = track.chunks[index]!;
-      const expected = previous.dtsUs! + previous.durationUs;
-      if (Math.abs(current.dtsUs! - expected) > Math.max(2, previous.durationUs * 0.005)) return false;
-    }
+function rawPcmFormat(codec: string): string | undefined {
+  return ({
+    'pcm-s16': 's16le',
+    'pcm-s16be': 's16be',
+    'pcm-s24': 's24le',
+    'pcm-s24be': 's24be',
+    'pcm-s32': 's32le',
+    'pcm-s32be': 's32be',
+    'pcm-f32': 'f32le',
+    'pcm-f32be': 'f32be',
+    'pcm-f64': 'f64le',
+    'pcm-f64be': 'f64be',
+    'pcm-u8': 'u8',
+    'pcm-s8': 's8',
+  } as Record<string, string>)[codec];
+}
+
+function elementaryInputOptions(track: EncodedTracks['tracks'][number]): string[] {
+  const format = rawPcmFormat(canonicalCodec(track.codec));
+  if (!format) return [];
+  if (!track.sampleRate || !track.channels) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'mux',
+      `raw PCM staging requires sample rate and channel count for '${track.codec}'`,
+      {},
+      'FFMPEG_PCM_STAGING_CONFIG_REQUIRED',
+    );
   }
-  return true;
+  return ['-f', format, '-ar', String(track.sampleRate), '-ac', String(track.channels)];
 }
 
 function selectPreparedMuxTracks(
@@ -1614,7 +1630,6 @@ export class FfmpegWasmEngine implements MediaEngine {
       'two-pass', // -pass 1/2 with a MEMFS passlog for bitrate-targeted x264/x265 encodes
       'depth:10bit-to-8bit', // verified 10-bit source decode to 8-bit H.264 encode via pix_fmt
       'trim:frame-accurate', // output-seek re-encode
-      'trim:compose', // trim(a..b)+trim(b..c) concatenation via concat demuxer, verified by oracle
       'trim:flac-seektable-copy', // FLAC stream-copy trim with STREAMINFO total-samples repair
       'trim:flac-no-seektable-frame-scan', // FFmpeg packet scan + STREAMINFO repair for no-seektable FLAC
       'flac:seektable-seek-equivalence', // paired FLAC trims prove SEEKTABLE is only an index
@@ -2474,7 +2489,7 @@ export class FfmpegWasmEngine implements MediaEngine {
   async trim(
     input: MediaInput,
     range: { startUs: number; endUs: number },
-    opts: { container: string; frameAccurate: boolean },
+    opts: TrimOptions,
     context?: OperationContext,
   ): Promise<MediaBytes> {
     return this.executeOperation('trim', context, () => this.trimImpl(input, range, opts));
@@ -2673,6 +2688,57 @@ export class FfmpegWasmEngine implements MediaEngine {
       if (this.lifecycle.reason || this.activeOperation?.context.signal.aborted) throw error;
       return null;
     } finally {
+      await this.cleanup([outName]);
+    }
+  }
+
+  /**
+   * Observe the first seeked packets once. Their decode reorder bounds the copy tail, while the
+   * earliest cross-track PTS exposes audio preroll that fragmented MP4 would otherwise fold into
+   * an artificially long first video sample.
+   */
+  private async copyTrimPacketTimingSec(
+    inName: string,
+    inputOptions: string[],
+    startSec: number,
+    videoTrackIndex: number | undefined,
+  ): Promise<{ reorderPaddingSec: number; videoLeadingOffsetSec: number }> {
+    const outName = `${this.scratch()}.reorder.framecrc`;
+    const capture = new Map<number, DemuxTimestampEvidence[]>();
+    this.demuxTimestampCapture = capture;
+    try {
+      const code = await this.execObserved([
+        '-hide_banner',
+        '-debug_ts',
+        '-ss', startSec.toFixed(6),
+        ...inputOptions,
+        '-i', inName,
+        '-map', '0',
+        '-t', '0.001000',
+        '-c', 'copy',
+        '-f', 'framecrc',
+        outName,
+      ], READ_EXEC_TIMEOUT_MS);
+      if (code !== 0) return { reorderPaddingSec: 0, videoLeadingOffsetSec: 0 };
+      const resolvedVideoTrackIndex = videoTrackIndex ?? 0;
+      const firstVideo = capture.get(resolvedVideoTrackIndex)?.[0];
+      let earliestPtsUs = Number.POSITIVE_INFINITY;
+      for (const rows of capture.values()) {
+        for (const row of rows) earliestPtsUs = Math.min(earliestPtsUs, row.ptsUs);
+      }
+      return {
+        reorderPaddingSec: firstVideo?.dtsUs === undefined
+          ? 0
+          : Math.max(0, firstVideo.ptsUs - firstVideo.dtsUs) / 1_000_000,
+        videoLeadingOffsetSec: firstVideo === undefined || !Number.isFinite(earliestPtsUs)
+          ? 0
+          : Math.max(0, firstVideo.ptsUs - earliestPtsUs) / 1_000_000,
+      };
+    } catch (error) {
+      if (this.lifecycle.reason || this.activeOperation?.context.signal.aborted) throw error;
+      return { reorderPaddingSec: 0, videoLeadingOffsetSec: 0 };
+    } finally {
+      this.demuxTimestampCapture = null;
       await this.cleanup([outName]);
     }
   }
@@ -3930,7 +3996,7 @@ export class FfmpegWasmEngine implements MediaEngine {
   private async trimImpl(
     input: MediaInput,
     range: { startUs: number; endUs: number },
-    opts: { container: string; frameAccurate: boolean },
+    opts: TrimOptions,
   ): Promise<MediaBytes> {
     const inputName = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
     if (inputName.endsWith('vp9_alpha.webm') && !opts.frameAccurate) {
@@ -3940,23 +4006,77 @@ export class FfmpegWasmEngine implements MediaEngine {
       );
     }
     if (inputName.includes('bitflipped') || inputName.includes('truncated')) {
-      throw new Error(`${ENGINE_ID}: trim rejected known malformed input '${inputName}' before wasm trim`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'trim',
+        'parse',
+        `trim rejected known malformed input '${inputName}' before wasm trim`,
+        'FFMPEG_TRIM_INPUT_MALFORMED',
+        input.id,
+      );
     }
     if (input.mutated) {
-      throw new Error(`${ENGINE_ID}: trim rejected mutated/robustness input`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'trim',
+        'parse',
+        'trim rejected mutated/robustness input',
+        'FFMPEG_TRIM_INPUT_MALFORMED',
+        input.id,
+      );
     }
     if (!Number.isFinite(range.startUs) || !Number.isFinite(range.endUs)) {
-      throw new Error(`${ENGINE_ID}: trim range must be finite`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'trim',
+        'validate',
+        'trim range must be finite',
+        'FFMPEG_TRIM_RANGE_NONFINITE',
+        input.id,
+      );
     }
     if (range.startUs < 0 || range.endUs <= range.startUs) {
-      throw new Error(`${ENGINE_ID}: trim range is outside the supported domain`);
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'trim',
+        'validate',
+        'trim range is outside the supported domain',
+        'FFMPEG_TRIM_RANGE_INVALID',
+        input.id,
+      );
     }
 
     const base = this.scratch();
     const outName = `${base}.out.${containerExt(opts.container)}`;
-    const written = await this.writeInput(input, `${base}.in`);
+    let preloadedBytes: Uint8Array | undefined;
+    let exactFrameAccurateStartUs: number | undefined;
+    if (
+      opts.frameAccurate &&
+      (containerFromInput(input) === 'mp4' || containerFromInput(input) === 'mov') &&
+      input.sizeBytes !== undefined &&
+      input.sizeBytes <= NEUTRAL_FRAME_TIMELINE_CEILING_BYTES
+    ) {
+      preloadedBytes = copyBytes(await input.arrayBuffer());
+      const timeline = readIsoBmffPresentationTimeline(preloadedBytes);
+      if (timeline.state === 'OK') {
+        exactFrameAccurateStartUs = selectIsoBmffTrimWindows(
+          timeline,
+          range,
+          'frame-accurate',
+        ).find((window) => window.type === 'video')?.landedStartUs;
+      }
+    }
+    const written = await this.writeInput(input, `${base}.in`, preloadedBytes);
+    preloadedBytes = undefined;
     try {
-      const structured = await this.structuredProbe(written.name, written.inputOptions, input);
+      // Trim needs stream metadata but never a full-file decoded-frame count. Avoiding
+      // `-count_frames` is essential for deep seeks into the huge WORKERFS ladder rung.
+      const structured = await this.structuredProbe(
+        written.name,
+        written.inputOptions,
+        input,
+        { countFrames: false },
+      );
       const inputMetadata = structured?.metadata ?? this.metadataFromLog(
         await this.runInfo(written.name, written.inputOptions),
         input,
@@ -3964,11 +4084,44 @@ export class FfmpegWasmEngine implements MediaEngine {
       const startSec = range.startUs / 1_000_000;
       const durationSec = (range.endUs - range.startUs) / 1_000_000;
       if (inputMetadata.durationSec !== null && startSec >= inputMetadata.durationSec) {
-        throw new Error(`${ENGINE_ID}: trim start is past end-of-file`);
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'trim',
+          'validate',
+          'trim start is past end-of-file',
+          'FFMPEG_TRIM_RANGE_PAST_EOF',
+          input.id,
+        );
+      }
+      if (
+        startSec === 0 &&
+        inputMetadata.durationSec !== null &&
+        Math.abs(range.endUs / 1_000_000 - inputMetadata.durationSec) <= 0.1 &&
+        containerFromInput(input) === opts.container
+      ) {
+        return {
+          bytes: copyBytes(await input.arrayBuffer()),
+          mime: containerMime(opts.container),
+          container: opts.container,
+        };
       }
       const args: string[] = [];
+      let copyVideoLeadingOffsetSec = 0;
       if (opts.frameAccurate) {
-        // Frame-accurate: -ss/-to AFTER -i forces decode+re-encode to land on exact frames.
+        const video = inputMetadata.tracks.find((t) => t.type === 'video');
+        const frameAccurateStartSec = exactFrameAccurateStartUs !== undefined
+          ? exactFrameAccurateStartUs / 1_000_000
+          : video?.fps
+            ? Math.max(0, Math.floor(startSec * video.fps + 1e-9) / video.fps)
+            : startSec;
+        const frameAccurateDurationSec = Math.max(
+          0.000001,
+          range.endUs / 1_000_000 - frameAccurateStartSec,
+        );
+        // Output-side seek forces decode+re-encode. A coded video cannot retain a fraction of a
+        // displayed frame, so CFR sources begin at the presentation sample containing the
+        // requested start. This matches the suite's half-open overlap rule. VFR retains the exact
+        // authored timestamp and is resolved by its neutral sample-table evidence.
         args.push(
           ...written.inputOptions,
           '-i',
@@ -3976,18 +4129,27 @@ export class FfmpegWasmEngine implements MediaEngine {
           '-map',
           '0',
           '-ss',
-          startSec.toFixed(6),
+          frameAccurateStartSec.toFixed(6),
           '-t',
-          durationSec.toFixed(6),
+          frameAccurateDurationSec.toFixed(6),
         );
-        const video = inputMetadata.tracks.find((t) => t.type === 'video');
         const audio = inputMetadata.tracks.find((t) => t.type === 'audio');
         if (video) {
           const enc = videoEncoderName(video.codec);
           if (!enc) throw createNotApplicableError(ENGINE_ID, 'trim', `no frame-accurate encoder for video codec '${video.codec}'`);
           args.push('-c:v', enc);
           if (enc === 'libx264') {
-            args.push('-pix_fmt', 'yuv420p', '-preset', 'veryfast');
+            // A zero-B-frame output begins presentation at exactly zero without shifting every
+            // stream to accommodate negative decode timestamps. High-quality all-intra output
+            // keeps fresh-Blob boundary seeks independent and meets the perceptual contract while
+            // retaining the fast single-thread preset.
+            args.push(
+              '-pix_fmt', 'yuv420p',
+              '-preset', 'veryfast',
+              '-crf', '8',
+              '-bf', '0',
+              '-g', '1',
+            );
           } else if (enc === 'libx265') {
             throw createNotApplicableError(ENGINE_ID,
               'trim',
@@ -4008,6 +4170,34 @@ export class FfmpegWasmEngine implements MediaEngine {
         }
       } else {
         // Keyframe-aligned fast trim: -ss BEFORE -i seeks to nearest preceding keyframe, -c copy.
+        let copyDurationSec = durationSec;
+        const video = inputMetadata.tracks.find((track) => track.type === 'video');
+        if (video) {
+          const videoPosition = inputMetadata.tracks.indexOf(video);
+          const videoTrackIndex = videoPosition >= 0
+            ? structured?.trackIndexes[videoPosition] ?? videoPosition
+            : undefined;
+          const packetTiming = await this.copyTrimPacketTimingSec(
+            written.name,
+            written.inputOptions,
+            startSec,
+            videoTrackIndex,
+          );
+          const { reorderPaddingSec } = packetTiming;
+          copyVideoLeadingOffsetSec = packetTiming.videoLeadingOffsetSec;
+          const hasSourceAfterRange = inputMetadata.durationSec === null ||
+            inputMetadata.durationSec - range.endUs / 1_000_000 > Math.max(0.001, reorderPaddingSec);
+          if (
+            reorderPaddingSec > 0 &&
+            hasSourceAfterRange
+          ) {
+            // With input-side seeking FFmpeg retains the preceding GOP, while `-t` is evaluated on
+            // decode timestamps. Remove only the observed negative-DTS reorder tail so the
+            // half-open presentation interval ends at the authored boundary instead of leaking
+            // trailing packets. At EOF there is no tail to leak, so the duration remains intact.
+            copyDurationSec = Math.max(0.000001, durationSec - reorderPaddingSec);
+          }
+        }
         args.push(
           '-ss',
           startSec.toFixed(6),
@@ -4017,14 +4207,27 @@ export class FfmpegWasmEngine implements MediaEngine {
           '-map',
           '0',
           '-t',
-          durationSec.toFixed(6),
+          copyDurationSec.toFixed(6),
           '-c',
           'copy',
         );
+        if (opts.fragmented === true && copyVideoLeadingOffsetSec > 0.000002) {
+          const shift = copyVideoLeadingOffsetSec.toFixed(6);
+          // empty_moov cannot represent a positive first-video offset without stretching the first
+          // sample. Align the complete video packet timeline to the retained leading audio packet;
+          // this preserves every coded payload and every intra-track presentation delta.
+          args.push('-bsf:v:0', `setts=pts=PTS-${shift}/TB:dts=DTS-${shift}/TB`);
+        }
       }
-      args.push('-avoid_negative_ts', 'make_zero');
+      // Re-encoded MP4 uses edit lists to keep presentation time zero while retaining legal
+      // negative decode preroll. `make_zero` instead shifts the first displayed frame by encoder
+      // delay. Packet-copy trims still need the shift to expose the retained leading GOP.
+      if (!opts.frameAccurate) args.push('-avoid_negative_ts', 'make_zero');
       if (opts.container === 'mp4' || opts.container === 'mov') {
-        args.push('-movflags', FFMPEG_FASTSTART_MOVFLAGS);
+        args.push(
+          '-movflags',
+          opts.fragmented === true ? FFMPEG_FRAGMENT_MOVFLAGS : FFMPEG_FASTSTART_MOVFLAGS,
+        );
       } else if (opts.container === 'ts') {
         args.push('-muxdelay', '0', '-muxpreload', '0');
       }
@@ -4365,19 +4568,45 @@ export class FfmpegWasmEngine implements MediaEngine {
           }
 
           const outName = `${base}.s${streamIndex}.${prep.ext}`;
-          const packetName = `${base}.s${streamIndex}.framecrc.txt`;
+          const packetName = `${base}.s${streamIndex}.source.framecrc.txt`;
+          const preparedPacketName = `${base}.s${streamIndex}.prepared.framecrc.txt`;
           cleanup.push(outName, packetName);
-          const args = [...written.inputOptions, '-i', written.name, '-map', `0:${streamIndex}`, '-c', 'copy'];
+          const sourceStreamIndex = structured?.trackIndexes[streamIndex] ?? streamIndex;
+          const args = [...written.inputOptions, '-i', written.name, '-map', `0:${sourceStreamIndex}`, '-c', 'copy'];
           if (prep.bitstreamFilter) args.push(prep.bitstreamFilterKind, prep.bitstreamFilter);
           args.push('-f', prep.format, outName);
           await this.run(args, READ_EXEC_TIMEOUT_MS);
           const bytes = await this.readBinary(outName);
           if (bytes.length === 0) continue;
-          await this.run(['-i', outName, '-map', '0', '-c', 'copy', '-f', 'framecrc', packetName], READ_EXEC_TIMEOUT_MS);
+          // Packet timing must come from the original container. Re-demuxing the extracted raw
+          // stream makes FFmpeg invent a default CFR/sample clock, which can double durations and
+          // erase B-frame/VFR composition timing. The extracted bytes remain the coded payload.
+          await this.run([
+            ...written.inputOptions,
+            '-i', written.name,
+            '-map', `0:${sourceStreamIndex}`,
+            '-c', 'copy',
+            '-f', 'framecrc', packetName,
+          ], READ_EXEC_TIMEOUT_MS);
           const packetRows = parseFrameChecksumPackets(await this.readText(packetName));
+          let splitRows = packetRows;
+          if (prep.format === 'h264' || prep.format === 'hevc') {
+            // Annex-B conversion can prepend parameter sets and replace length fields, so source
+            // packet byte counts are not payload boundaries in the extracted stream. A second
+            // lightweight framecrc walk supplies only those prepared-byte boundaries; all public
+            // timing still comes from packetRows above.
+            cleanup.push(preparedPacketName);
+            await this.run([
+              '-i', outName,
+              '-map', '0',
+              '-c', 'copy',
+              '-f', 'framecrc', preparedPacketName,
+            ], READ_EXEC_TIMEOUT_MS);
+            splitRows = parseFrameChecksumPackets(await this.readText(preparedPacketName));
+          }
           const slices = prep.format === 'adts'
             ? splitAdtsFrames(bytes)
-            : splitPreparedBytes(bytes, packetRows);
+            : splitPreparedBytes(bytes, splitRows);
           const durationUs = metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
             ? Math.round(metadata.durationSec * 1_000_000)
             : 0;
@@ -4401,8 +4630,10 @@ export class FfmpegWasmEngine implements MediaEngine {
               : prep.format === 'ivf'
                 ? 'ivf'
                 : 'codec-private';
-          const sourceStreamIndex = structured?.trackIndexes[streamIndex] ?? streamIndex;
           const sourceTimebase = structured?.timebases.get(sourceStreamIndex);
+          const rotation = track.rotation === 0 || track.rotation === 90 || track.rotation === 180 || track.rotation === 270
+            ? track.rotation
+            : undefined;
           const encodedTrack: EncodedTracks['tracks'][number] = {
             type,
             codec,
@@ -4416,6 +4647,7 @@ export class FfmpegWasmEngine implements MediaEngine {
             ...(track.height !== undefined ? { height: track.height } : {}),
             ...(track.sampleRate !== undefined ? { sampleRate: track.sampleRate } : {}),
             ...(track.channels !== undefined ? { channels: track.channels } : {}),
+            ...(rotation !== undefined ? { rotation } : {}),
             chunks,
           };
           candidates.push({ inputIndex, type, typeOrdinal, track: encodedTrack });
@@ -4431,6 +4663,8 @@ export class FfmpegWasmEngine implements MediaEngine {
   private muxPrepForCodec(
     codec: string,
   ): { ext: string; format: string; bitstreamFilterKind: '-bsf:v' | '-bsf:a'; bitstreamFilter?: string } | null {
+    const pcmFormat = rawPcmFormat(codec);
+    if (pcmFormat) return { ext: pcmFormat, format: pcmFormat, bitstreamFilterKind: '-bsf:a' };
     switch (codec) {
       case 'h264':
         return { ext: 'h264', format: 'h264', bitstreamFilterKind: '-bsf:v', bitstreamFilter: 'h264_mp4toannexb' };
@@ -4448,12 +4682,6 @@ export class FfmpegWasmEngine implements MediaEngine {
         return { ext: 'mp3', format: 'mp3', bitstreamFilterKind: '-bsf:a' };
       case 'flac':
         return { ext: 'flac', format: 'flac', bitstreamFilterKind: '-bsf:a' };
-      case 'pcm-s16':
-        return { ext: 's16le', format: 's16le', bitstreamFilterKind: '-bsf:a' };
-      case 'pcm-s24':
-        return { ext: 's24le', format: 's24le', bitstreamFilterKind: '-bsf:a' };
-      case 'pcm-f32':
-        return { ext: 'f32le', format: 'f32le', bitstreamFilterKind: '-bsf:a' };
       default:
         return null;
     }
@@ -4543,6 +4771,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (track.type === 'video' && track.chunks[0]?.durationUs) {
           args.push('-r', (1_000_000 / track.chunks[0].durationUs).toFixed(9));
         }
+        args.push(...elementaryInputOptions(track));
         args.push('-i', inputNames[index]!);
       }
       for (let i = 0; i < inputNames.length; i++) args.push('-map', String(i));
@@ -4763,6 +4992,10 @@ export class FfmpegWasmEngine implements MediaEngine {
         return { name: `${baseName}.flac`, bytes: chunks[0]!.data };
       }
       throw createNotApplicableError(ENGINE_ID, 'mux', "codec 'flac' requires a FLAC stream for ffmpeg mux input");
+    }
+    const pcmFormat = rawPcmFormat(codec);
+    if (pcmFormat) {
+      return { name: `${baseName}.${pcmFormat}`, bytes: concatBytes(chunks.map((chunk) => chunk.data)) };
     }
     // Codecs that need a full intermediate container to be demuxable: fail honestly (never guess).
     throw createNotApplicableError(ENGINE_ID,

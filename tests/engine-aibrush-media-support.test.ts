@@ -172,6 +172,32 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     }))).toEqual({ supported: true });
   });
 
+  test('declares only lossy audio copy trims without exact presentation timing NA', () => {
+    for (const [container, codec] of [
+      ['mp4', 'aac'],
+      ['mp3', 'mp3'],
+      ['ogg', 'opus'],
+    ] as const) {
+      expect(decideAibrushSupport(request('trim', container, [{
+        type: 'audio', codec, sampleRate: 48_000, channels: 2,
+      }], {
+        outputContainer: container,
+        options: { invariant: 'trim-audio-content' },
+      }))).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+      });
+    }
+
+    expect(decideAibrushSupport(request('trim', 'flac', [{
+      type: 'audio', codec: 'flac', sampleRate: 48_000, channels: 2,
+    }], {
+      outputContainer: 'flac',
+      options: { invariant: 'trim-audio-content' },
+    }))).toEqual({ supported: true });
+  });
+
   test('keeps measured alpha and roundtrip quality bounds narrow to their concrete contracts', () => {
     for (const [scenarioId, codec, reasonCode] of [
       ['transcode/vp9_alpha_to_vp8_keepalpha', 'vp8', 'AIBRUSH_VP8_ALPHA_FIDELITY_BOUND'],

@@ -211,6 +211,12 @@ function parseTrack(bytes: Uint8Array, trak: Box, movieTimescale: number): IsoBm
   const codec = stsd ? codecFromStsd(bytes, stsd) : null;
   const emptyLeadingEditTicks = leadingEmptyEditTicks(edits);
   const firstMediaTimeTicks = edits.find((entry) => entry.mediaTimeTicks >= 0)?.mediaTimeTicks ?? 0;
+  let presentationStartUs = Infinity;
+  let presentationEndUs = -Infinity;
+  for (const sample of mapped) {
+    presentationStartUs = Math.min(presentationStartUs, sample.presentationStartUs);
+    presentationEndUs = Math.max(presentationEndUs, sample.presentationEndUs);
+  }
   return Object.freeze({
     trackId,
     type,
@@ -222,8 +228,8 @@ function parseTrack(bytes: Uint8Array, trak: Box, movieTimescale: number): IsoBm
     samples: Object.freeze(mapped),
     emptyLeadingEditUs: ticksToUs(emptyLeadingEditTicks, movieTimescale),
     firstMediaTimeTicks,
-    presentationStartUs: Math.min(...mapped.map((sample) => sample.presentationStartUs)),
-    presentationEndUs: Math.max(...mapped.map((sample) => sample.presentationEndUs)),
+    presentationStartUs,
+    presentationEndUs,
     rotationDegrees: rotationFromTkhd(bytes, tkhd),
   });
 }

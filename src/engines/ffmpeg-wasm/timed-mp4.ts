@@ -38,6 +38,43 @@ export function canBuildTimedMp4(tracks: EncodedTracks['tracks']): boolean {
     (track.type === 'audio' && track.codec === 'aac'));
 }
 
+/** Raw demuxers can reconstruct only contiguous clocks; PCM derives time directly from samples. */
+export function hasImplicitRawDemuxTiming(track: EncodedTrack): boolean {
+  if (track.chunks.length <= 1) return true;
+  if (track.packetOrdering !== undefined && track.packetOrdering !== 'decode') return false;
+  const durations = track.chunks.map((chunk) => chunk.durationUs);
+  if (durations.some((duration) => duration <= 0)) return false;
+  if (track.codec.startsWith('pcm-')) {
+    const first = track.chunks[0]!;
+    if (Math.abs(first.ptsUs) > 2 || (first.dtsUs !== undefined && Math.abs(first.dtsUs) > 2)) return false;
+    for (let index = 1; index < track.chunks.length; index++) {
+      const previous = track.chunks[index - 1]!;
+      const current = track.chunks[index]!;
+      const tolerance = Math.max(2, previous.durationUs * 0.005);
+      if (Math.abs(current.ptsUs - (previous.ptsUs + previous.durationUs)) > tolerance) return false;
+      if (
+        previous.dtsUs !== undefined && current.dtsUs !== undefined &&
+        Math.abs(current.dtsUs - (previous.dtsUs + previous.durationUs)) > tolerance
+      ) return false;
+    }
+    return true;
+  }
+  const minDuration = Math.min(...durations);
+  const maxDuration = Math.max(...durations);
+  if (maxDuration - minDuration > Math.max(2, minDuration * 0.005)) return false;
+  const hasDts = track.chunks.some((chunk) => chunk.dtsUs !== undefined);
+  if (hasDts && track.chunks.some((chunk) => chunk.dtsUs === undefined)) return false;
+  if (hasDts) {
+    for (let index = 1; index < track.chunks.length; index++) {
+      const previous = track.chunks[index - 1]!;
+      const current = track.chunks[index]!;
+      const expected = previous.dtsUs! + previous.durationUs;
+      if (Math.abs(current.dtsUs! - expected) > Math.max(2, previous.durationUs * 0.005)) return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Build a minimal progressive MP4 whose sample tables retain every supplied decode/presentation
  * timestamp. FFmpeg then stream-copies this staging file to the requested muxer, avoiding the raw

@@ -135,7 +135,6 @@ import {
   type IsoBmffPresentationTimeline,
   type IsoBmffTrackTimeline,
 } from '../../features/trim/isobmff-timeline.ts';
-import { TRIM_NOOP_IDENTITY_INVARIANT } from '../../features/trim/contracts.ts';
 import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
 import {
   TRANSCODE_ABR_RENDITION_SET_ROLE,
@@ -254,6 +253,9 @@ function secToUs(sec: number): number {
  * authored 10s program), so a one-millisecond comparison wrongly remuxes a semantic no-op.
  */
 const NOOP_TRIM_TOLERANCE_SEC = 0.05;
+/** Retained Opus history rebuilds deterministic decoder state and remains representable by u16 pre-skip. */
+const OGG_OPUS_COPY_PREROLL_US = 1_340_000;
+const OGG_OPUS_SAMPLE_RATE = 48_000;
 
 /** True when the asset is an HLS playlist, including verified roots rebound to a blob URL. */
 function isHlsAsset(input: MediaInput, container?: string): boolean {
@@ -307,6 +309,11 @@ function isGracefulNegativeRequest(context?: OperationContext): boolean {
     robustness.schema === 'media-test/robustness-contract@1' &&
     robustness.inputClass === 'negative'
   );
+}
+
+function isDeliberatelyIllegalMuxRequest(context?: OperationContext): boolean {
+  return context?.request.operation === 'mux' &&
+    (ILLEGAL_MUX_SCENARIO_IDS as readonly string[]).includes(context.request.scenarioId);
 }
 
 function videoTransformExtrasFrom(opts?: Record<string, unknown>): VideoTransformExtras {
@@ -643,6 +650,36 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
     source: new mb.BlobSource(blob),
     formats: formats.length ? formats : mb.ALL_FORMATS,
   });
+}
+
+function containerHintFromMediaInput(input: MediaInput): string | undefined {
+  const id = input.id.toLowerCase().split(/[?#]/, 1)[0] ?? '';
+  const extension = /\.([a-z0-9]+)$/.exec(id)?.[1];
+  if (extension === 'm4v' || extension === 'm4a') return 'mp4';
+  if (extension === 'mka') return 'mkv';
+  if (extension === 'aac') return 'adts';
+  if (extension && ['mp4', 'mov', 'mkv', 'webm', 'ts', 'mp3', 'wav', 'flac', 'ogg', 'adts'].includes(extension)) {
+    return extension;
+  }
+  if (input.mime.includes('quicktime')) return 'mov';
+  if (input.mime.includes('webm')) return 'webm';
+  if (input.mime.includes('matroska')) return 'mkv';
+  if (input.mime.includes('mpeg')) return input.mime.startsWith('audio/') ? 'mp3' : 'ts';
+  if (input.mime.includes('mp4')) return 'mp4';
+  return undefined;
+}
+
+function mediabunnyOutputRotation(
+  rotation: EncodedTracks['tracks'][number]['rotation'],
+  container: string,
+): Rotation | undefined {
+  if (rotation === undefined) return undefined;
+  // Mediabunny 1.48's ISO writer/reader expose the same quarter-turn sign mismatch normalized at
+  // our input boundary. Translate back only while calling that writer; EncodedTrack stays in the
+  // suite-wide clockwise convention.
+  return (container === 'mp4' || container === 'mov') && (rotation === 90 || rotation === 270)
+    ? (360 - rotation) as Rotation
+    : rotation;
 }
 
 function traceHlsFetch(trace: MediabunnyHlsReadTrace, fallbackPath: string): typeof fetch {
@@ -1201,13 +1238,18 @@ export function selectMediabunnyCopyTrimChunks(
   chunks: readonly EncodedTracks['tracks'][number]['chunks'][number][],
   type: EncodedTracks['tracks'][number]['type'],
   range: { startUs: number; endUs: number },
+  options: Readonly<{ audioPrerollUs?: number }> = {},
 ): EncodedTracks['tracks'][number]['chunks'] {
   if (chunks.length === 0) return [];
-  const presentationOriginUs = Math.min(...chunks.map((chunk) => chunk.ptsUs));
+  let presentationOriginUs = Infinity;
+  for (const chunk of chunks) presentationOriginUs = Math.min(presentationOriginUs, chunk.ptsUs);
   const sourcePtsUs = (chunk: EncodedTracks['tracks'][number]['chunks'][number]) =>
     chunk.ptsUs - presentationOriginUs;
+  const selectionStartUs = type === 'audio'
+    ? Math.max(0, range.startUs - Math.max(0, options.audioPrerollUs ?? 0))
+    : range.startUs;
   let first = chunks.findIndex((chunk) =>
-    sourcePtsUs(chunk) + chunk.durationUs > range.startUs && sourcePtsUs(chunk) < range.endUs);
+    sourcePtsUs(chunk) + chunk.durationUs > selectionStartUs && sourcePtsUs(chunk) < range.endUs);
   if (first < 0) return [];
   if (type === 'video' && !chunks[first]!.keyframe) {
     for (let index = first; index >= 0; index--) {
@@ -1217,14 +1259,151 @@ export function selectMediabunnyCopyTrimChunks(
       }
     }
   }
-  return chunks
-    .slice(first)
-    .filter((chunk) => sourcePtsUs(chunk) < range.endUs)
-    .map((chunk, decodeIndex) => ({
+  const selected: EncodedTracks['tracks'][number]['chunks'] = [];
+  for (let index = first; index < chunks.length; index++) {
+    const chunk = chunks[index]!;
+    if (sourcePtsUs(chunk) >= range.endUs) continue;
+    selected.push({
       ...chunk,
       data: chunk.data.slice(),
-      decodeIndex,
-    }));
+      ...(chunk.alphaData !== undefined ? { alphaData: chunk.alphaData.slice() } : {}),
+      decodeIndex: selected.length,
+    });
+  }
+  return selected;
+}
+
+interface OggOpusCopyTrimFinalization {
+  readonly preSkipFrames: number;
+  readonly presentationFrames: number;
+}
+
+function prepareOggOpusCopyTrim(
+  track: EncodedTracks['tracks'][number],
+  selected: readonly EncodedTracks['tracks'][number]['chunks'][number][],
+  range: { startUs: number; endUs: number },
+): OggOpusCopyTrimFinalization | undefined {
+  const description = track.description;
+  if (
+    !description || description.byteLength < 19 ||
+    String.fromCharCode(...description.subarray(0, 8)) !== 'OpusHead' ||
+    selected.length === 0
+  ) {
+    return undefined;
+  }
+  let selectedStartUs = Infinity;
+  for (const chunk of selected) selectedStartUs = Math.min(selectedStartUs, chunk.ptsUs);
+  const preSkipFrames = Math.round((range.startUs - selectedStartUs) * OGG_OPUS_SAMPLE_RATE / 1_000_000);
+  const presentationFrames = Math.round((range.endUs - range.startUs) * OGG_OPUS_SAMPLE_RATE / 1_000_000);
+  const codedFrames = Math.round(
+    selected.reduce((sum, chunk) => sum + chunk.durationUs, 0) * OGG_OPUS_SAMPLE_RATE / 1_000_000,
+  );
+  if (
+    !Number.isSafeInteger(preSkipFrames) || preSkipFrames < 0 || preSkipFrames > 0xffff ||
+    !Number.isSafeInteger(presentationFrames) || presentationFrames <= 0 ||
+    preSkipFrames + presentationFrames > codedFrames
+  ) {
+    return undefined;
+  }
+  const adjustedDescription = description.slice();
+  adjustedDescription[10] = preSkipFrames & 0xff;
+  adjustedDescription[11] = preSkipFrames >>> 8;
+  track.description = adjustedDescription;
+  return { preSkipFrames, presentationFrames };
+}
+
+function mediabunnyOggU32le(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset]! | (bytes[offset + 1]! << 8) | (bytes[offset + 2]! << 16) |
+    (bytes[offset + 3]! * 0x1_000_000)) >>> 0;
+}
+
+function writeMediabunnyOggU32le(bytes: Uint8Array, offset: number, value: number): void {
+  bytes[offset] = value & 0xff;
+  bytes[offset + 1] = value >>> 8;
+  bytes[offset + 2] = value >>> 16;
+  bytes[offset + 3] = value >>> 24;
+}
+
+function writeMediabunnyOggU64le(bytes: Uint8Array, offset: number, value: number): void {
+  let remaining = BigInt(value);
+  for (let index = 0; index < 8; index++) {
+    bytes[offset + index] = Number(remaining & 0xffn);
+    remaining >>= 8n;
+  }
+}
+
+function mediabunnyOggPageCrc(bytes: Uint8Array, pageStart: number, pageEnd: number): number {
+  let crc = 0;
+  for (let index = pageStart; index < pageEnd; index++) {
+    const byte = index >= pageStart + 22 && index < pageStart + 26 ? 0 : bytes[index]!;
+    crc ^= byte << 24;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = ((crc << 1) ^ ((crc & 0x8000_0000) !== 0 ? 0x04c1_1db7 : 0)) >>> 0;
+    }
+  }
+  return crc >>> 0;
+}
+
+/** Apply Opus end trimming to Mediabunny-authored Ogg without changing any encoded packet payload. */
+export function finalizeMediabunnyOggOpusTrim(
+  bytes: Uint8Array,
+  finalization: OggOpusCopyTrimFinalization,
+): Uint8Array | undefined {
+  const finalGranule = finalization.preSkipFrames + finalization.presentationFrames;
+  if (!Number.isSafeInteger(finalGranule) || finalGranule <= finalization.preSkipFrames) return undefined;
+  const output = bytes.slice();
+  let offset = 0;
+  let opusSerial: number | undefined;
+  let headPayloadOffset: number | undefined;
+  let eosPage: { start: number; end: number } | undefined;
+  while (offset < output.byteLength) {
+    if (
+      offset + 27 > output.byteLength ||
+      output[offset] !== 0x4f || output[offset + 1] !== 0x67 ||
+      output[offset + 2] !== 0x67 || output[offset + 3] !== 0x53 || output[offset + 4] !== 0
+    ) {
+      return undefined;
+    }
+    const segmentCount = output[offset + 26]!;
+    const payloadOffset = offset + 27 + segmentCount;
+    if (payloadOffset > output.byteLength) return undefined;
+    let bodyBytes = 0;
+    for (let index = 0; index < segmentCount; index++) bodyBytes += output[offset + 27 + index]!;
+    const pageEnd = payloadOffset + bodyBytes;
+    if (
+      pageEnd > output.byteLength ||
+      mediabunnyOggPageCrc(output, offset, pageEnd) !== mediabunnyOggU32le(output, offset + 22)
+    ) {
+      return undefined;
+    }
+    const headerType = output[offset + 5]!;
+    const serial = mediabunnyOggU32le(output, offset + 14);
+    const beginsWithOpusHead = (headerType & 2) !== 0 && bodyBytes >= 19 &&
+      String.fromCharCode(...output.subarray(payloadOffset, payloadOffset + 8)) === 'OpusHead';
+    if (beginsWithOpusHead) {
+      if (opusSerial !== undefined) return undefined;
+      opusSerial = serial;
+      headPayloadOffset = payloadOffset;
+    }
+    if (opusSerial === serial && (headerType & 4) !== 0) {
+      if (eosPage !== undefined) return undefined;
+      eosPage = { start: offset, end: pageEnd };
+    }
+    offset = pageEnd;
+  }
+  if (offset !== output.byteLength || opusSerial === undefined || headPayloadOffset === undefined || !eosPage) {
+    return undefined;
+  }
+  const authoredPreSkip = output[headPayloadOffset + 10]! | (output[headPayloadOffset + 11]! << 8);
+  if (authoredPreSkip !== finalization.preSkipFrames) return undefined;
+  writeMediabunnyOggU64le(output, eosPage.start + 6, finalGranule);
+  writeMediabunnyOggU32le(output, eosPage.start + 22, mediabunnyOggPageCrc(output, eosPage.start, eosPage.end));
+  const inspected = inspectTrimAudioContainer(output, 'ogg');
+  return inspected.state === 'OK' &&
+      inspected.value.primingSampleFrames === finalization.preSkipFrames &&
+      inspected.value.presentationSampleFrames === finalization.presentationFrames
+    ? output
+    : undefined;
 }
 
 function applyObservedFrameRateEvidence(
@@ -1324,6 +1503,7 @@ async function prepareOpenedInput(
   inputIndex: number,
   engineId: string,
   context?: OperationContext,
+  sourceContainer?: string,
 ): Promise<PreparedOpenedInput> {
   const tracks = await input.getTracks();
   const metadataTags = await input.getMetadataTags().catch(() => undefined);
@@ -1344,18 +1524,23 @@ async function prepareOpenedInput(
     }
     const type: 'video' | 'audio' = track.isVideoTrack() ? 'video' : 'audio';
     const typeOrdinal = typeCounts[type]++;
-    const normalized = await normalizeTrack(track);
+    const normalized = await normalizeTrack(track, { sourceContainer });
     const decoderConfig = await track.getDecoderConfig().catch(() => null);
-    const timescale = await track.getTimeResolution().catch(() => 1_000_000);
+    const observedTimescale = await track.getTimeResolution().catch(() => 1_000_000);
+    const timescale = Number.isSafeInteger(observedTimescale) && observedTimescale > 0
+      ? observedTimescale
+      : 1_000_000;
     const sink = new mb.EncodedPacketSink(track);
     const chunks: EncodedTracks['tracks'][number]['chunks'] = [];
 
     for await (const pkt of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
       if (context?.signal.aborted) throw abortError(context.signal.reason);
       const data = copyBytes(pkt.data);
-      bytesRead += data.byteLength;
+      const alphaData = pkt.sideData.alpha ? copyBytes(pkt.sideData.alpha) : undefined;
+      bytesRead += data.byteLength + (alphaData?.byteLength ?? 0);
       chunks.push({
         data,
+        ...(alphaData !== undefined ? { alphaData } : {}),
         ptsUs: pkt.microsecondTimestamp,
         decodeIndex: chunks.length,
         durationUs: pkt.microsecondDuration,
@@ -1363,7 +1548,7 @@ async function prepareOpenedInput(
       });
     }
 
-    if (chunks.length === 0) {
+    if (chunks.length === 0 && !isDeliberatelyIllegalMuxRequest(context)) {
       throw createNotApplicableError(
         engineId,
         operation,
@@ -1384,14 +1569,18 @@ async function prepareOpenedInput(
         : normalized.nativeCodecTag
           ? { nativeCodecTag: normalized.nativeCodecTag }
           : {}),
-      timescale: Number.isFinite(timescale) && timescale > 0 ? timescale : 1_000_000,
+      timescale,
       packetOrdering: 'decode',
-      timebase: { numerator: 1, denominator: Number.isSafeInteger(timescale) && timescale > 0 ? timescale : 1_000_000 },
+      timebase: { numerator: 1, denominator: timescale },
       framing: representation.framing,
       accessUnitGrouping: representation.accessUnitGrouping,
       parameterSetLocation: representation.parameterSetLocation,
       ...(normalized.width !== undefined ? { width: normalized.width } : {}),
       ...(normalized.height !== undefined ? { height: normalized.height } : {}),
+      ...(normalized.rotation === 0 || normalized.rotation === 90 ||
+        normalized.rotation === 180 || normalized.rotation === 270
+        ? { rotation: normalized.rotation }
+        : {}),
       ...(normalized.sampleRate !== undefined ? { sampleRate: normalized.sampleRate } : {}),
       ...(normalized.channels !== undefined ? { channels: normalized.channels } : {}),
       ...(description !== undefined ? { description } : {}),
@@ -2065,6 +2254,7 @@ function nowMs(): number {
 /**
  * A single-owned positioned spool: individual native chunk objects are released immediately, but
  * the complete output allocation remains retained. This is not a bounded-memory benchmark sink.
+ * Finalization compacts geometric growth slack so MediaBytes receives a tight root allocation.
  */
 export class PositionedByteSpool {
   private storage = new Uint8Array(0);
@@ -2100,8 +2290,10 @@ export class PositionedByteSpool {
   }
 
   bytes(): Uint8Array {
-    // Return a view over the one spool allocation. No all-chunks + final-buffer duplication.
-    return this.storage.subarray(0, this.extent);
+    // MediaBytes rejects subarray aliases whose ArrayBuffer extends beyond the declared output.
+    // Compact once, replace the retained allocation, and thereafter return that tight root view.
+    if (this.storage.byteLength !== this.extent) this.storage = this.storage.slice(0, this.extent);
+    return this.storage;
   }
 }
 
@@ -2760,7 +2952,9 @@ function muxWriteTraceFromObservedWrites(
       atMs: write.atMs,
       position: write.position,
       bytes: write.bytes,
-      writeKind: reserveMode && write.position < maximumExtent ? 'patch' : 'append',
+      // Positioned targets may patch an already-written MP4 header in every mode (for example the
+      // final mdat size). Reserve mode additionally patches the forward moov reservation.
+      writeKind: write.position < maximumExtent ? 'patch' : 'append',
     });
     maximumExtent = Math.max(maximumExtent, write.position + write.bytes.byteLength);
   }
@@ -3022,16 +3216,19 @@ function assertMuxTrackTuple(
   const counts = { video: 0, audio: 0, subtitle: 0, other: 0 };
   for (const track of tracks.tracks) counts[track.type]++;
   if (counts.subtitle || counts.other) {
+    if (deliberateNegative) rejectDeliberateNegative('mux cannot author subtitle/other tracks through the encoded media path');
     throw createNotApplicableError(engineId, 'mux', 'subtitle/other tracks cannot be silently discarded', tuple, MEDIABUNNY_REASON.TRACK_TYPE);
   }
   const limits = format.getSupportedTrackCounts();
   for (const type of ['video', 'audio', 'subtitle'] as const) {
     const count = counts[type];
     if (count < limits[type].min || count > limits[type].max) {
+      if (deliberateNegative) rejectDeliberateNegative(`${type} track count ${count} is illegal for ${opts.container}`);
       throw createNotApplicableError(engineId, 'mux', `${type} track count ${count} is unsupported`, tuple, MEDIABUNNY_REASON.TRACK_COUNT);
     }
   }
   if (tracks.tracks.length < limits.total.min || tracks.tracks.length > limits.total.max) {
+    if (deliberateNegative) rejectDeliberateNegative(`total track count ${tracks.tracks.length} is illegal for ${opts.container}`);
     throw createNotApplicableError(engineId, 'mux', `total track count ${tracks.tracks.length} is unsupported`, tuple, MEDIABUNNY_REASON.TRACK_COUNT);
   }
   const videoCodecs = new Set(format.getSupportedVideoCodecs());
@@ -3650,7 +3847,14 @@ export class MediabunnyEngine implements MediaEngine {
       const mbInput = await openInput(this.lib, input);
       const unbindAbort = bindAbortToInput(mbInput, context?.signal);
       try {
-        const prepared = await prepareOpenedInput(this.lib, mbInput, inputIndex, this.id, context);
+        const prepared = await prepareOpenedInput(
+          this.lib,
+          mbInput,
+          inputIndex,
+          this.id,
+          context,
+          context?.request.inputs[inputIndex]?.container ?? containerHintFromMediaInput(input),
+        );
         candidates.push(...prepared.candidates);
         sourceTrackCount += prepared.sourceTrackCount;
         bytesRead += prepared.bytesRead;
@@ -4159,9 +4363,7 @@ export class MediabunnyEngine implements MediaEngine {
 
       if (Math.abs(range.startUs) <= NOOP_TRIM_TOLERANCE_SEC * 1e6) {
         const meta = await getMeta();
-        const authoredNoop = context?.request.options.invariant === TRIM_NOOP_IDENTITY_INVARIANT &&
-          meta.container === opts.container;
-        if (authoredNoop || isNoopTrim(meta, range, opts.container)) {
+        if (isNoopTrim(meta, range, opts.container)) {
           return {
             bytes: new Uint8Array(await input.arrayBuffer()),
             mime: mimeForContainer(opts.container),
@@ -4173,15 +4375,62 @@ export class MediabunnyEngine implements MediaEngine {
       if (!opts.frameAccurate) {
         // Non-frame-accurate means packet copy, never a permissive Conversion fallback.
         const prepared = await this.prepareMuxTracks([input], { ...opts }, context) as MediabunnyPreparedTracks;
-        for (const track of prepared.tracks) {
-          const selected = selectMediabunnyCopyTrimChunks(track.chunks, track.type, range);
+        let oggOpusFinalization: OggOpusCopyTrimFinalization | undefined;
+        const selections = prepared.tracks.map((track) => {
+          const isOggOpus = opts.container === 'ogg' && track.type === 'audio' && track.codec === 'opus';
+          const selected = selectMediabunnyCopyTrimChunks(
+            track.chunks,
+            track.type,
+            range,
+            isOggOpus ? { audioPrerollUs: OGG_OPUS_COPY_PREROLL_US } : {},
+          );
+          return { track, selected, isOggOpus };
+        });
+        if (selections.every(({ selected }) => selected.length === 0)) {
+          throw createMalformedInputError(
+            this.id,
+            'trim',
+            'validate',
+            `trim range ${range.startUs}..${range.endUs}us lies entirely outside the media timeline`,
+            'MEDIABUNNY_TRIM_RANGE_OUTSIDE_MEDIA_REJECTED',
+            input.id,
+          );
+        }
+        for (const { track, selected, isOggOpus } of selections) {
           if (selected.length === 0) {
             throw createNotApplicableError(this.id, 'trim', `copy trim selected no ${track.type} packets`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.COPY_REQUIRED);
+          }
+          if (isOggOpus) {
+            if (prepared.tracks.length !== 1 || oggOpusFinalization !== undefined) {
+              throw createNotApplicableError(
+                this.id,
+                'trim',
+                'exact Ogg Opus copy trim currently requires one logical stream',
+                context ? tupleSummary(context.request) : {},
+                MEDIABUNNY_REASON.COPY_REQUIRED,
+              );
+            }
+            oggOpusFinalization = prepareOggOpusCopyTrim(track, selected, range);
+            if (!oggOpusFinalization) {
+              throw createNotApplicableError(
+                this.id,
+                'trim',
+                'Ogg Opus copy trim cannot represent the requested pre-roll/end-granule interval',
+                context ? tupleSummary(context.request) : {},
+                MEDIABUNNY_REASON.COPY_REQUIRED,
+              );
+            }
           }
           track.chunks = selected;
           rebaseChunksToZero(track.chunks);
         }
-        return this.mux(prepared, opts, context);
+        const media = await this.mux(prepared, opts, context);
+        if (!oggOpusFinalization) return media;
+        const finalized = finalizeMediabunnyOggOpusTrim(media.bytes, oggOpusFinalization);
+        if (!finalized) {
+          throw new Error('[MEDIABUNNY_OGG_OPUS_TRIM_FINALIZATION_FAILED] authored Ogg trim metadata is invalid');
+        }
+        return { ...media, bytes: finalized };
       }
 
       const targetInfo = instrumentedOutputTarget(this.lib, opts as Record<string, unknown>, context);
@@ -4263,24 +4512,24 @@ export class MediabunnyEngine implements MediaEngine {
     const requestedTags = isPlainObject(opts.tags)
       ? Object.fromEntries(Object.entries(opts.tags) as Array<[string, string]>)
       : undefined;
-    const reserveMaximumPacketCount = opts.fastStart === 'reserve'
-      ? Number.isSafeInteger(opts.maximumPacketCount) && Number(opts.maximumPacketCount) > 0
-        ? Number(opts.maximumPacketCount)
-        : undefined
-      : undefined;
-    if (opts.fastStart === 'reserve' && reserveMaximumPacketCount === undefined) {
-      throw createNotApplicableError(
-        this.id,
-        'mux',
-        'reserve fast-start requires a positive maximumPacketCount propagated to every output track',
-        context ? tupleSummary(context.request) : { outputContainer: opts.container },
-        MEDIABUNNY_REASON.RESERVE_PACKET_BOUND,
-      );
-    }
     const observedPacketCount = tracks.tracks.reduce(
       (maximum, track) => Math.max(maximum, track.chunks.length),
       0,
     );
+    const explicitReserveMaximumPacketCount = opts.fastStart === 'reserve' && opts.maximumPacketCount !== undefined
+      ? Number.isSafeInteger(opts.maximumPacketCount) && Number(opts.maximumPacketCount) > 0
+        ? Number(opts.maximumPacketCount)
+        : undefined
+      : undefined;
+    if (opts.fastStart === 'reserve' && opts.maximumPacketCount !== undefined && explicitReserveMaximumPacketCount === undefined) {
+      throw new TypeError('maximumPacketCount must be a positive safe integer when supplied');
+    }
+    // prepareMuxTracks has already materialized the exact packet arrays. A mux row can therefore
+    // derive a tight per-track reserve bound; explicit streaming-output contracts still forward and
+    // enforce their caller-supplied bound unchanged.
+    const reserveMaximumPacketCount = opts.fastStart === 'reserve'
+      ? explicitReserveMaximumPacketCount ?? Math.max(1, observedPacketCount)
+      : undefined;
     if (reserveMaximumPacketCount !== undefined && observedPacketCount > reserveMaximumPacketCount) {
       const error = new RangeError(
         `MEDIABUNNY_RESERVE_PACKET_BOUND_EXCEEDED: observed ${observedPacketCount} packet(s) on one track, bound ${reserveMaximumPacketCount}`,
@@ -4290,7 +4539,10 @@ export class MediabunnyEngine implements MediaEngine {
     }
 
     const mb = this.lib;
-    const targetInfo = instrumentedOutputTarget(mb, opts, context);
+    const targetOpts = reserveMaximumPacketCount !== undefined && opts.maximumPacketCount === undefined
+      ? { ...opts, maximumPacketCount: reserveMaximumPacketCount }
+      : opts;
+    const targetInfo = instrumentedOutputTarget(mb, targetOpts, context);
     const output = new mb.Output({ format, target: targetInfo.target });
 
     interface Pending {
@@ -4307,8 +4559,10 @@ export class MediabunnyEngine implements MediaEngine {
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported video codec '${t.codec}'`);
         const source = new mb.EncodedVideoPacketSource(mbCodec);
         let sourceClosed = false;
+        const outputRotation = mediabunnyOutputRotation(t.rotation, opts.container);
         output.addVideoTrack(source, {
           maximumPacketCount: reserveMaximumPacketCount ?? t.chunks.length,
+          ...(outputRotation !== undefined ? { rotation: outputRotation } : {}),
         });
         pendings.push({
           add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata),
@@ -4359,45 +4613,58 @@ export class MediabunnyEngine implements MediaEngine {
     try {
       if (context?.signal.aborted) throw abortError(context.signal.reason);
       await output.start();
-      for (const p of pendings) {
-        const { track, isVideo, add } = p;
-        const description = track.description ? bufferOf(track.description) : undefined;
-        for (let i = 0; i < track.chunks.length; i++) {
-          if (context?.signal.aborted) throw abortError(context.signal.reason);
-          const c = track.chunks[i];
-          if (!c) continue;
-          const pkt = new mb.EncodedPacket(
-            c.data,
-            c.keyframe ? 'key' : 'delta',
-            c.ptsUs / 1e6,
-            c.durationUs / 1e6,
-            c.decodeIndex ?? i,
-          );
-          // First packet carries the decoder config so the muxer can emit codec-private boxes.
-          const meta =
-            i === 0
-              ? isVideo
-                ? ({
-                  decoderConfig: {
-                    codec: codecParamForTrack(track, true),
-                    codedWidth: track.width ?? 0,
-                    codedHeight: track.height ?? 0,
-                    description,
-                  },
-                } as EncodedVideoChunkMetadata)
-                : ({
-                  decoderConfig: {
-                    codec: codecParamForTrack(track, false),
-                    sampleRate: track.sampleRate ?? 48000,
-                    numberOfChannels: track.channels ?? 2,
-                    description,
-                  },
-                } as EncodedAudioChunkMetadata)
-              : undefined;
-          await add(pkt, meta);
+      // Feed track heads by presentation time instead of exhausting one whole track first. Reserve
+      // fast-start measures its forward moov as soon as every source configuration is known; giving
+      // every track its first packet promptly prevents Mediabunny 1.48.0 from measuring a partially
+      // initialized sample table. Per-track packet order remains the original decode order.
+      const nextChunkIndexes = new Map<Pending, number>(pendings.map((pending) => [pending, 0]));
+      for (;;) {
+        let selected: { pending: Pending; index: number; chunk: EncodedTracks['tracks'][number]['chunks'][number] } | undefined;
+        for (const pending of pendings) {
+          const index = nextChunkIndexes.get(pending) ?? 0;
+          const chunk = pending.track.chunks[index];
+          if (!chunk) continue;
+          if (!selected || chunk.ptsUs < selected.chunk.ptsUs) selected = { pending, index, chunk };
         }
-        p.close();
+        if (!selected) break;
+        if (context?.signal.aborted) throw abortError(context.signal.reason);
+        const { pending, index, chunk } = selected;
+        const { track, isVideo, add } = pending;
+        const description = track.description ? bufferOf(track.description) : undefined;
+        const pkt = new mb.EncodedPacket(
+          chunk.data,
+          chunk.keyframe ? 'key' : 'delta',
+          chunk.ptsUs / 1e6,
+          chunk.durationUs / 1e6,
+          chunk.decodeIndex ?? index,
+          undefined,
+          chunk.alphaData !== undefined ? { alpha: chunk.alphaData } : undefined,
+        );
+        // First packet carries the decoder config so the muxer can emit codec-private boxes.
+        const meta =
+          index === 0
+            ? isVideo
+              ? ({
+                decoderConfig: {
+                  codec: codecParamForTrack(track, true),
+                  codedWidth: track.width ?? 0,
+                  codedHeight: track.height ?? 0,
+                  description,
+                },
+              } as EncodedVideoChunkMetadata)
+              : ({
+                decoderConfig: {
+                  codec: codecParamForTrack(track, false),
+                  sampleRate: track.sampleRate ?? 48000,
+                  numberOfChannels: track.channels ?? 2,
+                  description,
+                },
+              } as EncodedAudioChunkMetadata)
+            : undefined;
+        await add(pkt, meta);
+        nextChunkIndexes.set(pending, index + 1);
       }
+      for (const pending of pendings) pending.close();
       targetInfo.markFinalizeStart();
       await output.finalize();
       const media = await targetInfo.mediaBytes(opts.container);
@@ -4507,7 +4774,7 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
     protectionWasResolved?: () => boolean,
   ): Promise<MediaBytes> {
-    const prepared = await prepareOpenedInput(this.lib, input, 0, this.id, context);
+    const prepared = await prepareOpenedInput(this.lib, input, 0, this.id, context, 'mp4');
     if (protectionWasResolved !== undefined && !protectionWasResolved()) {
       throw createNotApplicableError(
         this.id,

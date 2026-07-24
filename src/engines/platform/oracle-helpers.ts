@@ -14,7 +14,12 @@
 import type { FrameSink, MediaBytes } from '../../core/engine.ts';
 import { decodeWithVideoElement, decodeWithWebCodecs } from './decode.ts';
 import type { DecodeInput } from './decode.ts';
-import { demuxMp4Video, looksLikeMp4, UnsupportedMp4Error } from './demux-mp4.ts';
+import {
+  demuxMp4Video,
+  hasMp4DisplayMatrixTransform,
+  looksLikeMp4,
+  UnsupportedMp4Error,
+} from './demux-mp4.ts';
 import { demuxWebmVideo, looksLikeWebm, UnsupportedWebmError } from './demux-webm.ts';
 
 /** Coerce MediaBytes (or a bare Uint8Array) to a Uint8Array. */
@@ -133,6 +138,24 @@ export async function decodeBytesToFrames(
 ): Promise<FrameSink> {
   const bytes = toBytes(input);
   const container = input instanceof Uint8Array ? undefined : input.container;
+
+  // Raw WebCodecs decodes coded pixels and does not apply an ISO BMFF track matrix. Route any
+  // non-identity MP4/MOV transform through the browser presenter so source and candidate evidence
+  // is genuinely display-space rather than an unrotated coded-raster comparison.
+  if (hasDom() && looksLikeMp4(bytes) && hasMp4DisplayMatrixTransform(bytes)) {
+    const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
+    const displayOpts: {
+      maxFrames?: number;
+      durationHintSec?: number;
+      sampleTimesSec?: readonly number[];
+    } = {};
+    // Media-element evidence retains RGBA pixels. Bound display-matrix sampling so a caller's raw
+    // WebCodecs cap (often thousands of frames) cannot request tens of gigabytes of retained pixels.
+    displayOpts.maxFrames = Math.min(opts?.maxFrames ?? 8, 32);
+    if (opts?.durationHintSec !== undefined) displayOpts.durationHintSec = opts.durationHintSec;
+    if (opts?.sampleTimesSec !== undefined) displayOpts.sampleTimesSec = opts.sampleTimesSec;
+    return decodeWithVideoElement(blob, displayOpts);
+  }
 
   // Keep source and candidate sampling domains identical for comparisons involving formats that
   // require the media-element path (notably fragmented MP4). Inline WebCodecs returns a prefix,

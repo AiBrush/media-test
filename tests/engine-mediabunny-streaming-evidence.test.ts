@@ -219,12 +219,19 @@ describe('Mediabunny production streaming-output evidence boundary', () => {
       target: 'stream',
       writeChunkBytes: 0,
     }).context.request;
-    const malformedReserve = operationContext({
+    const derivedReserve = operationContext({
       container: 'mp4',
       target: 'stream',
       fastStart: 'reserve',
     }).context.request;
+    const malformedReserve = operationContext({
+      container: 'mp4',
+      target: 'stream',
+      fastStart: 'reserve',
+      maximumPacketCount: 0,
+    }).context.request;
     expect(() => decideMediabunnySupport(malformedChunk)).toThrow(TypeError);
+    expect(decideMediabunnySupport(derivedReserve)).toEqual({ supported: true });
     expect(() => decideMediabunnySupport(malformedReserve)).toThrow(TypeError);
   });
 

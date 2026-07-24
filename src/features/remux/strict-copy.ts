@@ -320,6 +320,7 @@ function trackFacts(
   representationDifferences: string[],
   label: string,
   aacSbrRateRepresentation: boolean,
+  equivalentAacConfig: boolean,
 ): string[] {
   const failures: string[] = [];
   for (const key of ['language', 'role', 'disposition'] as const) {
@@ -335,6 +336,10 @@ function trackFacts(
         representationDifferences.push(
           `${label} HE-AAC SBR presentation/core rates are represented differently across ADTS (${source.sampleRate}Hz -> ${output.sampleRate}Hz)`,
         );
+      } else if ((key === 'sampleRate' || key === 'channels') && equivalentAacConfig) {
+        representationDifferences.push(
+          `${label} container ${key} changed ${source[key]} -> ${output[key]} while the authoritative AAC decoder configuration stayed equivalent`,
+        );
       } else {
         failures.push(`${key} changed ${source[key]} -> ${output[key]}`);
       }
@@ -343,6 +348,23 @@ function trackFacts(
     }
   }
   return failures;
+}
+
+function equivalentAacDecoderConfiguration(
+  sourceTrack: RemuxTrackEvidence,
+  outputTrack: RemuxTrackEvidence,
+): boolean {
+  if (canonicalCodec(sourceTrack.codec) !== 'aac' || canonicalCodec(outputTrack.codec) !== 'aac' ||
+      !sourceTrack.codecPrivate || !outputTrack.codecPrivate) return false;
+  const source = aacAudioSpecificConfigFromEsds(sourceTrack.codecPrivate);
+  const output = aacAudioSpecificConfigFromEsds(outputTrack.codecPrivate);
+  if (!source || !output) return false;
+  return source.audioObjectType === output.audioObjectType &&
+    source.coreSampleRate === output.coreSampleRate &&
+    source.presentationSampleRate === output.presentationSampleRate &&
+    source.channelConfiguration === output.channelConfiguration &&
+    source.sbrPresent === output.sbrPresent &&
+    source.psPresent === output.psPresent;
 }
 
 function explicitAacSbrAdtsRateRepresentation(
@@ -492,12 +514,14 @@ export function compareStrictRemuxPrograms(
       sourceTrack,
       outputTrack,
     );
+    const equivalentAacConfig = equivalentAacDecoderConfiguration(sourceTrack, outputTrack);
     failures.push(...trackFacts(
       sourceTrack,
       outputTrack,
       differences,
       label,
       aacSbrRateRepresentation,
+      equivalentAacConfig,
     ).map((detail) => `${label} ${detail}`));
     const normalizedSource = normalizeTrack(sourceTrack);
     const normalizedOutput = normalizeTrack(outputTrack);

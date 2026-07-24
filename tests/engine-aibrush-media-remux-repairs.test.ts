@@ -4,6 +4,7 @@ import {
   materializeFiniteAibrushWebmClusters,
   prependAibrushMpegTsH264Aud,
   repairAibrushOggContinuationFlags,
+  selectAibrushCopyTrimSampleIndices,
 } from '../src/engines/aibrush-media/adapter.ts';
 import { readNeutralRemuxProgram } from '../src/features/remux/readers.ts';
 
@@ -53,6 +54,34 @@ function withSpuriousOggContinuation(source: Uint8Array): Uint8Array {
 }
 
 describe('aibrush-media strict-copy remux boundary repairs', () => {
+  test('selects a half-open presentation window and backs video up to its prior keyframe', () => {
+    const track = {
+      id: 'video:0',
+      type: 'video' as const,
+      codec: 'h264',
+      samples: [
+        { payload: new Uint8Array([0]), ptsUs: 1_000_000, dtsUs: 900_000, durationUs: 1_000_000, keyframe: true, framing: 'length-prefixed' as const },
+        { payload: new Uint8Array([1]), ptsUs: 2_000_000, dtsUs: 1_900_000, durationUs: 1_000_000, keyframe: false, framing: 'length-prefixed' as const },
+        { payload: new Uint8Array([2]), ptsUs: 3_000_000, dtsUs: 2_900_000, durationUs: 1_000_000, keyframe: false, framing: 'length-prefixed' as const },
+        { payload: new Uint8Array([3]), ptsUs: 4_000_000, dtsUs: 3_900_000, durationUs: 1_000_000, keyframe: true, framing: 'length-prefixed' as const },
+        { payload: new Uint8Array([4]), ptsUs: 5_000_000, dtsUs: 4_900_000, durationUs: 1_000_000, keyframe: false, framing: 'length-prefixed' as const },
+      ],
+    };
+
+    expect(selectAibrushCopyTrimSampleIndices(track, { startUs: 1_500_000, endUs: 3_500_000 }))
+      .toEqual([0, 1, 2, 3]);
+    expect(selectAibrushCopyTrimSampleIndices(track, { startUs: 4_000_000, endUs: 4_000_000 }))
+      .toEqual([]);
+
+    expect(selectAibrushCopyTrimSampleIndices({
+      ...track,
+      id: 'audio:0',
+      type: 'audio',
+      codec: 'opus',
+      samples: track.samples.map(({ durationUs: _durationUs, ...sample }) => sample),
+    }, { startUs: 1_500_000, endUs: 3_500_000 })).toEqual([1, 2, 3]);
+  });
+
   test('materializes sibling unknown-size WebM clusters without changing coded media', async () => {
     const source = new Uint8Array(
       await Bun.file('fixtures/media/recorder_headerless.webm').arrayBuffer(),

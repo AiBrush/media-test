@@ -270,21 +270,47 @@ function inspectOggOpus(bytes: Uint8Array): AudioContainerReadResult {
   }
   const channels = head[9]!;
   const preSkip = u16le(head, 10);
-  if (channels <= 0 || finalGranule === undefined || finalGranule < preSkip) {
+  let codedSampleFrames = 0;
+  for (const opusPacket of packets.slice(2)) {
+    const frames = opusPacketSampleFrames(opusPacket);
+    if (frames === undefined) {
+      return problem('MALFORMED', 'OGG_OPUS_PACKET_DURATION_INVALID', 'Opus packet duration cannot be derived from its TOC');
+    }
+    codedSampleFrames += frames;
+  }
+  if (
+    channels <= 0 || finalGranule === undefined || finalGranule < preSkip ||
+    !Number.isSafeInteger(codedSampleFrames) || finalGranule > codedSampleFrames
+  ) {
     return problem('MALFORMED', 'OGG_OPUS_GRANULE_INVALID', 'Opus channels/pre-skip/final granule are inconsistent');
   }
   if (!eos) return problem('INCOMPLETE', 'OGG_EOS_MISSING', 'Ogg Opus output has no EOS page');
   const presentation = finalGranule - preSkip;
   return ok({
     container: 'ogg', codec: 'opus', sampleRate: 48_000, channels,
-    codedSampleFrames: finalGranule,
+    codedSampleFrames,
     presentationSampleFrames: presentation,
     primingSampleFrames: preSkip,
-    endTrimSampleFrames: 0,
+    endTrimSampleFrames: codedSampleFrames - finalGranule,
     precision: 'exact', packetOrFrameCount: Math.max(0, packets.length - 2),
     metadataTotalSampleFrames: presentation,
     endOfStreamPresent: true,
   });
+}
+
+function opusPacketSampleFrames(packet: Uint8Array): number | undefined {
+  if (packet.byteLength < 1) return undefined;
+  const toc = packet[0]!;
+  const config = toc >> 3;
+  let frameSamples: number;
+  if (config >= 16) frameSamples = 120 << (config & 3);
+  else if (config >= 12) frameSamples = 480 << (config & 1);
+  else if ((config & 3) === 3) frameSamples = 2_880;
+  else frameSamples = 480 << (config & 3);
+  const code = toc & 3;
+  const frames = code === 0 ? 1 : code === 1 || code === 2 ? 2 : packet.byteLength >= 2 ? packet[1]! & 0x3f : 0;
+  const total = frameSamples * frames;
+  return frames > 0 && total <= 5_760 ? total : undefined;
 }
 
 function inspectFlac(bytes: Uint8Array): AudioContainerReadResult {

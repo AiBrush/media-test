@@ -10,6 +10,7 @@ import type {
   MediaInput,
   NormalizedMetadata,
 } from '../src/core/engine.ts';
+import { createMalformedInputError } from '../src/core/engine.ts';
 import type { ActiveFixtureRuntime } from '../src/core/fixture-integrity.ts';
 import type { CodecSupport } from '../src/core/feature-detect.ts';
 import { registerEngine, registerScenario } from '../src/core/registry.ts';
@@ -267,6 +268,57 @@ describe('REQ-FEAT-30 production runMatrix preflight', () => {
     expect(blocked?.reason).toContain('WEB_CODECS_CONFIG_UNSUPPORTED');
     expect(copyRuns).toBe(1);
     expect(accurateRuns).toBe(0);
+  });
+
+  test('deliberately invalid trim ranges reach the graceful-failure operation path', async () => {
+    installFixtureFetch();
+    const engineId = 'trim-invalid-range-acceptance@1.0.0';
+    const scenario = defineScenario({
+      id: 'trim/acceptance-invalid-range',
+      op: 'trim',
+      input: 'micro_h264_1frame.mp4',
+      requires: {
+        operations: ['trim'],
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        features: [],
+      },
+      options: {
+        container: 'mp4',
+        frameAccurate: false,
+        range: { startUs: 5_000_000, endUs: 5_000_000 },
+      },
+      oracles: ['graceful-failure'],
+      metrics: ['wall'],
+      timeoutMs: 1_000,
+    });
+    let trimRuns = 0;
+    const engine = {
+      id: engineId,
+      capabilities: () => capabilitiesFor(scenario),
+      supports: async () => ({ supported: true as const }),
+      trim: async (input: MediaInput) => {
+        trimRuns++;
+        throw createMalformedInputError(
+          engineId,
+          'trim',
+          'validate',
+          'zero-length trim range rejected',
+          'TEST_TRIM_EMPTY_RANGE_REJECTED',
+          input.id,
+        );
+      },
+    } as MediaEngine;
+
+    const result = await runOne(engine, scenario, 'chromium', codecSupport, { pixelBehavior: pixelPass });
+    expect(result.status).toBe('PASS');
+    expect(result.operationEvidence).toMatchObject({ disposition: 'clean-reject', stage: 'operation' });
+    expect(result.oracleOutcomes).toContainEqual(expect.objectContaining({
+      verdict: 'PASS',
+      reasonCode: 'ROBUSTNESS_NEGATIVE_CLEAN_REJECT',
+    }));
+    expect(trimRuns).toBe(1);
   });
 });
 

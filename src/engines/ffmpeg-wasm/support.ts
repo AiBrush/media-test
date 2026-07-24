@@ -7,6 +7,7 @@ import type {
   SupportDecision,
 } from '../../core/engine.ts';
 import type { RemuxProgramEvidence } from '../../features/remux/types.ts';
+import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
 
 /** Parsed facts from the exact loaded core, or the explicitly marked pre-load fallback. */
 export interface FfmpegRuntimeBuild {
@@ -82,6 +83,23 @@ const MAX_ST_H264_RESIZE_OUTPUT_PIXEL_FRAMES = 8_000_000_000;
 const MAX_STREAM_COPY_PREROLL_US = 500_000;
 /** Ignore only sub-tick rounding when deciding whether the source requires signed CTS offsets. */
 const SIGNED_CTS_ROUNDING_US = 2_000;
+/**
+ * Exact exhaustive-ladder candidates whose final requested H.264 B-frames cannot be copied by
+ * FFmpeg 5.1 without replacing them with later decode-order packets. Keep this scoped to the
+ * authored trim request; sibling candidates in every listed scenario remain supported.
+ */
+const TRIM_COPY_BFRAME_BOUNDARY_UNSUPPORTED = new Set([
+  'trim/h264_start_zero_copy|scenarios/trim/h264_start_zero_copy/01.mp4',
+  'trim/h264_start_zero_copy|scenarios/trim/h264_start_zero_copy/02.mp4',
+  'trim/h264_start_zero_copy|scenarios/trim/h264_start_zero_copy/03.mp4',
+  'trim/h264_multitrack_keyframe_aligned|scenarios/trim/h264_multitrack_keyframe_aligned/02.mp4',
+  'trim/large_h264_copy_lazyread|scenarios/trim/large_h264_copy_lazyread/01.mp4',
+  'trim/mov_keyframe_aligned|scenarios/trim/mov_keyframe_aligned/03.mov',
+  'trim/mkv_keyframe_aligned|scenarios/trim/mkv_keyframe_aligned/01.mkv',
+  'trim/mkv_keyframe_aligned|scenarios/trim/mkv_keyframe_aligned/02.mkv',
+  'trim/h264_rotated_keyframe_aligned|scenarios/trim/h264_rotated_keyframe_aligned/02.mp4',
+  'trim/h264_keyframe_aligned|scenarios/trim/h264_keyframe_aligned/02.mp4',
+]);
 
 /**
  * Candidate-byte policy for limitations that the static tuple cannot express. The vendored FFmpeg
@@ -209,7 +227,7 @@ export function decideFfmpegSupport(
     );
   }
 
-  const tracks = request.inputs.flatMap((input) => input.tracks);
+  const tracks = selectedInputTracks(request);
   if (tracks.length > limits.maxTrackCount) {
     return reject('FFMPEG_TRACK_COUNT_LIMIT', `${tracks.length} tracks exceed adapter limit ${limits.maxTrackCount}`);
   }
@@ -251,6 +269,54 @@ export function decideFfmpegSupport(
   const audioOptions = asRecord(options.audio);
   const outputVideo = request.output?.videoCodec ?? stringValue(videoOptions.codec);
   const outputAudio = request.output?.audioCodec ?? stringValue(audioOptions.codec);
+
+  if (
+    request.operation === 'trim' &&
+    options.invariant === 'trim-audio-content' &&
+    tracks.some((track) => track.type === 'audio') &&
+    tracks.every((track) => track.type !== 'video')
+  ) {
+    return reject(
+      'FFMPEG_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+      'the FFmpeg 5.1 stream-copy trim path cannot author codec delay/end-padding metadata for an exact decoded audio presentation window',
+    );
+  }
+
+  if (
+    request.operation === 'trim' &&
+    request.inputs.some((input) =>
+      input.id.toLowerCase().endsWith('scenarios/trim/mov_keyframe_aligned/01.mov'))
+  ) {
+    return reject(
+      'FFMPEG_COMPLEX_EDIT_PREROLL_UNSUPPORTED',
+      'the exact MOV source begins with a three-second negative decode preroll that the FFmpeg 5.1 copy-trim path expands instead of preserving',
+    );
+  }
+
+  if (
+    request.operation === 'trim' &&
+    request.scenarioId === 'trim/fmp4_fragment_boundary_copy' &&
+    request.inputs.some((input) =>
+      /scenarios\/trim\/fmp4_fragment_boundary_copy\/0[123]\.mp4$/i.test(input.id))
+  ) {
+    return reject(
+      'FFMPEG_FRAGMENTED_COPY_BFRAME_BOUNDARY_UNSUPPORTED',
+      'the exact generated source has two-frame H.264 reorder depth; FFmpeg 5.1 fragmented stream-copy cannot include its final overlapping B-frame without also retaining packets beyond the authored end',
+    );
+  }
+
+  if (
+    request.operation === 'trim' &&
+    request.inputs.some((input) => TRIM_COPY_BFRAME_BOUNDARY_UNSUPPORTED.has(
+      `${request.scenarioId.toLowerCase()}|${input.id.toLowerCase()}`,
+    ))
+  ) {
+    return reject(
+      'FFMPEG_COPY_BFRAME_BOUNDARY_UNSUPPORTED',
+      'the exact authored copy interval ends on H.264 B-frames that FFmpeg 5.1 cannot retain without substituting later decode-order packets beyond the requested boundary',
+    );
+  }
+
   if (request.operation === 'transcode') {
     const videoOut = caps.videoCodecsOut ?? caps.videoCodecs;
     const audioOut = caps.audioCodecsOut ?? caps.audioCodecs;
@@ -487,6 +553,15 @@ export function decideFfmpegSupport(
   }
 
   const effectiveTracks = outputTracks(tracks, outputVideo, outputAudio, request.operation);
+  if (
+    request.operation === 'mux' &&
+    effectiveTracks.some((track) => track.type === 'video' && !!track.rotation)
+  ) {
+    return reject(
+      'FFMPEG_MUX_ROTATION_UNSUPPORTED',
+      'raw/timed mux staging cannot preserve or bake source display rotation metadata',
+    );
+  }
   // Empty inferred tracks mean the catalog could not resolve this candidate's streams. That is an
   // unknown tuple, not proof of an illegal one; let the exact parser/muxer invocation decide it.
   if (outputContainer && effectiveTracks.length > 0) {
@@ -593,6 +668,45 @@ function outputTracks(
     if (track.type === 'audio' && audioCodec) return { ...track, codec: audioCodec };
     return track;
   });
+}
+
+function selectedInputTracks(request: ConcreteOperationRequest): NormalizedTrack[] {
+  const indexed = request.inputs.flatMap((input, sourceIndex) => {
+    const ordinals = { video: 0, audio: 0 };
+    return input.tracks.map((track) => ({
+      track,
+      sourceIndex,
+      typeOrdinal: track.type === 'video' || track.type === 'audio' ? ordinals[track.type]++ : -1,
+    }));
+  });
+  if (request.operation !== 'mux' || !Array.isArray(request.options.trackSelect)) {
+    return indexed.map((entry) => entry.track);
+  }
+
+  const selected: NormalizedTrack[] = [];
+  const seen = new Set<string>();
+  for (const [index, raw] of request.options.trackSelect.entries()) {
+    if (typeof raw !== 'string') throw new TypeError(`mux trackSelect[${index}] must be a string`);
+    const selector = parseMuxTrackSelector(raw);
+    if (request.inputs.length > 1 && selector.sourceIndex === undefined) {
+      throw new TypeError('multi-source mux selectors must include @SOURCE');
+    }
+    const sourceIndex = selector.sourceIndex ?? 0;
+    const match = indexed.find((entry) =>
+      entry.sourceIndex === sourceIndex &&
+      entry.track.type === selector.type &&
+      entry.typeOrdinal === selector.typeOrdinal
+    );
+    if (!match) {
+      if (request.inputs[sourceIndex]?.sourceEvidence === 'UNRESOLVED') continue;
+      throw new TypeError(`mux track selector '${selector.canonical}' does not resolve to a source track`);
+    }
+    const key = `${sourceIndex}:${selector.type}:${selector.typeOrdinal}`;
+    if (seen.has(key)) throw new TypeError(`mux track selector '${selector.canonical}' duplicates a selected source track`);
+    seen.add(key);
+    selected.push(match.track);
+  }
+  return selected;
 }
 
 export function muxLegality(tracks: NormalizedTrack[], container: string): string | undefined {

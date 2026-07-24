@@ -224,26 +224,55 @@ export function validateMuxWriteTrace(
     } else {
       const reservation = reservations.find((item) =>
         item.sequence < write.sequence && range.start >= item.position && range.end <= item.end);
-      if (!allowReservedPatches || !reservation) {
-        return muxVerdict('FAIL', 'MUX_PATCH_OUTSIDE_RESERVATION', `patch write ${write.sequence} is not inside a prior reservation`);
-      }
-      if (appendRanges.some((other) => overlaps(range, other)) || patchRanges.some((other) => overlaps(range, other))) {
-        return muxVerdict('FAIL', 'MUX_PATCH_WRITE_OVERLAP', `patch write ${write.sequence} overlaps prior output bytes`);
+      const priorWritesCoverRange = rangeCoveredBy(range, allRanges);
+      if (!priorWritesCoverRange && (!allowReservedPatches || !reservation)) {
+        return muxVerdict(
+          'FAIL',
+          'MUX_PATCH_WITHOUT_PRIOR_BYTES_OR_RESERVATION',
+          `patch write ${write.sequence} is neither inside a prior reservation nor over prior positioned bytes`,
+        );
       }
       patchRanges.push(range);
     }
-    for (let index = 0; index < write.bytes.byteLength; index++) {
-      if (write.bytes[index] !== finalBytes[write.position + index]) {
-        return muxVerdict(
-          'FAIL',
-          'MUX_WRITE_RECONSTRUCTION_MISMATCH',
-          `write ${write.sequence} differs from final output at byte ${write.position + index}`,
-        );
-      }
-    }
     allRanges.push(range);
   }
-  const merged = mergeRanges(allRanges);
+
+  // Validate the exact replay with last-write-wins semantics. Earlier placeholder/header writes
+  // are compared only where no later positioned patch superseded them; this retains a range ledger
+  // and never allocates a second output-sized buffer.
+  let laterRanges: Array<{ start: number; end: number }> = [];
+  for (let writeIndex = trace.writes.length - 1; writeIndex >= 0; writeIndex--) {
+    const write = trace.writes[writeIndex]!;
+    const range = { start: write.position, end: write.position + write.bytes.byteLength };
+    for (const visible of subtractCoveredRange(range, laterRanges)) {
+      for (let position = visible.start; position < visible.end; position++) {
+        if (write.bytes[position - write.position] !== finalBytes[position]) {
+          return muxVerdict(
+            'FAIL',
+            'MUX_WRITE_RECONSTRUCTION_MISMATCH',
+            `write ${write.sequence} differs from final output at byte ${position}`,
+          );
+        }
+      }
+    }
+    laterRanges = mergeRanges([...laterRanges, range]);
+  }
+  // A forward reservation is an observable zero-filled extent in the positioned spool. Patches may
+  // materialize only the moov/free headers; untouched free-box payload remains implicit zero data.
+  for (const reservation of reservations) {
+    for (const visible of subtractCoveredRange(reservation, allRanges)) {
+      for (let position = visible.start; position < visible.end; position++) {
+        if (finalBytes[position] !== 0) {
+          return muxVerdict(
+            'FAIL',
+            'MUX_RESERVATION_RECONSTRUCTION_MISMATCH',
+            `unwritten reserved byte ${position} is nonzero in final output`,
+          );
+        }
+      }
+    }
+  }
+  const merged = mergeRanges([...allRanges, ...reservations]);
   if (merged.length !== 1 || merged[0]!.start !== 0 || merged[0]!.end !== finalBytes.byteLength) {
     return muxVerdict('FAIL', 'MUX_WRITE_RECONSTRUCTION_GAP', 'positioned writes do not cover every final output byte exactly');
   }
@@ -306,6 +335,30 @@ function validRange(position: number, length: number, extent: number): boolean {
 
 function overlaps(a: { start: number; end: number }, b: { start: number; end: number }): boolean {
   return a.start < b.end && b.start < a.end;
+}
+
+function rangeCoveredBy(
+  range: { start: number; end: number },
+  ranges: readonly { start: number; end: number }[],
+): boolean {
+  return mergeRanges(ranges).some((candidate) => candidate.start <= range.start && candidate.end >= range.end);
+}
+
+function subtractCoveredRange(
+  range: { start: number; end: number },
+  covered: readonly { start: number; end: number }[],
+): Array<{ start: number; end: number }> {
+  const out: Array<{ start: number; end: number }> = [];
+  let cursor = range.start;
+  for (const item of mergeRanges(covered)) {
+    if (item.end <= cursor) continue;
+    if (item.start >= range.end) break;
+    if (item.start > cursor) out.push({ start: cursor, end: Math.min(item.start, range.end) });
+    cursor = Math.max(cursor, item.end);
+    if (cursor >= range.end) break;
+  }
+  if (cursor < range.end) out.push({ start: cursor, end: range.end });
+  return out;
 }
 
 function mergeRanges(ranges: readonly { start: number; end: number }[]): Array<{ start: number; end: number }> {

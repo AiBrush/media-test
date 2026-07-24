@@ -5,6 +5,7 @@ import type { InputTrack } from 'mediabunny';
 import {
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  isMalformedInputError,
   isNotApplicableError,
   type DemuxResult,
   type EncodedTracks,
@@ -13,6 +14,8 @@ import {
 } from '../src/core/engine.ts';
 import { isCorpusDeliveryIntegrityError, sha256Hex as selectionSha256Hex } from '../src/core/media-selection.ts';
 import { HLS_PLAYLIST_ONLY_CONTRACT } from '../src/features/probe/hls.ts';
+import { evaluateStrictStreamCopy } from '../src/features/remux/strict-copy.ts';
+import { inspectTrimAudioContainer } from '../src/features/trim/audio.ts';
 import {
   MediabunnyEngine,
   applyObservedAudioPresentationEvidence,
@@ -23,6 +26,7 @@ import {
   hlsKeyUrisFromPlaylist,
   normalizeTrack,
   representationForCodec,
+  selectMediabunnyCopyTrimChunks,
   type MediabunnyHlsReadTrace,
   type MediabunnyAuthenticatedRangeTrace,
 } from '../src/engines/mediabunny/adapter.ts';
@@ -924,6 +928,226 @@ describe('REQ-ENG-02/04: strict packet-copy remux and mux contract', () => {
       expect(after.representations?.[0]?.description).toEqual(before.representations?.[0]?.description);
       expect(media.telemetry).toMatchObject({ bytesWritten: media.bytes.byteLength });
     });
+  });
+
+  test('prepared timescales are always safe integers and reserve mux derives its exact packet bound', async () => {
+    await withEngine(async (engine) => {
+      const mp3 = await engine.prepareMuxTracks([await fixture('mp3_xing.mp3')]);
+      expect(mp3.tracks.every((track) => Number.isSafeInteger(track.timescale) && track.timescale > 0)).toBe(true);
+
+      const prepared = await engine.prepareMuxTracks([await fixture('micro_h264_1frame.mp4')]);
+      const media = await engine.mux(prepared, {
+        container: 'mp4',
+        fastStart: 'reserve',
+        target: 'stream',
+      });
+      expect(media.bytes.byteOffset).toBe(0);
+      expect(media.bytes.buffer.byteLength).toBe(media.bytes.byteLength);
+      expect((media as { targetTelemetry?: { reserveMaximumPacketCount?: number } }).targetTelemetry)
+        .toMatchObject({ reserveMaximumPacketCount: 1 });
+    });
+  });
+
+  test('declared-illegal codec/container and empty-track rows reject through the typed malformed channel', async () => {
+    await withEngine(async (engine) => {
+      const controller = new AbortController();
+      const contextFor = (
+        scenarioId: string,
+        input: MediaInput,
+        container: string,
+        tracks: NormalizedTrack[],
+      ) => ({
+        signal: controller.signal,
+        phase: 'functional' as const,
+        emit: () => undefined,
+        checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+        request: {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId,
+          operation: 'mux' as const,
+          inputs: [{
+            id: input.id,
+            mime: input.mime,
+            container: input.id.endsWith('.wav') ? 'wav' : 'mp4',
+            mutated: false,
+            tracks,
+          }],
+          output: { container },
+          options: { container },
+        },
+      });
+
+      const h264 = await fixture('micro_h264_1frame.mp4');
+      const h264Tracks = await engine.prepareMuxTracks([h264]);
+      await expect(engine.mux(
+        h264Tracks,
+        { container: 'ogg' },
+        contextFor('mux/neg_h264_into_ogg_illegal', h264, 'ogg', [
+          { type: 'video', codec: 'h264', width: 320, height: 240 },
+        ]),
+      )).rejects.toMatchObject({ reasonCode: 'MEDIABUNNY_ILLEGAL_MUX_REJECTED' });
+
+      const empty = await fixture('empty_audio.wav');
+      const emptyContext = contextFor('mux/neg_zero_tracks_empty_audio_to_mp4', empty, 'mp4', [
+        { type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 2 },
+      ]);
+      const emptyTracks = await engine.prepareMuxTracks([empty], { container: 'mp4' }, emptyContext);
+      expect(emptyTracks.tracks).toHaveLength(1);
+      expect(emptyTracks.tracks[0]?.chunks).toHaveLength(0);
+      await expect(engine.mux(emptyTracks, { container: 'mp4' }, emptyContext))
+        .rejects.toMatchObject({ reasonCode: 'MEDIABUNNY_ILLEGAL_MUX_REJECTED' });
+    });
+  });
+
+  test('unchanged AAC config and access units make contradictory container facts representational', async () => {
+    await withEngine(async (engine) => {
+      const bytes = new Uint8Array(await readFile(new URL(
+        '../fixtures/media/scenarios/mux/size_tiny_360p_to_mp4/02.mp4',
+        import.meta.url,
+      )));
+      const input = memoryInput('02.mp4', bytes);
+      const prepared = await engine.prepareMuxTracks([input]);
+      const media = await engine.mux(prepared, { container: 'mp4' });
+      expect(evaluateStrictStreamCopy(bytes, 'mp4', media.bytes, 'mp4').outcome).toMatchObject({
+        state: 'VERDICT',
+        verdict: 'PASS',
+        reasonCode: 'REMUX_VALID_REPRESENTATION_DIFFERENCE',
+      });
+    });
+  });
+
+  test('packet-copy trim preserves ISO display rotation without baking or dropping it', async () => {
+    await withEngine(async (engine) => {
+      const input = await fixture('h264_rotated90.mp4');
+      const prepared = await engine.prepareMuxTracks([input]);
+      expect(prepared.tracks.find((track) => track.type === 'video')).toMatchObject({
+        width: 1_280,
+        height: 720,
+        rotation: 90,
+      });
+
+      const media = await engine.trim(
+        input,
+        { startUs: 2_000_000, endUs: 7_000_000 },
+        { container: 'mp4', frameAccurate: false },
+      );
+      const metadata = await engine.probe(memoryInput('trimmed-rotated.mp4', media.bytes));
+      expect(metadata.tracks.find((track) => track.type === 'video')).toMatchObject({
+        width: 1_280,
+        height: 720,
+        rotation: 90,
+      });
+    });
+  });
+
+  test('VP9 WebM packet-copy trim preserves separately encoded alpha access units', async () => {
+    await withEngine(async (engine) => {
+      const input = await fixture('vp9_alpha.webm');
+      const prepared = await engine.prepareMuxTracks([input]);
+      const video = prepared.tracks.find((track) => track.type === 'video');
+      expect(video).toBeDefined();
+      if (!video) throw new Error('VP9 alpha fixture has no prepared video track');
+
+      const selected = selectMediabunnyCopyTrimChunks(
+        video.chunks,
+        'video',
+        { startUs: 1_000_000, endUs: 3_000_000 },
+      );
+      const expectedAlpha = selected.flatMap((chunk) =>
+        chunk.alphaData ? [selectionSha256Hex(chunk.alphaData)] : []
+      );
+      expect(expectedAlpha.length).toBeGreaterThan(0);
+      expect(selected.find((chunk) => chunk.alphaData)?.alphaData)
+        .not.toBe(video.chunks.find((chunk) => chunk.alphaData)?.alphaData);
+
+      const media = await engine.mux(
+        { tracks: [{ ...video, chunks: selected }] },
+        { container: 'webm' },
+      );
+      const reparsed = await engine.prepareMuxTracks([
+        memoryInput('trimmed-vp9-alpha.webm', media.bytes, 'video/webm'),
+      ]);
+      const actualAlpha = reparsed.tracks[0]?.chunks.flatMap((chunk) =>
+        chunk.alphaData ? [selectionSha256Hex(chunk.alphaData)] : []
+      ) ?? [];
+      expect(actualAlpha).toEqual(expectedAlpha);
+    });
+  });
+
+  test('Ogg Opus packet-copy trim preserves payloads while authoring exact pre-roll and end trim', async () => {
+    await withEngine(async (engine) => {
+      const input = await fixture('opus.ogg');
+      const source = await engine.prepareMuxTracks([input]);
+      const sourceTrack = source.tracks[0]!;
+      const selected = selectMediabunnyCopyTrimChunks(
+        sourceTrack.chunks,
+        'audio',
+        { startUs: 2_000_000, endUs: 7_000_000 },
+        { audioPrerollUs: 1_340_000 },
+      );
+      const expectedPayloads = selected.map((chunk) => selectionSha256Hex(chunk.data));
+
+      const media = await engine.trim(
+        input,
+        { startUs: 2_000_000, endUs: 7_000_000 },
+        { container: 'ogg', frameAccurate: false },
+      );
+      expect(inspectTrimAudioContainer(media.bytes, 'ogg')).toMatchObject({
+        state: 'OK',
+        value: {
+          codedSampleFrames: 305_280,
+          presentationSampleFrames: 240_000,
+          primingSampleFrames: 64_632,
+          endTrimSampleFrames: 648,
+        },
+      });
+      const reparsed = await engine.prepareMuxTracks([
+        memoryInput('trimmed-opus.ogg', media.bytes, 'audio/ogg'),
+      ]);
+      expect(reparsed.tracks[0]?.chunks.map((chunk) => selectionSha256Hex(chunk.data)))
+        .toEqual(expectedPayloads);
+    });
+  });
+
+  test('a trim range entirely past EOF is a typed boundary rejection, not engine inapplicability', async () => {
+    await withEngine(async (engine) => {
+      const input = await fixture('micro_h264_1frame.mp4');
+      let thrown: unknown;
+      try {
+        await engine.trim(
+          input,
+          { startUs: 40_000_000, endUs: 45_000_000 },
+          { container: 'mp4', frameAccurate: false },
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(isMalformedInputError(thrown)).toBe(true);
+      expect(thrown).toMatchObject({ reasonCode: 'MEDIABUNNY_TRIM_RANGE_OUTSIDE_MEDIA_REJECTED' });
+      expect(isNotApplicableError(thrown)).toBe(false);
+    });
+  });
+
+  test('copy selection remains stack-safe at the 216k-frame massive rung', () => {
+    const payload = new Uint8Array([1]);
+    const chunks: EncodedTracks['tracks'][number]['chunks'] = Array.from(
+      { length: 216_000 },
+      (_, index) => ({
+        data: payload,
+        ptsUs: Math.round(index * 1_000_000 / 30),
+        decodeIndex: index,
+        durationUs: Math.round(1_000_000 / 30),
+        keyframe: index % 60 === 0,
+      }),
+    );
+    const selected = selectMediabunnyCopyTrimChunks(
+      chunks,
+      'video',
+      { startUs: 3_600_000_000, endUs: 3_660_000_000 },
+    );
+    expect(selected.length).toBeGreaterThan(1_700);
+    expect(selected[0]).toMatchObject({ keyframe: true, decodeIndex: 0 });
+    expect(selected.at(-1)!.ptsUs).toBeLessThan(3_660_000_000);
   });
 
   test('B-frame, VFR, and multitrack MP4 round trips retain content, cadence, and every track', async () => {

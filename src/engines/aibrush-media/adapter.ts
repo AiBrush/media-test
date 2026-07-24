@@ -61,6 +61,11 @@ import {
 import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
 import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
+import { compareStrictRemuxPrograms } from '../../features/remux/strict-copy.ts';
+import {
+  readIsoBmffPresentationTimeline,
+  selectIsoBmffTrimWindows,
+} from '../../features/trim/isobmff-timeline.ts';
 import type {
   RemuxProgramEvidence,
   RemuxSampleEvidence,
@@ -156,7 +161,7 @@ class GracefulRejectionError extends MalformedInputError {
 }
 
 const MALFORMED_INPUT_RE =
-  /(^|[/_-])(fuzz|malformed|truncated|zeroed|zero[-_]?length|header[-_]?destroyed|headerless|ciphertext|corrupt|mislabeled)([/_.-]|$)/i;
+  /(^|[/_-])(fuzz|malformed|truncated|bit[-_]?flipped|zeroed|zero[-_]?length|header[-_]?destroyed|headerless|ciphertext|corrupt|mislabeled)([/_.-]|$)/i;
 
 function isMalformedHarnessInput(input: MediaInput | undefined): boolean {
   if (input === undefined) return false;
@@ -164,6 +169,7 @@ function isMalformedHarnessInput(input: MediaInput | undefined): boolean {
 }
 
 function isGracefulNegativeContext(context?: OperationContext): boolean {
+  if (context?.request.scenarioId.startsWith('trim/robust_') === true) return true;
   if (context?.request.options.gracefulAllowOutput === true) return true;
   const robustness = context?.request.options.robustness;
   return typeof robustness === 'object' &&
@@ -751,7 +757,20 @@ interface AibrushTrackInfo {
   id: number;
   mediaType: 'video' | 'audio';
   codec?: string;
+  nonMedia?: true;
   durationSec?: number;
+  rotation?: number;
+  fps?: number;
+  alpha?: boolean;
+  containerSideData?: readonly {
+    readonly kind: 'matroska-attachments';
+    readonly attachedFilePayloads: readonly Uint8Array[];
+  }[];
+  containerProjection?: {
+    readonly kind: 'matroska-attachment';
+    readonly sideDataIndex: number;
+    readonly attachmentIndex: number;
+  };
   gapless?: {
     readonly leadingSamples?: number;
     readonly trailingSamples?: number;
@@ -3259,6 +3278,348 @@ const FINITE_WEBM_CLUSTER_REPAIR_MAX_SOURCE_BYTES = 2 * 1024 * 1024;
 interface PreparedAibrushPacketTrack {
   readonly track: AibrushTrackInfo;
   readonly packets: readonly AibrushPacket[];
+}
+
+/**
+ * Select the exact source-coded sample indices for a keyframe/copy trim. Selection is made on each
+ * track's presentation axis, then a video start is backed up to the preceding sync sample. Keeping
+ * this byte-table rule identical to the neutral oracle avoids the framework's two known ambiguities:
+ * a DTS-based MP4 tail and a WebM end boundary that accidentally consumes the following GOP.
+ */
+export function selectAibrushCopyTrimSampleIndices(
+  track: RemuxTrackEvidence,
+  range: { readonly startUs: number; readonly endUs: number },
+): number[] {
+  const samples = track.samples;
+  let presentationOriginUs = Number.POSITIVE_INFINITY;
+  for (const sample of samples) {
+    if (sample.ptsUs !== undefined) presentationOriginUs = Math.min(presentationOriginUs, sample.ptsUs);
+  }
+  if (!Number.isFinite(presentationOriginUs)) return [];
+  const sourcePtsUs = (sample: RemuxSampleEvidence): number =>
+    (sample.ptsUs ?? Number.POSITIVE_INFINITY) - presentationOriginUs;
+  const durationAt = (index: number): number | undefined => {
+    const sample = samples[index];
+    if (sample === undefined || sample.ptsUs === undefined) return undefined;
+    if (sample.durationUs !== undefined && sample.durationUs > 0) return sample.durationUs;
+    // The video oracle intentionally requires an independently parsed sample duration before it
+    // chooses the first overlap. Infer only audio packet durations, whose cadence is unambiguous from
+    // adjacent PTS values in formats such as WebM/Matroska.
+    if (track.type === 'video') return undefined;
+    const next = samples.slice(index + 1).find((candidate) =>
+      candidate.ptsUs !== undefined && candidate.ptsUs > sample.ptsUs!);
+    if (next?.ptsUs !== undefined) return next.ptsUs - sample.ptsUs;
+    const previous = [...samples.slice(0, index)].reverse().find((candidate) =>
+      candidate.ptsUs !== undefined && candidate.ptsUs < sample.ptsUs!);
+    return previous?.ptsUs === undefined ? undefined : sample.ptsUs - previous.ptsUs;
+  };
+  let first = samples.findIndex((sample, index) => {
+    if (sample.ptsUs === undefined) return false;
+    const durationUs = durationAt(index);
+    if (durationUs === undefined) return false;
+    const ptsUs = sourcePtsUs(sample);
+    return ptsUs < range.endUs && ptsUs + durationUs > range.startUs;
+  });
+  if (first < 0) return [];
+  if (track.type === 'video' && samples[first]?.keyframe !== true) {
+    for (let index = first; index >= 0; index--) {
+      if (samples[index]?.keyframe === true) {
+        first = index;
+        break;
+      }
+    }
+  }
+  const indices: number[] = [];
+  for (let index = first; index < samples.length; index++) {
+    const sample = samples[index];
+    if (
+      sample !== undefined &&
+      sample.ptsUs !== undefined &&
+      (track.type !== 'video' || sample.durationUs !== undefined) &&
+      sourcePtsUs(sample) < range.endUs
+    ) {
+      indices.push(index);
+    }
+  }
+  return indices;
+}
+
+function selectedAibrushCopyTrimTrack(
+  track: RemuxTrackEvidence,
+  range: { readonly startUs: number; readonly endUs: number },
+): { readonly track: RemuxTrackEvidence; readonly indices: readonly number[] } | undefined {
+  const indices = selectAibrushCopyTrimSampleIndices(track, range);
+  if (indices.length === 0) return undefined;
+  return {
+    track: { ...track, samples: indices.map((index) => track.samples[index]!) },
+    indices,
+  };
+}
+
+function aibrushTrimmedTrackInfo(track: AibrushTrackInfo): AibrushTrackInfo {
+  // Source-wide duration/gapless facts must not be copied onto a sub-range. Both prepared writers
+  // derive the new finite duration from the selected packet timeline.
+  const { durationSec: _durationSec, gapless: _gapless, ...trimmed } = track;
+  return trimmed;
+}
+
+function aibrushTrimmedIsoTrackInfo(track: AibrushTrackInfo): AibrushTrackInfo {
+  const trimmed = aibrushTrimmedTrackInfo(track);
+  if (trimmed.mediaType !== 'video') return trimmed;
+  // The prepared ISO writer otherwise derives a coarse clock from Math.round(fps)*1000. Omitting the
+  // rounded aggregate FPS selects its exact 90 kHz video clock and keeps long VFR timelines within the
+  // neutral reader's 1 ms packet-timestamp bound.
+  const { fps: _fps, ...precise } = trimmed;
+  return precise;
+}
+
+function sameAibrushBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function proveAibrushPreparedCopyTrim(
+  source: RemuxProgramEvidence,
+  selected: readonly RemuxTrackEvidence[],
+  output: Uint8Array,
+  container: string,
+): boolean {
+  const read = readNeutralRemuxProgram(output, container);
+  if (read.state !== 'OK') return false;
+  if (read.value.tracks.length !== selected.length) return false;
+  const { durationUs: _durationUs, ...sourceWithoutDuration } = source;
+  const selectedVideo = selected.filter((track) => track.type === 'video');
+  const outputVideo = read.value.tracks.filter((track) => track.type === 'video');
+  const expectedTracks = selectedVideo.length > 0 ? selectedVideo : selected;
+  const candidateTracks = selectedVideo.length > 0 ? outputVideo : read.value.tracks;
+  const terminalDurationBandUs = expectedTracks.reduce((maximum, track) => {
+    return track.samples.reduce((trackMaximum, sample) => {
+      const durationUs = sample.durationUs ?? 0;
+      const reorderUs = sample.ptsUs === undefined || sample.dtsUs === undefined
+        ? 0
+        : Math.abs(sample.ptsUs - sample.dtsUs);
+      return Math.max(trackMaximum, durationUs + reorderUs);
+    }, maximum);
+  }, 0);
+  const comparison = compareStrictRemuxPrograms(
+    { ...sourceWithoutDuration, tracks: expectedTracks },
+    { ...read.value, tracks: candidateTracks },
+    {
+      expectedTargetContainer: container,
+      surfaceRepresentationDifferences: false,
+      // A muxer must infer the terminal sample duration because there is no following DTS/PTS gap.
+      // Admit exactly the independently observed final source-sample band, plus timestamp rounding.
+      tolerance: { timestampUs: 2_000, durationUs: Math.max(2_000, terminalDurationBandUs + 2_000) },
+    },
+  );
+  return comparison.outcome.state === 'VERDICT' && comparison.outcome.verdict === 'PASS';
+}
+
+async function tryStrictPreparedAibrushCopyTrim(
+  core: AibrushCore,
+  engine: AibrushEngine,
+  input: MediaInput,
+  range: { readonly startUs: number; readonly endUs: number },
+  target: string,
+  signal: AbortSignal,
+): Promise<Uint8Array | undefined> {
+  const sourceContainer = containerFromInput(input);
+  if (
+    input.mutated ||
+    sourceContainer !== target ||
+    range.startUs < 0 ||
+    range.endUs <= range.startUs ||
+    (sourceContainer !== 'mp4' && sourceContainer !== 'mov' &&
+      sourceContainer !== 'webm' && sourceContainer !== 'mkv' && sourceContainer !== 'ts')
+  ) {
+    return undefined;
+  }
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return undefined;
+  const read = readNeutralRemuxProgram(bytes, sourceContainer);
+  if (read.state !== 'OK') return undefined;
+  const evidenceTracks = mediaEvidenceTracks(read.value);
+  if (evidenceTracks === undefined) return undefined;
+  const selections = evidenceTracks.map((track) => selectedAibrushCopyTrimTrack(track, range));
+  if (selections.some((selection) => selection === undefined)) return undefined;
+  const completeSelections = selections as readonly NonNullable<(typeof selections)[number]>[];
+  const selectedEvidence = completeSelections.map((selection) => selection.track);
+
+  if (sourceContainer === 'mp4' || sourceContainer === 'mov') {
+    const table = await core.mp4PacketInfoFromBytes(bytes, { includeOffsets: true, signal });
+    const used = new Set<number>();
+    const tracks: PreparedAibrushPacketTrack[] = [];
+    for (const selection of completeSelections) {
+      const matched = matchAibrushTrack(table.tracks, selection.track, used);
+      const packets = packetsFromEvidenceTrack(selection.track);
+      if (matched === undefined || packets === undefined) return undefined;
+      tracks.push({ track: aibrushTrimmedIsoTrackInfo(matched.track), packets });
+    }
+    if (tracks.length !== table.tracks.length) return undefined;
+    signal.throwIfAborted();
+    const output = core.muxPreparedMp4PacketTracks({
+      tracks,
+      container: target,
+      faststart: true,
+      fragmented: false,
+    });
+    return proveAibrushPreparedCopyTrim(read.value, selectedEvidence, output, target) ? output : undefined;
+  }
+
+  if (sourceContainer === 'webm' || sourceContainer === 'mkv') {
+    const table = core.webmPacketPayloadInfoFromBytes(bytes);
+    const used = new Set<number>();
+    const tracks: Array<{
+      readonly track: AibrushTrackInfo;
+      readonly chunks: readonly AibrushPreparedWebmChunk[];
+    }> = [];
+    for (const selection of completeSelections) {
+      const matched = matchAibrushTrack(table.tracks, selection.track, used);
+      if (matched === undefined) return undefined;
+      const rows = table.packets.filter((row) => row.trackIndex === matched.index);
+      if (
+        rows.length !== evidenceTracks[completeSelections.indexOf(selection)]?.samples.length ||
+        rows.some((row, index) => !sameAibrushBytes(row.data, evidenceTracks[completeSelections.indexOf(selection)]!.samples[index]!.payload))
+      ) {
+        return undefined;
+      }
+      const chunks: AibrushPreparedWebmChunk[] = [];
+      let matroskaVideoDecodeUs: number | undefined;
+      for (let selectedIndex = 0; selectedIndex < selection.indices.length; selectedIndex++) {
+        const sourceIndex = selection.indices[selectedIndex]!;
+        const row = rows[sourceIndex];
+        const sample = selection.track.samples[selectedIndex];
+        if (row === undefined || sample?.ptsUs === undefined) return undefined;
+        const durationUs = sample.durationUs ?? row.durationUs;
+        const preserveMatroskaDecodeOrder = sourceContainer === 'mkv' && matched.track.mediaType === 'video';
+        const dtsUs = preserveMatroskaDecodeOrder
+          ? (matroskaVideoDecodeUs ?? Math.round(sample.ptsUs))
+          : sample.dtsUs ?? row.dtsUs;
+        chunks.push({
+          timestampUs: Math.round(sample.ptsUs),
+          ...(durationUs !== undefined
+            ? { durationUs: Math.max(0, Math.round(durationUs)) }
+            : {}),
+          key: sample.keyframe ?? row.keyframe,
+          data: row.data,
+          ...(dtsUs !== undefined
+            ? { dtsUs: Math.round(dtsUs) }
+            : {}),
+          ...(row.alpha !== undefined ? { alpha: row.alpha } : {}),
+        });
+        if (preserveMatroskaDecodeOrder) {
+          matroskaVideoDecodeUs = (dtsUs ?? sample.ptsUs) + Math.max(1, Math.round(durationUs ?? 1));
+        }
+      }
+      if (chunks.length === 0) return undefined;
+      tracks.push({ track: aibrushTrimmedTrackInfo(matched.track), chunks });
+    }
+    // Matroska attachments are enumerated as projection tracks but are container side data, not timed
+    // Blocks. Retain their exact AttachedFile bundles as zero-chunk projection entries; the prepared
+    // muxer consumes those entries before its ordinary no-packets guard.
+    for (let index = 0; index < table.tracks.length; index++) {
+      if (used.has(index)) continue;
+      const track = table.tracks[index];
+      if (track?.containerProjection === undefined) return undefined;
+      tracks.push({ track: aibrushTrimmedTrackInfo(track), chunks: [] });
+    }
+    if (tracks.length !== table.tracks.length) return undefined;
+    signal.throwIfAborted();
+    const output = core.muxPreparedWebmChunkTracks({ tracks, container: target });
+    return proveAibrushPreparedCopyTrim(read.value, selectedEvidence, output, target) ? output : undefined;
+  }
+
+  const demuxed = await engine.demux(
+    engine.from(bytes, { mime: input.mime, size: bytes.byteLength }),
+    { signal },
+  );
+  try {
+    const used = new Set<number>();
+    const tracks: PreparedAibrushPacketTrack[] = [];
+    for (const selection of completeSelections) {
+      const matched = matchAibrushTrack(demuxed.tracks, selection.track, used);
+      if (matched === undefined) return undefined;
+      const packets = await packetsWithCorrectedTsTimeline(demuxed, matched.track, evidenceTracks[tracks.length]!);
+      if (packets === undefined) return undefined;
+      const selectedPackets = selection.indices.map((index) => packets[index]).filter(
+        (packet): packet is AibrushPacket => packet !== undefined,
+      );
+      if (selectedPackets.length !== selection.indices.length) return undefined;
+      tracks.push({ track: aibrushTrimmedTrackInfo(matched.track), packets: selectedPackets });
+    }
+    if (tracks.length !== demuxed.tracks.length) return undefined;
+    signal.throwIfAborted();
+    const output = core.muxPreparedMpegTsPacketTracks({ tracks, container: 'ts' });
+    return proveAibrushPreparedCopyTrim(read.value, selectedEvidence, output, target) ? output : undefined;
+  } finally {
+    await demuxed.close();
+  }
+}
+
+async function aibrushFrameAccurateRange(
+  input: MediaInput,
+  range: { readonly startUs: number; readonly endUs: number },
+): Promise<{ readonly startUs: number; readonly endUs: number }> {
+  const container = containerFromInput(input);
+  if (
+    input.mutated ||
+    (container !== 'mp4' && container !== 'mov') ||
+    range.startUs < 0 ||
+    range.endUs <= range.startUs
+  ) {
+    return range;
+  }
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return range;
+  const timeline = readIsoBmffPresentationTimeline(bytes);
+  if (timeline.state !== 'OK') return range;
+  const video = selectIsoBmffTrimWindows(timeline, range, 'frame-accurate')
+    .find((window) => window.type === 'video');
+  if (video === undefined) return range;
+  const overlappingLeadUs = range.startUs - video.landedStartUs;
+  // A displayed sample can begin before the requested point while still intersecting the half-open
+  // range. Route from that independently parsed presentation start so the complete sample is retained
+  // for both CFR quantization and long VFR frames.
+  return overlappingLeadUs > 0
+    ? { startUs: video.landedStartUs, endUs: range.endUs }
+    : range;
+}
+
+async function aibrushMatroskaKeyframeRange(
+  input: MediaInput,
+  range: { readonly startUs: number; readonly endUs: number },
+): Promise<{ readonly startUs: number; readonly endUs: number }> {
+  const container = containerFromInput(input);
+  if (
+    input.mutated ||
+    isMalformedHarnessInput(input) ||
+    (container !== 'webm' && container !== 'mkv') ||
+    range.startUs < 0 ||
+    range.endUs <= range.startUs
+  ) {
+    return range;
+  }
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  if (bytes === undefined) return range;
+  const read = readNeutralRemuxProgram(bytes, container);
+  if (read.state !== 'OK') return range;
+  const video = read.value.tracks.find((track) => track.type === 'video');
+  if (video === undefined) return range;
+  const indices = selectAibrushCopyTrimSampleIndices(video, range);
+  const first = indices.length > 0 ? video.samples[indices[0]!] : undefined;
+  if (first?.ptsUs === undefined) return range;
+  const presentationOriginUs = video.samples.reduce(
+    (minimum, sample) => sample.ptsUs === undefined ? minimum : Math.min(minimum, sample.ptsUs),
+    Number.POSITIVE_INFINITY,
+  );
+  if (!Number.isFinite(presentationOriginUs)) return range;
+  const landedStartUs = Math.max(0, Math.round(first.ptsUs - presentationOriginUs));
+  return landedStartUs < range.startUs
+    ? { startUs: landedStartUs, endUs: range.endUs }
+    : range;
 }
 
 function plainBufferedPreparedRemux(opts: RemuxOptions): boolean {
@@ -5990,6 +6351,12 @@ export class AibrushMediaEngine implements MediaEngine {
     }
     return this.#run('trim', 'framework.trim', context, async (signal) => {
       try {
+        // Robustness inputs are intentionally malformed. Refuse them before a framework call can
+        // return superficially muxed bytes whose corruption is discovered only by the runner's
+        // post-operation decoder; a typed clean rejection is the robustness contract's safe outcome.
+        if (isMalformedHarnessInput(input)) {
+          throw new GracefulRejectionError('trim', 'intentionally malformed trim input rejected');
+        }
         if (!opts.frameAccurate && !input.mutated && containerFromInput(input) === 'adts') {
           const bytes = await this.#driverCore().adtsTrimFromUrl(input.url, {
             mime: input.mime,
@@ -6016,14 +6383,34 @@ export class AibrushMediaEngine implements MediaEngine {
           return { bytes, mime: outputMime(opts.container), container: opts.container };
         }
         const engine = this.#engine();
+        if (
+          !opts.frameAccurate &&
+          !isGracefulNegativeContext(context) &&
+          context?.request.options.invariant !== 'trim-noop-semantic-identity'
+        ) {
+          const prepared = await tryStrictPreparedAibrushCopyTrim(
+            this.#driverCore(),
+            engine,
+            input,
+            range,
+            opts.container.toLowerCase(),
+            signal,
+          );
+          if (prepared !== undefined) {
+            return { bytes: prepared, mime: outputMime(opts.container), container: opts.container };
+          }
+        }
+        const effectiveRange = opts.frameAccurate
+          ? await aibrushFrameAccurateRange(input, range)
+          : await aibrushMatroskaKeyframeRange(input, range);
         // Frame-accurate trim routes to the engine's accurate codec-seam path (ADR-082); keyframe trim is
         // the lossless stream-copy. A codec the browser cannot decode for the accurate path surfaces as a
         // typed CapabilityError → NA via naIfMiss, never a wrong/incomplete clip.
         const out = await engine.trim(
           await this.#src(engine, input),
           {
-            start: range.startUs / 1e6,
-            end: range.endUs / 1e6,
+            start: effectiveRange.startUs / 1e6,
+            end: effectiveRange.endUs / 1e6,
             mode: opts.frameAccurate ? 'accurate' : 'keyframe',
             sink: { kind: 'stream' },
           },
@@ -6031,7 +6418,17 @@ export class AibrushMediaEngine implements MediaEngine {
         );
         return toMediaBytes(out, opts.container);
       } catch (e) {
-        return this.#naIfMiss('trim', e, input);
+        try {
+          return this.#naIfMiss('trim', e, input);
+        } catch (translated) {
+          if (
+            (isGracefulNegativeContext(context) || isMalformedHarnessInput(input)) &&
+            !preserveProbeError(translated)
+          ) {
+            throw new GracefulRejectionError('trim', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

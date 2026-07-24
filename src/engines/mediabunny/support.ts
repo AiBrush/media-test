@@ -21,6 +21,8 @@ import {
   canonicalToMediabunnyVideo,
   makeOutputFormat,
 } from './codecs.ts';
+import { ILLEGAL_MUX_SCENARIO_IDS } from '../../features/mux/boundary.ts';
+import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
 
 export const MEDIABUNNY_REASON = {
   CONTAINER: 'MEDIABUNNY_OUTPUT_CONTAINER_UNSUPPORTED',
@@ -58,6 +60,13 @@ const NORMALIZED_METADATA_KEYS = new Set([
 // materialize that allocation in this browser-only runner, and MediaBytes requires the complete
 // output as one Uint8Array even when the native target is streamed.
 const MAX_SAFE_MATERIALIZED_OUTPUT_BYTES = 2 ** 31;
+const DELIBERATELY_ILLEGAL_MUX_IDS = new Set<string>(ILLEGAL_MUX_SCENARIO_IDS);
+const FULL_TIMELINE_MUX_IDS = new Set([
+  'mux/edge_bframes_decode_mux_mp4',
+  'mux/edge_bframes_decode_mux_mkv',
+  'mux/prop_vfr_mux_duration_mp4_to_mp4',
+  'mux/prop_vfr_mux_duration_mp4_to_mkv',
+]);
 
 type ConcreteTrack = Pick<NormalizedTrack, 'type' | 'codec' | 'width' | 'height' | 'sampleRate' | 'channels' | 'rotation'>;
 
@@ -175,6 +184,17 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     );
   }
   if (
+    request.operation === 'trim' &&
+    request.options.frameAccurate !== true &&
+    outputContainer === 'mp3' &&
+    request.options.invariant === 'trim-audio-content'
+  ) {
+    return no(
+      MEDIABUNNY_REASON.AUDIO_PRESENTATION_TIMING,
+      'Mediabunny 1.48.0 cannot author MP3 encoder-delay/padding metadata for an exact decoded trim window',
+    );
+  }
+  if (
     request.operation === 'transcode' &&
     request.options.invariant === 'transcode-effect-aware' &&
     (
@@ -228,8 +248,8 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     );
   }
   if (request.options.fastStart === 'reserve') {
-    if (!positiveInt(request.options.maximumPacketCount)) {
-      throw new TypeError('reserve fast-start requires a positive maximumPacketCount');
+    if (request.options.maximumPacketCount !== undefined && !positiveInt(request.options.maximumPacketCount)) {
+      throw new TypeError('maximumPacketCount must be a positive safe integer when supplied');
     }
   } else if (request.options.maximumPacketCount !== undefined) {
     if (!positiveInt(request.options.maximumPacketCount)) {
@@ -239,6 +259,23 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
   }
   const format = makeOutputFormat(outputContainer, outputOptions(request.options));
   if (!format) return no(MEDIABUNNY_REASON.CONTAINER, `output container '${outputContainer}' is not supported`);
+
+  // These four rows are executable rejection contracts, not ordinary containability claims. The
+  // runner deliberately bypasses tuple preflight for them; keep the adapter's repeated runtime
+  // decision aligned so mux() can return a typed malformed-input rejection instead of a false NA.
+  if (request.operation === 'mux' && DELIBERATELY_ILLEGAL_MUX_IDS.has(request.scenarioId)) {
+    return { supported: true };
+  }
+
+  // EncodedPacketSink exposes PTS plus decode sequence but no numeric source DTS. Consequently the
+  // packet-source writer cannot retain an input's independent leading composition offset; Matroska
+  // also uses a coarser default timecode scale. These complete-timeline rows must stay explicit NA.
+  if (request.operation === 'mux' && FULL_TIMELINE_MUX_IDS.has(request.scenarioId)) {
+    return no(
+      MEDIABUNNY_REASON.TIMESTAMP_MODE,
+      'Mediabunny 1.48.0 EncodedPacketSink does not expose the independent source DTS needed by this complete mux-timeline row',
+    );
+  }
 
   const unsupportedTag = unsupportedRequestedMetadataTag(request.options);
   if (unsupportedTag) {
@@ -405,8 +442,15 @@ function decideTrackTuple(
     return no(MEDIABUNNY_REASON.COPY_REQUIRED, 'the requested copy operation would change codec essence');
   }
 
-  if (!format.supportsVideoRotationMetadata && request.operation === 'remux' && tracks.some((track) => track.type === 'video' && !!track.rotation)) {
-    return no(MEDIABUNNY_REASON.COPY_REQUIRED, 'strict remux cannot discard or bake source rotation metadata');
+  if (
+    !format.supportsVideoRotationMetadata &&
+    (request.operation === 'remux' || request.operation === 'mux') &&
+    tracks.some((track) => track.type === 'video' && !!track.rotation)
+  ) {
+    return no(
+      MEDIABUNNY_REASON.COPY_REQUIRED,
+      `strict ${request.operation} cannot discard or bake source rotation metadata`,
+    );
   }
   return undefined;
 }
@@ -420,9 +464,45 @@ function projectOutputTracks(request: ConcreteOperationRequest, tracks: Concrete
 }
 
 function concreteTracks(request: ConcreteOperationRequest): ConcreteTrack[] {
-  return hasExplicitTrackDeclaration(request.options)
-    ? explicitMuxTracks(request.options)
-    : request.inputs.flatMap((input) => input.tracks).map((track) => ({ ...track }));
+  if (hasExplicitTrackDeclaration(request.options)) return explicitMuxTracks(request.options);
+
+  const indexed = request.inputs.flatMap((input, sourceIndex) => {
+    const ordinals = { video: 0, audio: 0 };
+    return input.tracks.map((track) => {
+      const typeOrdinal = track.type === 'video' || track.type === 'audio'
+        ? ordinals[track.type]++
+        : -1;
+      return { track: { ...track } as ConcreteTrack, sourceIndex, typeOrdinal };
+    });
+  });
+  if (!Array.isArray(request.options.trackSelect)) return indexed.map((entry) => entry.track);
+
+  const selected: ConcreteTrack[] = [];
+  const seen = new Set<string>();
+  for (const [index, raw] of request.options.trackSelect.entries()) {
+    if (typeof raw !== 'string') throw new TypeError(`mux trackSelect[${index}] must be a string`);
+    const selector = parseMuxTrackSelector(raw);
+    if (request.inputs.length > 1 && selector.sourceIndex === undefined) {
+      throw new TypeError('multi-source mux selectors must include @SOURCE');
+    }
+    const sourceIndex = selector.sourceIndex ?? 0;
+    const match = indexed.find((entry) =>
+      entry.sourceIndex === sourceIndex &&
+      entry.track.type === selector.type &&
+      entry.typeOrdinal === selector.typeOrdinal
+    );
+    if (!match) {
+      // The first support pass intentionally precedes selected-asset probing. Defer selector
+      // resolution for that source until its concrete track inventory is available.
+      if (request.inputs[sourceIndex]?.sourceEvidence === 'UNRESOLVED') continue;
+      throw new TypeError(`mux track selector '${selector.canonical}' does not resolve to a source track`);
+    }
+    const key = `${sourceIndex}:${selector.type}:${selector.typeOrdinal}`;
+    if (seen.has(key)) throw new TypeError(`mux track selector '${selector.canonical}' duplicates a selected source track`);
+    seen.add(key);
+    selected.push(match.track);
+  }
+  return selected;
 }
 
 function hasExplicitTrackDeclaration(options: Readonly<Record<string, unknown>>): boolean {

@@ -29,6 +29,8 @@ export interface MuxTargetSemanticContract {
   readonly schema: typeof MUX_TARGET_CONTRACT_SCHEMA;
   readonly container: MuxAdvertisedWriteTarget;
   readonly tracks: readonly MuxExpectedTrack[];
+  /** Dynamic selection layers validate any additional source tracks for keep-all scenarios. */
+  readonly allowAdditionalTracks?: boolean;
   readonly expectedDurationUs?: number;
   readonly durationToleranceUs: number;
 }
@@ -61,13 +63,7 @@ export function muxTargetContractFromScenario(
   const video = [...(scenario.requires.videoCodecs ?? [])];
   const audio = [...(scenario.requires.audioCodecs ?? [])];
   const tracks: MuxExpectedTrack[] = [];
-  if (scenario.id === 'mux/edge_multitrack_keep_all_to_mp4') {
-    tracks.push(
-      expectedTrack('video', video[0] ?? 'h264', container),
-      expectedTrack('audio', audio[0] ?? 'aac', container),
-      expectedTrack('audio', audio[0] ?? 'aac', container),
-    );
-  } else if (selectors.length > 0) {
+  if (selectors.length > 0) {
     let videoOrdinal = 0;
     let audioOrdinal = 0;
     for (const selector of selectors) {
@@ -83,6 +79,7 @@ export function muxTargetContractFromScenario(
     schema: MUX_TARGET_CONTRACT_SCHEMA,
     container: container as MuxAdvertisedWriteTarget,
     tracks: Object.freeze(tracks),
+    ...(scenario.id === 'mux/edge_multitrack_keep_all_to_mp4' ? { allowAdditionalTracks: true } : {}),
     durationToleranceUs: 125_000,
   });
 }
@@ -139,11 +136,15 @@ export function assessMuxTargetSemantics(
       measurements,
     );
   }
-  if (measuredTracks.length !== contract.tracks.length) {
+  if (
+    (!contract.allowAdditionalTracks && measuredTracks.length !== contract.tracks.length) ||
+    (contract.allowAdditionalTracks && measuredTracks.length < contract.tracks.length)
+  ) {
     return muxVerdict(
       'FAIL',
       'MUX_TARGET_TRACK_COUNT_MISMATCH',
-      `reader found ${measuredTracks.length} media track(s), expected ${contract.tracks.length}`,
+      `reader found ${measuredTracks.length} media track(s), expected ` +
+        `${contract.allowAdditionalTracks ? 'at least ' : ''}${contract.tracks.length}`,
       measurements,
     );
   }
@@ -154,11 +155,11 @@ export function assessMuxTargetSemantics(
       return got.type === expected.type && canonicalCodec(got.codec) === canonicalCodec(expected.codec) &&
         (!expected.requireCodecPrivate || !!got.codecPrivate?.byteLength);
     });
-    if (matches.length !== 1) {
+    if (matches.length === 0) {
       return muxVerdict(
         'FAIL',
         'MUX_TARGET_TRACK_SEMANTICS_MISMATCH',
-        `expected one ${expected.type}/${canonicalCodec(expected.codec)} track, matched ${matches.length}`,
+        `expected an unused ${expected.type}/${canonicalCodec(expected.codec)} track, matched none`,
         measurements,
       );
     }

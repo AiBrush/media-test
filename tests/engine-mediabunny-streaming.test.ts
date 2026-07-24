@@ -74,7 +74,10 @@ describe('REQ-ENG-06: positioned output, explicit retention, and truthful TTFB',
     spool.write(4, new Uint8Array([5, 6]));
     spool.write(0, new Uint8Array([1, 2, 3, 4]));
     spool.write(2, new Uint8Array([9, 9]));
-    expect(spool.bytes()).toEqual(new Uint8Array([1, 2, 9, 9, 5, 6]));
+    const bytes = spool.bytes();
+    expect(bytes).toEqual(new Uint8Array([1, 2, 9, 9, 5, 6]));
+    expect(bytes.byteOffset).toBe(0);
+    expect(bytes.buffer.byteLength).toBe(bytes.byteLength);
     expect(spool.byteLength).toBe(6);
     expect(spool.overwriteCount).toBe(1);
     expect(() => spool.write(-1, new Uint8Array([1]))).toThrow(TypeError);

@@ -34,6 +34,8 @@ export interface TrimBoundaryEvidenceArtifact {
   readonly timestampToleranceUs: number;
   /** Optional perceptual gate for a declared lossy boundary re-encode. */
   readonly minimumContentSimilarity?: number;
+  /** Optional aggregate gate across all paired required observations for a lossy re-encode. */
+  readonly minimumMeanContentSimilarity?: number;
   readonly frames: readonly TrimBoundaryFrame[];
 }
 
@@ -160,6 +162,24 @@ export function assessTrimBoundaryEvidence(request: TrimBoundaryAssessmentReques
     const wantEnd = want.ptsUs + want.durationUs;
     if (Math.abs(gotEnd - wantEnd) > artifact.timestampToleranceUs) {
       failures.push(`frame interval end ${gotEnd}us differs from expected ${wantEnd}us`);
+    }
+  }
+  if (
+    representationDifferences.length > 0 &&
+    artifact.minimumMeanContentSimilarity !== undefined
+  ) {
+    const pairedSimilarities = pairs.pairs.map((pair) =>
+      request.candidate.frames[pair.candidateIndex]?.contentSimilarity);
+    if (pairedSimilarities.some((value) => typeof value !== 'number' || !Number.isFinite(value))) {
+      failures.push('mean perceptual gate requires a similarity for every paired boundary observation');
+    } else if (pairedSimilarities.length > 0) {
+      const mean = (pairedSimilarities as number[]).reduce((sum, value) => sum + value, 0) /
+        pairedSimilarities.length;
+      if (mean < artifact.minimumMeanContentSimilarity) {
+        failures.push(
+          `mean boundary SSIM ${mean.toFixed(4)} is below ${artifact.minimumMeanContentSimilarity.toFixed(4)}`,
+        );
+      }
     }
   }
   const usedCandidates = new Set(pairs.pairs.map((pair) => pair.candidateIndex));

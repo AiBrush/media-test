@@ -14,8 +14,8 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | remux | V | V | V | V | V | V |
 | transcode | V | V | V | V | V | V |
 | decode-seek | V | V | V | V | V | V |
-| trim | A | P | P | P | P | P |
-| mux | P | P | P | P | P | P |
+| trim | V | V | V | V | V | V |
+| mux | V | A | P | P | P | P |
 | encryption | P | P | P | P | P | P |
 | metadata | P | P | P | P | P | P |
 | streaming-output | P | P | P | P | P | P |
@@ -23,7 +23,7 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | robustness | P | P | P | P | P | P |
 | performance | P | P | P | P | P | P |
 
-Totals: 30 verified, 1 active, 47 pending.
+Totals: 37 verified, 1 active, 40 pending.
 
 ## Campaign invariants
 
@@ -40,13 +40,14 @@ Totals: 30 verified, 1 active, 47 pending.
 ## Current evidence identity
 
 - Scenario definition digest:
-  `5773fa053a32f66ab871972183ceed4bf666f306c910adb6393c8ccf8fbba294`
+  `dd6d35bd381547227b869b957626f56991a5db18c275904fe352026efe59cdec`
 - Oracle definition digest:
-  `be38bfb3dc2ba637c3ffa19a55bec738993945771dedb8aa99141ada123b53d6`
-- Current regression gate (2026-07-24): focused aibrush-media and decode-seek
-  regressions 82 pass with 371 assertions; full suite 1129 pass with 14114
-  assertions across 80 files on the same executable source; typecheck clean,
-  `git diff --check` clean, and `git diff --cached --check` clean.
+  `a14ccf367013463ac463a6f4323a48affb03d9c8ac458de4293197d368edcc24`
+- Current regression gate (2026-07-24): focused trim/runner/aibrush-media
+  regressions 53 pass with 213 assertions, followed by a final aibrush-media
+  support/remux gate of 28 pass with 81 assertions; full suite 1143 pass with
+  14184 assertions across 80 files on the same executable source; typecheck,
+  `git diff --check`, and `git diff --cached --check` clean.
 
 ## Verified cells
 
@@ -1021,11 +1022,370 @@ Totals: 30 verified, 1 active, 47 pending.
   `7ebee8d5d82303afb3c40ef25a30070877c048239cb590fe4e223fce29329510`.
 - Suggested commit message: `cell(decode-seek × aibrush-media): complete exhaustive decode evidence`
 
-## Active cell
-
 ### trim × mediabunny
 
-- Scope lock: only Mediabunny trim adapter/support behavior and trim-owned
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T16-25-25-527Z.json`, a forced-fresh
+  Chromium run with 5 PASS, 12 NA_ENGINE, 1 NA_ASSET, 13 FAIL, and 12 ERROR.
+  It was not replayed after repair because the exhaustive diagnostic and
+  focused adverse proofs supersede it.
+- Authoritative exhaustive diagnostic:
+  `results/raw/chromium-2026-07-24T17-15-47-106Z.json`, seed
+  `8924abde-4c83-4761-8cc8-5402aa684155`. It exercised all 43 scenarios and
+  121 selected candidates: 23 scenario PASS, 7 NA_ENGINE, and 13 FAIL; at the
+  candidate level, 75 PASS, 24 FAIL, 19 NA_ENGINE, and 3 NA_ASSET. Every
+  adverse supported member was then repaired and rerun in a forced-fresh,
+  targeted proof rather than replaying the entire matrix.
+- Final grouped adverse proof:
+  `results/raw/chromium-2026-07-24T17-34-09-556Z.json`. All ten selected
+  scenario aggregates passed: fragmented MP4, H.264/VP8/MKV/MOV keyframe
+  copy, start-zero copy, large lazy-read copy, VFR frame-accurate trim, and
+  VP9 full-range idempotence. The rotated golden candidate passes exact
+  timeline, property-preservation, and playback checks; its three generated
+  variants are honest NA_ASSET because their sources contain no non-identity
+  orientation evidence.
+- The preceding grouped proof
+  `results/raw/chromium-2026-07-24T17-30-28-198Z.json` establishes all three
+  large frame-accurate throughput candidates PASS and all three MP3 exact
+  copy candidates NA_ENGINE. Mediabunny cannot author the MP3 delay/padding
+  metadata required to preserve the requested decoded presentation window.
+- Standalone terminal proofs: VP8 alpha side data, 2/2 PASS in
+  `results/raw/chromium-2026-07-24T16-59-47-907Z.json`; exact Ogg Opus,
+  240000 decoded samples with matching endpoint PCM digests in
+  `results/raw/chromium-2026-07-24T17-07-07-330Z.json`; both past-EOF
+  robustness cases PASS in
+  `results/raw/chromium-2026-07-24T17-08-12-988Z.json`; and the exact 1.1 GB
+  massive-file case PASS with 4613 retained samples plus playback in
+  `results/raw/chromium-2026-07-24T17-14-31-677Z.json`.
+- Remaining unexecutable inputs terminate with concrete evidence: undeclared
+  FLAC seek-table behavior, unsupported auxiliary-track selection, missing TS
+  decoder/mux configuration, undeclared concat/WAV/AIFF/ADTS surfaces, exact
+  MP3 presentation timing, or missing committed orientation evidence. No
+  executable admissible candidate remains failed.
+- Repairs preserve alpha and cardinal rotation metadata, enforce exact
+  packet-copy interval/timeline evidence without browser-seek instability,
+  preserve Opus pre-skip/end-trim semantics, handle very large ISO structures
+  without argument-stack overflow, reject malformed/past-EOF ranges, and
+  bound frame-accurate visual and final-frame duration tolerances to observed
+  source evidence.
+- Cell boundary: focused trim/runner/adapter regressions 64 pass with 282
+  assertions, additional support/selection/contract/conformance checks green,
+  full suite 1140 pass with 14150 assertions across 80 files, and typecheck
+  clean.
+- Quick artifact content hash:
+  `3c39cb8b872d80fce5360ef946d87b91edc650d0fbd54edbf259e7e4c00bab5a`;
+  file SHA-256:
+  `1409342359a81f980694f441edb8ddb3cb658abf9f530b2989dc7efe4071e77f`.
+- Exhaustive diagnostic content hash:
+  `4e05d8fde84bc3fc8662b8c2c6d472de755718e1e1aeae3bc85de479aa0391ec`;
+  file SHA-256:
+  `54bd031edfebd52b017b99583ac2150bc63ae1b50a963c710d5ae329fa5ba1ee`.
+- Final grouped proof content hash:
+  `207e76aea157341fbee9687461d954b0710c1fff248ac27b3fb3d342c2179e3d`;
+  file SHA-256:
+  `f2e680dbc8d4a68a6bed06b0b1d46c87484fd7761d1dfb40438d12cbeedacf50`.
+- Suggested commit message: `cell(trim × mediabunny): complete exhaustive trim evidence`
+
+### trim × ffmpeg-wasm
+
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T17-40-54-428Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `b1cef4a0-4647-42a1-b09e-c6ab470c888b`. It exercised all 43 scenarios and
+  isolated 8 PASS, 4 NA_ENGINE, 22 FAIL, and 9 ERROR rows. It was not replayed
+  after repair because exhaustive and focused evidence superseded it.
+- Authoritative exhaustive diagnostic:
+  `results/raw/chromium-2026-07-24T18-18-59-151Z.json`, seed
+  `75dd56a5-23c4-490b-838c-633df89417ac`. It covered all 43 scenarios and 118
+  candidate records: 75 PASS, 27 NA_ENGINE, 2 NA_ASSET, 11 FAIL, and 3 ERROR;
+  coverage grades were 22 full, 8 partial, and 13 none. This single exhaustive
+  run became the immutable baseline; the full matrix was not replayed.
+- Final grouped adverse proof:
+  `results/raw/chromium-2026-07-24T18-36-52-509Z.json`, seed
+  `e6a46b50-9d8d-4525-8ae0-81510825f886`. All nine affected scenario
+  aggregates passed. Across 35 exhaustive candidate records, 15 passed, 15
+  were concrete NA_ENGINE, and 5 were NA_ASSET; coverage grades were 7 full
+  and 2 partial, with no nested FAIL, ERROR, or SKIPPED outcome. The baked CMAF
+  source preserves all 60 selected coded samples and their relative timeline.
+- The final proof closes every adverse member from the exhaustive baseline:
+  generated TS sources without a complete independent range timeline are
+  typed NA_ASSET while the committed TS source passes; exact generated H.264
+  B-frame intervals that FFmpeg 5.1 cannot close without substituting later
+  decode-order packets are candidate-scoped NA_ENGINE; supported sibling
+  candidates remain PASS. Existing concrete NA_ENGINE rows also retain their
+  exact evidence for audio presentation timing, long MOV edit preroll,
+  fragmented B-frame boundaries, unavailable codecs/containers, composition,
+  and stable single-thread suite budgets.
+- Repairs add typed malformed/range rejection, literal full-range no-op
+  identity, bounded metadata probing, exact ISO presentation-window selection,
+  packet-authoritative copy evidence, measured reorder-tail clipping,
+  frame-accurate H.264/VP8/VP9 output, progressive/fragmented MP4 selection,
+  FLAC/TS evidence routing, and a single tiny cross-track timestamp probe. For
+  fragmented MP4 the measured leading AAC/video skew is applied to the whole
+  video packet timeline, preventing FFmpeg from stretching only the first
+  sample while retaining byte-exact coded payloads.
+- Focused FFmpeg support/trim/runner regressions: 40 pass with 277 assertions.
+  Cell boundary: full suite 1141 pass with 14177 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `d416cb40a96162fb19c0a7f84c5864cc7152eae95417865e6ee83d765d9eb253`;
+  file SHA-256:
+  `536b3e324287d957c37ed0beb460eccb3eefd9437a93f0d78cd008829716d9b8`.
+- Exhaustive diagnostic content hash:
+  `b31faf07dbda77224d67a9aa3e16fa7c9b08f7785200ce59f00400c4799cbc3f`;
+  file SHA-256:
+  `67e7bfe81339601f1cc6862f4b8cd0cf2059c9bc376a72d65908fffb97a75b9c`.
+- Final grouped proof content hash:
+  `d52312a0b1c5eecfb082185794ea1e711c6ac830f9d1df2e39edc92f5d31348c`;
+  file SHA-256:
+  `e4a01a6a50d50b60ddf76950ec3419f2be77c5eab1701f29939bb804fbeea558`.
+- Suggested commit message: `cell(trim × ffmpeg-wasm): complete exhaustive trim evidence`
+
+### trim × mp4box
+
+- Quick:
+  `results/raw/chromium-2026-07-24T18-41-45-049Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `a054813e-53af-4a41-8b64-92d8f5e1f71e`.
+- Exhaustive:
+  `results/raw/chromium-2026-07-24T18-41-55-493Z.json`, seed
+  `14cee7c6-bf52-465c-86d6-cf60774cfd7a`.
+- Both runs terminate all 43 scenario aggregates as concrete NA_ENGINE. The
+  exhaustive artifact retains all 118 selected candidate records as
+  NA_ENGINE, with 43 `none` coverage grades and no PASS, FAIL, ERROR,
+  NA_ASSET, or SKIPPED candidate.
+- Every candidate has the same exact boundary evidence: `engine does not
+  declare operation 'trim'`. MP4Box remains an ISO parser/extractor and
+  fragmented remux/mux authoring adapter; it exposes no trim operation. No
+  adapter operation, correctness oracle, warmup, or measurement replay ran.
+- Quick and exhaustive each completed in 2.9 seconds. No executable source
+  changed for this cell. Focused MP4Box/trim/runner regressions: 71 pass with
+  5157 assertions. The immediately preceding boundary remains applicable to
+  the identical executable source: full suite 1141 pass with 14177 assertions
+  across 80 files and typecheck clean. `git diff --check` and
+  `git diff --cached --check` are clean.
+- Quick artifact content hash:
+  `9592c146885702f2eb702fbd51487c946a6d6397f2144df2c6c8fb3b87dd405b`;
+  file SHA-256:
+  `9ec5ef02b712b3d64ef17490a8372d35424c46d03fc220502b2d1188ea58736b`.
+- Exhaustive artifact content hash:
+  `750ad1ba79519de381601beec37354e4dbed2055c88bafe4ebac505bbf56341b`;
+  file SHA-256:
+  `aab5b67311487ed1fd86290b4836eb68e6777b9afe7754a2d6747cedf3d5d1e7`.
+- Suggested commit message: `cell(trim × mp4box): record undeclared trim boundary`
+
+### trim × remotion
+
+- Quick:
+  `results/raw/chromium-2026-07-24T18-43-39-040Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `ef78c84d-753f-42b5-85d2-e1ee1a6434d0`.
+- Exhaustive:
+  `results/raw/chromium-2026-07-24T18-43-48-601Z.json`, seed
+  `7edbcde4-899a-4328-a9fa-ccdf41b19c6e`.
+- Both runs terminate all 43 scenario aggregates as concrete NA_ENGINE. The
+  exhaustive artifact retains all 118 selected candidates as NA_ENGINE, with
+  43 `none` coverage grades and no PASS, FAIL, ERROR, NA_ASSET, or SKIPPED
+  candidate.
+- Every candidate records `engine does not declare operation 'trim'`.
+  Remotion's scored adapter declares probe, demux, remux, transcode,
+  frame-decode, and seek, but it exposes no standalone trim operation. No
+  adapter operation, correctness oracle, warmup, or measurement replay ran.
+- Quick and exhaustive each completed in 2.8 seconds. No executable source
+  changed for this cell. Remotion adapter/support regressions: 38 pass with
+  276 assertions; trim/runner behavior was already green on the identical
+  source in the immediately preceding focused gate. The same boundary remains
+  applicable: full suite 1141 pass with 14177 assertions across 80 files,
+  typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `e823c907e9950cf823e757dcabccd464b708fede8bbbc895527593b0c123e51a`;
+  file SHA-256:
+  `bd4aa3507ce091d0450a0740b4ec9a31e5ab4d1d60bd17bb8ca04fe0980c38bd`.
+- Exhaustive artifact content hash:
+  `11c1d71503541822b82a5b03cc734691aba269d940063f4b06c2c15bddbf5e24`;
+  file SHA-256:
+  `9211a047dc686a1769ded3df8d5330bdddede1cd891bd569bce5be0d9f356d00`.
+- Suggested commit message: `cell(trim × remotion): record undeclared trim boundary`
+
+### trim × web-demuxer@4.0.0
+
+- Quick:
+  `results/raw/chromium-2026-07-24T18-44-54-505Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `594d1201-2886-46f5-a902-8b09ca6cc969`.
+- Exhaustive:
+  `results/raw/chromium-2026-07-24T18-45-04-513Z.json`, seed
+  `140fb5e5-5272-4d60-bb77-b36117fd90fa`.
+- Both runs terminate all 43 scenario aggregates as concrete NA_ENGINE. The
+  exhaustive artifact retains all 118 selected candidates as NA_ENGINE, with
+  43 `none` coverage grades and no PASS, FAIL, ERROR, NA_ASSET, or SKIPPED
+  candidate.
+- Every candidate records `engine does not declare operation 'trim'`.
+  web-demuxer 4.0.0 exposes probe/demux parser surfaces and bounded decode/seek
+  bridges, but no trim authoring operation. No adapter operation, correctness
+  oracle, warmup, or measurement replay ran.
+- The canonical scored selector is `web-demuxer@4.0.0`; one rejected shorthand
+  launcher request produced no run artifact and is not campaign evidence.
+  Quick and exhaustive each completed in about 2.9 seconds. No executable
+  source changed for this cell. Focused support regressions: 8 pass with 35
+  assertions; trim/runner behavior was already green on the identical source.
+  The same boundary remains applicable: full suite 1141 pass with 14177
+  assertions across 80 files, typecheck clean, `git diff --check` clean, and
+  `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `d0a43e3e6177b9cb309869e54a4b31c68256519bf8d544972142fb83f49fcd43`;
+  file SHA-256:
+  `141ce6ae8c9b977666b4b5fb4df9a4c8ea418876c450595b63d132405a6a1f24`.
+- Exhaustive artifact content hash:
+  `70d98d12fce5b420e444e88f3b54c5f5a4559c893113e2ff3c06426343c46080`;
+  file SHA-256:
+  `d1d18730d28cae0e8aa5645d8d9bf7a21cde919817a44f16099dc8eeb3b61061`.
+- Suggested commit message: `cell(trim × web-demuxer): record undeclared trim boundary`
+
+### trim × aibrush-media
+
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T18-45-53-581Z.json`, a forced-fresh
+  Chromium run from `http://127.0.0.1:5151` with seed
+  `fb222e31-0620-45e2-9c2d-1147e1450e3e`. It exercised all 43 scenarios and
+  isolated 14 PASS, 1 NA_ENGINE, 7 NA_BROWSER, 16 FAIL, and 5 ERROR rows. It
+  was not replayed after repair because the exhaustive baseline and targeted
+  adverse proofs supersede it.
+- Authoritative exhaustive diagnostic:
+  `results/raw/chromium-2026-07-24T19-11-40-324Z.json`, using the same seed.
+  It covered all 43 scenarios and 118 candidate records: 73 PASS, 10
+  NA_ENGINE, 25 NA_BROWSER, 3 NA_ASSET, 6 FAIL, and 1 ERROR. This was the one
+  complete exhaustive run; the full trim matrix was not replayed.
+- Final affected-candidate proof chain is forced-fresh and closes every
+  adverse member from that exhaustive baseline. In
+  `results/raw/chromium-2026-07-24T19-20-16-148Z.json`, AIFF PCM is 1/1 PASS,
+  MOV is 4/4 PASS, WAV is 3/3 PASS, the executable large frame-accurate member
+  is PASS with two exact browser-config NAs, and three of four MKV members
+  pass (including the formerly failing `02.mkv`). In
+  `results/raw/chromium-2026-07-24T19-24-20-580Z.json`, the bit-flipped input
+  passes its robustness contract as a typed clean rejection. Finally,
+  `results/raw/chromium-2026-07-24T19-27-42-093Z.json` selects the exact
+  remaining `03.mkv` identity
+  `15ac6672aed3905b6fff8dd3ca12c463d03a57f174dc8ca5a75229ef92a22b26`
+  and passes coded-content/timeline evidence. Together these targeted proofs
+  supersede all six FAIL candidates and the one ERROR candidate without a
+  second exhaustive run.
+- Terminal candidate accounting is therefore 80 PASS, 10 concrete
+  NA_ENGINE, 25 NA_BROWSER, and 3 NA_ASSET across the 118-member exhaustive
+  set; no executable admissible candidate remains failed. The four
+  NA_ENGINE scenario rows are exact presentation-timing limits for lossy
+  AAC/MP3/Opus packet-copy trims plus the framework's unexposed fragmented
+  trim shape. The six whole-row NA_BROWSER results retain the exact rejected
+  WebCodecs encoder configurations.
+- Repairs provide exact half-open packet selection for MP4/MOV,
+  WebM/Matroska, and MPEG-TS; preserve Matroska attachment bundles and
+  physical video decode order; retain ISO rotation, alpha, codec config, and
+  precise timestamp clocks; align frame-accurate requests to neutral
+  presentation samples; derive PCM and coded-audio interval duration from
+  native evidence; and cleanly reject intentional malformed robustness input
+  before post-output decode validation. Candidate-scoped support now declares
+  only the lossy audio presentation windows the public trim surface cannot
+  author exactly.
+- Cell boundary: focused trim/runner/aibrush-media regressions 53 pass with
+  213 assertions, final support/remux regressions 28 pass with 81 assertions,
+  full suite 1143 pass with 14184 assertions across 80 files, typecheck clean,
+  `git diff --check` clean, and `git diff --cached --check` clean.
+- Quick artifact content hash:
+  `54525b9fa107704e81884d7750fe18495e37f92f0f98209e198166f602901a48`;
+  file SHA-256:
+  `ad9c560d7381b6202386454a49b57ebbdda22469a573d8611a75383dc57fa17a`.
+- Exhaustive diagnostic content hash:
+  `7c187370b3b9bd961fbd2f403ea59bff0b58dad3b05a39b11b8c558e06029705`;
+  file SHA-256:
+  `1f6b26393e507d4bbbd9387be38cbff6b3cbee63a9f8b93b577504c6e5c80371`.
+- Affected-group content hashes / file SHA-256 values are respectively
+  `67547fa7ed6dbbe6136da5316aba341abe3b7e983901869953ab724803e33865` /
+  `26d60bb28f8cfca253c1c24497014f7df5c8850355bf895f3a7b0c8ce4ab23b6`,
+  `d4a87797f34647012f22b24efa15b1734fc6992b05d75d7c07a4f78c9e504cde` /
+  `521eee88b11ef6b88ba7a98173410a433ae85345b1dabe8ee0bc2503ecc9e1aa`,
+  and
+  `e24ce03b5c73b35ba54b576e2d34931717fec43bdf5c2d9487663d6ae435fd82` /
+  `28ac0b0a48b119642b752d16e1999bb705a73c807b97e306652735412b095c4b`.
+- Suggested commit message: `cell(trim × aibrush-media): complete exhaustive trim evidence`
+
+### mux × mediabunny
+
+- Quick diagnostic:
+  `results/raw/chromium-2026-07-24T19-32-59-866Z.json`, a completed
+  forced-fresh Chromium run from `http://127.0.0.1:5151` with seed
+  `mux-mediabunny-20260724-v1`. It exercised all 53 scenarios and isolated 22
+  PASS, 7 NA_ENGINE, 3 NA_ASSET, 7 FAIL, and 14 ERROR rows. It was not
+  replayed after repair because the exhaustive baseline plus targeted adverse
+  proofs supersede it.
+- Authoritative exhaustive diagnostic:
+  `results/raw/chromium-2026-07-24T19-34-17-417Z.json`, using the same seed.
+  This was the one complete exhaustive run: all 53 scenarios and 176 candidate
+  records, comprising 70 PASS, 20 NA_ENGINE, 12 NA_ASSET, 27 FAIL, and 47
+  ERROR candidates before repair. The full mux matrix was not replayed.
+- The forced-fresh targeted chain closes every adverse baseline scenario.
+  `results/raw/chromium-2026-07-24T20-00-19-757Z.json` reruns the 25 affected
+  scenarios together and proves typed illegal-tuple rejection, safe integer
+  timebases, exact multitrack membership, TS/WAV/MP3/AAC target semantics,
+  concrete full-timeline NAs, and rotation-policy handling.
+  `results/raw/chromium-2026-07-24T20-06-48-152Z.json` then proves ordinary
+  positioned MP4 streaming 4/4 PASS and the rotated MOV's structural and
+  presentation-normalized layer with 12/12 paired frames. Finally,
+  `results/raw/chromium-2026-07-24T20-10-31-602Z.json` proves reserve
+  fast-start 4/4 PASS, and
+  `results/raw/chromium-2026-07-24T20-13-44-785Z.json` replaces the false
+  Vorbis track-count skip with four concrete
+  `MEDIABUNNY_TIMESTAMP_MODE_UNSUPPORTED` results.
+- Latest-evidence reduction across the 53 exhaustive scenarios is 40 PASS,
+  12 concrete NA_ENGINE, and 1 NA_ASSET, with zero FAIL or ERROR rows.
+  Candidate accounting is 119 PASS, 44 NA_ENGINE, and 13 NA_ASSET across all
+  176 members. The sole NA_ASSET aggregate is the rotation row: generated
+  members lack authoritative rotation evidence, while the baked rotated source
+  independently passes `MUX_ROTATION_STRUCTURE_AND_PRESENTATION_MATCH` with
+  its 90-degree matrix retained.
+- Repairs make mux support selector-aware, retain executable negative rows for
+  typed rejection, and declare only concrete timestamp/rotation gaps as
+  NA_ENGINE. The packet-copy path now normalizes unsafe source timebases,
+  returns tight owned buffers, replays positioned patches latest-write-wins,
+  derives exact reserve packet bounds, and interleaves track heads so
+  Mediabunny measures reserve tables only after every track configuration is
+  known. Neutral mux readers also prove dynamic multitrack membership, AAC
+  representation equivalence, target duration, and display-matrix
+  presentation.
+- Cell boundary: the single full-suite run executed 1152 tests across 80 files
+  in 122.30 seconds; 1151 passed and its sole failure was a stale assertion
+  that still required an explicit reserve bound. After updating that assertion
+  to distinguish an omitted derived bound from an invalid explicit zero, the
+  final affected gate is 172 pass with 675 assertions across six files. Direct
+  reserve reproductions pass all three formerly asserting generated assets;
+  typecheck, `git diff --check`, and `git diff --cached --check` are clean. Per
+  the no-repeat rule, the full suite was not run a second time.
+- Quick artifact content hash:
+  `4f258f004f80cc77890b435e8422e1e6109da33a0bec3e63de7b58d880fc20f5`;
+  file SHA-256:
+  `e03a35f2188c3150a66bc99d9257ba781d6611a8ee3c81611a717b4aacfc8472`.
+- Exhaustive diagnostic content hash:
+  `a9c1f172c217ced0c1e9b1de19b33cba9acc8c9745ae6dc306d1fdaa75640764`;
+  file SHA-256:
+  `965d071046782e18751c9dbaee180ea6baf3914ebe9bcc56a681274c887fe2ce`.
+- Targeted-chain content hashes / file SHA-256 values are respectively
+  `4b29071e50d32a4f987448d48825ac26e3d784c6a3ff32935d597a281c216be8` /
+  `18418c689bd8cc37769306b01529b87384c0f41ea07c3e101f1ae19b98610d90`,
+  `d961276d3d950141ba43b3e46aceabcc134f1ac159e68af7416de80de3348f69` /
+  `6cefdf30c696f78a2cab3a4174b812333eded1840a78be8c3c93672476b35a54`,
+  `86c570b0033637e004a794a276e66a648f97353f2b5e70a95ac8191e5ad297de` /
+  `2575a1d3287347028a4dd2b0eac1c90a608c54fca9641ba1117ea87c9d574456`,
+  and
+  `fc36f296241c6812840c547dec63f7c250ac0a01aa6bd71d02211b88f067051c` /
+  `4c4f09fea9967b37ea823ca36c89b1f81881101ae1894cd602c8436b48edfb48`.
+- Suggested commit message: `cell(mux × mediabunny): complete exhaustive mux evidence`
+
+## Active cell
+
+### mux × ffmpeg-wasm
+
+- Scope lock: only ffmpeg-wasm mux adapter/support behavior and mux-owned
   shared layers when independently proven necessary.
 - Quick: pending.
 - Exhaustive: pending.

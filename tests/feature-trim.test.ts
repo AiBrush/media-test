@@ -126,6 +126,50 @@ describe('REQ-FEAT-25 presentation-time-windowed boundary evidence', () => {
     });
   });
 
+  test('perceptual boundary matches require a declared re-encode and must meet the artifact gate', () => {
+    const artifact = { ...boundaryArtifact(), minimumContentSimilarity: 0.98 };
+    const perceptualCandidate = (similarity: number, declareDifference: boolean) => ({
+      ...exactBoundaryCandidate(),
+      frames: exactBoundaryCandidate().frames.map((frame) => ({
+        ...frame,
+        contentDigest: 'ff'.repeat(32),
+        contentSimilarity: similarity,
+      })),
+      ...(declareDifference ? { representationDifferences: ['lossy boundary re-encode'] } : {}),
+    });
+    const base = {
+      assetId: artifact.assetId,
+      range: artifact.range,
+      mode: artifact.mode,
+      representationClass: artifact.representationClass,
+      reference: { state: 'READY' as const, artifact },
+    };
+
+    expect(assessTrimBoundaryEvidence({ ...base, candidate: perceptualCandidate(1, false) }))
+      .toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_BOUNDARY_CONTENT_MISMATCH' });
+    expect(assessTrimBoundaryEvidence({ ...base, candidate: perceptualCandidate(0.9799, true) }))
+      .toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_BOUNDARY_CONTENT_MISMATCH' });
+    expect(assessTrimBoundaryEvidence({ ...base, candidate: perceptualCandidate(0.98, true) }))
+      .toMatchObject({ verdict: 'PASS', reasonCode: 'TRIM_LEGAL_REPRESENTATION_DIFFERENCE' });
+
+    const aggregateArtifact = {
+      ...artifact,
+      minimumContentSimilarity: 0.94,
+      minimumMeanContentSimilarity: 0.98,
+    };
+    const aggregateBase = { ...base, reference: { state: 'READY' as const, artifact: aggregateArtifact } };
+    const mixed = perceptualCandidate(0.99, true);
+    mixed.frames[0] = { ...mixed.frames[0]!, contentSimilarity: 0.94 };
+    expect(assessTrimBoundaryEvidence({ ...aggregateBase, candidate: mixed }))
+      .toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_BOUNDARY_CONTENT_MISMATCH' });
+    mixed.frames[1] = { ...mixed.frames[1]!, contentSimilarity: 1 };
+    expect(assessTrimBoundaryEvidence({ ...aggregateBase, candidate: mixed }))
+      .toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_BOUNDARY_CONTENT_MISMATCH' });
+    mixed.frames[0] = { ...mixed.frames[0]!, contentSimilarity: 0.96 };
+    expect(assessTrimBoundaryEvidence({ ...aggregateBase, candidate: mixed }))
+      .toMatchObject({ verdict: 'PASS', reasonCode: 'TRIM_LEGAL_REPRESENTATION_DIFFERENCE' });
+  });
+
   test('range evidence and neutral decoder absence remain distinct NA states', () => {
     const artifact = boundaryArtifact();
     const common = {
@@ -174,6 +218,15 @@ describe('REQ-FEAT-26 reachable decoded-audio/content oracles', () => {
   test('one-sample deletion and duplicated boundary PCM each fail', () => {
     const read = inspectTrimAudioContainer(media('opus.ogg'), 'ogg');
     expect(read.state).toBe('OK');
+    expect(read).toMatchObject({
+      state: 'OK',
+      value: {
+        codedSampleFrames: 480_960,
+        presentationSampleFrames: 480_000,
+        primingSampleFrames: 312,
+        endTrimSampleFrames: 648,
+      },
+    });
     const reference = fixture.audio;
     const candidate = {
       sampleRate: reference.sampleRate,
@@ -184,8 +237,8 @@ describe('REQ-FEAT-26 reachable decoded-audio/content oracles', () => {
     };
     const container: AudioContainerEvidence = {
       container: 'ogg', codec: 'opus', sampleRate: 48_000, channels: 2,
-      codedSampleFrames: 240_312, presentationSampleFrames: 240_000,
-      primingSampleFrames: 312, endTrimSampleFrames: 0, precision: 'exact', packetOrFrameCount: 250,
+      codedSampleFrames: 240_960, presentationSampleFrames: 240_000,
+      primingSampleFrames: 312, endTrimSampleFrames: 648, precision: 'exact', packetOrFrameCount: 251,
       metadataTotalSampleFrames: 240_000, endOfStreamPresent: true,
     };
     expect(assessAudioTrimEvidence({ reference, candidate, container: { state: 'OK', value: container } })).toMatchObject({

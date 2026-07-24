@@ -349,6 +349,32 @@ describe('REQ-ADP-05: explicit coded representation', () => {
       'encodedTracks.tracks[0].chunks',
     );
   });
+
+  test('encoded chunks validate separately owned alpha access units', () => {
+    const track = encodedTrackFixture('h264', 'annexb');
+    track.chunks[0]!.alphaData = new Uint8Array([4, 3, 2, 1]);
+    expect(validateEncodedTracks(ENGINE_ID, { tracks: [track] }).tracks[0]!.chunks[0]!.alphaData)
+      .toEqual(new Uint8Array([4, 3, 2, 1]));
+
+    const aliased = encodedTrackFixture('h264', 'annexb');
+    aliased.chunks[0]!.alphaData = aliased.chunks[0]!.data.subarray(0, 1);
+    expectContractPath(
+      () => validateEncodedTracks(ENGINE_ID, { tracks: [aliased] }),
+      'encodedTracks.tracks[0].chunks[0].alphaData',
+    );
+  });
+
+  test('encoded video rotation is restricted to clockwise cardinal metadata', () => {
+    const track = encodedTrackFixture('h264', 'annexb');
+    track.rotation = 90;
+    expect(validateEncodedTracks(ENGINE_ID, { tracks: [track] }).tracks[0]!.rotation).toBe(90);
+
+    (track as EncodedTrack & { rotation: number }).rotation = 45;
+    expectContractPath(
+      () => validateEncodedTracks(ENGINE_ID, { tracks: [track] }),
+      'encodedTracks.tracks[0].rotation',
+    );
+  });
 });
 
 describe('capability and final-counter boundary checks', () => {

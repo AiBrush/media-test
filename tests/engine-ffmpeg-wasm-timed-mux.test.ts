@@ -3,11 +3,28 @@ import type { EncodedTrack } from '../src/core/engine.ts';
 import {
   buildTimedMp4,
   canBuildTimedMp4,
+  hasImplicitRawDemuxTiming,
   TimedMp4UnsupportedError,
 } from '../src/engines/ffmpeg-wasm/timed-mp4.ts';
 import { splitAdtsFrames } from '../src/engines/ffmpeg-wasm/evidence.ts';
 
 describe('REQ-ENG-17: route-independent timestamped mux staging', () => {
+  test('accepts a shorter terminal PCM packet while requiring a contiguous zero-based sample clock', () => {
+    const pcm: EncodedTrack = {
+      type: 'audio', codec: 'pcm-s16', timescale: 48_000, packetOrdering: 'decode',
+      framing: 'raw', accessUnitGrouping: 'one-packet-per-chunk', parameterSetLocation: 'not-applicable',
+      sampleRate: 48_000, channels: 2,
+      chunks: [
+        { data: new Uint8Array(19_200), ptsUs: 0, dtsUs: 0, durationUs: 100_000, keyframe: true },
+        { data: new Uint8Array(19_200), ptsUs: 100_000, dtsUs: 100_000, durationUs: 100_000, keyframe: true },
+        { data: new Uint8Array(9_600), ptsUs: 200_000, dtsUs: 200_000, durationUs: 50_000, keyframe: true },
+      ],
+    };
+    expect(hasImplicitRawDemuxTiming(pcm)).toBe(true);
+    pcm.chunks[2]!.ptsUs += 10_000;
+    expect(hasImplicitRawDemuxTiming(pcm)).toBe(false);
+  });
+
   test('writes exact VFR/B-frame DTS, CTS, durations, sizes, and sync samples into MP4 tables', () => {
     const track = avcTrack();
     const first = buildTimedMp4([track]);

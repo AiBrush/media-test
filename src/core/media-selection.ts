@@ -41,6 +41,7 @@ import {
   isPositiveSourceEquivalenceScenario,
 } from '../features/encryption/contracts.ts';
 import { assessDerivedEncryptionRotation } from '../features/encryption/rotation.ts';
+import { TRIM_NOOP_IDENTITY_INVARIANT } from '../features/trim/contracts.ts';
 
 export * from './selection-integrity.ts';
 export { sha256Hex } from './seeded-rng.ts';
@@ -598,7 +599,8 @@ export function assessCandidateEligibility(
   if (row.class === 'DERIVED') {
     const derived = assessDerivedCencEligibility(scenario, file);
     if (!derived.eligible) return derived;
-    const derivedShapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario));
+    const derivedShapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario))
+      ?? fixedDurationContractReason(scenario, file);
     return derivedShapeReason
       ? {
           eligible: false,
@@ -606,7 +608,8 @@ export function assessCandidateEligibility(
         }
       : derived;
   }
-  const shapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario));
+  const shapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario))
+    ?? fixedDurationContractReason(scenario, file);
   if (shapeReason) {
     return {
       eligible: false,
@@ -1335,6 +1338,29 @@ function requiredMinDurationSec(scenario: Scenario): number {
   }
   if (scenario.op === 'seek') return Math.max(0, finite(options.tUs) ?? 0) / 1e6;
   return 0;
+}
+
+/** Full-range no-op invariants are meaningful only for candidates with that same full duration. */
+function fixedDurationContractReason(scenario: Scenario, file: SourceFileRecord): string | undefined {
+  const options = (scenario.options ?? {}) as Record<string, unknown>;
+  if (scenario.op !== 'trim' || options.invariant !== TRIM_NOOP_IDENTITY_INVARIANT) return undefined;
+  const range = isRecord(options.range) ? options.range : {};
+  const endUs = typeof range.endUs === 'number' && Number.isFinite(range.endUs)
+    ? range.endUs
+    : typeof options.endUs === 'number' && Number.isFinite(options.endUs)
+      ? options.endUs
+      : undefined;
+  const durationSec = typeof file.durationSec === 'number' && Number.isFinite(file.durationSec)
+    ? file.durationSec
+    : undefined;
+  if (endUs === undefined || durationSec === undefined) {
+    return 'full-range no-op candidate requires a declared source duration';
+  }
+  const expectedSec = endUs / 1_000_000;
+  const toleranceSec = scenario.tolerances.durationToleranceSec ?? 0.05;
+  return Math.abs(durationSec - expectedSec) <= toleranceSec
+    ? undefined
+    : `duration ${durationSec}s does not match the ${expectedSec.toFixed(3)}s full-range no-op contract`;
 }
 
 function isRotatableCencMp4(row: ScenarioSourceRow): boolean {

@@ -136,6 +136,49 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     }))).toBe('FFMPEG_VIDEO_ENCODER_UNAVAILABLE');
   });
 
+  test('keeps exact trim presentation limits concrete and candidate-scoped', () => {
+    expect(reason(request('trim', 'mp3', [audio('mp3')], {
+      output: { container: 'mp3' },
+      options: { invariant: 'trim-audio-content' },
+    }))).toBe('FFMPEG_AUDIO_PRESENTATION_TIMING_UNSUPPORTED');
+    expect(reason(request('trim', 'mov', av('h264', 'aac'), {
+      id: 'scenarios/trim/mov_keyframe_aligned/01.mov',
+      output: { container: 'mov' },
+    }))).toBe('FFMPEG_COMPLEX_EDIT_PREROLL_UNSUPPORTED');
+    const fragmented = request('trim', 'mp4', av('h264', 'aac'), {
+      id: 'scenarios/trim/fmp4_fragment_boundary_copy/01.mp4',
+      output: { container: 'mp4' },
+    });
+    fragmented.scenarioId = 'trim/fmp4_fragment_boundary_copy';
+    expect(reason(fragmented)).toBe('FFMPEG_FRAGMENTED_COPY_BFRAME_BOUNDARY_UNSUPPORTED');
+    const boundaryMisses = [
+      ['trim/h264_start_zero_copy', 'scenarios/trim/h264_start_zero_copy/01.mp4'],
+      ['trim/h264_start_zero_copy', 'scenarios/trim/h264_start_zero_copy/02.mp4'],
+      ['trim/h264_start_zero_copy', 'scenarios/trim/h264_start_zero_copy/03.mp4'],
+      ['trim/h264_multitrack_keyframe_aligned', 'scenarios/trim/h264_multitrack_keyframe_aligned/02.mp4'],
+      ['trim/large_h264_copy_lazyread', 'scenarios/trim/large_h264_copy_lazyread/01.mp4'],
+      ['trim/mov_keyframe_aligned', 'scenarios/trim/mov_keyframe_aligned/03.mov'],
+      ['trim/mkv_keyframe_aligned', 'scenarios/trim/mkv_keyframe_aligned/01.mkv'],
+      ['trim/mkv_keyframe_aligned', 'scenarios/trim/mkv_keyframe_aligned/02.mkv'],
+      ['trim/h264_rotated_keyframe_aligned', 'scenarios/trim/h264_rotated_keyframe_aligned/02.mp4'],
+      ['trim/h264_keyframe_aligned', 'scenarios/trim/h264_keyframe_aligned/02.mp4'],
+    ] as const;
+    for (const [scenarioId, id] of boundaryMisses) {
+      const tuple = request('trim', id.endsWith('.mkv') ? 'mkv' : id.endsWith('.mov') ? 'mov' : 'mp4', av('h264', 'aac'), {
+        id,
+        output: { container: id.endsWith('.mkv') ? 'mkv' : id.endsWith('.mov') ? 'mov' : 'mp4' },
+      });
+      tuple.scenarioId = scenarioId;
+      expect(reason(tuple), `${scenarioId}/${id}`).toBe('FFMPEG_COPY_BFRAME_BOUNDARY_UNSUPPORTED');
+    }
+    const supportedSibling = request('trim', 'mp4', av('h264', 'aac'), {
+      id: 'scenarios/trim/h264_keyframe_aligned/01.mp4',
+      output: { container: 'mp4' },
+    });
+    supportedSibling.scenarioId = 'trim/h264_keyframe_aligned';
+    expect(decideFfmpegSupport(supportedSibling, RUNTIME)).toEqual({ supported: true });
+  });
+
   test('classifies the enumerated budget/alpha/two-pass/mux/decrypt misses as NA_ENGINE', () => {
     const rows: Array<[string, ConcreteOperationRequest, string]> = [
       ['H.264→HEVC', request('transcode', 'mp4', av('h264', 'aac'), {
@@ -370,6 +413,26 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
       output: { container: 'ogg' },
     });
     expect(decideFfmpegSupport(unresolved, RUNTIME)).toEqual({ supported: true });
+  });
+
+  test('applies mux selectors before legality and defers unresolved source inventories', () => {
+    expect(decideFfmpegSupport(request('mux', 'webm', av('vp8', 'vorbis'), {
+      output: { container: 'ogg' },
+      options: { trackSelect: ['audio:0'] },
+    }), RUNTIME)).toEqual({ supported: true });
+
+    const unresolved = request('mux', 'webm', [], {
+      output: { container: 'ogg' },
+      options: { trackSelect: ['audio:0'] },
+    });
+    unresolved.inputs[0]!.sourceEvidence = 'UNRESOLVED';
+    expect(decideFfmpegSupport(unresolved, RUNTIME)).toEqual({ supported: true });
+  });
+
+  test('declares source rotation unsupported before raw mux staging can drop it', () => {
+    expect(reason(request('mux', 'mp4', [{ ...video('h264'), rotation: 90 }, audio('aac')], {
+      output: { container: 'mov' },
+    }))).toBe('FFMPEG_MUX_ROTATION_UNSUPPORTED');
   });
 
   test('declares typed demux scale rows NA when packet-yield latency is unobservable', () => {

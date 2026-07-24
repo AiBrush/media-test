@@ -118,6 +118,47 @@ function bakedManifest(
   return parsed.manifest;
 }
 
+test('full-range no-op selection admits only candidates with the authored full duration', () => {
+  const noop = scenario({
+    id: 'trim/noop-selection',
+    family: 'trim',
+    op: 'trim',
+    input: 'baked.webm',
+    options: {
+      container: 'webm',
+      frameAccurate: false,
+      range: { startUs: 0, endUs: 10_000_000 },
+      invariant: 'trim-noop-semantic-identity',
+    },
+    tolerances: { durationToleranceSec: 0.05 },
+    oracles: ['property-invariant', 'trim-boundaries'],
+  });
+  const candidate = (name: string, durationSec: number) => sourceFile(name, name, {
+    container: 'webm',
+    videoCodecs: ['vp9'],
+    audioCodecs: ['opus'],
+    durationSec,
+  });
+  const contractRow = (file: SourceFileRecord) => row([file], {
+    scenarioId: noop.id,
+    requires: {
+      container: 'webm',
+      video: true,
+      videoCodecs: ['vp9'],
+      audioCodecs: ['opus'],
+    },
+  });
+  const exact = candidate('exact.webm', 10.03);
+  const unrelated = candidate('unrelated.webm', 26.019);
+  expect(assessCandidateEligibility(noop, contractRow(exact), exact).eligible).toBe(true);
+  const rejected = assessCandidateEligibility(noop, contractRow(unrelated), unrelated);
+  expect(rejected.eligible).toBe(false);
+  if (!rejected.eligible) {
+    expect(rejected.rejection).toMatchObject({ reasonCode: 'CANDIDATE_INPUT_CONTRACT_MISMATCH' });
+    expect(rejected.rejection.detail).toContain('full-range no-op contract');
+  }
+});
+
 function manifestFor(
   files: SourceFileRecord[],
   options: {

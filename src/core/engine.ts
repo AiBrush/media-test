@@ -572,6 +572,8 @@ export interface EncodedTrack {
   parameterSetLocation?: ParameterSetLocation;
   width?: number;
   height?: number;
+  /** Clockwise display rotation metadata retained by packet-copy paths. */
+  rotation?: 0 | 90 | 180 | 270;
   sampleRate?: number;
   channels?: number;
   /** codec private/description data (e.g. avcC/hvcC/esds), if any */
@@ -583,6 +585,8 @@ export interface EncodedTrack {
 
 export interface EncodedChunk {
   data: Uint8Array;
+  /** Separately encoded alpha access unit when the container/codec carries one (for example VP9 WebM). */
+  alphaData?: Uint8Array;
   ptsUs: number;
   /** Decode timestamp only when exposed by the source; never synthesize it from PTS. */
   dtsUs?: number;
@@ -2051,6 +2055,9 @@ export function validateEncodedTrack(
   requireSafeInteger(engineId, `${path}.timescale`, record.timescale, { min: 1 });
   validatePositiveIntegerOptional(engineId, record, path, 'width');
   validatePositiveIntegerOptional(engineId, record, path, 'height');
+  if (record.rotation !== undefined && ![0, 90, 180, 270].includes(record.rotation as number)) {
+    contractFail(engineId, `${path}.rotation`, 'must be 0, 90, 180, or 270');
+  }
   validatePositiveIntegerOptional(engineId, record, path, 'sampleRate');
   validatePositiveIntegerOptional(engineId, record, path, 'channels');
   if (record.packetOrdering !== undefined && !isPacketOrdering(record.packetOrdering)) {
@@ -2073,6 +2080,9 @@ export function validateEncodedTrack(
     const chunkPath = `${path}.chunks[${index}]`;
     const item = requireRecord(engineId, chunkPath, chunk);
     requireOwnedBytes(engineId, `${chunkPath}.data`, item.data, buffers, false);
+    if (item.alphaData !== undefined) {
+      requireOwnedBytes(engineId, `${chunkPath}.alphaData`, item.alphaData, buffers, false);
+    }
     requireFinite(engineId, `${chunkPath}.ptsUs`, item.ptsUs);
     if (item.dtsUs !== undefined) requireFinite(engineId, `${chunkPath}.dtsUs`, item.dtsUs);
     if (item.decodeIndex !== undefined) {

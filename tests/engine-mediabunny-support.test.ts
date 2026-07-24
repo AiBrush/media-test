@@ -199,6 +199,17 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
       reasonCode: MEDIABUNNY_REASON.TIMESTAMP_MODE,
     },
     {
+      name: 'exact decoded MP3 copy-trim window',
+      value: request({
+        operation: 'trim',
+        outputContainer: 'mp3',
+        tracks: [{ type: 'audio', codec: 'mp3', sampleRate: 48_000, channels: 1 }],
+        audioCodec: 'mp3',
+        options: { frameAccurate: false, invariant: 'trim-audio-content' },
+      }),
+      reasonCode: MEDIABUNNY_REASON.AUDIO_PRESENTATION_TIMING,
+    },
+    {
       name: 'metadata in MPEG-TS',
       value: request({ outputContainer: 'ts', tracks: [VIDEO], options: { tags: { title: 'unsupported' } } }),
       reasonCode: MEDIABUNNY_REASON.METADATA_FORMAT,
@@ -245,6 +256,61 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
       });
     });
   }
+
+  test('keeps declared-illegal mux rows executable while classifying full-timeline gaps explicitly', () => {
+    const illegal = request({ outputContainer: 'ogg', tracks: [VIDEO] });
+    illegal.scenarioId = 'mux/neg_h264_into_ogg_illegal';
+    expect(decideMediabunnySupport(illegal)).toEqual({ supported: true });
+
+    const timeline = request({ outputContainer: 'mp4', tracks: [VIDEO, AUDIO] });
+    timeline.scenarioId = 'mux/edge_bframes_decode_mux_mp4';
+    expect(decideMediabunnySupport(timeline)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.TIMESTAMP_MODE,
+    });
+  });
+
+  test('derives reserve bounds during mux and rejects only malformed explicit bounds', () => {
+    expect(decideMediabunnySupport(request({
+      outputContainer: 'mp4',
+      tracks: [VIDEO, AUDIO],
+      options: { fastStart: 'reserve', target: 'stream' },
+    }))).toMatchObject({ supported: true });
+    expect(() => decideMediabunnySupport(request({
+      outputContainer: 'mp4',
+      tracks: [VIDEO, AUDIO],
+      options: { fastStart: 'reserve', target: 'stream', maximumPacketCount: 0 },
+    }))).toThrow(TypeError);
+  });
+
+  test('does not claim a Matroska mux can silently discard concrete rotation metadata', () => {
+    expect(decideMediabunnySupport(request({
+      outputContainer: 'mkv',
+      tracks: [{ ...VIDEO, rotation: 90 }],
+    }))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.COPY_REQUIRED,
+    });
+  });
+
+  test('applies mux track selection before output cardinality and containability checks', () => {
+    expect(decideMediabunnySupport(request({
+      outputContainer: 'ogg',
+      tracks: [VIDEO, { type: 'audio', codec: 'vorbis', sampleRate: 44_100, channels: 2 }],
+      options: { trackSelect: ['audio:0'] },
+    }))).toEqual({ supported: true });
+  });
+
+  test('defers mux selector resolution until unresolved source tracks are probed', () => {
+    const value = request({
+      outputContainer: 'ogg',
+      options: { trackSelect: ['audio:0'] },
+    });
+    value.inputs[0]!.sourceEvidence = 'UNRESOLVED';
+    expect(decideMediabunnySupport(value)).toEqual({ supported: true });
+  });
 
   test('admits the independently verified fragmented CENC-CTR metadata probe', () => {
     const value = request({

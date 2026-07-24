@@ -285,6 +285,23 @@ describe('REQ-FEAT-15 positioned output modes and fragment internals', () => {
     expect(validateMuxWriteTrace(mismatch, bytes, false)).toMatchObject({
       verdict: 'FAIL', reasonCode: 'MUX_WRITE_RECONSTRUCTION_MISMATCH',
     });
+
+    const initialHeader = bytes.slice(0, 100);
+    initialHeader[28] ^= 0xff;
+    const positionedPatch: MuxWriteTrace = {
+      schema: MUX_WRITE_TRACE_SCHEMA,
+      finalByteLength: bytes.byteLength,
+      peakBufferedBytes: 512,
+      reservations: [],
+      writes: [
+        { sequence: 0, atMs: 0, position: 0, bytes: initialHeader, kind: 'append' },
+        { sequence: 1, atMs: 1, position: 100, bytes: bytes.slice(100), kind: 'append' },
+        { sequence: 2, atMs: 2, position: 28, bytes: bytes.slice(28, 29), kind: 'patch' },
+      ],
+    };
+    expect(validateMuxWriteTrace(positionedPatch, bytes, false)).toMatchObject({
+      verdict: 'PASS', reasonCode: 'MUX_WRITE_RECONSTRUCTION_EXACT',
+    });
   });
 
   test('reserve mode proves forward media write followed by an in-range positioned patch', () => {
@@ -393,6 +410,18 @@ describe('REQ-FEAT-16 decisive neutral readers for every advertised mux target',
       tracks: [],
       durationToleranceUs: 0,
     })).toMatchObject({ state: 'ERROR', reasonCode: 'MUX_TARGET_READER_COVERAGE_ERROR' });
+  });
+
+  test('keep-all target semantics allow dynamic extra tracks while selection proves exact membership', () => {
+    const scenario = muxScenarios.find((entry) => entry.id === 'mux/edge_multitrack_keep_all_to_mp4')!;
+    const contract = muxTargetContractFromScenario(scenario)!;
+    expect(contract).toMatchObject({ allowAdditionalTracks: true });
+    expect(contract.tracks).toHaveLength(2);
+    expect(assessMuxTargetSemantics(bytesAt('fixtures/media/h264_multitrack.mp4'), contract)).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      reasonCode: 'MUX_TARGET_SEMANTIC_REIMPORT_VALID',
+    });
   });
 });
 
