@@ -5,11 +5,12 @@
  * PTS/DTS and keyframe flags, plus the video codec description (avcC / hvcC / vpcC) needed for the
  * decoder config and the audio descriptor (esds → AAC) needed for honest probe metadata.
  *
- * Scope (HONEST): progressive (non-fragmented) MP4/MOV with a contiguous moov. This is NOT a general
- * MP4 parser — it does not handle moof/traf fragments. It enumerates every 'vide'/'soun' trak so the
- * normalized metadata + packet table match a multi-track golden; it throws a typed
- * {@link UnsupportedMp4Error} when it meets something it cannot handle so callers can fall back to a
- * <video>-element frame grab. AV bytes are never mutated.
+ * Scope (HONEST): progressive MP4/MOV with a contiguous moov, plus flat/hybrid movie fragments whose
+ * traf/trun tables carry bounded sample sizes and an explicit addressable media-data offset. This is
+ * NOT a general MP4 parser. It enumerates every 'vide'/'soun' trak so the normalized metadata + packet
+ * table match a multi-track golden; it throws a typed {@link UnsupportedMp4Error} when it meets a
+ * fragment layout it cannot address so callers can fall back to a <video>-element frame grab. AV
+ * bytes are never mutated.
  *
  * SOURCES (dossier research/dossiers/platform.md §2 demux / §5 description seam, researched 2026-06-17):
  *   - WebCodecs API: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
@@ -645,6 +646,8 @@ function childBoxes(buf: Uint8Array, box: Box): Box[] {
 
 interface FragmentDefaults {
   durationTicks?: number;
+  sizeBytes?: number;
+  sampleFlags?: number;
 }
 
 interface FragmentStats {
@@ -661,7 +664,13 @@ function parseTrexDefaults(buf: Uint8Array, moov: Box): Map<number, FragmentDefa
     if (trex.type !== 'trex' || trex.bodyStart + 24 > trex.bodyEnd) continue;
     const trackId = be32(buf, trex.bodyStart + 4);
     const durationTicks = be32(buf, trex.bodyStart + 12);
-    out.set(trackId, durationTicks > 0 ? { durationTicks } : {});
+    const sizeBytes = be32(buf, trex.bodyStart + 16);
+    const sampleFlags = be32(buf, trex.bodyStart + 20);
+    out.set(trackId, {
+      ...(durationTicks > 0 ? { durationTicks } : {}),
+      ...(sizeBytes > 0 ? { sizeBytes } : {}),
+      ...(sampleFlags > 0 ? { sampleFlags } : {}),
+    });
   }
   return out;
 }
@@ -754,6 +763,182 @@ function parseFragmentStats(buf: Uint8Array, moov: Box): Map<number, FragmentSta
     }
   }
   return stats;
+}
+
+interface FragmentSampleHeader {
+  trackId: number;
+  baseDataOffset?: number;
+  defaultDurationTicks?: number;
+  defaultSizeBytes?: number;
+  defaultSampleFlags?: number;
+}
+
+/** Fully parse the tfhd fields that are needed to address and decode a fragment's sample payloads. */
+function parseFragmentSampleHeader(
+  buf: Uint8Array,
+  moof: Box,
+  tfhd: Box,
+  defaults: FragmentDefaults | undefined,
+): FragmentSampleHeader {
+  if (tfhd.bodyStart + 8 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated tfhd');
+  const flags = be24(buf, tfhd.bodyStart + 1);
+  const trackId = be32(buf, tfhd.bodyStart + 4);
+  let off = tfhd.bodyStart + 8;
+  let baseDataOffset: number | undefined;
+  if (flags & 0x000001) {
+    if (off + 8 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated tfhd base-data-offset');
+    baseDataOffset = Number(be64(buf, off));
+    off += 8;
+  } else if (flags & 0x020000) {
+    baseDataOffset = moof.start;
+  }
+  if (flags & 0x000002) {
+    if (off + 4 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated sample-description-index');
+    off += 4;
+  }
+
+  let defaultDurationTicks = defaults?.durationTicks;
+  let defaultSizeBytes = defaults?.sizeBytes;
+  let defaultSampleFlags = defaults?.sampleFlags;
+  if (flags & 0x000008) {
+    if (off + 4 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated default sample duration');
+    defaultDurationTicks = be32(buf, off);
+    off += 4;
+  }
+  if (flags & 0x000010) {
+    if (off + 4 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated default sample size');
+    defaultSizeBytes = be32(buf, off);
+    off += 4;
+  }
+  if (flags & 0x000020) {
+    if (off + 4 > tfhd.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated default sample flags');
+    defaultSampleFlags = be32(buf, off);
+  }
+  return {
+    trackId,
+    ...(baseDataOffset !== undefined ? { baseDataOffset } : {}),
+    ...(defaultDurationTicks !== undefined ? { defaultDurationTicks } : {}),
+    ...(defaultSizeBytes !== undefined ? { defaultSizeBytes } : {}),
+    ...(defaultSampleFlags !== undefined ? { defaultSampleFlags } : {}),
+  };
+}
+
+function fragmentSampleIsSync(flags: number): boolean {
+  return (flags & 0x0001_0000) === 0;
+}
+
+/**
+ * Read every addressable sample for one track from top-level moof/traf/trun fragments. Hybrid files
+ * are common in the encryption corpus: their moov contains an initial progressive prefix and later
+ * moofs continue the same timeline. Ignoring those moofs silently truncated the clear reference from
+ * 150 to 60 frames and manufactured a decrypt cardinality failure.
+ */
+function buildSamplesFromFragments(
+  bytes: Uint8Array,
+  moov: Box,
+  trackId: number,
+  timescale: number,
+): Mp4Sample[] {
+  const defaults = parseTrexDefaults(bytes, moov);
+  const samples: Mp4Sample[] = [];
+  let nextDecodeTicks: number | undefined;
+
+  for (const moof of iterBoxes(bytes, 0, bytes.length)) {
+    if (moof.type !== 'moof') continue;
+    for (const traf of childBoxes(bytes, moof)) {
+      if (traf.type !== 'traf') continue;
+      const tfhd = findBox(bytes, traf.bodyStart, traf.bodyEnd, 'tfhd');
+      if (!tfhd) throw new UnsupportedMp4Error('fragment traf is missing tfhd');
+      const header = parseFragmentSampleHeader(bytes, moof, tfhd, defaults.get(trackId));
+      if (header.trackId !== trackId) continue;
+
+      const tfdt = findBox(bytes, traf.bodyStart, traf.bodyEnd, 'tfdt');
+      let decodeTicks = parseTfdtBaseTicks(bytes, tfdt) ?? nextDecodeTicks;
+      if (decodeTicks === undefined) {
+        throw new UnsupportedMp4Error(`fragment track ${trackId} has no addressable decode-time origin`);
+      }
+      let previousRunEnd: number | undefined;
+
+      for (const trun of childBoxes(bytes, traf)) {
+        if (trun.type !== 'trun') continue;
+        if (trun.bodyStart + 8 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated trun');
+        const version = bytes[trun.bodyStart] ?? 0;
+        const flags = be24(bytes, trun.bodyStart + 1);
+        const declaredSamples = be32(bytes, trun.bodyStart + 4);
+        if (declaredSamples > bytes.byteLength) {
+          throw new UnsupportedMp4Error('fragment sample count exceeds the bounded input size');
+        }
+        let off = trun.bodyStart + 8;
+        let dataStart: number | undefined;
+        if (flags & 0x000001) {
+          if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated trun data offset');
+          if (header.baseDataOffset === undefined) {
+            throw new UnsupportedMp4Error('fragment trun data offset has no addressable tfhd base');
+          }
+          dataStart = header.baseDataOffset + (be32(bytes, off) | 0);
+          off += 4;
+        } else {
+          dataStart = previousRunEnd ?? header.baseDataOffset;
+        }
+        if (dataStart === undefined || !Number.isSafeInteger(dataStart) || dataStart < 0) {
+          throw new UnsupportedMp4Error('fragment media-data offset is not addressable');
+        }
+
+        let firstSampleFlags: number | undefined;
+        if (flags & 0x000004) {
+          if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated first-sample flags');
+          firstSampleFlags = be32(bytes, off);
+          off += 4;
+        }
+
+        let dataOffset = dataStart;
+        for (let index = 0; index < declaredSamples; index++) {
+          let durationTicks = header.defaultDurationTicks ?? 0;
+          let sizeBytes = header.defaultSizeBytes ?? 0;
+          let sampleFlags = index === 0 && firstSampleFlags !== undefined
+            ? firstSampleFlags
+            : header.defaultSampleFlags ?? 0;
+          let compositionOffsetTicks = 0;
+          if (flags & 0x000100) {
+            if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated sample duration');
+            durationTicks = be32(bytes, off);
+            off += 4;
+          }
+          if (flags & 0x000200) {
+            if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated sample size');
+            sizeBytes = be32(bytes, off);
+            off += 4;
+          }
+          if (flags & 0x000400) {
+            if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated sample flags');
+            sampleFlags = be32(bytes, off);
+            off += 4;
+          }
+          if (flags & 0x000800) {
+            if (off + 4 > trun.bodyEnd) throw new UnsupportedMp4Error('fragment has truncated composition offset');
+            compositionOffsetTicks = version === 1 ? (be32(bytes, off) | 0) : be32(bytes, off);
+            off += 4;
+          }
+          if (durationTicks <= 0 || sizeBytes <= 0 || dataOffset + sizeBytes > bytes.byteLength) {
+            throw new UnsupportedMp4Error('fragment sample has invalid duration, size, or media-data extent');
+          }
+          const toUs = (ticks: number): number => Math.round((ticks * 1_000_000) / timescale);
+          samples.push({
+            data: bytes.subarray(dataOffset, dataOffset + sizeBytes).slice(),
+            dtsUs: toUs(decodeTicks),
+            ptsUs: toUs(decodeTicks + compositionOffsetTicks),
+            durationUs: toUs(durationTicks),
+            keyframe: fragmentSampleIsSync(sampleFlags),
+          });
+          dataOffset += sizeBytes;
+          decodeTicks += durationTicks;
+        }
+        previousRunEnd = dataOffset;
+      }
+      nextDecodeTicks = decodeTicks;
+    }
+  }
+  return samples;
 }
 
 /** hdlr handler_type fourcc (e.g. 'vide','soun'). */
@@ -897,7 +1082,16 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       const stsd = findBox(bytes, stbl.bodyStart, stbl.bodyEnd, 'stsd');
       if (!stsd) throw new UnsupportedMp4Error('video track missing stsd');
       const sampleDesc = parseStsd(bytes, stsd);
-      const samples = buildSamplesFromStbl(bytes, stbl, timescale);
+      const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
+      const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
+      let samples: Mp4Sample[] = [];
+      try {
+        samples = buildSamplesFromStbl(bytes, stbl, timescale);
+      } catch (error) {
+        if (!findBox(bytes, 0, bytes.length, 'moof')) throw error;
+      }
+      if (trackId !== null) samples.push(...buildSamplesFromFragments(bytes, moov, trackId, timescale));
+      if (samples.length === 0) throw new UnsupportedMp4Error('video track contains no addressable samples');
       const config: Mp4VideoConfig = {
         codec: sampleDesc.token,
         codecString: sampleDesc.codecString,
@@ -915,12 +1109,16 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       if (!audioDesc) continue; // sample entry not one we identify (e.g. non-AAC) → skip
       // Audio sample tables can be malformed in fuzzed input; degrade by skipping THIS track rather
       // than failing the whole demux (the video track may still be perfectly readable).
-      let samples: Mp4Sample[];
+      let samples: Mp4Sample[] = [];
       try {
         samples = buildSamplesFromStbl(bytes, stbl, timescale);
-      } catch {
-        continue;
+      } catch (error) {
+        if (!findBox(bytes, 0, bytes.length, 'moof')) continue;
       }
+      const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
+      const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
+      if (trackId !== null) samples.push(...buildSamplesFromFragments(bytes, moov, trackId, timescale));
+      if (samples.length === 0) continue;
       const config: Mp4AudioConfig = {
         codec: audioDesc.token,
         codecString: audioDesc.codecString,
@@ -1081,9 +1279,8 @@ export function probeMp4Metadata(bytes: Uint8Array): Mp4MetadataProbe {
 }
 
 /**
- * Demux the first video track of a progressive MP4/MOV into ordered encoded samples + decoder
- * config. Thin wrapper over {@link demuxMp4Tracks}. Throws {@link UnsupportedMp4Error} for fragmented
- * MP4, no moov, or no decodable video track.
+ * Demux the first video track of a progressive or addressable flat/hybrid-fragmented MP4/MOV into
+ * ordered encoded samples + decoder config. Thin wrapper over {@link demuxMp4Tracks}.
  */
 export function demuxMp4Video(bytes: Uint8Array): Mp4VideoTrack {
   const tracks = demuxMp4Tracks(bytes);

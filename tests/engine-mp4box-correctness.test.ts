@@ -17,6 +17,7 @@ import {
   type OperationContext,
   type PacketInfo,
 } from '../src/core/engine.ts';
+import { readOutputStructure } from '../src/core/box-readers.ts';
 import { Mp4boxEngine, mp4boxSampleEvidence } from '../src/engines/mp4box/adapter.ts';
 import {
   fpsEvidenceFromSamples,
@@ -24,6 +25,7 @@ import {
   validateFragmentedMp4,
 } from '../src/engines/mp4box/evidence.ts';
 import { decideMp4boxSupport } from '../src/engines/mp4box/support.ts';
+import { readNeutralRemuxProgram } from '../src/features/remux/readers.ts';
 
 const VIDEO: NormalizedTrack = { type: 'video', codec: 'h264', width: 320, height: 240, fps: 30 };
 const AUDIO: NormalizedTrack = { type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 };
@@ -596,6 +598,33 @@ describe('REQ-ENG-23: sample-entry configuration and presentation timeline prese
     });
   }
 
+  test('copies the terminal stts delta and keeps edit-list presentation duration decisive', async () => {
+    await withEngine(async (engine) => {
+      const vfrSource = await fixtureInput('scenarios/mux/prop_vfr_mux_duration_mp4_to_mp4/01.mp4');
+      const vfrBytes = new Uint8Array(await vfrSource.arrayBuffer());
+      const sourceProgram = readNeutralRemuxProgram(vfrBytes, 'mp4');
+      const prepared = await engine.prepareMuxTracks([vfrSource], { container: 'mp4', fragmented: true });
+      const muxed = await engine.mux(prepared, { container: 'mp4', fragmented: true });
+      const outputProgram = readNeutralRemuxProgram(muxed.bytes, 'mp4');
+      expect(sourceProgram.state).toBe('OK');
+      expect(outputProgram.state).toBe('OK');
+      if (sourceProgram.state === 'OK' && outputProgram.state === 'OK') {
+        const sourceAudio = sourceProgram.value.tracks.find((track) => track.type === 'audio');
+        const outputAudio = outputProgram.value.tracks.find((track) => track.type === 'audio');
+        expect(outputAudio?.samples.at(-1)?.durationUs).toBe(sourceAudio?.samples.at(-1)?.durationUs);
+      }
+
+      const editedPath = 'scenarios/mux/h264_aac_to_mp4/01.mp4';
+      const editedBytes = new Uint8Array(await Bun.file(`fixtures/media/${editedPath}`).arrayBuffer());
+      const editedInput = bytesInput(editedPath, editedBytes);
+      const editedPrepared = await engine.prepareMuxTracks([editedInput], { container: 'mp4', fragmented: true });
+      const editedMuxed = await engine.mux(editedPrepared, { container: 'mp4', fragmented: true });
+      const sourceStructure = readOutputStructure(editedBytes, 'mp4');
+      const outputStructure = readOutputStructure(editedMuxed.bytes, 'mp4');
+      expect(Math.abs((outputStructure?.durationSec ?? 0) - (sourceStructure?.durationSec ?? 0))).toBeLessThanOrEqual(0.001);
+    });
+  });
+
   test('marks fragmented trun offsets signed when a MOV carries negative video composition offsets', async () => {
     await withEngine(async (engine) => {
       const source = await fixtureInput(
@@ -864,5 +893,14 @@ describe('REQ-ENG-25: bounded progressive memory and deterministic cancellation/
     expect(first).not.toBe(second);
     expect(first.id).toBe(second.id);
     expect(Object.isFrozen(engine.configUsed)).toBe(true);
+    expect(engine.benchmarkLimits).toEqual({
+      maxInnerIterations: 1,
+      memoryWindow: {
+        sampleImmediatelyDuringOperation: true,
+        maxOperationSamples: 1,
+        settleWindowMs: 0,
+        sampleTimeoutMs: 1_000,
+      },
+    });
   });
 });

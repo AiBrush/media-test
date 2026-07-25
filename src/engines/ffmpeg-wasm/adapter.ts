@@ -138,6 +138,7 @@ import {
   parseFfprobeFramesJson,
   parseFfprobeJson,
   parseFrameChecksumPackets,
+  parseFrameChecksumTimebases,
   parseMp3XingDurationSec,
   parseTracksFromLog,
   nearestObservedFrame,
@@ -174,7 +175,9 @@ import {
   buildTimedMp4,
   canBuildTimedMp4,
   hasImplicitRawDemuxTiming,
+  timescaleForTimedMux,
   TimedMp4UnsupportedError,
+  type TimedMp4Presentation,
 } from './timed-mp4.ts';
 import {
   DEFAULT_FFMPEG_LIMITS,
@@ -510,6 +513,46 @@ interface PreparedMuxTrackCandidate {
   type: 'video' | 'audio';
   typeOrdinal: number;
   track: EncodedTracks['tracks'][number];
+}
+
+interface NeutralMuxTimingTrack {
+  type: 'video' | 'audio';
+  codec: string;
+  timescale?: number;
+  programDurationUs?: number;
+  samples: Array<{
+    ptsUs?: number;
+    dtsUs?: number;
+    durationUs?: number;
+    keyframe?: boolean;
+  }>;
+}
+
+async function neutralMuxTimingTracks(input: MediaInput): Promise<NeutralMuxTimingTrack[]> {
+  if (typeof input.sizeBytes === 'number' && input.sizeBytes > NEUTRAL_FRAME_TIMELINE_CEILING_BYTES) return [];
+  try {
+    const bytes = new Uint8Array(await input.arrayBuffer());
+    const read = readNeutralRemuxProgram(bytes, containerFromInput(input));
+    if (read.state !== 'OK') return [];
+    return read.value.tracks.flatMap((track) =>
+      track.type === 'video' || track.type === 'audio'
+        ? [{
+            type: track.type,
+            codec: canonicalCodec(track.codec),
+            ...(track.timescale !== undefined ? { timescale: track.timescale } : {}),
+            ...(read.value.durationUs !== undefined ? { programDurationUs: read.value.durationUs } : {}),
+            samples: track.samples.map((sample) => ({
+              ...(sample.ptsUs !== undefined ? { ptsUs: sample.ptsUs } : {}),
+              ...(sample.dtsUs !== undefined ? { dtsUs: sample.dtsUs } : {}),
+              ...(sample.durationUs !== undefined ? { durationUs: sample.durationUs } : {}),
+              ...(sample.keyframe !== undefined ? { keyframe: sample.keyframe } : {}),
+            })),
+          }]
+        : [],
+    );
+  } catch {
+    return [];
+  }
 }
 
 /** Parse `Duration: HH:MM:SS.ms` from an `ffmpeg -i` log; null if absent/`N/A`. */
@@ -3459,11 +3502,43 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
     }
 
-    const protection = inspectProtectionStructure(encryptedBytes);
+    let protection: ReturnType<typeof inspectProtectionStructure>;
+    try {
+      protection = inspectProtectionStructure(encryptedBytes);
+    } catch (error) {
+      const robustness = this.activeOperation?.context.request.options.robustness;
+      const deliberateMalformed = robustness !== null && typeof robustness === 'object' &&
+        !Array.isArray(robustness) &&
+        (robustness as Record<string, unknown>).schema === 'media-test/robustness-contract@1';
+      if (
+        deliberateMalformed &&
+        !this.lifecycle.reason &&
+        !this.activeOperation?.context.signal.aborted &&
+        !(error instanceof FfmpegWorkerStateError)
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'decrypt',
+          'parse',
+          describeError(error),
+          'FFMPEG_DECRYPT_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
+    }
     const applicability = classifyIsoDecryptApplicability(protection, opts.scheme);
     if (!applicability.supported) {
       this.recordInputBytes(encryptedBytes.byteLength);
       throw this.applicabilityMiss(applicability.reasonCode, applicability.reason);
+    }
+
+    // A clear ISO-BMFF input is a literal decrypt no-op. Returning the owned input copy preserves
+    // byte identity; remuxing it through FFmpeg is playable but violates the declared no-op contract.
+    if (protection.protectedTracks === 0) {
+      this.recordInputBytes(encryptedBytes.byteLength);
+      return { bytes: encryptedBytes, mime: input.mime || containerMime('mp4'), container: 'mp4' };
     }
 
     const keyHex = key.keyHex.trim().toLowerCase();
@@ -3478,16 +3553,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     this.fsLedger.addJsCopy(encryptedBytes.byteLength);
     this.recordInputBytes(encryptedBytes.byteLength);
     let clearBytes: Uint8Array;
-    try {
-      clearBytes = await decryptCencCtrMp4(encryptedBytes, hexToBytesStrict(keyHex, 'CENC key'), key.kid);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/CENC decrypt found no protected tracks/.test(msg)) {
-        throw err;
-      }
-      // Clear MP4 no-op decrypt case: preserve usable media by remuxing the original bytes below.
-      clearBytes = encryptedBytes;
-    }
+    clearBytes = await decryptCencCtrMp4(encryptedBytes, hexToBytesStrict(keyHex, 'CENC key'), key.kid);
     if (clearBytes !== encryptedBytes) this.fsLedger.addJsCopy(clearBytes.byteLength);
     await this.requireFf().writeFile(clearName, clearBytes, { signal });
     this.fsLedger.add(clearName, clearBytes.byteLength, 'MEMFS');
@@ -4552,6 +4618,7 @@ export class FfmpegWasmEngine implements MediaEngine {
           await this.runInfo(written.name, written.inputOptions),
           input,
         );
+        const neutralTimingTracks = await neutralMuxTimingTracks(input);
         const typeCounts: Record<'video' | 'audio', number> = { video: 0, audio: 0 };
         for (let streamIndex = 0; streamIndex < metadata.tracks.length; streamIndex++) {
           const track = metadata.tracks[streamIndex]!;
@@ -4559,6 +4626,8 @@ export class FfmpegWasmEngine implements MediaEngine {
           const type = track.type;
           const typeOrdinal = typeCounts[type]++;
           const codec = canonicalCodec(track.codec);
+          const neutralTimingTrack = neutralTimingTracks.filter((candidate) => candidate.type === type)[typeOrdinal];
+          const exactNeutralTiming = neutralTimingTrack?.codec === codec ? neutralTimingTrack : undefined;
           const prep = this.muxPrepForCodec(codec);
           if (!prep) {
             throw createNotApplicableError(ENGINE_ID,
@@ -4588,7 +4657,9 @@ export class FfmpegWasmEngine implements MediaEngine {
             '-c', 'copy',
             '-f', 'framecrc', packetName,
           ], READ_EXEC_TIMEOUT_MS);
-          const packetRows = parseFrameChecksumPackets(await this.readText(packetName));
+          const packetText = await this.readText(packetName);
+          const packetRows = parseFrameChecksumPackets(packetText);
+          const packetTimebase = parseFrameChecksumTimebases(packetText).get(0);
           let splitRows = packetRows;
           if (prep.format === 'h264' || prep.format === 'hevc') {
             // Annex-B conversion can prepend parameter sets and replace length fields, so source
@@ -4610,16 +4681,32 @@ export class FfmpegWasmEngine implements MediaEngine {
           const durationUs = metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
             ? Math.round(metadata.durationSec * 1_000_000)
             : 0;
+          const timingRows = exactNeutralTiming?.samples.length === slices.length
+            ? exactNeutralTiming.samples.map((sample, packetIndex) => ({
+                ptsUs: sample.ptsUs ?? packetRows[packetIndex]?.ptsUs ?? 0,
+                ...(sample.dtsUs !== undefined
+                  ? { dtsUs: sample.dtsUs }
+                  : packetRows[packetIndex]?.dtsUs !== undefined
+                    ? { dtsUs: packetRows[packetIndex]!.dtsUs }
+                    : {}),
+                ...(sample.durationUs !== undefined
+                  ? { durationUs: sample.durationUs }
+                  : packetRows[packetIndex]?.durationUs !== undefined
+                    ? { durationUs: packetRows[packetIndex]!.durationUs }
+                    : {}),
+                keyframe: sample.keyframe ?? packetRows[packetIndex]?.keyframe ?? false,
+              }))
+            : packetRows;
           const chunks: EncodedTracks['tracks'][number]['chunks'] =
-            slices.length === packetRows.length
-              ? packetRows.map((packet, packetIndex) => ({
+            slices.length === timingRows.length
+              ? timingRows.map((packet, packetIndex) => ({
                   data: slices[packetIndex]!,
                   ptsUs: packet.ptsUs,
                   ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
                   decodeIndex: packetIndex,
                   durationUs:
                     packet.durationUs ??
-                    Math.max(0, (packetRows[packetIndex + 1]?.ptsUs ?? durationUs) - packet.ptsUs),
+                    Math.max(0, (timingRows[packetIndex + 1]?.ptsUs ?? durationUs) - packet.ptsUs),
                   keyframe: packet.keyframe,
                 }))
               : [{ data: bytes, ptsUs: 0, decodeIndex: 0, durationUs, keyframe: true }];
@@ -4630,16 +4717,57 @@ export class FfmpegWasmEngine implements MediaEngine {
               : prep.format === 'ivf'
                 ? 'ivf'
                 : 'codec-private';
-          const sourceTimebase = structured?.timebases.get(sourceStreamIndex);
+          const neutralTimebase = exactNeutralTiming?.timescale !== undefined &&
+            Number.isSafeInteger(exactNeutralTiming.timescale) && exactNeutralTiming.timescale > 0
+              ? { numerator: 1, denominator: exactNeutralTiming.timescale }
+              : undefined;
+          const sourceTimebase = structured?.timebases.get(sourceStreamIndex) ?? neutralTimebase ?? packetTimebase;
+          const neutralMinimumPtsUs = exactNeutralTiming === undefined
+            ? undefined
+            : exactNeutralTiming.samples.reduce(
+                (minimum, sample) => sample.ptsUs === undefined ? minimum : Math.min(minimum, sample.ptsUs),
+                Number.POSITIVE_INFINITY,
+              );
+          const programStartUs = exactNeutralTiming
+            ? 0
+            : Math.round((metadata.presentationStartSec ?? 0) * 1_000_000);
+          const trackStartUs = exactNeutralTiming && Number.isFinite(neutralMinimumPtsUs)
+            ? Math.max(0, Math.round(neutralMinimumPtsUs!))
+            : Math.round((track.presentationStartSec ?? metadata.presentationStartSec ?? 0) * 1_000_000);
+          const explicitTrackDurationSec = track.presentationDurationSec ?? track.mediaDurationSec;
+          const packetPresentationEndUs = chunks.reduce(
+            (max, chunk) => Math.max(max, chunk.ptsUs + chunk.durationUs),
+            Number.NEGATIVE_INFINITY,
+          );
+          const neutralProgramDurationUs = exactNeutralTiming?.programDurationUs;
+          const neutralTrackSpanUs = Number.isFinite(packetPresentationEndUs) && packetPresentationEndUs >= trackStartUs
+            ? Math.round(packetPresentationEndUs - trackStartUs)
+            : undefined;
+          const neutralHasVideo = neutralTimingTracks.some((candidate) => candidate.type === 'video');
+          const trackPresentationDurationUs = neutralProgramDurationUs !== undefined
+            ? track.type === 'video' || !neutralHasVideo
+              ? Math.max(0, neutralProgramDurationUs - trackStartUs)
+              : neutralTrackSpanUs === undefined
+                ? Math.max(0, neutralProgramDurationUs - trackStartUs)
+                : Math.min(neutralTrackSpanUs, Math.max(0, neutralProgramDurationUs - trackStartUs))
+            : explicitTrackDurationSec !== undefined && Number.isFinite(explicitTrackDurationSec)
+              ? Math.round(explicitTrackDurationSec * 1_000_000)
+              : neutralTrackSpanUs ?? (metadata.durationSec !== null && Number.isFinite(metadata.durationSec)
+                ? Math.round(metadata.durationSec * 1_000_000)
+                : undefined);
+          const timedMp4Presentation: TimedMp4Presentation | undefined = trackPresentationDurationUs === undefined
+            ? undefined
+            : { programStartUs, trackStartUs, durationUs: trackPresentationDurationUs };
           const rotation = track.rotation === 0 || track.rotation === 90 || track.rotation === 180 || track.rotation === 270
             ? track.rotation
             : undefined;
-          const encodedTrack: EncodedTracks['tracks'][number] = {
+          const encodedTrack: EncodedTracks['tracks'][number] & { timedMp4Presentation?: TimedMp4Presentation } = {
             type,
             codec,
-            timescale: 1_000_000,
+            timescale: timescaleForTimedMux(sourceTimebase),
             packetOrdering: 'decode',
             ...(sourceTimebase ? { timebase: sourceTimebase } : {}),
+            ...(timedMp4Presentation ? { timedMp4Presentation } : {}),
             framing,
             accessUnitGrouping: 'one-packet-per-chunk',
             parameterSetLocation: framing === 'annexb' ? 'in-band' : 'not-applicable',
@@ -4820,7 +4948,7 @@ export class FfmpegWasmEngine implements MediaEngine {
     const outName = `${base}.out.${containerExt(opts.container)}`;
     let stage: Uint8Array;
     try {
-      stage = buildTimedMp4(tracks);
+      stage = buildTimedMp4(tracks, opts.container === 'mov' ? 'mov' : 'mp4');
     } catch (error) {
       if (error instanceof TimedMp4UnsupportedError) {
         throw createNotApplicableError(
@@ -4834,6 +4962,28 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
       throw error;
     }
+    if (
+      (opts.container === 'mp4' || opts.container === 'mov') &&
+      opts.fragmented !== true &&
+      opts.fastStart !== 'fragmented' &&
+      opts.fastStart !== true &&
+      opts.fastStart !== 'in-memory'
+    ) {
+      // This is already the requested progressive ISO-BMFF target. A second FFmpeg demux/remux pass can rewrite
+      // authored VFR sample durations (especially the terminal run), so return the verified staging
+      // artifact directly. Its mdat-before-moov layout also implements fastStart:false exactly.
+      return {
+        bytes: stage,
+        mime: containerMime(opts.container),
+        container: opts.container,
+        ffmpegRepresentation: {
+          muxer: opts.container,
+          timingSource: 'explicit-iso-bmff-sample-tables',
+          inputFraming: tracks.map((track) => track.framing ?? 'missing'),
+          fragmentFlags: null,
+        },
+      } as MediaBytes;
+    }
     this.fsLedger.addJsCopy(stage.byteLength);
     try {
       await this.writeScratch(stageName, stage, true);
@@ -4841,7 +4991,12 @@ export class FfmpegWasmEngine implements MediaEngine {
       this.fsLedger.releaseJsCopy(stage.byteLength);
     }
     try {
-      const args = ['-copyts', '-i', stageName, '-map', '0', '-c', 'copy', '-avoid_negative_ts', 'make_zero'];
+      // The staging edit list already maps negative decode preroll onto presentation time zero.
+      // make_zero would shift that authored presentation back by the preroll a second time.
+      const args = [
+        '-copyts', '-i', stageName, '-map', '0', '-c', 'copy',
+        '-avoid_negative_ts', opts.container === 'ts' ? 'make_zero' : 'disabled',
+      ];
       if (opts.container === 'mp4' || opts.container === 'mov') {
         if (opts.fragmented === true || opts.fastStart === 'fragmented') {
           args.push('-movflags', FFMPEG_FRAGMENT_MOVFLAGS);

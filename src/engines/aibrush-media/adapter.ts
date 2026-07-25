@@ -38,6 +38,7 @@ import type {
   MediaBytes,
   MediaEngine,
   MediaInput,
+  MuxWriteTraceEvidence,
   MuxOptions,
   LifecycleContext,
   NormalizedMetadata,
@@ -60,6 +61,7 @@ import {
 } from '../../core/engine.ts';
 import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
+import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
 import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
 import { compareStrictRemuxPrograms } from '../../features/remux/strict-copy.ts';
 import {
@@ -92,6 +94,8 @@ import {
   buildAibrushDemuxResult,
   canonicalAibrushCodec,
   normalizeAibrushTrack,
+  representationForAibrushTrack,
+  type AibrushObservedTrack,
 } from './representation.ts';
 import { aibrushTupleSummary, decideAibrushSupport } from './support.ts';
 import { takeFirstOwned } from './ownership.ts';
@@ -378,6 +382,47 @@ function packetRowsArePreindexed(packetRows: readonly AibrushPacketInfoRow[], tr
   return hasHarnessPacketAliases(first, trackCount) && (last === first || hasHarnessPacketAliases(last, trackCount));
 }
 
+/**
+ * Preserve the framework-observed coded representation on the demux-to-mux handoff. The shared
+ * adapter contract intentionally refuses to infer H.264/H.265 framing from a codec name, and every
+ * codec-private description must identify the record it carries.
+ */
+export function aibrushMuxRepresentationFields(
+  track: AibrushObservedTrack,
+): Pick<
+  EncodedTrack,
+  | 'nativeCodecTag'
+  | 'framing'
+  | 'accessUnitGrouping'
+  | 'parameterSetLocation'
+  | 'rotation'
+  | 'description'
+  | 'descriptionRecord'
+> {
+  const representation = representationForAibrushTrack(track, 0, 'decode');
+  if (representation.description !== undefined && representation.descriptionRecord === undefined) {
+    throw new Error('aibrush mux representation has description bytes without a record type');
+  }
+  return {
+    framing: representation.framing,
+    accessUnitGrouping: representation.accessUnitGrouping,
+    parameterSetLocation: representation.parameterSetLocation,
+    ...(representation.nativeCodecTag !== undefined
+      ? { nativeCodecTag: representation.nativeCodecTag }
+      : {}),
+    ...(track.mediaType === 'video' &&
+    (track.rotation === 0 || track.rotation === 90 || track.rotation === 180 || track.rotation === 270)
+      ? { rotation: track.rotation }
+      : {}),
+    ...(representation.description !== undefined && representation.descriptionRecord !== undefined
+      ? {
+          description: representation.description,
+          descriptionRecord: representation.descriptionRecord,
+        }
+      : {}),
+  };
+}
+
 function encodedFlacTrackFromPacketInfo(
   table: AibrushPacketInfoTable,
   bytes: Uint8Array,
@@ -422,7 +467,7 @@ function encodedFlacTrackFromPacketInfo(
     timescale: 1_000_000,
     sampleRate: cfg.sampleRate,
     channels: cfg.numberOfChannels,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -463,7 +508,7 @@ function encodedOggAudioTrackFromPacketInfo(
     const end = offset + row.size;
     if (!Number.isSafeInteger(end) || end > bytes.byteLength) return undefined;
     chunks.push({
-      data: bytes.subarray(offset, end),
+      data: bytes.slice(offset, end),
       ptsUs: row.ptsUs,
       ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
       durationUs,
@@ -477,7 +522,7 @@ function encodedOggAudioTrackFromPacketInfo(
     timescale: 1_000_000,
     sampleRate: cfg.sampleRate,
     channels: cfg.numberOfChannels,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -518,7 +563,7 @@ function encodedMp3AudioTrackFromPacketInfo(
     const end = offset + row.size;
     if (!Number.isSafeInteger(end) || end > bytes.byteLength) return undefined;
     chunks.push({
-      data: bytes.subarray(offset, end),
+      data: bytes.slice(offset, end),
       ptsUs: row.ptsUs,
       ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
       durationUs,
@@ -532,6 +577,7 @@ function encodedMp3AudioTrackFromPacketInfo(
     timescale: 1_000_000,
     sampleRate: cfg.sampleRate,
     channels: cfg.numberOfChannels,
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -572,7 +618,7 @@ function encodedAdtsAudioTrackFromPacketInfo(
     const end = offset + row.size;
     if (!Number.isSafeInteger(end) || end > bytes.byteLength) return undefined;
     chunks.push({
-      data: bytes.subarray(offset, end),
+      data: bytes.slice(offset, end),
       ptsUs: row.ptsUs,
       ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
       durationUs,
@@ -586,7 +632,7 @@ function encodedAdtsAudioTrackFromPacketInfo(
     timescale: 1_000_000,
     sampleRate: cfg.sampleRate,
     channels: cfg.numberOfChannels,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -633,7 +679,7 @@ function encodedMp4VideoTrackFromPacketInfo(
     const end = offset + row.size;
     if (!Number.isSafeInteger(end) || end > bytes.byteLength) return undefined;
     chunks.push({
-      data: bytes.subarray(offset, end),
+      data: bytes.slice(offset, end),
       ptsUs: row.ptsUs,
       ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
       durationUs,
@@ -647,7 +693,7 @@ function encodedMp4VideoTrackFromPacketInfo(
     timescale: 1_000_000,
     width,
     height,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -695,7 +741,7 @@ function encodedMp4TrackFromPacketInfo(
     const end = offset + row.size;
     if (!Number.isSafeInteger(end) || end > bytes.byteLength) return undefined;
     chunks.push({
-      data: bytes.subarray(offset, end),
+      data: bytes.slice(offset, end),
       ptsUs: row.ptsUs,
       ...(row.dtsUs !== undefined ? { dtsUs: row.dtsUs } : {}),
       durationUs,
@@ -707,7 +753,7 @@ function encodedMp4TrackFromPacketInfo(
     const width = cfg.codedWidth;
     const height = cfg.codedHeight;
     if (
-      codec !== 'h264' ||
+      (codec !== 'h264' && codec !== 'hevc') ||
       width === undefined ||
       height === undefined ||
       !Number.isFinite(width) ||
@@ -723,7 +769,7 @@ function encodedMp4TrackFromPacketInfo(
       timescale: 1_000_000,
       width,
       height,
-      ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+      ...aibrushMuxRepresentationFields(track),
       chunks,
     };
   }
@@ -747,7 +793,7 @@ function encodedMp4TrackFromPacketInfo(
     timescale: 1_000_000,
     sampleRate,
     channels,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -1480,10 +1526,14 @@ function pcmMetadataFromBytes(input: MediaInput, bytes: Uint8Array): NormalizedM
     const body = offset + 8;
     if (tagEquals(bytes, offset, 'fmt ') && size >= 16 && body + 16 <= bytes.byteLength) {
       const formatTag = u16le(bytes, body);
+      const concreteFormatTag =
+        formatTag === 0xfffe && size >= 40 && body + 40 <= bytes.byteLength
+          ? u16le(bytes, body + 24)
+          : formatTag;
       channels = u16le(bytes, body + 2);
       sampleRate = u32le(bytes, body + 4);
       blockAlign = u16le(bytes, body + 12);
-      codec = wavCodecFromFmt(formatTag, u16le(bytes, body + 14));
+      codec = wavCodecFromFmt(concreteFormatTag, u16le(bytes, body + 14));
     } else if (tagEquals(bytes, offset, 'data')) {
       dataBytes = Math.min(size, Math.max(0, bytes.byteLength - body));
     }
@@ -1612,15 +1662,20 @@ function pcmEncodedTrackFrom(
     metadata.durationSec !== null && metadata.durationSec > 0
       ? Math.max(1, Math.round(metadata.durationSec * 1_000_000))
       : 0;
+  if (durationUs > 0 && data.byteLength === 0) return undefined;
   return {
     type: 'audio',
     codec: track.codec,
+    nativeCodecTag: track.nativeCodecTag ?? track.codec,
     timescale: 1_000_000,
+    framing: 'raw',
+    accessUnitGrouping: 'one-packet-per-chunk',
+    parameterSetLocation: 'not-applicable',
     sampleRate: track.sampleRate,
     channels: track.channels,
     chunks:
       durationUs > 0
-        ? [{ data, ptsUs: 0, dtsUs: 0, durationUs, keyframe: true }]
+        ? [{ data: tightBytes(data), ptsUs: 0, dtsUs: 0, durationUs, keyframe: true }]
         : [],
   };
 }
@@ -1724,6 +1779,7 @@ interface AibrushOutputRuntimeIdentity {
   readonly operationStartMs?: number;
   readonly emit?: OperationContext['emit'];
   readonly resolvedRepresentation?: AibrushStreamingRuntimeEvidence['resolvedRepresentation'];
+  readonly captureMuxWriteTrace?: boolean;
 }
 
 interface AibrushOutputObservation {
@@ -1743,9 +1799,24 @@ function instrumentedAibrushSink(
 
   if (target === 'stream') {
     const accumulator = new AibrushCallbackAccumulator({ operationStartMs: runtime.operationStartMs });
+    const muxWrites: MuxWriteTraceEvidence['writes'] = [];
+    let muxPeakBufferedBytes = 0;
     let emittedFirstByte = false;
     const sink = lib.toStreamTarget((chunk, position) => {
       accumulator.write(chunk, position);
+      if (runtime.captureMuxWriteTrace === true && chunk.byteLength > 0) {
+        const observedAtMs = accumulator.recorder.lastWriteAtMs ?? nowMs();
+        muxWrites.push({
+          sequence: muxWrites.length,
+          atMs: runtime.operationStartMs === undefined
+            ? observedAtMs
+            : Math.max(0, observedAtMs - runtime.operationStartMs),
+          position,
+          bytes: chunk.slice(),
+          kind: 'append',
+        });
+        muxPeakBufferedBytes = Math.max(muxPeakBufferedBytes, chunk.byteLength);
+      }
       if (chunk.byteLength === 0 || runtime.operationStartMs === undefined || runtime.emit === undefined) return;
       const atMs = Math.max(
         0,
@@ -1779,6 +1850,17 @@ function instrumentedAibrushSink(
           mime: outputMime(container),
           container,
           targetWrites: evidence.callbackWriteCount,
+          ...(runtime.captureMuxWriteTrace === true
+            ? {
+                muxWriteTrace: {
+                  schema: 'media-test/mux-write-trace@1',
+                  writes: muxWrites,
+                  reservations: [],
+                  finalByteLength: bytes.byteLength,
+                  peakBufferedBytes: muxPeakBufferedBytes,
+                },
+              }
+            : {}),
         };
         return attachStreamingEvidence(media, trace, runtime, 'stream');
       },
@@ -2933,25 +3015,89 @@ function normalizedTrackSelect(opts: MuxOptions): string[] {
   return raw.filter((value): value is string => typeof value === 'string');
 }
 
-function selectorMatchesTrack(selector: string, type: TrackType, indexWithinType: number): boolean {
-  const sourceFree = selector.split('@', 1)[0] ?? selector;
-  return sourceFree === `${type}:${indexWithinType}`;
+interface AibrushMuxSourceIdentity {
+  readonly sourceIndex: number;
+  readonly typeOrdinal: number;
+}
+
+const aibrushMuxSourceIdentity = new WeakMap<EncodedTrack, AibrushMuxSourceIdentity>();
+
+function markAibrushMuxSourceTracks(tracks: readonly EncodedTrack[], sourceIndex: number): void {
+  const seenByType = new Map<TrackType, number>();
+  for (const track of tracks) {
+    const typeOrdinal = seenByType.get(track.type) ?? 0;
+    seenByType.set(track.type, typeOrdinal + 1);
+    aibrushMuxSourceIdentity.set(track, { sourceIndex, typeOrdinal });
+  }
+}
+
+function appendAibrushMuxSourceTracks(
+  destination: EncodedTrack[],
+  tracks: readonly EncodedTrack[],
+  sourceIndex: number,
+): void {
+  markAibrushMuxSourceTracks(tracks, sourceIndex);
+  destination.push(...tracks);
+}
+
+export function selectAibrushMuxTrackCandidates(
+  candidates: readonly {
+    readonly track: EncodedTrack;
+    readonly sourceIndex: number;
+    readonly typeOrdinal: number;
+  }[],
+  selectorValues: readonly string[],
+): readonly EncodedTrack[] {
+  const selected: EncodedTrack[] = [];
+  const seen = new Set<EncodedTrack>();
+  for (const value of selectorValues) {
+    const selector = parseMuxTrackSelector(value);
+    const sourceIndex = selector.sourceIndex ?? 0;
+    const candidate = candidates.find((entry) =>
+      entry.sourceIndex === sourceIndex &&
+      entry.track.type === selector.type &&
+      entry.typeOrdinal === selector.typeOrdinal);
+    if (candidate !== undefined && !seen.has(candidate.track)) {
+      seen.add(candidate.track);
+      selected.push(candidate.track);
+    }
+  }
+  return selected;
 }
 
 function muxTracksAfterSelection(tracks: EncodedTracks, opts: MuxOptions): readonly EncodedTrack[] {
   const selectors = normalizedTrackSelect(opts);
   if (selectors.length === 0) return tracks.tracks;
   const seenByType = new Map<TrackType, number>();
-  return tracks.tracks.filter((track) => {
-    const indexWithinType = seenByType.get(track.type) ?? 0;
-    seenByType.set(track.type, indexWithinType + 1);
-    return selectors.some((selector) => selectorMatchesTrack(selector, track.type, indexWithinType));
+  const candidates = tracks.tracks.map((track) => {
+    const fallbackOrdinal = seenByType.get(track.type) ?? 0;
+    seenByType.set(track.type, fallbackOrdinal + 1);
+    const identity = aibrushMuxSourceIdentity.get(track);
+    return {
+      track,
+      sourceIndex: identity?.sourceIndex ?? 0,
+      typeOrdinal: identity?.typeOrdinal ?? fallbackOrdinal,
+    };
   });
+  return selectAibrushMuxTrackCandidates(candidates, selectors);
 }
 
 function muxTrackSummary(tracks: readonly EncodedTrack[]): string {
   if (tracks.length === 0) return 'no selected tracks';
   return tracks.map((track) => `${track.type}/${canonicalCodec(track.codec)}`).join('+');
+}
+
+function hasNonIdentityMuxRotation(tracks: readonly EncodedTrack[]): boolean {
+  return tracks.some((track) => track.type === 'video' && track.rotation !== undefined && track.rotation !== 0);
+}
+
+function hasVariableVideoPacketDurations(tracks: readonly EncodedTrack[]): boolean {
+  return tracks.some((track) => {
+    if (track.type !== 'video') return false;
+    const durations = track.chunks.map((chunk) => chunk.durationUs).filter((duration) => duration > 0);
+    if (durations.length < 2) return false;
+    return Math.max(...durations) - Math.min(...durations) > 2;
+  });
 }
 
 function rejectIllegalMuxTarget(target: string, tracks: readonly EncodedTrack[]): void {
@@ -2985,7 +3131,7 @@ async function encodedTrackFrom(demuxed: AibrushDemuxed, track: AibrushTrackInfo
       const chunk = value.chunk;
       const data = packetPayloadBytes(value);
       chunks.push({
-        data,
+        data: tightBytes(data),
         ptsUs: Math.round(chunk.timestamp),
         ...(value.dtsUs !== undefined ? { dtsUs: Math.round(value.dtsUs) } : {}),
         durationUs: Math.round(chunk.duration ?? 0),
@@ -2995,7 +3141,6 @@ async function encodedTrackFrom(demuxed: AibrushDemuxed, track: AibrushTrackInfo
   } finally {
     reader.releaseLock();
   }
-  const description = cfg.description ? bufferBytes(cfg.description) : undefined;
   return {
     type,
     codec: canonicalCodec(track.codec ?? cfg.codec ?? ''),
@@ -3005,7 +3150,7 @@ async function encodedTrackFrom(demuxed: AibrushDemuxed, track: AibrushTrackInfo
     ...(cfg.codedHeight !== undefined ? { height: cfg.codedHeight } : {}),
     ...(cfg.sampleRate !== undefined ? { sampleRate: cfg.sampleRate } : {}),
     ...(cfg.numberOfChannels !== undefined ? { channels: cfg.numberOfChannels } : {}),
-    ...(description ? { description } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -3029,7 +3174,7 @@ function encodedTrackFromWebmPayloadInfo(
       return undefined;
     }
     chunks.push({
-      data: row.data,
+      data: tightBytes(row.data),
       ptsUs: Math.round(row.ptsUs),
       ...(row.dtsUs !== undefined ? { dtsUs: Math.round(row.dtsUs) } : {}),
       durationUs: row.durationUs === undefined ? 0 : Math.max(0, Math.round(row.durationUs)),
@@ -3056,7 +3201,7 @@ function encodedTrackFromWebmPayloadInfo(
       timescale: 1_000_000,
       width,
       height,
-      ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+      ...aibrushMuxRepresentationFields(track),
       chunks,
     };
   }
@@ -3079,7 +3224,7 @@ function encodedTrackFromWebmPayloadInfo(
     timescale: 1_000_000,
     sampleRate,
     channels,
-    ...(cfg.description !== undefined ? { description: bufferBytes(cfg.description) } : {}),
+    ...aibrushMuxRepresentationFields(track),
     chunks,
   };
 }
@@ -3217,6 +3362,9 @@ async function encodedTracksForPreparedWebmMuxInput(
 function preparedWebmChunkTracksFromEncodedTracks(
   tracks: readonly EncodedTrack[],
 ): Array<{ readonly track: AibrushTrackInfo; readonly chunks: readonly AibrushPreparedWebmChunk[] }> | undefined {
+  // The dependency's prepared-chunk shortcut currently drops TrackInfo.rotation. Leave rotated inputs on
+  // the public framework mux/remux route, whose WebM writer carries ProjectionPoseRoll.
+  if (hasNonIdentityMuxRotation(tracks)) return undefined;
   const prepared: Array<{ readonly track: AibrushTrackInfo; readonly chunks: readonly AibrushPreparedWebmChunk[] }> = [];
   for (const track of tracks) {
     const trackInfo = track.type === 'video' ? videoTrackInfoFromEncoded(track) : audioTrackInfoFromEncoded(track);
@@ -3226,6 +3374,41 @@ function preparedWebmChunkTracksFromEncodedTracks(
     prepared.push({ track: trackInfo, chunks });
   }
   return prepared.length === 0 ? undefined : prepared;
+}
+
+interface AibrushPreparedWebmMuxer {
+  readonly output: ReadableStream<Uint8Array>;
+  addTrack(track: AibrushTrackInfo): number;
+  addChunkStruct(trackId: number, chunk: AibrushPreparedWebmChunk): void;
+  finalize(): Promise<void>;
+}
+
+async function muxPreparedWebmRotationTracks(
+  tracks: readonly {
+    readonly track: AibrushTrackInfo;
+    readonly chunks: readonly AibrushPreparedWebmChunk[];
+  }[],
+  container: 'webm' | 'mkv',
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  signal?.throwIfAborted();
+  const driverModule = await import('@aibrush/media/drivers/webm') as unknown as {
+    readonly WebmDriver: {
+      createMuxer(options: { readonly container: 'webm' | 'mkv' }): AibrushPreparedWebmMuxer;
+    };
+  };
+  const muxer = driverModule.WebmDriver.createMuxer({ container });
+  for (const entry of tracks) {
+    const trackId = muxer.addTrack(entry.track);
+    for (const chunk of entry.chunks) {
+      signal?.throwIfAborted();
+      muxer.addChunkStruct(trackId, chunk);
+    }
+  }
+  const output = streamBytes(muxer.output);
+  await muxer.finalize();
+  signal?.throwIfAborted();
+  return output;
 }
 
 async function prepareMultiSourceWebmMux(
@@ -3246,6 +3429,7 @@ async function prepareMultiSourceWebmMux(
     if (input === undefined) return undefined;
     const inputTracks = await encodedTracksForPreparedWebmMuxInput(core, input, signal);
     if (inputTracks === undefined) return undefined;
+    markAibrushMuxSourceTracks(inputTracks, i);
     if (i === 0) {
       firstInputHasVideo = inputTracks.some((track) => track.type === 'video');
       firstInputHasAudio = inputTracks.some((track) => track.type === 'audio');
@@ -4793,14 +4977,16 @@ function videoTrackInfoFromEncoded(track: EncodedTrack): AibrushTrackInfo | unde
     firstDurationUs !== undefined && Number.isFinite(firstDurationUs) && firstDurationUs > 0
       ? 1_000_000 / firstDurationUs
       : undefined;
+  const writerCodec = track.codec === 'hevc' ? track.nativeCodecTag ?? track.codec : track.codec;
   return {
     id: 0,
     mediaType: 'video',
-    codec: track.codec,
+    codec: writerCodec,
     ...(durationUs > 0 ? { durationSec: durationUs / 1_000_000 } : {}),
     ...(fps !== undefined ? { fps } : {}),
+    ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     config: {
-      codec: track.codec,
+      codec: writerCodec,
       codedWidth: track.width,
       codedHeight: track.height,
       ...(description !== undefined ? { description } : {}),
@@ -5536,7 +5722,13 @@ export class AibrushMediaEngine implements MediaEngine {
       addHlsDecryptKeyUris(playlistText, baseUrl, core.parseM3u8, keyUris, keyOverride.ivHex);
     }
     const fetchResource = async (uri: string): Promise<Uint8Array> => {
-      if (keyOverride !== undefined && keyUris.has(uri)) return keyOverride.keyBytes.slice();
+      // DecryptKey carries one key. The runner has already digest-bound every HLS sidecar and
+      // verified a rotation contract's URI-to-key mapping, so a multi-key playlist must read its
+      // distinct sealed key resources. Applying the first caller key to every URI corrupts the
+      // rotation tail. Keep the override only for the ordinary single-key route.
+      if (keyOverride !== undefined && keyUris.size <= 1 && keyUris.has(uri)) {
+        return keyOverride.keyBytes.slice();
+      }
       const bytes = await hlsFetch(uri, signal);
       if (keyOverride !== undefined && /\.m3u8?($|\?)/i.test(uri)) {
         addHlsDecryptKeyUris(new TextDecoder().decode(bytes), uri, core.parseM3u8, keyUris, keyOverride.ivHex);
@@ -6603,7 +6795,10 @@ export class AibrushMediaEngine implements MediaEngine {
             const table = this.#driverCore().webmPacketPayloadInfoFromBytes(bytes);
             const tracks = encodedTracksFromWebmPayloadInfo(table);
             if (tracks !== undefined) {
-              if ((options as { target?: unknown } | undefined)?.target !== 'stream') {
+              if (
+                (options as { target?: unknown } | undefined)?.target !== 'stream' &&
+                !hasNonIdentityMuxRotation(tracks)
+              ) {
                 const preparedTracks = preparedWebmChunkTracksFromPayloadInfo(table);
                 if (preparedTracks !== undefined) {
                   this.#preparedWebmMuxOutput = {
@@ -6655,13 +6850,16 @@ export class AibrushMediaEngine implements MediaEngine {
                   }
                 }
                 if (preparedTracks.length === tracks.length) {
+                  const rotated = hasNonIdentityMuxRotation(tracks);
                   this.#preparedWebmMuxOutput = {
                     input,
                     target: requestedTarget,
-                    bytes: this.#driverCore().muxPreparedWebmChunkTracks({
-                      tracks: preparedTracks,
-                      container: requestedTarget,
-                    }),
+                    bytes: rotated
+                      ? await muxPreparedWebmRotationTracks(preparedTracks, requestedTarget, context?.signal)
+                      : this.#driverCore().muxPreparedWebmChunkTracks({
+                          tracks: preparedTracks,
+                          container: requestedTarget,
+                        }),
                   };
                 }
               }
@@ -6698,6 +6896,8 @@ export class AibrushMediaEngine implements MediaEngine {
               if (
                 outputTarget !== 'stream' &&
                 (!fragmented || canPreparedFragmented) &&
+                !hasNonIdentityMuxRotation(tracks) &&
+                !hasVariableVideoPacketDurations(tracks) &&
                 normalizedTrackSelect((options ?? {}) as MuxOptions).length === 0
               ) {
                 const preparedTracks = preparedMp4PacketTracksFromEncoded(tracks);
@@ -6717,6 +6917,8 @@ export class AibrushMediaEngine implements MediaEngine {
               } else if (
                 outputTarget !== 'stream' &&
                 !fragmented &&
+                !hasNonIdentityMuxRotation(tracks) &&
+                !hasVariableVideoPacketDurations(tracks) &&
                 tracks.length === 1 &&
                 tracks[0]?.type === 'video'
               ) {
@@ -6769,6 +6971,8 @@ export class AibrushMediaEngine implements MediaEngine {
               if (
                 outputTarget !== 'stream' &&
                 (!fragmented || canPreparedFragmented) &&
+                !hasNonIdentityMuxRotation(tracks) &&
+                !hasVariableVideoPacketDurations(tracks) &&
                 normalizedTrackSelect((options ?? {}) as MuxOptions).length === 0
               ) {
                 const preparedTracks = preparedMp4PacketTracksFromEncoded(tracks);
@@ -6985,7 +7189,9 @@ export class AibrushMediaEngine implements MediaEngine {
           }
         }
         const tracks: EncodedTrack[] = [];
-        for (const input of inputs) {
+        for (let sourceIndex = 0; sourceIndex < inputs.length; sourceIndex++) {
+          const input = inputs[sourceIndex];
+          if (input === undefined) continue;
           if (canCachePcmSource && requestedTarget !== undefined) {
             const bytes = await inputBytes(input);
             const metadata = pcmMetadataFromBytes(input, bytes);
@@ -6993,7 +7199,7 @@ export class AibrushMediaEngine implements MediaEngine {
             const pcmTrackForMux =
               metadata === undefined ? undefined : pcmEncodedTrackFrom(metadata, payload);
             if (pcmTrackForMux !== undefined) {
-              tracks.push(pcmTrackForMux);
+              appendAibrushMuxSourceTracks(tracks, [pcmTrackForMux], sourceIndex);
               this.#preparedPcmMuxSource = { input, target: requestedTarget, bytes };
               continue;
             }
@@ -7002,7 +7208,7 @@ export class AibrushMediaEngine implements MediaEngine {
           if (pcmTrack(metadata) !== undefined) {
             const pcmTrackForMux = pcmEncodedTrackFrom(metadata);
             if (pcmTrackForMux !== undefined) {
-              tracks.push(pcmTrackForMux);
+              appendAibrushMuxSourceTracks(tracks, [pcmTrackForMux], sourceIndex);
               if (canCachePcmSource && requestedTarget !== undefined) {
                 this.#preparedPcmMuxSource = {
                   input,
@@ -7015,13 +7221,15 @@ export class AibrushMediaEngine implements MediaEngine {
           }
           const mp4Fast = await this.#tryEncodedMp4TracksFromBytes(input, signal);
           if (mp4Fast !== undefined) {
-            for (const track of mp4Fast) tracks.push(track);
+            appendAibrushMuxSourceTracks(tracks, mp4Fast, sourceIndex);
             continue;
           }
           const engine = this.#engine();
           const demuxed = await engine.demux(await this.#src(engine, input), { signal });
           try {
-            for (const track of demuxed.tracks) tracks.push(await encodedTrackFrom(demuxed, track));
+            const sourceTracks: EncodedTrack[] = [];
+            for (const track of demuxed.tracks) sourceTracks.push(await encodedTrackFrom(demuxed, track));
+            appendAibrushMuxSourceTracks(tracks, sourceTracks, sourceIndex);
           } finally {
             await demuxed.close();
           }
@@ -7264,6 +7472,7 @@ export class AibrushMediaEngine implements MediaEngine {
     if (
       preparedSingleTrack !== undefined &&
       preparedSingleTrack.type === 'video' &&
+      (preparedSingleTrack.rotation === undefined || preparedSingleTrack.rotation === 0) &&
       (target === 'mp4' || target === 'mov')
     ) {
       const trackInfo = videoTrackInfoFromEncoded(preparedSingleTrack);
@@ -7290,7 +7499,10 @@ export class AibrushMediaEngine implements MediaEngine {
         }
         return this.#run('mux', 'framework.packet-mux.video', context, async (signal) => {
           try {
-            const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>);
+            const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>, {
+              operationStartMs: context?.operationStartMs,
+              captureMuxWriteTrace: true,
+            });
             const out = await engine.mux(
               {
                 video: {
@@ -7316,6 +7528,7 @@ export class AibrushMediaEngine implements MediaEngine {
       streamTarget === 'stream' &&
       !wantsFragmented(opts) &&
       (fastStartOption === undefined || typeof fastStartOption === 'boolean') &&
+      !hasNonIdentityMuxRotation(selectedTracks) &&
       normalizedTrackSelect(opts).length === 0
     ) {
       const preparedTracks = preparedMp4PacketTracksFromEncoded(selectedTracks);
@@ -7324,7 +7537,10 @@ export class AibrushMediaEngine implements MediaEngine {
           try {
             const lib = this.#lib;
             if (lib === undefined) throw new Error('aibrush-media not initialized');
-            const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>);
+            const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>, {
+              operationStartMs: context?.operationStartMs,
+              captureMuxWriteTrace: true,
+            });
             if (telemetry.sink.kind !== 'stream-target') {
               throw new Error('prepared MP4 streaming mux requires a stream-target sink');
             }
@@ -7374,7 +7590,15 @@ export class AibrushMediaEngine implements MediaEngine {
               { container: target, sink: telemetry.sink },
               { signal },
             );
-            return verifyRequestedIsoShape(await telemetry.mediaBytes(out, target), opts, false);
+            const media = await telemetry.mediaBytes(out, target);
+            const repairedOgg = target === 'ogg'
+              ? repairAibrushOggContinuationFlags(media.bytes)
+              : undefined;
+            return verifyRequestedIsoShape(
+              repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },
+              opts,
+              false,
+            );
           } catch (e) {
             return this.#naIfMiss('mux', e, recorded[0]);
           }
@@ -7659,7 +7883,14 @@ export class AibrushMediaEngine implements MediaEngine {
           );
           return toMediaBytes(out, 'mp4');
         } catch (e) {
-          return this.#naIfMiss('decrypt', e, input);
+          try {
+            return this.#naIfMiss('decrypt', e, input);
+          } catch (translated) {
+            if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+              throw new GracefulRejectionError('decrypt', aibrushErrorReason(translated));
+            }
+            throw translated;
+          }
         }
       });
     }
@@ -7687,7 +7918,14 @@ export class AibrushMediaEngine implements MediaEngine {
         );
         return toMediaBytes(out, 'mp4');
       } catch (e) {
-        return this.#naIfMiss('decrypt', e, input);
+        try {
+          return this.#naIfMiss('decrypt', e, input);
+        } catch (translated) {
+          if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+            throw new GracefulRejectionError('decrypt', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

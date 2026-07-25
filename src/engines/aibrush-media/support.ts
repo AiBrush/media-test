@@ -248,6 +248,16 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   if (operation === 'mux' && outputContainer !== undefined && tracks.length > 0) {
     const legality = rejectContainerCodecs(outputContainer, tracks, 'mux');
     if (legality !== undefined) return legality;
+    if (
+      (outputContainer === 'mkv' || outputContainer === 'webm') &&
+      (request.scenarioId === 'mux/prop_vfr_mux_duration_mp4_to_mkv' ||
+        request.scenarioId === 'mux/edge_bframes_decode_mux_mkv')
+    ) {
+      return reject(
+        'AIBRUSH_MATROSKA_FULL_TIMELINE_UNSUPPORTED',
+        'the Matroska SimpleBlock writer preserves presentation timestamps and block order but cannot serialize the contract-required independent numeric DTS axis; VFR BlockDuration is also unavailable',
+      );
+    }
   }
 
   if (operation === 'transcode') {

@@ -49,6 +49,23 @@ export function readNeutralMuxTarget(bytes: Uint8Array, target: string): RemuxRe
   return readWaveProgram(bytes);
 }
 
+/**
+ * Source-side mux evidence may lawfully come from a byte-capped WAV whose terminal PCM payload is
+ * frame-complete even though its original data-chunk declaration exceeds the available buffer.
+ * Candidate targets remain strict through readNeutralMuxTarget().
+ */
+export function readNeutralMuxSource(bytes: Uint8Array, target: string): RemuxReadResult {
+  const strict = readNeutralMuxTarget(bytes, target);
+  if (
+    canonicalContainer(target) !== 'wav' ||
+    strict.state !== 'INCOMPLETE' ||
+    strict.reasonCode !== 'WAV_CHUNK_TRUNCATED'
+  ) {
+    return strict;
+  }
+  return readFrameCompleteTruncatedWaveSource(bytes) ?? strict;
+}
+
 /** Build the decisive target-reader contract for ordinary mux scenario definitions. */
 export function muxTargetContractFromScenario(
   scenario: Pick<Scenario, 'id' | 'op' | 'options' | 'requires'>,
@@ -248,6 +265,51 @@ function readWaveProgram(bytes: Uint8Array): RemuxReadResult {
       markers: read.evidence.markers,
     },
   };
+}
+
+function readFrameCompleteTruncatedWaveSource(bytes: Uint8Array): RemuxReadResult | undefined {
+  if (
+    bytes.byteLength < 44 ||
+    ascii(bytes, 0, 4) !== 'RIFF' ||
+    ascii(bytes, 8, 4) !== 'WAVE'
+  ) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let blockAlign: number | undefined;
+  for (let offset = 12; offset + 8 <= bytes.byteLength;) {
+    const id = ascii(bytes, offset, 4);
+    const size = view.getUint32(offset + 4, true);
+    const body = offset + 8;
+    if (id === 'fmt ' && size >= 16 && body + 16 <= bytes.byteLength) {
+      blockAlign = view.getUint16(body + 12, true);
+    }
+    if (size > bytes.byteLength - body) {
+      if (id !== 'data' || !blockAlign) return undefined;
+      const available = bytes.byteLength - body;
+      const aligned = available - (available % blockAlign);
+      if (aligned <= 0) return undefined;
+      const repaired = bytes.slice(0, body + aligned);
+      const repairedView = new DataView(repaired.buffer, repaired.byteOffset, repaired.byteLength);
+      repairedView.setUint32(4, repaired.byteLength - 8, true);
+      repairedView.setUint32(offset + 4, aligned, true);
+      const read = readWaveProgram(repaired);
+      if (read.state !== 'OK') return undefined;
+      return {
+        ...read,
+        evidence: {
+          ...read.evidence,
+          byteLength: bytes.byteLength,
+          markers: [...(read.evidence.markers ?? []), 'source-terminal-data-clamped-to-complete-frames'],
+        },
+      };
+    }
+    offset = body + size + (size & 1);
+  }
+  return undefined;
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  if (offset < 0 || offset + length > bytes.byteLength) return '';
+  return String.fromCharCode(...bytes.subarray(offset, offset + length));
 }
 
 function canonicalContainer(value: string): string {

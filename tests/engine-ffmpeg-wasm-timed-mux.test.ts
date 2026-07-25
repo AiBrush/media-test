@@ -4,6 +4,7 @@ import {
   buildTimedMp4,
   canBuildTimedMp4,
   hasImplicitRawDemuxTiming,
+  timescaleForTimedMux,
   TimedMp4UnsupportedError,
 } from '../src/engines/ffmpeg-wasm/timed-mp4.ts';
 import { splitAdtsFrames } from '../src/engines/ffmpeg-wasm/evidence.ts';
@@ -52,6 +53,36 @@ describe('REQ-ENG-17: route-independent timestamped mux staging', () => {
     expect(u32(first, stsz.bodyStart + 8)).toBe(3);
     expect([0, 1, 2].map((index) => u32(first, stsz.bodyStart + 12 + index * 4)))
       .toEqual(track.chunks.map((chunk) => chunk.data.byteLength));
+  });
+
+  test('uses the exact source clock and an edit list to hide decode preroll from presentation duration', () => {
+    expect(timescaleForTimedMux({ numerator: 1, denominator: 15_360 })).toBe(15_360);
+    expect(timescaleForTimedMux({ numerator: 1001, denominator: 30_000 })).toBe(1_000_000);
+
+    const track = avcTrack() as EncodedTrack & {
+      timedMp4Presentation: { programStartUs: number; trackStartUs: number; durationUs: number };
+    };
+    track.timescale = 25;
+    track.chunks = [
+      { ...track.chunks[0]!, ptsUs: 0, dtsUs: -80_000, durationUs: 40_000 },
+      { ...track.chunks[1]!, ptsUs: 120_000, dtsUs: -40_000, durationUs: 40_000 },
+      { ...track.chunks[2]!, ptsUs: 40_000, dtsUs: 0, durationUs: 40_000 },
+    ];
+    track.timedMp4Presentation = { programStartUs: 0, trackStartUs: 0, durationUs: 160_000 };
+
+    const bytes = buildTimedMp4([track]);
+    const moov = child(bytes, root(bytes), 'moov');
+    const mvhd = child(bytes, moov, 'mvhd');
+    expect(u32(bytes, mvhd.bodyStart + 16)).toBe(160_000);
+    const trak = child(bytes, moov, 'trak');
+    const tkhd = child(bytes, trak, 'tkhd');
+    expect(u32(bytes, tkhd.bodyStart + 20)).toBe(160_000);
+    const elst = path(bytes, ['moov', 'trak', 'edts', 'elst']);
+    expect(u32(bytes, elst.bodyStart + 4)).toBe(1);
+    expect(u32(bytes, elst.bodyStart + 8)).toBe(160_000);
+    expect(u32(bytes, elst.bodyStart + 12)).toBe(2);
+    const mov = buildTimedMp4([track], 'mov');
+    expect(new TextDecoder().decode(mov.slice(8, 12))).toBe('qt  ');
   });
 
   test('converts Annex-B parameter sets/samples without collapsing chunk cardinality', () => {

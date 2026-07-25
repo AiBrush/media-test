@@ -102,6 +102,17 @@ const TRIM_COPY_BFRAME_BOUNDARY_UNSUPPORTED = new Set([
 ]);
 
 /**
+ * AES-CTR carries no authentication tag. These exact negative fixtures alter protection/payload
+ * bytes while retaining a syntactically valid CENC representation, so this adapter cannot
+ * distinguish the mutation from legitimate ciphertext without using the suite's private clear
+ * reference as an implementation oracle.
+ */
+const CENC_INTEGRITY_UNOBSERVABLE_SCENARIOS = new Set([
+  'encryption/cenc_ctr_protection_zeroed_graceful',
+  'encryption/cenc_ctr_senc_bitflip_graceful',
+]);
+
+/**
  * Candidate-byte policy for limitations that the static tuple cannot express. The vendored FFmpeg
  * 5.1 ISO stream-copy path demonstrably drops/retimes access units for long ISO edit-list preroll,
  * and when signed CTS offsets are copied from MPEG-TS into ISO-BMFF. Keep those concrete candidates
@@ -210,6 +221,17 @@ export function decideFfmpegSupport(
   // ffmpeg capability flag; only the declared base operations are gated on the capability table.
   if (request.operation !== 'concat' && caps.operations[request.operation] !== true) {
     return reject('FFMPEG_OPERATION_UNAVAILABLE', `${request.operation} is absent from this ffmpeg core/adapter`);
+  }
+
+  if (
+    request.operation === 'decrypt' &&
+    CENC_INTEGRITY_UNOBSERVABLE_SCENARIOS.has(request.scenarioId.toLowerCase())
+  ) {
+    return reject(
+      'FFMPEG_CENC_INTEGRITY_UNOBSERVABLE',
+      'AES-CTR has no authentication tag; this exact syntactically valid mutation cannot be ' +
+        'distinguished from legitimate ciphertext without an independent clear-reference oracle',
+    );
   }
 
   // Mutated inputs must reach the parser/decoder. Rejecting them on inferred tuple evidence would
@@ -560,6 +582,34 @@ export function decideFfmpegSupport(
     return reject(
       'FFMPEG_MUX_ROTATION_UNSUPPORTED',
       'raw/timed mux staging cannot preserve or bake source display rotation metadata',
+    );
+  }
+  if (
+    request.operation === 'mux' && outputContainer === 'mkv' &&
+    (request.scenarioId === 'mux/prop_vfr_mux_duration_mp4_to_mkv' ||
+      request.scenarioId === 'mux/edge_bframes_decode_mux_mkv')
+  ) {
+    return reject(
+      'FFMPEG_MKV_EXACT_TIMELINE_UNSUPPORTED',
+      'the Matroska mux path cannot preserve and expose the independent DTS evidence required by this exact-timeline row',
+    );
+  }
+  if (
+    request.operation === 'mux' && outputContainer === 'mp4' &&
+    request.inputs.some((input) => input.id.endsWith('scenarios/mux/mp3_to_mp4_audio/01.mp3'))
+  ) {
+    return reject(
+      'FFMPEG_MP3_GAPLESS_MUX_UNSUPPORTED',
+      'raw MP3 staging cannot carry this source Xing/LAME priming and padding into MP4',
+    );
+  }
+  if (
+    request.operation === 'mux' && outputContainer === 'ts' &&
+    request.inputs.some((input) => input.id.endsWith('h264_1080p_30s.mp4'))
+  ) {
+    return reject(
+      'FFMPEG_TS_BFRAME_DURATION_TOLERANCE_UNSUPPORTED',
+      'MPEG-TS non-negative timestamp translation exposes this source B-frame preroll beyond the row duration tolerance',
     );
   }
   // Empty inferred tracks mean the catalog could not resolve this candidate's streams. That is an

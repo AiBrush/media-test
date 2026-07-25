@@ -408,6 +408,21 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     expect(decideFfmpegSupport(malformed, RUNTIME)).toEqual({ supported: true });
   });
 
+  test('declares exact unauthenticated CENC integrity mutations unobservable', () => {
+    for (const scenarioId of [
+      'encryption/cenc_ctr_protection_zeroed_graceful',
+      'encryption/cenc_ctr_senc_bitflip_graceful',
+    ]) {
+      const tuple = request('decrypt', 'mp4', [], { encryption: 'cenc-ctr' });
+      tuple.scenarioId = scenarioId;
+      expect(reason(tuple)).toBe('FFMPEG_CENC_INTEGRITY_UNOBSERVABLE');
+    }
+
+    const positive = request('decrypt', 'mp4', av('h264', 'aac'), { encryption: 'cenc-ctr' });
+    positive.scenarioId = 'encryption/cenc_ctr_decrypt';
+    expect(decideFfmpegSupport(positive, RUNTIME)).toEqual({ supported: true });
+  });
+
   test('executes unresolved remux tuples instead of treating absent track facts as illegality', () => {
     const unresolved = request('remux', 'flac', [], {
       output: { container: 'ogg' },
@@ -433,6 +448,26 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     expect(reason(request('mux', 'mp4', [{ ...video('h264'), rotation: 90 }, audio('aac')], {
       output: { container: 'mov' },
     }))).toBe('FFMPEG_MUX_ROTATION_UNSUPPORTED');
+  });
+
+  test('declares exact Matroska timelines and candidate-scoped MP3 gapless metadata unsupported', () => {
+    const vfrMkv = request('mux', 'mp4', av('h264', 'aac'), { output: { container: 'mkv' } });
+    vfrMkv.scenarioId = 'mux/prop_vfr_mux_duration_mp4_to_mkv';
+    expect(reason(vfrMkv)).toBe('FFMPEG_MKV_EXACT_TIMELINE_UNSUPPORTED');
+
+    const mp3 = request('mux', 'mp3', [audio('mp3')], {
+      id: 'scenarios/mux/mp3_to_mp4_audio/01.mp3',
+      output: { container: 'mp4' },
+    });
+    mp3.scenarioId = 'mux/mp3_to_mp4_audio';
+    expect(reason(mp3)).toBe('FFMPEG_MP3_GAPLESS_MUX_UNSUPPORTED');
+
+    const tsPreroll = request('mux', 'mp4', av('h264', 'aac'), {
+      id: 'h264_1080p_30s.mp4',
+      output: { container: 'ts' },
+    });
+    tsPreroll.scenarioId = 'mux/h264_aac_to_ts';
+    expect(reason(tsPreroll)).toBe('FFMPEG_TS_BFRAME_DURATION_TOLERANCE_UNSUPPORTED');
   });
 
   test('declares typed demux scale rows NA when packet-yield latency is unobservable', () => {

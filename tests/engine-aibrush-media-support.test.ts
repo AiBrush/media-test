@@ -60,6 +60,12 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     ['positioned writes', request('mux', 'mp4', [VIDEO], {
       outputContainer: 'mp4', options: { target: 'stream', positionedWrites: true },
     }), 'AIBRUSH_POSITIONED_WRITES_UNSUPPORTED'],
+    ['Matroska VFR full timeline', request('mux', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'mux/prop_vfr_mux_duration_mp4_to_mkv', outputContainer: 'mkv',
+    }), 'AIBRUSH_MATROSKA_FULL_TIMELINE_UNSUPPORTED'],
+    ['Matroska B-frame full timeline', request('mux', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'mux/edge_bframes_decode_mux_mkv', outputContainer: 'mkv',
+    }), 'AIBRUSH_MATROSKA_FULL_TIMELINE_UNSUPPORTED'],
   ];
 
   for (const [name, tuple, reasonCode] of rows) {

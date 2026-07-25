@@ -1,7 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import type { NormalizedMetadata } from '../src/core/engine.ts';
 import {
+  validateEncodedTrack,
+  validateEncodedTracks,
+  type MediaInput,
+  type NormalizedMetadata,
+} from '../src/core/engine.ts';
+import {
+  AibrushMediaEngine,
+  aibrushMuxRepresentationFields,
   enrichAibrushProbeMetadata,
+  selectAibrushMuxTrackCandidates,
   selectAibrushSeekPacketPts,
 } from '../src/engines/aibrush-media/adapter.ts';
 import {
@@ -11,6 +19,94 @@ import {
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('makes mux handoff representation explicit and keeps description bytes tightly owned', () => {
+    const source = new Uint8Array(new ArrayBuffer(10), 2, 6);
+    source.set([1, 100, 0, 40, 0xff, 0xe1]);
+    const fields = aibrushMuxRepresentationFields({
+      id: 7,
+      mediaType: 'video',
+      codec: 'avc1.640028',
+      rotation: 90,
+      config: { codec: 'avc1.640028', codedWidth: 1_920, codedHeight: 1_080, description: source },
+    });
+    const track = {
+      type: 'video' as const,
+      codec: 'h264',
+      timescale: 1_000_000,
+      width: 1_920,
+      height: 1_080,
+      ...fields,
+      chunks: [{
+        data: new Uint8Array([0, 0, 0, 1]),
+        ptsUs: 0,
+        dtsUs: 0,
+        durationUs: 40_000,
+        keyframe: true,
+      }],
+    };
+
+    expect(fields).toMatchObject({
+      nativeCodecTag: 'avc1.640028',
+      framing: 'avc',
+      accessUnitGrouping: 'one-access-unit-per-chunk',
+      parameterSetLocation: 'description',
+      descriptionRecord: 'avc-decoder-configuration-record',
+      rotation: 90,
+    });
+    expect(fields.description?.byteOffset).toBe(0);
+    expect(fields.description?.byteLength).toBe(fields.description?.buffer.byteLength);
+    expect(fields.description?.buffer).not.toBe(source.buffer);
+    expect(() => validateEncodedTrack('aibrush-media@dev', track)).not.toThrow();
+  });
+
+  test('resolves mux selectors against per-source type ordinals in requested order', () => {
+    const track = (type: 'video' | 'audio', codec: string): ReturnType<typeof validateEncodedTrack> => ({
+      type,
+      codec,
+      timescale: 1_000_000,
+      ...(type === 'video' ? { width: 16, height: 16 } : { sampleRate: 48_000, channels: 2 }),
+      chunks: [{ data: new Uint8Array([1]), ptsUs: 0, durationUs: 1_000, keyframe: true }],
+    });
+    const sourceVideo = track('video', 'vp9');
+    const sourceAudio = track('audio', 'aac');
+    const replacementAudio = track('audio', 'opus');
+    const selected = selectAibrushMuxTrackCandidates([
+      { track: sourceVideo, sourceIndex: 0, typeOrdinal: 0 },
+      { track: sourceAudio, sourceIndex: 0, typeOrdinal: 0 },
+      { track: replacementAudio, sourceIndex: 1, typeOrdinal: 0 },
+    ], ['audio:0@1', 'video:0@0']);
+
+    expect(selected).toEqual([replacementAudio, sourceVideo]);
+  });
+
+  test('prepares WAVE_FORMAT_EXTENSIBLE float PCM as a non-empty owned mux track', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/scenarios/mux/pcm_f32_to_wav/03.wav').arrayBuffer(),
+    );
+    const input: MediaInput = {
+      id: '03.wav',
+      url: 'http://127.0.0.1/03.wav',
+      mime: 'audio/wav',
+      sizeBytes: source.byteLength,
+      blob: () => Promise.resolve(new Blob([source.slice().buffer])),
+      arrayBuffer: () => Promise.resolve(source.slice().buffer),
+    };
+    const engine = new AibrushMediaEngine();
+    const prepared = await engine.prepareMuxTracks([input], { container: 'wav' });
+    const validated = validateEncodedTracks(engine.id, prepared);
+
+    expect(validated.tracks).toHaveLength(1);
+    expect(validated.tracks[0]).toMatchObject({
+      type: 'audio',
+      codec: 'pcm-f32',
+      framing: 'raw',
+      accessUnitGrouping: 'one-packet-per-chunk',
+      parameterSetLocation: 'not-applicable',
+    });
+    expect(validated.tracks[0]?.chunks[0]?.data.byteLength).toBeGreaterThan(0);
+    expect(validated.tracks[0]?.chunks[0]?.data.buffer).not.toBe(source.buffer);
+  });
+
   test('selects nearest real seek PTS with an earlier tie and keyframes at-or-before', () => {
     const tracks = [
       { mediaType: 'audio' },

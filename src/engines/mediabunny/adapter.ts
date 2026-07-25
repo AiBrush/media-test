@@ -765,6 +765,16 @@ export function hlsExplicitIvHexesFromPlaylist(playlist: string): Set<string> {
   return out;
 }
 
+export function hlsKeyMethodsFromPlaylist(playlist: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of playlist.split(/\r?\n/)) {
+    if (!/^#EXT-X-KEY:/i.test(line)) continue;
+    const match = /(?:^|,)METHOD=([^,]+)/i.exec(line.slice(line.indexOf(':') + 1));
+    if (match?.[1]) out.add(match[1].trim().toUpperCase());
+  }
+  return out;
+}
+
 /** Single-key CENC resolver: a key is never reused for a different KID in a multi-key asset. */
 export function createCencKeyResolver(
   keyBytes: Uint8Array,
@@ -1815,9 +1825,12 @@ async function metadataFromInput(
 function metadataTagsFromRecord(
   original: MetadataTags | undefined,
   requested: Record<string, string> | undefined,
+  outputContainer: string,
 ): MetadataTags | undefined {
   if (!requested || Object.keys(requested).length === 0) return original;
   const tags: MetadataTags = { ...(original ?? {}) };
+  if (tags.raw) tags.raw = { ...tags.raw };
+  removeCarrierMetadataAliases(tags, requested, outputContainer);
   for (const [key, value] of Object.entries(requested)) {
     switch (key) {
       case 'title':
@@ -1850,6 +1863,60 @@ function metadataTagsFromRecord(
     }
   }
   return tags;
+}
+
+/**
+ * A normalized write must replace carrier aliases of the same semantic field. Mediabunny retains
+ * both normalized and raw source tags; without this cleanup, an MKV DESCRIPTION can survive beside
+ * a newly requested COMMENT and the neutral reader correctly reports two conflicting comments.
+ */
+function removeCarrierMetadataAliases(
+  tags: MetadataTags,
+  requested: Readonly<Record<string, string>>,
+  outputContainer: string,
+): void {
+  if (outputContainer !== 'mkv' && outputContainer !== 'webm') return;
+
+  const requestedKeys = new Set(Object.keys(requested));
+  const requestedCommentAlias = requestedKeys.has('comment') || requestedKeys.has('description');
+  if (requestedCommentAlias) {
+    delete tags.comment;
+    delete tags.description;
+  }
+
+  if (!tags.raw) return;
+  const semanticKey = (rawKey: string): string | undefined => {
+    const normalized = rawKey.toUpperCase().replace(/[-_ ]/g, '');
+    const aliases: Record<string, string> = {
+      TITLE: 'title',
+      ARTIST: 'artist',
+      ALBUM: 'album',
+      ALBUMARTIST: 'albumArtist',
+      GENRE: 'genre',
+      COMMENT: 'comment',
+      DESCRIPTION: 'comment',
+      LYRICS: 'lyrics',
+      DATE: 'date',
+      YEAR: 'date',
+      TRACK: 'trackNumber',
+      TRACKNUMBER: 'trackNumber',
+      PARTNUMBER: 'trackNumber',
+      DISC: 'discNumber',
+      DISCNUMBER: 'discNumber',
+    };
+    return aliases[normalized];
+  };
+  for (const rawKey of Object.keys(tags.raw)) {
+    const semantic = semanticKey(rawKey);
+    if (semantic && (
+      requestedKeys.has(semantic) ||
+      (semantic === 'comment' && requestedCommentAlias) ||
+      (semantic === 'trackNumber' && requestedKeys.has('tracksTotal')) ||
+      (semantic === 'discNumber' && requestedKeys.has('discsTotal'))
+    )) {
+      delete tags.raw[rawKey];
+    }
+  }
 }
 
 async function verifyMetadataTags(
@@ -4598,7 +4665,7 @@ export class MediabunnyEngine implements MediaEngine {
     }
 
     const prepared = tracks as MediabunnyPreparedTracks;
-    const tags = metadataTagsFromRecord(prepared.metadataTags, requestedTags);
+    const tags = metadataTagsFromRecord(prepared.metadataTags, requestedTags, opts.container);
     if (tags) output.setMetadataTags(tags);
 
     let cancelPromise: Promise<void> | undefined;
@@ -4709,6 +4776,25 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
   ): Promise<MediaBytes> {
     this.assertRuntimeSupport(context);
+    if (opts.scheme !== 'cenc-ctr' && opts.scheme !== 'cenc-cbcs' && opts.scheme !== 'hls-aes128') {
+      throw createNotApplicableError(
+        this.id,
+        'decrypt',
+        `unsupported protection scheme '${opts.scheme}'`,
+        context ? tupleSummary(context.request) : { encryption: opts.scheme },
+        MEDIABUNNY_REASON.PROTECTION_FORM,
+      );
+    }
+    if (key.keyHex.length === 0) {
+      throw createMalformedInputError(
+        this.id,
+        'decrypt',
+        'decrypt',
+        'decrypt request does not contain a 16-byte key',
+        'MEDIABUNNY_DECRYPT_KEY_MISSING',
+        input.id,
+      );
+    }
     const keyBytes = strictHexBytes(key.keyHex, 'keyHex', 16);
     const normalizedKid = key.kid === undefined ? undefined : normalizeHex(key.kid, 'kid', 16);
     const normalizedIv = key.ivHex === undefined ? undefined : normalizeHex(key.ivHex, 'ivHex', 16);
@@ -4723,16 +4809,41 @@ export class MediabunnyEngine implements MediaEngine {
     }
     if (opts.scheme === 'hls-aes128') {
       const mb = this.lib;
+      const playlist = new TextDecoder().decode(await input.arrayBuffer());
+      const methods = hlsKeyMethodsFromPlaylist(playlist);
+      const incompatibleMethod = [...methods].find((method) => method !== 'AES-128' && method !== 'NONE');
+      if (incompatibleMethod !== undefined) {
+        throw createMalformedInputError(
+          this.id,
+          'decrypt',
+          'decrypt',
+          `HLS playlist declares METHOD=${incompatibleMethod}, not AES-128`,
+          'MEDIABUNNY_HLS_METHOD_MISMATCH',
+          input.id,
+        );
+      }
       if (normalizedIv !== undefined) {
-        const playlist = new TextDecoder().decode(await input.arrayBuffer());
         const declaredIvs = hlsExplicitIvHexesFromPlaylist(playlist);
         if ([...declaredIvs].some((iv) => iv !== normalizedIv)) {
-          // A wrong IV is supplied data, not a missing engine/browser capability.
-          throw new Error(`mediabunny HLS IV mismatch: playlist declares ${[...declaredIvs].join(', ')}, supplied ${normalizedIv}`);
+          throw createMalformedInputError(
+            this.id,
+            'decrypt',
+            'decrypt',
+            `HLS IV mismatch: playlist declares ${[...declaredIvs].join(', ')}, supplied ${normalizedIv}`,
+            'MEDIABUNNY_HLS_IV_MISMATCH',
+            input.id,
+          );
         }
       }
       const trace: MediabunnyHlsReadTrace = { rootMode: 'caller-key-override', reads: [] };
-      const mbInput = await openInput(mb, input, 'hls', { hlsKeyBytes: keyBytes, trace });
+      const keyUris = hlsKeyUrisFromPlaylist(playlist, input.url);
+      // DecryptKey carries one key. For a verified rotation contract, the runner has already bound
+      // every key sidecar to the authoritative keySet; let Mediabunny read those distinct sealed
+      // resources instead of incorrectly applying the first key to every URI.
+      const mbInput = await openInput(mb, input, 'hls', {
+        ...(keyUris.size <= 1 ? { hlsKeyBytes: keyBytes } : {}),
+        trace,
+      });
       const unbindAbort = bindAbortToInput(mbInput, context?.signal);
       try {
         const media = await this.muxDecryptedInput(mbInput, context);
@@ -4742,9 +4853,6 @@ export class MediabunnyEngine implements MediaEngine {
         unbindAbort();
         mbInput.dispose();
       }
-    }
-    if (opts.scheme !== 'cenc-cbcs') {
-      throw createNotApplicableError(this.id, 'decrypt', `unsupported protection scheme '${opts.scheme}'`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.PROTECTION_FORM);
     }
     const mb = this.lib;
     const buffer = await input.arrayBuffer();

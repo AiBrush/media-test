@@ -329,7 +329,7 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
     expect(decideMediabunnySupport(value)).toEqual({ supported: true });
   });
 
-  test('demux admits A/V inputs but declares unexposed auxiliary tracks intrinsic NA_ENGINE', () => {
+  test('probe/demux admit A/V inputs but declare unexposed auxiliary tracks intrinsic NA_ENGINE', () => {
     const av = request({ operation: 'demux', outputContainer: '', tracks: [VIDEO, AUDIO] });
     delete av.output;
     expect(decideMediabunnySupport(av)).toEqual({ supported: true });
@@ -345,6 +345,19 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
       status: 'NA_ENGINE',
       reasonCode: MEDIABUNNY_REASON.TRACK_TYPE,
       reason: expect.stringContaining('Input.getTracks()/EncodedPacketSink'),
+    });
+
+    const probeAuxiliary = request({
+      operation: 'probe',
+      outputContainer: '',
+      tracks: [VIDEO, AUDIO, { type: 'other', codec: '' }],
+    });
+    delete probeAuxiliary.output;
+    expect(decideMediabunnySupport(probeAuxiliary)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: MEDIABUNNY_REASON.TRACK_TYPE,
+      reason: expect.stringContaining('probe inventory'),
     });
   });
 

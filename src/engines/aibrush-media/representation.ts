@@ -13,6 +13,7 @@ export interface AibrushObservedTrack {
   readonly mediaType: 'video' | 'audio';
   readonly codec?: string;
   readonly durationSec?: number;
+  readonly rotation?: number;
   readonly config?: {
     readonly codec?: string;
     readonly codedWidth?: number;

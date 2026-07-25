@@ -14,6 +14,10 @@ import {
 } from '../src/core/engine.ts';
 import { isCorpusDeliveryIntegrityError, sha256Hex as selectionSha256Hex } from '../src/core/media-selection.ts';
 import { HLS_PLAYLIST_ONLY_CONTRACT } from '../src/features/probe/hls.ts';
+import {
+  canonicalizeSemanticTags,
+  readNeutralMetadataTags,
+} from '../src/features/metadata/index.ts';
 import { evaluateStrictStreamCopy } from '../src/features/remux/strict-copy.ts';
 import { inspectTrimAudioContainer } from '../src/features/trim/audio.ts';
 import {
@@ -23,6 +27,7 @@ import {
   createCencKeyResolver,
   h264PacketKeyframe,
   hlsExplicitIvHexesFromPlaylist,
+  hlsKeyMethodsFromPlaylist,
   hlsKeyUrisFromPlaylist,
   normalizeTrack,
   representationForCodec,
@@ -1281,6 +1286,20 @@ describe('REQ-ENG-05: protected-form and metadata correctness', () => {
     });
   });
 
+  test('an MKV comment edit replaces a pre-existing DESCRIPTION alias', async () => {
+    await withEngine(async (engine) => {
+      const input = await fixture('scenarios/metadata/write_mkv_tags/01.mkv');
+      const comment = 'replacement comment';
+      const output = await engine.remux(input, { container: 'mkv', tags: { comment } });
+      const read = readNeutralMetadataTags(output.bytes, 'mkv');
+      expect(read.state).toBe('OK');
+      if (read.state !== 'OK') return;
+      const canonical = canonicalizeSemanticTags('mkv', read.value.tags, read.value.scopedTags);
+      expect(canonical.conflicts).toEqual([]);
+      expect(canonical.semantic.comment).toBe(comment);
+    });
+  });
+
   test('the single-key CENC resolver never reuses a key for a different KID', () => {
     const key = new Uint8Array(16).fill(0x5a);
     const kid = 'abcdef00112233445566778899aabbcc';
@@ -1327,6 +1346,14 @@ describe('REQ-ENG-05: protected-form and metadata correctness', () => {
       });
       await expect(engine.decrypt(input, { keyHex: 'not-hex' }, { scheme: 'cenc-ctr' }))
         .rejects.toBeInstanceOf(TypeError);
+      let missingKey: unknown;
+      try {
+        await engine.decrypt(input, { keyHex: '' }, { scheme: 'cenc-ctr' });
+      } catch (error) {
+        missingKey = error;
+      }
+      expect(isMalformedInputError(missingKey)).toBe(true);
+      expect(missingKey).toMatchObject({ reasonCode: 'MEDIABUNNY_DECRYPT_KEY_MISSING' });
     });
   });
 
@@ -1339,14 +1366,46 @@ describe('REQ-ENG-05: protected-form and metadata correctness', () => {
     expect(hlsExplicitIvHexesFromPlaylist(playlist)).toEqual(
       new Set(['c0643a1737869dcf50b7d5daa37b466b']),
     );
+    expect(hlsKeyMethodsFromPlaylist(playlist)).toEqual(new Set(['AES-128']));
 
     await withEngine(async (engine) => {
       const input = memoryInput('hls_aes128.m3u8', playlistBytes, 'application/vnd.apple.mpegurl');
       input.url = 'https://media.test/path/hls_aes128.m3u8';
-      await expect(engine.decrypt(input, {
-        keyHex: '26cc7945163ec2b0c6c1bf651431a683',
-        ivHex: '00000000000000000000000000000000',
-      }, { scheme: 'hls-aes128' })).rejects.toBeInstanceOf(Error);
+      let wrongIv: unknown;
+      try {
+        await engine.decrypt(input, {
+          keyHex: '26cc7945163ec2b0c6c1bf651431a683',
+          ivHex: '00000000000000000000000000000000',
+        }, { scheme: 'hls-aes128' });
+      } catch (error) {
+        wrongIv = error;
+      }
+      expect(isMalformedInputError(wrongIv)).toBe(true);
+      expect(wrongIv).toMatchObject({ reasonCode: 'MEDIABUNNY_HLS_IV_MISMATCH' });
     });
+  });
+
+  test('HLS AES-128 rejects SAMPLE-AES before framework parsing and identifies key rotation', async () => {
+    const sampleAesBytes = new Uint8Array(await readFile(new URL('hls_sample_aes.m3u8', MEDIA_ROOT)));
+    const sampleAes = new TextDecoder().decode(sampleAesBytes);
+    expect(hlsKeyMethodsFromPlaylist(sampleAes)).toEqual(new Set(['SAMPLE-AES']));
+
+    await withEngine(async (engine) => {
+      const input = memoryInput('hls_sample_aes.m3u8', sampleAesBytes, 'application/vnd.apple.mpegurl');
+      let methodMismatch: unknown;
+      try {
+        await engine.decrypt(input, {
+          keyHex: '000102030405060708090a0b0c0d0e0f',
+        }, { scheme: 'hls-aes128' });
+      } catch (error) {
+        methodMismatch = error;
+      }
+      expect(isMalformedInputError(methodMismatch)).toBe(true);
+      expect(methodMismatch).toMatchObject({ reasonCode: 'MEDIABUNNY_HLS_METHOD_MISMATCH' });
+    });
+
+    const rotationBytes = new Uint8Array(await readFile(new URL('hls_aes128_rotation.m3u8', MEDIA_ROOT)));
+    const rotation = new TextDecoder().decode(rotationBytes);
+    expect(hlsKeyUrisFromPlaylist(rotation, 'https://media.test/path/hls_aes128_rotation.m3u8').size).toBe(2);
   });
 });

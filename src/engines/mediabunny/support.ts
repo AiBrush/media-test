@@ -133,14 +133,16 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     }
   }
 
-  if (request.operation === 'demux') {
+  if (request.operation === 'demux' || request.operation === 'probe') {
     const unsupportedInputTrack = request.inputs
       .flatMap((input) => input.tracks)
       .find((track) => track.type !== 'video' && track.type !== 'audio');
     if (unsupportedInputTrack) {
       return no(
         MEDIABUNNY_REASON.TRACK_TYPE,
-        `Mediabunny 1.48.0 Input.getTracks()/EncodedPacketSink does not expose demux packets for '${unsupportedInputTrack.type}' tracks`,
+        request.operation === 'probe'
+          ? `Mediabunny 1.48.0 Input.getTracks() does not expose '${unsupportedInputTrack.type}' tracks in probe inventory`
+          : `Mediabunny 1.48.0 Input.getTracks()/EncodedPacketSink does not expose demux packets for '${unsupportedInputTrack.type}' tracks`,
       );
     }
   }

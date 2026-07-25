@@ -35,6 +35,7 @@ import {
   parseMuxTrackSelector,
   preflightMuxApplicability,
   readMuxOrientation,
+  readNeutralMuxSource,
   readNeutralMuxTarget,
   validateMuxWriteTrace,
   type MuxCandidateTrackEvidence,
@@ -410,6 +411,19 @@ describe('REQ-FEAT-16 decisive neutral readers for every advertised mux target',
       tracks: [],
       durationToleranceUs: 0,
     })).toMatchObject({ state: 'ERROR', reasonCode: 'MUX_TARGET_READER_COVERAGE_ERROR' });
+  });
+
+  test('accepts frame-complete terminal WAV truncation only as source evidence', () => {
+    const bytes = bytesAt('fixtures/media/scenarios/mux/pcm_s24_to_wav/01.wav');
+    expect(readNeutralMuxTarget(bytes, 'wav')).toMatchObject({
+      state: 'INCOMPLETE',
+      reasonCode: 'WAV_CHUNK_TRUNCATED',
+    });
+    const source = readNeutralMuxSource(bytes, 'wav');
+    expect(source.state).toBe('OK');
+    if (source.state === 'OK') {
+      expect(source.value.tracks[0]).toMatchObject({ codec: 'pcm-s24', sampleRate: 96_000, channels: 2 });
+    }
   });
 
   test('keep-all target semantics allow dynamic extra tracks while selection proves exact membership', () => {

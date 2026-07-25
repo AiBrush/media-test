@@ -547,7 +547,7 @@ export function readMp4Structure(bytes: Uint8Array): ReadStructure | null {
     if (!hasEditList && mediaDurations.length > 0) {
       durationSec = Math.max(durationSec ?? 0, ...mediaDurations);
     }
-    if (findBox(top, 'moof') || findBox(moovChildren, 'mvex')) {
+    if ((findBox(top, 'moof') || findBox(moovChildren, 'mvex')) && (!hasEditList || durationSec === undefined)) {
       const fragmentPackets = readMp4FragmentPackets(bytes, dv, top, moov);
       if (fragmentPackets?.length) {
         // Do not spread the packet table into Math.max: long-form fragmented inputs can contain

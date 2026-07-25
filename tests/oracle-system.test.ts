@@ -15,6 +15,7 @@ import {
   type OracleContext,
 } from '../src/core/oracles.ts';
 import { readOutputPacketsResult, readOutputStructure } from '../src/core/box-readers.ts';
+import { demuxMp4Video } from '../src/engines/platform/demux-mp4.ts';
 import { sha256Hex as sha256HexSync } from '../src/core/canonical-json.ts';
 import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
 import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
@@ -24,6 +25,14 @@ test('neutral MP4 structure duration does not truncate a complete media timeline
   const structure = readOutputStructure(bytes, 'mp4');
   expect(structure?.durationSec).toBeGreaterThan(5);
   expect(structure?.tracks.map((track) => track.type)).toEqual(['video', 'audio']);
+});
+
+test('platform reference demux includes a hybrid MP4 progressive prefix and every later fragment', async () => {
+  const bytes = new Uint8Array(await Bun.file('fixtures/media/cenc_ctr_clear.mp4').arrayBuffer());
+  const video = demuxMp4Video(bytes);
+  expect(video.samples).toHaveLength(150);
+  expect(video.samples[0]?.ptsUs).toBe(0);
+  expect(video.samples.at(-1)?.ptsUs).toBeGreaterThan(4_980_000);
 });
 
 test.each([
@@ -185,6 +194,43 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
           sampleTimesSec: [0.5],
         },
       },
+    ]);
+  });
+
+  test('metadata decode-remux uses a same-run source reference even when a frame cache exists', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
+    const remuxInput: MediaInput = {
+      id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    const store = golden({ container: 'mp4', durationSec: 1, tracks: [] });
+    store.frames = [{ index: 0, ptsUs: 0, sha256: 'cd'.repeat(32) }];
+    store.evidence.frames = {
+      state: 'OK', value: store.frames, url: 'frames.json', raw: store.frames,
+    };
+    const remuxScenario = scenario('remux', 'property-invariant', {
+      container: 'mkv',
+      invariant: 'decode(remux(x))==decode(x)',
+    });
+    remuxScenario.family = 'metadata';
+    const decodeCalls: Array<{ container: string; sampling?: 'prefix' | 'uniform' }> = [];
+    const outcome = await runOracle('property-invariant', context({
+      scenario: remuxScenario,
+      input: remuxInput,
+      output: { bytes: new Uint8Array([4, 5, 6]), mime: 'video/x-matroska', container: 'mkv' },
+      golden: store,
+      decodeWithPlatform: async (media, options) => {
+        decodeCalls.push({ container: media.container, sampling: options?.sampling });
+        return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
+      },
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodeCalls).toEqual([
+      { container: 'mp4', sampling: 'prefix' },
+      { container: 'mkv', sampling: 'prefix' },
     ]);
   });
 
@@ -880,6 +926,59 @@ describe('REQ-FEAT-53/59 live decrypt oracle integration', () => {
       state: 'VERDICT',
       verdict: 'PASS',
       reasonCode: 'DECRYPT_COMPLETE_PRESENTATION_VALID',
+    });
+  });
+
+  test('a mismatched clear-reference timeline is NA_ASSET when output matches primary frame evidence', async () => {
+    const primary = [digest(0, 0, 'a'), digest(1, 33_333, 'b'), digest(2, 66_667, 'c')];
+    const clear = [digest(0, 0, 'a'), digest(1, 54_688, 'b'), digest(2, 88_021, 'c')];
+    const store = emptyGoldenStore();
+    store.frames = primary;
+    store.evidence.frames = { state: 'OK', value: primary, url: 'primary.frames.json', raw: primary };
+    const out = await runOracle('decrypt-bitexact', context({
+      scenario: decryptScenario(),
+      input: { ...input, id: 'protected.mp4' },
+      golden: store,
+      output: { bytes: Uint8Array.of(2), mime: 'video/mp4', container: 'mp4' },
+      verifiedResources: { 'clear.mp4': Uint8Array.of(1) },
+      decodeWithPlatform: async (media) => ({
+        frames: media.bytes[0] === 1 ? clear : primary,
+      }),
+    }));
+
+    expect(out).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_ASSET',
+      reasonCode: 'DECRYPT_CLEAR_REFERENCE_PRESENTATION_MISMATCH',
+    });
+  });
+
+  test('verified protected-source timing localizes a clear-reference asset mismatch without a frame golden', async () => {
+    const protectedBytes = new Uint8Array(await Bun.file('fixtures/media/cenc_cbcs.mp4').arrayBuffer());
+    const primary = Array.from({ length: 150 }, (_, index) =>
+      digest(index, Math.round(index * 1_000_000 / 30), index % 2 === 0 ? 'a' : 'b'));
+    const clear = primary.map((frame, index) => ({
+      ...frame,
+      ptsUs: index === 0 ? 0 : frame.ptsUs + 21_355,
+    }));
+    const out = await runOracle('decrypt-bitexact', context({
+      scenario: decryptScenario(),
+      input: {
+        ...input,
+        id: 'cenc_cbcs.mp4',
+        arrayBuffer: async () => protectedBytes.slice().buffer,
+      },
+      output: { bytes: Uint8Array.of(2), mime: 'video/mp4', container: 'mp4' },
+      verifiedResources: { 'clear.mp4': Uint8Array.of(1) },
+      decodeWithPlatform: async (media) => ({
+        frames: media.bytes[0] === 1 ? clear : primary,
+      }),
+    }));
+
+    expect(out).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_ASSET',
+      reasonCode: 'DECRYPT_CLEAR_REFERENCE_PRESENTATION_MISMATCH',
     });
   });
 

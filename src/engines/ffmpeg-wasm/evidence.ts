@@ -201,6 +201,26 @@ export function parseFrameChecksumPackets(
   return packets;
 }
 
+/** Exact rational clocks declared by framecrc/framehash headers, keyed by their output stream. */
+export function parseFrameChecksumTimebases(out: string): Map<number, RationalTimebase> {
+  const timebases = new Map<number, RationalTimebase>();
+  for (const raw of out.split('\n')) {
+    const match = /^#tb (\d+):\s*(\d+)\/(\d+)/.exec(raw.replace(/\r$/, ''));
+    if (!match) continue;
+    const index = Number(match[1]);
+    const numerator = Number(match[2]);
+    const denominator = Number(match[3]);
+    if (
+      Number.isSafeInteger(index) && index >= 0 &&
+      Number.isSafeInteger(numerator) && numerator > 0 &&
+      Number.isSafeInteger(denominator) && denominator > 0
+    ) {
+      timebases.set(index, { numerator, denominator });
+    }
+  }
+  return timebases;
+}
+
 /** Parse one `-debug_ts` demuxer line before any output muxer timestamp repair is applied. */
 export function parseDemuxTimestampLog(message: string): DemuxTimestampEvidence | undefined {
   if (!message.includes('demuxer ->')) return undefined;

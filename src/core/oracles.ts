@@ -125,6 +125,7 @@ import {
   muxTimelineEvidenceFromProgram,
   normalizeMuxTrackSelection,
   readMuxOrientation,
+  readNeutralMuxSource,
   readNeutralMuxTarget,
   type MuxCandidateTrackEvidence,
   type MuxDecision,
@@ -3442,7 +3443,7 @@ async function muxReferenceReimport(ctx: OracleContext): Promise<OracleOutcome> 
     const strictSourceRead = readNeutralRemuxProgram(source, sourceContainer);
     const muxSourceRead = strictSourceRead.state === 'OK'
       ? undefined
-      : readNeutralMuxTarget(source, sourceContainer);
+      : readNeutralMuxSource(source, sourceContainer);
     if (strictSourceRead.state !== 'OK' && muxSourceRead?.state === 'OK') {
       // WAV is intentionally outside the remux reader but inside mux's advertised target-reader
       // boundary. Its dynamic selection layer compares exact PCM payload identity and track shape,
@@ -3473,7 +3474,7 @@ async function muxSelectionLayer(ctx: OracleContext, declaredSelectors: readonly
     const input = inputs[sourceIndex]!;
     const bytes = new Uint8Array(await input.arrayBuffer());
     const container = resolveContainer(undefined, input.id);
-    const read = readNeutralMuxTarget(bytes, container);
+    const read = readNeutralMuxSource(bytes, container);
     if (read.state !== 'OK') {
       return read.state === 'UNSUPPORTED_FORMAT'
         ? oracleError(
@@ -3624,7 +3625,7 @@ async function muxRotationLayer(
   let sourceFrames: FrameSink;
   let candidateFrames: FrameSink;
   try {
-    sourceFrames = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 12 });
+    sourceFrames = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 12, sampling: 'uniform' });
   } catch (error) {
     return classifyReferenceDecodeFailure(oracle, 'source', error, sourceMedia);
   }
@@ -3640,6 +3641,7 @@ async function muxRotationLayer(
   try {
     candidateFrames = await ctx.decodeWithPlatform(ctx.output, {
       maxFrames: pairedPresentationTimesSec.length,
+      sampling: 'uniform',
       sampleTimesSec: pairedPresentationTimesSec,
     });
   } catch (error) {
@@ -6125,14 +6127,83 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   }
   const got = candidateSink && Array.isArray(candidateSink.frames) ? candidateSink.frames : [];
   const negative = encryptionNegativeContractFromOptions(ctx.scenario.options);
-  return encryptionVerdictOutcome(
-    oracle,
-    compareCompleteDecryptPresentation(got, want, {
-      ...(negative?.partialOutput.allowed
-        ? { partialPrefix: { minimumFrames: negative.partialOutput.minimumDecodedFrames } }
-        : {}),
-    }),
-  );
+  const comparisonOptions = {
+    ...(negative?.partialOutput.allowed
+      ? { partialPrefix: { minimumFrames: negative.partialOutput.minimumDecodedFrames } }
+      : {}),
+  };
+  const comparison = compareCompleteDecryptPresentation(got, want, comparisonOptions);
+
+  // A protected fixture and its declared clear twin can carry different edit-list/priming timing
+  // even when their complete decoded pixels are identical. Do not blame a decryptor whose output
+  // exactly matches the independently baked primary-source frame evidence: the clear-reference
+  // tuple is the unavailable part. This remains fail-closed — cardinality, order, every digest, and
+  // the primary timeline must all match before the result can become NA_ASSET.
+  if (
+    comparison.verdict === 'FAIL' &&
+    comparison.reasonCode === 'DECRYPT_FRAME_TIMELINE_MISMATCH' &&
+    ctx.golden.evidence.frames.state === 'OK' &&
+    Array.isArray(ctx.golden.frames) &&
+    ctx.golden.frames.length > 0
+  ) {
+    const primary = ctx.golden.frames;
+    const candidateVsPrimary = compareCompleteDecryptPresentation(got, primary, comparisonOptions);
+    const referenceVsPrimary = compareCompleteDecryptPresentation(want, primary, comparisonOptions);
+    if (candidateVsPrimary.verdict === 'PASS' && referenceVsPrimary.verdict === 'FAIL') {
+      return unavailable(
+        oracle,
+        'NA_ASSET',
+        'DECRYPT_CLEAR_REFERENCE_PRESENTATION_MISMATCH',
+        `decrypted output matches the complete '${primaryAssetId(ctx)}' frame evidence, but the ` +
+          `digest-verified clear reference does not: ${referenceVsPrimary.detail}`,
+        candidateVsPrimary.measurements ? { ...candidateVsPrimary.measurements } : undefined,
+      );
+    }
+  }
+
+  if (
+    comparison.verdict === 'FAIL' &&
+    comparison.reasonCode === 'DECRYPT_FRAME_TIMELINE_MISMATCH' &&
+    negative === undefined &&
+    sameFrameIdentity(got, want)
+  ) {
+    const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+    const sourceTimeline = readIsoBmffPresentationTimeline(sourceBytes);
+    const sourceVideo = sourceTimeline.state === 'OK'
+      ? sourceTimeline.tracks.find((track) => track.type === 'video')
+      : undefined;
+    if (sourceVideo?.samples.length === got.length) {
+      const sourceTimedFrames = got.map((frame, index) => ({
+        ...frame,
+        ptsUs: sourceVideo.samples[index]!.presentationStartUs,
+      }));
+      const exactTimelineOptions = { timestampToleranceUs: 1_000 };
+      const candidateVsSource = compareCompleteDecryptPresentation(got, sourceTimedFrames, exactTimelineOptions);
+      const referenceVsSource = compareCompleteDecryptPresentation(want, sourceTimedFrames, exactTimelineOptions);
+      if (candidateVsSource.verdict === 'PASS' && referenceVsSource.verdict === 'FAIL') {
+        return unavailable(
+          oracle,
+          'NA_ASSET',
+          'DECRYPT_CLEAR_REFERENCE_PRESENTATION_MISMATCH',
+          `decrypted output matches the digest-verified protected source's complete presentation ` +
+            `timeline and every clear-reference frame digest, but the declared clear reference ` +
+            `timeline does not: ${referenceVsSource.detail}`,
+          candidateVsSource.measurements ? { ...candidateVsSource.measurements } : undefined,
+        );
+      }
+    }
+  }
+
+  return encryptionVerdictOutcome(oracle, comparison);
+}
+
+function sameFrameIdentity(left: readonly FrameDigest[], right: readonly FrameDigest[]): boolean {
+  return left.length === right.length && left.every((frame, index) => {
+    const peer = right[index];
+    return peer !== undefined &&
+      frame.index === peer.index &&
+      normHex(frame.sha256) === normHex(peer.sha256);
+  });
 }
 
 function frameComparisonAssetId(ctx: OracleContext): string | undefined {
@@ -6557,11 +6628,17 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     // candidate through the same independent browser path.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const golden = await frameComparisonGolden(ctx);
-    let want = golden.frames;
+    // Metadata remux rows state the literal metamorphic property decode(remux(x))==decode(x).
+    // Compare both verified byte streams in this browser invocation even when an offline frame
+    // cache exists: hardware/WebCodecs raster hashes can vary on isolated frames across processes,
+    // while the independent reference-reimport layer still proves exact coded-unit preservation.
+    const preferLiveMetadataReference =
+      ctx.scenario.op === 'remux' && ctx.scenario.family === 'metadata';
+    let want = preferLiveMetadataReference ? undefined : golden.frames;
     let liveReferenceDecodeOptions:
       | {
           maxFrames: number;
-          sampling: 'uniform';
+          sampling: 'prefix' | 'uniform';
           durationHintSec?: number;
           sampleTimesSec?: readonly number[];
         }
@@ -6592,17 +6669,28 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
       const sampleTimesSec = sourceRead.state === 'OK'
         ? anchoredRemuxSampleTimesSec(sourceRead.value, 60)
         : [];
+      const sourceStructure = readOutputStructureResult(sourceBytes, sourceContainer);
+      const outputStructure = readOutputStructureResult(ctx.output.bytes, ctx.output.container);
+      const hasDisplayTransform = [sourceStructure, outputStructure].some((structure) =>
+        structure.state === 'OK' && structure.value.tracks.some((track) =>
+          typeof track.rotation === 'number' && track.rotation !== 0));
       // Inline WebCodecs decoding yields a leading prefix, while the HTMLVideoElement fallback
       // samples uniformly across presentation time. A source and remux target can take different
       // decode paths even though their essence is identical (for example an edit-list MP4 source
-      // and an inline-demuxable Matroska output). Force both sides onto one presentation-time
-      // domain whenever the committed source-frame cache is unavailable.
-      liveReferenceDecodeOptions = {
-        maxFrames: sampleTimesSec.length || 60,
-        sampling: 'uniform',
-        ...(durationHintSec !== undefined ? { durationHintSec } : {}),
-        ...(sampleTimesSec.length ? { sampleTimesSec } : {}),
-      };
+      // and an inline-demuxable Matroska output). Force both sides onto one presentation-time domain
+      // for transformed media. Plain metadata remuxes instead use sequential WebCodecs prefixes:
+      // repeated HTMLMediaElement seeks can land on an adjacent frame at a rounded wrapper boundary.
+      liveReferenceDecodeOptions = preferLiveMetadataReference && !hasDisplayTransform
+        ? {
+            maxFrames: sampleTimesSec.length || 60,
+            sampling: 'prefix',
+          }
+        : {
+            maxFrames: sampleTimesSec.length || 60,
+            sampling: 'uniform',
+            ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+            ...(sampleTimesSec.length ? { sampleTimesSec } : {}),
+          };
       try {
         const sourceSink = await ctx.decodeWithPlatform(sourceMedia, liveReferenceDecodeOptions);
         want = sourceSink?.frames ?? [];

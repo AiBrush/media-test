@@ -16,6 +16,7 @@ import {
   parseFfprobeFramesJson,
   parseFfprobeJson,
   parseFrameChecksumPackets,
+  parseFrameChecksumTimebases,
   parseMp3XingDurationSec,
   parseTracksFromLog,
   representationForTracks,
@@ -26,6 +27,17 @@ import { isWorkerFsBlobUnreadableError } from '../src/engines/ffmpeg-wasm/suppor
 import type { RemuxProgramEvidence } from '../src/features/remux/types.ts';
 
 describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
+  test('retains exact framecrc rational clocks for timed mux staging', () => {
+    expect(parseFrameChecksumTimebases([
+      '#tb 0: 1/15360',
+      '#tb 1: 1/48000',
+      '0, 0, 0, 512, 42, 0x00000000',
+    ].join('\n'))).toEqual(new Map([
+      [0, { numerator: 1, denominator: 15_360 }],
+      [1, { numerator: 1, denominator: 48_000 }],
+    ]));
+  });
+
   test('recognizes only concrete browser WORKERFS read failures', () => {
     expect(isWorkerFsBlobUnreadableError(new DOMException('blob read failed', 'NotReadableError'))).toBe(true);
     expect(isWorkerFsBlobUnreadableError(new Error(

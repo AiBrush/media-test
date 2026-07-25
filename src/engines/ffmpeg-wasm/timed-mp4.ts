@@ -1,4 +1,4 @@
-import type { EncodedTrack, EncodedTracks } from '../../core/engine.ts';
+import type { EncodedTrack, EncodedTracks, RationalTimebase } from '../../core/engine.ts';
 
 export class TimedMp4UnsupportedError extends Error {
   readonly reasonCode: string;
@@ -29,6 +29,32 @@ interface PreparedTrack {
   decoderConfig: Uint8Array;
   samples: PreparedSample[];
   chunkOffset: number;
+  edit?: PreparedEdit;
+}
+
+interface PreparedEdit {
+  emptyDuration: number;
+  presentationDuration: number;
+  mediaTime: number;
+}
+
+/** Source-container presentation timing carried only between FFmpeg prepareMuxTracks() and mux(). */
+export interface TimedMp4Presentation {
+  programStartUs: number;
+  trackStartUs: number;
+  durationUs: number;
+}
+
+export type TimedMp4Track = EncodedTrack & { timedMp4Presentation?: TimedMp4Presentation };
+
+/** Recover an exact ISO media clock when FFprobe exposes a unit-numerator source timebase. */
+export function timescaleForTimedMux(timebase: RationalTimebase | undefined): number {
+  return timebase?.numerator === 1 &&
+    Number.isSafeInteger(timebase.denominator) &&
+    timebase.denominator > 0 &&
+    timebase.denominator <= 0x7fffffff
+    ? timebase.denominator
+    : 1_000_000;
 }
 
 /** True when the staging writer can carry the coded representation without conversion/re-encode. */
@@ -80,7 +106,10 @@ export function hasImplicitRawDemuxTiming(track: EncodedTrack): boolean {
  * timestamp. FFmpeg then stream-copies this staging file to the requested muxer, avoiding the raw
  * elementary demuxers' synthetic-CFR clocks.
  */
-export function buildTimedMp4(sourceTracks: EncodedTracks['tracks']): Uint8Array {
+export function buildTimedMp4(
+  sourceTracks: EncodedTracks['tracks'],
+  target: 'mp4' | 'mov' = 'mp4',
+): Uint8Array {
   if (!canBuildTimedMp4(sourceTracks)) {
     throw new TimedMp4UnsupportedError(
       'FFMPEG_TIMED_STAGING_CODEC_UNSUPPORTED',
@@ -99,7 +128,7 @@ export function buildTimedMp4(sourceTracks: EncodedTracks['tracks']): Uint8Array
   }
   if (!Number.isFinite(globalDtsOriginUs)) globalDtsOriginUs = 0;
   for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
-    const source = sourceTracks[trackIndex]!;
+    const source = sourceTracks[trackIndex]! as TimedMp4Track;
     const prepared = tracks[trackIndex]!;
     let inferredDtsUs = 0;
     prepared.samples = prepared.samples.map((sample, sampleIndex) => {
@@ -113,9 +142,21 @@ export function buildTimedMp4(sourceTracks: EncodedTracks['tracks']): Uint8Array
         duration: Math.max(1, usToTicks(chunk.durationUs, prepared.timescale)),
       };
     });
+    if (source.timedMp4Presentation) {
+      const timing = checkedPresentation(source.timedMp4Presentation);
+      const visibleStartUs = Math.max(timing.trackStartUs, timing.programStartUs);
+      const clippedPrefixUs = Math.max(0, timing.programStartUs - timing.trackStartUs);
+      prepared.edit = {
+        emptyDuration: Math.max(0, timing.trackStartUs - timing.programStartUs),
+        presentationDuration: Math.max(0, timing.durationUs - clippedPrefixUs),
+        mediaTime: usToTicks(visibleStartUs - globalDtsOriginUs, prepared.timescale),
+      };
+    }
   }
 
-  const ftyp = box('ftyp', concat(ascii('isom'), u32(0x200), ascii('isom'), ascii('iso6'), ascii('mp41')));
+  const ftyp = target === 'mov'
+    ? box('ftyp', concat(ascii('qt  '), u32(0), ascii('qt  ')))
+    : box('ftyp', concat(ascii('isom'), u32(0x200), ascii('isom'), ascii('iso6'), ascii('mp41')));
   const samplePayloads: Uint8Array[] = [];
   let mdatCursor = ftyp.byteLength + 8;
   for (const track of tracks) {
@@ -332,12 +373,13 @@ function parseSingleAdtsFrame(bytes: Uint8Array): { asc: Uint8Array; payload: Ui
 }
 
 function trak(track: PreparedTrack, trackId: number, movieTimescale: number): Uint8Array {
-  const mediaDuration = track.samples.reduce((max, sample) => Math.max(max, sample.dts + sample.duration), 0);
+  const mediaDuration = rawTrackEnd(track);
   const movieDuration = trackDurationInMovieTicks(track, movieTimescale);
   assertU32(mediaDuration, 'track media duration');
   assertU32(movieDuration, 'track movie duration');
   return box('trak', concat(
     tkhd(track, trackId, movieDuration),
+    ...(track.edit ? [edts(track.edit, movieTimescale)] : []),
     box('mdia', concat(
       mdhd(track.timescale, mediaDuration),
       hdlr(track.type),
@@ -470,6 +512,22 @@ function mdhd(timescale: number, duration: number): Uint8Array {
   ));
 }
 
+function edts(edit: PreparedEdit, movieTimescale: number): Uint8Array {
+  const emptyDuration = usToUnsignedTicks(edit.emptyDuration, movieTimescale, 'empty edit duration');
+  const presentationDuration = usToUnsignedTicks(
+    edit.presentationDuration,
+    movieTimescale,
+    'presentation edit duration',
+  );
+  const mediaTime = edit.mediaTime;
+  assertI32(mediaTime, 'edit media time');
+  const entries = [
+    ...(emptyDuration > 0 ? [concat(u32(emptyDuration), i32(-1), u16(1), u16(0))] : []),
+    concat(u32(presentationDuration), i32(mediaTime), u16(1), u16(0)),
+  ];
+  return box('edts', box('elst', concat(fullBoxHeader(0, 0), u32(entries.length), ...entries)));
+}
+
 function hdlr(type: PreparedTrack['type']): Uint8Array {
   return box('hdlr', concat(
     fullBoxHeader(0, 0), u32(0), ascii(type === 'video' ? 'vide' : 'soun'), new Uint8Array(12),
@@ -499,8 +557,36 @@ function matrix(): Uint8Array {
 }
 
 function trackDurationInMovieTicks(track: PreparedTrack, movieTimescale: number): number {
-  const end = track.samples.reduce((max, sample) => Math.max(max, sample.cts + sample.duration, sample.dts + sample.duration), 0);
-  return Math.max(0, Math.ceil(end * movieTimescale / track.timescale));
+  if (track.edit) {
+    return usToUnsignedTicks(
+      track.edit.emptyDuration + track.edit.presentationDuration,
+      movieTimescale,
+      'track presentation duration',
+    );
+  }
+  return Math.max(0, Math.ceil(rawTrackEnd(track) * movieTimescale / track.timescale));
+}
+
+function rawTrackEnd(track: PreparedTrack): number {
+  return track.samples.reduce(
+    (max, sample) => Math.max(max, sample.cts + sample.duration, sample.dts + sample.duration),
+    0,
+  );
+}
+
+function checkedPresentation(value: TimedMp4Presentation): TimedMp4Presentation {
+  if (
+    !Number.isSafeInteger(value.programStartUs) ||
+    !Number.isSafeInteger(value.trackStartUs) ||
+    !Number.isSafeInteger(value.durationUs) ||
+    value.durationUs < 0
+  ) {
+    throw new TimedMp4UnsupportedError(
+      'FFMPEG_TIMED_STAGING_PRESENTATION_INVALID',
+      'source presentation timing must contain safe integer microseconds and a non-negative duration',
+    );
+  }
+  return value;
 }
 
 function runsOf(values: number[]): Array<{ count: number; value: number }> {
@@ -524,6 +610,12 @@ function checkedTimescale(value: number): number {
 function usToTicks(value: number, timescale: number): number {
   const ticks = Math.round(value * timescale / 1_000_000);
   assertI32(ticks, 'sample timestamp');
+  return ticks;
+}
+
+function usToUnsignedTicks(value: number, timescale: number, label: string): number {
+  const ticks = Math.round(value * timescale / 1_000_000);
+  assertU32(ticks, label);
   return ticks;
 }
 

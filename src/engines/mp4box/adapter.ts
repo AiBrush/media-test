@@ -344,6 +344,11 @@ interface Mp4Edit {
   mediaRateFraction: number;
 }
 
+interface ClassicSampleDurationRun {
+  sampleCount: number;
+  sampleDelta: number;
+}
+
 interface ParsedSession {
   file: Mp4ISOFile;
   info: Mp4Movie;
@@ -561,6 +566,40 @@ function normalizedEdits(track: Mp4Track): Mp4Edit[] {
     mediaRateInteger: entry.media_rate_integer,
     mediaRateFraction: entry.media_rate_fraction,
   }));
+}
+
+/**
+ * MP4Box 2.3 rewrites the final classic sample duration as `mdhd.duration - final dts` while
+ * building its extraction list, even when the authoritative stts table carries a different final
+ * delta. Preserve the public stts run table for mux copy; fragmented inputs have an empty stts and
+ * correctly fall back to each extracted fragment sample's duration.
+ */
+function classicSampleDurationRuns(
+  file: Mp4ISOFile,
+  trackId: number,
+  expectedSamples: number,
+): readonly ClassicSampleDurationRun[] | undefined {
+  const stts = file.getTrackById(trackId)?.mdia?.minf?.stbl?.stts;
+  if (!stts || stts.sample_counts.length === 0 || stts.sample_deltas.length === 0) return undefined;
+  if (stts.sample_counts.length !== stts.sample_deltas.length) {
+    throw new Error(`${ENGINE_ID}: track ${trackId} has inconsistent stts run arrays`);
+  }
+  const runs: ClassicSampleDurationRun[] = [];
+  let total = 0;
+  for (let index = 0; index < stts.sample_counts.length; index++) {
+    const sampleCount = stts.sample_counts[index]!;
+    const sampleDelta = stts.sample_deltas[index]!;
+    if (!Number.isSafeInteger(sampleCount) || sampleCount <= 0 || !Number.isSafeInteger(sampleDelta) || sampleDelta <= 0) {
+      throw new Error(`${ENGINE_ID}: track ${trackId} has invalid stts run ${index}`);
+    }
+    total += sampleCount;
+    if (!Number.isSafeInteger(total)) throw new Error(`${ENGINE_ID}: track ${trackId} stts sample count is unsafe`);
+    runs.push({ sampleCount, sampleDelta });
+  }
+  if (total !== expectedSamples) {
+    throw new Error(`${ENGINE_ID}: track ${trackId} stts covers ${total} samples, expected ${expectedSamples}`);
+  }
+  return runs;
 }
 
 function editPresentationSpanSec(track: Mp4Track): number | undefined {
@@ -1333,6 +1372,21 @@ function fallbackRequest(
  */
 export class Mp4boxEngine implements MediaEngine {
   readonly id = ENGINE_ID;
+  /**
+   * One MP4Box operation is already an independent pure-JS execution. Repeating the global
+   * cross-process memory sampler inside every timing repetition adds no MP4Box-specific evidence
+   * and can take tens of seconds per sample in Chromium, so retain one bounded in-operation sample
+   * and the terminal endpoint without a settle burst.
+   */
+  readonly benchmarkLimits = {
+    maxInnerIterations: 1,
+    memoryWindow: {
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 1_000,
+    },
+  } as const;
 
   private mp4box: Mp4boxModule | null = null;
   private readonly lifecycle = new AdapterLifecycleController(ENGINE_ID);
@@ -1911,19 +1965,33 @@ export class Mp4boxEngine implements MediaEngine {
             if (samples.length === 0) throw new Error(`${ENGINE_ID}: media track ${source.id} emitted no samples`);
             samples.sort((a, b) => a.dts - b.dts || a.number - b.number);
             const timescale = source.timescale > 0 ? source.timescale : (samples[0]?.timescale ?? 1_000_000);
+            const durationRuns = classicSampleDurationRuns(file, source.id, samples.length);
+            let durationRunIndex = 0;
+            let durationRunRemaining = durationRuns?.[0]?.sampleCount ?? 0;
             const chunks: Mp4boxPreparedChunk[] = samples.map((sample, decodeIndex) => {
               if (sample.descriptionIndex < 0 || sample.descriptionIndex >= sampleEntry.sampleEntries.length) {
                 throw new Error(`${ENGINE_ID}: sample ${sample.number} references missing description ${sample.descriptionIndex}`);
+              }
+              if (durationRuns && sample.number !== decodeIndex) {
+                throw new Error(`${ENGINE_ID}: classic track ${source.id} sample order is non-contiguous`);
+              }
+              const duration = durationRuns?.[durationRunIndex]?.sampleDelta ?? sample.duration;
+              if (durationRuns) {
+                durationRunRemaining--;
+                if (durationRunRemaining === 0 && durationRunIndex + 1 < durationRuns.length) {
+                  durationRunIndex++;
+                  durationRunRemaining = durationRuns[durationRunIndex]!.sampleCount;
+                }
               }
               return {
                 data: sample.data,
                 ptsUs: (sample.cts * 1_000_000) / timescale,
                 dtsUs: (sample.dts * 1_000_000) / timescale,
                 decodeIndex,
-                durationUs: (sample.duration * 1_000_000) / timescale,
+                durationUs: (duration * 1_000_000) / timescale,
                 keyframe: sample.isSync,
                 sampleDescriptionIndex: sample.descriptionIndex,
-                mp4boxTiming: { cts: sample.cts, dts: sample.dts, duration: sample.duration },
+                mp4boxTiming: { cts: sample.cts, dts: sample.dts, duration },
               };
             });
             const representation = sampleDescriptionEvidence(sampleEntry.sampleEntries[0], codec, this.lib());
