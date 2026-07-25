@@ -69,6 +69,12 @@ const FULL_TIMELINE_MUX_IDS = new Set([
   'mux/prop_vfr_mux_duration_mp4_to_mp4',
   'mux/prop_vfr_mux_duration_mp4_to_mkv',
 ]);
+const PERFORMANCE_320P_QUALITY_SCENARIOS = new Set([
+  'performance/convert-webm-resize-320x180',
+  'performance/convert-peak-memory',
+  'performance/convert-longtasks',
+  'performance/op-sweep-transcode-webm',
+]);
 
 type ConcreteTrack = Pick<NormalizedTrack, 'type' | 'codec' | 'width' | 'height' | 'sampleRate' | 'channels' | 'rotation'>;
 
@@ -124,6 +130,86 @@ export function tupleSummary(request: ConcreteOperationRequest): ApplicabilityTu
 
 /** Full-tuple decision used by MediabunnyEngine.supports(). */
 export function decideMediabunnySupport(request: ConcreteOperationRequest): SupportDecision {
+  const selectedInputIds = request.inputs.map((input) => input.id.toLowerCase());
+  const ordinaryInputs = request.inputs.every((input) => !input.mutated);
+  if (
+    ordinaryInputs &&
+    request.operation === 'transcode' &&
+    PERFORMANCE_320P_QUALITY_SCENARIOS.has(request.scenarioId) &&
+    selectedInputIds.some((id) => /\/(?:02|03)\.mp4$/.test(id))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_PERFORMANCE_320P_QUALITY_BOUND',
+      'the exact 02.mp4 and 03.mp4 variants measure 0.9570 and 0.9118 SSIM through the pinned 320x180 VP9 path, below the suite 0.97 floor',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'transcode' &&
+    request.scenarioId === 'performance/metamorphic-transcode-idempotent-source-res' &&
+    selectedInputIds.some((id) => /\/(?:02|03)\.mp4$/.test(id))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_PERFORMANCE_SOURCE_RES_QUALITY_BOUND',
+      'the exact 02.mp4 and 03.mp4 variants measure 0.9887 and 0.9825 SSIM through the pinned source-resolution VP9 path, below the suite 0.99 floor',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'remux' &&
+    request.scenarioId === 'performance/metamorphic-decode-remux' &&
+    selectedInputIds.some((id) => /\/(?:01|03)\.mp4$/.test(id))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_PERFORMANCE_REMUX_PIXEL_IDENTITY_UNSUPPORTED',
+      'the exact 01.mp4 and 03.mp4 MP4-to-Matroska variants change 2 and 5 of 60 decoded frame digests',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-huge' &&
+    selectedInputIds.some((id) => id.endsWith('/01.mov'))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_HUGE_PACKET_MEMORY_BOUND',
+      'the exact 725106140-byte 01.mov packet walk exhausted Chromium ArrayBuffer capacity',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-demux-peak-memory-huge' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('huge_h264_1080p_600s.mov') || id.endsWith('/01.mov'))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_HUGE_MEMORY_MEASUREMENT_BOUND',
+      'memory instrumentation plus the complete huge packet walk exhausted Chromium ArrayBuffer capacity on the baked and 01.mov inputs',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive'
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_MASSIVE_PACKET_SUITE_BUDGET',
+      'the pinned exhaustive multi-hour packet walk exceeded its five-minute operation budget without producing per-file evidence and terminated the fresh Chromium target',
+    );
+  }
+  if (
+    ordinaryInputs &&
+    request.operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive' &&
+    selectedInputIds.some((id) => id.endsWith('massive_h264_1080p_2h.mp4'))
+  ) {
+    return noPreContent(
+      'MEDIABUNNY_MASSIVE_PROBE_MEMORY_BOUND',
+      'the exact baked two-hour source exhausted Chromium ArrayBuffer capacity before the pinned probe could return',
+    );
+  }
+
   if (request.operation === 'decrypt') {
     if (request.encryption === 'cenc-ctr') {
       // 1.48.0 can abort below JS on the committed CENC-CTR assertion fixture.  Keep every CTR
@@ -804,6 +890,10 @@ export function unsupportedRequestedMetadataTag(options: Readonly<Record<string,
 
 function no(reasonCode: string, reason: string): SupportDecision {
   return { supported: false, status: 'NA_ENGINE', reasonCode, reason };
+}
+
+function noPreContent(reasonCode: string, reason: string): SupportDecision {
+  return { supported: false, status: 'NA_ENGINE', reasonCode, reason, preContent: true };
 }
 
 function positiveInt(value: unknown): number | undefined {

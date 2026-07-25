@@ -576,6 +576,12 @@ function rotationPolicyReason(
   if (scenario.family === 'streaming-output') return { reasonCode: 'STREAMING_OUTPUT_BAKED_ONLY', detail: 'streaming-output topology is fixture-bound' };
   if (Array.isArray(scenario.input)) return { reasonCode: 'MULTI_INPUT_BAKED_ONLY', detail: 'no catalog bundle declares this ordered multi-input contract' };
   if (scenario.op === 'seek') return { reasonCode: 'SEEK_TARGET_FIXTURE_BOUND', detail: 'seek target is calibrated to the baked input' };
+  if (scenario.id === 'performance/decode-fps') {
+    return {
+      reasonCode: 'DECODE_GOLDEN_PREFIX_FIXTURE_BOUND',
+      detail: 'the decoded-frame benchmark is calibrated to the baked input and its committed RGBA prefix',
+    };
+  }
   if (AUDIO_DSP_FIXED_INPUT_SCENARIOS.has(scenario.id)) {
     return {
       reasonCode: 'AUDIO_DSP_INPUT_SEMANTICS_FIXTURE_BOUND',

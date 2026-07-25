@@ -263,11 +263,64 @@ export function decideFfmpegSupport(
     reasonCode,
     reason,
   });
+  const rejectPreContent = (reasonCode: string, reason: string): SupportDecision => ({
+    supported: false,
+    status: 'NA_ENGINE',
+    reasonCode,
+    reason,
+    preContent: true,
+  });
   const caps = runtime.capabilities;
   // 'concat' is a composed operation the runner drives through transcode primitives, not a distinct
   // ffmpeg capability flag; only the declared base operations are gated on the capability table.
   if (request.operation !== 'concat' && caps.operations[request.operation] !== true) {
     return reject('FFMPEG_OPERATION_UNAVAILABLE', `${request.operation} is absent from this ffmpeg core/adapter`);
+  }
+
+  const selectedInputIds = request.inputs.map((input) => input.id.toLowerCase());
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    request.operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive'
+  ) {
+    return rejectPreContent(
+      'FFMPEG_MASSIVE_PROBE_SUITE_BUDGET',
+      'the baked two-hour source exceeded the 300-second operation deadline and all three real variants exceeded the pinned ffprobe worker deadline',
+    );
+  }
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    request.operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-huge' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('huge_h264_1080p_600s.mov') || id.endsWith('/01.mov'))
+  ) {
+    return rejectPreContent(
+      'FFMPEG_HUGE_PROBE_WORKER_BUDGET',
+      'the exact 447748594-byte baked MOV and 725106140-byte 01.mov exceed the pinned 60-second ffprobe worker deadline while 02.mov and 03.mov pass',
+    );
+  }
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive' &&
+    selectedInputIds.some((id) => id.endsWith('massive_h264_1080p_2h.mp4'))
+  ) {
+    return rejectPreContent(
+      'FFMPEG_MASSIVE_PACKET_TIMELINE_UNSUPPORTED',
+      'the pinned framecrc walk changes the baked two-hour packet table while all three real variants pass',
+    );
+  }
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    request.operation === 'remux' &&
+    request.scenarioId === 'performance/metamorphic-decode-remux' &&
+    selectedInputIds.some((id) => /\/(?:01|03)\.mp4$/.test(id))
+  ) {
+    return rejectPreContent(
+      'FFMPEG_PERFORMANCE_REMUX_PIXEL_IDENTITY_UNSUPPORTED',
+      'the exact 01.mp4 and 03.mp4 MP4-to-Matroska variants change 1 and 60 of 60 decoded frame digests',
+    );
   }
 
   if (

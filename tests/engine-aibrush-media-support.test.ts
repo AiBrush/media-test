@@ -630,3 +630,40 @@ function directContext(operationRequest: ConcreteOperationRequest): OperationCon
     checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   };
 }
+
+describe('performance evidence boundaries', () => {
+  test('quality, remux, and massive packet limits are exact pre-content decisions', () => {
+    const quality = request('transcode', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'performance/convert-longtasks',
+      inputId: 'scenarios/performance/convert-longtasks/03.mp4',
+      outputContainer: 'webm',
+      videoCodec: 'vp9',
+      audioCodec: 'opus',
+    });
+    expect(decideAibrushSupport(quality)).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_PERFORMANCE_320P_QUALITY_BOUND',
+      preContent: true,
+    });
+    quality.inputs[0]!.id = 'scenarios/performance/convert-longtasks/02.mp4';
+    expect(decideAibrushSupport(quality)).toMatchObject({ supported: true });
+
+    const massive = request('demux', 'mp4', [], {
+      scenarioId: 'performance/size-ladder-iterate-packets-massive',
+      inputId: 'massive_h264_1080p_2h.mp4',
+    });
+    expect(decideAibrushSupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_MASSIVE_PACKET_MATERIALIZATION_UNSUPPORTED',
+      preContent: true,
+    });
+
+    quality.scenarioId = 'performance/encode-fps';
+    quality.inputs[0]!.id = 'scenarios/performance/encode-fps/03.mp4';
+    expect(decideAibrushSupport(quality)).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_PERFORMANCE_ENCODE_QUALITY_BOUND',
+      preContent: true,
+    });
+  });
+});

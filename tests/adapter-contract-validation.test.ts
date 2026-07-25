@@ -76,8 +76,16 @@ describe('REQ-ADP-01/02/03: verdict-neutral evidence and typed applicability cha
       status: 'NA_BROWSER',
       reasonCode: browserMiss.reasonCode,
       reason: browserMiss.reason,
+      preContent: true,
       browserConfigs: [browserMiss.browserConfig!],
-    }).status).toBe('NA_BROWSER');
+    })).toMatchObject({ status: 'NA_BROWSER', preContent: true });
+    expect(() => validateSupportDecision(ENGINE_ID, {
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'BAD_PREFLIGHT',
+      reason: 'invalid marker',
+      preContent: false,
+    })).toThrow(/preContent/);
   });
 
   test('malformed rejection and unexpected fault are never reclassified by names or prose', () => {

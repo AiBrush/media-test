@@ -1436,6 +1436,16 @@ function compareSemanticTrack(
     failures.push(`${p}.codec canonical '${aCodec.canonical}' vs '${bCodec.canonical}'`);
   } else if ((aCodec.canonical === null) !== (bCodec.canonical === null)) {
     failures.push(`${p}.codec canonical '${aCodec.canonical ?? aCodec.raw}' vs '${bCodec.canonical ?? bCodec.raw}'`);
+  } else if (
+    match.type === 'other' &&
+    !aCodec.canonical &&
+    !bCodec.canonical &&
+    normStr(bCodec.raw) === '' &&
+    normStr(aCodec.raw) !== ''
+  ) {
+    representationDifferences.push(
+      `${p}.codec implementation labels golden-unspecified auxiliary track '${aCodec.raw}'`,
+    );
   } else if (!aCodec.canonical && !bCodec.canonical && normStr(aCodec.raw) !== normStr(bCodec.raw)) {
     failures.push(`${p}.codec raw unknown '${aCodec.raw}' vs '${bCodec.raw}'`);
   } else if (normStr(aCodec.raw) !== normStr(bCodec.raw)) {

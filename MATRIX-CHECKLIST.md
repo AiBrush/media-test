@@ -21,9 +21,9 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | streaming-output | V | V | V | V | V | V |
 | audio-dsp | V | V | V | V | V | V |
 | robustness | V | V | V | V | V | V |
-| performance | P | P | P | P | P | P |
+| performance | V | V | V | V | V | V |
 
-Totals: 72 verified, 0 active, 6 pending.
+Totals: 78 verified, 0 active, 0 pending.
 
 ## Campaign invariants
 
@@ -45,10 +45,10 @@ Totals: 72 verified, 0 active, 6 pending.
 - aibrush-media four-row closure scenario/oracle definition digests:
   `666fa8e2058ca0d4d7789133d84c54e25da1f3e9bb2635f0af8014525983346e` /
   `6e12c3a2c8315f2e9ae24eac9cd930ed7f14b9fde072ffdfd2d23cf0fd7dfe74`.
-- Current regression gate (2026-07-25): focused robustness/core/Audio-DSP/
-  Mediabunny regressions are 73 pass with 567 assertions. The one
-  post-repair full suite is 1196 pass with 14396 assertions across 80 files
-  in 119.84 seconds; typecheck and `git diff --check` are clean.
+- Current regression gate (2026-07-25): the one final post-performance
+  full-suite run is 1215 pass with 14426 assertions across 80 files in
+  119.62 seconds. Typecheck, `git diff --check`, and
+  `git diff --cached --check` are clean.
 
 ## Verified cells
 
@@ -2500,9 +2500,8 @@ Totals: 72 verified, 0 active, 6 pending.
   and web-demuxer preserve their ordinary partial-decode errors while typing
   the same damaged-input failures only under the negative robustness
   contract.
-- Focused regressions and typecheck are clean; the final post-change full
-  suite is deferred until the performance cells reach their final source
-  boundary.
+- Focused regressions and typecheck are clean. The final post-change
+  full-suite gate is recorded in the performance closure below.
 - Artifact file SHA-256 values, in the order listed above:
   `49c3e298bacf60d8b34d65e61587dcfed0cbdd3a724426ec145122d3a3e41f46`,
   `035db81c236067b70967dc41ae12dd158f11b6da6344c02b9d8804bc0128ea67`,
@@ -2512,3 +2511,74 @@ Totals: 72 verified, 0 active, 6 pending.
   `e520e30b800e4688ac6ace7dd87b8ddf0f86141b628d9d13eab762f963bd900c`,
   and `dee86d0da54cf0c991c14b4e24e0c4d5ce3d9679e3e49d0849758808c07da53a`.
 - Suggested commit message: `cell(robustness): complete remaining exhaustive engine evidence`
+
+### performance × all six engines
+
+- No quick baseline was performed. The one authoritative forced-fresh
+  exhaustive Chromium baseline is
+  `results/raw/chromium-2026-07-25T15-20-38-465Z.json`, seed
+  `performance-all-20260725-v1`. It scheduled all 198 engine-scenario cells
+  and retained 173 results before the one-hour launcher ceiling promoted the
+  checkpoint to `completed-partial`. Its 25 unstarted cells and only its
+  adverse rows became the closure set; already-terminal scenarios were not
+  replayed.
+- Engine-scoped checkpoints and closures were:
+  `results/raw/chromium-2026-07-25T16-32-40-694Z.json` plus
+  `results/raw/chromium-2026-07-25T16-37-50-797Z.json` (aibrush-media);
+  `results/raw/.partial/chromium-2026-07-25T16-39-10-323Z.partial.json`,
+  `results/raw/.partial/chromium-2026-07-25T16-46-22-523Z.partial.json`,
+  and `results/raw/chromium-2026-07-25T16-56-56-140Z.json`
+  (Mediabunny); `results/raw/chromium-2026-07-25T16-58-51-988Z.json`
+  plus `results/raw/chromium-2026-07-25T17-12-43-955Z.json`
+  (FFmpeg.wasm); `results/raw/chromium-2026-07-25T17-18-01-279Z.json`,
+  the two isolated massive-input diagnostics
+  `results/raw/chromium-2026-07-25T17-18-49-552Z.json` and
+  `results/raw/chromium-2026-07-25T17-20-54-598Z.json`, and
+  `results/raw/chromium-2026-07-25T17-22-13-623Z.json` (Remotion);
+  `results/raw/chromium-2026-07-25T17-23-27-347Z.json`,
+  `results/raw/chromium-2026-07-25T17-25-02-843Z.json`, and
+  `results/raw/chromium-2026-07-25T17-25-48-651Z.json`
+  (web-demuxer); and
+  `results/raw/.partial/chromium-2026-07-25T17-26-00-224Z.partial.json`
+  plus `results/raw/chromium-2026-07-25T17-30-17-321Z.json` (MP4Box).
+  Renderer-loss checkpoints were preserved and only unfinished rows were
+  restarted.
+- Latest-evidence reduction covers exactly 198/198 performance cells with
+  149 PASS and 49 evidence-backed NA_ENGINE outcomes. Per engine:
+  aibrush-media 31 PASS / 2 NA_ENGINE; Mediabunny 29 / 4; FFmpeg.wasm
+  24 / 9; Remotion 23 / 10; web-demuxer 21 / 12; MP4Box 21 / 12.
+  Every engine has all 33 scenarios terminal, with zero FAIL, ERROR,
+  NA_ASSET, NA_BROWSER, partial, or SKIPPED latest outcome.
+- Repairs are narrow and evidence-producing. Decode-FPS remains bound to its
+  committed RGBA-prefix source; a golden-unspecified auxiliary track may
+  retain an implementation codec label as a recorded representation
+  difference; and explicit pre-content support decisions prevent known
+  quality, packet-timeline, worker-budget, inventory, FileReader/Blob, and
+  ArrayBuffer limits from materializing unsafe inputs. Reviewed suppressions
+  were removed, so every limitation is now an adapter-owned concrete
+  NA_ENGINE decision with focused positive-neighbor coverage.
+- Final boundary: the one post-change full suite is 1215 pass with 14426
+  assertions across 80 files in 119.62 seconds. Typecheck,
+  `git diff --check`, and `git diff --cached --check` are clean.
+- Artifact file SHA-256 values, in the order listed above (baseline first,
+  then each engine group):
+  `095e217b4be65f9ef3a519aee88442c938ed4c14aa888559eb181f7e108aafc6`;
+  `39360c482f4fbaa697631c1da90d6bae2ebe6047507c1919c3f5c79af854ce79`,
+  `f3ed9d673b6ff9f71405ba8f70f5e59e79c548050c35571ed44c9bcf5f8a09d5`;
+  `3ba3f3b6993167a875d15353256377bae1300acf0e6fd6be61d03bb634cc5ce9`,
+  `3c02669f5a9305fb4d280d1a16eef07a7020fa5ff1d533066ef01c94eeecc414`,
+  `bb988f49b497cd40470ccbf105266091ba5ad12e4ec8e511e480e0d34149d8cd`;
+  `492dde009f378c058c2d7862063eb18683ad8c86d3072929c009cb93c0827ca2`,
+  `1ad244ea906f755e6ba3ee1992ac1a216ea14d8befecdbb41bea95818a89c97b`;
+  `48ff7a789bb4b76e610bb145a81dc408d0597be0bb4fc597a2868abed04df3c6`,
+  `dc6540b3129f0f3fdb033f8ddf90692b588ef64d075eecc49656884fac3894bf`,
+  `4c25d57cb624c56ba9e36bceb6cc044c6612cd265cdfcac87df01a883a7c1c5d`,
+  `542249eb07f15a01f657756fe4dfa7c299c7182dce0a91473a781df06e698d83`;
+  `8278a78a5b5b37ebec51c3c67b4158c0ec42cb7b1589f5f26325f28ce34ebf10`,
+  `61c78027afce8b69644482ba60aabb55a09bb04b91f94e39ee6b30e3dffeadd6`,
+  `6f135e7dfcc27d1fe7ca50949a72384e0bdd7089f68258bd379265368f4e44c2`;
+  and
+  `9d5bf27bf73eb42a3c9517986dc7ea0ffee9bf1e1f6863031bfff958078b1488`,
+  `42de640a129cd5a4c0ed764f12ab7c87351feb3784d4434d383a6d559728795b`.
+- Suggested commit message:
+  `cell(performance): complete exhaustive six-engine evidence`

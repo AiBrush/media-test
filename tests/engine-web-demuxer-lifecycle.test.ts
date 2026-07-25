@@ -14,6 +14,7 @@ import {
   WebDemuxerEngine,
   type WebDemuxerEngineDependencies,
 } from '../src/engines/web-demuxer/adapter.ts';
+import { decideWebDemuxerSupport } from '../src/engines/web-demuxer/support.ts';
 import { WebDemuxerPartialDecodeError } from '../src/engines/web-demuxer/temporal.ts';
 import type { AVMediaType, AVSeekFlag, WebAVPacket, WebAVStream, WebMediaInfo } from 'web-demuxer';
 
@@ -809,3 +810,42 @@ function restoreGlobal(name: string, descriptor: PropertyDescriptor | undefined)
   if (descriptor) Object.defineProperty(globalThis, name, descriptor);
   else Reflect.deleteProperty(globalThis, name);
 }
+
+describe('performance evidence boundaries', () => {
+  test('huge channel and massive packet misses are exact pre-content decisions', () => {
+    const huge = request('probe');
+    huge.scenarioId = 'performance/size-ladder-extract-metadata-huge';
+    huge.inputs[0]!.container = 'mov';
+    huge.inputs[0]!.mime = 'video/quicktime';
+    huge.inputs[0]!.id = 'scenarios/performance/size-ladder-extract-metadata-huge/01.mov';
+    expect(decideWebDemuxerSupport(huge)).toMatchObject({
+      supported: false,
+      reasonCode: 'WEB_DEMUXER_HUGE_MOV_CHANNEL_INVENTORY_UNSUPPORTED',
+      preContent: true,
+    });
+
+    const massive = request('demux');
+    massive.scenarioId = 'performance/size-ladder-iterate-packets-massive';
+    massive.inputs[0]!.id = 'massive_h264_1080p_2h.mp4';
+    expect(decideWebDemuxerSupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'WEB_DEMUXER_MASSIVE_PACKET_SEMANTICS_UNSUPPORTED',
+      preContent: true,
+    });
+    massive.inputs[0]!.id = 'scenarios/performance/size-ladder-iterate-packets-massive/03.mp4';
+    expect(decideWebDemuxerSupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'WEB_DEMUXER_MASSIVE_PACKET_FILE_READER_BOUND',
+      preContent: true,
+    });
+
+    const massiveProbe = request('probe');
+    massiveProbe.scenarioId = 'performance/size-ladder-extract-metadata-massive';
+    massiveProbe.inputs[0]!.id = 'massive_h264_1080p_2h.mp4';
+    expect(decideWebDemuxerSupport(massiveProbe)).toMatchObject({
+      supported: false,
+      reasonCode: 'WEB_DEMUXER_MASSIVE_PROBE_FILE_READER_BOUND',
+      preContent: true,
+    });
+  });
+});

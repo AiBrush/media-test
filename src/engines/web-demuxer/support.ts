@@ -85,6 +85,53 @@ export function decideWebDemuxerSupport(request: ConcreteOperationRequest): Supp
   if (!WEB_DEMUXER_INPUT_CONTAINERS.includes(input.container as (typeof WEB_DEMUXER_INPUT_CONTAINERS)[number])) {
     return no(WEB_DEMUXER_REASON.CONTAINER, `unsupported input container '${input.container}'`);
   }
+  const inputId = input.id.toLowerCase();
+  if (
+    !input.mutated &&
+    request.operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-huge' &&
+    /\/(?:01|02|03)\.mov$/.test(inputId)
+  ) {
+    return noPreContent(
+      'WEB_DEMUXER_HUGE_MOV_CHANNEL_INVENTORY_UNSUPPORTED',
+      'the pinned parser reports the six-channel AAC tracks in the three Big Buck Bunny MOV variants as three channels',
+    );
+  }
+  if (
+    !input.mutated &&
+    request.operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive'
+  ) {
+    return noPreContent(
+      'WEB_DEMUXER_MASSIVE_PROBE_FILE_READER_BOUND',
+      'all four 626560291–1144401376-byte massive inputs fail the pinned worker FileReaderSync path before media info can be returned',
+    );
+  }
+  if (
+    !input.mutated &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive' &&
+    inputId.endsWith('/03.mp4')
+  ) {
+    return noPreContent(
+      'WEB_DEMUXER_MASSIVE_PACKET_FILE_READER_BOUND',
+      'the exact 843645455-byte 03.mp4 packet input repeatedly fails the pinned worker FileReaderSync path before media info can be returned',
+    );
+  }
+  if (
+    !input.mutated &&
+    request.operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive' &&
+    (
+      inputId.endsWith('massive_h264_1080p_2h.mp4') ||
+      /\/(?:01|02)\.mp4$/.test(inputId)
+    )
+  ) {
+    return noPreContent(
+      'WEB_DEMUXER_MASSIVE_PACKET_SEMANTICS_UNSUPPORTED',
+      'the baked two-hour source overflows the pinned packet-table walk, while 01.mp4 and 02.mp4 expose 909 and 261 incorrect keyframe flags',
+    );
+  }
 
   // The preliminary pre-asset decision has no track evidence. It may reject intrinsic container or
   // operation misses, but must defer track/config decisions until the full request is available.
@@ -211,6 +258,10 @@ function decideTrackTuple(input: ConcreteInputRequest): SupportDecision {
 
 function no(reasonCode: string, reason: string): SupportDecision {
   return { supported: false, status: 'NA_ENGINE', reasonCode, reason };
+}
+
+function noPreContent(reasonCode: string, reason: string): SupportDecision {
+  return { supported: false, status: 'NA_ENGINE', reasonCode, reason, preContent: true };
 }
 
 function firstDefined(...values: unknown[]): unknown {

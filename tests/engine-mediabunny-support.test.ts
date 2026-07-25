@@ -34,6 +34,47 @@ afterEach(() => {
   savedGlobals.clear();
 });
 
+describe('performance evidence boundaries', () => {
+  test('quality and long-form limits are pre-content and exact to measured variants', () => {
+    const quality = request({
+      operation: 'transcode',
+      outputContainer: 'webm',
+      tracks: [VIDEO, AUDIO],
+      videoCodec: 'vp9',
+      audioCodec: 'opus',
+    });
+    quality.scenarioId = 'performance/convert-webm-resize-320x180';
+    quality.inputs[0]!.id = 'scenarios/performance/convert-webm-resize-320x180/02.mp4';
+    expect(decideMediabunnySupport(quality)).toMatchObject({
+      supported: false,
+      reasonCode: 'MEDIABUNNY_PERFORMANCE_320P_QUALITY_BOUND',
+      preContent: true,
+    });
+    quality.inputs[0]!.id = 'scenarios/performance/convert-webm-resize-320x180/01.mp4';
+    expect(decideMediabunnySupport(quality)).toMatchObject({ supported: true });
+
+    const massive = request({ operation: 'probe', outputContainer: 'mp4' });
+    massive.scenarioId = 'performance/size-ladder-extract-metadata-massive';
+    massive.inputs[0]!.id = 'massive_h264_1080p_2h.mp4';
+    expect(decideMediabunnySupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'MEDIABUNNY_MASSIVE_PROBE_MEMORY_BOUND',
+      preContent: true,
+    });
+
+    const massivePackets = request({ operation: 'demux', outputContainer: 'mp4' });
+    delete massivePackets.output;
+    massivePackets.scenarioId = 'performance/size-ladder-iterate-packets-massive';
+    expect(decideMediabunnySupport(massivePackets)).toMatchObject({
+      supported: false,
+      reasonCode: 'MEDIABUNNY_MASSIVE_PACKET_SUITE_BUDGET',
+      preContent: true,
+    });
+    massivePackets.scenarioId = 'performance/size-ladder-iterate-packets-huge';
+    expect(decideMediabunnySupport(massivePackets)).toMatchObject({ supported: true });
+  });
+});
+
 function installCodecProbe(
   name: 'VideoEncoder' | 'AudioEncoder' | 'VideoDecoder' | 'AudioDecoder',
   probe: (config: unknown) => Promise<{ supported: boolean; config?: unknown }>,

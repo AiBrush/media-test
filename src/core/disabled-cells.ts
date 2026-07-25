@@ -45,30 +45,6 @@ export interface ForcedTimeoutCell extends ReviewedSuppressionMetadata {
   reason: string;
 }
 
-const OWNER = 'media-test runner maintainers';
-const REVIEW_EXPIRY = '2027-01-31T00:00:00.000Z';
-
-function budget(
-  scenarioId: string,
-  evidence: string,
-  retestCondition: string,
-): DisabledCell {
-  return {
-    kind: 'budget',
-    engineId: 'remotion@4.0.479',
-    scenarioId,
-    owner: OWNER,
-    issue: 'REQ-RUN-07/remotion-long-form-budget',
-    evidence,
-    expiresAtIso: REVIEW_EXPIRY,
-    retestCondition,
-    workerIsolationReason:
-      'Worker termination bounds UI blocking but does not make repeated full-file parsing/encoding fit the shared matrix CPU and memory budget.',
-    browsers: [],
-    reason: `reviewed budget suppression: ${evidence}`,
-  };
-}
-
 // Real per-file Worker isolation makes static timeout fabrication unnecessary. Kept as an empty
 // compatibility surface so older audit consumers can prove that every former entry was retired.
 const FORCED_TIMEOUT_CELLS: readonly ForcedTimeoutCell[] = [];
@@ -78,33 +54,9 @@ const FORCED_TIMEOUT_CELLS: readonly ForcedTimeoutCell[] = [];
  * defects were removed. What remains is long-form work with measured, multiplicative suite cost or
  * one narrow main-thread safety quarantine.
  */
-const DISABLED_CELLS: readonly DisabledCell[] = [
-  budget(
-    'performance/size-ladder-iterate-packets-huge',
-    'Repeated full packet iteration of the huge file exceeded the 300-second benchmark watchdog.',
-    'Retest when benchmark work can reuse a validated packet walk or parser throughput materially improves.',
-  ),
-  budget(
-    'performance/size-ladder-demux-peak-memory-huge',
-    'A measured browser run took more than four minutes before peak-memory aggregation.',
-    'Retest after a streaming parser path no longer retains the complete packet walk.',
-  ),
-  budget(
-    'performance/size-ladder-iterate-packets-large',
-    'Repeated packet iteration of the 120-second rung exceeds the shared performance-run allocation.',
-    'Retest after parser throughput or benchmark reuse materially improves.',
-  ),
-  budget(
-    'performance/size-ladder-iterate-packets-massive',
-    'Repeated packet iteration of the two-hour rung exceeds the shared performance-run allocation.',
-    'Retest after parser throughput or benchmark reuse materially improves.',
-  ),
-  budget(
-    'performance/size-ladder-demux-peak-memory-large',
-    'Repeated full demux of the 120-second rung exceeds the shared measurement allocation.',
-    'Retest after memory measurement can observe one validated packet walk.',
-  ),
-];
+// Every former performance budget entry is now an adapter-owned, pre-content NA_ENGINE decision.
+// Keeping this list empty proves reviewed suppressions cannot hide applicability.
+const DISABLED_CELLS: readonly DisabledCell[] = [];
 
 export interface DisabledCellAuditInput {
   engineIds: readonly string[];

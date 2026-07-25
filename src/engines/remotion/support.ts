@@ -88,6 +88,59 @@ const LONG_FORM_DECODE_BUDGETS: Readonly<Record<string, string>> = Object.freeze
     'the pinned media-parser sample callback performs a whole-file scan of the 600-second MOV before the bounded WebCodecs frame prefix returns',
 });
 
+const PERFORMANCE_PACKET_BUDGETS: Readonly<Record<string, string>> = Object.freeze({
+  'performance/size-ladder-iterate-packets-large':
+    'the pinned parser repeats a complete 120-second packet callback walk for every benchmark sample',
+  'performance/size-ladder-iterate-packets-huge':
+    'the pinned parser repeats a complete 600-second MOV packet callback walk for every benchmark sample',
+  'performance/size-ladder-iterate-packets-massive':
+    'the pinned parser repeats a complete multi-hour packet callback walk for every benchmark sample',
+  'performance/size-ladder-demux-peak-memory-large':
+    'the pinned parser retains the complete 120-second packet walk before memory aggregation',
+  'performance/size-ladder-demux-peak-memory-huge':
+    'the pinned parser takes more than four minutes before completing huge-file memory aggregation',
+});
+
+function performancePreContentLimit(request: ConcreteOperationRequest): SupportDecision | undefined {
+  if (request.inputs.some((input) => input.mutated)) return undefined;
+  const packetBudget = PERFORMANCE_PACKET_BUDGETS[request.scenarioId];
+  if (packetBudget) {
+    return noPreContent(
+      'REMOTION_PERFORMANCE_PACKET_SUITE_BUDGET',
+      `${packetBudget}; the public parser exposes neither incremental completion nor benchmark-walk reuse`,
+    );
+  }
+  const ids = request.inputs.map((input) => input.id.toLowerCase());
+  if (
+    request.scenarioId === 'performance/size-ladder-extract-metadata-huge' &&
+    ids.some((id) => /\/(?:01|02|03)\.mov$/.test(id))
+  ) {
+    return noPreContent(
+      'REMOTION_HUGE_MOV_CHANNEL_INVENTORY_UNSUPPORTED',
+      'the pinned parser reports the six-channel AAC tracks in the three Big Buck Bunny MOV variants as three channels',
+    );
+  }
+  if (
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive' &&
+    ids.some((id) => /\/(?:01|02)\.mp4$/.test(id))
+  ) {
+    return noPreContent(
+      'REMOTION_MASSIVE_METADATA_BLOB_BOUND',
+      'the exact 626560291-byte 01.mp4 and 759842422-byte 02.mp4 URL-fetch paths repeatedly fail with Chromium ERR_BLOB_OUT_OF_MEMORY, including from a clean browser profile',
+    );
+  }
+  if (
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive' &&
+    ids.some((id) => id.endsWith('massive_h264_1080p_2h.mp4') || id.endsWith('/03.mp4'))
+  ) {
+    return noPreContent(
+      'REMOTION_MASSIVE_METADATA_INVENTORY_UNSUPPORTED',
+      'the pinned parser omits both default dispositions on the baked two-hour source and reports the exact 03.mp4 mono AAC track as stereo',
+    );
+  }
+  return undefined;
+}
+
 function isDemuxScaleRequest(request: ConcreteOperationRequest): boolean {
   const robustness = request.options.robustness;
   return request.operation === 'demux'
@@ -124,6 +177,8 @@ export function decideRemotionParserSupport(request: ConcreteOperationRequest): 
   if (request.operation !== 'probe' && request.operation !== 'demux') {
     return no('REMOTION_PARSER_OPERATION_UNDECLARED', `media-parser cannot execute ${request.operation}`);
   }
+  const performanceLimit = performancePreContentLimit(request);
+  if (performanceLimit) return performanceLimit;
   if (isDemuxScaleRequest(request)) {
     return no(
       'REMOTION_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
@@ -141,6 +196,9 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
 
   const readable = decideReadableInputs(request.inputs);
   if (!readable.supported) return readable;
+
+  const performanceLimit = performancePreContentLimit(request);
+  if (performanceLimit) return performanceLimit;
 
   if (operation !== 'remux' && request.inputs.length !== 1) {
     return no('REMOTION_SINGLE_INPUT_ONLY', `${operation} requires exactly one input`);
@@ -618,4 +676,8 @@ function yes(): SupportDecision {
 
 function no(reasonCode: string, reason: string): SupportDecision {
   return { supported: false, status: 'NA_ENGINE', reasonCode, reason };
+}
+
+function noPreContent(reasonCode: string, reason: string): SupportDecision {
+  return { supported: false, status: 'NA_ENGINE', reasonCode, reason, preContent: true };
 }

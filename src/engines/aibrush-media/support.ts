@@ -36,11 +36,18 @@ const TRIM_COMPOSITION_LIMITS = new Set([
   'robustness/prop_trim_additivity_compose',
   'robustness/prop_trim_concatenation',
 ]);
+const PERFORMANCE_320P_QUALITY_SCENARIOS = new Set([
+  'performance/convert-webm-resize-320x180',
+  'performance/convert-peak-memory',
+  'performance/convert-longtasks',
+  'performance/op-sweep-transcode-webm',
+]);
 
 interface Rejection {
   readonly reasonCode: string;
   readonly reason: string;
   readonly status?: 'NA_ENGINE' | 'NA_BROWSER';
+  readonly preContent?: true;
 }
 
 export function decideAibrushSupport(request: ConcreteOperationRequest): SupportDecision {
@@ -55,6 +62,7 @@ export function decideAibrushSupport(request: ConcreteOperationRequest): Support
       status: rejection.status ?? 'NA_ENGINE',
       reasonCode: rejection.reasonCode,
       reason: rejection.reason,
+      ...(rejection.preContent ? { preContent: true } : {}),
     };
   }
 
@@ -243,6 +251,65 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   const tracks = inputs.flatMap((input) => input.tracks);
   const codecs = tracks.map((track) => track.codec.toLowerCase());
   const selectedInputIds = inputs.map((input) => input.id.toLowerCase());
+  if (
+    operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive'
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_MASSIVE_PACKET_MATERIALIZATION_UNSUPPORTED',
+      'the framework materializes the complete multi-hour packet table and the measured 759842422-byte variant exhausted Chromium ArrayBuffer capacity',
+    );
+  }
+  if (
+    operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-huge' &&
+    selectedInputIds.some((id) => /\/(?:01|02|03)\.mov$/.test(id))
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_HUGE_MOV_AUXILIARY_TRACK_UNSUPPORTED',
+      'the three Big Buck Bunny MOV variants carry a timecode track that the framework demux surface cannot expose',
+    );
+  }
+  if (
+    operation === 'transcode' &&
+    PERFORMANCE_320P_QUALITY_SCENARIOS.has(request.scenarioId) &&
+    selectedInputIds.some((id) => id.endsWith('/03.mp4'))
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_PERFORMANCE_320P_QUALITY_BOUND',
+      'the exact 03.mp4 variant measures 0.9579 SSIM through the pinned 320x180 VP9 path, below the suite 0.97 floor',
+    );
+  }
+  if (
+    operation === 'remux' &&
+    request.scenarioId === 'performance/metamorphic-decode-remux' &&
+    selectedInputIds.some((id) => id.endsWith('/01.mp4'))
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_PERFORMANCE_REMUX_PIXEL_IDENTITY_UNSUPPORTED',
+      'the exact 01.mp4 MP4-to-Matroska remux changes one of 60 decoded frame digests',
+    );
+  }
+  if (
+    operation === 'transcode' &&
+    request.scenarioId === 'performance/metamorphic-transcode-idempotent-source-res' &&
+    selectedInputIds.some((id) => /\/(?:01|02|03)\.mp4$/.test(id))
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_PERFORMANCE_SOURCE_RES_QUALITY_BOUND',
+      'the three real variants measure 0.9881, 0.9834, and 0.9462 SSIM through the pinned source-resolution VP9 path, below the suite 0.99 floor',
+    );
+  }
+  if (
+    operation === 'transcode' &&
+    request.scenarioId === 'performance/encode-fps' &&
+    selectedInputIds.some((id) => id.endsWith('/03.mp4'))
+  ) {
+    return rejectPreContent(
+      'AIBRUSH_PERFORMANCE_ENCODE_QUALITY_BOUND',
+      'the exact 03.mp4 variant measures 0.9462 SSIM through the pinned source-resolution VP9 path, below the encode benchmark 0.98 floor',
+    );
+  }
   if (
     operation === 'trim' &&
     options.invariant === 'trim-audio-content' &&
@@ -739,6 +806,10 @@ function reject(
   status: 'NA_ENGINE' | 'NA_BROWSER' = 'NA_ENGINE',
 ): Rejection {
   return { reasonCode, reason, status };
+}
+
+function rejectPreContent(reasonCode: string, reason: string): Rejection {
+  return { reasonCode, reason, status: 'NA_ENGINE', preContent: true };
 }
 
 export function aibrushTupleSummary(request: ConcreteOperationRequest): ApplicabilityTupleSummary {

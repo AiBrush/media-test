@@ -1074,6 +1074,12 @@ export type SupportDecision =
       status: 'NA_ENGINE' | 'NA_BROWSER';
       reasonCode: string;
       reason: string;
+      /**
+       * The decision depends only on the scenario, declared input identity/size/container, and
+       * requested output shape. The runner may therefore apply it before downloading the media
+       * body. Omit this when track/golden/content evidence is required.
+       */
+      preContent?: true;
       browserConfigs?: ConcreteWebCodecsConfig[];
     };
 
@@ -2629,6 +2635,9 @@ export function validateSupportDecision(engineId: string, value: unknown, path =
   }
   requireNonEmptyString(engineId, `${path}.reasonCode`, record.reasonCode);
   requireNonEmptyString(engineId, `${path}.reason`, record.reason);
+  if (record.preContent !== undefined && record.preContent !== true) {
+    contractFail(engineId, `${path}.preContent`, 'must be true when present');
+  }
   if (record.browserConfigs !== undefined) validateBrowserConfigs(engineId, record.browserConfigs, `${path}.browserConfigs`);
   return value as SupportDecision;
 }

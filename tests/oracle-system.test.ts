@@ -311,6 +311,38 @@ describe('REQ-ORAC-01 semantic golden metadata', () => {
     expect(out.detail).toContain("codec alias '2'→aac");
   });
 
+  test('an implementation label for a golden-unspecified auxiliary track is a representation difference', async () => {
+    const unspecified = await compare(
+      {
+        container: 'mov',
+        durationSec: 10,
+        tracks: [video('h264'), { type: 'other', codec: 'tmcd' } as any],
+      },
+      {
+        container: 'mov',
+        durationSec: 10,
+        tracks: [video('h264'), { type: 'other', codec: '' } as any],
+      },
+    );
+    expect(verdict(unspecified)).toBe('PASS');
+    expect(unspecified.reasonCode).toBe('ORACLE_REPRESENTATION_DIFF');
+    expect(unspecified.detail).toContain("golden-unspecified auxiliary track 'tmcd'");
+
+    const conflicting = await compare(
+      {
+        container: 'mov',
+        durationSec: 10,
+        tracks: [video('h264'), { type: 'other', codec: 'text' } as any],
+      },
+      {
+        container: 'mov',
+        durationSec: 10,
+        tracks: [video('h264'), { type: 'other', codec: 'tmcd' } as any],
+      },
+    );
+    expect(verdict(conflicting)).toBe('FAIL');
+  });
+
   test('track ordering and deterministic same-type matching are preserved as DIFF evidence', async () => {
     const got = {
       container: 'mp4', durationSec: 10,

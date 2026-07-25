@@ -22,6 +22,10 @@ function no(reasonCode: string, reason: string): Rejection {
   return { supported: false, status: 'NA_ENGINE', reasonCode, reason };
 }
 
+function noPreContent(reasonCode: string, reason: string): Rejection {
+  return { supported: false, status: 'NA_ENGINE', reasonCode, reason, preContent: true };
+}
+
 function outputContainer(request: ConcreteOperationRequest): string | undefined {
   const option = request.options.container;
   return request.output?.container ?? (typeof option === 'string' ? option : undefined);
@@ -112,6 +116,28 @@ export function decideMp4boxSupport(request: ConcreteOperationRequest): SupportD
         return no('MP4BOX_INPUT_CONTAINER_UNSUPPORTED', `mux preparation cannot parse '${input.container}'`);
       }
     }
+  }
+
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    operation === 'probe' &&
+    request.scenarioId === 'performance/size-ladder-extract-metadata-massive' &&
+    request.inputs.some((input) => input.id.toLowerCase().endsWith('massive_h264_1080p_2h.mp4'))
+  ) {
+    return noPreContent(
+      'MP4BOX_MASSIVE_DEFAULT_DISPOSITION_UNSUPPORTED',
+      'the pinned MP4Box metadata view omits both default dispositions on the exact baked two-hour source',
+    );
+  }
+  if (
+    request.inputs.every((input) => !input.mutated) &&
+    operation === 'demux' &&
+    request.scenarioId === 'performance/size-ladder-iterate-packets-massive'
+  ) {
+    return noPreContent(
+      'MP4BOX_MASSIVE_PACKET_ARRAYBUFFER_BOUND',
+      'the pinned appendBuffer path requires complete 626560291–1144401376-byte ArrayBuffers; the baseline exhausted allocation/transport and a fresh targeted run terminated Chromium',
+    );
   }
 
   if (operation === 'probe') return yes();

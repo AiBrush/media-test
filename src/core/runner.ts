@@ -829,6 +829,73 @@ function mediaAssetUrl(assetId: string): string {
   return new URL(path, globalThis.location?.href ?? 'http://localhost/').href;
 }
 
+type PreContentSupportBlocker = {
+  request: ConcreteOperationRequest;
+  decision: Extract<SupportDecision, { supported: false }>;
+};
+
+/**
+ * Ask an adapter whether a declared scenario/input identity is intrinsically unsupported before the
+ * runner downloads the media body. Only an explicit `preContent:true` rejection is actionable;
+ * every ordinary or malformed preliminary decision is deferred to runOne's evidence-complete gate.
+ */
+async function preContentSupportBlocker(
+  engine: MediaEngine,
+  selection: ScenarioSelection,
+): Promise<PreContentSupportBlocker | undefined> {
+  const operationInputs = selection.resolvedInputs.filter((input) => input.transport === undefined);
+  const inputs: MediaInput[] = operationInputs.map((input) => ({
+    id: input.id,
+    url: mediaAssetUrl(input.urlAssetPath),
+    mime: mimeForAssetId(input.urlAssetPath),
+    ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+    blob: async () => {
+      throw new Error('pre-content support inspection cannot materialize media bytes');
+    },
+    arrayBuffer: async () => {
+      throw new Error('pre-content support inspection cannot materialize media bytes');
+    },
+  }));
+  const request = buildConcreteOperationRequest(
+    selection.effectiveScenario,
+    inputs,
+    inputs.map(() => emptyGoldenStore()),
+  );
+  try {
+    const decision = validateSupportDecision(engine.id, await engine.supports(request));
+    return !decision.supported && decision.preContent === true ? { request, decision } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function preContentBlockedResult(
+  engineId: string,
+  browser: BrowserName,
+  selection: ScenarioSelection,
+  blocker: PreContentSupportBlocker,
+  env: RunEnv,
+  runSeed?: string,
+): ScenarioResult {
+  const result = selectedStatusResult(
+    engineId,
+    browser,
+    selection.effectiveScenario,
+    selection,
+    blocker.decision.status,
+    `[${blocker.decision.reasonCode}] ${blocker.decision.reason}`,
+    env,
+    runSeed,
+  );
+  result.support = {
+    request: blocker.request,
+    decision: blocker.decision,
+    browserConfigs: blocker.decision.browserConfigs ?? [],
+    probes: [],
+  };
+  return result;
+}
+
 function createRunFixtureIntegrityRuntime(): ActiveFixtureRuntime {
   const base = globalThis.location?.href ?? 'http://localhost/';
   return new ActiveFixtureRuntime({
@@ -4300,6 +4367,13 @@ async function runExhaustiveCell(
   const isolateFiles = scenarioRequiresRobustnessIsolation(scenario);
   if (isolateFiles) await disposeConstructedEngine(firstEngine, opts.signal);
   let firstEngineAvailable = !isolateFiles;
+  const preContentBlockers = new Map<ScenarioSelection, PreContentSupportBlocker>();
+  if (!isolateFiles) {
+    for (const candidate of candidates) {
+      const blocker = await preContentSupportBlocker(firstEngine, candidate);
+      if (blocker) preContentBlockers.set(candidate, blocker);
+    }
+  }
 
   const perFile: Array<{ sel: ScenarioSelection; result: ScenarioResult }> = [];
   for (let i = 0; i < candidates.length; i++) {
@@ -4321,6 +4395,21 @@ async function runExhaustiveCell(
             measurement: { state: 'NOT_REQUESTED' },
             env: { ...runEnvBase, engineId: instanceId },
           },
+        });
+        continue;
+      }
+      const preContentBlock = preContentBlockers.get(candidate);
+      if (preContentBlock) {
+        perFile.push({
+          sel: candidate,
+          result: preContentBlockedResult(
+            instanceId,
+            opts.browser,
+            candidate,
+            preContentBlock,
+            runEnvBase,
+            opts.randomSeed,
+          ),
         });
         continue;
       }
@@ -8096,6 +8185,25 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       // cannot execute the tuple must report NA_ENGINE without downloading an otherwise valid asset.
       // Successful preparation is held only for this one runOne call and becomes collectible as soon
       // as the cell completes.
+      const preContentBlock = await preContentSupportBlocker(engine, selection);
+      if (preContentBlock) {
+        result = preContentBlockedResult(
+          engine.id,
+          opts.browser,
+          selection,
+          preContentBlock,
+          runEnvBase,
+          opts.randomSeed,
+        );
+        if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${scenario.id} / ${engine.id} (pre-content NA)`);
+        continue;
+      }
       let prepared: PreparedSelection;
       try {
         prepared = await prepareSelection(selection, { authenticatedStreamTransport });

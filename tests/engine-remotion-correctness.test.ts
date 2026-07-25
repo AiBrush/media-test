@@ -1822,3 +1822,47 @@ function finalConvertState(bytesWritten = 0): Record<string, number> {
     overallProgress: 1,
   };
 }
+
+describe('performance evidence boundaries', () => {
+  test('former suppressions and exact metadata misses are pre-content NA_ENGINE', () => {
+    const packet = request('demux');
+    packet.scenarioId = 'performance/size-ladder-iterate-packets-huge';
+    expect(decideRemotionParserSupport(packet)).toMatchObject({
+      supported: false,
+      reasonCode: 'REMOTION_PERFORMANCE_PACKET_SUITE_BUDGET',
+      preContent: true,
+    });
+
+    const huge = request('probe', {
+      inputs: [concreteInput('mov', [], {
+        id: 'scenarios/performance/size-ladder-extract-metadata-huge/01.mov',
+        sourceEvidence: 'UNRESOLVED',
+      })],
+    });
+    huge.scenarioId = 'performance/size-ladder-extract-metadata-huge';
+    expect(decideRemotionParserSupport(huge)).toMatchObject({
+      supported: false,
+      reasonCode: 'REMOTION_HUGE_MOV_CHANNEL_INVENTORY_UNSUPPORTED',
+      preContent: true,
+    });
+
+    const massive = request('probe', {
+      inputs: [concreteInput('mp4', [], {
+        id: 'scenarios/performance/size-ladder-extract-metadata-massive/01.mp4',
+        sourceEvidence: 'UNRESOLVED',
+      })],
+    });
+    massive.scenarioId = 'performance/size-ladder-extract-metadata-massive';
+    expect(decideRemotionParserSupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'REMOTION_MASSIVE_METADATA_BLOB_BOUND',
+      preContent: true,
+    });
+    massive.inputs[0]!.id = 'scenarios/performance/size-ladder-extract-metadata-massive/03.mp4';
+    expect(decideRemotionParserSupport(massive)).toMatchObject({
+      supported: false,
+      reasonCode: 'REMOTION_MASSIVE_METADATA_INVENTORY_UNSUPPORTED',
+      preContent: true,
+    });
+  });
+});

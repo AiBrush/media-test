@@ -429,6 +429,31 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
   });
 });
 
+describe('performance evidence boundaries', () => {
+  test('the baked massive disposition miss is an exact pre-content decision', () => {
+    const value = request({ operation: 'probe' });
+    value.scenarioId = 'performance/size-ladder-extract-metadata-massive';
+    value.inputs[0]!.id = 'massive_h264_1080p_2h.mp4';
+    expect(decideMp4boxSupport(value)).toMatchObject({
+      supported: false,
+      reasonCode: 'MP4BOX_MASSIVE_DEFAULT_DISPOSITION_UNSUPPORTED',
+      preContent: true,
+    });
+    value.inputs[0]!.id = 'scenarios/performance/size-ladder-extract-metadata-massive/01.mp4';
+    expect(decideMp4boxSupport(value)).toEqual({ supported: true });
+
+    const massivePackets = request({ operation: 'demux' });
+    massivePackets.scenarioId = 'performance/size-ladder-iterate-packets-massive';
+    expect(decideMp4boxSupport(massivePackets)).toMatchObject({
+      supported: false,
+      reasonCode: 'MP4BOX_MASSIVE_PACKET_ARRAYBUFFER_BOUND',
+      preContent: true,
+    });
+    massivePackets.scenarioId = 'performance/size-ladder-iterate-packets-medium';
+    expect(decideMp4boxSupport(massivePackets)).toEqual({ supported: true });
+  });
+});
+
 describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence', () => {
   test('normalizes real probe header evidence into the suite presentation view', async () => {
     await withEngine(async (engine) => {

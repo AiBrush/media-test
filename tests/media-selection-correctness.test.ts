@@ -132,6 +132,28 @@ test('fixed-layout audio-DSP rows keep arbitrary same-codec real files out of th
   expect(selections.get(fixed.id)?.map((selection) => selection.isBaked)).toEqual([true]);
 });
 
+test('decode-fps keeps its committed RGBA prefix bound to the baked input', () => {
+  const fixed = scenario({
+    id: 'performance/decode-fps',
+    family: 'performance',
+    op: 'decodeFrames',
+    input: 'h264_1080p_30s.mp4',
+    options: { maxFrames: 12 },
+    requires: {
+      operations: ['decodeFrames'],
+      containersIn: ['mp4'],
+      videoCodecs: ['h264'],
+      audioCodecs: ['aac'],
+      features: ['decode:golden-rgba'],
+    },
+    oracles: ['decoded-frames-bitexact'],
+  });
+  const real = sourceFile('01.mp4', 'shape-compatible bytes');
+  const sourceRow = row([real], { scenarioId: fixed.id });
+  const selections = candidatesForRun([fixed], new Map([[fixed.id, sourceRow]]));
+  expect(selections.get(fixed.id)?.map((selection) => selection.isBaked)).toEqual([true]);
+});
+
 function catalogFromRows(rows: readonly ScenarioSourceRow[]): ValidatedScenarioSourceCatalog {
   const parsed = parseScenarioSourceCatalog(rows.map((entry) => JSON.stringify(entry)).join('\n'));
   if (parsed.state !== 'VALID') throw new Error(parsed.issues.map((issue) => issue.detail).join('; '));

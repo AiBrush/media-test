@@ -730,3 +730,42 @@ function remuxProgramReason(
   expect(decision.supported).toBe(false);
   return decision.supported ? '' : decision.reasonCode;
 }
+
+describe('performance evidence boundaries', () => {
+  test('massive probe and exact remux misses are pre-content decisions', () => {
+    const massive = request('probe', 'mp4', []);
+    massive.scenarioId = 'performance/size-ladder-extract-metadata-massive';
+    massive.inputs[0]!.id = 'massive_h264_1080p_2h.mp4';
+    expect(decideFfmpegSupport(massive, RUNTIME)).toMatchObject({
+      supported: false,
+      reasonCode: 'FFMPEG_MASSIVE_PROBE_SUITE_BUDGET',
+      preContent: true,
+    });
+
+    const huge = request('probe', 'mov', [], {
+      id: 'huge_h264_1080p_600s.mov',
+      sizeBytes: 447_748_594,
+    });
+    huge.scenarioId = 'performance/size-ladder-extract-metadata-huge';
+    expect(decideFfmpegSupport(huge, RUNTIME)).toMatchObject({
+      supported: false,
+      reasonCode: 'FFMPEG_HUGE_PROBE_WORKER_BUDGET',
+      preContent: true,
+    });
+    huge.inputs[0]!.id = 'scenarios/performance/size-ladder-extract-metadata-huge/03.mov';
+    expect(decideFfmpegSupport(huge, RUNTIME)).toEqual({ supported: true });
+
+    const remux = request('remux', 'mp4', av('h264', 'aac'), {
+      id: 'scenarios/performance/metamorphic-decode-remux/01.mp4',
+      output: { container: 'mkv' },
+    });
+    remux.scenarioId = 'performance/metamorphic-decode-remux';
+    expect(decideFfmpegSupport(remux, RUNTIME)).toMatchObject({
+      supported: false,
+      reasonCode: 'FFMPEG_PERFORMANCE_REMUX_PIXEL_IDENTITY_UNSUPPORTED',
+      preContent: true,
+    });
+    remux.inputs[0]!.id = 'scenarios/performance/metamorphic-decode-remux/02.mp4';
+    expect(decideFfmpegSupport(remux, RUNTIME)).toEqual({ supported: true });
+  });
+});
