@@ -399,6 +399,37 @@ describe('REQ-ENG-26/28/30: exact browser config and temporal decode/seek', () =
     await engine.dispose(lifecycle());
   });
 
+  test('types the same partial decoder failure as malformed input for a negative robustness row', async () => {
+    installWebCodecs();
+    plan.packets = [packet(0), packet(0.1), packet(0.2)];
+    decoderPlan.failAfterOutputs = 2;
+    const engine = makeEngine();
+    await engine.init(lifecycle());
+    const base = operationContext('decodeFrames');
+    const negativeContext: OperationContext = {
+      ...base,
+      request: {
+        ...base.request,
+        options: {
+          ...base.request.options,
+          robustness: {
+            schema: 'media-test/robustness-contract@1',
+            inputClass: 'negative',
+          },
+        },
+      },
+    };
+    const error = await capture(engine.decodeFrames(input(), { maxFrames: 3 }, negativeContext));
+    expect(error).toMatchObject({
+      name: 'MalformedInputError',
+      reasonCode: 'WEB_DEMUXER_DECODE_MALFORMED_INPUT_REJECTED',
+      operation: 'decodeFrames',
+      stage: 'decode',
+    });
+    expect(FakeVideoFrame.closed.sort((a, b) => a - b)).toEqual([0, 100_000]);
+    await engine.dispose(lifecycle());
+  });
+
   test('attempts every frame close and reports a cleanup failure as part of settlement', async () => {
     installWebCodecs();
     plan.packets = [packet(0), packet(0.1)];

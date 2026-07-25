@@ -22,6 +22,7 @@
 import type { OracleId, MetricId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import { audioDspContractForScenario } from '../../features/audio-dsp/contracts.ts';
+import { defineRobustnessContract } from '../robustness/contracts.ts';
 
 // ── Conversion cases (A.9 + A.6 PCM edges) ──────────────────────────────────────────────────────
 
@@ -627,7 +628,17 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44100 }, gracefulAllowOutput: true },
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-s16', sampleRate: 44100 },
+      gracefulAllowOutput: true,
+      robustness: defineRobustnessContract(
+        'boundary',
+        'media-structure',
+        ['graceful-failure'],
+        AUDIO_FUZZ_TIMEOUT_MS,
+      ),
+    },
     oracles: ['graceful-failure'],
     notes:
       'A.16 zero-length/empty audio: structurally-valid empty WAV through a resample must be handled gracefully (empty output or clean throw).',
@@ -638,6 +649,14 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     asset: 'wav_header_truncated.wav',
     container: 'wav',
     audioCodecs: ['pcm-s16'],
+    opts: {
+      robustness: defineRobustnessContract(
+        'negative',
+        'probe-structure',
+        ['graceful-failure'],
+        AUDIO_FUZZ_TIMEOUT_MS,
+      ),
+    },
     oracles: ['graceful-failure'],
     notes:
       'A.16 header-truncated WAV: only the first 20 bytes kept (fmt/data chunk gone); probe must reject cleanly.',
@@ -649,7 +668,16 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     container: 'wav',
     audioCodecs: ['pcm-s16'],
     outContainer: 'wav',
-    opts: { container: 'wav', audio: { codec: 'pcm-s16', channels: 1 } },
+    opts: {
+      container: 'wav',
+      audio: { codec: 'pcm-s16', channels: 1 },
+      robustness: defineRobustnessContract(
+        'negative',
+        'media-structure',
+        ['graceful-failure'],
+        AUDIO_FUZZ_TIMEOUT_MS,
+      ),
+    },
     oracles: ['graceful-failure'],
     notes:
       'A.16 bit-flipped/fuzzed RIFF fmt header (sample-rate/format zeroed): a downmix transcode must fail gracefully on the bad descriptor.',
@@ -671,6 +699,14 @@ const ROBUSTNESS_AUDIO_CASES: RobustnessAudioCase[] = [
     asset: 'aiff_header_truncated.aiff',
     container: 'aiff',
     audioCodecs: ['pcm-s16be'],
+    opts: {
+      robustness: defineRobustnessContract(
+        'negative',
+        'probe-structure',
+        ['graceful-failure'],
+        AUDIO_FUZZ_TIMEOUT_MS,
+      ),
+    },
     oracles: ['graceful-failure'],
     notes:
       'A.16 header-truncated AIFF: FORM/COMM header destroyed; big-endian PCM probe must reject cleanly.',

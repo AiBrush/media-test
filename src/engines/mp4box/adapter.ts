@@ -1,13 +1,13 @@
 /**
  * src/engines/mp4box/adapter.ts — MediaEngine adapter for mp4box.js (npm `mp4box`) @ 2.3.0.
  *
- * ROLE: ISO-BMFF (MP4 / MOV, incl. fragmented-MP4 / CMAF) PARSER + FRAGMENTER. mp4box.js is a
+ * ROLE: ISO-BMFF (MP4 / MOV, including fragmented MP4) PARSER + FRAGMENTER. mp4box.js is a
  * pure-JS box parser, sample-table walker, and on-the-fly fragmenter/segmenter + box writer. It does
  * NOT decode or encode media (no pixels, no PCM, no re-encode) and handles ONLY ISOBMFF. So this
  * adapter declares — and implements — exactly four operations:
  *   - probe   : read `moov` → NormalizedMetadata.
  *   - demux   : walk sample tables → representation-aware encoded PacketInfo evidence.
- *   - remux   : ISOBMFF → FRAGMENTED-MP4 (fMP4/CMAF) via setSegmentOptions/onSegment (the fragmenter).
+ *   - remux   : ISOBMFF → FRAGMENTED-MP4 via setSegmentOptions/onSegment (the fragmenter).
  *   - mux     : MP4Box-prepared encoded MP4/MOV tracks → MP4 via addTrack/addSample/getBuffer.
  * Everything else (transcode/decodeFrames/seek-to-frame/trim/decrypt) needs decode/encode or a
  * non-ISOBMFF container and is therefore NOT declared — the runner records those as NA(engine).
@@ -91,6 +91,7 @@ import {
   captureConfigUsedSnapshot,
   createMalformedInputError,
   createNotApplicableError,
+  isMalformedInputError,
   validateAdapterResult,
   validateEncodedTracks,
 } from '../../core/engine.ts';
@@ -124,6 +125,49 @@ type Mp4ISOFile = import('mp4box').ISOFile;
 type Mp4BoxKind = import('mp4box').BoxKind;
 
 const ENGINE_ID = MP4BOX_ENGINE_ID;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isNegativeRobustnessRequest(request: ConcreteOperationRequest): boolean {
+  const robustness = request.options.robustness;
+  return typeof robustness === 'object' &&
+    robustness !== null &&
+    !Array.isArray(robustness) &&
+    (robustness as Record<string, unknown>).schema === 'media-test/robustness-contract@1' &&
+    (robustness as Record<string, unknown>).inputClass === 'negative';
+}
+
+/** Exact parser/extraction failures produced by MP4Box for damaged ISO-BMFF inputs. */
+export function isMp4boxMalformedDemuxFailure(error: unknown): boolean {
+  const message = errorMessage(error);
+  return /^mp4box parse\/processing error \[ISOFile\]: Invalid data found while parsing box\b/.test(message) ||
+    /^mp4box@2\.3\.0: incomplete extraction for track \d+: \d+\/\d+$/.test(message);
+}
+
+function classifyMp4boxDemuxError(
+  context: OperationContext,
+  input: MediaInput,
+  error: unknown,
+): unknown {
+  return (
+    isNegativeRobustnessRequest(context.request) &&
+    !context.signal.aborted &&
+    !isMalformedInputError(error) &&
+    isMp4boxMalformedDemuxFailure(error)
+  )
+    ? createMalformedInputError(
+        ENGINE_ID,
+        'demux',
+        'parse',
+        errorMessage(error),
+        'MP4BOX_DEMUX_MALFORMED_INPUT_REJECTED',
+        input.id,
+        error,
+      )
+    : error;
+}
 
 /** The chosen best-path config, surfaced as configUsed (dossier §3). mp4box is pure-JS/CPU-only. */
 const READ_CHUNK_BYTES = 1 * 1024 * 1024;
@@ -1413,7 +1457,7 @@ export class Mp4boxEngine implements MediaEngine {
         remux: true,
         mux: true,
       },
-      // ISO-BMFF only. 'mov' shares the box structure; fragmented-MP4/CMAF are the same family,
+      // ISO-BMFF only. 'mov' shares the box structure; fragmented MP4 is the same family,
       // surfaced via the 'fragmented' feature, not a separate container token.
       containersIn: [...MP4BOX_INPUT_CONTAINERS],
       // Remux writes FRAGMENTED MP4 (fMP4/CMAF), container token 'mp4'.
@@ -1427,7 +1471,7 @@ export class Mp4boxEngine implements MediaEngine {
       audioCodecsOut: [...MP4BOX_AUDIO_CODECS],
       // Parses CENC signalling (pssh/senc/...) but does NOT decrypt → declare none.
       encryption: [],
-      // 'fragmented'        : remux produces fMP4/CMAF.
+      // 'fragmented'        : remux produces fragmented MP4.
       // 'metadata:read'     : probe reads duration/dims/fps/rotation/brands/language; unwraps CENC
       //                       'encv'/'enca' to the original codec via sinf→frma.data_format, and
       //                       derives video fps from fragment_duration for fragmented inputs.
@@ -1725,17 +1769,18 @@ export class Mp4boxEngine implements MediaEngine {
    */
   async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
     const call = context ?? this.fallbackOperation('demux', [input]);
-    return this.lifecycle.operation('demux', call, async () => {
-      this.beginOperation('demux', true);
-      this.assertSupported(call);
-      const packets: PacketInfo[] = [];
-      const extractedCounts = new Map<number, number>();
-      const idToIndex = new Map<number, number>();
-      const presentedSampleNumbers = new Map<number, Set<number>>();
-      let readyMetadata: NormalizedMetadata | undefined;
-      let ownedPacketBytes = 0;
-      let presentationEditFilteredSamples = 0;
-      const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
+    try {
+      return await this.lifecycle.operation('demux', call, async () => {
+        this.beginOperation('demux', true);
+        this.assertSupported(call);
+        const packets: PacketInfo[] = [];
+        const extractedCounts = new Map<number, number>();
+        const idToIndex = new Map<number, number>();
+        const presentedSampleNumbers = new Map<number, Set<number>>();
+        let readyMetadata: NormalizedMetadata | undefined;
+        let ownedPacketBytes = 0;
+        let presentationEditFilteredSamples = 0;
+        const session = await this.parseToInfo(input, true, call, (readyFile, readyInfo, throwIfError) => {
         readyMetadata = toNormalizedMetadata(readyFile, readyInfo);
         readyInfo.tracks.forEach((track, index) => {
           idToIndex.set(track.id, index);
@@ -1794,9 +1839,9 @@ export class Mp4boxEngine implements MediaEngine {
         }
         readyFile.start();
       });
-      const { file, info } = session;
-      let primaryError: unknown;
-      try {
+        const { file, info } = session;
+        let primaryError: unknown;
+        try {
         session.throwIfError();
         for (const track of info.tracks) {
           const expected = trackSampleCount(file, track);
@@ -1835,20 +1880,24 @@ export class Mp4boxEngine implements MediaEngine {
           representations,
           telemetry,
         }, { requireExplicitCodedRepresentation: true });
-      } catch (error) {
-        primaryError = error;
-        throw error;
-      } finally {
-        for (const track of info.tracks) {
-          try {
-            file.unsetExtractionOptions(track.id);
-          } catch {
-            // stop()/session cleanup is authoritative; an unset diagnostic must not mask the result.
+        } catch (error) {
+          const classified = classifyMp4boxDemuxError(call, input, error);
+          primaryError = classified;
+          throw classified;
+        } finally {
+          for (const track of info.tracks) {
+            try {
+              file.unsetExtractionOptions(track.id);
+            } catch {
+              // stop()/session cleanup is authoritative; an unset diagnostic must not mask the result.
+            }
           }
+          session.close(primaryError);
         }
-        session.close(primaryError);
-      }
-    });
+      });
+    } catch (error) {
+      throw classifyMp4boxDemuxError(call, input, error);
+    }
   }
 
   async prepareMuxTracks(
@@ -2070,7 +2119,7 @@ export class Mp4boxEngine implements MediaEngine {
 
   // ── remux (FRAGMENTER) ───────────────────────────────────────────────────────────────────────
   /**
-   * ISO-BMFF → FRAGMENTED-MP4 (fMP4 / CMAF). This is mp4box's documented "fragmenter" path:
+   * ISO-BMFF → FRAGMENTED-MP4. This is mp4box's documented "fragmenter" path:
    * setSegmentOptions per track → initializeSegmentation() (one combined init segment) → onSegment
    * (media fragments) → start()/flush(). An observable growable target receives init + fragments in
    * arrival order and materializes one tight fragmented-MP4 byte buffer. Cross-family conversion (to

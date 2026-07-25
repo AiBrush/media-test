@@ -15,6 +15,7 @@ import {
 } from '../src/core/engine.ts';
 import {
   MediabunnyEngine,
+  isMediabunnyMalformedParseFailure,
   materializeTightRgbaVideoSample,
   mediabunnyAbrIntermediates,
   needsTightAvcFrameMaterialization,
@@ -74,6 +75,38 @@ function memoryInput(id: string, bytes: Uint8Array, mime = 'video/mp4'): MediaIn
     sizeBytes: bytes.byteLength,
     blob: async () => new Blob([bytes.slice()], { type: mime }),
     arrayBuffer: async () => bytes.slice().buffer as ArrayBuffer,
+  };
+}
+
+function negativeRequest(
+  operation: 'demux' | 'decodeFrames',
+  id: string,
+  container: string,
+  mime: string,
+): ConcreteOperationRequest {
+  return {
+    protocol: CONCRETE_OPERATION_PROTOCOL,
+    scenarioId: `robustness/${id}`,
+    operation,
+    inputs: [{
+      id,
+      mime,
+      container,
+      mutated: false,
+      sourceEvidence: 'RESOLVED',
+      tracks: [{ type: 'video', codec: 'h264', width: 320, height: 240, fps: 30 }],
+    }],
+    options: {
+      ...(operation === 'decodeFrames' ? { maxFrames: 60 } : {}),
+      gracefulAllowOutput: true,
+      robustness: {
+        schema: 'media-test/robustness-contract@1',
+        inputClass: 'negative',
+        returnedOutputCheck: operation === 'demux' ? 'packet-structure' : 'frame-coverage',
+        survivorOracles: ['graceful-failure'],
+        timeoutMs: 60_000,
+      },
+    },
   };
 }
 
@@ -372,6 +405,160 @@ describe('Mediabunny transcode boundary repairs', () => {
       }
       expect(isMalformedInputError(caught)).toBe(true);
       expect(caught).toMatchObject({ reasonCode: 'MEDIABUNNY_TRANSCODE_INPUT_MALFORMED' });
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  test('declared empty and malformed WAV rows use the typed graceful-failure channel', async () => {
+    const engine = new MediabunnyEngine();
+    await engine.init();
+    try {
+      for (const name of ['empty_audio.wav', 'wav_fmt_corrupt.wav']) {
+        const bytes = new Uint8Array(
+          await readFile(new URL(`../fixtures/media/${name}`, import.meta.url)),
+        );
+        const operationRequest: ConcreteOperationRequest = {
+          protocol: CONCRETE_OPERATION_PROTOCOL,
+          scenarioId: `audio-dsp/${name}`,
+          operation: 'transcode',
+          inputs: [{
+            id: name,
+            mime: 'audio/wav',
+            container: 'wav',
+            mutated: false,
+            sourceEvidence: 'RESOLVED',
+            tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 2 }],
+          }],
+          output: { container: 'wav', audioCodec: 'pcm-s16' },
+          options: {
+            container: 'wav',
+            audio: { codec: 'pcm-s16', sampleRate: 44_100 },
+            ...(name === 'empty_audio.wav' ? { gracefulAllowOutput: true } : {}),
+            robustness: {
+              schema: 'media-test/robustness-contract@1',
+              inputClass: name === 'empty_audio.wav' ? 'boundary' : 'negative',
+              returnedOutputCheck: 'media-structure',
+              survivorOracles: ['graceful-failure'],
+              timeoutMs: 15_000,
+            },
+          },
+        };
+        let caught: unknown;
+        try {
+          await engine.transcode(
+            memoryInput(name, bytes, 'audio/wav'),
+            operationRequest.options as never,
+            context(operationRequest),
+          );
+        } catch (error) {
+          caught = error;
+        }
+        expect(isMalformedInputError(caught)).toBe(true);
+        expect(caught).toMatchObject({ reasonCode: 'MEDIABUNNY_TRANSCODE_INPUT_MALFORMED' });
+      }
+
+      const name = 'wav_header_truncated.wav';
+      const bytes = new Uint8Array(
+        await readFile(new URL(`../fixtures/media/${name}`, import.meta.url)),
+      );
+      const operationRequest: ConcreteOperationRequest = {
+        protocol: CONCRETE_OPERATION_PROTOCOL,
+        scenarioId: 'audio-dsp/fuzz_wav_header_truncated_probe',
+        operation: 'probe',
+        inputs: [{
+          id: name,
+          mime: 'audio/wav',
+          container: 'wav',
+          mutated: false,
+          sourceEvidence: 'RESOLVED',
+          tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 2 }],
+        }],
+        options: {
+          robustness: {
+            schema: 'media-test/robustness-contract@1',
+            inputClass: 'negative',
+            returnedOutputCheck: 'probe-structure',
+            survivorOracles: ['graceful-failure'],
+            timeoutMs: 15_000,
+          },
+        },
+      };
+      let caught: unknown;
+      try {
+        await engine.probe(
+          memoryInput(name, bytes, 'audio/wav'),
+          context(operationRequest),
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(isMalformedInputError(caught)).toBe(true);
+      expect(caught).toMatchObject({ reasonCode: 'MEDIABUNNY_PROBE_INPUT_MALFORMED' });
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  test('known malformed demux/decode framework errors use the typed rejection channel', async () => {
+    expect(isMediabunnyMalformedParseFailure(
+      new Error('Decoding error.'),
+      mediabunny.UnsupportedInputFormatError,
+    )).toBe(true);
+    expect(isMediabunnyMalformedParseFailure(
+      new Error('Invalid TS packet sync byte. Likely an internal bug, please report this file.'),
+      mediabunny.UnsupportedInputFormatError,
+    )).toBe(true);
+    expect(isMediabunnyMalformedParseFailure(
+      new Error('Assertion failed.'),
+      mediabunny.UnsupportedInputFormatError,
+    )).toBe(true);
+    const cases = [
+      {
+        id: 'fuzz_ts_zeroed_spans.ts',
+        operation: 'demux' as const,
+        container: 'ts',
+        mime: 'video/mp2t',
+        reasonCode: 'MEDIABUNNY_DEMUX_INPUT_MALFORMED',
+      },
+      {
+        id: 'fuzz_encrypted_mp4_ciphertext.mp4',
+        operation: 'decodeFrames' as const,
+        container: 'mp4',
+        mime: 'video/mp4',
+        reasonCode: 'MEDIABUNNY_DECODE_INPUT_MALFORMED',
+      },
+    ];
+    const engine = new MediabunnyEngine();
+    await engine.init();
+    try {
+      for (const testCase of cases) {
+        const bytes = new Uint8Array(
+          await readFile(new URL(`../fixtures/media/${testCase.id}`, import.meta.url)),
+        );
+        const operationRequest = negativeRequest(
+          testCase.operation,
+          testCase.id,
+          testCase.container,
+          testCase.mime,
+        );
+        let caught: unknown;
+        try {
+          const input = memoryInput(testCase.id, bytes, testCase.mime);
+          if (testCase.operation === 'demux') {
+            await engine.demux(input, context(operationRequest));
+          } else {
+            await engine.decodeFrames(input, { maxFrames: 60 }, context(operationRequest));
+          }
+        } catch (error) {
+          caught = error;
+        }
+        expect(
+          isMalformedInputError(caught),
+          `${testCase.id}: ${caught instanceof Error ? `${caught.name}: ${caught.message}` : JSON.stringify(caught)}`,
+        ).toBe(true);
+        expect(caught).toMatchObject({ reasonCode: testCase.reasonCode });
+      }
     } finally {
       await engine.dispose();
     }

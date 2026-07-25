@@ -2,10 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { CapabilityError, InputError } from '@aibrush/media';
 import {
   CONCRETE_OPERATION_PROTOCOL,
+  SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  isMalformedInputError,
   isNotApplicableError,
   validateCapabilitySet,
   type ConcreteOperationRequest,
+  type MediaInput,
   type NormalizedTrack,
+  type OperationContext,
 } from '../src/core/engine.ts';
 import { AibrushMediaEngine } from '../src/engines/aibrush-media/adapter.ts';
 import {
@@ -156,6 +160,26 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     });
   });
 
+  test('probes a dimension-valid H.264 level for 1080p output', () => {
+    expect(decideAibrushSupport(request('transcode', 'mp4', [VIDEO, AUDIO], {
+      outputContainer: 'mp4',
+      videoCodec: 'h264',
+      outputWidth: 1_920,
+      outputHeight: 1_080,
+    }))).toMatchObject({
+      supported: true,
+      browserConfigs: expect.arrayContaining([{
+        role: 'video-encoder',
+        config: expect.objectContaining({
+          codec: 'avc1.42E028',
+          width: 1_920,
+          height: 1_080,
+          framerate: 30,
+        }),
+      }]),
+    });
+  });
+
   test('declares measured audio-content writer and decoder boundaries without hiding working codecs', () => {
     const audioRows: Array<[string, string, string, string]> = [
       ['wav', 'mp4', 'aac', 'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED'],
@@ -221,6 +245,141 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       outputContainer: 'flac',
       options: { invariant: 'trim-audio-content' },
     }))).toEqual({ supported: true });
+  });
+
+  test('declares only the measured robustness trim composition contracts unsupported', () => {
+    for (const scenarioId of [
+      'robustness/prop_trim_additivity_compose',
+      'robustness/prop_trim_concatenation',
+    ]) {
+      expect(decideAibrushSupport(request('trim', 'mp4', [VIDEO, AUDIO], {
+        scenarioId,
+        outputContainer: 'mp4',
+        options: { invariant: 'trim(a..b)++trim(b..c)==trim(a..c)' },
+      }))).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_TRIM_COMPOSITION_BOUNDARY_UNSUPPORTED',
+      });
+    }
+
+    expect(decideAibrushSupport(request('trim', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'robustness/edge_trim_zero_length',
+      outputContainer: 'mp4',
+      options: { invariant: 'trim(a..b)++trim(b..c)==trim(a..c)' },
+    }))).toMatchObject({ supported: true });
+  });
+
+  test('declares only the measured stereo-to-5.1 authored matrix unsupported', () => {
+    const upmix = request('transcode', 'wav', [{
+      type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 2,
+    }], {
+      scenarioId: 'audio-dsp/upmix_stereo_to_5_1',
+      outputContainer: 'wav',
+      audioCodec: 'pcm-s16',
+      options: {
+        invariant: 'audio-dsp-transform',
+        audio: {
+          codec: 'pcm-s16',
+          channels: 6,
+          mixMatrix: [[1, 0], [0, 1], [Math.SQRT1_2, Math.SQRT1_2], [0, 0], [Math.SQRT1_2, 0], [0, Math.SQRT1_2]],
+        },
+      },
+    });
+    upmix.output!.channels = 6;
+    expect(decideAibrushSupport(upmix)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_AUDIO_MIX_MATRIX_UNSUPPORTED',
+    });
+
+    upmix.scenarioId = 'audio-dsp/upmix_mono_to_stereo';
+    upmix.output!.channels = 2;
+    expect(decideAibrushSupport(upmix)).toEqual({ supported: true });
+
+    upmix.scenarioId = 'audio-dsp/upmix_stereo_to_5_1';
+    upmix.output!.channels = 6;
+    upmix.inputs[0]!.mutated = true;
+    expect(decideAibrushSupport(upmix)).toEqual({ supported: true });
+  });
+
+  test('negative header probes and empty audio use typed graceful rejection', async () => {
+    for (const [scenarioId, filename, container, mime] of [
+      ['audio-dsp/fuzz_aiff_header_truncated_probe', 'aiff_header_truncated.aiff', 'aiff', 'application/octet-stream'],
+      ['audio-dsp/fuzz_wav_header_truncated_probe', 'wav_header_truncated.wav', 'wav', 'audio/wav'],
+    ] as const) {
+      const input = await fixtureInput(filename, mime);
+      const operationRequest = request('probe', container, [], {
+        scenarioId,
+        inputId: filename,
+        options: {
+          robustness: {
+            schema: 'media-test/robustness-contract@1',
+            inputClass: 'negative',
+            returnedOutputCheck: 'probe-structure',
+            survivorOracles: ['graceful-failure'],
+            timeoutMs: 15_000,
+          },
+        },
+      });
+      operationRequest.inputs[0]!.sourceEvidence = 'UNRESOLVED';
+      operationRequest.inputs[0]!.sizeBytes = input.sizeBytes;
+      const operationContext = directContext(operationRequest);
+      const engine = new AibrushMediaEngine();
+      await engine.init(operationContext);
+      try {
+        let thrown: unknown;
+        try {
+          await engine.probe(input, operationContext);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(isMalformedInputError(thrown)).toBe(true);
+        expect(thrown).toMatchObject({
+          reasonCode: 'AIBRUSH_REQUEST_REJECTED',
+          operation: 'probe',
+          stage: 'validate',
+        });
+      } finally {
+        await engine.dispose(operationContext);
+      }
+    }
+
+    const emptyInput = await fixtureInput('empty_audio.wav', 'audio/wav');
+    const emptyRequest = request('transcode', 'wav', [], {
+      scenarioId: 'audio-dsp/edge_empty_audio_transcode',
+      inputId: 'empty_audio.wav',
+      outputContainer: 'wav',
+      audioCodec: 'pcm-s16',
+      options: {
+        container: 'wav',
+        audio: { codec: 'pcm-s16', sampleRate: 44_100 },
+        gracefulAllowOutput: true,
+      },
+    });
+    const emptyContext = directContext(emptyRequest);
+    const emptyEngine = new AibrushMediaEngine();
+    await emptyEngine.init(emptyContext);
+    try {
+      let thrown: unknown;
+      try {
+        await emptyEngine.transcode(
+          emptyInput,
+          { container: 'wav', audio: { codec: 'pcm-s16', sampleRate: 44_100 } },
+          emptyContext,
+        );
+      } catch (error) {
+        thrown = error;
+      }
+      expect(isMalformedInputError(thrown)).toBe(true);
+      expect(thrown).toMatchObject({
+        reasonCode: 'AIBRUSH_REQUEST_REJECTED',
+        operation: 'transcode',
+        stage: 'validate',
+      });
+    } finally {
+      await emptyEngine.dispose(emptyContext);
+    }
   });
 
   test('keeps measured alpha and roundtrip quality bounds narrow to their concrete contracts', () => {
@@ -447,4 +606,27 @@ function captureThrown(run: () => unknown): unknown {
     return error;
   }
   throw new Error('expected callback to throw');
+}
+
+async function fixtureInput(filename: string, mime: string): Promise<MediaInput> {
+  const bytes = new Uint8Array(await Bun.file(`fixtures/media/${filename}`).arrayBuffer());
+  return {
+    id: filename,
+    url: `blob:http://127.0.0.1:5151/${filename}`,
+    mime,
+    mutated: false,
+    sizeBytes: bytes.byteLength,
+    blob: () => Promise.resolve(new Blob([bytes.slice().buffer], { type: mime })),
+    arrayBuffer: () => Promise.resolve(bytes.slice().buffer),
+  };
+}
+
+function directContext(operationRequest: ConcreteOperationRequest): OperationContext {
+  return {
+    signal: new AbortController().signal,
+    phase: 'functional',
+    emit: () => undefined,
+    request: operationRequest,
+    checkedSupport: SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  };
 }

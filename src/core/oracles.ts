@@ -57,6 +57,7 @@ import {
 import { compareDecryptNoopBytes } from '../features/encryption/byte-identity.ts';
 import { encryptionNegativeContractFromOptions } from '../features/encryption/contracts.ts';
 import {
+  decodeNativePcm,
   evaluateAudioDspTransform,
   evaluateEndiannessRoundTrip,
   evaluateGaplessNativeEvidence,
@@ -6150,6 +6151,14 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
     const candidateVsPrimary = compareCompleteDecryptPresentation(got, primary, comparisonOptions);
     const referenceVsPrimary = compareCompleteDecryptPresentation(want, primary, comparisonOptions);
     if (candidateVsPrimary.verdict === 'PASS' && referenceVsPrimary.verdict === 'FAIL') {
+      if (acceptProtectedSourceTimeline(ctx) && sameFrameIdentity(got, want)) {
+        return protectedTimelineClearIdentityPass(
+          oracle,
+          candidateVsPrimary.measurements,
+          `decrypted output matches the complete '${primaryAssetId(ctx)}' presentation timeline and ` +
+            `every frame identity independently decoded from the declared clear reference`,
+        );
+      }
       return unavailable(
         oracle,
         'NA_ASSET',
@@ -6181,6 +6190,14 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
       const candidateVsSource = compareCompleteDecryptPresentation(got, sourceTimedFrames, exactTimelineOptions);
       const referenceVsSource = compareCompleteDecryptPresentation(want, sourceTimedFrames, exactTimelineOptions);
       if (candidateVsSource.verdict === 'PASS' && referenceVsSource.verdict === 'FAIL') {
+        if (acceptProtectedSourceTimeline(ctx)) {
+          return protectedTimelineClearIdentityPass(
+            oracle,
+            candidateVsSource.measurements,
+            'decrypted output matches the digest-verified protected source presentation timeline ' +
+              'and every frame identity independently decoded from the declared clear reference',
+          );
+        }
         return unavailable(
           oracle,
           'NA_ASSET',
@@ -6195,6 +6212,25 @@ async function decryptBitexact(ctx: OracleContext): Promise<OracleOutcome> {
   }
 
   return encryptionVerdictOutcome(oracle, comparison);
+}
+
+function acceptProtectedSourceTimeline(ctx: OracleContext): boolean {
+  return readStringOption(ctx.scenario.options, ['clearReferenceTimeline']) === 'protected-source';
+}
+
+function protectedTimelineClearIdentityPass(
+  oracle: OracleId,
+  measurements: Record<string, number> | undefined,
+  detail: string,
+): OracleOutcome {
+  return {
+    state: 'VERDICT',
+    oracle,
+    verdict: 'PASS',
+    reasonCode: 'DECRYPT_PROTECTED_TIMELINE_CLEAR_IDENTITY_VALID',
+    detail,
+    ...(measurements ? { measurements: { ...measurements } } : {}),
+  };
 }
 
 function sameFrameIdentity(left: readonly FrameDigest[], right: readonly FrameDigest[]): boolean {
@@ -6615,7 +6651,7 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   if (which === 'gapless-decoded-sample-count-priming-removed' || which.includes('gapless')) {
-    return gaplessDecodedSampleCountInvariant(ctx, which);
+    return gaplessNativeEvidenceInvariant(ctx, which);
   }
 
   if (which === 'audio-pcm-digest' || which.includes('audio-pcm')) {
@@ -7196,6 +7232,19 @@ async function audioPcmDigestInvariant(ctx: OracleContext, which: string): Promi
 }
 
 async function decodeAudioPcmDigest(out: MediaBytes): Promise<AudioPcmDigest> {
+  const nativePcm = decodeNativePcm(out.bytes, { containerHint: out.container });
+  if (nativePcm.state === 'OK') {
+    const floats = new Float32Array(nativePcm.value.samples.length);
+    for (let index = 0; index < floats.length; index++) {
+      floats[index] = nativePcm.value.samples[index] ?? 0;
+    }
+    return {
+      samples: nativePcm.value.decodedSampleFrames,
+      sampleRate: nativePcm.value.sampleRate,
+      channels: nativePcm.value.channels,
+      sha256: await sha256Hex(new Uint8Array(floats.buffer)),
+    };
+  }
   const nativeFlac = await decodeNativeFlacPcmDigest(out);
   if (nativeFlac) return nativeFlac;
   const audio = await decodeAudioBuffer(out);

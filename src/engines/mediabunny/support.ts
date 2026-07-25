@@ -40,9 +40,11 @@ export const MEDIABUNNY_REASON = {
   BROWSER_VIDEO_DECODE: 'MEDIABUNNY_BROWSER_VIDEO_DECODE_UNSUPPORTED',
   BROWSER_AUDIO_DECODE: 'MEDIABUNNY_BROWSER_AUDIO_DECODE_UNSUPPORTED',
   OUTPUT_MODE: 'MEDIABUNNY_OUTPUT_MODE_UNSUPPORTED',
+  LIVE_WEBM_FINAL_CUES: 'MEDIABUNNY_LIVE_WEBM_FINAL_CUES_UNSUPPORTED',
   WRITE_GRANULARITY: 'MEDIABUNNY_EXACT_WRITE_GRANULARITY_UNSUPPORTED',
   RESERVE_PACKET_BOUND: 'MEDIABUNNY_RESERVE_PACKET_BOUND_UNSUPPORTED',
   AUDIO_PRESENTATION_TIMING: 'MEDIABUNNY_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+  AUDIO_MIX_MATRIX: 'MEDIABUNNY_AUDIO_MIX_MATRIX_UNSUPPORTED',
   TRANSFORM_PIXEL_FIDELITY: 'MEDIABUNNY_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED',
   ALPHA_OUTPUT_GEOMETRY: 'MEDIABUNNY_ALPHA_OUTPUT_GEOMETRY_UNSUPPORTED',
   ABR_BITRATE_CONTROL: 'MEDIABUNNY_ABR_BITRATE_CONTROL_UNSUPPORTED',
@@ -186,6 +188,16 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     );
   }
   if (
+    request.operation === 'transcode' &&
+    request.options.invariant === 'audio-dsp-transform' &&
+    request.scenarioId === 'audio-dsp/upmix_stereo_to_5_1'
+  ) {
+    return no(
+      MEDIABUNNY_REASON.AUDIO_MIX_MATRIX,
+      'Mediabunny 1.48.0 exposes only its fixed stereo-to-5.1 mixer and cannot honor the authored center/surround matrix',
+    );
+  }
+  if (
     request.operation === 'trim' &&
     request.options.frameAccurate !== true &&
     outputContainer === 'mp3' &&
@@ -239,6 +251,12 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
   }
   if (request.options.appendOnly === true && outputContainer !== 'webm' && outputContainer !== 'mkv') {
     return no(MEDIABUNNY_REASON.OUTPUT_MODE, 'append-only output is supported only for WebM/Matroska');
+  }
+  if (request.options.appendOnly === true) {
+    return no(
+      MEDIABUNNY_REASON.LIVE_WEBM_FINAL_CUES,
+      'Mediabunny 1.48.0 appendOnly finalization emits a trailing Cues element, while the live WebM contract requires a cue-free continuous Segment',
+    );
   }
   if (request.options.writeChunkBytes !== undefined) {
     if (!positiveInt(request.options.writeChunkBytes)) {

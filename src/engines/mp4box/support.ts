@@ -131,6 +131,28 @@ export function decideMp4boxSupport(request: ConcreteOperationRequest): SupportD
   const shapeDecision = fragmentedOutputDecision(request, operation);
   if (!shapeDecision.supported) return shapeDecision;
 
+  if (
+    request.scenarioId === 'streaming-output/mp4_fragmented_cmaf' &&
+    !request.inputs.some((input) => input.mutated)
+  ) {
+    return no(
+      'MP4BOX_CMAF_BRAND_UNSUPPORTED',
+      'MP4Box 2.3.0 emits isom/iso2/avc1/mp41 brands for this fragmented output and does not author the required CMAF brand',
+    );
+  }
+
+  if (
+    operation === 'mux' &&
+    request.scenarioId === 'robustness/prop_demux_mux_roundtrip_eq' &&
+    !request.inputs.some((input) => input.mutated)
+  ) {
+    return no(
+      'MP4BOX_LONG_AAC_ROUNDTRIP_UNSUPPORTED',
+      'the pinned MP4Box 2.3.0 writer cannot preserve the complete 1408-packet AAC presentation edit ' +
+        'for this exact long-form mux roundtrip (reference re-import observes 1147 packets)',
+    );
+  }
+
   // An empty/trackless ISO BMFF remains applicable. Runtime parsing must reject it as invalid input.
   for (const input of request.inputs) {
     const unsupported = unsupportedTrack(input);

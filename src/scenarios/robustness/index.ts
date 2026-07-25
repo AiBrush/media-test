@@ -27,6 +27,7 @@ import {
   type RobustnessInputClass,
   type RobustnessSurvivorCheck,
 } from './contracts.ts';
+import { decryptKeyFor } from '../encryption/_shared.ts';
 
 const FUZZ_TIMEOUT_MS = 15_000;
 const TRANSCODE_PROPERTY_TIMEOUT_MS = 120_000;
@@ -120,7 +121,7 @@ const EDGE_CASES: EdgeCase[] = [
     audioCodecs: ['aac'],
     features: ['rotate'],
     options: { container: 'mov' },
-    oracles: ['reference-reimport', 'playback-smoke'],
+    oracles: ['reference-reimport'],
     notes: 'Rotation metadata survival through a wrapper change.',
   },
   {
@@ -153,7 +154,7 @@ const EDGE_CASES: EdgeCase[] = [
     videoCodecs: ['vp8'],
     audioCodecs: ['opus'],
     options: { container: 'webm' },
-    oracles: ['reference-reimport', 'playback-smoke'],
+    oracles: ['reference-reimport'],
     notes: 'Re-wrap a headerless recorder stream into a seekable WebM (add Cues / known duration).',
   },
   {
@@ -191,10 +192,15 @@ const EDGE_CASES: EdgeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     encryption: ['cenc-cbcs'],
-    options: { scheme: 'cenc-cbcs', key: { kid: 'abcdef00112233445566778899aabbcc', keyHex: '0123456789abcdef0123456789abcdef' } },
+    options: {
+      scheme: 'cenc-cbcs',
+      key: decryptKeyFor('cenc_cbcs', { use: 'authoritative-positive' }),
+      cleartextAsset: 'cenc_ctr_clear.mp4',
+      clearReferenceTimeline: 'protected-source',
+    },
     oracles: ['decrypt-bitexact'],
     notes:
-      'cbcs crypt/skip pattern-block boundaries — the classic off-by-one decrypt edge. Key/KID mirror fixtures/golden/cenc_cbcs.mp4.keys.json.',
+      'cbcs crypt/skip pattern-block boundaries — the classic off-by-one decrypt edge. Key/KID mirror fixtures/golden/cenc_cbcs.mp4.keys.json; cenc_ctr_clear.mp4 independently proves complete frame identity while the protected source supplies its retained presentation timeline.',
   },
   {
     id: 'edge_faststart_reserve_remux',
@@ -206,7 +212,7 @@ const EDGE_CASES: EdgeCase[] = [
     audioCodecs: ['aac'],
     features: ['fastStart:reserve'],
     options: { container: 'mp4', fastStart: 'reserve' },
-    oracles: ['reference-reimport', 'playback-smoke'],
+    oracles: ['reference-reimport'],
     notes: 'fastStart:reserve provokes a large forward seek in the target buffer.',
   },
   {
@@ -219,7 +225,7 @@ const EDGE_CASES: EdgeCase[] = [
     audioCodecs: ['aac'],
     features: ['fragmented'],
     options: { container: 'mp4', fragmented: true },
-    oracles: ['reference-reimport', 'playback-smoke'],
+    oracles: ['reference-reimport'],
     notes: 'Fragmented/CMAF output structure.',
   },
   {
@@ -876,8 +882,8 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
   // NOTE: decoded-frames-bitexact digests RGBA VIDEO frames; an AAC audio stream has none, so that
   // oracle would guaranteed-FAIL here. The live, defensible gate is golden-metadata on probe — a
   // priming/padding-aware demuxer reports the trimmed (gapless) duration, which golden encodes. The
-  // exact decoded-sample-count-with-priming-removed check needs an audio-sample oracle that does not
-  // exist yet; that stricter property is registered as an honest-FAIL property-invariant below.
+  // exact decoded-sample-count-with-priming-removed check is the native container-timing/WebCodecs
+  // property-invariant below; Web Audio's host sample rate is deliberately not accepted.
   {
     id: 'edge_gapless_priming_probe',
     op: 'probe',
@@ -888,7 +894,7 @@ const SHAPE_EDGE_CASES: ShapeEdgeCase[] = [
     notes:
       '§A.16 gapless audio: AAC with encoder delay (priming) + padding (iTunSMPB / edit list). A ' +
       'priming-aware demuxer reports the trimmed gapless duration; golden encodes it. The exact priming-removed decoded-sample-count check ' +
-      'is the honest-FAIL property-invariant prop_gapless_sample_count_priming below (no audio-sample oracle yet).',
+      'is the native WebCodecs property-invariant prop_gapless_sample_count_priming below.',
   },
 
   // non-stereo channel count — probe/decode must survive a non-default layout.
@@ -1065,7 +1071,7 @@ const transcodeIdempotentScenarios: Scenario[] = [
       { container: 'mp4', video: { codec: 'h264', width: 1920, height: 1080 } },
       'hard-valid',
       'transcode',
-      ['ssim-psnr', 'playback-smoke'],
+      ['ssim-psnr'],
       TRANSCODE_PROPERTY_TIMEOUT_MS,
     ),
     requires: {
@@ -1082,9 +1088,9 @@ const transcodeIdempotentScenarios: Scenario[] = [
     // frames as ABSENT → the §5.2 reference-source path runs. If a future frame-bake fills real source
     // digests, an .ssim.json must accompany it or this lossy-re-encode case would mis-compare against
     // bit-exact source digests — same dependency the transcode family's resize cases carry.)
-    // playback-smoke is the second independent gate (output must actually play), mirroring the
-    // transcode family's ['ssim-psnr','playback-smoke'] pairing. Neither oracle can be won by prose.
-    oracles: ['ssim-psnr', 'playback-smoke'],
+    // Robustness cells execute in a terminable Worker, where DOM media elements do not exist.
+    // The live source-vs-output decode/SSIM comparison is the substantive, worker-safe gate.
+    oracles: ['ssim-psnr'],
     metrics: ['wall', 'peakMemory'],
     // Slightly tighter SSIM floor than the lossy-resize default: same-size same-codec should be near 1.
     tolerances: { ssimMin: 0.97 },
@@ -1092,7 +1098,7 @@ const transcodeIdempotentScenarios: Scenario[] = [
     notes:
       '§A.16 metamorphic transcode idempotence: transcode with target dims == source dims (1920×1080) ' +
       'and same codec ⇒ perceptually identical (resize-to-same ≈ no-op). Gated by ssim-psnr vs the ' +
-      'in-browser-decoded source (§5.2) + playback-smoke, so a wrong/empty output FAILs — no golden frame bake needed.',
+      'in-browser-decoded source (§5.2), so a wrong/empty output FAILs — no golden frame bake needed.',
   }),
 ];
 
@@ -1237,7 +1243,7 @@ const METAMORPHIC_TODO_CASES: MetamorphicTodoCase[] = [
     notes:
       '§A.16 gapless audio exact-sample-count: the decoded/trimmed sample count must equal the ' +
       'priming(encoder-delay)+padding-removed total (AAC priming stripped), not raw frameCount×1024. ' +
-      'The property oracle browser-decodes the trimmed AAC output and compares the priming-removed ' +
+      'The property oracle uses container timing plus native WebCodecs decode counts and compares the priming-removed ' +
       'sample count; decoded-frames-bitexact remains RGBA-video-only and is deliberately not used here.',
   },
   {

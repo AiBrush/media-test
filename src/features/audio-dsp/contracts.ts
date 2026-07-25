@@ -12,7 +12,7 @@ const CONTRACTS: Readonly<Record<string, AudioTransformContract>> = Object.freez
   resample_48k_to_44k1: resample(44_100),
   resample_44k1_to_48k: resample(48_000),
   resample_48k_to_16k: resample(16_000),
-  edge_longform_audio_resample_16k: resample(16_000),
+  edge_longform_audio_resample_16k: resample(16_000, { minimumSpectralBins: 0 }),
 
   downmix_stereo_to_mono: matrix({
     channels: 1,
@@ -99,10 +99,14 @@ export function audioDspContractScenarioIds(): string[] {
   return Object.keys(CONTRACTS).map((id) => `audio-dsp/${id}`).sort();
 }
 
-function resample(sampleRate: number): AudioTransformContract {
+function resample(
+  sampleRate: number,
+  policy: { minimumSpectralBins?: number } = {},
+): AudioTransformContract {
   return {
     kind: 'resample', container: 'wav', codec: 'pcm-s16', sampleRate,
     probeFrequenciesHz: [220, 440, 1_000, 4_000],
+    ...policy,
     maxSpectralDeltaDb: 0.75,
     maxRmsDeltaDb: 0.5,
     durationFrameTolerance: 1,

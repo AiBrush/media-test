@@ -1490,6 +1490,33 @@ export class WebDemuxerEngine implements MediaEngine {
     opts?: DecodeOptions,
     context?: OperationContext,
   ): Promise<FrameSink> {
+    try {
+      return await this.decodeFramesUnchecked(input, opts, context);
+    } catch (error) {
+      if (
+        isGracefulNegativeContext(context) &&
+        !isMalformedInputError(error) &&
+        error instanceof WebDemuxerPartialDecodeError
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'decodeFrames',
+          'decode',
+          describeError(error),
+          'WEB_DEMUXER_DECODE_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async decodeFramesUnchecked(
+    input: MediaInput,
+    opts?: DecodeOptions,
+    context?: OperationContext,
+  ): Promise<FrameSink> {
     const startedAt = this.dependencies.now();
     const prepared = await this.prepareVideoRuntime(input, 'decodeFrames', context, opts?.track);
     const maxFrames = resolveDecodeFrameLimit(

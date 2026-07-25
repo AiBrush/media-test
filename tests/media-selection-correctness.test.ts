@@ -88,6 +88,50 @@ function row(files: SourceFileRecord[], overrides: Partial<ScenarioSourceRow> = 
   };
 }
 
+test('fixed-layout audio-DSP rows keep arbitrary same-codec real files out of the pool', () => {
+  const fixed = scenario({
+    id: 'audio-dsp/downmix_stereo_to_mono',
+    family: 'audio-dsp',
+    op: 'transcode',
+    input: 'baked.wav',
+    options: {
+      container: 'wav',
+      invariant: 'audio-dsp-transform',
+      audio: {
+        codec: 'pcm-s16',
+        channels: 1,
+        inputLayout: ['FL', 'FR'],
+        outputLayout: ['FC'],
+        mixMatrix: [[0.5, 0.5]],
+      },
+    },
+    requires: {
+      operations: ['transcode'],
+      containersIn: ['wav'],
+      containersOut: ['wav'],
+      audioCodecs: ['pcm-s16'],
+      features: ['downmix'],
+    },
+    oracles: ['property-invariant'],
+  });
+  const real = sourceFile('mono.wav', 'same codec but wrong layout', {
+    container: 'wav',
+    videoCodecs: [],
+    audioCodecs: ['pcm-s16'],
+  });
+  const sourceRow = row([real], {
+    scenarioId: fixed.id,
+    requires: {
+      container: 'wav',
+      video: false,
+      videoCodecs: [],
+      audioCodecs: ['pcm-s16'],
+    },
+  });
+  const selections = candidatesForRun([fixed], new Map([[fixed.id, sourceRow]]));
+  expect(selections.get(fixed.id)?.map((selection) => selection.isBaked)).toEqual([true]);
+});
+
 function catalogFromRows(rows: readonly ScenarioSourceRow[]): ValidatedScenarioSourceCatalog {
   const parsed = parseScenarioSourceCatalog(rows.map((entry) => JSON.stringify(entry)).join('\n'));
   if (parsed.state !== 'VALID') throw new Error(parsed.issues.map((issue) => issue.detail).join('; '));

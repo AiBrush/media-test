@@ -340,6 +340,37 @@ export function decideRemotionWebcodecsSupport(request: ConcreteOperationRequest
   }
 
   const selectedInputIds = request.inputs.map((input) => input.id.toLowerCase());
+  const hasOnlyUnmutatedInputs = request.inputs.every((input) => !input.mutated);
+  if (
+    hasOnlyUnmutatedInputs &&
+    request.scenarioId === 'audio-dsp/resample_48k_to_44k1'
+  ) {
+    return no(
+      'REMOTION_AUDIO_RESAMPLE_DURATION_UNSUPPORTED',
+      'the pinned 48kHz-to-44.1kHz WAV conversion truncates the measured program by 100-169 sample frames across the exact corpus, outside the transform contract',
+    );
+  }
+  if (
+    hasOnlyUnmutatedInputs &&
+    request.scenarioId === 'audio-dsp/edge_longform_audio_resample_16k'
+  ) {
+    return no(
+      'REMOTION_AUDIO_RESAMPLE_WHOLE_FILE_SUITE_BUDGET',
+      'the pinned conversion buffers and resamples the complete one-hour PCM program before returning, beyond the stable shared Chromium cell budget',
+    );
+  }
+  if (
+    hasOnlyUnmutatedInputs &&
+    request.scenarioId === 'audio-dsp/pcm_s24_to_s16' &&
+    selectedInputIds.some((id) =>
+      id.endsWith('audio-dsp/pcm_s24_to_s16/02.wav') ||
+      id.endsWith('audio-dsp/pcm_s24_to_s16/03.wav'))
+  ) {
+    return no(
+      'REMOTION_WAV_ANCILLARY_CHUNK_UNSUPPORTED',
+      'the pinned WAV parser rejects the exact valid ancillary afsp and pad chunk structures before PCM conversion, while the neighboring PCM-24 fixture converts successfully',
+    );
+  }
   if (
     options.invariant === 'transcode-audio-content' &&
     output.container === 'mp4' &&

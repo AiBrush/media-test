@@ -2009,6 +2009,7 @@ describe('REQ-RUN-07 reviewed suppression audit', () => {
     expect(disabledCellReason('web-demuxer@4.0.0', 'robustness/edge_ts_pts_wraparound_demux')).toBeUndefined();
     expect(disabledCellReason('mediabunny@1.48.0', 'probe/cenc_ctr')).toBeUndefined();
     expect(disabledCellReason('remotion@4.0.479', 'demux/graceful_mp4_header_destroyed')).toBeUndefined();
+    expect(disabledCellReason('remotion@4.0.479', 'streaming-output/buffer_massive_h264_mp4')).toBeUndefined();
     const retained = reviewedDisabledCells()[0]!;
     expect(disabledCellReason(retained.engineId, retained.scenarioId, 'enforce')).toContain(retained.issue);
     expect(disabledCellReason(retained.engineId, retained.scenarioId, 'audit')).toBeUndefined();

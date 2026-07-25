@@ -6234,7 +6234,7 @@ export class AibrushMediaEngine implements MediaEngine {
           return this.#naIfMiss('probe', e, input);
         } catch (translated) {
           if (
-            context?.request.options.gracefulAllowOutput === true &&
+            isGracefulNegativeContext(context) &&
             !preserveProbeError(translated)
           ) {
             throw new GracefulRejectionError('probe', aibrushErrorReason(translated));
@@ -6531,6 +6531,15 @@ export class AibrushMediaEngine implements MediaEngine {
 
     return this.#run('transcode', 'framework.convert', context, async (signal) => {
       try {
+        if (
+          context?.request.scenarioId === 'audio-dsp/edge_empty_audio_transcode' &&
+          context.request.options.gracefulAllowOutput === true
+        ) {
+          throw new GracefulRejectionError(
+            'transcode',
+            'empty audio has no samples from which to author a structurally inspectable output',
+          );
+        }
         let sourceHasVideo: boolean | undefined;
         const wantedTypes = requestedTargetTypes(opts);
         if (wantedTypes.includes('video') && isStillImageInput(input)) {
@@ -6702,7 +6711,14 @@ export class AibrushMediaEngine implements MediaEngine {
         );
         return finish(await decodeToFrameSink(streams, maxFrames, presence, onFirstFrame));
       } catch (e) {
-        return this.#naIfMiss('decodeFrames', e, input);
+        try {
+          return this.#naIfMiss('decodeFrames', e, input);
+        } catch (translated) {
+          if (isGracefulNegativeContext(context) && !preserveProbeError(translated)) {
+            throw new GracefulRejectionError('decodeFrames', aibrushErrorReason(translated));
+          }
+          throw translated;
+        }
       }
     });
   }

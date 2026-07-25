@@ -361,6 +361,7 @@ const FIXTURES_MEDIA_BASE = '/fixtures/media';
 const FIXTURES_MANIFEST_URL = '/fixtures/manifest.json';
 const FIXTURES_GENERATION_INDEX_URL = '/fixtures/generation-index.json';
 const FIXTURES_BASE_URL = '/fixtures/';
+const FIXTURES_GOLDEN_BASE = '/fixtures/golden';
 
 interface FixtureManifestAsset {
   id?: string;
@@ -847,6 +848,12 @@ const goldenLoadCacheByRuntime = new WeakMap<ActiveFixtureRuntime, Map<string, P
  */
 export function goldenKindsForScenario(scenario: Scenario): readonly GoldenKind[] {
   const kinds = new Set<GoldenKind>(['meta']);
+  const robustness = robustnessContractFromOptions(scenario.options);
+  if (robustness?.returnedOutputCheck === 'seek-clamp') {
+    // The graceful-failure oracle validates a returned boundary seek against committed packet PTS.
+    // Its oracle id alone does not advertise that dependency, so include it from the typed contract.
+    kinds.add('packets');
+  }
   for (const oracle of scenario.oracles) {
     switch (oracle) {
       case 'golden-packets':
@@ -893,10 +900,15 @@ function loadGoldenForRun(
   runtime?: ActiveFixtureRuntime,
   requestedKinds?: readonly GoldenKind[],
 ): Promise<GoldenStore> {
+  const baseUrl = new URL(
+    FIXTURES_GOLDEN_BASE,
+    globalThis.location?.href ?? 'http://localhost/',
+  ).href;
   if (!runtime) {
-    return requestedKinds
-      ? loadGolden(assetId, { requestedKinds })
-      : loadGolden(assetId);
+    return loadGolden(assetId, {
+      baseUrl,
+      ...(requestedKinds ? { requestedKinds } : {}),
+    });
   }
 
   // ActiveFixtureRuntime already freezes indexed artifacts. This adjacent cache also freezes the
@@ -913,6 +925,11 @@ function loadGoldenForRun(
   if (cached) return cached;
 
   const pending = loadGolden(assetId, {
+    // Keep the legacy flat-artifact fallback origin-rooted. Robustness and rotated corpus assets
+    // are commonly outside a selected-assets generation, and may execute from a nested runner
+    // document/worker URL where the historical `fixtures/golden` relative path resolves to Vite's
+    // HTML fallback (HTTP 200) and is then misreported as a JSON parse error.
+    baseUrl,
     requestedKinds: plan,
     evidenceProvider: {
       load: (kind, parsePayload) => runtime.loadGoldenEvidence(assetId, kind, parsePayload),
@@ -6290,6 +6307,7 @@ async function runRobustness(
   const survivor = validateRobustnessReturnedValue(contract, robustnessOpResult, {
     seekPolicy: readStringOption(scenario.options, ['seekPolicy']),
     goldenPackets: golden.packets,
+    goldenMetadata: golden.meta,
     seekToleranceUs: scenario.tolerances?.seekToleranceUs,
   });
   if (survivor.state !== 'PASS') {

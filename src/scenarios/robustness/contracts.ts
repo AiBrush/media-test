@@ -7,6 +7,7 @@ import type {
   PacketInfo,
 } from '../../core/engine.ts';
 import { readOutputStructureResult } from '../../core/box-readers.ts';
+import { readPcmStructure } from '../../features/audio-dsp/readers.ts';
 
 /**
  * The operation outcome is independent from the semantic oracle verdict.  In particular, an
@@ -189,6 +190,7 @@ export function validateRobustnessReturnedValue(
   options: Readonly<{
     seekPolicy?: string;
     goldenPackets?: readonly PacketInfo[];
+    goldenMetadata?: NormalizedMetadata;
     seekToleranceUs?: number;
   }> = {},
 ): RobustnessSurvivorDecision {
@@ -262,6 +264,23 @@ export function validateRobustnessReturnedValue(
           detail: `neutral reader accepted ${output.container} structure`,
         };
       }
+      if (read.state === 'UNSUPPORTED_FORMAT') {
+        const pcm = readPcmStructure(output.bytes, output.container);
+        if (pcm.state === 'OK') {
+          return {
+            state: 'PASS',
+            reasonCode: 'ROBUSTNESS_MEDIA_PARTIAL_STRUCTURAL',
+            detail: `neutral PCM reader accepted ${output.container} structure`,
+          };
+        }
+        if (pcm.state === 'MALFORMED' || pcm.state === 'INCOMPLETE') {
+          return {
+            state: 'FAIL',
+            reasonCode: pcm.reasonCode,
+            detail: `returned ${output.container} bytes are ${pcm.state.toLowerCase()}`,
+          };
+        }
+      }
       if (read.state === 'MALFORMED' || read.state === 'INCOMPLETE') {
         return {
           state: 'FAIL',
@@ -284,7 +303,16 @@ export function validateRobustnessReturnedValue(
           detail: 'seek returned without a finite landing timestamp',
         };
       }
+      const tracks = options.goldenMetadata?.tracks ?? [];
+      const preferredTrackIndex = tracks.findIndex((track) => track.type === 'video');
+      const fallbackTrackIndex = tracks.findIndex((track) => track.type === 'audio');
+      const targetTrackIndex = preferredTrackIndex >= 0
+        ? preferredTrackIndex
+        : fallbackTrackIndex >= 0
+          ? fallbackTrackIndex
+          : undefined;
       const points = (options.goldenPackets ?? [])
+        .filter((packet) => targetTrackIndex === undefined || packet.trackIndex === targetTrackIndex)
         .map((packet) => packet.ptsUs)
         .filter(Number.isFinite);
       if (points.length === 0) {

@@ -120,20 +120,46 @@ describe('REQ-FEAT-77: structured disposition and survivor contracts', () => {
     expect(validateRobustnessReturnedValue(mediaContract, {
       output: { bytes: realBytes, container: 'mp4', mime: 'video/mp4' },
     }).state).toBe('PASS');
+    const pcmBytes = new Uint8Array(
+      await Bun.file('fixtures/media/wav_s24.wav').arrayBuffer(),
+    );
+    expect(validateRobustnessReturnedValue(mediaContract, {
+      output: { bytes: pcmBytes, container: 'wav', mime: 'audio/wav' },
+    })).toMatchObject({
+      state: 'PASS',
+      reasonCode: 'ROBUSTNESS_MEDIA_PARTIAL_STRUCTURAL',
+    });
   });
 
   test('a returned boundary seek must land on the declared first/last timestamp', () => {
     const packets = [
       { trackIndex: 0, size: 4, ptsUs: 1_000, keyframe: true },
       { trackIndex: 0, size: 4, ptsUs: 9_000, keyframe: false },
+      { trackIndex: 1, size: 4, ptsUs: -2_000, keyframe: true },
+      { trackIndex: 1, size: 4, ptsUs: 12_000, keyframe: true },
     ];
+    const goldenMetadata = {
+      container: 'mp4',
+      durationSec: 0.01,
+      tracks: [
+        { type: 'video' as const, codec: 'h264' },
+        { type: 'audio' as const, codec: 'aac' },
+      ],
+    };
     expect(validateRobustnessReturnedValue(boundary, { seek: { landedPtsUs: 1_000 } }, {
       seekPolicy: 'first-frame-or-clean-reject',
       goldenPackets: packets,
+      goldenMetadata,
     }).state).toBe('PASS');
-    expect(validateRobustnessReturnedValue(boundary, { seek: { landedPtsUs: 5_000 } }, {
+    expect(validateRobustnessReturnedValue(boundary, { seek: { landedPtsUs: 9_000 } }, {
       seekPolicy: 'last-frame-or-clean-reject',
       goldenPackets: packets,
+      goldenMetadata,
+    }).state).toBe('PASS');
+    expect(validateRobustnessReturnedValue(boundary, { seek: { landedPtsUs: 12_000 } }, {
+      seekPolicy: 'last-frame-or-clean-reject',
+      goldenPackets: packets,
+      goldenMetadata,
     })).toMatchObject({ state: 'FAIL', reasonCode: 'ROBUSTNESS_SEEK_CLAMP_INVALID' });
   });
 
@@ -433,6 +459,14 @@ describe('REQ-FEAT-79: labels are literal executable rows', () => {
     });
     expect(byId.get('robustness/edge_seek_past_eof')?.options).toMatchObject({
       seekPolicy: 'last-frame-or-clean-reject',
+    });
+  });
+
+  test('CBCS boundary decrypt identifies its retained cleartext twin', () => {
+    expect(byId.get('robustness/edge_cbcs_boundary_decrypt')?.options).toMatchObject({
+      scheme: 'cenc-cbcs',
+      cleartextAsset: 'cenc_ctr_clear.mp4',
+      clearReferenceTimeline: 'protected-source',
     });
   });
 });

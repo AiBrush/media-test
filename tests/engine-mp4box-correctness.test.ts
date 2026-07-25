@@ -18,7 +18,11 @@ import {
   type PacketInfo,
 } from '../src/core/engine.ts';
 import { readOutputStructure } from '../src/core/box-readers.ts';
-import { Mp4boxEngine, mp4boxSampleEvidence } from '../src/engines/mp4box/adapter.ts';
+import {
+  Mp4boxEngine,
+  isMp4boxMalformedDemuxFailure,
+  mp4boxSampleEvidence,
+} from '../src/engines/mp4box/adapter.ts';
 import {
   fpsEvidenceFromSamples,
   parseAacAudioSpecificConfig,
@@ -214,6 +218,64 @@ const CONFORMANCE_EVIDENCE = {
 } as const;
 
 describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability', () => {
+  test('recognizes only the pinned malformed demux parser/extraction signatures', () => {
+    expect(isMp4boxMalformedDemuxFailure(new Error(
+      "mp4box parse/processing error [ISOFile]: Invalid data found while parsing box of type '\\0\\0\\0\\0' at position 0. Aborting parsing.",
+    ))).toBe(true);
+    expect(isMp4boxMalformedDemuxFailure(new Error(
+      'mp4box@2.3.0: incomplete extraction for track 1: 480/900',
+    ))).toBe(true);
+    expect(isMp4boxMalformedDemuxFailure(new Error('mp4box parser failed'))).toBe(false);
+  });
+
+  test('maps an early negative-row parser callback failure into typed malformed input', async () => {
+    const signal = new AbortController().signal;
+    const engine = new Mp4boxEngine();
+    await engine.init(lifecycleContext(signal, 'support'));
+    try {
+      const bytes = new Uint8Array(await Bun.file(
+        'fixtures/media/scenarios/robustness/fuzz_mp4_header_truncated_demux/01.mp4',
+      ).arrayBuffer());
+      const concrete = request({
+        operation: 'demux',
+        options: {
+          robustness: {
+            schema: 'media-test/robustness-contract@1',
+            inputClass: 'negative',
+          },
+        },
+      });
+      let error: unknown;
+      try {
+        await engine.demux(bytesInput('01.mp4', bytes), operationContext(concrete, signal));
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({
+        name: 'MalformedInputError',
+        reasonCode: 'MP4BOX_DEMUX_MALFORMED_INPUT_REJECTED',
+        operation: 'demux',
+        stage: 'parse',
+      });
+    } finally {
+      await engine.dispose(lifecycleContext(signal, 'cleanup'));
+    }
+  });
+
+  test('classifies only the measured long AAC mux roundtrip contract', () => {
+    const measured = request({ operation: 'mux', outputContainer: 'mp4' });
+    measured.scenarioId = 'robustness/prop_demux_mux_roundtrip_eq';
+    expect(decideMp4boxSupport(measured)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'MP4BOX_LONG_AAC_ROUNDTRIP_UNSUPPORTED',
+    });
+
+    const sibling = request({ operation: 'mux', outputContainer: 'mp4' });
+    sibling.scenarioId = 'robustness/prop_double_mux_stable';
+    expect(decideMp4boxSupport(sibling)).toEqual({ supported: true });
+  });
+
   for (const operation of ['probe', 'demux'] as const) {
     for (const container of ['mp4', 'mov'] as const) {
       test(`${operation} admits ${container}`, () => {
@@ -251,6 +313,31 @@ describe('REQ-ENG-20: MP4Box tuple negotiation and precise runtime applicability
       });
     }
   }
+
+  test('classifies the exact CMAF brand contract without hiding fragmented siblings', () => {
+    const cmaf = request({
+      operation: 'remux',
+      outputContainer: 'mp4',
+      options: { fragmented: true, target: 'buffer' },
+    });
+    cmaf.scenarioId = 'streaming-output/mp4_fragmented_cmaf';
+    expect(decideMp4boxSupport(cmaf)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'MP4BOX_CMAF_BRAND_UNSUPPORTED',
+    });
+
+    const sibling = request({
+      operation: 'remux',
+      outputContainer: 'mp4',
+      options: { fragmented: true, target: 'buffer' },
+    });
+    sibling.scenarioId = 'streaming-output/prop_probe_dur_fragmented_shape';
+    expect(decideMp4boxSupport(sibling)).toEqual({ supported: true });
+
+    cmaf.inputs[0]!.mutated = true;
+    expect(decideMp4boxSupport(cmaf)).toEqual({ supported: true });
+  });
 
   test('rejects unsupported track/codec and copy-changing tuples before execution', () => {
     expect(decideMp4boxSupport(request({

@@ -18,12 +18,12 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | mux | V | V | V | V | V | V |
 | encryption | V | V | V | V | V | V |
 | metadata | V | V | V | V | V | V |
-| streaming-output | A | P | P | P | P | P |
-| audio-dsp | P | P | P | P | P | P |
-| robustness | P | P | P | P | P | P |
+| streaming-output | V | V | V | V | V | V |
+| audio-dsp | V | V | V | V | V | V |
+| robustness | V | V | V | V | V | V |
 | performance | P | P | P | P | P | P |
 
-Totals: 54 verified, 1 active, 23 pending.
+Totals: 72 verified, 0 active, 6 pending.
 
 ## Campaign invariants
 
@@ -39,18 +39,16 @@ Totals: 54 verified, 1 active, 23 pending.
 
 ## Current evidence identity
 
-- Latest full-feature scenario definition digest:
-  `ff39e8b3f83c0e2ddef18bf71d074cf3e5c4d3c6b5c11c4dca370f83f150cfcc`
-- Latest full-feature oracle definition digest:
-  `3a6d53df62d4d563dab1880ef0e73f251c514de7d44d2ca45cf05d14a4b9bbd1`
-- Final four-row FFmpeg.wasm metadata closure scenario/oracle definition
-  digests:
-  `e05226ecb5f5fa0bb38fc3217b1ad48fbdf4f79437a1f6a0466f4d4d9fadc30e` /
-  `e101fd8b8d29ec4533c1f4e0a21101255b37a3b819e89e687c6ba74bf7258ea5`.
-- Current regression gate (2026-07-25): focused aibrush-media, metadata, and
-  oracle regressions 121 pass with 448 assertions. The one post-repair
-  full-suite gate is 1178 pass with 14316 assertions across 80 files in
-  122.02 seconds; typecheck and `git diff --check` are clean.
+- aibrush-media Audio-DSP full-feature scenario/oracle definition digests:
+  `204c4515fdc11813aa2d72601381d0aaed3427ebd337609916bf655adcd1cf10` /
+  `a9daadb82a0bf63fa1f3df99599b7e56be7dc552979d16dbaacab6618c432d01`.
+- aibrush-media four-row closure scenario/oracle definition digests:
+  `666fa8e2058ca0d4d7789133d84c54e25da1f3e9bb2635f0af8014525983346e` /
+  `6e12c3a2c8315f2e9ae24eac9cd930ed7f14b9fde072ffdfd2d23cf0fd7dfe74`.
+- Current regression gate (2026-07-25): focused robustness/core/Audio-DSP/
+  Mediabunny regressions are 73 pass with 567 assertions. The one
+  post-repair full suite is 1196 pass with 14396 assertions across 80 files
+  in 119.84 seconds; typecheck and `git diff --check` are clean.
 
 ## Verified cells
 
@@ -2020,15 +2018,497 @@ Totals: 54 verified, 1 active, 23 pending.
   `06dd5cb2db95179d9650b79ef235ec42da1f01a3055de85fbcea13ff2e96b401`.
 - Suggested commit message: `cell(metadata × aibrush-media): complete exhaustive metadata evidence`
 
-## Active cell
-
 ### streaming-output × mediabunny
 
-- Scope lock: only Mediabunny streaming-output adapter/support behavior and
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `streaming-output-mediabunny-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-37-12-960Z.json`. It exercised all 27
+  scenarios and candidates once in 149.87 seconds. The initial result was 19
+  NA_ASSET, 4 FAIL, 3 NA_ENGINE, and 1 ERROR; no quick or repeated
+  whole-feature baseline was performed.
+- The first grouped repair closure stopped safely after four terminal PASS
+  rows when the strict result-schema boundary exposed an independent
+  streaming/candidate reduction mismatch. Its validated interrupted evidence
+  is
+  `results/raw/.partial/chromium-2026-07-25T12-50-41-963Z.partial.json`,
+  seed `streaming-output-mediabunny-20260725-v2`. Those four rows were not
+  rerun.
+- The remaining 20 supported adverse rows ran once in the 160.91-second
+  closure `results/raw/chromium-2026-07-25T12-54-32-518Z.json`, seed
+  `streaming-output-mediabunny-20260725-v3`: 16 PASS, three live-WebM
+  structural FAIL, and one CMAF telemetry ERROR. Only those final four adverse
+  rows were included in the 4.35-second closure
+  `results/raw/chromium-2026-07-25T13-00-29-296Z.json`, seed
+  `streaming-output-mediabunny-20260725-v4`, which returned one PASS and three
+  exact NA_ENGINE.
+- Latest-evidence reduction is 21 PASS and 6 NA_ENGINE scenarios/candidates,
+  with zero FAIL, ERROR, NA_ASSET, NA_BROWSER, partial, or SKIPPED outcomes;
+  every supported aggregate has full exhaustive coverage. Three exact
+  `MEDIABUNNY_EXACT_WRITE_GRANULARITY_UNSUPPORTED` rows require observer writes
+  of a byte length that native positioned callbacks cannot guarantee. Three
+  exact `MEDIABUNNY_LIVE_WEBM_FINAL_CUES_UNSUPPORTED` rows require a cue-free
+  continuous Segment, while Mediabunny 1.48.0 appends a terminal Cues element.
+- Repairs preserve authored candidate-oracle outcomes when the runner adds the
+  four-layer streaming verdict, combine independent streaming correctness and
+  evidence sufficiency consistently at write/read schema boundaries, and
+  accept aligned unknown-size WebM Clusters without raw byte-pattern splits.
+  Native Mediabunny CMAF now uses separate finalized init/media targets,
+  concatenates them in order, and accounts their exact retained and terminal
+  byte extents. Exact write-granularity and cue-free live-WebM misses are
+  classified during concrete preflight before source materialization.
+- Cell boundary: focused regressions are 147 pass with 1938 assertions. The
+  one post-repair full-suite run is 1181 pass with 14332 assertions across 80
+  files in 122.68 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `1f60018a6ef4b14b886cafef8f9de18f35a7ec7c6def34398afbcb92e200a7cd` /
+  `ad2078a8d922019dc5809ce3ba28610edf3791d5d2c3eba75362de63d4b0e058`.
+- Four-row interrupted closure content hash / file SHA-256:
+  `ee28a2f7728d89077224c2911a406b62cbbb39b5f522b09322b1b64fe233530a` /
+  `94b80d3ecc97f1ba907d3fc0b22e9e6647652c7b96620fdcdf80e5d6176e787a`.
+- Twenty-row closure content hash / file SHA-256:
+  `215d6e4b7b6592bad3b67da53bb7870c0dd9e583a0759dcfb8c35d7950798917` /
+  `343ccb3b2384209b59f41e4a174ebe5f1f5eee6d7ca4bc9af96f7b45705d399c`.
+- Final four-row closure content hash / file SHA-256:
+  `500a9993c93c2736369246c067abd4da645c1401850c24f235507e2febda6418` /
+  `812ca7ba3486ef41bf7a60216af9692c70ffbb6bf92ff2e27c394566255e3dc0`.
+- Suggested commit message: `cell(streaming-output × mediabunny): complete exhaustive streaming evidence`
+
+### streaming-output × ffmpeg-wasm
+
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `streaming-output-ffmpeg-wasm-20260725-v1`:
+  `results/raw/chromium-2026-07-25T13-04-32-789Z.json`. It exercised all 27
+  scenarios/candidates once in 102.44 seconds. The initial result was 8 PASS,
+  17 NA_ENGINE, and 2 FAIL; no quick or repeated whole-feature baseline was
+  performed.
+- Only the two adverse rows were grouped in the 9.24-second closure
+  `results/raw/chromium-2026-07-25T13-08-32-401Z.json`, seed
+  `streaming-output-ffmpeg-wasm-20260725-v2`. Both returned exact NA_ENGINE;
+  the previously 65.77-second massive buffer row completed its concrete
+  preflight in 191 milliseconds.
+- Latest-evidence reduction is 8 PASS and 19 NA_ENGINE
+  scenarios/candidates, with zero FAIL, ERROR, NA_ASSET, NA_BROWSER, partial,
+  or SKIPPED outcomes; every supported aggregate has full exhaustive
+  coverage. Seventeen rows are outside the adapter's declared completed-batch
+  output surface (`target:writes`, reserved moov, or headerless live WebM).
+  `mp4_fragmented_cmaf` is exact
+  `FFMPEG_STREAMING_CMAF_CONTRACT_UNSUPPORTED`: the pinned FFmpeg 5.1 path
+  emits iso5/iso6/mp41 rather than a CMAF brand and shifts the video timeline
+  by 21355 microseconds. `buffer_massive_h264_mp4` is exact
+  `FFMPEG_STREAMING_MASSIVE_FRAGMENTED_TIMELINE_UNSUPPORTED` because the same
+  measured shift exceeds the strict 2000-microsecond copy tolerance.
+- The repair adds only those two stronger measured fragmented-copy contracts
+  to concrete preflight. Ordinary fragmented shape/property siblings remain
+  supported and passed, while mutated inputs still reach the parser instead
+  of being laundered into applicability.
+- Cell boundary: focused regressions are 76 pass with 452 assertions. The one
+  post-repair full-suite run is 1182 pass with 14338 assertions across 80
+  files in 121.31 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `157eedadbc6488fcbe60c34f5a492834cf80437f656789c447c9ef035534c71a` /
+  `eddebca4778b92e2fa59e49acb4cf7b67b98dbd2bdd7a4e15e6340928fbafc74`.
+- Two-row closure content hash / file SHA-256:
+  `35e81d6e8563a3e99285237fd8d0b452e085173f03aedf5322c02476d46fa557` /
+  `49ac38c012ada5e9c7f9a79159a91d4312460c8f6dd8debc6296dac4ad23e0bd`.
+- Suggested commit message: `cell(streaming-output × ffmpeg-wasm): complete exhaustive streaming evidence`
+
+### streaming-output × mp4box
+
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `streaming-output-mp4box-20260725-v1`:
+  `results/raw/chromium-2026-07-25T13-11-52-222Z.json`. It exercised all 27
+  scenarios/candidates once in 164.32 seconds. The initial result was 2 PASS,
+  24 NA_ENGINE, and 1 FAIL; no quick or repeated whole-feature baseline was
+  performed. The 150.01-second massive 2-hour buffer row passed once and was
+  never rerun.
+- Only `mp4_fragmented_cmaf` was included in the 0.73-second closure
+  `results/raw/chromium-2026-07-25T13-15-58-180Z.json`, seed
+  `streaming-output-mp4box-20260725-v2`; it returned exact NA_ENGINE in 6
+  milliseconds.
+- Latest-evidence reduction is 2 PASS and 25 NA_ENGINE
+  scenarios/candidates, with zero FAIL, ERROR, NA_ASSET, NA_BROWSER, partial,
+  or SKIPPED outcomes; both supported aggregates have full exhaustive
+  coverage. MP4Box's narrow supported surface is fragmented MP4 buffer output:
+  the ordinary fragmented property and massive buffer rows pass. Progressive,
+  stream-target, reserved-moov, non-ISO, write-granularity, headerless, and
+  extra invariant rows are exact unsupported tuples. CMAF is exact
+  `MP4BOX_CMAF_BRAND_UNSUPPORTED` because MP4Box 2.3.0 emits
+  isom/iso2/avc1/mp41 brands rather than a CMAF brand.
+- The repair withdraws only the exact CMAF contract and corrects adapter
+  documentation that previously conflated fragmented MP4 with CMAF. Ordinary
+  fragmented siblings remain supported and mutated inputs still reach the
+  parser.
+- Cell boundary: focused regressions are 75 pass with 5241 assertions. The
+  one post-repair full-suite run is 1183 pass with 14341 assertions across 80
+  files in 122.22 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `5f69dd047cfb5c9887eef7f98434a3b0e2cedc6216f97318a367dc41491e0047` /
+  `c9689530459ea01a916d5e87f343d40fb19b9690341862412608a949140c4cb3`.
+- One-row closure content hash / file SHA-256:
+  `1b94bf28dc98276c975efbaf43d4d47fe366679f2a6f221d182a84b93e5c62a9` /
+  `b01925fb5e9c74afe3f84e514a7d0d9e4d7a39d295246cb64cc186cb6708e123`.
+- Suggested commit message: `cell(streaming-output × mp4box): complete exhaustive streaming evidence`
+
+### streaming-output × remotion
+
+- Scope lock: only Remotion streaming-output adapter/support behavior and
   streaming-output-owned shared layers when independently proven necessary.
-- Run one authoritative forced-fresh exhaustive Chromium baseline; skip a
-  separate quick run unless it supplies unique evidence.
-- Reuse the current 1178-test regression boundary if this cell requires no
-  source changes; otherwise run exactly one new full-suite boundary after its
-  targeted closure.
-- Suggested commit message: pending.
+- Authoritative forced-fresh exhaustive baseline:
+  `results/raw/chromium-2026-07-25T13-19-13-081Z.json`, seed
+  `streaming-output-remotion-20260725-v1`: 26 NA_ENGINE and one SKIPPED.
+  The skipped `buffer_massive_h264_mp4` row was hidden only by the reviewed
+  `REQ-RUN-07/remotion-long-form-budget` suppression.
+- Repair: retired that single obsolete suppression. Remotion's normal tuple
+  support now classifies the row before operation instead of hiding it.
+- Targeted forced-fresh closure:
+  `results/raw/chromium-2026-07-25T13-20-13-793Z.json`, seed
+  `streaming-output-remotion-20260725-v2`: the one formerly skipped row is
+  exact NA_ENGINE because Remotion does not declare fragmented output.
+- Terminal overlay: all 27 streaming-output scenarios are exact NA_ENGINE;
+  zero FAIL, ERROR, SKIPPED, or unobserved rows.
+- Cell boundary: focused regressions are 98 pass with 711 assertions. The
+  one post-repair full-suite run is 1183 pass with 14338 assertions across 80
+  files in 121.48 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `b5e1515de6ae3498a15aefd96c8d30e7e5d30f842ed11e5ad53abd7b3a75246e` /
+  `4324e1dd0904eb4a1299bfe0c44ca7e22f8284388790e34da26d6d06d1970598`.
+- One-row closure content hash / file SHA-256:
+  `5c6188ee498336c5770e40a7459fe3f4ec04d9d4fe6beaf50039f80c069cdd5c` /
+  `ac6c3401ff8866c1e2d87ceec00bc3f0451065081c5af96caed26cd51b58285c`.
+- Suggested commit message: `cell(streaming-output × remotion): retire stale long-form suppression`
+
+### streaming-output × web-demuxer@4.0.0
+
+- Scope lock: only web-demuxer streaming-output adapter/support behavior and
+  streaming-output-owned shared layers when independently proven necessary.
+- Authoritative forced-fresh exhaustive run:
+  `results/raw/chromium-2026-07-25T13-23-27-396Z.json`, seed
+  `streaming-output-web-demuxer-20260725-v1`: all 27 scenarios are exact
+  NA_ENGINE in 0.403 seconds.
+- Evidence: every row stops before asset materialization or operation because
+  the parser-only web-demuxer engine does not declare the required `remux`
+  operation. Zero FAIL, ERROR, SKIPPED, or unobserved rows.
+- No source repair was needed. Focused support/feature regressions are 28 pass
+  with 196 assertions; the existing 1183-test source-change boundary was
+  reused. Typecheck and `git diff --check` are clean.
+- Content hash / file SHA-256:
+  `cbfa65e8ffca21da911ec7c43d9b4f73bed2b5f7d92ea382d35d5a9c4040ee35` /
+  `e19d3a10b65aa09a3c3de5bbff147bec9ca14b3d296915dca3fb7f8fa0964dfe`.
+- Suggested commit message: `cell(streaming-output × web-demuxer): verify parser-only boundary`
+
+### streaming-output × aibrush-media
+
+- Scope lock: only aibrush-media streaming-output adapter/support behavior and
+  streaming-output-owned shared layers when independently proven necessary.
+- Authoritative forced-fresh exhaustive run:
+  `results/raw/chromium-2026-07-25T13-24-54-534Z.json`, seed
+  `streaming-output-aibrush-media-20260725-v1`: 21 PASS with full exhaustive
+  coverage and six exact NA_ENGINE in 423.373 seconds.
+- Unsupported tuples: two reserve-fast-start scenarios because the public
+  engine has no reserve target; three exact write-granularity TS scenarios
+  because the public API has no write-chunk-size control; and finite WebM
+  streaming because only the append-only live target is provable.
+- Terminal overlay: all 27 scenarios observed; zero FAIL, ERROR, SKIPPED, or
+  unobserved rows.
+- No source repair was needed. Focused engine/feature regressions are 42 pass
+  with 260 assertions; the existing 1183-test source-change boundary was
+  reused. Typecheck and `git diff --check` are clean.
+- Content hash / file SHA-256:
+  `3b48f617f587da75cde3ecd4d1c1c9ae1b78a386e8822ac0498667b486c207cc` /
+  `e44bd4ca0ce48df0106238200be42b806e526f49c38e1aaa53e7f5a71a9b03c5`.
+- Suggested commit message: `cell(streaming-output × aibrush-media): verify callback-output boundary`
+
+### audio-dsp × mediabunny
+
+- Scope lock: only Mediabunny audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-mediabunny-20260725-v1`:
+  `results/raw/chromium-2026-07-25T13-32-44-719Z.json`. It exercised all 36
+  scenarios and 102 candidates once. The initial raw result was 12 PASS, 10
+  NA_ENGINE, 9 FAIL, and 5 ERROR scenarios; no quick or repeated whole-feature
+  baseline was performed.
+- Only the 14 adverse scenarios were grouped in the forced-fresh closure
+  `results/raw/chromium-2026-07-25T13-49-26-053Z.json`, seed
+  `audio-dsp-mediabunny-20260725-v2`: 12 PASS, one exact NA_ENGINE, and one
+  partial long-form row. The 13 terminal rows from that closure were not
+  rerun.
+- Only the remaining long-form row was included in the final forced-fresh
+  closure `results/raw/chromium-2026-07-25T13-53-13-484Z.json`, seed
+  `audio-dsp-mediabunny-20260725-v3`; all four exhaustive candidates passed.
+- Latest-evidence reduction is 25 PASS and 11 NA_ENGINE scenarios. Candidate
+  accounting is 67 PASS and 35 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, partial, or SKIPPED outcomes.
+- Repairs are evidence-scoped: fixed-semantics channel/gapless rows no longer
+  rotate through layout-incompatible real files; one physically truncated
+  PCM-s24 source is excluded from three positive rows; the fixed native mixer
+  declares the authored stereo-to-5.1 matrix exact NA_ENGINE; malformed WAV
+  parse failures use the typed graceful-rejection channel; and resampling
+  ignores negligible narrow-bin leakage while the long-form broadband
+  contract explicitly retains structure, duration, RMS, and clipping gates
+  when no authored tone bin is energized.
+- Cell boundary: focused regressions are 130 pass with 2078 assertions. The
+  one post-repair full-suite run is 1189 pass with 14362 assertions across 80
+  files in 123.69 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `e69590f1a61df1a63db0ae6f599946e428ca9fe85afe529326f06f42a284a1bb` /
+  `2cf69d60c830d37a3fd5f75c59f29e0dfbb00ec08041b3328b009909e753fc6c`.
+- Fourteen-row closure content hash / file SHA-256:
+  `1840579d190191665e418bf469df204712df123aa2f03a6bdb5eed4091f547ad` /
+  `5b18f82420c313e52074d21f5bc2a163ba03d7522cf2237962297b86bbb17e62`.
+- Final one-row closure content hash / file SHA-256:
+  `c5a6178e9f80fc7312eb49119a3376d68264e84a9a6eb6a30560e382740bc267` /
+  `676819a52fcc8365294cb95d9b4ee69da97473de31d53db72f95787c72317960`.
+- Suggested commit message: `cell(audio-dsp × mediabunny): complete exhaustive audio evidence`
+
+### audio-dsp × ffmpeg-wasm
+
+- Scope lock: only FFmpeg.wasm audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-ffmpeg-wasm-20260725-v1`:
+  `results/raw/chromium-2026-07-25T13-58-00-777Z.json`. It exercised all 36
+  scenarios and 102 candidates once in about 87 seconds. The initial raw
+  result was 24 PASS, 2 NA_ENGINE, 5 FAIL, and 5 ERROR scenarios; no quick or
+  repeated whole-feature baseline was performed.
+- Only the ten adverse scenarios were grouped in the 9.35-second forced-fresh
+  closure `results/raw/chromium-2026-07-25T14-03-19-153Z.json`, seed
+  `audio-dsp-ffmpeg-wasm-20260725-v2`. It returned 5 PASS and 5 exact
+  NA_ENGINE; none of the 26 terminal baseline rows was rerun.
+- Latest-evidence reduction is 29 PASS and 7 NA_ENGINE scenarios. Candidate
+  accounting is 89 PASS and 13 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, partial, or SKIPPED outcomes.
+- Repairs are exact to observed boundaries: robustness contracts route
+  truncated WAV/AIFF and corrupt-WAV parse failures through typed malformed
+  rejection; the zero-sample transcode rejects before emitting an
+  uninspectable WAV; endianness-roundtrip telemetry counts only the final WAV
+  while retaining the intermediate AIFF evidence; and support declares the
+  four measured authored-matrix limitations plus the strict floating-point
+  fade-envelope limitation as reason-coded NA_ENGINE. The working
+  stereo-to-mono matrix remains supported.
+- Cell boundary: focused regressions are 113 pass with 1797 assertions. The
+  one post-repair full-suite run is 1190 pass with 14373 assertions across 80
+  files in 123.94 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `e25954e10382adf3d6917670317e6f64122fe219badff091648b404c74d7f310` /
+  `790ea9de70720c79b871a2bb1251aaa041aaf4361383359fcfff831d3653fc8a`.
+- Ten-row closure content hash / file SHA-256:
+  `bd406525f097ea9f6758eded46f5ab3a13d3e152158ff1b55bfdc0a5a4e2c034` /
+  `7d1d8021a17595d9cfc0609b55a0953dbeebf2386d68913bc0fec52801dfce91`.
+- Suggested commit message: `cell(audio-dsp × ffmpeg-wasm): complete exhaustive audio evidence`
+
+### audio-dsp × mp4box
+
+- Scope lock: only MP4Box audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The sole authoritative run is the forced-fresh exhaustive Chromium baseline
+  at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-mp4box-20260725-v1`:
+  `results/raw/chromium-2026-07-25T14-06-43-085Z.json`. All 36 scenarios are
+  exact NA_ENGINE in 3.26 seconds.
+- Evidence: every Audio-DSP row requires transcode, decode, or a non-ISO probe
+  tuple outside MP4Box's scored ISO-BMFF parser/mux surface. Every row stops at
+  concrete support preflight before operation; zero FAIL, ERROR, SKIPPED,
+  partial, or unobserved rows.
+- No source repair was needed. Focused MP4Box/Audio-DSP regressions are 63
+  pass with 5173 assertions; the existing 1190-test source-change boundary
+  was reused. Typecheck and `git diff --check` are clean.
+- Content hash / file SHA-256:
+  `7ad8a632a1088c0cc916af1ed9a6a0c6801cd520187ffef5c2fc190780ea59a1` /
+  `ddd374a281933fb418fe953a405a1b20368b730e4a5827b2fd7c4a696cd2c76b`.
+- Suggested commit message: `cell(audio-dsp × mp4box): verify parser-only audio boundary`
+
+### audio-dsp × remotion
+
+- Scope lock: only Remotion audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-remotion-20260725-v1`:
+  `results/raw/chromium-2026-07-25T14-07-31-608Z.json`. It exercised all 36
+  scenarios and 102 candidates once in about 37 seconds. The initial raw
+  result was 4 PASS, 28 NA_ENGINE, 2 partial, 1 SKIPPED, and 1 ERROR
+  scenario; no quick or repeated whole-feature baseline was performed.
+- Only those four adverse scenarios were grouped in the 10-second
+  forced-fresh closure
+  `results/raw/chromium-2026-07-25T14-14-06-682Z.json`, seed
+  `audio-dsp-remotion-20260725-v2`. It returned 2 PASS and 2 exact
+  NA_ENGINE; none of the 32 terminal baseline rows was rerun.
+- Latest-evidence reduction is 6 PASS and 30 NA_ENGINE scenarios. Candidate
+  accounting is 12 PASS and 90 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, partial, or SKIPPED outcomes.
+- Repairs are exact to observed Remotion 4.0.479 boundaries: 48kHz-to-44.1kHz
+  WAV conversion is reason-coded NA after measured 100–169-frame program
+  truncation; the exact valid PCM-24 `afsp` and `pad` ancillary-chunk inputs
+  are parser NA while their working sibling remains supported; the obsolete
+  blanket long-form skip is replaced by a concrete whole-file resampling
+  budget decision; and empty audio is a typed graceful rejection before
+  Remotion can publish non-finite progress. Mutated inputs remain executable.
+- Cell boundary: focused regressions are 122 pass with 2014 assertions. The
+  one post-repair full-suite run is 1192 pass with 14377 assertions across 80
+  files in 122.20 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `afdadbca86761b139e51c146684a2b7ab9476f5c4d8a13a98735835952687fe5` /
+  `1798d79f21cb77ccd485f4ecb64a8660b1ccc83c98d0c61276e8524899a3d2c7`.
+- Four-row closure content hash / file SHA-256:
+  `87af2a9c6d440daa2ead2db2cd209f69a86f704fc1c3a32345d52c1afcc843ee` /
+  `42b5cf2d7052aef6061d6ce5de5742fc687df076f5c9cf52a3f0189413ce20f5`.
+- Suggested commit message: `cell(audio-dsp × remotion): complete exhaustive audio evidence`
+
+### audio-dsp × web-demuxer@4.0.0
+
+- Scope lock: only web-demuxer audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The sole authoritative run is the forced-fresh exhaustive Chromium baseline
+  at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-web-demuxer-20260725-v1`:
+  `results/raw/chromium-2026-07-25T14-18-34-503Z.json`. All 36 scenarios and
+  all 102 candidates are exact NA_ENGINE; the launcher completed in 2.7
+  seconds.
+- Evidence: every row stops at coarse capability preflight. The parser does
+  not declare Audio-DSP's transcode/trim operations or the WAV/AIFF/CAF input
+  surface needed by the few probe/decode rows. Zero operation calls, FAIL,
+  ERROR, SKIPPED, partial, or unobserved outcomes remain.
+- No source repair was needed. Focused web-demuxer/Audio-DSP regressions are
+  37 pass with 292 assertions; the existing 1192-test source-change boundary
+  was reused. Typecheck and `git diff --check` are clean.
+- Content hash / file SHA-256:
+  `1751ccd92b1a6952e3ea6682c4461182fe12360afae7ed41cd4d1035f3d69a8c` /
+  `6280d413a6215626a60fa30a7b4678e48868a37b23c8f121b00dea5c99494def`.
+- Suggested commit message: `cell(audio-dsp × web-demuxer): verify parser-only audio boundary`
+
+### audio-dsp × aibrush-media
+
+- Scope lock: only aibrush-media audio-DSP adapter/support behavior and
+  audio-DSP-owned shared layers when independently proven necessary.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `audio-dsp-aibrush-media-20260725-v1`:
+  `results/raw/chromium-2026-07-25T14-19-29-536Z.json`. It exercised all 36
+  scenarios and 102 candidates once in about one minute. The initial raw
+  result was 30 PASS, 2 NA_ENGINE, 3 ERROR, and 1 FAIL scenario; no quick or
+  repeated whole-feature baseline was performed.
+- Only those four adverse scenarios were grouped in the 3.1-second
+  forced-fresh closure
+  `results/raw/chromium-2026-07-25T14-23-34-726Z.json`, seed
+  `audio-dsp-aibrush-media-20260725-v2`. It returned 3 PASS and 1 exact
+  NA_ENGINE; none of the 32 terminal baseline rows was rerun.
+- Latest-evidence reduction is 33 PASS and 3 NA_ENGINE scenarios. Candidate
+  accounting is 93 PASS and 9 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, partial, or SKIPPED outcomes.
+- Repairs are narrow: negative WAV/AIFF header probe failures now use the
+  existing typed graceful-rejection channel; empty audio rejects before an
+  uninspectable WAV can escape; and only the authored stereo-to-5.1
+  FL/FR/FC/LFE/BL/BR matrix is exact NA_ENGINE because the pinned PCM
+  converter does not implement those coefficients. Working mono/stereo and
+  5.1-to-stereo siblings remain supported, and mutated inputs remain
+  executable.
+- Cell boundary: focused regressions are 112 pass with 1805 assertions. The
+  one post-repair full-suite run is 1194 pass with 14386 assertions across 80
+  files in 119.74 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `77e049a8228b41a8dfc88baacc145d58ab0732a05452413c7bcd21e51b6285ff` /
+  `7da29318bd8f29a9633eb816786dca83691ffad8cab3fc03883559d29a78d453`.
+- Four-row closure content hash / file SHA-256:
+  `b6a79876eb7240c8bfb46e12a1b14991e60c88c1ad3a5533b661b41b608a721f` /
+  `65ed682bc4d0d0c56d0a713ac866f4a5bfaa10aca4545257e4de5bf846670da3`.
+- Suggested commit message: `cell(audio-dsp × aibrush-media): complete exhaustive audio evidence`
+
+### robustness × mediabunny
+
+- Scope lock: only Mediabunny robustness adapter/support behavior and
+  robustness-owned shared layers when independently proven necessary.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run with seed `robustness-mediabunny-20260725-v1`:
+  `results/raw/chromium-2026-07-25T14-26-47-676Z.json`. It exercised all 63
+  scenarios and 65 candidates once in about 32 seconds. The initial result
+  was 18 PASS, 10 NA_ENGINE, 5 FAIL, and 30 ERROR scenarios (one ERROR cell
+  had partial 1/3 candidate coverage); no quick baseline was performed.
+- All 35 adverse scenarios were grouped in one forced-fresh closure,
+  `results/raw/chromium-2026-07-25T14-44-04-156Z.json`, seed
+  `robustness-mediabunny-20260725-v2`. It returned 30 PASS, 1 exact
+  NA_ENGINE, and four residual FAIL; none of the 28 already-terminal baseline
+  scenarios was rerun.
+- Only those four residual rows were then closed in
+  `results/raw/chromium-2026-07-25T14-46-31-254Z.json`, seed
+  `robustness-mediabunny-20260725-v3`: 4 PASS in 4.1 seconds.
+- Latest-evidence reduction is 52 PASS and 11 NA_ENGINE scenarios. Candidate
+  accounting is 54 PASS and 11 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, partial, or SKIPPED outcomes.
+- Shared repairs are evidence-producing: isolated Workers now use
+  origin-rooted golden URLs and parent-verified exhaustive malformed
+  candidates; seek survivor plans request packet evidence and compare the
+  primary video presentation boundaries; PCM output uses the neutral native
+  reader; gapless audio uses container timing plus native WebCodecs rather
+  than main-thread AudioContext; and DOM playback checks were removed only
+  from Worker-isolated rows already gated by stronger live SSIM or strict
+  reference re-import.
+- Mediabunny-specific malformed TS/decode framework errors are mapped to the
+  typed negative-input channel only for the exact known parse/decode forms.
+  CBCS remains honest NA_ENGINE because Mediabunny 1.48.0 does not expose
+  this protection form through `resolveKeyId`; its scenario now uses the
+  authoritative versioned key record before that applicability decision.
+- Cell boundary: focused regressions are 73 pass with 567 assertions. The
+  one post-repair full-suite run is 1196 pass with 14396 assertions across 80
+  files in 119.84 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `6005a2d601dd0edaaf165c26a23e318551f011e665a90e60ebe8582e6d2da263` /
+  `d4c7d7ef1853b6be3ec68a5f8966067c0c117b1a916f12bf19f8cb9bec862fe5`.
+- Thirty-five-row closure content hash / file SHA-256:
+  `5b7e0bf39bede25a23d32dce09cc41b910be1b63b85c5573c7d3db0120da4f28` /
+  `fc6808257addbef6e39da69d16ed113f5afdbe1bf4a85ee98b34e75f0f7750b7`.
+- Four-row closure content hash / file SHA-256:
+  `7b852cd9a479fecfe2c1b6f823c7d0d7992d05bbd53b9c3031285d0719312820` /
+  `d2db324d6cdfa8901185dad0c5ff851823c71ef7114df1e0f9b99e56f00e2f50`.
+- Suggested commit message: `cell(robustness × mediabunny): complete isolated robustness evidence`
+
+### robustness × ffmpeg-wasm, mp4box, remotion, web-demuxer, aibrush-media
+
+- The sole five-engine full-feature baseline is the forced-fresh exhaustive
+  Chromium batch `results/raw/chromium-2026-07-25T14-50-43-570Z.json`, seed
+  `robustness-remaining-20260725-v1`. It exercised 315 scenario rows and 325
+  candidates once. The baseline left only 12 adverse engine-scenario rows;
+  the other 303 rows were never rerun.
+- Adverse rows were closed in engine-scoped batches so selector cross-products
+  could not repeat terminal evidence:
+  `results/raw/chromium-2026-07-25T15-12-15-713Z.json` (Aibrush discovery),
+  `results/raw/chromium-2026-07-25T15-14-59-170Z.json` (FFmpeg),
+  `results/raw/chromium-2026-07-25T15-15-07-548Z.json` (MP4Box discovery),
+  `results/raw/chromium-2026-07-25T15-15-49-584Z.json` (Remotion +
+  web-demuxer), `results/raw/chromium-2026-07-25T15-18-47-827Z.json`
+  (three-row Aibrush final), and
+  `results/raw/chromium-2026-07-25T15-18-59-971Z.json` (one-row MP4Box final).
+- Latest-evidence scenario/candidate reductions are:
+  FFmpeg 47/49 PASS and 16/16 NA_ENGINE; MP4Box 18/20 PASS and 45/45
+  NA_ENGINE; Remotion 39/41 PASS and 24/24 NA_ENGINE; web-demuxer 26/28 PASS
+  and 37/37 NA_ENGINE; Aibrush 56/58 PASS and 7/7 NA_ENGINE. All five cells
+  have 63/63 scenarios and 65/65 candidates terminal, with zero FAIL, ERROR,
+  NA_ASSET, NA_BROWSER, partial, or SKIPPED outcomes.
+- Repairs are exact to measured boundaries. Negative damaged-payload decode
+  and malformed-parser signatures use typed clean rejection without
+  relabeling lifecycle failures. FFmpeg's strict fragmented-copy row and
+  MP4Box's long AAC mux-roundtrip row are exact NA_ENGINE. Aibrush probes a
+  dimension-valid H.264 Level 4.0 configuration at 1080p; its two measured
+  trim-composition boundary misses are exact NA_ENGINE. The CBCS row composes
+  the protected source's exact presentation timeline with independently
+  decoded clear-reference frame identity, avoiding a corpus change. Remotion
+  and web-demuxer preserve their ordinary partial-decode errors while typing
+  the same damaged-input failures only under the negative robustness
+  contract.
+- Focused regressions and typecheck are clean; the final post-change full
+  suite is deferred until the performance cells reach their final source
+  boundary.
+- Artifact file SHA-256 values, in the order listed above:
+  `49c3e298bacf60d8b34d65e61587dcfed0cbdd3a724426ec145122d3a3e41f46`,
+  `035db81c236067b70967dc41ae12dd158f11b6da6344c02b9d8804bc0128ea67`,
+  `3ee519deb8341b01eb893d514714c77a2c0ac6708db2aa8d55b534789be1a5e4`,
+  `40ba0314a1f72f699278c88bd57829a01ca29033ff0935118dc05435d08909c3`,
+  `3c96064cf171cbe188d6938a3a859039dd31ce9bd4ab0d0916a41e06b7812c02`,
+  `e520e30b800e4688ac6ace7dd87b8ddf0f86141b628d9d13eab762f963bd900c`,
+  and `dee86d0da54cf0c991c14b4e24e0c4d5ce3d9679e3e49d0849758808c07da53a`.
+- Suggested commit message: `cell(robustness): complete remaining exhaustive engine evidence`

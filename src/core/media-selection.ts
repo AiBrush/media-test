@@ -576,6 +576,12 @@ function rotationPolicyReason(
   if (scenario.family === 'streaming-output') return { reasonCode: 'STREAMING_OUTPUT_BAKED_ONLY', detail: 'streaming-output topology is fixture-bound' };
   if (Array.isArray(scenario.input)) return { reasonCode: 'MULTI_INPUT_BAKED_ONLY', detail: 'no catalog bundle declares this ordered multi-input contract' };
   if (scenario.op === 'seek') return { reasonCode: 'SEEK_TARGET_FIXTURE_BOUND', detail: 'seek target is calibrated to the baked input' };
+  if (AUDIO_DSP_FIXED_INPUT_SCENARIOS.has(scenario.id)) {
+    return {
+      reasonCode: 'AUDIO_DSP_INPUT_SEMANTICS_FIXTURE_BOUND',
+      detail: 'the authored sample-rate, channel-layout, or gapless contract is calibrated to the baked input',
+    };
+  }
   if (row.class === 'DERIVED' && !isRotatableCencMp4(row)) {
     return { reasonCode: 'DERIVED_SCHEME_NOT_ROTATABLE', detail: 'derived row is not supported CENC-in-MP4' };
   }
@@ -583,6 +589,16 @@ function rotationPolicyReason(
   // assessRobustnessVariantEligibility below, which requires an exact same-contract declaration.
   return undefined;
 }
+
+const AUDIO_DSP_FIXED_INPUT_SCENARIOS = new Set([
+  'audio-dsp/resample_48k_to_16k',
+  'audio-dsp/downmix_stereo_to_mono',
+  'audio-dsp/upmix_mono_to_stereo',
+  'audio-dsp/downmix_5_1_to_stereo',
+  'audio-dsp/upmix_stereo_to_5_1',
+  'audio-dsp/edge_gapless_aac_decode',
+  'audio-dsp/edge_variable_channel_count_downmix',
+]);
 
 export type CandidateEligibility =
   | { eligible: true; evidencePlan: CandidateOracleEvidencePlan }

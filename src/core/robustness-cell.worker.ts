@@ -42,15 +42,32 @@ async function execute(request: RobustnessWorkerRequest): Promise<RobustnessWork
     let scenario = baseScenario;
     const selectedFile = request.selectedFile;
     if (selectedFile && !isBakedSelection(baseScenario.input, selectedFile)) {
-      const sources = await loadScenarioSources();
-      const candidates = candidatesForRun([baseScenario], sources, { rotate: true }).get(baseScenario.id) ?? [];
-      const selected = candidates.find((candidate) => candidate.selectedFile === selectedFile);
-      if (!selected) {
-        throw new Error(
-          `isolated selection '${selectedFile}' is absent from the verified pool for '${baseScenario.id}'`,
-        );
+      const parentVerifiedMalformedCandidate =
+        request.options.selectionEvidencePlan?.declaredAvailable.includes('MALFORMED_REJECTION') === true &&
+        (request.options.verifiedContents?.length ?? 0) > 0;
+      if (parentVerifiedMalformedCandidate) {
+        // The parent already selected, digest-verified, and transferred these exact malformed bytes
+        // plus their evidence plan. Re-fetching/re-filtering the mutable catalog in every fresh
+        // worker both duplicates work and can reject a non-HRW exhaustive candidate. Resolved input
+        // ids are authoritative at runOne's boundary, so only mirror them into the scenario view.
+        const ids = request.options.resolvedInputs
+          ?.filter((input) => input.transport === undefined)
+          .map((input) => input.id) ?? [];
+        if (ids.length === 0) {
+          throw new Error(`isolated malformed selection '${selectedFile}' has no resolved operation input`);
+        }
+        scenario = { ...baseScenario, input: ids.length === 1 ? ids[0]! : ids };
+      } else {
+        const sources = await loadScenarioSources();
+        const candidates = candidatesForRun([baseScenario], sources, { rotate: true }).get(baseScenario.id) ?? [];
+        const selected = candidates.find((candidate) => candidate.selectedFile === selectedFile);
+        if (!selected) {
+          throw new Error(
+            `isolated selection '${selectedFile}' is absent from the verified pool for '${baseScenario.id}'`,
+          );
+        }
+        scenario = selected.effectiveScenario;
       }
-      scenario = selected.effectiveScenario;
     }
 
     const engine = await registered.factory();

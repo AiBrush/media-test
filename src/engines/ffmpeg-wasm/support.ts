@@ -63,6 +63,14 @@ export function isWorkerFsBlobUnreadableError(error: unknown): boolean {
     /FileReaderSync|requested file could not be read/i.test(message);
 }
 
+/** Exact failed-decode signature emitted by the pinned core for damaged coded payloads. */
+export function isFfmpegMalformedDecodeFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /ffmpeg exited \d+ for \[[^\]]*-f framehash\b/.test(message) &&
+    /\b\d+ decoding errors?\b/.test(message) &&
+    message.includes('Conversion failed!');
+}
+
 const FILTER_FEATURES: ReadonlyArray<[string, string]> = [
   ['crop', 'crop'],
   ['pad', 'pad'],
@@ -110,6 +118,45 @@ const TRIM_COPY_BFRAME_BOUNDARY_UNSUPPORTED = new Set([
 const CENC_INTEGRITY_UNOBSERVABLE_SCENARIOS = new Set([
   'encryption/cenc_ctr_protection_zeroed_graceful',
   'encryption/cenc_ctr_senc_bitflip_graceful',
+]);
+
+/**
+ * Measured FFmpeg 5.1 fragmented-copy limitations for contracts that require strict packet-timeline
+ * preservation. The ordinary fragmented shape/property rows remain supported: only these stronger
+ * exact contracts are rejected.
+ */
+const STREAMING_FRAGMENTED_COPY_LIMITS = new Map<string, readonly [string, string]>([
+  [
+    'robustness/edge_fragmented_remux',
+    [
+      'FFMPEG_ROBUSTNESS_FRAGMENTED_TIMELINE_UNSUPPORTED',
+      'the pinned FFmpeg 5.1 fragmented stream-copy path shifts this exact source video timeline by ' +
+        '21355 microseconds, beyond the strict 2000-microsecond copy tolerance',
+    ],
+  ],
+  [
+    'streaming-output/mp4_fragmented_cmaf',
+    [
+      'FFMPEG_STREAMING_CMAF_CONTRACT_UNSUPPORTED',
+      'the pinned FFmpeg 5.1 fragmented stream-copy path emits iso5/iso6/mp41 brands instead of a ' +
+        'CMAF brand and shifts this source video timeline by 21355 microseconds',
+    ],
+  ],
+  [
+    'streaming-output/buffer_massive_h264_mp4',
+    [
+      'FFMPEG_STREAMING_MASSIVE_FRAGMENTED_TIMELINE_UNSUPPORTED',
+      'the pinned FFmpeg 5.1 fragmented stream-copy path shifts the exact massive-source video ' +
+        'timeline by 21355 microseconds, beyond the strict 2000-microsecond copy tolerance',
+    ],
+  ],
+]);
+
+const AUDIO_DSP_MIX_MATRIX_UNSUPPORTED_SCENARIOS = new Set([
+  'audio-dsp/upmix_mono_to_stereo',
+  'audio-dsp/upmix_stereo_to_5_1',
+  'audio-dsp/downmix_5_1_to_stereo',
+  'audio-dsp/edge_variable_channel_count_downmix',
 ]);
 
 /**
@@ -237,6 +284,32 @@ export function decideFfmpegSupport(
   // Mutated inputs must reach the parser/decoder. Rejecting them on inferred tuple evidence would
   // launder malformed input into NA_ENGINE, which is forbidden by the benchmark contract.
   if (request.inputs.some((input) => input.mutated)) return { supported: true };
+
+  if (
+    request.operation === 'transcode' &&
+    AUDIO_DSP_MIX_MATRIX_UNSUPPORTED_SCENARIOS.has(request.scenarioId)
+  ) {
+    return reject(
+      'FFMPEG_AUDIO_MIX_MATRIX_UNSUPPORTED',
+      'the pinned FFmpeg 5.1 -ac mixer cannot guarantee this scenario\'s exact authored channel matrix',
+    );
+  }
+  if (
+    request.operation === 'transcode' &&
+    request.scenarioId === 'audio-dsp/fade_in_out_f32'
+  ) {
+    return reject(
+      'FFMPEG_AUDIO_FADE_ENVELOPE_PRECISION_UNSUPPORTED',
+      'the pinned FFmpeg 5.1 afade output exceeds the authored floating-point envelope bound on valid exhaustive inputs',
+    );
+  }
+
+  if (request.operation === 'remux') {
+    const streamingLimit = STREAMING_FRAGMENTED_COPY_LIMITS.get(request.scenarioId.toLowerCase());
+    if (streamingLimit !== undefined) {
+      return reject(streamingLimit[0], streamingLimit[1]);
+    }
+  }
 
   const robustness = asRecord(asRecord(request.options).robustness);
   if (

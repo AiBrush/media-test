@@ -90,11 +90,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'Retest after a streaming parser path no longer retains the complete packet walk.',
   ),
   budget(
-    'streaming-output/buffer_massive_h264_mp4',
-    'A no-reuse Chromium run timed out buffering the two-hour MP4 through bufferWriter.',
-    'Retest when the adapter exposes a bounded streaming target for this operation.',
-  ),
-  budget(
     'performance/size-ladder-iterate-packets-large',
     'Repeated packet iteration of the 120-second rung exceeds the shared performance-run allocation.',
     'Retest after parser throughput or benchmark reuse materially improves.',
@@ -108,11 +103,6 @@ const DISABLED_CELLS: readonly DisabledCell[] = [
     'performance/size-ladder-demux-peak-memory-large',
     'Repeated full demux of the 120-second rung exceeds the shared measurement allocation.',
     'Retest after memory measurement can observe one validated packet walk.',
-  ),
-  budget(
-    'audio-dsp/edge_longform_audio_resample_16k',
-    'Resampling the complete one-hour PCM fixture through conversion exceeds the shared run budget.',
-    'Retest after chunked audio conversion avoids whole-file buffering/repetition.',
   ),
 ];
 

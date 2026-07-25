@@ -1154,7 +1154,7 @@ const OPTION_KEYS: Record<Operation, ReadonlySet<string>> = {
   seek: new Set(['expectKeyframe', 'invariant', 'priorSeekUs', 'robustness', 'seekEdge', 'seekPolicy', 'tUs']),
   trim: new Set(['a', 'b', 'c', 'container', 'endUs', 'fragmented', 'frameAccurate', 'gracefulAllowOutput', 'invariant', 'range', 'robustness', 'startUs']),
   mux: new Set(['container', 'fastStart', 'fragmented', 'invariant', 'robustness', 'swapAudioFrom', 'target', 'trackSelect']),
-  decrypt: new Set(['cleartextAsset', 'invariant', 'key', 'robustness', 'scheme']),
+  decrypt: new Set(['clearReferenceTimeline', 'cleartextAsset', 'invariant', 'key', 'robustness', 'scheme']),
 };
 const OUTPUT_CONTAINER_OPERATIONS = new Set<Operation>(['remux', 'transcode', 'trim', 'mux']);
 

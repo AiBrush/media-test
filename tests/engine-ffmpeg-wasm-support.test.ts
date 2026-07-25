@@ -10,6 +10,7 @@ import {
   FFMPEG_BENCHMARK_LIMITS,
   decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
+  isFfmpegMalformedDecodeFailure,
   muxLegality,
   tupleSummary,
   type FfmpegRuntimeBuild,
@@ -66,6 +67,33 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
         sampleTimeoutMs: 1_000,
       },
     });
+  });
+
+  test('recognizes only the pinned damaged-payload decode signature', () => {
+    const measured = new Error(
+      'ffmpeg.wasm@0.12.15: ffmpeg exited 69 for [-i op1.in -frames:v 30 -f framehash ' +
+      '-hash sha256 op1.framehash.txt]. Log: 1 frames successfully decoded, 131 decoding errors | ' +
+      'Conversion failed! | Aborted()',
+    );
+    expect(isFfmpegMalformedDecodeFailure(measured)).toBe(true);
+    expect(isFfmpegMalformedDecodeFailure(new Error('Conversion failed!'))).toBe(false);
+    expect(isFfmpegMalformedDecodeFailure(new DOMException('cancelled', 'AbortError'))).toBe(false);
+  });
+
+  test('classifies only the measured robustness fragmented-copy contract', () => {
+    const measured = request('remux', 'mp4', av('h264', 'aac'), {
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true },
+    });
+    measured.scenarioId = 'robustness/edge_fragmented_remux';
+    expect(reason(measured)).toBe('FFMPEG_ROBUSTNESS_FRAGMENTED_TIMELINE_UNSUPPORTED');
+
+    const sibling = request('remux', 'mp4', av('h264', 'aac'), {
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true },
+    });
+    sibling.scenarioId = 'robustness/edge_faststart_reserve_remux';
+    expect(decideFfmpegSupport(sibling, RUNTIME)).toEqual({ supported: true });
   });
 
   test('marks the static fallback unverified while retaining explicit runtime facts', () => {
@@ -179,6 +207,36 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     expect(decideFfmpegSupport(supportedSibling, RUNTIME)).toEqual({ supported: true });
   });
 
+  test('classifies only the two measured strict fragmented streaming contracts', () => {
+    const cmaf = request('remux', 'mp4', av('h264', 'aac'), {
+      id: 'h264_1080p_30s.mp4',
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true, target: 'buffer' },
+    });
+    cmaf.scenarioId = 'streaming-output/mp4_fragmented_cmaf';
+    expect(reason(cmaf)).toBe('FFMPEG_STREAMING_CMAF_CONTRACT_UNSUPPORTED');
+
+    const massive = request('remux', 'mp4', av('h264', 'aac'), {
+      id: 'massive_h264_1080p_2h.mp4',
+      sizeBytes: 1_141_204_791,
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true, target: 'buffer' },
+    });
+    massive.scenarioId = 'streaming-output/buffer_massive_h264_mp4';
+    expect(reason(massive)).toBe('FFMPEG_STREAMING_MASSIVE_FRAGMENTED_TIMELINE_UNSUPPORTED');
+
+    const supportedSibling = request('remux', 'mp4', av('h264', 'aac'), {
+      id: 'h264_1080p_30s.mp4',
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true, target: 'buffer' },
+    });
+    supportedSibling.scenarioId = 'streaming-output/prop_probe_dur_fragmented_shape';
+    expect(decideFfmpegSupport(supportedSibling, RUNTIME)).toEqual({ supported: true });
+
+    cmaf.inputs[0]!.mutated = true;
+    expect(decideFfmpegSupport(cmaf, RUNTIME)).toEqual({ supported: true });
+  });
+
   test('classifies the enumerated budget/alpha/two-pass/mux/decrypt misses as NA_ENGINE', () => {
     const rows: Array<[string, ConcreteOperationRequest, string]> = [
       ['H.264→HEVC', request('transcode', 'mp4', av('h264', 'aac'), {
@@ -231,6 +289,37 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
         invariant: 'transcode-effect-aware',
       },
     }))).toBe('FFMPEG_DEPTH_TRANSFORM_PIXEL_FIDELITY_UNSUPPORTED');
+  });
+
+  test('declares measured audio-DSP matrix and fade precision limits without hiding supported stereo downmix', () => {
+    const matrixRows = [
+      'audio-dsp/upmix_mono_to_stereo',
+      'audio-dsp/upmix_stereo_to_5_1',
+      'audio-dsp/downmix_5_1_to_stereo',
+      'audio-dsp/edge_variable_channel_count_downmix',
+    ];
+    for (const scenarioId of matrixRows) {
+      const tuple = request('transcode', 'wav', [audio('pcm-s16')], {
+        output: { container: 'wav', audioCodec: 'pcm-s16' },
+        options: { audio: { codec: 'pcm-s16', channels: 2 } },
+      });
+      tuple.scenarioId = scenarioId;
+      expect(reason(tuple), scenarioId).toBe('FFMPEG_AUDIO_MIX_MATRIX_UNSUPPORTED');
+    }
+
+    const fade = request('transcode', 'wav', [audio('pcm-f32')], {
+      output: { container: 'wav', audioCodec: 'pcm-f32' },
+      options: { audio: { codec: 'pcm-f32', fade: { inSec: 1, outSec: 1, curve: 'linear' } } },
+    });
+    fade.scenarioId = 'audio-dsp/fade_in_out_f32';
+    expect(reason(fade)).toBe('FFMPEG_AUDIO_FADE_ENVELOPE_PRECISION_UNSUPPORTED');
+
+    const supported = request('transcode', 'wav', [audio('pcm-s16')], {
+      output: { container: 'wav', audioCodec: 'pcm-s16' },
+      options: { audio: { codec: 'pcm-s16', channels: 1 } },
+    });
+    supported.scenarioId = 'audio-dsp/downmix_stereo_to_mono';
+    expect(decideFfmpegSupport(supported, RUNTIME)).toEqual({ supported: true });
   });
 
   test('classifies concrete ST-core deadline and MP3-in-MP4 limits before execution', () => {

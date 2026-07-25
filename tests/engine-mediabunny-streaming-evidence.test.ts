@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 
 import {
   CONCRETE_OPERATION_PROTOCOL,
+  validateOperationTelemetry,
   type MediaInput,
   type OperationContext,
   type OperationPhase,
@@ -168,7 +169,7 @@ describe('Mediabunny production streaming-output evidence boundary', () => {
   test('native CMAF joins the finalized init and media targets with exact retention evidence', async () => {
     await withEngine(async (engine) => {
       const options = { container: 'mp4', target: 'buffer', fragmented: true };
-      const { context } = operationContext(options);
+      const { context, events } = operationContext(options);
       context.request.scenarioId = 'streaming-output/mp4_fragmented_cmaf';
       const output = await engine.remux(await fixture(), options, context) as MediabunnyMediaBytes;
       const { evidence, trace } = requireEvidence(output);
@@ -183,6 +184,8 @@ describe('Mediabunny production streaming-output evidence boundary', () => {
         retainedOutputPolicy: 'native-init-plus-media-plus-concatenated-output',
       });
       expect(trace.retainedOutputBytes).toBe(output.bytes.byteLength * 2);
+      expect(() => validateOperationTelemetry('mediabunny@1.48.0', events, output.telemetry))
+        .not.toThrow();
       expect(validateSinkTrace(trace, { target: 'buffer' }))
         .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
     });
@@ -233,6 +236,32 @@ describe('Mediabunny production streaming-output evidence boundary', () => {
         supported: false,
         status: 'NA_ENGINE',
         reasonCode: MEDIABUNNY_REASON.WRITE_GRANULARITY,
+      });
+    });
+  });
+
+  test('cue-free live WebM is exact NA_ENGINE before source materialization', async () => {
+    await withEngine(async (engine) => {
+      const bytes = new Uint8Array(await readFile(new URL('recorder_headerless.webm', MEDIA_ROOT)));
+      const reads = { count: 0 };
+      const input = memoryInput('recorder_headerless.webm', bytes, reads);
+      const options = { container: 'webm', target: 'stream', appendOnly: true };
+      const { context } = operationContext(options);
+      context.request.inputs[0]!.container = 'webm';
+      context.request.inputs[0]!.tracks = [
+        { type: 'video', codec: 'vp8', width: 320, height: 240, fps: 30 },
+      ];
+      context.request.output = { container: 'webm', videoCodec: 'vp8' };
+
+      await expect(engine.remux(input, options, context)).rejects.toMatchObject({
+        name: 'NotApplicableError',
+        reasonCode: MEDIABUNNY_REASON.LIVE_WEBM_FINAL_CUES,
+      });
+      expect(reads.count).toBe(0);
+      expect(decideMediabunnySupport(context.request)).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: MEDIABUNNY_REASON.LIVE_WEBM_FINAL_CUES,
       });
     });
   });

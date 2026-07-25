@@ -982,6 +982,40 @@ describe('REQ-FEAT-53/59 live decrypt oracle integration', () => {
     });
   });
 
+  test('an explicit protected-source timeline policy composes exact source timing with clear frame identity', async () => {
+    const protectedBytes = new Uint8Array(await Bun.file('fixtures/media/cenc_cbcs.mp4').arrayBuffer());
+    const primary = Array.from({ length: 150 }, (_, index) =>
+      digest(index, Math.round(index * 1_000_000 / 30), index % 2 === 0 ? 'a' : 'b'));
+    const clear = primary.map((frame, index) => ({
+      ...frame,
+      ptsUs: index === 0 ? 0 : frame.ptsUs + 21_355,
+    }));
+    const policyScenario = decryptScenario();
+    policyScenario.options = {
+      ...policyScenario.options,
+      clearReferenceTimeline: 'protected-source',
+    };
+    const out = await runOracle('decrypt-bitexact', context({
+      scenario: policyScenario,
+      input: {
+        ...input,
+        id: 'cenc_cbcs.mp4',
+        arrayBuffer: async () => protectedBytes.slice().buffer,
+      },
+      output: { bytes: Uint8Array.of(2), mime: 'video/mp4', container: 'mp4' },
+      verifiedResources: { 'clear.mp4': Uint8Array.of(1) },
+      decodeWithPlatform: async (media) => ({
+        frames: media.bytes[0] === 1 ? clear : primary,
+      }),
+    }));
+
+    expect(out).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      reasonCode: 'DECRYPT_PROTECTED_TIMELINE_CLEAR_IDENTITY_VALID',
+    });
+  });
+
   test('clear-input decrypt is a literal byte-no-op, not a playable rewrap', async () => {
     const source = Uint8Array.of(1, 2, 3, 4);
     const clearInput: MediaInput = {

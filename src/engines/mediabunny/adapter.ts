@@ -313,6 +313,19 @@ function isGracefulNegativeRequest(context?: OperationContext): boolean {
   );
 }
 
+export function isMediabunnyMalformedParseFailure(
+  error: unknown,
+  unsupportedInputFormatError: new (...args: never[]) => Error,
+): boolean {
+  if (error instanceof unsupportedInputFormatError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return message === 'Assertion failed.' ||
+    message === 'Decoding error.' ||
+    message.startsWith('Invalid TS packet sync byte.') ||
+    message.startsWith('Invalid WAVE file - ') ||
+    /^Tried reading \[\d+, \d+\), but slice is \[\d+, \d+\)\./.test(message);
+}
+
 function isDeliberatelyIllegalMuxRequest(context?: OperationContext): boolean {
   return context?.request.operation === 'mux' &&
     (ILLEGAL_MUX_SCENARIO_IDS as readonly string[]).includes(context.request.scenarioId);
@@ -2445,6 +2458,7 @@ function instrumentedCmafBufferTargets(
   let maxPosition = 0;
   let overwriteCount = 0;
   let completed = false;
+  const extents = { init: 0, media: 0 };
   const ranges = {
     init: [] as Array<{ start: number; end: number }>,
     media: [] as Array<{ start: number; end: number }>,
@@ -2463,8 +2477,13 @@ function instrumentedCmafBufferTargets(
     nativeWriteBytes += end - start;
     writeCount++;
     maxPosition = Math.max(maxPosition, start);
+    extents[kind] = Math.max(extents[kind], end);
     firstNativeWriteMs ??= relativeMs(atMs);
-    context?.emit({ type: 'bytes-written', atMs: relativeMs(atMs), bytes: nativeWriteBytes });
+    context?.emit({
+      type: 'bytes-written',
+      atMs: relativeMs(atMs),
+      bytes: extents.init + extents.media,
+    });
     context?.emit({ type: 'write-count', atMs: relativeMs(atMs), count: writeCount });
   };
   const initTarget = new mb.BufferTarget({
@@ -3717,7 +3736,9 @@ export class MediabunnyEngine implements MediaEngine {
         'mux:roundtrip-compare', // demux->mux->demux packet stability is validated by the property oracle
         'streaming:decode-equality', // output-shape remuxes preserve decoded video frames
         'target:writes', // Output can write through native StreamTarget and reports target write telemetry
-        'headerless', // WebM/Matroska appendOnly live layout: unknown Segment size, no SeekHead/duration
+        // Coarse append-only discovery. Exact live rows are rejected by concrete preflight because
+        // Mediabunny 1.48.0 finalization appends Cues, which the cue-free contract forbids.
+        'headerless',
         'fanout', // transcode() returns every requested ABR rendition in MediaBytes.variants[]
         // mediabunny encodes AND decodes all PCM codecs in PURE TS, independent of WebCodecs:
         // encode.js canEncodeAudio / decode.js canDecodeAudio return true for PCM_AUDIO_CODECS BEFORE
@@ -3875,6 +3896,22 @@ export class MediabunnyEngine implements MediaEngine {
         }
       }
       return metadata;
+    } catch (error) {
+      if (
+        isGracefulNegativeRequest(context) &&
+        isMediabunnyMalformedParseFailure(error, this.lib.UnsupportedInputFormatError)
+      ) {
+        throw createMalformedInputError(
+          this.id,
+          'probe',
+          'parse',
+          'Mediabunny rejected the declared malformed probe input',
+          'MEDIABUNNY_PROBE_INPUT_MALFORMED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       unbindAbort();
       mbInput.dispose();
@@ -4041,11 +4078,9 @@ export class MediabunnyEngine implements MediaEngine {
         telemetry: { bytesRead: scaleContract ? sourceBytesRead : bytesRead, packetCount: packets.length },
       };
     } catch (error) {
-      const robustness = context?.request.options.robustness;
       if (
-        error instanceof this.lib.UnsupportedInputFormatError &&
-        isPlainObject(robustness) &&
-        robustness.schema === 'media-test/robustness-contract@1'
+        isGracefulNegativeRequest(context) &&
+        isMediabunnyMalformedParseFailure(error, this.lib.UnsupportedInputFormatError)
       ) {
         throw createMalformedInputError(
           this.id,
@@ -4272,7 +4307,13 @@ export class MediabunnyEngine implements MediaEngine {
           this.activeConversions,
         );
       } catch (error) {
-        if (error instanceof this.lib.UnsupportedInputFormatError) {
+        if (
+          error instanceof this.lib.UnsupportedInputFormatError ||
+          (
+            isGracefulNegativeRequest(singleContext) &&
+            isMediabunnyMalformedParseFailure(error, this.lib.UnsupportedInputFormatError)
+          )
+        ) {
           throw createMalformedInputError(
             this.id,
             'transcode',
@@ -4359,9 +4400,11 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
   ): Promise<FrameSink> {
     this.assertRuntimeSupport(context);
-    const mbInput = await openInput(this.lib, input);
-    const unbindAbort = bindAbortToInput(mbInput, context?.signal);
+    let mbInput: Input | undefined;
+    let unbindAbort: () => void = () => undefined;
     try {
+      mbInput = await openInput(this.lib, input);
+      unbindAbort = bindAbortToInput(mbInput, context?.signal);
       const operationStart = nowMs();
       let observedFirstFrameMs: number | undefined;
       const applicability = context
@@ -4498,9 +4541,25 @@ export class MediabunnyEngine implements MediaEngine {
       };
       out.selectedTrack = selectedTrack;
       return out;
+    } catch (error) {
+      if (
+        isGracefulNegativeRequest(context) &&
+        isMediabunnyMalformedParseFailure(error, this.lib.UnsupportedInputFormatError)
+      ) {
+        throw createMalformedInputError(
+          this.id,
+          'decodeFrames',
+          'decode',
+          'Mediabunny rejected the declared malformed decode input',
+          'MEDIABUNNY_DECODE_INPUT_MALFORMED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       unbindAbort();
-      mbInput.dispose();
+      mbInput?.dispose();
     }
   }
 

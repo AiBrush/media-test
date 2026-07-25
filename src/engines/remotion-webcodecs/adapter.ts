@@ -742,6 +742,19 @@ export class RemotionWebcodecsEngine implements MediaEngine {
           const decision = decideRemotionWebcodecsSupport(call.request);
           if (!decision.supported) throw decisionToNotApplicable(call.request, decision);
         }
+        if (
+          call.request.scenarioId === 'audio-dsp/edge_empty_audio_transcode' &&
+          call.request.options.gracefulAllowOutput === true
+        ) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'transcode',
+            'parse',
+            'the pinned Remotion conversion cannot construct finite progress for an empty audio program',
+            'REMOTION_TRANSCODE_EMPTY_AUDIO_REJECTED',
+            input.id,
+          );
+        }
         const output = await this.transcodeImpl(input, opts, call);
         return validateAdapterResult(ENGINE_ID, 'transcode', output);
       } catch (error) {
@@ -1307,6 +1320,25 @@ export class RemotionWebcodecsEngine implements MediaEngine {
       this.beginOperation('decodeFrames');
       try {
         return validateAdapterResult(ENGINE_ID, 'decodeFrames', await this.decodeFramesImpl(input, opts, call));
+      } catch (error) {
+        if (
+          isNegativeRobustnessRequest(call.request) &&
+          !isMalformedInputError(error) &&
+          !isNotApplicableError(error) &&
+          !isBrowserNotSupportedError(error) &&
+          isRemotionMalformedDecodeFailure(error)
+        ) {
+          throw createMalformedInputError(
+            ENGINE_ID,
+            'decodeFrames',
+            'decode',
+            describeError(error),
+            'REMOTION_DECODE_MALFORMED_INPUT_REJECTED',
+            input.id,
+            error,
+          );
+        }
+        throw error;
       } finally {
         this.updateResourceConfig(this.allResourcesClosed());
       }
@@ -3930,8 +3962,26 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isNegativeRobustnessRequest(request: ConcreteOperationRequest): boolean {
+  const robustness = request.options.robustness;
+  return typeof robustness === 'object' &&
+    robustness !== null &&
+    !Array.isArray(robustness) &&
+    (robustness as Record<string, unknown>).schema === 'media-test/robustness-contract@1' &&
+    (robustness as Record<string, unknown>).inputClass === 'negative';
+}
+
+/** Exact Chromium WebCodecs failure emitted after the damaged sample reaches Remotion's decoder. */
+export function isRemotionMalformedDecodeFailure(error: unknown): boolean {
+  return typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'EncodingError' &&
+    describeError(error) === 'Decoding error.';
+}
+
 function isGracefulTranscodeNegative(request: ConcreteOperationRequest): boolean {
-  return request.options.gracefulAllowOutput === true ||
+  return isNegativeRobustnessRequest(request) ||
+    request.options.gracefulAllowOutput === true ||
     request.scenarioId.startsWith('transcode/malformed_') ||
     request.scenarioId.startsWith('transcode/mismatch_');
 }

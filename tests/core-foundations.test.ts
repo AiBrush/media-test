@@ -357,6 +357,29 @@ describe('REQ-CORE-04: typed golden and neutral-reader evidence', () => {
     expect(requested).toEqual(['fixtures/golden/asset.meta.json']);
   });
 
+  test('a robustness seek-clamp survivor plan includes committed packet timing', () => {
+    const planned = goldenKindsForScenario(defineScenario({
+      id: 'robustness/seek-boundary-plan',
+      op: 'seek',
+      input: 'asset.mp4',
+      options: {
+        tUs: -1,
+        robustness: {
+          schema: 'media-test/robustness-contract@1',
+          inputClass: 'boundary',
+          returnedOutputCheck: 'seek-clamp',
+          survivorOracles: ['graceful-failure'],
+          timeoutMs: 15_000,
+        },
+      },
+      requires: { operations: ['seek'] },
+      oracles: ['graceful-failure'],
+      metrics: [],
+    }));
+
+    expect(planned).toEqual(['meta', 'packets']);
+  });
+
   test('an oracle accessing evidence omitted by its plan is a harness ERROR, not NA_ASSET', async () => {
     await withMockFetch((url) => Response.json(validGoldenForUrl(url)), async () => {
       const planned = await loadGolden('asset', { requestedKinds: [] });

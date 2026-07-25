@@ -28,6 +28,7 @@ import {
   buildResize,
   remotionOutputDimensions,
   RemotionWebcodecsEngine,
+  isRemotionMalformedDecodeFailure,
   probeExactRemotionVideoDecoderConfig,
   remotionWebcodecsSampleEvidence,
   shouldReplaceRemotionSeekSample,
@@ -161,6 +162,15 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
     ['adts', [audio('aac')]],
   ];
 
+  test('recognizes only Chromium damaged-sample EncodingError', () => {
+    const measured = Object.assign(new Error('Decoding error.'), { name: 'EncodingError' });
+    expect(isRemotionMalformedDecodeFailure(measured)).toBe(true);
+    expect(isRemotionMalformedDecodeFailure(new Error('Decoding error.'))).toBe(false);
+    expect(isRemotionMalformedDecodeFailure(
+      Object.assign(new Error('Decoder closed.'), { name: 'EncodingError' }),
+    )).toBe(false);
+  });
+
   test('every advertised input container has positive parser and WebCodecs read tuples', () => {
     expect(readableContainerCases.map(([container]) => container)).toEqual([...REMOTION_INPUT_CONTAINERS]);
     for (const [container, tracks] of readableContainerCases) {
@@ -286,6 +296,15 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
       inputs: [concreteInput('mp4', [video('h264')], { sizeBytes: 512 * 1024 * 1024 + 1 })],
       output: { container: 'mp4' },
     }), 'REMOTION_BUFFER_WRITER_RESOURCE_LIMIT');
+    const massiveBuffer = request('remux', {
+      inputs: [concreteInput('mp4', [video('h264'), audio('aac')], {
+        sizeBytes: 1_141_204_791,
+      })],
+      output: { container: 'mp4' },
+      options: { container: 'mp4', fragmented: true, target: 'buffer' },
+    });
+    massiveBuffer.scenarioId = 'streaming-output/buffer_massive_h264_mp4';
+    expectNa(massiveBuffer, 'REMOTION_BUFFER_WRITER_RESOURCE_LIMIT');
     expectNa(request('transcode', {
       output: { container: 'mp4' },
       encryption: 'cenc-ctr',
@@ -391,6 +410,55 @@ describe('REQ-ENG-08: tuple-aware Remotion capability', () => {
     const corrupted = structuredClone(h264Long);
     corrupted.inputs[0]!.mutated = true;
     expect(decideRemotionWebcodecsSupport(corrupted)).toEqual({ supported: true });
+  });
+
+  test('measured audio resample and WAV parser limits are exact concrete NA_ENGINE', () => {
+    const audioTranscode = (
+      scenarioId: string,
+      inputId: string,
+      sampleRate = 48_000,
+    ): ConcreteOperationRequest => {
+      const concrete = request('transcode', {
+        inputs: [concreteInput('wav', [audio('pcm-s24', sampleRate)])],
+        output: { container: 'wav', audioCodec: 'pcm-s16', sampleRate: 44_100 },
+        options: {
+          container: 'wav',
+          audio: { codec: 'pcm-s16', sampleRate: 44_100 },
+          invariant: 'audio-dsp-transform',
+        },
+      });
+      concrete.scenarioId = scenarioId;
+      concrete.inputs[0]!.id = inputId;
+      return concrete;
+    };
+
+    const downsample = audioTranscode(
+      'audio-dsp/resample_48k_to_44k1',
+      'scenarios/audio-dsp/resample_48k_to_44k1/01.wav',
+    );
+    expectNa(downsample, 'REMOTION_AUDIO_RESAMPLE_DURATION_UNSUPPORTED');
+
+    const longform = audioTranscode(
+      'audio-dsp/edge_longform_audio_resample_16k',
+      'scenarios/audio-dsp/edge_longform_audio_resample_16k/longform_1h_audio_pcm.wav',
+    );
+    expectNa(longform, 'REMOTION_AUDIO_RESAMPLE_WHOLE_FILE_SUITE_BUDGET');
+    longform.inputs[0]!.mutated = true;
+    expect(decideRemotionWebcodecsSupport(longform)).toEqual({ supported: true });
+
+    const ancillary = audioTranscode(
+      'audio-dsp/pcm_s24_to_s16',
+      'scenarios/audio-dsp/pcm_s24_to_s16/02.wav',
+      8_000,
+    );
+    expectNa(ancillary, 'REMOTION_WAV_ANCILLARY_CHUNK_UNSUPPORTED');
+    ancillary.inputs[0]!.id = 'scenarios/audio-dsp/pcm_s24_to_s16/03.wav';
+    expectNa(ancillary, 'REMOTION_WAV_ANCILLARY_CHUNK_UNSUPPORTED');
+    ancillary.inputs[0]!.id = 'scenarios/audio-dsp/pcm_s24_to_s16/wav_s24.wav';
+    expect(decideRemotionWebcodecsSupport(ancillary)).toEqual({ supported: true });
+    ancillary.inputs[0]!.id = 'scenarios/audio-dsp/pcm_s24_to_s16/02.wav';
+    ancillary.inputs[0]!.mutated = true;
+    expect(decideRemotionWebcodecsSupport(ancillary)).toEqual({ supported: true });
   });
 
   test('seek chooses the nearest real presentation sample with an earlier tie break', () => {
@@ -1123,6 +1191,43 @@ describe('REQ-ENG-08/11: exact browser config and output options', () => {
       new Uint8Array([64]),
       new Uint8Array([32]),
     ]);
+  });
+
+  test('empty-audio graceful transcode rejects before Remotion can emit non-finite progress', async () => {
+    const engine = new RemotionWebcodecsEngine();
+    const operationRequest = request('transcode', {
+      inputs: [concreteInput('wav', [audio('pcm-s16')])],
+      output: { container: 'wav', audioCodec: 'pcm-s16' },
+      options: {
+        container: 'wav',
+        audio: { codec: 'pcm-s16' },
+        gracefulAllowOutput: true,
+      },
+    });
+    operationRequest.scenarioId = 'audio-dsp/edge_empty_audio_transcode';
+    const operationContext = context(operationRequest);
+    await engine.init(operationContext);
+    let conversionCalls = 0;
+    installPrivateWebcodecsLib(engine, {
+      convertMedia: async () => {
+        conversionCalls++;
+        throw new Error('conversion must not start for the empty-audio contract');
+      },
+    });
+    try {
+      await expect(engine.transcode(
+        mediaInput({ id: 'empty_audio.wav', mime: 'audio/wav' }),
+        { container: 'wav', audio: { codec: 'pcm-s16' } },
+        operationContext,
+      )).rejects.toMatchObject({
+        reasonCode: 'REMOTION_TRANSCODE_EMPTY_AUDIO_REJECTED',
+        stage: 'parse',
+        inputId: 'empty_audio.wav',
+      });
+    } finally {
+      await engine.dispose(operationContext);
+    }
+    expect(conversionCalls).toBe(0);
   });
 
   test('audio bitrate is forwarded and exact decoder/encoder configs are recorded', async () => {

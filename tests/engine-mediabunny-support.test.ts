@@ -103,6 +103,32 @@ async function fixtureInput(name: string, mime = 'video/mp4'): Promise<MediaInpu
 }
 
 describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
+  test('rejects an authored stereo-to-5.1 matrix the fixed native mixer cannot honor', () => {
+    const concrete = request({
+      operation: 'transcode',
+      outputContainer: 'wav',
+      tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 2 }],
+      audioCodec: 'pcm-s16',
+      options: {
+        invariant: 'audio-dsp-transform',
+        audio: {
+          codec: 'pcm-s16',
+          channels: 6,
+          inputLayout: ['FL', 'FR'],
+          outputLayout: ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
+          mixMatrix: [[1, 0], [0, 1], [Math.SQRT1_2, Math.SQRT1_2], [0, 0], [Math.SQRT1_2, 0], [0, Math.SQRT1_2]],
+        },
+      },
+    });
+    concrete.scenarioId = 'audio-dsp/upmix_stereo_to_5_1';
+    concrete.inputs[0]!.container = 'wav';
+    expect(decideMediabunnySupport(concrete)).toMatchObject({
+      supported: false,
+      reasonCode: MEDIABUNNY_REASON.AUDIO_MIX_MATRIX,
+      reason: expect.stringContaining('cannot honor'),
+    });
+  });
+
   test('selects the nearest seek sample with an earlier-PTS tie break', () => {
     expect(nearestPresentationSampleIndex([
       { microsecondTimestamp: 7_300_000 },

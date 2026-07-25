@@ -82,6 +82,8 @@ export interface StructuralAudioExpectation {
 export interface ResampleContract extends StructuralAudioExpectation {
   kind: 'resample';
   probeFrequenciesHz: number[];
+  /** Long-form broadband sources may have no material energy at any authored narrow-frequency probe. */
+  minimumSpectralBins?: number;
   maxSpectralDeltaDb: number;
   maxRmsDeltaDb: number;
 }

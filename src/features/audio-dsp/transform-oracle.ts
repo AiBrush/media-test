@@ -16,6 +16,8 @@ import type {
 const ORACLE = 'property-invariant' as const;
 const MAX_SIGNAL_FRAMES = 524_288;
 const SILENCE_RMS = 1e-8;
+const MIN_SPECTRAL_AMPLITUDE = 1e-5;
+const MIN_SPECTRAL_TO_RMS_RATIO = 0.0075;
 
 /** Neutral two-layer (container + decoded signal) evaluator for every PCM audio-DSP conversion. */
 export function evaluateAudioDspTransform(
@@ -207,7 +209,10 @@ function compareResample(
     for (const frequency of contract.probeFrequenciesHz) {
       if (frequency >= Math.min(source.sampleRate, output.sampleRate) * 0.48) continue;
       const a = spectralAmplitude(source, channel, frequency);
-      if (a < 1e-5) continue;
+      // A fixed-frequency DFT bin in arbitrary real audio can contain only leakage. Ratios on that
+      // negligible energy are unstable under a lawful resampler and must not outweigh the native
+      // RMS and materially energized bins. Authored tone fixtures remain far above this floor.
+      if (a < Math.max(MIN_SPECTRAL_AMPLITUDE, sourceRms * MIN_SPECTRAL_TO_RMS_RATIO)) continue;
       const b = spectralAmplitude(output, channel, frequency);
       const deltaDb = Math.abs(amplitudeDb(Math.max(b, 1e-12) / a));
       maxSpectralDeltaDb = Math.max(maxSpectralDeltaDb, deltaDb);
@@ -221,8 +226,11 @@ function compareResample(
   for (const sample of output.samples) if (!Number.isFinite(sample) || Math.abs(sample) > 1.000001) clippedSamples++;
   result.checks++;
   if (clippedSamples > 0) result.failures.push(`${clippedSamples} non-finite/out-of-range output sample(s)`);
-  if (comparedBins === 0 && channels > 0 && channelRms(source, 0) > SILENCE_RMS) {
-    result.failures.push('no authored spectral probe had source energy; signal contract is unscored');
+  const minimumSpectralBins = contract.minimumSpectralBins ?? 1;
+  if (comparedBins < minimumSpectralBins && channels > 0 && channelRms(source, 0) > SILENCE_RMS) {
+    result.failures.push(
+      `only ${comparedBins} authored spectral probe(s) had source energy; ${minimumSpectralBins} required`,
+    );
   }
   result.measurements = { maxSpectralDeltaDb, maxRmsDeltaDb, comparedSpectralBins: comparedBins, clippedSamples };
   if (result.failures.length === 0) {

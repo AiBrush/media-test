@@ -16,6 +16,7 @@ import {
 } from '../src/features/audio-dsp/index.ts';
 import { audioDspScenarios } from '../src/scenarios/audio-dsp/index.ts';
 import { demuxMp4GaplessAudio } from '../src/engines/platform/demux-mp4.ts';
+import { parseScenarioSourceCatalog, scenarioSourceMap } from '../src/core/media-selection.ts';
 
 const AUDIO_MEDIA = 'fixtures/media';
 
@@ -52,6 +53,27 @@ describe('REQ-FEAT-62/63 native PCM readers and evidence', () => {
     const invalid = wav([[0, 0.1, -0.1]], 48_000, { bits: 16 });
     new DataView(invalid.buffer).setUint32(24, 0, true);
     expect(readPcmStructure(invalid)).toMatchObject({ state: 'MALFORMED', reasonCode: 'AUDIO_SAMPLE_RATE_INVALID' });
+  });
+
+  test('positive s24 rotation excludes the source whose declared data chunk is truncated', async () => {
+    const parsed = parseScenarioSourceCatalog(
+      await Bun.file('fixtures/media/scenarios/_sources.ndjson').text(),
+    );
+    expect(parsed.state).toBe('VALID');
+    if (parsed.state !== 'VALID') return;
+    const rows = scenarioSourceMap(parsed.catalog);
+    for (const id of ['pcm_s24_to_s16', 'pcm_s24_to_f32', 'throughput_decode_s24']) {
+      const row = rows.get(`audio-dsp/${id}`)!;
+      expect(row.files.map((file) => file.sha256)).not.toContain(
+        '3cb89a79d3164ea340ce20150b7ce1fe1719b1e908f379b5a56e9db657e9c085',
+      );
+      for (const file of row.files) {
+        const bytes = new Uint8Array(
+          await Bun.file(`fixtures/media/scenarios/audio-dsp/${id}/${file.file}`).arrayBuffer(),
+        );
+        expect(readPcmStructure(bytes).state).toBe('OK');
+      }
+    }
   });
 
   test('native verdict ignores host AudioContext rate and catches a mislabeled/wrong rate', () => {
@@ -108,6 +130,85 @@ describe('REQ-FEAT-61 transform-specific sample and spectral contracts', () => {
     const fault = wav([new Float64Array(Math.round(outputRate * durationSec))], outputRate, { bits: 16 });
     const invalid = evaluateAudioDspTransform('test/resample', source, fault, contract);
     expect(invalid.state === 'VERDICT' ? invalid.verdict : '').toBe('FAIL');
+  });
+
+  test('negligible fixed-bin leakage cannot outweigh material native-rate evidence', () => {
+    const sourceRate = 48_000;
+    const outputRate = 16_000;
+    const durationSec = 0.25;
+    const sourceFrames = Math.round(sourceRate * durationSec);
+    const outputFrames = Math.round(outputRate * durationSec);
+    const source = new Float64Array(sourceFrames);
+    const output = new Float64Array(outputFrames);
+    for (let frame = 0; frame < sourceFrames; frame++) {
+      source[frame] =
+        0.2 * Math.sin(2 * Math.PI * 440 * frame / sourceRate) +
+        1e-5 * Math.sin(2 * Math.PI * 4_000 * frame / sourceRate);
+    }
+    for (let frame = 0; frame < outputFrames; frame++) {
+      output[frame] = 0.2 * Math.sin(2 * Math.PI * 440 * frame / outputRate);
+    }
+    const contract: AudioTransformContract = {
+      kind: 'resample',
+      container: 'wav',
+      codec: 'pcm-s16',
+      sampleRate: outputRate,
+      probeFrequenciesHz: [440, 4_000],
+      maxSpectralDeltaDb: 0.35,
+      maxRmsDeltaDb: 0.25,
+      durationFrameTolerance: 1,
+    };
+    const valid = evaluateAudioDspTransform(
+      'test/low-energy-bin',
+      wav([source], sourceRate, { bits: 16 }),
+      wav([output], outputRate, { bits: 16 }),
+      contract,
+    );
+    expect(verdict(valid)).toBe('PASS');
+    expect(valid.state === 'VERDICT' ? valid.measurements?.comparedSpectralBins : -1).toBe(1);
+
+    for (let frame = 0; frame < outputFrames; frame++) output[frame] *= 0.5;
+    expect(verdict(evaluateAudioDspTransform(
+      'test/material-energy-fault',
+      wav([source], sourceRate, { bits: 16 }),
+      wav([output], outputRate, { bits: 16 }),
+      contract,
+    ))).toBe('FAIL');
+  });
+
+  test('long-form broadband policy can rely on native RMS and structure when narrow probes are empty', () => {
+    const sourceRate = 44_100;
+    const outputRate = 16_000;
+    const durationSec = 0.25;
+    const source = multiTone([733, 1_777], sourceRate, durationSec);
+    const output = multiTone([733, 1_777], outputRate, durationSec);
+    const contract: AudioTransformContract = {
+      kind: 'resample',
+      container: 'wav',
+      codec: 'pcm-s16',
+      sampleRate: outputRate,
+      probeFrequenciesHz: [220, 440, 1_000, 4_000],
+      minimumSpectralBins: 0,
+      maxSpectralDeltaDb: 0.75,
+      maxRmsDeltaDb: 0.5,
+      durationFrameTolerance: 1,
+    };
+    const valid = evaluateAudioDspTransform(
+      'test/long-form-broadband',
+      wav([source], sourceRate, { bits: 16 }),
+      wav([output], outputRate, { bits: 16 }),
+      contract,
+    );
+    expect(verdict(valid)).toBe('PASS');
+    expect(valid.state === 'VERDICT' ? valid.measurements?.comparedSpectralBins : -1).toBe(0);
+
+    for (let frame = 0; frame < output.length; frame++) output[frame] *= 0.5;
+    expect(verdict(evaluateAudioDspTransform(
+      'test/long-form-broadband-amplitude-fault',
+      wav([source], sourceRate, { bits: 16 }),
+      wav([output], outputRate, { bits: 16 }),
+      contract,
+    ))).toBe('FAIL');
   });
 
   test('explicit 5.1 matrix checks every impulse/routing coefficient, tones, clipping, and silence', () => {

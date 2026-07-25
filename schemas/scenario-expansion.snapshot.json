@@ -4186,7 +4186,7 @@
     {
       "id": "audio-dsp/edge_empty_audio_transcode",
       "revision": 1,
-      "definitionHash": "253e8f6f4686159e8360aae723d799dc4033a27d908995cc5e252a0873de66c1",
+      "definitionHash": "c4bf5dc6f4753fcefc7dfed1fa715ac83e011845dbfaa263c36c19084bcf0ce1",
       "inputVariantIds": [
         "baked"
       ],
@@ -4240,7 +4240,7 @@
     {
       "id": "audio-dsp/fuzz_aiff_header_truncated_probe",
       "revision": 1,
-      "definitionHash": "1773ba40884b0b6ac50990b11f4031e4d22026f0ba1e9af9fa86a0405ace7f62",
+      "definitionHash": "1228fbdc3cd26e30ba4728762fe13e39f02a77159d0e65b40d539bfd155c7116",
       "inputVariantIds": [
         "baked"
       ],
@@ -4258,7 +4258,7 @@
     {
       "id": "audio-dsp/fuzz_wav_fmt_corrupt_transcode",
       "revision": 1,
-      "definitionHash": "7feb139653d0b80dcf8b305a6cf2fa43db3f5069b3a3043e0aa15dfa7e0b13fc",
+      "definitionHash": "e474bc45a4d0187501b4d6a23e7472344ef5f04ab27c715594f0d59b1a152b64",
       "inputVariantIds": [
         "baked"
       ],
@@ -4267,7 +4267,7 @@
     {
       "id": "audio-dsp/fuzz_wav_header_truncated_probe",
       "revision": 1,
-      "definitionHash": "e3ffe8173492ea8ee25dd4be4c98ed2b179219b0d9bee7bf09b88f332fd3298b",
+      "definitionHash": "d978841c291609efcde2ad61358ddc85a42de6bdffeb882516bd2354bcf97fd5",
       "inputVariantIds": [
         "baked"
       ],
@@ -4501,7 +4501,7 @@
     {
       "id": "robustness/edge_cbcs_boundary_decrypt",
       "revision": 1,
-      "definitionHash": "4d05806b651fc10d4c9908a7f3ff939b200ec189a4d799d5206788e86fe4dc0b",
+      "definitionHash": "14ee34080ac88c520e67323ed31fc565578e65a19d496ecc89567677a7c28a9f",
       "inputVariantIds": [
         "baked"
       ],
@@ -4555,7 +4555,7 @@
     {
       "id": "robustness/edge_faststart_reserve_remux",
       "revision": 1,
-      "definitionHash": "2cf93e3bb492d5e20ceb43e75b79923f15150f1b334d58d51fd48e92d3f72085",
+      "definitionHash": "e4492217b0ed3574f85e78e59199ac8a72d51d69995ec0d51e7a19dedb1518b0",
       "inputVariantIds": [
         "baked"
       ],
@@ -4582,7 +4582,7 @@
     {
       "id": "robustness/edge_fragmented_remux",
       "revision": 1,
-      "definitionHash": "4854384516fd71ad4ae38df9de54976564e5f6422e7b54f51eebce6a61b7dcd2",
+      "definitionHash": "7ae4a6f0f973b841937b4acde963ef6e83b1ef5cbeaa6f662477ba6ba387fad9",
       "inputVariantIds": [
         "baked"
       ],
@@ -4591,7 +4591,7 @@
     {
       "id": "robustness/edge_gapless_priming_probe",
       "revision": 1,
-      "definitionHash": "ee696a6621d2bde79190f2ec4627a722a59f610e16efb073d1199953983cfeff",
+      "definitionHash": "f15a3a010e402fc11e0699582dc35123baa94902a978e596ced76acb96b49f9b",
       "inputVariantIds": [
         "baked"
       ],
@@ -4609,7 +4609,7 @@
     {
       "id": "robustness/edge_headerless_recorder_remux",
       "revision": 1,
-      "definitionHash": "c286ccf81ccd2ed51e731ae407090e8749d84057247601ee01fc73ddac108166",
+      "definitionHash": "5f477fcd7306d2a7159e8e47ff68eb6897cadab298a54c815f09399c059460b5",
       "inputVariantIds": [
         "baked"
       ],
@@ -4681,7 +4681,7 @@
     {
       "id": "robustness/edge_rotated_remux",
       "revision": 1,
-      "definitionHash": "9cee75bec613499b3c6cd8aa7d01f42200495c12f54b1259e9702ba22c077b55",
+      "definitionHash": "2cf06f71b8ede80d71d44c2357c9a34d545bdb8266deff397892e4cb579461d2",
       "inputVariantIds": [
         "baked"
       ],
@@ -4996,7 +4996,7 @@
     {
       "id": "robustness/prop_gapless_sample_count_priming",
       "revision": 1,
-      "definitionHash": "56d8922dd4027bfe6c0ea4f6c29238f3d00f2b7184da43c5451c6bc04478682b",
+      "definitionHash": "2cbcc60778f6ba18d8c5f697ab0e82f0e7f66da5d2ba69028a23f74c43efef16",
       "inputVariantIds": [
         "baked"
       ],
@@ -5014,7 +5014,7 @@
     {
       "id": "robustness/prop_transcode_idempotent_dims_h264",
       "revision": 1,
-      "definitionHash": "7694015ecc5c34bf017acbf31c45719770c6a2e9b2ff41c55c2b61fcc402f05c",
+      "definitionHash": "b886bf465536702076b19b87e1cffd0c5e43a3e83a14d3000a1d8a1005dc5135",
       "inputVariantIds": [
         "baked"
       ],

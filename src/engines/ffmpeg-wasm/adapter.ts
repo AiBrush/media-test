@@ -185,6 +185,7 @@ import {
   FFMPEG_BENCHMARK_LIMITS,
   decideFfmpegRemuxProgramSupport,
   decideFfmpegSupport,
+  isFfmpegMalformedDecodeFailure,
   isWorkerFsBlobUnreadableError,
   muxLegality,
   tupleSummary,
@@ -1552,6 +1553,18 @@ function describeError(e: unknown): string {
   }
 }
 
+function isNegativeRobustnessRequest(request: ConcreteOperationRequest | undefined): boolean {
+  const robustness = plainObject(request?.options.robustness);
+  return robustness?.schema === 'media-test/robustness-contract@1' &&
+    robustness.inputClass === 'negative';
+}
+
+function isFfmpegInputParseFailure(error: unknown): boolean {
+  const message = describeError(error);
+  return message.includes('ffmpeg could not read input for probe') ||
+    message.includes('Invalid data found when processing input');
+}
+
 /**
  * ffmpeg.wasm engine. The heavy WASM core (+ runtime capability probe + warm-up) is loaded ONCE in
  * init() (UNTIMED, §0.7); each op writes input to MEMFS, runs the ffmpeg program, reads output back,
@@ -2879,7 +2892,10 @@ export class FfmpegWasmEngine implements MediaEngine {
         metadata.probeEvidence = { readMode: 'whole-file' };
         return metadata;
       } catch (error) {
-        if (request?.options.gracefulAllowOutput === true) {
+        if (
+          request?.options.gracefulAllowOutput === true ||
+          (isNegativeRobustnessRequest(request) && isFfmpegInputParseFailure(error))
+        ) {
           throw createMalformedInputError(
             ENGINE_ID,
             'probe',
@@ -3588,6 +3604,20 @@ export class FfmpegWasmEngine implements MediaEngine {
 
   private async transcodeImpl(input: MediaInput, opts: TranscodeOptions): Promise<MediaBytes> {
     const inputName = (input.id || input.url || '').toLowerCase().split(/[?#]/)[0] ?? '';
+    const request = this.activeOperation?.context.request;
+    if (
+      request?.scenarioId === 'audio-dsp/edge_empty_audio_transcode' &&
+      request.options.gracefulAllowOutput === true
+    ) {
+      throw createMalformedInputError(
+        ENGINE_ID,
+        'transcode',
+        'validate',
+        'the zero-sample WAV cannot produce a structurally inspectable resampled output',
+        'FFMPEG_TRANSCODE_EMPTY_AUDIO_REJECTED',
+        input.id,
+      );
+    }
     if (isStillImageInput(input)) {
       throw createMalformedInputError(
         ENGINE_ID,
@@ -3725,7 +3755,7 @@ export class FfmpegWasmEngine implements MediaEngine {
         if (opts.audio?.bitrate) finalArgs.push('-b:a', String(opts.audio.bitrate));
         finalArgs.push(outName);
         await this.run(finalArgs);
-        const intermediate = await this.readBinary(midName);
+        const intermediate = await this.readBinary(midName, false);
         const bytes = await this.readBinary(outName);
         return {
           bytes,
@@ -4051,6 +4081,19 @@ export class FfmpegWasmEngine implements MediaEngine {
       await this.run(args);
       const bytes = await this.readBinary(outName);
       return { bytes, mime: containerMime(opts.container), container: opts.container };
+    } catch (error) {
+      if (isNegativeRobustnessRequest(request) && isFfmpegInputParseFailure(error)) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'transcode',
+          'parse',
+          describeError(error),
+          'FFMPEG_TRANSCODE_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       await this.cleanup(cleanupPaths);
     }
@@ -4462,6 +4505,26 @@ export class FfmpegWasmEngine implements MediaEngine {
           return cachedPixels;
         },
       };
+    } catch (error) {
+      const request = this.activeOperation?.context.request;
+      if (
+        isNegativeRobustnessRequest(request) &&
+        isFfmpegMalformedDecodeFailure(error) &&
+        !this.lifecycle.reason &&
+        !this.activeOperation?.context.signal.aborted &&
+        !(error instanceof FfmpegWorkerStateError)
+      ) {
+        throw createMalformedInputError(
+          ENGINE_ID,
+          'decodeFrames',
+          'decode',
+          describeError(error),
+          'FFMPEG_DECODE_MALFORMED_INPUT_REJECTED',
+          input.id,
+          error,
+        );
+      }
+      throw error;
     } finally {
       await this.cleanup([...written.cleanupPaths, rawName, checksumName]);
     }

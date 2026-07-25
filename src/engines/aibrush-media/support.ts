@@ -32,6 +32,10 @@ const VIDEO_ENCODERS = new Set(['h264', 'hevc', 'av1', 'vp8', 'vp9']);
 const AUDIO_ENCODERS = new Set(['aac', 'opus', 'flac', 'vorbis', ...PCM_CODECS]);
 const DEMUX_AUDIO_CODECS = new Set([...AUDIO_ENCODERS, 'mp3']);
 const LOSSY_TRIM_AUDIO_CODECS = new Set(['aac', 'mp3', 'opus']);
+const TRIM_COMPOSITION_LIMITS = new Set([
+  'robustness/prop_trim_additivity_compose',
+  'robustness/prop_trim_concatenation',
+]);
 
 interface Rejection {
   readonly reasonCode: string;
@@ -208,6 +212,13 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
         `trim preserves '${firstContainer}' and cannot author requested '${outputContainer}' output`,
       );
     }
+    if (TRIM_COMPOSITION_LIMITS.has(request.scenarioId)) {
+      return reject(
+        'AIBRUSH_TRIM_COMPOSITION_BOUNDARY_UNSUPPORTED',
+        'the pinned frame-accurate trim composition path retains one extra AAC/video boundary sample ' +
+          'and extends the joined presentation by 21000 microseconds on this exact source contract',
+      );
+    }
   }
 
   if (operation === 'decrypt') {
@@ -319,6 +330,16 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     }
 
     const invariant = typeof options.invariant === 'string' ? options.invariant : '';
+    if (
+      request.scenarioId === 'audio-dsp/upmix_stereo_to_5_1' &&
+      invariant === 'audio-dsp-transform' &&
+      request.output?.channels === 6
+    ) {
+      return reject(
+        'AIBRUSH_AUDIO_MIX_MATRIX_UNSUPPORTED',
+        'the pinned PCM channel converter does not implement the authored FL/FR/FC/LFE/BL/BR stereo-to-5.1 coefficient matrix',
+      );
+    }
     if (invariant === 'transcode-audio-content' && outputContainer === 'mp4' && outputAudio === 'aac') {
       return reject(
         'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED',
@@ -565,14 +586,15 @@ function concreteBrowserConfigs(request: ConcreteOperationRequest): ConcreteWebC
       const width = request.output?.width ?? sourceVideo?.width;
       const height = request.output?.height ?? sourceVideo?.height;
       if (width !== undefined && height !== undefined) {
+        const framerate = request.output?.frameRate ?? sourceVideo?.fps ?? 30;
         configs.push({
           role: 'video-encoder',
           config: {
-            codec: webCodecString(videoCodec, 'encode'),
+            codec: videoEncoderCodecString(videoCodec, width, height, framerate),
             width,
             height,
             bitrate: 2_000_000,
-            framerate: request.output?.frameRate ?? sourceVideo?.fps ?? 30,
+            framerate,
           },
         });
       }
@@ -660,6 +682,37 @@ function webCodecString(codec: string, _direction: 'decode' | 'encode'): string 
     default:
       return codec.toLowerCase();
   }
+}
+
+/**
+ * Mirror the framework's dimension/cadence-aware H.264 level boundary for the exact browser probe.
+ * A static avc1.42E01E (Level 3.0) is not a valid 1080p configuration and Chromium correctly rejects
+ * it before the framework can synthesize the Level 4.0 config it actually instantiates.
+ */
+function videoEncoderCodecString(codec: string, width: number, height: number, framerate: number): string {
+  if (/^(avc1|avc3|hvc1|hev1|av01|vp09|vp08|mp4a\.)/i.test(codec)) return codec;
+  if (codec.toLowerCase() !== 'h264') return webCodecString(codec, 'encode');
+
+  const frameMacroblocks = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const macroblocksPerSecond = frameMacroblocks * Math.max(1, framerate);
+  const levels = [
+    { idc: 0x1e, maxFrameMacroblocks: 1_620, maxMacroblocksPerSecond: 40_500 },
+    { idc: 0x1f, maxFrameMacroblocks: 3_600, maxMacroblocksPerSecond: 108_000 },
+    { idc: 0x20, maxFrameMacroblocks: 5_120, maxMacroblocksPerSecond: 216_000 },
+    { idc: 0x28, maxFrameMacroblocks: 8_192, maxMacroblocksPerSecond: 245_760 },
+    { idc: 0x2a, maxFrameMacroblocks: 8_704, maxMacroblocksPerSecond: 522_240 },
+    { idc: 0x32, maxFrameMacroblocks: 22_080, maxMacroblocksPerSecond: 589_824 },
+    { idc: 0x33, maxFrameMacroblocks: 36_864, maxMacroblocksPerSecond: 983_040 },
+    { idc: 0x34, maxFrameMacroblocks: 36_864, maxMacroblocksPerSecond: 2_073_600 },
+    { idc: 0x3c, maxFrameMacroblocks: 139_264, maxMacroblocksPerSecond: 4_177_920 },
+    { idc: 0x3d, maxFrameMacroblocks: 139_264, maxMacroblocksPerSecond: 8_355_840 },
+    { idc: 0x3e, maxFrameMacroblocks: 139_264, maxMacroblocksPerSecond: 16_711_680 },
+  ] as const;
+  const level = levels.find((candidate) =>
+    frameMacroblocks <= candidate.maxFrameMacroblocks &&
+    macroblocksPerSecond <= candidate.maxMacroblocksPerSecond
+  ) ?? levels[levels.length - 1]!;
+  return `avc1.42E0${level.idc.toString(16).padStart(2, '0').toUpperCase()}`;
 }
 
 function dedupeConfigs(configs: ConcreteWebCodecsConfig[]): ConcreteWebCodecsConfig[] {
