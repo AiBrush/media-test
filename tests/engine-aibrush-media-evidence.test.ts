@@ -9,6 +9,7 @@ import {
   AibrushMediaEngine,
   aibrushMuxRepresentationFields,
   enrichAibrushProbeMetadata,
+  normalizedAibrushCodecFields,
   selectAibrushMuxTrackCandidates,
   selectAibrushSeekPacketPts,
 } from '../src/engines/aibrush-media/adapter.ts';
@@ -19,6 +20,14 @@ import {
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('represents an auxiliary track with no codec token as explicit unknown evidence', () => {
+    expect(normalizedAibrushCodecFields('')).toEqual({ codec: 'unknown' });
+    expect(normalizedAibrushCodecFields(' avc1.640028 ')).toEqual({
+      codec: 'h264',
+      nativeCodecTag: 'avc1.640028',
+    });
+  });
+
   test('makes mux handoff representation explicit and keeps description bytes tightly owned', () => {
     const source = new Uint8Array(new ArrayBuffer(10), 2, 6);
     source.set([1, 100, 0, 40, 0xff, 0xe1]);

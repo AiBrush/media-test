@@ -26,6 +26,12 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     expect(capabilities.containersIn).toEqual(expect.arrayContaining(['jpeg', 'png', 'webp']));
   });
 
+  test('does not claim display-matrix-applied decode without an explicit rotation path', () => {
+    const capabilities = validateCapabilitySet(new AibrushMediaEngine());
+    expect(capabilities.features).not.toContain('rotation:decode');
+    expect(capabilities.features).toContain('rotate');
+  });
+
   test('bounds adaptive reuse and cross-process memory sampling', () => {
     expect(new AibrushMediaEngine().benchmarkLimits).toEqual({
       maxInnerIterations: 1,
@@ -123,6 +129,19 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       supported: false,
       status: 'NA_ENGINE',
       reasonCode: 'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
+    });
+  });
+
+  test('declares a probe with an auxiliary non-canonical video codec NA', () => {
+    expect(decideAibrushSupport(request('probe', 'mkv', [
+      VIDEO,
+      AUDIO,
+      { type: 'other', codec: 'unknown' },
+      { type: 'video', codec: 'mjpeg', width: 480, height: 360 },
+    ]))).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_PROBE_TRACK_REPRESENTATION_UNSUPPORTED',
     });
   });
 

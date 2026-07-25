@@ -4,9 +4,13 @@ import {
   materializeFiniteAibrushWebmClusters,
   prependAibrushMpegTsH264Aud,
   repairAibrushOggContinuationFlags,
+  rewriteAibrushMatroskaTags,
   selectAibrushCopyTrimSampleIndices,
 } from '../src/engines/aibrush-media/adapter.ts';
+import { readNeutralMetadataTags } from '../src/features/metadata/neutral-reader.ts';
+import { canonicalizeSemanticTags } from '../src/features/metadata/tags.ts';
 import { readNeutralRemuxProgram } from '../src/features/remux/readers.ts';
+import { compareStrictRemuxPrograms } from '../src/features/remux/strict-copy.ts';
 
 function oggCrc(bytes: Uint8Array, start: number, end: number): number {
   let crc = 0;
@@ -54,6 +58,47 @@ function withSpuriousOggContinuation(source: Uint8Array): Uint8Array {
 }
 
 describe('aibrush-media strict-copy remux boundary repairs', () => {
+  test('writes Matroska tags without changing any coded access unit', async () => {
+    const requested = {
+      title: 'Conformance 🎬 字幕 Clip',
+      artist: 'aibrűsh-media-tëst',
+      album: 'Suite Vol. 1',
+      comment: 'metadata:write roundtrip — '.repeat(12),
+      date: '2026-06-18',
+      genre: 'Test',
+      trackNumber: '7',
+    };
+    for (const file of ['01.mkv', '02.mkv', '03.mkv', 'h264_in_mkv.mkv']) {
+      const source = new Uint8Array(
+        await Bun.file(`fixtures/media/scenarios/metadata/write_mkv_tags/${file}`).arrayBuffer(),
+      );
+      const rewritten = rewriteAibrushMatroskaTags(source, requested);
+      expect(rewritten, file).toBeDefined();
+      expect(rewritten!.byteLength, file).toBeGreaterThan(source.byteLength);
+
+      const before = readNeutralRemuxProgram(source, 'mkv');
+      const after = readNeutralRemuxProgram(rewritten!, 'mkv');
+      expect(before.state, file).toBe('OK');
+      expect(after.state, file).toBe('OK');
+      if (before.state !== 'OK' || after.state !== 'OK') continue;
+      expect(compareStrictRemuxPrograms(before.value, after.value).outcome, file).toMatchObject({
+        state: 'VERDICT',
+        verdict: 'PASS',
+      });
+
+      const observation = readNeutralMetadataTags(rewritten!, 'mkv');
+      expect(observation.state, file).toBe('OK');
+      if (observation.state !== 'OK') continue;
+      const canonical = canonicalizeSemanticTags(
+        observation.value.carrier,
+        observation.value.tags,
+        observation.value.scopedTags,
+      );
+      expect(canonical.conflicts, file).toEqual([]);
+      expect(canonical.semantic, file).toEqual(requested);
+    }
+  });
+
   test('selects a half-open presentation window and backs video up to its prior keyframe', () => {
     const track = {
       id: 'video:0',

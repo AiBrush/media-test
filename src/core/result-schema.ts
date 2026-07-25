@@ -558,9 +558,13 @@ function validateStatusConsistency(value: Record<string, unknown>, add: AddDiagn
   }
   const candidateEvidence = isRecord(value.candidateEvidence) ? value.candidateEvidence : undefined;
   if (candidateEvidence && CANDIDATE_EVIDENCE_STATUSES.has(candidateEvidence.status as string)) {
-    if (candidateEvidence.status !== status) {
+    const oracleStatus = outcomes.length > 0 ? reduceOracleOutcomes(outcomes).status : 'PASS';
+    const expected = oracleStatus === 'PASS'
+      ? candidateEvidence.status as ResultStatus
+      : oracleStatus;
+    if (expected !== status) {
       add('$.status', 'CANDIDATE_EVIDENCE_RESULT_MISMATCH',
-        `candidate evidence reduces to ${String(candidateEvidence.status)}, not ${status}`);
+        `oracle correctness plus candidate evidence reduce to ${expected}, not ${status}`);
     }
     return;
   }
@@ -873,9 +877,13 @@ function validateExhaustiveOutcomeConsistency(
   }
   const candidateEvidence = isRecord(entry.candidateEvidence) ? entry.candidateEvidence : undefined;
   if (candidateEvidence && CANDIDATE_EVIDENCE_STATUSES.has(candidateEvidence.status as string)) {
-    if (candidateEvidence.status !== status) {
+    const oracleStatus = outcomes.length > 0 ? reduceOracleOutcomes(outcomes).status : 'PASS';
+    const expected = oracleStatus === 'PASS'
+      ? candidateEvidence.status as ResultStatus
+      : oracleStatus;
+    if (expected !== status) {
       add(`${path}.status`, 'EXHAUSTIVE_CANDIDATE_EVIDENCE_RESULT_MISMATCH',
-        `candidate evidence reduces to ${String(candidateEvidence.status)}, not ${status}`);
+        `oracle correctness plus candidate evidence reduce to ${expected}, not ${status}`);
     }
     return;
   }

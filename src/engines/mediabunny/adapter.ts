@@ -285,10 +285,12 @@ function outputFormatOptionsFrom(opts?: Record<string, unknown>): OutputFormatOp
     fastStart = rawFastStart;
   }
   const appendOnly = opts?.appendOnly === true ? true : undefined;
-  if (fastStart === undefined && appendOnly === undefined) return undefined;
+  const cmaf = opts?.cmaf === true ? true : undefined;
+  if (fastStart === undefined && appendOnly === undefined && cmaf === undefined) return undefined;
   return {
     ...(fastStart !== undefined ? { fastStart } : {}),
     ...(appendOnly !== undefined ? { appendOnly } : {}),
+    ...(cmaf !== undefined ? { cmaf } : {}),
   };
 }
 
@@ -2307,6 +2309,7 @@ export type MediabunnyMediaBytes = MediaBytes & {
 
 interface OutputTargetTelemetry {
   target: Target;
+  initTarget?: Target;
   markFinalizeStart: () => void;
   mediaBytes: (container: string) => Promise<MediabunnyMediaBytes>;
   cancel: (reason?: unknown) => Promise<void>;
@@ -2414,12 +2417,176 @@ function streamingRepresentationFromOptions(
   return 'other';
 }
 
+/**
+ * Mediabunny's public CMAF format writes the initialization segment and media segment to distinct
+ * BufferTargets. The suite consumes one MediaBytes value, so concatenate those two finalized,
+ * independently observed buffers in init-then-media order and account for all three retained
+ * allocations. This keeps CMAF native (including cmfc/styp/sidx authoring) without inventing a
+ * generic fragmented-MP4 brand.
+ */
+function instrumentedCmafBufferTargets(
+  mb: MB,
+  opts: Record<string, unknown>,
+  context?: OperationContext,
+  starvation = new PipelineStarvationSampler(),
+): OutputTargetTelemetry {
+  const operationStartMs = context?.operationStartMs ?? nowMs();
+  const traceEnabled = context?.request.operation === 'remux';
+  const traceEvents: SinkTraceEvent[] = traceEnabled
+    ? [{ type: 'operation-start', sequence: 0, atMs: operationStartMs }]
+    : [];
+  let initBuffer: ArrayBuffer | undefined;
+  let mediaBuffer: ArrayBuffer | undefined;
+  let finalizeStartMs: number | undefined;
+  let finalizeCompleteMs: number | undefined;
+  let firstNativeWriteMs: number | undefined;
+  let nativeWriteBytes = 0;
+  let writeCount = 0;
+  let maxPosition = 0;
+  let overwriteCount = 0;
+  let completed = false;
+  const ranges = {
+    init: [] as Array<{ start: number; end: number }>,
+    media: [] as Array<{ start: number; end: number }>,
+  };
+  const absoluteNow = (): number =>
+    Math.max(operationStartMs, traceEvents.at(-1)?.atMs ?? operationStartMs, nowMs());
+  const relativeMs = (absolute: number): number => Math.max(0, absolute - operationStartMs);
+  const push = (event: UnsequencedSinkTraceEvent): void => {
+    if (traceEnabled) traceEvents.push({ ...event, sequence: traceEvents.length } as SinkTraceEvent);
+  };
+  const recordNativeWrite = (kind: keyof typeof ranges, start: number, end: number): void => {
+    if (end <= start) return;
+    const atMs = absoluteNow();
+    if (ranges[kind].some((range) => start < range.end && end > range.start)) overwriteCount++;
+    ranges[kind] = coalesceRanges([...ranges[kind], { start, end }]);
+    nativeWriteBytes += end - start;
+    writeCount++;
+    maxPosition = Math.max(maxPosition, start);
+    firstNativeWriteMs ??= relativeMs(atMs);
+    context?.emit({ type: 'bytes-written', atMs: relativeMs(atMs), bytes: nativeWriteBytes });
+    context?.emit({ type: 'write-count', atMs: relativeMs(atMs), count: writeCount });
+  };
+  const initTarget = new mb.BufferTarget({
+    onFinalize(buffer) {
+      initBuffer = buffer;
+    },
+  });
+  const target = new mb.BufferTarget({
+    onFinalize(buffer) {
+      mediaBuffer = buffer;
+    },
+  });
+  initTarget.on('write', ({ start, end }) => recordNativeWrite('init', start, end));
+  target.on('write', ({ start, end }) => recordNativeWrite('media', start, end));
+
+  return {
+    target,
+    initTarget,
+    markFinalizeStart() {
+      if (finalizeStartMs !== undefined) return;
+      finalizeStartMs = absoluteNow();
+      push({ type: 'finalize-start', atMs: finalizeStartMs });
+    },
+    async mediaBytes(container) {
+      const init = initBuffer ?? initTarget.buffer;
+      const media = mediaBuffer ?? target.buffer;
+      if (!init || !media) throw new Error('mediabunny CMAF output did not finalize both init and media buffers');
+      const initBytes = new Uint8Array(init);
+      const mediaBytes = new Uint8Array(media);
+      const bytes = new Uint8Array(initBytes.byteLength + mediaBytes.byteLength);
+      bytes.set(initBytes, 0);
+      bytes.set(mediaBytes, initBytes.byteLength);
+      const atMs = absoluteNow();
+      finalizeCompleteMs = atMs;
+      completed = true;
+      const firstByteMs = relativeMs(atMs);
+      context?.emit({ type: 'first-byte', atMs: firstByteMs });
+      push({
+        type: 'write',
+        atMs,
+        position: 0,
+        length: bytes.byteLength,
+        cumulativeUniqueBytes: bytes.byteLength,
+        outstandingWritePromises: 1,
+      });
+      push({ type: 'buffer-observable', atMs, length: bytes.byteLength });
+      push({ type: 'finalize-complete', atMs });
+      push({ type: 'close', atMs });
+      const retainedOutputBytes = init.byteLength + media.byteLength + bytes.byteLength;
+      const sinkTrace: SinkTrace = {
+        schema: 'media-test/sink-trace@1',
+        target: 'buffer',
+        events: traceEvents.map((event) => ({ ...event })),
+        totalUniqueBytes: bytes.byteLength,
+        nativeWriteBytes: bytes.byteLength,
+        maximumOutstandingWritePromises: 1,
+        maximumQueuedBytes: bytes.byteLength,
+        retainedOutputBytes,
+        rollingHash: fnv1a64Hex(bytes),
+        rollingHashAlgorithm: 'fnv1a64',
+        validationPrefix: bytes.slice(0, 4096),
+        validationTail: bytes.slice(Math.max(0, bytes.byteLength - 4096)),
+      };
+      const streamingEvidence: StreamingRuntimeEvidence | undefined = traceEnabled
+        ? {
+            schema: 'media-test/streaming-runtime-evidence@1',
+            sinkTrace,
+            resolvedRepresentation: streamingRepresentationFromOptions(container, opts),
+            observerPolicy: 'mediabunny-cmaf-init-media-buffer-concatenation@1',
+            retainedOutputPolicy: 'native-init-plus-media-plus-concatenated-output',
+            measurementContract: 'media-test/streaming-output-measure@1',
+          }
+        : undefined;
+      return {
+        bytes,
+        mime: mimeForContainer(container),
+        container,
+        targetWrites: writeCount,
+        firstByteMs,
+        telemetry: { bytesWritten: bytes.byteLength, writeCount, firstByteMs },
+        targetTelemetry: {
+          targetKind: 'buffer',
+          appendOnly: false,
+          ...(firstNativeWriteMs !== undefined ? { firstNativeWriteMs } : {}),
+          writeCount,
+          nativeWriteBytes,
+          finalExtentBytes: bytes.byteLength,
+          maxPosition,
+          overwriteCount,
+          peakQueuedBytes: bytes.byteLength,
+          maximumOutstandingWritePromises: 1,
+          retainedOutputBytes,
+          operationStartMs,
+          ...(finalizeStartMs !== undefined ? { finalizeStartMs } : {}),
+          finalizeCompleteMs,
+          closeMs: atMs,
+          completed,
+        },
+        ...(streamingEvidence ? { streamingEvidence } : {}),
+        starvation: starvation.finish(),
+      };
+    },
+    async cancel() {
+      completed = true;
+      push({ type: 'abort', atMs: absoluteNow(), reasonCode: 'MEDIABUNNY_TARGET_ABORTED' });
+      starvation.finish();
+    },
+  };
+}
+
 function instrumentedOutputTarget(
   mb: MB,
   opts?: Record<string, unknown>,
   context?: OperationContext,
   starvation = new PipelineStarvationSampler(),
 ): OutputTargetTelemetry {
+  if (opts?.cmaf === true) {
+    if (opts.target !== undefined && opts.target !== 'buffer') {
+      throw new TypeError('mediabunny CMAF output currently requires the explicit buffer target');
+    }
+    return instrumentedCmafBufferTargets(mb, opts, context, starvation);
+  }
   const operationStartMs = context?.operationStartMs ?? nowMs();
   const traceEnabled = context?.request.operation === 'remux';
   const traceEvents: SinkTraceEvent[] = traceEnabled
@@ -4066,7 +4233,11 @@ export class MediabunnyEngine implements MediaEngine {
       const mbInput = await openInput(this.lib, input, undefined, { starvation });
       const unbindAbort = bindAbortToInput(mbInput, singleContext?.signal);
       const targetInfo = instrumentedOutputTarget(this.lib, runtimeOpts, singleContext, starvation);
-      const output = new this.lib.Output({ format, target: targetInfo.target });
+      const output = new this.lib.Output({
+        format,
+        target: targetInfo.target,
+        ...(targetInfo.initTarget ? { initTarget: targetInfo.initTarget } : {}),
+      });
       const convOpts: ConversionOptions = { input: mbInput, output };
 
       try {
@@ -4501,7 +4672,11 @@ export class MediabunnyEngine implements MediaEngine {
       }
 
       const targetInfo = instrumentedOutputTarget(this.lib, opts as Record<string, unknown>, context);
-      const output = new this.lib.Output({ format, target: targetInfo.target });
+      const output = new this.lib.Output({
+        format,
+        target: targetInfo.target,
+        ...(targetInfo.initTarget ? { initTarget: targetInfo.initTarget } : {}),
+      });
       const convOpts: ConversionOptions = {
         input: mbInput,
         output,
@@ -4554,7 +4729,9 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
   ): Promise<MediaBytes> {
     this.assertRuntimeSupport(context);
-    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(opts));
+    const nativeCmaf = context?.request.scenarioId === 'streaming-output/mp4_fragmented_cmaf';
+    const effectiveOpts = nativeCmaf ? { ...opts, cmaf: true } : opts;
+    const format = makeOutputFormat(opts.container, outputFormatOptionsFrom(effectiveOpts));
     if (!format) {
       throw createNotApplicableError(this.id, 'mux', `cannot author '${opts.container}'`, context ? tupleSummary(context.request) : {}, MEDIABUNNY_REASON.CONTAINER);
     }
@@ -4607,10 +4784,14 @@ export class MediabunnyEngine implements MediaEngine {
 
     const mb = this.lib;
     const targetOpts = reserveMaximumPacketCount !== undefined && opts.maximumPacketCount === undefined
-      ? { ...opts, maximumPacketCount: reserveMaximumPacketCount }
-      : opts;
+      ? { ...effectiveOpts, maximumPacketCount: reserveMaximumPacketCount }
+      : effectiveOpts;
     const targetInfo = instrumentedOutputTarget(mb, targetOpts, context);
-    const output = new mb.Output({ format, target: targetInfo.target });
+    const output = new mb.Output({
+      format,
+      target: targetInfo.target,
+      ...(targetInfo.initTarget ? { initTarget: targetInfo.initTarget } : {}),
+    });
 
     interface Pending {
       add: (pkt: EncodedPacket, meta?: EncodedVideoChunkMetadata | EncodedAudioChunkMetadata) => Promise<void>;

@@ -3915,7 +3915,11 @@ async function assessStreamingOracleBoundary(
 
   const containerOutcome = outcomes.find((outcome) =>
     outcome.oracle === 'mp4-box-layout' || outcome.oracle === 'webm-live-layout') ??
-    outcomes.find((outcome) => outcome.oracle === 'reference-reimport');
+    outcomes.find((outcome) => outcome.oracle === 'reference-reimport') ??
+    // Every authored streaming property currently re-imports the produced output through either
+    // decode(remux(x)) or probe(remux(x)). Reuse that executed result as the external container
+    // decision when the scenario deliberately has no redundant structural/re-import sibling.
+    outcomes.find((outcome) => outcome.oracle === 'property-invariant');
   const semanticCandidates = outcomes.filter((outcome) =>
     outcome.oracle !== 'mp4-box-layout' && outcome.oracle !== 'webm-live-layout');
   const semanticReduction = semanticCandidates.length > 0
@@ -5618,6 +5622,11 @@ export async function runOne(
         });
       }
     }
+    // Candidate sufficiency is defined over the scenario's authored oracle identities. The
+    // streaming bridge below intentionally replaces those siblings with one four-layer outcome so
+    // a sink/container failure cannot be masked by an unrelated PASS, but that synthetic
+    // `property-invariant` identity must not erase the already-executed source-bound evidence plan.
+    const candidateOracleOutcomes = [...oracleOutcomes];
     const streamingOutcome = await assessStreamingOracleBoundary(
       scenario,
       opResult,
@@ -5632,12 +5641,16 @@ export async function runOne(
     }
     const reduction = reduceOracleOutcomes(oracleOutcomes);
     const evidenceEvaluation = opts?.selectionEvidencePlan
-      ? evaluateCandidateEvidence(opts.selectionEvidencePlan, oracleOutcomes)
+      ? evaluateCandidateEvidence(opts.selectionEvidencePlan, candidateOracleOutcomes)
       : undefined;
     candidateEvidence = opts?.selectionEvidencePlan && evidenceEvaluation
       ? candidateEvidenceResult(opts.selectionEvidencePlan, evidenceEvaluation)
       : undefined;
-    const reducedStatus = evidenceEvaluation?.status ?? reduction.status;
+    // A mandatory streaming-layer failure/error remains decisive. Candidate sufficiency is an
+    // additional admission gate only after the combined correctness boundary itself passes.
+    const reducedStatus = reduction.status === 'PASS'
+      ? evidenceEvaluation?.status ?? reduction.status
+      : reduction.status;
     if (!isBenchmarkEligible(reducedStatus)) {
       return finalize(
         reducedStatus,

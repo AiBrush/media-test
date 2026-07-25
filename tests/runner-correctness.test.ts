@@ -360,6 +360,64 @@ describe('REQ-FEAT-80/86 production streaming runner boundary', () => {
       reasonCode: 'STREAMING_RUNTIME_EVIDENCE_ABSENT',
     }));
   });
+
+  test('combined streaming evidence preserves the authored candidate-oracle sufficiency plan', async () => {
+    installCorpusFetch();
+    const sourceSha256 = '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a';
+    const evidencePlan: CandidateOracleEvidencePlan = {
+      schemaVersion: 'candidate-oracle-evidence@1',
+      sourceSha256,
+      requirements: [
+        {
+          oracle: 'mp4-box-layout',
+          role: 'REQUIRED',
+          needs: [{ kind: 'STRUCTURAL_OUTPUT' }],
+        },
+        {
+          oracle: 'playback-smoke',
+          role: 'REQUIRED',
+          needs: [{ kind: 'BROWSER_CAPABILITY' }],
+        },
+      ],
+      requiredOracles: ['mp4-box-layout', 'playback-smoke'],
+      sufficientOracleSets: [['mp4-box-layout', 'playback-smoke']],
+      declaredAvailable: ['BROWSER_CAPABILITY', 'STRUCTURAL_OUTPUT'],
+      contractDigest: '66'.repeat(32),
+    };
+    const result = await runOne(
+      baseEngine('remux', {
+        capabilities: () => ({
+          ...caps('remux'),
+          features: ['webcodecs:independent', 'fastStart:none', 'target:writes'],
+        }),
+        remux: async () => streamingMp4Bytes(),
+      }),
+      streamingScenario('buffer'),
+      browser,
+      support,
+      {
+        pixelBehavior: pixelPass,
+        playbackSmoke: async () => true,
+        selectionEvidencePlan: evidencePlan,
+      },
+    );
+
+    expect(result.status).toBe('PASS');
+    expect(result.oracleOutcomes).toEqual([
+      expect.objectContaining({
+        state: 'VERDICT',
+        oracle: 'property-invariant',
+        verdict: 'PASS',
+        reasonCode: 'STREAMING_CORRECTNESS_VALID',
+      }),
+    ]);
+    expect(result.candidateEvidence).toMatchObject({
+      status: 'PASS',
+      applied: ['mp4-box-layout', 'playback-smoke'],
+      sufficientSurvivorOracles: ['mp4-box-layout', 'playback-smoke'],
+      sufficient: true,
+    });
+  });
 });
 
 describe('REQ-RUN-01/02/04 staged concrete applicability', () => {

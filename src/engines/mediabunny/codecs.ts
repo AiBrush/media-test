@@ -21,6 +21,7 @@ import {
   OGG,
   ADTS as ADTS_FORMAT,
   // output format classes
+  CmafOutputFormat,
   Mp4OutputFormat,
   MovOutputFormat,
   MkvOutputFormat,
@@ -148,6 +149,8 @@ export interface OutputFormatOptions {
   fastStart?: IsobmffOutputFormatOptions['fastStart'];
   /** Matroska/WebM append-only live output. */
   appendOnly?: MkvOutputFormatOptions['appendOnly'];
+  /** Native split init/media CMAF output. */
+  cmaf?: boolean;
 }
 
 /**
@@ -162,6 +165,7 @@ export function makeOutputFormat(token: string, opts?: OutputFormatOptions): Out
     opts?.appendOnly !== undefined ? { appendOnly: opts.appendOnly } : undefined;
   switch (token) {
     case 'mp4':
+      if (opts?.cmaf) return new CmafOutputFormat();
       return new Mp4OutputFormat(isobmff);
     case 'mov':
       return new MovOutputFormat(isobmff);

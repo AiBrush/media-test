@@ -11,6 +11,16 @@ const TIMECODE_ID = 0xe7;
 const DURATION_ID = 0x4489;
 const VOID_ID = 0xec;
 const CRC32_ID = 0xbf;
+const SEGMENT_CHILD_IDS = new Set([
+  SEEK_HEAD_ID,
+  INFO_ID,
+  TRACKS_ID,
+  CLUSTER_ID,
+  CUES_ID,
+  0x1941a469, // Attachments
+  0x1043a770, // Chapters
+  0x1254c367, // Tags
+]);
 
 interface EbmlElementHeader {
   id: number;
@@ -91,11 +101,11 @@ export class IncrementalLiveWebmParser {
         this.absoluteOffset,
       );
     }
-    await this.drain();
+    await this.drain(false);
   }
 
   async finish(): Promise<LiveWebmEvidence> {
-    await this.drain();
+    await this.drain(true);
     if (this.phase === 'EBML') throw fault('WEBM_EBML_HEADER_MISSING', 'stream has no complete EBML header');
     if (this.phase === 'SEGMENT') throw fault('WEBM_SEGMENT_MISSING', 'stream has no continuous Segment');
     if (this.pending.byteLength !== 0) {
@@ -116,7 +126,7 @@ export class IncrementalLiveWebmParser {
     });
   }
 
-  private async drain(): Promise<void> {
+  private async drain(finishing: boolean): Promise<void> {
     for (;;) {
       const header = parseElementHeader(this.pending, 0);
       if (!header) return;
@@ -131,7 +141,21 @@ export class IncrementalLiveWebmParser {
         continue;
       }
       if (header.unknownSize) {
-        throw fault('WEBM_CHILD_UNKNOWN_SIZE_UNSUPPORTED', 'only the outer continuous Segment may use unknown size', this.absoluteOffset);
+        if (header.id !== CLUSTER_ID) {
+          throw fault(
+            'WEBM_CHILD_UNKNOWN_SIZE_UNSUPPORTED',
+            'only the outer continuous Segment and its media Clusters may use unknown size',
+            this.absoluteOffset,
+          );
+        }
+        const total = unknownClusterExtent(this.pending, header, finishing);
+        if (total === undefined) return;
+        if (total > this.maximumElementBytes) {
+          throw fault('WEBM_INCREMENTAL_ELEMENT_BOUND_EXCEEDED', `element size ${total} exceeds bound`, this.absoluteOffset);
+        }
+        const element = this.consume(total);
+        await this.consumeChild(header, element);
+        continue;
       }
       const total = header.headerBytes + header.size;
       if (total > this.maximumElementBytes) {
@@ -193,6 +217,44 @@ export class IncrementalLiveWebmParser {
     this.absoluteOffset += length;
     return out;
   }
+}
+
+/**
+ * Resolve one unknown-size Cluster at EBML child boundaries. Scanning raw payload bytes for the
+ * next four-byte Cluster ID produces false boundaries when a coded block happens to contain that
+ * byte sequence; walking the finite Cluster children keeps the boundary aligned and incremental.
+ */
+function unknownClusterExtent(
+  bytes: Uint8Array,
+  cluster: EbmlElementHeader,
+  finishing: boolean,
+): number | undefined {
+  let offset = cluster.headerBytes;
+  while (offset < bytes.byteLength) {
+    const child = parseElementHeader(bytes, offset);
+    if (!child) {
+      if (finishing) {
+        throw fault('WEBM_INCREMENTAL_ELEMENT_INCOMPLETE', 'unknown-size Cluster ends with an incomplete child', offset);
+      }
+      return undefined;
+    }
+    if (SEGMENT_CHILD_IDS.has(child.id)) return offset;
+    if (child.unknownSize) {
+      throw fault('WEBM_CLUSTER_CHILD_UNKNOWN_SIZE_UNSUPPORTED', 'unknown-size Cluster contains an unbounded child', offset);
+    }
+    const end = offset + child.headerBytes + child.size;
+    if (!Number.isSafeInteger(end)) {
+      throw fault('WEBM_ELEMENT_EXTENT_UNSAFE', 'Cluster child extent exceeds the safe integer range', offset);
+    }
+    if (end > bytes.byteLength) {
+      if (finishing) {
+        throw fault('WEBM_INCREMENTAL_ELEMENT_INCOMPLETE', 'unknown-size Cluster ends with a truncated child', offset);
+      }
+      return undefined;
+    }
+    offset = end;
+  }
+  return finishing ? offset : undefined;
 }
 
 export async function inspectLiveWebm(

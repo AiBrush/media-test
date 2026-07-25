@@ -7,6 +7,7 @@ import {
   FFMPEG_BATCH_LAYOUT_FEATURES,
   FFMPEG_FASTSTART_MOVFLAGS,
   FFMPEG_FRAGMENT_MOVFLAGS,
+  ffmpegMetadataArguments,
   redactFfmpegCommand,
 } from '../src/engines/ffmpeg-wasm/provenance.ts';
 
@@ -33,6 +34,27 @@ describe('REQ-ENG-18: honest layout tokens and reproducible envelope', () => {
     ]);
     expect(redactFfmpegCommand(['-vf', 'scale=1280:720', '-c:v', 'libx264']))
       .toEqual(['-vf', 'scale=1280:720', '-c:v', 'libx264']);
+  });
+
+  test('maps normalized metadata keys and clears conflicting Matroska comment aliases', () => {
+    expect(ffmpegMetadataArguments({
+      title: 'Title',
+      albumArtist: 'Album artist',
+      comment: 'Replacement',
+      trackNumber: '7',
+      tracksTotal: '12',
+    }, 'mkv')).toEqual([
+      '-metadata', 'comment=',
+      '-metadata', 'description=',
+      '-metadata', 'title=Title',
+      '-metadata', 'album_artist=Album artist',
+      '-metadata', 'comment=Replacement',
+      '-metadata', 'track=7/12',
+    ]);
+    expect(ffmpegMetadataArguments({ trackNumber: '7' }, 'mp4'))
+      .toEqual(['-metadata', 'track=7']);
+    expect(ffmpegMetadataArguments({ trackNumber: '7' }, 'mp3'))
+      .toEqual(['-metadata', 'track=7']);
   });
 
   test('captures an immutable, complete profile before source mutation/disposal', () => {

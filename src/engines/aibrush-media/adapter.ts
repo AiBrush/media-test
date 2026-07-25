@@ -4581,6 +4581,228 @@ function sameRemuxProgramMedia(left: RemuxProgramEvidence, right: RemuxProgramEv
   return true;
 }
 
+function aibrushEbmlIdBytes(id: number): Uint8Array | undefined {
+  if (!Number.isSafeInteger(id) || id <= 0 || id > 0xffff_ffff) return undefined;
+  const length = id > 0xff_ffff ? 4 : id > 0xffff ? 3 : id > 0xff ? 2 : 1;
+  const bytes = new Uint8Array(length);
+  let remaining = id;
+  for (let index = length - 1; index >= 0; index--) {
+    bytes[index] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  return remaining === 0 ? bytes : undefined;
+}
+
+function aibrushEbmlSizeBytes(value: number): Uint8Array | undefined {
+  if (!Number.isSafeInteger(value) || value < 0) return undefined;
+  for (let length = 1; length <= 8; length++) {
+    const maximum = (1n << BigInt(length * 7)) - 2n;
+    if (BigInt(value) > maximum) continue;
+    const bytes = new Uint8Array(length);
+    return writeAibrushEbmlSize(bytes, 0, length, value) ? bytes : undefined;
+  }
+  return undefined;
+}
+
+function joinAibrushBytes(parts: readonly Uint8Array[]): Uint8Array {
+  const byteLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const output = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+function aibrushEbmlBytes(id: number, body: Uint8Array): Uint8Array | undefined {
+  const idBytes = aibrushEbmlIdBytes(id);
+  const sizeBytes = aibrushEbmlSizeBytes(body.byteLength);
+  return idBytes === undefined || sizeBytes === undefined
+    ? undefined
+    : joinAibrushBytes([idBytes, sizeBytes, body]);
+}
+
+function aibrushEbmlVoid(totalBytes: number): Uint8Array | undefined {
+  if (!Number.isSafeInteger(totalBytes) || totalBytes < 2) return undefined;
+  for (let sizeLength = 1; sizeLength <= 8; sizeLength++) {
+    const bodyLength = totalBytes - 1 - sizeLength;
+    if (bodyLength < 0) continue;
+    const maximum = (1n << BigInt(sizeLength * 7)) - 2n;
+    if (BigInt(bodyLength) > maximum) continue;
+    const output = new Uint8Array(totalBytes);
+    output[0] = 0xec;
+    return writeAibrushEbmlSize(output, 1, sizeLength, bodyLength) ? output : undefined;
+  }
+  return undefined;
+}
+
+const AIBRUSH_MATROSKA_SEMANTIC_TAG_NAMES = new Set([
+  'TITLE',
+  'ARTIST',
+  'ALBUM',
+  'COMMENT',
+  'DESCRIPTION',
+  'DATE',
+  'YEAR',
+  'GENRE',
+  'TRACKNUMBER',
+  'PARTNUMBER',
+  'TRACK',
+]);
+
+function normalizedAibrushMatroskaTagName(name: string): string {
+  const semantic: Record<string, string> = {
+    title: 'TITLE',
+    artist: 'ARTIST',
+    album: 'ALBUM',
+    comment: 'COMMENT',
+    date: 'DATE',
+    genre: 'GENRE',
+    trackNumber: 'TRACKNUMBER',
+  };
+  return semantic[name] ?? name.toUpperCase();
+}
+
+function neutralizeAibrushMatroskaSimpleTags(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): boolean {
+  const decoder = new TextDecoder();
+  let offset = start;
+  while (offset < end) {
+    const item = aibrushEbmlElement(bytes, offset, end);
+    if (item === undefined || item.end <= offset) return false;
+    if (item.id === 0x45a3 && item.end > item.body) {
+      const rawName = decoder.decode(bytes.subarray(item.body, item.end));
+      const semanticName = rawName.toUpperCase().replace(/[-_ ]/g, '');
+      if (AIBRUSH_MATROSKA_SEMANTIC_TAG_NAMES.has(semanticName)) {
+        // Keep every extent and SeekHead-relative offset stable while making the inherited key
+        // technical rather than a conflicting semantic alias.
+        bytes[item.body] = 0x58; // ASCII X
+      }
+    } else if (item.id === 0x7373 || item.id === 0x67c8) {
+      if (!neutralizeAibrushMatroskaSimpleTags(bytes, item.body, item.end)) return false;
+    }
+    offset = item.end;
+  }
+  return offset === end;
+}
+
+function buildAibrushMatroskaTags(tags: Readonly<Record<string, string>>): Uint8Array | undefined {
+  const encoder = new TextEncoder();
+  const simpleTags: Uint8Array[] = [];
+  for (const [name, value] of Object.entries(tags).sort(([left], [right]) => left.localeCompare(right))) {
+    if (typeof value !== 'string') return undefined;
+    const nameElement = aibrushEbmlBytes(0x45a3, encoder.encode(normalizedAibrushMatroskaTagName(name)));
+    const valueElement = aibrushEbmlBytes(0x4487, encoder.encode(value));
+    if (nameElement === undefined || valueElement === undefined) return undefined;
+    const simpleTag = aibrushEbmlBytes(0x67c8, joinAibrushBytes([nameElement, valueElement]));
+    if (simpleTag === undefined) return undefined;
+    simpleTags.push(simpleTag);
+  }
+  if (simpleTags.length === 0) return undefined;
+  const tag = aibrushEbmlBytes(0x7373, joinAibrushBytes(simpleTags));
+  return tag === undefined ? undefined : aibrushEbmlBytes(0x1254c367, tag);
+}
+
+/**
+ * Author same-container Matroska tags without remuxing a single media block. Existing semantic
+ * aliases are neutralized in place, Segment/Info Title becomes an equal-size Void, and one new
+ * container-scoped Tags element is appended. A neutral before/after proof admits the result only
+ * when every coded sample byte and timestamp remains identical.
+ */
+export function rewriteAibrushMatroskaTags(
+  source: Uint8Array,
+  tags: Readonly<Record<string, string>>,
+): Uint8Array | undefined {
+  const appendedTags = buildAibrushMatroskaTags(tags);
+  const before = readNeutralRemuxProgram(source, 'mkv');
+  if (appendedTags === undefined || before.state !== 'OK') return undefined;
+
+  const patched = source.slice();
+  let topOffset = 0;
+  let segmentStart = -1;
+  let segment: AibrushEbmlElement | undefined;
+  while (topOffset < patched.byteLength) {
+    const item = aibrushEbmlElement(patched, topOffset, patched.byteLength);
+    if (item === undefined || item.end <= topOffset) return undefined;
+    if (item.id === AIBRUSH_EBML_SEGMENT_ID) {
+      segmentStart = topOffset;
+      segment = item;
+      break;
+    }
+    topOffset = item.end;
+  }
+  if (segment === undefined || segmentStart < 0) return undefined;
+
+  let offset = segment.body;
+  while (offset < segment.end) {
+    const item = aibrushEbmlElement(patched, offset, segment.end);
+    if (item === undefined || item.end <= offset) return undefined;
+    if (item.id === 0x1549a966) {
+      let infoOffset = item.body;
+      while (infoOffset < item.end) {
+        const field = aibrushEbmlElement(patched, infoOffset, item.end);
+        if (field === undefined || field.end <= infoOffset) return undefined;
+        if (field.id === 0x7ba9) {
+          const replacement = aibrushEbmlVoid(field.end - infoOffset);
+          if (replacement === undefined) return undefined;
+          patched.set(replacement, infoOffset);
+        }
+        infoOffset = field.end;
+      }
+    } else if (item.id === 0x1254c367) {
+      if (!neutralizeAibrushMatroskaSimpleTags(patched, item.body, item.end)) return undefined;
+    }
+    offset = item.end;
+  }
+
+  const output = new Uint8Array(patched.byteLength + appendedTags.byteLength);
+  output.set(patched.subarray(0, segment.end), 0);
+  output.set(appendedTags, segment.end);
+  output.set(patched.subarray(segment.end), segment.end + appendedTags.byteLength);
+  if (
+    !segment.unknown &&
+    !writeAibrushEbmlSize(
+      output,
+      segment.sizeOffset,
+      segment.sizeLength,
+      segment.end - segment.body + appendedTags.byteLength,
+    )
+  ) {
+    return undefined;
+  }
+
+  const after = readNeutralRemuxProgram(output, 'mkv');
+  return after.state === 'OK' && sameRemuxProgramMedia(before.value, after.value)
+    ? output
+    : undefined;
+}
+
+async function tryPreparedAibrushMatroskaTagRewrite(
+  input: MediaInput,
+  target: string,
+  opts: RemuxOptions,
+): Promise<Uint8Array | undefined> {
+  const trackSelect = (opts as { trackSelect?: unknown }).trackSelect;
+  if (
+    input.mutated ||
+    containerFromInput(input) !== 'mkv' ||
+    target !== 'mkv' ||
+    opts.tags === undefined ||
+    wantsStreamTarget(opts) ||
+    wantsAppendOnly(opts) ||
+    wantsFragmented(opts) ||
+    (Array.isArray(trackSelect) && trackSelect.length > 0)
+  ) {
+    return undefined;
+  }
+  const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
+  return bytes === undefined ? undefined : rewriteAibrushMatroskaTags(bytes, opts.tags);
+}
+
 /**
  * Replace only unknown-size top-level Cluster size vints with their observed finite spans. MediaRecorder
  * commonly emits several such sibling Clusters; the framework currently lets the first consume the
@@ -5020,6 +5242,17 @@ function concatTrackKey(track: AibrushTrackInfo, seenByType: Map<'video' | 'audi
   return `${track.mediaType}:${index}`;
 }
 
+export function normalizedAibrushCodecFields(
+  nativeCodecTag: string,
+): Pick<NormalizedTrack, 'codec' | 'nativeCodecTag'> {
+  const trimmed = nativeCodecTag.trim();
+  const codec = canonicalCodec(trimmed);
+  return {
+    codec: codec.length > 0 ? codec : 'unknown',
+    ...(trimmed.length > 0 ? { nativeCodecTag: trimmed } : {}),
+  };
+}
+
 function normalizedMetadataFromAibrushInfo(
   input: MediaInput,
   info: AibrushInfo,
@@ -5027,8 +5260,7 @@ function normalizedMetadataFromAibrushInfo(
 ): NormalizedMetadata {
   const tracks: NormalizedTrack[] = info.tracks.map((t) => ({
     type: t.type,
-    codec: canonicalCodec(t.codec),
-    nativeCodecTag: t.codec,
+    ...normalizedAibrushCodecFields(t.codec),
     ...(t.width !== undefined ? { width: t.width } : {}),
     ...(t.height !== undefined ? { height: t.height } : {}),
     ...(t.fps !== undefined
@@ -5901,8 +6133,9 @@ export class AibrushMediaEngine implements MediaEngine {
       // `headerless` maps the harness's `appendOnly:true` WebM/MKV rows to the root WebM fragmented/live
       // muxer: an unknown-size Segment, no SeekHead/Duration, and one top-level Cluster per fragment.
       // `metadata:write` forwards the benchmark's `options.tags` into the engine's same-container tag
-      // writers (MP4/MOV ilst, Matroska Tags, ID3v2, FLAC/Ogg VorbisComment), validated by structural
-      // readback plus media-preservation checks.
+      // writers. Matroska uses the adapter's byte-preserving tag-only rewrite because the dependency's
+      // generic remux route can alter H.264 access units; structural readback plus the neutral media
+      // proof validate the result.
       // `fanout` routes `options.variants` through the engine's H.264 ABR ladder API and returns
       // independent rendition files in `MediaBytes.variants[]`.
       // `audio-samples:gapless-priming` carries MP4 AAC edit-list sample-count facts through full-range
@@ -5948,7 +6181,6 @@ export class AibrushMediaEngine implements MediaEngine {
         'upmix',
         'gain',
         'fade',
-        'rotation:decode',
         'mux:vfr-timestamps',
         'mux:browser-decode-equality',
         'mux:roundtrip-compare',
@@ -6231,13 +6463,15 @@ export class AibrushMediaEngine implements MediaEngine {
           emit: context?.emit,
           resolvedRepresentation: resolvedStreamingRepresentation(target, opts, fragmented),
         });
-        const prepared = await tryStrictPreparedAibrushRemux(
-          this.#driverCore(),
-          engine,
-          input,
-          opts,
-          signal,
-        );
+        const prepared =
+          await tryPreparedAibrushMatroskaTagRewrite(input, target, opts) ??
+          await tryStrictPreparedAibrushRemux(
+            this.#driverCore(),
+            engine,
+            input,
+            opts,
+            signal,
+          );
         const out = prepared ?? await engine.remux(
           (await finiteWebmClusterSource(engine, input)) ?? await this.#src(engine, input),
           {

@@ -311,6 +311,9 @@ describe('REQ-FEAT-85 continuous live WebM and incremental consumption', () => {
     expect(await inspectLiveWebm(eightByteUnknownSegment, 2)).toMatchObject({
       state: 'OK', clusterCount: 2, clusterTimecodes: [0, 1000], incrementallyConsumed: true,
     });
+    expect(await inspectLiveWebm(liveWebm({ unknownClusters: true }), 1)).toMatchObject({
+      state: 'OK', clusterCount: 2, clusterTimecodes: [0, 1000], incrementallyConsumed: true,
+    });
 
     const order: string[] = [];
     const parser = new IncrementalLiveWebmParser({
@@ -720,6 +723,7 @@ interface WebmOptions {
   duration?: boolean;
   knownSegment?: boolean;
   reverseClusters?: boolean;
+  unknownClusters?: boolean;
 }
 
 function liveWebm(options: WebmOptions = {}): Uint8Array {
@@ -729,8 +733,8 @@ function liveWebm(options: WebmOptions = {}): Uint8Array {
     options.duration ? ebmlElement([0x44, 0x89], new Uint8Array([0, 0, 0, 0])) : new Uint8Array(0),
   );
   const tracks = ebmlElement([0x16, 0x54, 0xae, 0x6b], new Uint8Array(0));
-  const first = webmCluster(options.reverseClusters ? 1000 : 0);
-  const second = webmCluster(options.reverseClusters ? 0 : 1000);
+  const first = webmCluster(options.reverseClusters ? 1000 : 0, options.unknownClusters);
+  const second = webmCluster(options.reverseClusters ? 0 : 1000, options.unknownClusters);
   const body = concatBytes(
     options.seekHead ? ebmlElement([0x11, 0x4d, 0x9b, 0x74], new Uint8Array(0)) : new Uint8Array(0),
     info,
@@ -743,11 +747,18 @@ function liveWebm(options: WebmOptions = {}): Uint8Array {
   return concatBytes(ebml, new Uint8Array([0x18, 0x53, 0x80, 0x67]), segmentSize, body);
 }
 
-function webmCluster(timecode: number): Uint8Array {
+function webmCluster(timecode: number, unknownSize = false): Uint8Array {
   const value = timecode <= 0xff
     ? new Uint8Array([timecode])
     : new Uint8Array([timecode >>> 8, timecode]);
-  return ebmlElement([0x1f, 0x43, 0xb6, 0x75], ebmlElement([0xe7], value));
+  const body = concatBytes(
+    ebmlElement([0xe7], value),
+    // A level-one byte pattern inside a finite child must not be mistaken for a sibling boundary.
+    ebmlElement([0xa3], new Uint8Array([0x1f, 0x43, 0xb6, 0x75])),
+  );
+  return unknownSize
+    ? concatBytes(new Uint8Array([0x1f, 0x43, 0xb6, 0x75, 0xff]), body)
+    : ebmlElement([0x1f, 0x43, 0xb6, 0x75], body);
 }
 
 function ebmlElement(id: number[], body: Uint8Array): Uint8Array {

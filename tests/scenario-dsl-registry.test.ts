@@ -494,6 +494,27 @@ describe('REQ-DSL-03/06: result schema v2 and explicit v1 migration', () => {
       ...source,
       candidateEvidence: { ...source.candidateEvidence!, sufficient: 'yes' },
     }).some((entry) => entry.code === 'CANDIDATE_EVIDENCE_SUFFICIENT')).toBe(true);
+
+    const sufficientEvidence = {
+      ...source.candidateEvidence!,
+      status: 'PASS' as const,
+      reasonCode: 'EVIDENCE_SUFFICIENT_PASS',
+      required: ['golden-metadata' as const],
+      applied: ['golden-metadata' as const],
+      unavailable: [],
+      sufficientSurvivorOracles: ['golden-metadata' as const],
+      sufficient: true,
+    };
+    const independentStreamingFailure = resultV2('FAIL', [verdicts.fail], {
+      candidateEvidence: sufficientEvidence,
+    });
+    expect(validateScenarioResultV2(independentStreamingFailure)
+      .some((entry) => entry.code === 'CANDIDATE_EVIDENCE_RESULT_MISMATCH')).toBe(false);
+    expect(readResultsEnvelope(envelope([independentStreamingFailure])).results[0]?.status).toBe('FAIL');
+    expect(validateScenarioResultV2({
+      ...independentStreamingFailure,
+      status: 'PASS',
+    }).some((entry) => entry.code === 'CANDIDATE_EVIDENCE_RESULT_MISMATCH')).toBe(true);
   });
 });
 

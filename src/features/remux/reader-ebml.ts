@@ -109,14 +109,16 @@ const LEVEL_ONE_IDS = new Set([
   0x1254c367, // Tags
 ]);
 
-function nextLevelOne(bytes: Uint8Array, start: number, end: number): number | undefined {
-  for (let at = start; at + 4 <= end; at++) {
-    const id = bytes[at]! * 0x1000000 + (bytes[at + 1]! << 16) + (bytes[at + 2]! << 8) + bytes[at + 3]!;
-    if (!LEVEL_ONE_IDS.has(id)) continue;
-    const candidate = element(bytes, at, end);
-    if (candidate && LEVEL_ONE_IDS.has(candidate.id)) return at;
+function unknownClusterEnd(bytes: Uint8Array, start: number, end: number): number | undefined {
+  let offset = start;
+  while (offset < end) {
+    const item = element(bytes, offset, end);
+    if (!item) return undefined;
+    if (LEVEL_ONE_IDS.has(item.id)) return offset;
+    if (item.unknown || item.end <= offset) return undefined;
+    offset = item.end;
   }
-  return undefined;
+  return offset;
 }
 
 /** Unknown-size clusters end at the next level-1 element, as required by live WebM. */
@@ -129,8 +131,9 @@ function segmentChildren(bytes: Uint8Array, segment: Element): Element[] | undef
     if (!item) return undefined;
     if (item.unknown && item.id !== ID.Cluster) return undefined;
     if (item.unknown) {
-      const next = nextLevelOne(bytes, item.body, segment.end);
-      const bounded = { ...item, end: next ?? segment.end };
+      const next = unknownClusterEnd(bytes, item.body, segment.end);
+      if (next === undefined) return undefined;
+      const bounded = { ...item, end: next };
       if (bounded.end <= bounded.body) return undefined;
       out.push(bounded);
       offset = bounded.end;

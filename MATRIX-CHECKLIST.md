@@ -1,6 +1,6 @@
 # Media-test feature × engine campaign
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 This is the persistent checklist for the 78-cell Chromium campaign. Cells are
 processed feature-row first, then engine-column, using the exact order below.
@@ -17,13 +17,13 @@ Legend: `V` = verified terminal, `A` = active scope lock, `P` = pending.
 | trim | V | V | V | V | V | V |
 | mux | V | V | V | V | V | V |
 | encryption | V | V | V | V | V | V |
-| metadata | A | P | P | P | P | P |
-| streaming-output | P | P | P | P | P | P |
+| metadata | V | V | V | V | V | V |
+| streaming-output | A | P | P | P | P | P |
 | audio-dsp | P | P | P | P | P | P |
 | robustness | P | P | P | P | P | P |
 | performance | P | P | P | P | P | P |
 
-Totals: 48 verified, 1 active, 29 pending.
+Totals: 54 verified, 1 active, 23 pending.
 
 ## Campaign invariants
 
@@ -40,17 +40,17 @@ Totals: 48 verified, 1 active, 29 pending.
 ## Current evidence identity
 
 - Latest full-feature scenario definition digest:
-  `38e372aea7089a51863955eb22356c72724bcb2f6b01b3870ad697439bc8993e`
+  `ff39e8b3f83c0e2ddef18bf71d074cf3e5c4d3c6b5c11c4dca370f83f150cfcc`
 - Latest full-feature oracle definition digest:
-  `5f61a518416aa68f8cb6854285359bbf4e1a0f006ee1dfc6a49b969cf22d5773`
-- Final CBCS closure scenario/oracle definition digests:
-  `c85ba8f303fb8c2a8b5add8b5f0afabde65cd53a09fd32ed7046da355b26b66a` /
-  `c50eecc893a569bf702dabd8b26c50a4dd3e76f5e65ac74a7cc512dc195d69dd`.
-- Current regression gate (2026-07-24): focused aibrush-media support,
-  encryption, representation, and oracle regressions 123 pass with 511
-  assertions. The single full-suite gate for this source-change boundary is
-  1170 pass with 14267 assertions across 80 files in 119.85 seconds; typecheck
-  and `git diff --check` clean.
+  `3a6d53df62d4d563dab1880ef0e73f251c514de7d44d2ca45cf05d14a4b9bbd1`
+- Final four-row FFmpeg.wasm metadata closure scenario/oracle definition
+  digests:
+  `e05226ecb5f5fa0bb38fc3217b1ad48fbdf4f79437a1f6a0466f4d4d9fadc30e` /
+  `e101fd8b8d29ec4533c1f4e0a21101255b37a3b819e89e687c6ba74bf7258ea5`.
+- Current regression gate (2026-07-25): focused aibrush-media, metadata, and
+  oracle regressions 121 pass with 448 assertions. The one post-repair
+  full-suite gate is 1178 pass with 14316 assertions across 80 files in
+  122.02 seconds; typecheck and `git diff --check` are clean.
 
 ## Verified cells
 
@@ -1816,14 +1816,219 @@ Totals: 48 verified, 1 active, 29 pending.
   `017d9cf4eae28f556206b9be5495780a20da51fa6c39b9c536ab91df600ba36f`.
 - Suggested commit message: `cell(encryption × aibrush-media): complete exhaustive encryption evidence`
 
-## Active cell
-
 ### metadata × mediabunny
 
-- Scope lock: only Mediabunny metadata adapter/support behavior and
-  metadata-owned shared layers when independently proven necessary.
-- One authoritative forced-fresh exhaustive Chromium baseline: pending. A
-  separate quick run will be skipped unless it supplies unique evidence.
-- Boundary gates: pending; if no source changes are required, reuse the
-  current 1170-test regression boundary above.
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-mediabunny-20260724-v1`:
+  `results/raw/chromium-2026-07-24T23-27-53-446Z.json`. It exercised all 25
+  scenarios and 94 candidates once in about 53 seconds. The initial result
+  was 17 PASS, 3 NA_ENGINE, and 5 partial scenarios; no quick run or repeated
+  whole-feature baseline was performed.
+- Only the five partial rows were grouped in
+  `results/raw/chromium-2026-07-24T23-34-35-048Z.json`. After that diagnostic
+  closure, the single MP4-tag row was verified in
+  `results/raw/chromium-2026-07-25T11-58-24-580Z.json`, and the remaining
+  three remux rows were closed together in
+  `results/raw/chromium-2026-07-25T11-58-44-344Z.json`. Latest-evidence
+  reduction is 22 PASS and 3 NA_ENGINE scenarios; candidate accounting is 75
+  PASS and 19 NA_ENGINE with zero FAIL, ERROR, NA_ASSET, NA_BROWSER, or
+  SKIPPED outcomes. Every supported aggregate has full exhaustive coverage.
+- The three fully unsupported scenarios retain exact evidence: AIFF is outside
+  the declared input-container surface, display-matrix decode is undeclared,
+  and Ogg packet-copy cannot preserve the requested explicit timing. Mixed
+  candidate NA_ENGINE outcomes additionally retain exact auxiliary-track,
+  rotation-copy, codec/container, and timestamp-mode tuple reasons.
+- Repairs are evidence-producing: probe preflight now rejects resolved
+  auxiliary track inventories that `Input.getTracks()` cannot expose; an MKV
+  normalized comment edit removes conflicting DESCRIPTION/COMMENT carrier
+  aliases; and metadata remux pixel equality compares sequential same-run
+  source/output WebCodecs prefixes. The latter removes boundary-seek false
+  mismatches while the independent neutral reader still proves exact track,
+  access-unit, parameter-set, and timeline preservation. Direct diagnostics
+  confirmed all six initially failing remux outputs retained every coded
+  video/audio access unit.
+- Cell boundary: focused regressions are 163 pass with 534 assertions. The one
+  post-repair full-suite run is 1172 pass with 14273 assertions across 80
+  files in 128.58 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `4a4656acabe3db9022a6a76d49dcd52e1b174d255c7b6de947a9633b9f8332ed` /
+  `4fdc10fc7421f3942d26559b425d69990bf679c16c568815f8c0b9f4f02dd5b2`.
+- Five-row diagnostic closure content hash / file SHA-256:
+  `048b75e406e32aa27e07bfb3b7c9b188d59dc6b07848b52aacc8b671987d12c6` /
+  `06e0de4f8b5eb76268f180aad9054bc717b4020f6f0f296cbd649a258848acc0`.
+- MP4-tag closure content hash / file SHA-256:
+  `4d4fa266ca47d048368746dc9b6e3a1ca9e652bdb4c05ea8ba0f351e1c77838c` /
+  `7a638b1d46b56989ad62e286b03e00ce0dd6853085be4b4a8133cb8e11359a4e`.
+- Final three-row closure content hash / file SHA-256:
+  `563e02a517f557d19c470acff3de8a994037eef0001dfb15ece6010cacb4a5b5` /
+  `1319a59a77b4fc1692a0f326487d444cd08f7675ea5aabbc1e91f059c8858601`.
+- Suggested commit message: `cell(metadata × mediabunny): complete exhaustive metadata evidence`
+
+### metadata × ffmpeg-wasm
+
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-ffmpeg-wasm-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-04-25-066Z.json`. It exercised all 25
+  scenarios and 94 candidates once in 351.78 seconds. The initial result was
+  20 PASS, 1 NA_ENGINE, 2 FAIL, and 2 partial scenarios; no quick or repeated
+  whole-feature run was performed.
+- Only those four adverse rows were grouped in the 16.97-second closure
+  `results/raw/chromium-2026-07-25T12-13-43-607Z.json`, seed
+  `metadata-ffmpeg-wasm-20260725-v2`; all four closed as PASS. Latest-evidence
+  reduction is 24 PASS and 1 NA_ENGINE scenarios. Candidate accounting is 90
+  PASS and 4 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET, NA_BROWSER, or
+  SKIPPED outcomes; every supported aggregate has full exhaustive coverage.
+- Exact NA_ENGINE evidence is limited to the undeclared rotation-decode
+  feature, the valid MJPEG auxiliary stream in two `03.mkv` candidates that
+  the loaded core cannot decode/read, and the rotated MP4 candidate whose
+  display matrix FFmpeg 5.1 cannot carry into Matroska during stream copy.
+- Repairs map normalized `trackNumber` to FFmpeg's carrier-native `track` key
+  for MP4/ID3/Matroska, clear inherited Matroska DESCRIPTION/COMMENT aliases
+  before a requested comment write, and preflight the lossy rotation-carrier
+  conversion as `FFMPEG_REMUX_ROTATION_UNSUPPORTED`. Stream copy remains
+  independently proven exact by the neutral access-unit/timeline reader.
+- Cell boundary: focused regressions are 101 pass with 476 assertions. The one
+  post-repair full-suite run is 1174 pass with 14279 assertions across 80
+  files in 132.20 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `aeeaa7fc5be675eb3a3741651b267b84e506010053e1c39b4597add9ac6a7e6d` /
+  `0e394469ea64b6ae0ee23afa57a709f6ff18c884156070e676a92b54155346bd`.
+- Four-row closure content hash / file SHA-256:
+  `c1adc9c67a4fcef3bdd3f21885fcf1fef1185c13d88da5dc55b58ccd69aaccd0` /
+  `15f453ffeec74a879454fe07b603d62b8b3ad109020bb53366ce1b453e0ea109`.
+- Suggested commit message: `cell(metadata × ffmpeg-wasm): complete exhaustive metadata evidence`
+
+### metadata × mp4box
+
+- The sole authoritative run is the forced-fresh exhaustive Chromium baseline
+  at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-mp4box-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-18-04-536Z.json`. It exercised all 25
+  scenarios and 94 candidates once in 3.24 seconds and was terminal
+  immediately: 6 PASS and 19 NA_ENGINE scenarios; 24 PASS and 70 NA_ENGINE
+  candidates. There are no FAIL, ERROR, NA_ASSET, NA_BROWSER, partial, or
+  SKIPPED outcomes, and every supported aggregate has full coverage.
+- NA_ENGINE evidence follows MP4Box's declared ISO-BMFF parser/writer surface:
+  non-ISO input carriers are absent, Matroska output is absent, normalized
+  metadata writing is undeclared, and `decodeFrames`/rotation decode is
+  undeclared. Every admitted ISO probe/remux row executed and passed; no
+  diagnostic prose was used to infer applicability.
+- No source change or browser closure was needed. Focused MP4Box, metadata,
+  and oracle regressions are 122 pass with 5321 assertions. The cell reuses
+  the immediately preceding full-suite boundary of 1174 pass with 14279
+  assertions across 80 files in 132.20 seconds. Typecheck and `git diff
+  --check` are clean.
+- Baseline content hash / file SHA-256:
+  `33dd0fad65acffa09b1d0cd9572a4aa806d19761d5992f0ef4072c0fb0873409` /
+  `002919a469f502c664ac0b3ff73588dc9169cf4972a7d2b07272171cd337d25e`.
+- Suggested commit message: `cell(metadata × mp4box): verify exhaustive metadata boundary`
+
+### metadata × remotion
+
+- The sole authoritative run is the forced-fresh exhaustive Chromium baseline
+  at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-remotion-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-20-06-530Z.json`. It exercised all 25
+  scenarios and 94 candidates once in 7.63 seconds and was terminal
+  immediately: 13 PASS and 12 NA_ENGINE scenarios; 48 PASS and 46 NA_ENGINE
+  candidates. There are no FAIL, ERROR, NA_ASSET, NA_BROWSER, partial, or
+  SKIPPED outcomes, and every supported aggregate has full coverage.
+- NA_ENGINE evidence follows Remotion's declared tuple matrix: AIFF and Ogg
+  inputs, Matroska/MP3/FLAC outputs, normalized metadata writing, and
+  rotation decode are absent. The only mixed aggregate is
+  `metadata/read_h264_in_mkv`: three candidates pass and `03.mkv` is narrowly
+  rejected as `REMOTION_INPUT_CODEC_TUPLE_UNSUPPORTED` because its auxiliary
+  MJPEG stream is outside the pinned parser tuple matrix.
+- No source change or browser closure was needed. Focused Remotion, metadata,
+  and oracle regressions are 113 pass with 567 assertions. The cell reuses
+  the immediately preceding full-suite boundary of 1174 pass with 14279
+  assertions across 80 files in 132.20 seconds. Typecheck and `git diff
+  --check` are clean.
+- Baseline content hash / file SHA-256:
+  `5c7c867cebe228609deb6e577e2003ede2eda0a088c63e4d743ce296b58179b5` /
+  `6f819526ea00e5d0b4fe06001c46192a2f5bb500144c550449c243b094f8cd8c`.
+- Suggested commit message: `cell(metadata × remotion): verify exhaustive metadata boundary`
+
+### metadata × web-demuxer@4.0.0
+
+- The sole authoritative run is the forced-fresh exhaustive Chromium baseline
+  at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-web-demuxer-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-21-50-811Z.json`. It exercised all 25
+  scenarios and 94 candidates once in 12.14 seconds and was terminal
+  immediately: 9 PASS and 16 NA_ENGINE scenarios; 32 PASS and 62 NA_ENGINE
+  candidates. There are no FAIL, ERROR, NA_ASSET, NA_BROWSER, partial, or
+  SKIPPED outcomes, and every supported aggregate has full coverage.
+- NA_ENGINE evidence follows the pinned parser-only surface: AIFF, Ogg, FLAC,
+  WAV, and MP3 inputs are absent; remux and normalized metadata writing are
+  undeclared; and rotation decode is undeclared. The only mixed aggregate is
+  `metadata/read_h264_in_mkv`: three candidates pass and `03.mkv` is narrowly
+  rejected as `WEB_DEMUXER_CONTAINER_CODEC_UNSUPPORTED` because its auxiliary
+  MJPEG stream is not a declared Matroska parser tuple. No supported candidate
+  had an adverse outcome.
+- No source change or browser closure was needed. Focused web-demuxer,
+  metadata, and oracle regressions are 126 pass with 552 assertions. The cell
+  reuses the immediately preceding full-suite boundary of 1174 pass with
+  14279 assertions across 80 files in 132.20 seconds. Typecheck and `git diff
+  --check` are clean.
+- Baseline content hash / file SHA-256:
+  `df721ab17d2cd87981a4e7ebf99d4aeea1d8b65a01d4759c550e5e8e9d052385` /
+  `085da9c0d7aa0100c7c748bc9d598423cb801ef8d05d2eaf8fb73e6e2d3e6ac1`.
+- Suggested commit message: `cell(metadata × web-demuxer): verify exhaustive metadata boundary`
+
+### metadata × aibrush-media
+
+- The one authoritative full-feature baseline is the forced-fresh exhaustive
+  Chromium run at `http://127.0.0.1:5151` with `--no-reuse` and seed
+  `metadata-aibrush-media-20260725-v1`:
+  `results/raw/chromium-2026-07-25T12-23-03-371Z.json`. It exercised all 25
+  scenarios and 94 candidates once in 67.94 seconds. The initial result was
+  22 PASS, 2 ERROR, and 1 partial scenario; no quick or repeated whole-feature
+  baseline was performed.
+- Only the three adverse rows were grouped in the 4.79-second closure
+  `results/raw/chromium-2026-07-25T12-31-56-629Z.json`, seed
+  `metadata-aibrush-media-20260725-v2`. That closed Matroska tag writing as
+  full PASS and rotation decode as exact NA_ENGINE. The remaining mixed
+  Matroska probe row alone was verified in the 0.50-second closure
+  `results/raw/chromium-2026-07-25T12-33-53-681Z.json`, seed
+  `metadata-aibrush-media-20260725-v3`.
+- Latest-evidence reduction is 24 PASS and 1 NA_ENGINE scenarios. Candidate
+  accounting is 92 PASS and 2 NA_ENGINE, with zero FAIL, ERROR, NA_ASSET,
+  NA_BROWSER, or SKIPPED outcomes; every supported aggregate has full
+  exhaustive coverage. The two exact unsupported candidates are display-matrix
+  decode, which the adapter does not implement, and the auxiliary MJPEG track
+  in `03.mkv`, which is outside the adapter's normalized probe vocabulary.
+- Repairs normalize empty auxiliary codec tokens as `unknown`, reject an
+  unrepresentable resolved probe track before operation, and withdraw the
+  unsupported `rotation:decode` claim. Same-container Matroska tag writes now
+  neutralize inherited semantic aliases, replace Segment Info Title with
+  equal-size Void, append one container-scoped Tags element, and are admitted
+  only when every coded sample and timestamp remains exactly unchanged.
+- Cell boundary: focused regressions are 121 pass with 448 assertions. The one
+  post-repair full-suite run is 1178 pass with 14316 assertions across 80
+  files in 122.02 seconds. Typecheck and `git diff --check` are clean.
+- Baseline content hash / file SHA-256:
+  `38c7efc5a2b5f8239634842f23b1e112c5079781687a4cce5f3a7c20f1701513` /
+  `636df463a6dec89de4778fddadf34894383e22b0ec984e0a93786528bc868f98`.
+- Three-row closure content hash / file SHA-256:
+  `153f897051e719834919d37eaa6e57e9283af92dfe48be6331c906547876a3cc` /
+  `7bb1fbf480a3f8f2544da8e494d0392b7ed7cb02d8bbc5c35091e511e114f98c`.
+- Final one-row closure content hash / file SHA-256:
+  `27911b805fa592edb8468c324e975df3e972c57bccc34e8b2eefb4e14ba94501` /
+  `06dd5cb2db95179d9650b79ef235ec42da1f01a3055de85fbcea13ff2e96b401`.
+- Suggested commit message: `cell(metadata × aibrush-media): complete exhaustive metadata evidence`
+
+## Active cell
+
+### streaming-output × mediabunny
+
+- Scope lock: only Mediabunny streaming-output adapter/support behavior and
+  streaming-output-owned shared layers when independently proven necessary.
+- Run one authoritative forced-fresh exhaustive Chromium baseline; skip a
+  separate quick run unless it supplies unique evidence.
+- Reuse the current 1178-test regression boundary if this cell requires no
+  source changes; otherwise run exactly one new full-suite boundary after its
+  targeted closure.
 - Suggested commit message: pending.

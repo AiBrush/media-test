@@ -91,6 +91,19 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     );
   }
 
+  if (
+    operation === 'probe' &&
+    inputs.some((input) => input.tracks.some((track) =>
+      (track.type === 'video' && !VIDEO_ENCODERS.has(track.codec)) ||
+      (track.type === 'audio' && !DEMUX_AUDIO_CODECS.has(track.codec))
+    ))
+  ) {
+    return reject(
+      'AIBRUSH_PROBE_TRACK_REPRESENTATION_UNSUPPORTED',
+      'the framework probe result contains a media codec outside the normalized adapter vocabulary',
+    );
+  }
+
   if (inputs.length === 0 && operation !== 'mux') {
     return reject('AIBRUSH_INPUT_REQUIRED', `${operation} requires a media input`);
   }

@@ -450,6 +450,16 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
     }))).toBe('FFMPEG_MUX_ROTATION_UNSUPPORTED');
   });
 
+  test('declares source rotation unsupported when remuxing to a carrier that drops it', () => {
+    const rotated = [{ ...video('h264'), rotation: 90 }, audio('aac')];
+    expect(reason(request('remux', 'mp4', rotated, {
+      output: { container: 'mkv' },
+    }))).toBe('FFMPEG_REMUX_ROTATION_UNSUPPORTED');
+    expect(decideFfmpegSupport(request('remux', 'mp4', rotated, {
+      output: { container: 'mov' },
+    }), RUNTIME)).toEqual({ supported: true });
+  });
+
   test('declares exact Matroska timelines and candidate-scoped MP3 gapless metadata unsupported', () => {
     const vfrMkv = request('mux', 'mp4', av('h264', 'aac'), { output: { container: 'mkv' } });
     vfrMkv.scenarioId = 'mux/prop_vfr_mux_duration_mp4_to_mkv';

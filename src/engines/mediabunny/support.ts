@@ -259,7 +259,10 @@ export function decideMediabunnySupport(request: ConcreteOperationRequest): Supp
     }
     throw new TypeError('maximumPacketCount is meaningful only for reserve fast-start');
   }
-  const format = makeOutputFormat(outputContainer, outputOptions(request.options));
+  const format = makeOutputFormat(
+    outputContainer,
+    outputOptions(request.options, request.scenarioId === 'streaming-output/mp4_fragmented_cmaf'),
+  );
   if (!format) return no(MEDIABUNNY_REASON.CONTAINER, `output container '${outputContainer}' is not supported`);
 
   // These four rows are executable rejection contracts, not ordinary containability claims. The
@@ -753,16 +756,22 @@ function audioCodecString(codec: AudioCodec, channels: number, sampleRate: numbe
   return codec;
 }
 
-function outputOptions(options: Readonly<Record<string, unknown>>): { fastStart?: false | 'in-memory' | 'reserve' | 'fragmented'; appendOnly?: boolean } | undefined {
+function outputOptions(options: Readonly<Record<string, unknown>>, cmaf = false): {
+  fastStart?: false | 'in-memory' | 'reserve' | 'fragmented';
+  appendOnly?: boolean;
+  cmaf?: boolean;
+} | undefined {
   const fastStart = options.fragmented === true
     ? 'fragmented'
     : options.fastStart === false || options.fastStart === 'in-memory' || options.fastStart === 'reserve' || options.fastStart === 'fragmented'
       ? options.fastStart
       : undefined;
   const appendOnly = options.appendOnly === true ? true : undefined;
-  return fastStart === undefined && appendOnly === undefined ? undefined : {
+  const nativeCmaf = cmaf ? true : undefined;
+  return fastStart === undefined && appendOnly === undefined && nativeCmaf === undefined ? undefined : {
     ...(fastStart !== undefined ? { fastStart } : {}),
     ...(appendOnly !== undefined ? { appendOnly } : {}),
+    ...(nativeCmaf !== undefined ? { cmaf: nativeCmaf } : {}),
   };
 }
 

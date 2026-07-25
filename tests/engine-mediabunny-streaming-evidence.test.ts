@@ -24,6 +24,7 @@ import {
   assessTimeToFirstByte,
   validateSinkTrace,
 } from '../src/features/streaming-output/sink-trace.ts';
+import { inspectFragmentedMp4 } from '../src/features/streaming-output/fragmented-mp4.ts';
 
 const MEDIA_ROOT = new URL('../fixtures/media/', import.meta.url);
 
@@ -161,6 +162,29 @@ describe('Mediabunny production streaming-output evidence boundary', () => {
       expect(validateSinkTrace(trace, { target: 'buffer' }))
         .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
       expect(assessTimeToFirstByte(trace)).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+    });
+  });
+
+  test('native CMAF joins the finalized init and media targets with exact retention evidence', async () => {
+    await withEngine(async (engine) => {
+      const options = { container: 'mp4', target: 'buffer', fragmented: true };
+      const { context } = operationContext(options);
+      context.request.scenarioId = 'streaming-output/mp4_fragmented_cmaf';
+      const output = await engine.remux(await fixture(), options, context) as MediabunnyMediaBytes;
+      const { evidence, trace } = requireEvidence(output);
+
+      expect(inspectFragmentedMp4(output.bytes, { cmaf: true })).toMatchObject({
+        state: 'OK',
+        cmafCompatible: true,
+      });
+      expect(evidence).toMatchObject({
+        resolvedRepresentation: 'fragmented-mp4',
+        observerPolicy: 'mediabunny-cmaf-init-media-buffer-concatenation@1',
+        retainedOutputPolicy: 'native-init-plus-media-plus-concatenated-output',
+      });
+      expect(trace.retainedOutputBytes).toBe(output.bytes.byteLength * 2);
+      expect(validateSinkTrace(trace, { target: 'buffer' }))
+        .toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
     });
   });
 

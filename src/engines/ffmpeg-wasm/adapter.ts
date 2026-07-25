@@ -168,6 +168,7 @@ import {
   FFMPEG_BATCH_LAYOUT_FEATURES,
   FFMPEG_FASTSTART_MOVFLAGS,
   FFMPEG_FRAGMENT_MOVFLAGS,
+  ffmpegMetadataArguments,
   redactFfmpegArg,
   redactFfmpegCommand,
 } from './provenance.ts';
@@ -3390,9 +3391,7 @@ export class FfmpegWasmEngine implements MediaEngine {
       }
       // Metadata WRITE (dossier §A.11): `-metadata key=value` per tag, still lossless under -c copy.
       if (opts.tags) {
-        for (const [k, v] of Object.entries(opts.tags)) {
-          if (k) args.push('-metadata', `${k}=${v ?? ''}`);
-        }
+        args.push(...ffmpegMetadataArguments(opts.tags, opts.container));
       }
       args.push(outName);
       await this.run(args);

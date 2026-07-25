@@ -576,6 +576,17 @@ export function decideFfmpegSupport(
 
   const effectiveTracks = outputTracks(tracks, outputVideo, outputAudio, request.operation);
   if (
+    request.operation === 'remux' &&
+    outputContainer !== undefined &&
+    !ISO_BMFF_CONTAINERS.has(outputContainer) &&
+    effectiveTracks.some((track) => track.type === 'video' && !!track.rotation)
+  ) {
+    return reject(
+      'FFMPEG_REMUX_ROTATION_UNSUPPORTED',
+      `FFmpeg 5.1 stream-copy cannot carry source display rotation into '${outputContainer}'`,
+    );
+  }
+  if (
     request.operation === 'mux' &&
     effectiveTracks.some((track) => track.type === 'video' && !!track.rotation)
   ) {
