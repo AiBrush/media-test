@@ -232,7 +232,7 @@ P0 first, then P1, then P2, grouped stably by area. This table is the index; ful
 | REQ-UI-16 | Disable /__save by default; loopback dev server | App/UI | P1 | — |
 | REQ-UI-17 | Expose seed entry/replay + selected input variant/SHA | App/UI | P2 | UI-08 |
 | REQ-UI-18 | Cross-port cache origin + import provenance | App/UI | P2 | UI-09 |
-| REQ-UI-19 | Window/paginate matrix; keep full model for export | App/UI | P2 | — |
+| REQ-UI-19 | Render all matrix rows on one scrollable page | App/UI | P2 | — |
 | REQ-UI-20 | One CLI/UI option schema; fix headed/headless copy | App/UI | P2 | — |
 | REQ-UI-21 | Correct reference-engine copy to unscored instrument | App/UI | P2 | — |
 | REQ-FEAT-01 | [demux] DTS value-plus-provenance or unknown | Features | P1 | CORE-04 |
@@ -1514,14 +1514,14 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 - **Acceptance:** Running on two ports with the same profile shows no native rows in the second origin until an explicit validated import, after which every status follows the same epoch policy.
 - **Source:** docs/subsystems/app-ui.md — Target "Reproducibility and cache contract" / gap 7
 
-### REQ-UI-19 — Window or paginate matrix rows while keeping the full model for export
+### REQ-UI-19 — Render all matrix rows on one scrollable page
 - **Priority:** P2
 - **Depends on:** none
-- **Current:** `start()` creates every row and engine cell before execution and only scoreboard/race repaint is animation-frame-coalesced (`src/app/ui.ts:258-323`).
-- **Problem:** Large selections incur whole-table cost before the benchmark begins, potentially perturbing measurement.
-- **Change:** Window or paginate scenario rows to a bounded DOM (target ≤100 rows plus small overscan) while keeping the full result model/export outside the DOM, derive winner/status counts from the model not rendered rows, and expose total row/column counts and stable indexes per the ARIA table pattern.
-- **Acceptance:** A 10,000-cell stress run respects the ~100-row bound, produces and exports all cells, preserves logical indexes across scrolling/filtering, keeps pending/not-run/cached/resolved states distinguishable on re-entry, and shows no measurement-time long task from whole-table repaint.
-- **Source:** docs/subsystems/app-ui.md — Target "Large-matrix rendering" / gap 12
+- **Current:** The complete filtered matrix is rendered as one semantic table inside a horizontally scrollable wrapper.
+- **Preference:** Operators prefer continuous browser-page scrolling over row pagination, even for large selections.
+- **Change:** Keep every matching scenario row in one table, retain the full result model/export, and expose total row/column counts and stable indexes per the ARIA table pattern.
+- **Acceptance:** A 10,000-cell stress run renders every scenario row without pagination, produces and exports all cells, preserves logical indexes across filtering, and keeps pending/not-run/cached/resolved states distinguishable.
+- **Source:** docs/subsystems/app-ui.md — Target "Single-page matrix rendering" / gap 12
 
 ### REQ-UI-20 — Give the CLI and UI one option schema and fix inert --headed/headless copy
 - **Priority:** P2

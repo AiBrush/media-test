@@ -209,18 +209,18 @@ Acceptance criteria:
 3. A synthetic top-level runner exception preserves all streamed results, sets completion state `failed`, enables export, and does not leak its error flag into the next successful run.
 4. Resume is offered only when run id, manifest digest, cache validation, and selected input hashes match; otherwise the UI labels the action as a new run.
 
-#### Large-matrix rendering
+#### Single-page matrix rendering
 
-Keep the full result model outside the DOM and window or paginate scenario rows once the matrix exceeds a small threshold. A target bound is at most 100 scenario rows plus a small overscan in the DOM at once; filtering, sorting, and export operate on the complete result set. DOM write coalescing may continue, but winner calculation and status counts must derive from the model, not rendered rows.
+Keep the full result model and render every matching scenario row in one semantic table. Filtering, sorting, and export operate on the complete result set. The table may overflow horizontally inside its focusable wrapper, while vertical navigation uses normal browser-page scrolling. Winner calculation and status counts derive from the model, not only currently visible rows.
 
-If virtualization removes rows from the accessibility tree, expose total row/column counts and stable row/column positions as specified by the [WAI-ARIA table pattern](https://www.w3.org/WAI/ARIA/apg/patterns/table/), or provide accessible pagination/static-table mode. Do not turn a read-only result table into an interactive ARIA grid unless cell-level keyboard interaction genuinely requires grid behavior.
+Expose total row/column counts and stable row/column positions as specified by the [WAI-ARIA table pattern](https://www.w3.org/WAI/ARIA/apg/patterns/table/). Do not turn a read-only result table into an interactive ARIA grid unless cell-level keyboard interaction genuinely requires grid behavior.
 
 Acceptance criteria:
 
-1. A generated 10,000-cell matrix keeps the bounded row window, remains responsive during streaming, and exports all 10,000 cells.
-2. Scrolling, filtering, or sorting never loses focus context or changes a cell's engine/scenario identity.
-3. Screen readers receive the full logical row/column counts and correct indexes, or an equivalent paginated native table.
-4. Pending, not-run, cached, and resolved states remain distinguishable when a row leaves and re-enters the render window.
+1. A generated 10,000-cell matrix renders every scenario row on one page and exports all 10,000 cells.
+2. Scrolling, filtering, or sorting never changes a cell's engine/scenario identity.
+3. Screen readers receive the full logical row/column counts and correct indexes.
+4. Pending, not-run, cached, and resolved states remain distinguishable.
 
 #### Export and server boundary
 
@@ -319,12 +319,12 @@ Acceptance criteria:
 - **Target:** Keep a run-scoped immutable result accumulator, preserve it on every terminal state, and reset error state at run start; announce terminal status through [WAI-ARIA `status`](https://www.w3.org/TR/wai-aria-1.2/#status) without forcing focus.
 - **Verification:** Throw after several streamed cells, export those cells with `completionState: failed`, then run successfully and assert no prior error or partial reason remains.
 
-#### Gap 12 — The matrix is eagerly materialized
+#### Gap 12 — Operators want one continuous matrix
 
-- **Current:** `start()` creates every row and every engine cell before execution; only scoreboard and race repaint work is animation-frame-coalesced. [src/app/ui.ts:258-323](../../src/app/ui.ts#L258-L323) [src/app/ui.ts:365-375](../../src/app/ui.ts#L365-L375)
-- **Consequence:** Large selections incur DOM, layout, memory, zoom, and navigation cost before the benchmark begins, potentially perturbing an in-page measurement.
-- **Target:** Window/paginate rows with a bounded DOM while preserving full model/export; communicate total and virtual positions as required by the [ARIA table pattern](https://www.w3.org/WAI/ARIA/apg/patterns/table/).
-- **Verification:** A 10,000-cell stress run respects the 100-row target bound, produces all results, preserves logical indexes, and shows no measurement-time long task attributable to whole-table repaint.
+- **Current:** The matrix renders every matching row and engine cell in one semantic table.
+- **Consequence:** Operators can inspect the entire run using normal browser-page scrolling without changing pages.
+- **Target:** Preserve the single-page table and full model/export; communicate total positions as required by the [ARIA table pattern](https://www.w3.org/WAI/ARIA/apg/patterns/table/).
+- **Verification:** A 10,000-cell stress run renders all scenario rows without pagination, produces all results, and preserves logical indexes.
 
 #### Gap 13 — Manual and automated artifacts have different provenance
 

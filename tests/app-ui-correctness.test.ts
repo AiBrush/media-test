@@ -30,14 +30,12 @@ import {
 } from '../src/app/result-cache.ts';
 import type { CachedResultRow } from '../src/app/result-cache.ts';
 import {
-  MAX_MATRIX_ROWS,
   appendBrowserRunEvidence,
   beginBrowserRunEvidence,
   cancellationPresentation,
   correctnessRate,
   failBrowserRunEvidence,
   formatStatusLabel,
-  matrixPageBounds,
   reconcileBrowserRunEvidence,
   resultDisplay,
   runContinuationAction,
@@ -88,7 +86,7 @@ const CACHE: CacheManifestSnapshot = {
   hits: [],
 };
 
-describe('REQ-UI-01/02/06/07/19: honest and bounded presentation model', () => {
+describe('REQ-UI-01/02/06/07/19: honest presentation model', () => {
   test('PASS and FAIL remain distinct and DIFF is no longer a status', () => {
     const pass = resultDisplay(displayResult('PASS', 'exact evidence'));
     const fail = resultDisplay(displayResult('FAIL', 'decoded samples changed'));
@@ -171,15 +169,6 @@ describe('REQ-UI-01/02/06/07/19: honest and bounded presentation model', () => {
     }
   });
 
-  test('10,000 logical rows never produce a page larger than the DOM bound', () => {
-    const first = matrixPageBounds(10_000, 0, 10_000);
-    const middle = matrixPageBounds(10_000, 53, 75);
-    const last = matrixPageBounds(10_000, 999_999, 75);
-    expect(first.visibleCount).toBe(MAX_MATRIX_ROWS);
-    expect(middle.visibleCount).toBeLessThanOrEqual(MAX_MATRIX_ROWS);
-    expect(last.end).toBe(10_000);
-    expect(last.visibleCount).toBeLessThanOrEqual(MAX_MATRIX_ROWS);
-  });
 });
 
 describe('REQ-UI-04/05/08/15/17: frozen configuration and canonical artifacts', () => {

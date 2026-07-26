@@ -1,4 +1,4 @@
-/** Accessible, bounded-DOM rendering for the browser application. */
+/** Accessible rendering for the browser application. */
 
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
 import { formatExecTime, pickExecutionMs } from '../core/format.ts';
@@ -27,17 +27,6 @@ export interface FeaturePickerItem {
   count: number;
   title?: string;
   checked?: boolean;
-}
-
-export const MAX_MATRIX_ROWS = 100;
-export const MATRIX_PAGE_SIZE = 75;
-
-export interface MatrixPageBounds {
-  page: number;
-  pageCount: number;
-  start: number;
-  end: number;
-  visibleCount: number;
 }
 
 /**
@@ -221,21 +210,6 @@ export function runContinuationAction(
 
 function isSha256(value: string): boolean {
   return /^[a-f0-9]{64}$/.test(value);
-}
-
-/** Pure pagination contract used by the DOM renderer and its large-matrix acceptance test. */
-export function matrixPageBounds(
-  totalRows: number,
-  requestedPage: number,
-  requestedPageSize = MATRIX_PAGE_SIZE,
-): MatrixPageBounds {
-  const total = Math.max(0, Math.trunc(totalRows));
-  const pageSize = Math.max(1, Math.min(MAX_MATRIX_ROWS, Math.trunc(requestedPageSize) || MATRIX_PAGE_SIZE));
-  const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const page = Math.max(0, Math.min(Math.trunc(requestedPage) || 0, pageCount - 1));
-  const start = page * pageSize;
-  const end = Math.min(total, start + pageSize);
-  return Object.freeze({ page, pageCount, start, end, visibleCount: end - start });
 }
 
 function $<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -658,7 +632,6 @@ export class MatrixView {
   private execOrder: string[] = [];
   private currentKey: string | undefined;
   private finished = false;
-  private page = 0;
   private filter: ResultFilter = 'all';
   private winnerKeys = new Set<string>();
   private tieKeys = new Set<string>();
@@ -681,7 +654,6 @@ export class MatrixView {
     this.resultByKey.clear();
     this.cells.clear();
     this.finished = false;
-    this.page = 0;
     this.filter = 'all';
     this.winnerKeys.clear();
     this.tieKeys.clear();
@@ -694,14 +666,13 @@ export class MatrixView {
     this.startedAtMs = nowMs();
     this.elapsedTimer = window.setInterval(() => this.renderElapsed(), 500);
     this.buildRace();
-    this.renderPage();
+    this.renderMatrix();
     this.renderScoreboard();
   }
 
   setResultFilter(filter: ResultFilter): void {
     this.filter = filter;
-    this.page = 0;
-    this.renderPage();
+    this.renderMatrix();
   }
 
   update(result: ScenarioResult): void {
@@ -735,7 +706,7 @@ export class MatrixView {
     this.currentKey = undefined;
     this.stopElapsed();
     this.renderElapsed();
-    this.renderPage();
+    this.renderMatrix();
     this.renderScoreboard();
   }
 
@@ -763,7 +734,7 @@ export class MatrixView {
     this.startedAtMs = 0;
     this.currentKey = undefined;
     this.finished = options.finished === true;
-    this.renderPage();
+    this.renderMatrix();
     this.renderScoreboard();
   }
 
@@ -781,7 +752,7 @@ export class MatrixView {
     });
   }
 
-  private renderPage(): void {
+  private renderMatrix(): void {
     clear(this.host);
     this.cells.clear();
     const scenarios = this.filteredScenarios();
@@ -793,20 +764,6 @@ export class MatrixView {
       this.host.append(el('p', { class: 'muted' }, 'No matrix rows match this result filter.'));
       return;
     }
-    const bounds = matrixPageBounds(scenarios.length, this.page);
-    this.page = bounds.page;
-    const { start, pageCount } = bounds;
-    const pageScenarios = scenarios.slice(bounds.start, bounds.end);
-    const nav = el('nav', { class: 'matrix-pages', 'aria-label': 'Matrix pages' });
-    const previous = el('button', { type: 'button' }, 'Previous rows');
-    previous.disabled = this.page === 0;
-    previous.addEventListener('click', () => { this.page--; this.renderPage(); });
-    const next = el('button', { type: 'button' }, 'Next rows');
-    next.disabled = this.page >= pageCount - 1;
-    next.addEventListener('click', () => { this.page++; this.renderPage(); });
-    nav.append(previous, el('span', {}, `Rows ${start + 1}–${start + pageScenarios.length} of ${scenarios.length} · page ${this.page + 1} of ${pageCount}`), next);
-    this.host.append(nav);
-
     const scroll = el('div', { class: 'matrix-scroll', tabindex: '0', 'aria-label': 'Conformance matrix; scroll horizontally for all engines' });
     const table = el('table', {
       // Positions remain tied to the immutable full model even while a status filter is active.
@@ -816,7 +773,10 @@ export class MatrixView {
     // Keep each engine column readable at narrow viewports/200% zoom; the focusable wrapper owns
     // horizontal overflow instead of squeezing cell text into an unusable sliver.
     table.style.minWidth = `${Math.max(48, 24 + this.engines.length * 11)}rem`;
-    table.append(el('caption', {}, `Conformance verdicts and measured metrics. Showing ${pageScenarios.length} of ${scenarios.length} scenario rows.`));
+    const rowSummary = this.filter === 'all'
+      ? `Showing all ${scenarios.length} scenario rows.`
+      : `Showing all ${scenarios.length} matching scenario rows out of ${this.scenarios.length}.`;
+    table.append(el('caption', {}, `Conformance verdicts and measured metrics. ${rowSummary}`));
     const head = el('thead');
     const headRow = el('tr', { 'aria-rowindex': '1' });
     headRow.append(el('th', { scope: 'col', 'aria-colindex': '1' }, 'Scenario'));
@@ -827,7 +787,7 @@ export class MatrixView {
     head.append(headRow);
     table.append(head);
     const body = el('tbody');
-    pageScenarios.forEach((scenarioId, rowIndex) => {
+    scenarios.forEach((scenarioId) => {
       const logicalIndex = this.scenarios.indexOf(scenarioId);
       const row = el('tr', { 'aria-rowindex': String(logicalIndex + 2) });
       row.append(el('th', { scope: 'row', class: 'scn', 'aria-colindex': '1' }, scenarioId));

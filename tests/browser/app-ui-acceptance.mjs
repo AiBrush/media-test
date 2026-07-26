@@ -239,35 +239,24 @@ try {
     });
   });
 
-  await check('REQ-UI-11/19 keeps a semantic, focusable, bounded matrix with all 10,002 results', async () => {
+  await check('REQ-UI-11/19 keeps all test rows in one semantic, scrollable matrix', async () => {
     const stress = await idlePage.evaluate(async () => {
       const prior = document.getElementById('browser-matrix-acceptance');
       prior?.remove();
       const host = document.createElement('div');
       host.id = 'browser-matrix-acceptance';
       document.body.append(host);
-      const { MatrixView, MAX_MATRIX_ROWS } = await import('/src/app/ui.ts');
+      const { MatrixView } = await import('/src/app/ui.ts');
       const engines = Array.from({ length: 6 }, (_, index) => `stress-engine-${index}@1`);
       const scenarios = Array.from({ length: 1667 }, (_, index) => `probe/stress-${String(index).padStart(4, '0')}`);
-      const longTasks = [];
-      const observer = typeof PerformanceObserver === 'function' && PerformanceObserver.supportedEntryTypes.includes('longtask')
-        ? new PerformanceObserver((list) => longTasks.push(...list.getEntries().map((entry) => entry.duration)))
-        : undefined;
-      observer?.observe({ type: 'longtask', buffered: true });
       const view = new MatrixView(host.id);
-      const started = performance.now();
       view.start(engines, scenarios);
-      const startDuration = performance.now() - started;
-      await new Promise(requestAnimationFrame);
-      observer?.disconnect();
       window.__BROWSER_ACCEPTANCE_MATRIX__ = view;
       return {
         engines,
         scenarios,
-        maxRows: MAX_MATRIX_ROWS,
         renderedRows: view.getRenderedRowCount(),
-        startDuration,
-        longTasks,
+        paginationControls: host.querySelectorAll('.matrix-pages, [aria-label="Matrix pages"]').length,
         rowCount: host.querySelector('table')?.getAttribute('aria-rowcount'),
         colCount: host.querySelector('table')?.getAttribute('aria-colcount'),
         caption: host.querySelector('caption')?.textContent,
@@ -279,23 +268,17 @@ try {
       };
     });
     assert.equal(stress.engines.length * stress.scenarios.length, 10_002);
-    assert(stress.renderedRows <= stress.maxRows);
-    assert.equal(stress.renderedRows, 75);
+    assert.equal(stress.renderedRows, 1667);
+    assert.equal(stress.paginationControls, 0);
     assert.equal(stress.rowCount, '1668');
     assert.equal(stress.colCount, '7');
     assert.match(stress.caption, /Conformance verdicts and measured metrics/);
+    assert.match(stress.caption, /Showing all 1667 scenario rows/);
     assert.equal(stress.firstRowIndex, '2');
-    assert.equal(stress.lastRowIndex, '76');
+    assert.equal(stress.lastRowIndex, '1668');
     assert.equal(stress.rowScope, 'row');
     assert(stress.columnScopes.every((scope) => scope === 'col'));
     assert.equal(stress.scrollTabIndex, '0');
-    assert(stress.startDuration < 250, `bounded initial page took ${stress.startDuration.toFixed(1)} ms`);
-    assert.equal(stress.longTasks.filter((duration) => duration >= 250).length, 0);
-
-    await keyboardActivate(idlePage, '#browser-matrix-acceptance .matrix-pages button:last-child');
-    assert.equal(await idlePage.locator('#browser-matrix-acceptance tbody tr').first().getAttribute('aria-rowindex'), '77');
-    await keyboardActivate(idlePage, '#browser-matrix-acceptance .matrix-pages button:first-child');
-    assert.equal(await idlePage.locator('#browser-matrix-acceptance tbody tr').first().getAttribute('aria-rowindex'), '2');
 
     await idlePage.evaluate(() => {
       const view = window.__BROWSER_ACCEPTANCE_MATRIX__;
@@ -310,11 +293,9 @@ try {
         },
       });
     });
-    await keyboardActivate(idlePage, '#browser-matrix-acceptance .matrix-pages button:last-child');
-    await keyboardActivate(idlePage, '#browser-matrix-acceptance .matrix-pages button:first-child');
     assert.match(await idlePage.locator('#browser-matrix-acceptance tbody tr').first().innerText(), /PASS/);
-    await keyboardActivate(idlePage, '#browser-matrix-acceptance tbody tr:first-child details summary', 'Enter');
-    assert.match(await idlePage.locator('#browser-matrix-acceptance tbody tr').first().innerText(), /cache hit from run stress-prior-run/);
+    await keyboardActivate(idlePage, '#browser-matrix-acceptance tbody tr:first-child td:first-of-type', 'Enter');
+    assert.match(await idlePage.locator('.cell-modal-body').innerText(), /cache hit from run stress-prior-run/);
 
     const filled = await idlePage.evaluate(async () => {
       const view = window.__BROWSER_ACCEPTANCE_MATRIX__;
@@ -350,7 +331,7 @@ try {
       produced: 10_002,
       modelCount: 10_002,
       serializedCount: 10_002,
-      renderedRows: 75,
+      renderedRows: 1667,
       totalCounter: '10002',
     });
   });
