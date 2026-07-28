@@ -9,6 +9,7 @@ import {
   AibrushMediaEngine,
   aibrushMuxRepresentationFields,
   enrichAibrushProbeMetadata,
+  enrichAibrushProbeMetadataFromTrackFacts,
   normalizedAibrushCodecFields,
   selectAibrushMuxTrackCandidates,
   selectAibrushSeekPacketPts,
@@ -161,10 +162,10 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     }, rotatedBytes);
     expect(rotated.tracks[0]?.rotation).toBe(90);
 
-    const pcm = enrichAibrushProbeMetadata({
+    const pcm = enrichAibrushProbeMetadataFromTrackFacts({
       container: 'wav', durationSec: 1,
       tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels: 2, bitrate: null }],
-    }, new Uint8Array());
+    });
     expect(pcm.tracks[0]?.bitrate).toBe(1_411_200);
   });
 

@@ -151,19 +151,26 @@ if [ "$(find -L "$MEDIA/dist" -type f -name '*.wasm' | wc -l | tr -d ' ')" -eq 0
   exit 1
 fi
 
-# Bun currently installs this file dependency as per-file symlinks. If that link already targets the
-# freshly-built sibling, avoid an unnecessary package-manager pass. A copied/absent install is refreshed
-# with a frozen lockfile and a loopback-only registry so this local sync cannot contact the network.
+# Bun installs this file dependency as per-file symlinks. A single known link is not sufficient proof
+# that the install follows the current build: a new export or content-hashed chunk has no pre-existing
+# symlink. Compare the complete dist file set and force-refresh whenever it differs. The frozen lockfile
+# and loopback-only registry keep this local sync offline.
 INDEX_LINK="$(readlink "$INSTALLED/dist/index.js" 2>/dev/null || true)"
-case "$INDEX_LINK" in
-  "$MEDIA/dist/"*) echo "[sync-vendor] installed file dependency already follows the local dist" ;;
-  *)
-    echo "[sync-vendor] refreshing the local file dependency with the frozen lockfile"
-    ( cd "$HERE" && bun install --frozen-lockfile --ignore-scripts --registry=http://127.0.0.1:9 )
-    ;;
-esac
+DIST_FILE_SET_MATCHES=false
+if [ -d "$INSTALLED/dist" ] && diff -q \
+  <(cd "$MEDIA/dist" && find . -type f -print | LC_ALL=C sort) \
+  <(cd "$INSTALLED/dist" && find -L . -type f -print | LC_ALL=C sort) \
+  >/dev/null; then
+  DIST_FILE_SET_MATCHES=true
+fi
+if [[ "$INDEX_LINK" == "$MEDIA/dist/"* ]] && [ "$DIST_FILE_SET_MATCHES" = true ]; then
+  echo "[sync-vendor] installed file dependency already follows the complete local dist"
+else
+  echo "[sync-vendor] refreshing the local file dependency with the frozen lockfile"
+  ( cd "$HERE" && bun install --force --frozen-lockfile --ignore-scripts --registry=http://127.0.0.1:9 )
+fi
 
-for entry in index.js core.js; do
+for entry in index.js core.js image.js wav.js; do
   [ -f "$INSTALLED/dist/$entry" ] || {
     echo "[sync-vendor] ERROR: installed dist/$entry is missing" >&2
     exit 1

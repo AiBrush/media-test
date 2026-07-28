@@ -65,6 +65,12 @@ describe('REQ-ENG-35: cell cancellation and exactly-once ownership', () => {
     expect(source).not.toMatch(/globalThis\.addEventListener\(['"](?:unhandledrejection|error)['"]/);
     expect(source).not.toContain('OP_TIMEOUT_MS');
     expect(source).not.toContain('setTimeout(');
+    expect(source).not.toContain('edge_empty_audio_transcode');
+    expect(source).not.toContain('fuzz_wav_bitflip_decode');
+    expect(source).not.toContain('fuzz_wav_fmt_corrupt_transcode');
+    expect(source).not.toContain('fuzz_wav_header_truncated_probe');
+    expect(source).not.toContain('meta_idempotent_resample_same_rate');
+    expect(source).not.toContain('meta_roundtrip_endianness_s16');
   });
 });
 
