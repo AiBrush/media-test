@@ -46,6 +46,7 @@ import type {
   OperationContext,
   PacketInfo,
   RemuxOptions,
+  TrimOptions,
   TrackType,
   TranscodeAudioOptions,
   TranscodeOptions,
@@ -968,6 +969,7 @@ interface AibrushEngine {
       start: number;
       end: number;
       mode: 'keyframe' | 'accurate';
+      fragmented?: boolean;
       sink?: AibrushSink;
     },
     o?: AibrushCallOptions,
@@ -4365,12 +4367,14 @@ async function tryStrictPreparedAibrushCopyTrim(
   input: MediaInput,
   range: { readonly startUs: number; readonly endUs: number },
   target: string,
+  fragmented: boolean,
   signal: AbortSignal,
 ): Promise<Uint8Array | undefined> {
   const sourceContainer = containerFromInput(input);
   if (
     input.mutated ||
     sourceContainer !== target ||
+    (fragmented && target !== 'mp4') ||
     range.startUs < 0 ||
     range.endUs <= range.startUs ||
     (sourceContainer !== 'mp4' &&
@@ -4413,8 +4417,8 @@ async function tryStrictPreparedAibrushCopyTrim(
     const output = core.muxPreparedMp4PacketTracks({
       tracks,
       container: target,
-      faststart: true,
-      fragmented: false,
+      faststart: !fragmented,
+      fragmented,
     });
     return proveAibrushPreparedCopyTrim(read.value, selectedEvidence, output, target) ? output : undefined;
   }
@@ -7707,20 +7711,11 @@ export class AibrushMediaEngine implements MediaEngine {
   async trim(
     input: MediaInput,
     range: { startUs: number; endUs: number },
-    opts: { container: string; frameAccurate: boolean },
+    opts: TrimOptions,
     context?: OperationContext,
   ): Promise<MediaBytes> {
     const shape = opts as unknown as Record<string, unknown>;
     rejectUnforwardableOutputShape('trim', shape);
-    if (shape.fragmented === true || shape.fastStart === 'fragmented') {
-      throw createNotApplicableError(
-        ENGINE_ID,
-        'trim',
-        'the framework TrimOptions surface cannot request fragmented output',
-        {},
-        'AIBRUSH_FRAGMENTED_TRIM_UNSUPPORTED',
-      );
-    }
     return this.#run('trim', 'framework.trim', context, async (signal) => {
       try {
         // Robustness inputs are intentionally malformed. Refuse them before a framework call can
@@ -7774,6 +7769,7 @@ export class AibrushMediaEngine implements MediaEngine {
             input,
             range,
             opts.container.toLowerCase(),
+            opts.fragmented === true,
             signal,
           );
           if (prepared !== undefined) {
@@ -7796,6 +7792,7 @@ export class AibrushMediaEngine implements MediaEngine {
             start: effectiveRange.startUs / 1e6,
             end: effectiveRange.endUs / 1e6,
             mode: opts.frameAccurate ? 'accurate' : 'keyframe',
+            ...(opts.fragmented === true ? { fragmented: true } : {}),
             sink: { kind: 'stream' },
           },
           { signal },

@@ -15,11 +15,15 @@ import {
 import {
   AibrushMediaEngine,
   aibrushDirectDecodeFitsFrameBudget,
+  selectAibrushCopyTrimSampleIndices,
 } from '../src/engines/aibrush-media/adapter.ts';
 import { classifyAibrushFrameworkError, translateAibrushFrameworkError } from '../src/engines/aibrush-media/errors.ts';
 import { sha256Hex } from '../src/engines/platform/digest.ts';
 import { decideAibrushSupport } from '../src/engines/aibrush-media/support.ts';
 import { decodeNativePcm } from '../src/features/audio-dsp/index.ts';
+import { inspectTrimAudioContainer } from '../src/features/trim/audio.ts';
+import { assessFragmentedTrimOutput } from '../src/features/trim/fragmented.ts';
+import { readNeutralRemuxProgram } from '../src/features/remux/readers.ts';
 
 const VIDEO: NormalizedTrack = {
   type: 'video',
@@ -106,14 +110,6 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       'still-image remux',
       request('remux', 'png', [], { outputContainer: 'mp4' }),
       'AIBRUSH_STILL_IMAGE_OPERATION_UNSUPPORTED',
-    ],
-    [
-      'fragmented trim',
-      request('trim', 'mp4', [VIDEO, AUDIO], {
-        outputContainer: 'mp4',
-        options: { fragmented: true },
-      }),
-      'AIBRUSH_FRAGMENTED_TRIM_UNSUPPORTED',
     ],
     [
       'append-only MP4',
@@ -219,6 +215,147 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         ),
       ),
     ).toEqual({ supported: true });
+  });
+
+  test('admits and authors fragmented MP4 trim through the public framework option', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/fragmented_cmaf.mp4').arrayBuffer(),
+    );
+    const input = rangeBackedInput('fragmented_cmaf.mp4', 'video/mp4', bytes);
+    const operationRequest = request('trim', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'trim/general_fragmented_mp4_copy',
+      inputId: input.id,
+      outputContainer: 'mp4',
+      options: {
+        container: 'mp4',
+        frameAccurate: false,
+        fragmented: true,
+        range: { startUs: 2_021_354, endUs: 4_021_354 },
+      },
+      transforms: {
+        trim: {
+          startUs: 2_021_354,
+          endUs: 4_021_354,
+          frameAccurate: false,
+        },
+      },
+    });
+    expect(decideAibrushSupport(operationRequest)).toEqual({ supported: true });
+
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    installRangeFetch(bytes);
+    const context = directContext(operationRequest);
+    const engine = new AibrushMediaEngine();
+    try {
+      await engine.init(context);
+      const output = await engine.trim(
+        input,
+        {
+          startUs: 2_021_354,
+          endUs: 4_021_354,
+        },
+        {
+          container: 'mp4',
+          frameAccurate: false,
+          fragmented: true,
+        },
+        context,
+      );
+      expect(
+        assessFragmentedTrimOutput(output.bytes, {
+          requiredTrackTypes: ['video', 'audio'],
+          requireZeroBasedDecodeTime: true,
+        }),
+      ).toMatchObject({
+        state: 'VERDICT',
+        verdict: 'PASS',
+        reasonCode: 'TRIM_FRAGMENT_STRUCTURE_VALID',
+      });
+      expect(engine.configUsed).toMatchObject({
+        operation: 'trim',
+        route: 'framework.trim',
+      });
+    } finally {
+      await engine.dispose(context);
+      restoreGlobal('fetch', fetchDescriptor);
+    }
+  });
+
+  test('fragmented MP4 copy trim selects reordered H.264 access units on presentation time', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/h264_bframes_1080p.mp4').arrayBuffer(),
+    );
+    const range = { startUs: 2_021_354, endUs: 4_021_354 };
+    const input = rangeBackedInput('h264_bframes_1080p.mp4', 'video/mp4', bytes);
+    const operationRequest = request('trim', 'mp4', [VIDEO], {
+      inputId: input.id,
+      outputContainer: 'mp4',
+      options: {
+        container: 'mp4',
+        frameAccurate: false,
+        fragmented: true,
+        range,
+      },
+      transforms: {
+        trim: {
+          ...range,
+          frameAccurate: false,
+        },
+      },
+    });
+    const source = readNeutralRemuxProgram(bytes, 'mp4');
+    expect(source.state).toBe('OK');
+    if (source.state !== 'OK') return;
+    const sourceVideo = source.value.tracks.find((track) => track.type === 'video');
+    expect(sourceVideo).toBeDefined();
+    if (sourceVideo === undefined) return;
+    const selected = selectAibrushCopyTrimSampleIndices(sourceVideo, range);
+    expect(selected.length).toBeGreaterThan(0);
+    expect(selected[selected.length - 1]! - selected[0]! + 1).toBeGreaterThan(selected.length);
+
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    installRangeFetch(bytes);
+    const context = directContext(operationRequest);
+    const engine = new AibrushMediaEngine();
+    try {
+      await engine.init(context);
+      const output = await engine.trim(
+        input,
+        range,
+        {
+          container: 'mp4',
+          frameAccurate: false,
+          fragmented: true,
+        },
+        context,
+      );
+      expect(
+        assessFragmentedTrimOutput(output.bytes, {
+          requiredTrackTypes: ['video'],
+          requireZeroBasedDecodeTime: true,
+        }),
+      ).toMatchObject({
+        state: 'VERDICT',
+        verdict: 'PASS',
+        reasonCode: 'TRIM_FRAGMENT_STRUCTURE_VALID',
+      });
+
+      const trimmed = readNeutralRemuxProgram(output.bytes, 'mp4');
+      expect(trimmed.state).toBe('OK');
+      if (trimmed.state !== 'OK') return;
+      const trimmedVideo = trimmed.value.tracks.find((track) => track.type === 'video');
+      expect(trimmedVideo).toBeDefined();
+      expect(trimmedVideo?.samples.map((sample) => sample.payload)).toEqual(
+        selected.map((index) => sourceVideo.samples[index]!.payload),
+      );
+      expect(engine.configUsed).toMatchObject({
+        operation: 'trim',
+        route: 'framework.trim',
+      });
+    } finally {
+      await engine.dispose(context);
+      restoreGlobal('fetch', fetchDescriptor);
+    }
   });
 
   test('returns the exact HEVC browser re-import decoder configuration', () => {
@@ -463,7 +600,6 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     for (const [container, codec] of [
       ['mp4', 'aac'],
       ['mp3', 'mp3'],
-      ['ogg', 'opus'],
     ] as const) {
       expect(
         decideAibrushSupport(
@@ -495,6 +631,28 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       decideAibrushSupport(
         request(
           'trim',
+          'ogg',
+          [
+            {
+              type: 'audio',
+              codec: 'opus',
+              sampleRate: 48_000,
+              channels: 2,
+            },
+          ],
+          {
+            outputContainer: 'ogg',
+            audioCodec: 'opus',
+            options: { invariant: 'trim-audio-content' },
+          },
+        ),
+      ),
+    ).toEqual({ supported: true });
+
+    expect(
+      decideAibrushSupport(
+        request(
+          'trim',
           'flac',
           [
             {
@@ -511,6 +669,83 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         ),
       ),
     ).toEqual({ supported: true });
+  });
+
+  test('authors an exact decoded Ogg Opus copy-trim window through the framework route', async () => {
+    const bytes = new Uint8Array(await Bun.file('fixtures/media/opus.ogg').arrayBuffer());
+    const input = rangeBackedInput('opus.ogg', 'audio/ogg', bytes);
+    const range = { startUs: 2_000_000, endUs: 7_000_000 };
+    const operationRequest = request(
+      'trim',
+      'ogg',
+      [
+        {
+          type: 'audio',
+          codec: 'opus',
+          sampleRate: 48_000,
+          channels: 2,
+        },
+      ],
+      {
+        inputId: input.id,
+        outputContainer: 'ogg',
+        audioCodec: 'opus',
+        options: {
+          container: 'ogg',
+          frameAccurate: false,
+          invariant: 'trim-audio-content',
+          range,
+        },
+        transforms: {
+          trim: {
+            ...range,
+            frameAccurate: false,
+          },
+        },
+      },
+    );
+    expect(decideAibrushSupport(operationRequest)).toEqual({ supported: true });
+
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    installRangeFetch(bytes);
+    const context = directContext(operationRequest);
+    const engine = new AibrushMediaEngine();
+    try {
+      await engine.init(context);
+      const output = await engine.trim(
+        input,
+        range,
+        {
+          container: 'ogg',
+          frameAccurate: false,
+        },
+        context,
+      );
+      expect(inspectTrimAudioContainer(output.bytes, 'ogg')).toEqual({
+        state: 'OK',
+        value: {
+          container: 'ogg',
+          codec: 'opus',
+          sampleRate: 48_000,
+          channels: 2,
+          codedSampleFrames: 305_280,
+          presentationSampleFrames: 240_000,
+          primingSampleFrames: 64_632,
+          endTrimSampleFrames: 648,
+          precision: 'exact',
+          packetOrFrameCount: 318,
+          metadataTotalSampleFrames: 240_000,
+          endOfStreamPresent: true,
+        },
+      });
+      expect(engine.configUsed).toMatchObject({
+        operation: 'trim',
+        route: 'framework.trim',
+      });
+    } finally {
+      await engine.dispose(context);
+      restoreGlobal('fetch', fetchDescriptor);
+    }
   });
 
   test('declares only the measured robustness trim composition contracts unsupported', () => {
@@ -1590,6 +1825,65 @@ async function fixtureInput(filename: string, mime: string): Promise<MediaInput>
     blob: () => Promise.resolve(new Blob([bytes.slice().buffer], { type: mime })),
     arrayBuffer: () => Promise.resolve(bytes.slice().buffer),
   };
+}
+
+function rangeBackedInput(filename: string, mime: string, bytes: Uint8Array): MediaInput {
+  return {
+    id: filename,
+    url: `http://127.0.0.1:5151/${filename}`,
+    mime,
+    mutated: false,
+    sizeBytes: bytes.byteLength,
+    blob: () => Promise.resolve(new Blob([bytes.slice().buffer], { type: mime })),
+    arrayBuffer: () => Promise.resolve(bytes.slice().buffer),
+  };
+}
+
+function installRangeFetch(bytes: Uint8Array): void {
+  Object.defineProperty(globalThis, 'fetch', {
+    configurable: true,
+    writable: true,
+    value: async (resource: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const requestHeaders = resource instanceof Request ? resource.headers : undefined;
+      const headers = new Headers(requestHeaders);
+      new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+      const range = headers.get('Range');
+      if (range === null) {
+        return new Response(bytes.slice(), {
+          status: 200,
+          headers: {
+            'Accept-Ranges': 'bytes',
+            'Content-Length': String(bytes.byteLength),
+          },
+        });
+      }
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (match === null || (match[1] === '' && match[2] === '')) {
+        throw new Error(`unexpected Range '${range}'`);
+      }
+      const requestedStart =
+        match[1] === '' ? Math.max(0, bytes.byteLength - Number(match[2])) : Number(match[1]);
+      const requestedEnd =
+        match[1] === '' || match[2] === ''
+          ? bytes.byteLength - 1
+          : Math.min(bytes.byteLength - 1, Number(match[2]));
+      if (requestedStart >= bytes.byteLength || requestedEnd < requestedStart) {
+        return new Response(undefined, {
+          status: 416,
+          headers: { 'Content-Range': `bytes */${bytes.byteLength}` },
+        });
+      }
+      const body = bytes.slice(requestedStart, requestedEnd + 1);
+      return new Response(body, {
+        status: 206,
+        headers: {
+          'Accept-Ranges': 'bytes',
+          'Content-Length': String(body.byteLength),
+          'Content-Range': `bytes ${requestedStart}-${requestedEnd}/${bytes.byteLength}`,
+        },
+      });
+    },
+  });
 }
 
 function insertWavJunkBeforeData(bytes: Uint8Array, junkBodyBytes: number): Uint8Array {

@@ -37,9 +37,17 @@
       }
       body {
         font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-        margin: 0 auto;
-        padding: 1.25rem 1.5rem 4rem;
-        max-width: 1400px;
+        margin: 0;
+        padding: 1.5rem clamp(0.75rem, 2.6vw, 2.5rem) 4rem;
+        width: 100%;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background:
+            radial-gradient(55rem 42rem at 12% 62%, rgba(31, 111, 235, 0.07), transparent 68%),
+            radial-gradient(48rem 36rem at 88% 55%, rgba(31, 156, 240, 0.045), transparent 70%),
+            #0d1117;
+        }
       }
 
       /* ── animated hero ──────────────────────────────────────────────────────────────────────── */
@@ -234,6 +242,409 @@
       #progress-label {
         color: var(--na);
         font-size: 0.85rem;
+      }
+
+      /* ── progressive run workspace ─────────────────────────────────────────────────────────── */
+      .run-workspace {
+        margin-top: 2rem;
+      }
+      .run-command-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1.5rem;
+        padding: 0 0 1rem;
+      }
+      .run-command-copy {
+        min-width: 0;
+      }
+      #scenario-intersection {
+        margin: 0;
+        color: inherit;
+        font-size: 1.08rem;
+      }
+      .configuration-message {
+        margin: 0.35rem 0 0;
+        color: var(--na);
+        font-size: 0.82rem;
+      }
+      .configuration-message:empty {
+        display: none;
+      }
+      .run-primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        min-height: 2.9rem;
+        padding-inline: 1.15rem;
+        white-space: nowrap;
+      }
+      .run-primary .ph {
+        font-size: 1.05rem;
+      }
+      .run-toolbar {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(25rem, 0.53fr);
+        gap: 1.5rem;
+        align-items: stretch;
+        padding: 1.45rem 0;
+        border-top: 1px solid var(--border);
+      }
+      .selection-actions {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        min-width: 0;
+      }
+      .selection-action-group {
+        min-width: 0;
+        padding: 0 1.05rem;
+        border-right: 1px solid var(--border);
+      }
+      .selection-action-group:first-child {
+        padding-left: 0;
+      }
+      .selection-action-label {
+        display: block;
+        margin-bottom: 0.65rem;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+      .selection-action-buttons {
+        display: flex;
+        gap: 0.45rem;
+      }
+      .selection-action-buttons button {
+        min-height: 2.35rem;
+        padding: 0.38rem 0.7rem;
+        flex: 1 1 auto;
+        font-size: 0.95rem;
+        white-space: nowrap;
+      }
+      .download-actions {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.55rem;
+        min-width: 0;
+      }
+      .download-actions button,
+      .cache-action-group button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 0.55rem;
+        min-width: 0;
+        min-height: 2.55rem;
+        text-align: left;
+      }
+      .download-actions button {
+        justify-content: center;
+        padding: 0.45rem 0.65rem;
+        font-size: 0.875rem;
+        line-height: 1.25;
+      }
+      .download-actions button:disabled {
+        opacity: 0.72;
+      }
+      .download-actions .ph,
+      .cache-action-group .ph,
+      .cache-import-picker .ph {
+        flex: none;
+        font-size: 1.1rem;
+      }
+      .run-activity-panel {
+        margin-top: 0.75rem;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        overflow: hidden;
+        background: rgba(127, 127, 127, 0.025);
+        font-size: 1rem;
+      }
+      .run-activity-panel .jump-links {
+        padding: 1.3rem 1.35rem 0.85rem;
+        margin: 0;
+        font-size: 1rem;
+      }
+      .jump-links a {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+      .jump-links .ph {
+        color: var(--accent);
+        font-size: 1rem;
+      }
+      .run-status-line {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.7rem;
+        min-width: 0;
+        padding: 0.9rem 1.35rem;
+      }
+      .run-status-line > .ph {
+        flex: none;
+        color: var(--na);
+        font-size: 1.15rem;
+        margin-top: 0.08rem;
+      }
+      #run-status {
+        min-width: 0;
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+      .run-progress-row {
+        display: grid;
+        grid-template-columns: minmax(8.5rem, 0.28fr) minmax(14rem, 0.58fr) minmax(18rem, 1.4fr);
+        align-items: center;
+        min-height: 5rem;
+        padding: 0.65rem 1.35rem 1.15rem;
+      }
+      .run-progress-title {
+        font-weight: 600;
+      }
+      .run-progress-stack {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        min-width: 0;
+        min-height: 2.4rem;
+        padding: 0 1.3rem;
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+      }
+      .run-progress-icon {
+        flex: none;
+        color: var(--accent);
+        font-size: 1.15rem;
+      }
+      body[data-run-state='running'] .run-progress-icon,
+      body[data-run-state='stopping'] .run-progress-icon {
+        animation: spinner-spin 0.9s linear infinite;
+      }
+      .run-progress-copy {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .run-progress-copy #run-progress {
+        display: block;
+        width: 100%;
+        height: 0.55rem;
+        margin: 0 0 0.3rem;
+      }
+      .run-progress-copy #run-progress[hidden] {
+        display: none;
+      }
+      #progress-label {
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+      #current-work {
+        min-width: 0;
+        margin: 0;
+        padding-left: 1.3rem;
+        color: var(--na);
+        overflow-wrap: anywhere;
+      }
+      #current-work:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 4px;
+      }
+      #file-progress-group {
+        margin: 0 1.35rem 1rem;
+        padding: 0.8rem 0;
+        border-top: 1px solid var(--border);
+      }
+      #file-progress-group p {
+        margin: 0.25rem 0 0;
+      }
+      #registration-notes-slot {
+        border-top: 1px solid var(--border);
+      }
+      #registration-notes-slot:empty {
+        display: none;
+      }
+      #registration-notes-slot #registration-banner {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.65rem;
+        padding: 1.35rem;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+      }
+      #registration-banner > .ph {
+        flex: none;
+        color: var(--na);
+        font-size: 1.1rem;
+        margin-top: 0.05rem;
+      }
+
+      /* ── cache workspace ───────────────────────────────────────────────────────────────────── */
+      #cache-section {
+        margin-top: 2rem;
+        padding-top: 2rem;
+        border-top: 1px solid var(--border);
+        font-size: 1rem;
+      }
+      #cache-section > h2 {
+        margin: 0 0 1.5rem;
+        padding: 0;
+        border: 0;
+        color: inherit;
+        font-size: 1.5rem;
+        font-weight: 500;
+        letter-spacing: 0;
+        text-transform: none;
+      }
+      #cache-status {
+        color: var(--na);
+      }
+      .cache-status-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+        max-width: 56.5rem;
+        margin-bottom: 0.725rem;
+      }
+      .cache-status-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        min-width: 0;
+        padding: 0 2rem;
+      }
+      .cache-status-item:first-child {
+        padding-left: 0;
+        border-right: 1px solid var(--border);
+      }
+      .cache-status-item:last-child {
+        border-right: 1px solid var(--border);
+      }
+      .cache-status-item > .ph {
+        flex: none;
+        color: inherit;
+        font-size: 1.2rem;
+        margin-top: 0.12rem;
+      }
+      .cache-status-copy {
+        min-width: 0;
+      }
+      .cache-status-copy p {
+        margin: 0 0 0.85rem;
+        overflow-wrap: anywhere;
+      }
+      .cache-status-copy strong {
+        color: inherit;
+        font-weight: 500;
+      }
+      .cache-status-message {
+        margin: 0.75rem 0 0;
+      }
+      .cache-actions {
+        display: grid;
+        grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.01fr) minmax(0, 1.08fr);
+        padding: 1.75rem 0 1.55rem;
+        border-top: 1px solid var(--border);
+      }
+      .cache-action-group {
+        min-width: 0;
+        padding: 0 2.4rem;
+      }
+      .cache-action-group:first-child {
+        padding-left: 0;
+      }
+      .cache-action-group:last-child {
+        padding-right: 0;
+      }
+      .cache-action-group + .cache-action-group {
+        border-left: 1px solid var(--border);
+      }
+      .cache-action-group h3 {
+        margin: 0 0 0.2rem;
+        font-size: 1.15rem;
+        font-weight: 500;
+      }
+      .cache-action-group > p {
+        min-height: 1.5rem;
+        margin: 0 0 1.7rem;
+        color: var(--na);
+        font-size: 0.95rem;
+      }
+      .cache-action-group > button {
+        width: 100%;
+        min-height: 3.25rem;
+      }
+      .cache-clear-actions {
+        display: flex;
+        flex-direction: column;
+      }
+      .cache-clear-actions > p {
+        min-height: 1.5rem;
+      }
+      .cache-clear-actions button + button {
+        margin-top: 0.55rem;
+      }
+      .danger-button {
+        color: var(--fail);
+        border-color: color-mix(in srgb, var(--fail) 58%, transparent);
+        background: color-mix(in srgb, var(--fail) 7%, transparent);
+      }
+      .danger-button:hover:not(:disabled) {
+        background: color-mix(in srgb, var(--fail) 12%, transparent);
+      }
+      @media (prefers-color-scheme: dark) {
+        .danger-button {
+          color: #ff6b6b;
+          border-color: rgba(255, 84, 89, 0.52);
+          background: rgba(207, 34, 46, 0.08);
+        }
+      }
+      .cache-import-picker {
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        min-height: 3.25rem;
+        margin-bottom: 0.65rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .cache-import-picker label {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55rem;
+        flex: none;
+        padding-left: 1rem;
+        white-space: nowrap;
+      }
+      .cache-import-picker input {
+        min-width: 0;
+        width: 100%;
+        color: var(--na);
+        font: inherit;
+      }
+      .cache-import-picker input::file-selector-button {
+        min-height: 3.25rem;
+        margin: 0 0.65rem;
+        padding: 0.4rem 0.75rem;
+        color: inherit;
+        border: 0;
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        background: var(--bg-alt);
+        font: inherit;
+        cursor: pointer;
+      }
+      .cache-scope-note {
+        margin: 0;
+        padding-top: 1.35rem;
+        border-top: 1px solid var(--border);
+        color: var(--na);
+        font-size: 0.875rem;
+      }
+      #import-cache {
+        width: 13.75rem;
+        max-width: 100%;
       }
 
       /* ── live scoreboard ────────────────────────────────────────────────────────────────────── */
@@ -583,7 +994,9 @@
       .detail-grid dd,
       .manifest-grid dd { margin: 0; overflow-wrap: anywhere; }
       .matrix-scroll {
-        overflow: auto;
+        width: 100%;
+        min-width: 0;
+        overflow-x: visible;
         max-width: 100%;
         outline-offset: 3px;
       }
@@ -606,7 +1019,6 @@
         border: 0;
       }
       .jump-links { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0; }
-      .cache-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
       .selected-inputs ul { max-height: 12rem; overflow: auto; }
       .env-grid {
         display: grid;
@@ -686,6 +1098,131 @@
       }
       .legend code {
         color: inherit;
+      }
+
+      @media (max-width: 1180px) {
+        .run-toolbar {
+          grid-template-columns: 1fr;
+        }
+        .download-actions {
+          max-width: none;
+        }
+        .run-progress-row {
+          grid-template-columns: minmax(7.5rem, 0.3fr) minmax(12rem, 0.7fr) minmax(16rem, 1.2fr);
+        }
+      }
+
+      @media (max-width: 820px) {
+        body {
+          padding-inline: 1rem;
+        }
+        .selection-actions {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 1rem 0;
+        }
+        .selection-action-group:nth-child(2) {
+          border-right: 0;
+        }
+        .selection-action-group:nth-child(3) {
+          padding-left: 0;
+        }
+        .download-actions {
+          grid-template-columns: 1fr;
+        }
+        .download-actions button {
+          justify-content: flex-start;
+        }
+        .run-progress-row {
+          grid-template-columns: 1fr;
+          gap: 0.75rem;
+          align-items: stretch;
+          padding-top: 0.8rem;
+        }
+        .run-progress-stack {
+          padding: 0;
+          border: 0;
+        }
+        #current-work {
+          padding: 0.75rem 0 0;
+          border-top: 1px solid var(--border);
+        }
+        .cache-status-grid {
+          grid-template-columns: 1fr;
+          gap: 1rem;
+        }
+        .cache-status-item {
+          padding: 0;
+        }
+        .cache-status-item:first-child {
+          padding-bottom: 1rem;
+          border-right: 0;
+          border-bottom: 1px solid var(--border);
+        }
+        .cache-status-item:last-child {
+          border-right: 0;
+        }
+        .cache-actions {
+          grid-template-columns: 1fr;
+          gap: 1.25rem;
+        }
+        .cache-action-group {
+          padding: 0;
+        }
+        .cache-action-group + .cache-action-group {
+          padding-top: 1.25rem;
+          border-top: 1px solid var(--border);
+          border-left: 0;
+        }
+      }
+
+      @media (max-width: 560px) {
+        body {
+          padding-inline: 0.75rem;
+        }
+        .run-command-head {
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .run-primary {
+          width: 100%;
+        }
+        .selection-actions {
+          grid-template-columns: 1fr;
+        }
+        .selection-action-group,
+        .selection-action-group:nth-child(3) {
+          padding: 0 0 1rem;
+          border-right: 0;
+          border-bottom: 1px solid var(--border);
+        }
+        .selection-action-group:last-child {
+          padding-bottom: 0;
+          border-bottom: 0;
+        }
+        .selection-action-buttons button {
+          flex: 0 1 auto;
+        }
+        .run-activity-panel .jump-links,
+        .run-status-line,
+        .run-progress-row,
+        #registration-notes-slot #registration-banner {
+          padding-inline: 0.9rem;
+        }
+        .run-activity-panel .jump-links {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+        .cache-import-picker {
+          align-items: stretch;
+          flex-direction: column;
+        }
+        .cache-import-picker label {
+          min-height: 2.65rem;
+        }
+        .cache-import-picker input::file-selector-button {
+          margin-left: 0;
+          border-left: 0;
+        }
       }
 
       /* ── entrance + reduced-motion ──────────────────────────────────────────────────────────── */
@@ -778,7 +1315,8 @@
         .fade-seq,
         .hero::before,
         h1,
-        .chip.ok .dot {
+        .chip.ok .dot,
+        .run-progress-icon {
           animation: none !important;
         }
         progress {
@@ -876,67 +1414,147 @@
             class="opt"
             title="Shuffle the selected engine/scenario cells once at run start so the next pending test row is chosen randomly instead of scenario-major order."
           >
-            <input data-run-config="true" id="randomize-order" type="checkbox" checked />
+            <input data-run-config="true" id="randomize-order" type="checkbox" />
             Randomize next test row
           </label>
           <label
             class="opt"
             title="Run every scenario against every eligible catalog input in the same order for every engine. Full coverage requires every file to be correct (PASS); mixed coverage is reported as Partial with each file retained. Metrics use their declared exhaustive aggregation policy."
           >
-            <input data-run-config="true" id="exhaustive-media" type="checkbox" />
+            <input data-run-config="true" id="exhaustive-media" type="checkbox" checked />
             Exhaustive (all files per scenario)
           </label>
         </fieldset>
       </div>
-      <p id="scenario-intersection" class="muted">Scenario intersection pending registration.</p>
-      <p id="validation-message" class="muted"></p>
-      <p id="next-run-note" class="muted"></p>
-      <div class="actions">
-        <button id="run" class="primary">Run selected features</button>
-        <button id="select-all-features" type="button">Select all features</button>
-        <button id="clear-features" type="button">Clear features</button>
-        <button id="select-all-eng" type="button">Select all engines</button>
-        <button id="clear-engines" type="button">Clear engines</button>
-        <button id="select-all-scn" type="button">Select all scenarios</button>
-        <button id="clear-scenarios" type="button">Clear scenarios</button>
-        <button id="select-all-operations" type="button">Select all operations</button>
-        <button id="clear-operations" type="button">Clear operations</button>
-        <button id="download" type="button" disabled>Download raw results@2 JSON</button>
-        <button id="download-report-json" type="button" disabled>Download report JSON</button>
-        <button id="download-report-md" type="button" disabled>Download report Markdown</button>
-      </div>
-      <div class="jump-links">
-        <a href="#current-work">Jump to current cell</a>
-        <a href="#results-section">Jump to results</a>
-      </div>
-      <p id="run-status" class="muted">idle</p>
-      <div id="live-status" role="status" aria-live="polite" aria-atomic="true"></div>
-      <label for="run-progress">Run progress</label>
-      <progress id="run-progress" min="0" max="1" value="0" hidden>0 of 1</progress>
-      <p id="progress-label" class="muted">No run in progress.</p>
-      <div id="file-progress-group" hidden>
-        <label for="file-progress">Current exhaustive-cell input progress</label>
-        <progress id="file-progress" min="0" max="1" value="0">0 of 1</progress>
-        <p id="file-progress-label" class="muted">No exhaustive input in progress.</p>
-      </div>
-      <p id="current-work" tabindex="-1">Current cell: not running.</p>
-    </section>
+      <div class="run-workspace">
+        <div class="run-command-head">
+          <div class="run-command-copy">
+            <p id="scenario-intersection">Scenario intersection pending registration.</p>
+            <p id="validation-message" class="configuration-message"></p>
+            <p id="next-run-note" class="configuration-message"></p>
+          </div>
+          <button id="run" class="primary run-primary">
+            <i class="ph ph-play" aria-hidden="true"></i>
+            <span id="run-button-label" class="button-label">Run selected features</span>
+          </button>
+        </div>
 
-    <section id="run-config-section" class="fade-seq">
-      <h2>Run configuration &amp; provenance</h2>
-      <div id="run-manifest"><p class="muted">Idle — no run manifest yet.</p></div>
+        <div class="run-toolbar" aria-label="Run selection and download actions">
+          <div class="selection-actions">
+            <div class="selection-action-group">
+              <span class="selection-action-label">Features</span>
+              <div class="selection-action-buttons">
+                <button id="select-all-features" type="button">Select all</button>
+                <button id="clear-features" type="button">Clear</button>
+              </div>
+            </div>
+            <div class="selection-action-group">
+              <span class="selection-action-label">Engines</span>
+              <div class="selection-action-buttons">
+                <button id="select-all-eng" type="button">Select all</button>
+                <button id="clear-engines" type="button">Clear</button>
+              </div>
+            </div>
+            <div class="selection-action-group">
+              <span class="selection-action-label">Scenarios</span>
+              <div class="selection-action-buttons">
+                <button id="select-all-scn" type="button">Select all</button>
+                <button id="clear-scenarios" type="button">Clear</button>
+              </div>
+            </div>
+            <div class="selection-action-group">
+              <span class="selection-action-label">Operations</span>
+              <div class="selection-action-buttons">
+                <button id="select-all-operations" type="button">Select all</button>
+                <button id="clear-operations" type="button">Clear</button>
+              </div>
+            </div>
+          </div>
+          <div class="download-actions">
+            <button id="download" type="button" disabled>
+              <i class="ph ph-download-simple" aria-hidden="true"></i>
+              <span>Download raw results@2 JSON</span>
+            </button>
+            <button id="download-report-json" type="button" disabled>
+              <i class="ph ph-download-simple" aria-hidden="true"></i>
+              <span>Download report JSON</span>
+            </button>
+            <button id="download-report-md" type="button" disabled>
+              <i class="ph ph-download-simple" aria-hidden="true"></i>
+              <span>Download report Markdown</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="run-activity-panel">
+          <div class="jump-links">
+            <a href="#current-work"><i class="ph ph-arrows-out" aria-hidden="true"></i>Jump to current cell</a>
+            <a href="#results-section"><i class="ph ph-arrows-out" aria-hidden="true"></i>Jump to results</a>
+          </div>
+          <div class="run-status-line">
+            <i class="ph ph-database" aria-hidden="true"></i>
+            <p id="run-status" class="muted">idle</p>
+          </div>
+          <div id="live-status" role="status" aria-live="polite" aria-atomic="true"></div>
+          <div class="run-progress-row">
+            <label class="run-progress-title" for="run-progress">Run progress</label>
+            <div class="run-progress-stack">
+              <i class="ph ph-circle-notch run-progress-icon" aria-hidden="true"></i>
+              <div class="run-progress-copy">
+                <progress id="run-progress" min="0" max="1" value="0" hidden>0 of 1</progress>
+                <p id="progress-label" class="muted">No run in progress.</p>
+              </div>
+            </div>
+            <p id="current-work" tabindex="-1">Current cell: not running.</p>
+          </div>
+          <div id="file-progress-group" hidden>
+            <label for="file-progress">Current exhaustive-cell input progress</label>
+            <progress id="file-progress" min="0" max="1" value="0">0 of 1</progress>
+            <p id="file-progress-label" class="muted">No exhaustive input in progress.</p>
+          </div>
+          <div id="registration-notes-slot"></div>
+        </div>
+      </div>
     </section>
 
     <section id="cache-section" class="fade-seq">
       <h2>Origin-scoped result cache</h2>
       <div id="cache-status" class="muted">Inspecting origin storage…</div>
       <div class="cache-actions">
-        <button id="export-cache" type="button" disabled>Export validated cache bundle</button>
-        <button id="clear-cache" type="button" disabled>Clear all cached results</button>
-        <button id="clear-aibrush-cache" type="button" disabled>Clear aibrush-media cached results</button>
-        <label>Import cache bundle <input id="import-cache-file" type="file" accept="application/json,.json" /></label>
-        <button id="import-cache" type="button" disabled>Import after validation</button>
+        <div class="cache-action-group">
+          <h3>Export</h3>
+          <p>Download validated data for backup or transfer.</p>
+          <button id="export-cache" type="button" disabled>
+            <i class="ph ph-download-simple" aria-hidden="true"></i>
+            <span>Export validated cache bundle</span>
+          </button>
+        </div>
+        <div class="cache-action-group cache-clear-actions">
+          <h3>Clear</h3>
+          <p>Remove cached data from this origin.</p>
+          <button id="clear-cache" class="danger-button" type="button" disabled>
+            <i class="ph ph-trash" aria-hidden="true"></i>
+            <span>Clear all cached results</span>
+          </button>
+          <button id="clear-aibrush-cache" class="danger-button" type="button" disabled>
+            <i class="ph ph-trash" aria-hidden="true"></i>
+            <span>Clear aibrush-media cached results</span>
+          </button>
+        </div>
+        <div class="cache-action-group">
+          <h3>Import</h3>
+          <p>Import a validated cache bundle.</p>
+          <div class="cache-import-picker">
+            <label for="import-cache-file">
+              <i class="ph ph-upload-simple" aria-hidden="true"></i>
+              <span>Import cache bundle</span>
+            </label>
+            <input id="import-cache-file" type="file" accept="application/json,.json" />
+          </div>
+          <button id="import-cache" type="button" disabled>Import after validation</button>
+        </div>
       </div>
+      <p class="cache-scope-note">Cache operations affect only the current origin and browser profile. Always back up before clearing or importing.</p>
     </section>
 
     <section id="summary-section" class="fade-seq" hidden>

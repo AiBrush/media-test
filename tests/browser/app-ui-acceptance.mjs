@@ -162,6 +162,15 @@ try {
     assert.equal(await idlePage.locator('#results table').count(), 0);
     assert.equal(await idlePage.evaluate(() => window.__RESULTS__?.length ?? 0), 0);
     assert.equal(await idlePage.evaluate(() => window.__RUN_DONE__), undefined);
+    assert.equal(await idlePage.locator('#randomize-order').isChecked(), false);
+    assert.equal(await idlePage.locator('#exhaustive-media').isChecked(), true);
+    assert.equal(await idlePage.locator('#run-config-section').count(), 0);
+    assert.equal((await idlePage.locator('body').innerText()).includes('Run configuration & provenance'), false);
+    const pageWidth = await idlePage.evaluate(() => ({
+      body: document.body.getBoundingClientRect().width,
+      viewport: document.documentElement.clientWidth,
+    }));
+    assert(Math.abs(pageWidth.body - pageWidth.viewport) <= 1, 'page does not use the full viewport width');
 
     await keyboardActivate(idlePage, '#clear-engines');
     await keyboardActivate(idlePage, '#run');
@@ -239,7 +248,7 @@ try {
     });
   });
 
-  await check('REQ-UI-11/19 keeps all test rows in one semantic, scrollable matrix', async () => {
+  await check('REQ-UI-11/19 keeps all test rows in one semantic, full-width matrix', async () => {
     const stress = await idlePage.evaluate(async () => {
       const prior = document.getElementById('browser-matrix-acceptance');
       prior?.remove();
@@ -264,7 +273,10 @@ try {
         lastRowIndex: host.querySelector('tbody tr:last-child')?.getAttribute('aria-rowindex'),
         rowScope: host.querySelector('tbody th')?.getAttribute('scope'),
         columnScopes: [...host.querySelectorAll('thead th')].map((node) => node.getAttribute('scope')),
-        scrollTabIndex: host.querySelector('.matrix-scroll')?.getAttribute('tabindex'),
+        matrixWidth: host.querySelector('.matrix-scroll')?.clientWidth,
+        matrixScrollWidth: host.querySelector('.matrix-scroll')?.scrollWidth,
+        tableWidth: host.querySelector('table')?.clientWidth,
+        tableMinWidth: host.querySelector('table')?.style.minWidth,
       };
     });
     assert.equal(stress.engines.length * stress.scenarios.length, 10_002);
@@ -278,7 +290,9 @@ try {
     assert.equal(stress.lastRowIndex, '1668');
     assert.equal(stress.rowScope, 'row');
     assert(stress.columnScopes.every((scope) => scope === 'col'));
-    assert.equal(stress.scrollTabIndex, '0');
+    assert.equal(stress.tableMinWidth, '');
+    assert.equal(stress.tableWidth, stress.matrixWidth);
+    assert(stress.matrixScrollWidth <= stress.matrixWidth + 1, 'matrix unexpectedly overflows horizontally');
 
     await idlePage.evaluate(() => {
       const view = window.__BROWSER_ACCEPTANCE_MATRIX__;
@@ -349,15 +363,16 @@ try {
     return { id: scenario.id, family: scenario.family, operation: scenario.op, engineId, cancelEngineId };
   });
 
-  await check('REQ-UI-08/09/17 shows immutable manifest, selected SHA, and attributed cache reuse', async () => {
+  await check('REQ-UI-08/09/17 retains immutable manifest, selected SHA, and attributed cache reuse', async () => {
     const first = await runPage.evaluate(async (filter) => await window.__SUITE__.run(filter), runFilter(selection));
     assert.equal(first.length, 1);
     assert(['PASS', 'DIFF', 'FAIL'].includes(first[0].status), `unexpected first status ${first[0].status}: ${first[0].reason}`);
     assert.equal(await runPage.evaluate(() => window.__RUN_ARTIFACT__?.completionState), 'completed');
-    const firstManifest = await runPage.locator('#run-manifest').innerText();
-    assert.match(firstManifest, /browser-acceptance-seed/);
-    assert.match(firstManifest, /SHA-256 [a-f0-9]{64}/i);
-    assert.match(firstManifest, /candidate\(s\)/i);
+    const firstManifest = await runPage.evaluate(() => window.__RUN_ARTIFACT__?.manifest);
+    assert(firstManifest, 'completed run omitted its manifest artifact');
+    assert.equal(firstManifest.configuration.randomSeed, 'browser-acceptance-seed');
+    assert(firstManifest.selectedInputs.some((input) => /^[a-f0-9]{64}$/i.test(input.sha256 ?? '')));
+    assert(firstManifest.selectedInputs.some((input) => typeof input.candidateCount === 'number'));
 
     const cacheProbe = await runPage.evaluate(async (liveResult) => {
       const [{ createResultCache }, { canonicalJsonSha256 }, { isExecutionFingerprintReusable }] = await Promise.all([
@@ -403,10 +418,11 @@ try {
     assert.equal(second.length, 1);
     selection.status = second[0].status;
     assert(second[0].cacheReuse, 'identical full-manifest run did not produce attributed cache reuse');
-    const secondManifest = await runPage.locator('#run-manifest').innerText();
-    assert.match(secondManifest, /Attributed cache reuse/);
-    assert.match(secondManifest, /source run run-/);
-    assert.match(secondManifest, /why|matched|valid|identity|fingerprint/i);
+    const secondManifest = await runPage.evaluate(() => window.__RUN_ARTIFACT__?.manifest);
+    assert(secondManifest, 'cache-reused run omitted its manifest artifact');
+    assert(secondManifest.cache.hits.length > 0, 'cache-reused run omitted attributed cache hits');
+    assert(secondManifest.cache.hits.some((hit) => /^run-/.test(hit.sourceRunId ?? '')));
+    assert(secondManifest.cache.hits.some((hit) => /why|matched|valid|identity|fingerprint/i.test(hit.validBecause)));
 
     const summary = runPage.locator('#results details summary').first();
     await summary.focus();
@@ -470,7 +486,7 @@ try {
     await secondOrigin.close();
   });
 
-  await check('REQ-UI-11/12 remains reachable with keyboard at narrow 200% zoom', async () => {
+  await check('REQ-UI-11/12 remains reachable without horizontal scrolling at narrow 200% zoom', async () => {
     await runPage.setViewportSize({ width: 640, height: 720 });
     await runPage.evaluate(() => { document.documentElement.style.zoom = '2'; });
     const layout = await runPage.evaluate(() => {
@@ -479,23 +495,24 @@ try {
       const caption = table?.querySelector('caption');
       const summary = table?.querySelector('details summary');
       return {
-        scrollTabIndex: scroll?.getAttribute('tabindex'),
         scrollWidth: scroll?.scrollWidth,
         clientWidth: scroll?.clientWidth,
+        pageScrollWidth: document.documentElement.scrollWidth,
+        pageClientWidth: document.documentElement.clientWidth,
         caption: caption?.textContent,
         columnScopes: [...(table?.querySelectorAll('thead th') ?? [])].map((node) => node.getAttribute('scope')),
         rowScope: table?.querySelector('tbody th')?.getAttribute('scope'),
         summaryLabel: summary?.getAttribute('aria-label'),
       };
     });
-    assert.equal(layout.scrollTabIndex, '0');
-    assert(layout.scrollWidth > layout.clientWidth, 'matrix did not expose deliberate horizontal overflow');
+    assert(layout.scrollWidth <= layout.clientWidth + 1, 'matrix unexpectedly requires horizontal scrolling');
+    assert(layout.pageScrollWidth <= layout.pageClientWidth + 1, 'page unexpectedly requires horizontal scrolling');
     assert.match(layout.caption, /Conformance verdicts/);
     assert(layout.columnScopes.every((scope) => scope === 'col'));
     assert.equal(layout.rowScope, 'row');
     assert.match(layout.summaryLabel, new RegExp(`${selection.id}.*mp4box.*${selection.status}`, 'i'));
 
-    for (const selector of ['#run', '#download', '#results .matrix-scroll', '#results details summary']) {
+    for (const selector of ['#run', '#download', '#results details summary']) {
       const locator = runPage.locator(selector).first();
       await locator.scrollIntoViewIfNeeded();
       await locator.focus();

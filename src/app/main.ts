@@ -1,5 +1,6 @@
 /** Browser application orchestration and the launcher control surface. */
 
+import '@phosphor-icons/web/regular';
 import { detectEnv, detectCodecSupport } from '../core/feature-detect.ts';
 import type { EnvInfo, CodecSupport } from '../core/feature-detect.ts';
 import type { BrowserName, Operation } from '../core/engine.ts';
@@ -244,7 +245,7 @@ async function restoreLatestCachedRun(): Promise<boolean> {
     // The result cache does not contain the frozen run manifest/configuration required for a
     // canonical export. Show its results, but keep export disabled until a live run creates one.
     setExportControlsDisabled(true);
-    getEl<HTMLButtonElement>('run').textContent = 'Run selected features';
+    setRunButtonLabel('Run selected features');
     const source = view.sourceRunId ? ` run ${view.sourceRunId}` : '';
     setRunStatus(
       `Loaded ${view.results.length} persisted result${view.results.length === 1 ? '' : 's'} from the existing cache${source}` +
@@ -348,6 +349,16 @@ async function copySeed(): Promise<void> {
   } catch {
     getEl<HTMLInputElement>('random-seed').select();
     setRunStatus('Clipboard unavailable; replay seed selected for copying.');
+  }
+}
+
+function setRunButtonLabel(text: string): void {
+  const button = getEl<HTMLButtonElement>('run');
+  getEl<HTMLSpanElement>('run-button-label').textContent = text;
+  const icon = button.querySelector<HTMLElement>('.ph');
+  if (icon) {
+    const startsRun = /^(Run|Start|Resume)\b/.test(text);
+    icon.className = `ph ${startsRun ? 'ph-play' : 'ph-stop'}`;
   }
 }
 
@@ -529,8 +540,7 @@ async function runFromFilter(
   setConfigurationControlsDisabled(true);
   setExportControlsDisabled(true);
   setCacheControlsDisabled(true);
-  const runButton = getEl<HTMLButtonElement>('run');
-  runButton.textContent = 'Stop run safely';
+  setRunButtonLabel('Stop run safely');
   setRunState('running');
   setRunStatus(`Run ${runId} started on ${configuration.browser}.`);
   setCurrentWork(activeRunWorkText(activeRun.work));
@@ -562,7 +572,7 @@ async function runFromFilter(
       };
       if (activeRun.state === 'stopping') {
         const presentation = cancellationPresentation(activeRun.work);
-        runButton.textContent = presentation.buttonLabel;
+        setRunButtonLabel(presentation.buttonLabel);
         setCurrentWork(presentation.currentWork);
       } else {
         setCurrentWork(activeRunWorkText(activeRun.work));
@@ -577,7 +587,7 @@ async function runFromFilter(
       };
       if (activeRun.state === 'stopping') {
         const presentation = cancellationPresentation(activeRun.work);
-        runButton.textContent = presentation.buttonLabel;
+        setRunButtonLabel(presentation.buttonLabel);
         setCurrentWork(presentation.currentWork);
       } else {
         setCurrentWork(activeRunWorkText(activeRun.work));
@@ -656,11 +666,11 @@ async function runFromFilter(
     window.__RUN_DONE__ = true;
     setRunState(terminalState);
     const hasRemainingCells = streamed.length < executionOrder.length;
-    runButton.textContent = terminalState === 'completed'
+    setRunButtonLabel(terminalState === 'completed'
       ? 'Run selected features'
       : hasRemainingCells && configuration.reuseData
         ? 'Run remaining with cache'
-        : runContinuationAction(undefined).label;
+        : runContinuationAction(undefined).label);
     const summary = summarize(currentArtifact?.results ?? streamed);
     if (currentArtifact) {
       setRunStatus(terminalState === 'completed'
@@ -735,7 +745,7 @@ function stopActiveRun(reason: string): void {
   run.controller.abort(new DOMException(reason, 'AbortError'));
   setRunState('stopping');
   const presentation = cancellationPresentation(run.work);
-  getEl<HTMLButtonElement>('run').textContent = presentation.buttonLabel;
+  setRunButtonLabel(presentation.buttonLabel);
   setRunStatus(presentation.status);
   setCurrentWork(presentation.currentWork);
 }

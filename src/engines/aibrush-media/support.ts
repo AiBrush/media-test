@@ -161,12 +161,6 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
       `fastStart applies only to mp4/mov output, not '${outputContainer ?? 'missing'}'`,
     );
   }
-  if (fragmented && operation === 'trim') {
-    return reject(
-      'AIBRUSH_FRAGMENTED_TRIM_UNSUPPORTED',
-      'the framework TrimOptions surface cannot request fragmented output',
-    );
-  }
   if (fragmented && outputContainer !== 'mp4' && outputContainer !== 'mov' && outputContainer !== 'webm' && outputContainer !== 'mkv') {
     return reject(
       'AIBRUSH_FRAGMENTED_CONTAINER_ILLEGAL',
@@ -315,11 +309,18 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     options.invariant === 'trim-audio-content' &&
     tracks.length > 0 &&
     tracks.every((track) => track.type === 'audio') &&
-    tracks.some((track) => LOSSY_TRIM_AUDIO_CODECS.has(track.codec.toLowerCase()))
+    tracks.some((track) => LOSSY_TRIM_AUDIO_CODECS.has(track.codec.toLowerCase())) &&
+    !(
+      inputContainers.length === 1 &&
+      firstContainer === 'ogg' &&
+      outputContainer === 'ogg' &&
+      tracks.length === 1 &&
+      codecs[0] === 'opus'
+    )
   ) {
     return reject(
       'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
-      'the packet-copy trim surface cannot author the exact decoded presentation window for AAC, MP3, or Opus priming/padding',
+      'the packet-copy trim surface cannot author the exact decoded presentation window for AAC, MP3, or Opus outside same-container Ogg pre-skip/end-granule authoring',
     );
   }
   if (operation === 'remux' && outputContainer !== undefined) {

@@ -693,6 +693,10 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(html).toMatch(/<progress id="run-progress"[^>]*min="0"[^>]*max="1"/);
     expect(html).toMatch(/<progress id="file-progress"[^>]*min="0"[^>]*max="1"/);
     expect(html).toContain('id="live-status" role="status" aria-live="polite"');
+    expect(html).toMatch(/id="randomize-order" type="checkbox" \/>/);
+    expect(html).toMatch(/id="exhaustive-media" type="checkbox" checked \/>/);
+    expect(html).not.toContain('Run configuration &amp; provenance');
+    expect(html).not.toContain('id="run-config-section"');
     expect(html).toContain('Jump to current cell');
     for (const status of ['PASS', 'FAIL', 'NA_ENGINE', 'NA_BROWSER', 'NA_ASSET', 'SKIPPED', 'ERROR']) {
       expect(html).toContain(`<option value="${status}">${status}</option>`);

@@ -368,8 +368,10 @@ export function renderRegistrationBanner(lines: readonly string[]): void {
   existing?.remove();
   if (lines.length === 0) return;
   const banner = el('div', { id: 'registration-banner', class: 'banner' });
-  banner.append(el('strong', {}, 'Registration notes: '), document.createTextNode(lines.join(' · ')));
-  $('controls-section').append(banner);
+  const copy = el('span');
+  copy.append(el('strong', {}, 'Registration notes: '), document.createTextNode(lines.join(' · ')));
+  banner.append(el('i', { class: 'ph ph-file-text', 'aria-hidden': 'true' }), copy);
+  (byId('registration-notes-slot') ?? $('controls-section')).append(banner);
 }
 
 export function renderRunManifest(manifest: RunManifest | undefined): void {
@@ -461,12 +463,35 @@ export function renderCacheStatus(snapshot: CacheManifestSnapshot): void {
   const estimate = snapshot.estimate
     ? `${formatBytes(snapshot.estimate.usage)} used of ${formatBytes(snapshot.estimate.quota)}`
     : 'storage estimate not available';
-  host.append(el('p', {}, `Origin ${snapshot.origin}. IndexedDB is isolated by scheme, host, and port; a browser profile does not share this cache across ports.`));
-  host.append(el('p', {}, `${snapshot.available ? 'Cache available' : 'Cache unavailable'} · ${snapshot.entryCount} entries · ${snapshot.invalidatedCount} invalidated · ${estimate}.`));
+  const grid = el('div', { class: 'cache-status-grid' });
+  const originCopy = el('div', { class: 'cache-status-copy' });
+  originCopy.append(
+    el('p', {}, el('strong', {}, 'Origin '), `${snapshot.origin}.`),
+    el('p', {}, 'IndexedDB is isolated by scheme, host, and port; a browser profile does not share this cache across ports.'),
+  );
+  const origin = el('div', { class: 'cache-status-item' });
+  origin.append(el('i', { class: 'ph ph-globe', 'aria-hidden': 'true' }), originCopy);
+
+  const healthCopy = el('div', { class: 'cache-status-copy' });
+  healthCopy.append(
+    el('p', {}, el('strong', {}, snapshot.available ? 'Cache available' : 'Cache unavailable')),
+    el('p', {}, `${snapshot.entryCount} entries · ${snapshot.invalidatedCount} invalidated`),
+    el('p', {}, `${estimate}.`),
+  );
+  const health = el('div', { class: 'cache-status-item' });
+  health.append(el('i', { class: 'ph ph-database', 'aria-hidden': 'true' }), healthCopy);
+  grid.append(origin, health);
+  host.append(grid);
   if (snapshot.importProvenance) {
-    host.append(el('p', {}, `Imported from ${snapshot.importProvenance.sourceOrigin} at ${snapshot.importProvenance.importedAtIso}; bundle ${snapshot.importProvenance.contentHash}.`));
+    host.append(el(
+      'p',
+      { class: 'cache-status-message' },
+      `Imported from ${snapshot.importProvenance.sourceOrigin} at ${snapshot.importProvenance.importedAtIso}; bundle ${snapshot.importProvenance.contentHash}.`,
+    ));
   }
-  if (snapshot.lastError) host.append(el('p', { class: 'cache-warning' }, snapshot.lastError));
+  if (snapshot.lastError) {
+    host.append(el('p', { class: 'cache-status-message cache-warning' }, snapshot.lastError));
+  }
 }
 
 function listOrAll(values: readonly string[]): string {
@@ -764,15 +789,12 @@ export class MatrixView {
       this.host.append(el('p', { class: 'muted' }, 'No matrix rows match this result filter.'));
       return;
     }
-    const scroll = el('div', { class: 'matrix-scroll', tabindex: '0', 'aria-label': 'Conformance matrix; scroll horizontally for all engines' });
+    const scroll = el('div', { class: 'matrix-scroll' });
     const table = el('table', {
       // Positions remain tied to the immutable full model even while a status filter is active.
       'aria-rowcount': String(this.scenarios.length + 1),
       'aria-colcount': String(this.engines.length + 1),
     });
-    // Keep each engine column readable at narrow viewports/200% zoom; the focusable wrapper owns
-    // horizontal overflow instead of squeezing cell text into an unusable sliver.
-    table.style.minWidth = `${Math.max(48, 24 + this.engines.length * 11)}rem`;
     const rowSummary = this.filter === 'all'
       ? `Showing all ${scenarios.length} scenario rows.`
       : `Showing all ${scenarios.length} matching scenario rows out of ${this.scenarios.length}.`;
