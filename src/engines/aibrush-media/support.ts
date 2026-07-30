@@ -309,6 +309,22 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     options.invariant === 'trim-audio-content' &&
     tracks.length > 0 &&
     tracks.every((track) => track.type === 'audio') &&
+    inputContainers.length === 1 &&
+    firstContainer === 'mp3' &&
+    outputContainer === 'mp3' &&
+    tracks.length === 1 &&
+    codecs[0] === 'mp3'
+  ) {
+    return reject(
+      'AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED',
+      'MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable',
+    );
+  }
+  if (
+    operation === 'trim' &&
+    options.invariant === 'trim-audio-content' &&
+    tracks.length > 0 &&
+    tracks.every((track) => track.type === 'audio') &&
     tracks.some((track) => LOSSY_TRIM_AUDIO_CODECS.has(track.codec.toLowerCase())) &&
     !(
       inputContainers.length === 1 &&
@@ -320,7 +336,7 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   ) {
     return reject(
       'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
-      'the packet-copy trim surface cannot author the exact decoded presentation window for AAC, MP3, or Opus outside same-container Ogg pre-skip/end-granule authoring',
+      'the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring',
     );
   }
   if (operation === 'remux' && outputContainer !== undefined) {

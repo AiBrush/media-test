@@ -30,6 +30,9 @@
         --bg-alt: rgba(127, 127, 127, 0.08);
         --card: rgba(127, 127, 127, 0.06);
         --border: rgba(127, 127, 127, 0.35);
+        --control-surface: rgba(255, 255, 255, 0.86);
+        --control-subtle: rgba(246, 248, 250, 0.92);
+        --control-hover: rgba(9, 105, 218, 0.07);
         --shadow: 0 1px 2px rgba(0, 0, 0, 0.16), 0 8px 24px rgba(0, 0, 0, 0.1);
       }
       * {
@@ -42,6 +45,11 @@
         width: 100%;
       }
       @media (prefers-color-scheme: dark) {
+        :root {
+          --control-surface: rgba(13, 17, 23, 0.94);
+          --control-subtle: rgba(22, 27, 34, 0.94);
+          --control-hover: rgba(31, 111, 235, 0.12);
+        }
         body {
           background:
             radial-gradient(55rem 42rem at 12% 62%, rgba(31, 111, 235, 0.07), transparent 68%),
@@ -158,29 +166,322 @@
       section {
         margin: 1.6rem 0;
       }
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
 
       /* ── benchmark flow ─────────────────────────────────────────────────────────────────────── */
-      .controls {
+      .controls-heading {
         display: flex;
-        flex-wrap: wrap;
-        gap: 1.25rem;
-        align-items: flex-start;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 0.9rem;
       }
-      fieldset {
+      .controls-heading h2 {
+        margin: 0;
+      }
+      .controls-heading p {
+        margin: 0.55rem 0 0;
+        color: var(--na);
+      }
+      .controls {
         border: 1px solid var(--border);
-        border-radius: 8px;
-        min-width: 220px;
-        max-height: 280px;
-        overflow: auto;
+        border-radius: 14px;
+        background: var(--control-surface);
+        box-shadow: var(--shadow);
+        overflow: hidden;
       }
-      legend {
+      .selection-grid {
+        display: grid;
+        grid-template-columns:
+          minmax(13rem, 0.9fr)
+          minmax(22rem, 1.65fr)
+          minmax(13rem, 0.9fr)
+          minmax(12rem, 0.78fr);
+        gap: 1px;
+        background: var(--control-surface);
+      }
+      .picker-card,
+      .run-options-card {
+        min-width: 0;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+        background: var(--control-surface);
+      }
+      .picker-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 23rem;
+        padding: 1.05rem 1rem 1rem;
+        border-right: 1px solid var(--border);
+      }
+      .picker-card:last-child {
+        border-right: 0;
+      }
+      .picker-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+        font-size: 1rem;
         font-weight: 600;
-        padding: 0 0.4rem;
       }
-      label.opt {
-        display: block;
+      .selection-count {
+        padding: 0.12rem 0.5rem;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--na);
+        background: var(--control-subtle);
+        font-size: 0.7rem;
+        font-weight: 600;
+        letter-spacing: 0.01em;
         white-space: nowrap;
-        padding: 1px 0;
+      }
+      .picker-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 0.35rem;
+        min-height: 2rem;
+        margin: 0.7rem 0 0.6rem;
+      }
+      .picker-actions button {
+        min-height: 1.9rem;
+        padding: 0.2rem 0.55rem;
+        border-radius: 6px;
+        color: var(--na);
+        background: transparent;
+        font-size: 0.76rem;
+      }
+      .picker-actions button:hover:not(:disabled) {
+        color: inherit;
+        background: var(--control-hover);
+        box-shadow: none;
+      }
+      .scenario-tools {
+        display: grid;
+        grid-template-columns: minmax(9rem, 1fr) auto;
+        align-items: center;
+        gap: 0.55rem;
+        margin-top: 0.7rem;
+      }
+      .scenario-tools .picker-actions {
+        min-height: 0;
+        margin: 0;
+      }
+      .picker-search {
+        position: relative;
+        display: flex;
+        align-items: center;
+        min-width: 0;
+      }
+      .picker-search .ph {
+        position: absolute;
+        left: 0.65rem;
+        color: var(--na);
+        font-size: 0.95rem;
+        pointer-events: none;
+      }
+      .scenario-tools .picker-search input {
+        width: 100%;
+        min-height: 2.15rem;
+        padding: 0.35rem 0.6rem 0.35rem 2.25rem;
+      }
+      .picker-filter-status {
+        min-height: 1rem;
+        margin: 0.35rem 0 0.45rem;
+        color: var(--na);
+        font-size: 0.72rem;
+      }
+      .checklist-viewport {
+        flex: 1 1 auto;
+        min-height: 0;
+        max-height: 17rem;
+        padding-right: 0.2rem;
+        overflow: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
+      }
+      .checklist-viewport label.opt {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.45rem;
+        min-width: 0;
+        margin: 0;
+        padding: 0.32rem 0.4rem;
+        border-radius: 6px;
+        line-height: 1.3;
+        white-space: normal;
+        cursor: pointer;
+      }
+      .checklist-viewport label.opt:hover {
+        color: inherit;
+        background: var(--control-hover);
+      }
+      .checklist-viewport label.opt:has(input:checked) {
+        color: inherit;
+        background: color-mix(in srgb, var(--accent) 9%, transparent);
+      }
+      .checklist-viewport label.opt:has(input:focus-visible) {
+        outline: 2px solid var(--accent);
+        outline-offset: -2px;
+      }
+      .checklist-viewport label.opt[hidden] {
+        display: none;
+      }
+      .checklist-viewport input[type='checkbox'] {
+        flex: none;
+        margin: 0.13rem 0 0;
+        accent-color: var(--accent);
+      }
+      .run-options-card {
+        padding: 1.1rem 1.15rem 1.2rem;
+        border-top: 1px solid var(--border);
+      }
+      .controls fieldset[aria-invalid='true'] {
+        box-shadow: inset 0 0 0 2px var(--fail);
+      }
+      .run-options-card > legend {
+        padding: 0 0.35rem;
+        font-size: 1rem;
+        font-weight: 650;
+      }
+      .panel-help {
+        margin: 0 0 0.85rem;
+        color: var(--na);
+        font-size: 0.8rem;
+      }
+      .option-field-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+        gap: 0.75rem;
+      }
+      .control-field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+        min-width: 0;
+        color: var(--na);
+        font-size: 0.76rem;
+        font-weight: 600;
+      }
+      .control-field > span:first-child {
+        min-height: 1.1rem;
+      }
+      .control-field small {
+        font-size: inherit;
+        font-weight: 500;
+      }
+      .control-field input,
+      .control-field select {
+        width: 100%;
+        min-height: 2.45rem;
+        color: inherit;
+        background: var(--control-subtle);
+      }
+      .seed-field {
+        grid-column: span 2;
+      }
+      .input-action {
+        display: flex;
+        min-width: 0;
+      }
+      .input-action input {
+        min-width: 0;
+        border-radius: 7px 0 0 7px;
+      }
+      .input-action button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.35rem;
+        min-width: 4.8rem;
+        margin-left: -1px;
+        border-radius: 0 7px 7px 0;
+      }
+      .option-toggle-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.7rem;
+        margin-top: 0.85rem;
+      }
+      .toggle-card {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 0.75rem;
+        min-width: 0;
+        padding: 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        background: var(--control-subtle);
+        cursor: pointer;
+      }
+      .toggle-card:hover {
+        border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+      }
+      .toggle-card > input[type='checkbox'] {
+        position: relative;
+        width: 2.45rem;
+        height: 1.4rem;
+        margin: 0.08rem 0 0;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        appearance: none;
+        background: rgba(127, 127, 127, 0.22);
+        cursor: pointer;
+        transition: background 0.16s ease;
+      }
+      .toggle-card > input[type='checkbox']::after {
+        content: '';
+        position: absolute;
+        top: 0.16rem;
+        left: 0.17rem;
+        width: 0.95rem;
+        height: 0.95rem;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+        transition: transform 0.16s ease;
+      }
+      .toggle-card > input[type='checkbox']:checked {
+        border-color: var(--accent);
+        background: var(--accent);
+      }
+      .toggle-card > input[type='checkbox']:checked::after {
+        transform: translateX(1.02rem);
+      }
+      .toggle-card > input[type='checkbox']:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .toggle-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 0.18rem;
+        min-width: 0;
+      }
+      .toggle-copy strong {
+        font-size: 0.86rem;
+        font-weight: 650;
+      }
+      .toggle-copy small {
+        color: var(--na);
+        font-size: 0.74rem;
+        line-height: 1.35;
       }
       .actions {
         display: flex;
@@ -222,6 +523,7 @@
         cursor: not-allowed;
       }
       select,
+      input[type='search'],
       input[type='text'],
       input[type='number'] {
         font: inherit;
@@ -246,22 +548,57 @@
 
       /* ── progressive run workspace ─────────────────────────────────────────────────────────── */
       .run-workspace {
-        margin-top: 2rem;
+        margin-top: 1.1rem;
       }
       .run-command-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 1.5rem;
-        padding: 0 0 1rem;
+        padding: 1.05rem 1.15rem;
+        border-top: 1px solid var(--border);
+        background:
+          linear-gradient(110deg, rgba(31, 111, 235, 0.11), rgba(137, 87, 229, 0.07) 52%, transparent),
+          var(--control-surface);
       }
       .run-command-copy {
         min-width: 0;
       }
+      .run-command-eyebrow {
+        display: block;
+        margin-bottom: 0.12rem;
+        color: var(--accent);
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
       #scenario-intersection {
         margin: 0;
         color: inherit;
-        font-size: 1.08rem;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+      .run-facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem 0.95rem;
+        margin-top: 0.42rem;
+        color: var(--na);
+        font-size: 0.76rem;
+      }
+      .run-facts span {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.28rem;
+      }
+      .run-facts span::before {
+        content: '';
+        width: 0.35rem;
+        height: 0.35rem;
+        border-radius: 50%;
+        background: var(--accent);
+        opacity: 0.78;
       }
       .configuration-message {
         margin: 0.35rem 0 0;
@@ -276,8 +613,9 @@
         align-items: center;
         justify-content: center;
         gap: 0.5rem;
-        min-height: 2.9rem;
-        padding-inline: 1.15rem;
+        min-width: 13rem;
+        min-height: 3rem;
+        padding-inline: 1.2rem;
         white-space: nowrap;
       }
       .run-primary .ph {
@@ -285,41 +623,25 @@
       }
       .run-toolbar {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(25rem, 0.53fr);
-        gap: 1.5rem;
-        align-items: stretch;
-        padding: 1.45rem 0;
-        border-top: 1px solid var(--border);
+        grid-template-columns: minmax(12rem, 1fr) minmax(30rem, 1.25fr);
+        gap: 1rem;
+        align-items: center;
+        padding: 0.9rem 1rem;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--card);
       }
-      .selection-actions {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        min-width: 0;
-      }
-      .selection-action-group {
-        min-width: 0;
-        padding: 0 1.05rem;
-        border-right: 1px solid var(--border);
-      }
-      .selection-action-group:first-child {
-        padding-left: 0;
-      }
-      .selection-action-label {
-        display: block;
-        margin-bottom: 0.65rem;
-        font-size: 1rem;
-        font-weight: 600;
-      }
-      .selection-action-buttons {
+      .toolbar-copy {
         display: flex;
-        gap: 0.45rem;
+        flex-direction: column;
+        min-width: 0;
       }
-      .selection-action-buttons button {
-        min-height: 2.35rem;
-        padding: 0.38rem 0.7rem;
-        flex: 1 1 auto;
-        font-size: 0.95rem;
-        white-space: nowrap;
+      .toolbar-copy strong {
+        font-size: 0.9rem;
+      }
+      .toolbar-copy span {
+        color: var(--na);
+        font-size: 0.76rem;
       }
       .download-actions {
         display: grid;
@@ -1101,6 +1423,18 @@
       }
 
       @media (max-width: 1180px) {
+        .selection-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .scenario-picker {
+          grid-column: span 2;
+        }
+        .picker-card {
+          min-height: 19rem;
+        }
+        .scenario-picker {
+          min-height: 21rem;
+        }
         .run-toolbar {
           grid-template-columns: 1fr;
         }
@@ -1116,15 +1450,26 @@
         body {
           padding-inline: 1rem;
         }
-        .selection-actions {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 1rem 0;
+        .selection-grid {
+          grid-template-columns: 1fr;
         }
-        .selection-action-group:nth-child(2) {
+        .scenario-picker {
+          grid-column: auto;
+        }
+        .picker-card,
+        .scenario-picker {
+          min-height: 0;
           border-right: 0;
+          border-bottom: 1px solid var(--border);
         }
-        .selection-action-group:nth-child(3) {
-          padding-left: 0;
+        .picker-card:last-child {
+          border-bottom: 0;
+        }
+        .checklist-viewport {
+          max-height: 14rem;
+        }
+        .option-toggle-grid {
+          grid-template-columns: 1fr;
         }
         .download-actions {
           grid-template-columns: 1fr;
@@ -1186,21 +1531,18 @@
         .run-primary {
           width: 100%;
         }
-        .selection-actions {
+        .scenario-tools {
           grid-template-columns: 1fr;
         }
-        .selection-action-group,
-        .selection-action-group:nth-child(3) {
-          padding: 0 0 1rem;
-          border-right: 0;
-          border-bottom: 1px solid var(--border);
+        .scenario-tools .picker-actions {
+          justify-content: flex-start;
         }
-        .selection-action-group:last-child {
-          padding-bottom: 0;
-          border-bottom: 0;
+        .seed-field {
+          grid-column: auto;
         }
-        .selection-action-buttons button {
-          flex: 0 1 auto;
+        .run-facts {
+          flex-direction: column;
+          gap: 0.28rem;
         }
         .run-activity-panel .jump-links,
         .run-status-line,
@@ -1351,85 +1693,171 @@
     </section>
 
     <section id="controls-section" class="fade-seq" style="animation-delay: 0.15s">
-      <h2>Controls</h2>
-      <div class="controls" id="controls">
-        <fieldset id="features-fs" aria-describedby="scenario-intersection validation-message">
-          <legend>Features</legend>
-          <div id="features-list" class="muted">Registering feature groups…</div>
-        </fieldset>
-        <fieldset id="scenarios-fs" aria-describedby="scenario-intersection validation-message">
-          <legend>Scenarios</legend>
-          <div id="scenarios-list" class="muted">Registering scenarios…</div>
-        </fieldset>
-        <fieldset id="engines-fs" aria-describedby="validation-message">
-          <legend>Engines</legend>
-          <div id="engines-list" class="muted">Registering engines…</div>
-        </fieldset>
-        <fieldset id="operations-fs" aria-describedby="scenario-intersection">
-          <legend>Operations</legend>
-          <div id="operations-list" class="muted">Registering operations…</div>
-        </fieldset>
-        <fieldset id="options-fs" aria-describedby="validation-message next-run-note">
-          <legend>Options</legend>
-          <label class="opt"
-            >Warmup <input data-run-config="true" type="number" id="warmup" min="0" max="20" value="1" style="width: 4rem"
-          /></label>
-          <label class="opt"
-            >Iters <input data-run-config="true" type="number" id="iters" min="1" max="50" value="1" style="width: 4rem"
-          /></label>
-          <label class="opt"
-            >Timeout ms <input data-run-config="true" type="number" id="timeout-ms" min="1000" max="86400000" value="86400000" style="width: 8rem"
-          /></label>
-          <label class="opt"
-            >Replay seed <input data-run-config="true" type="text" id="random-seed" value="" autocomplete="off" spellcheck="false" style="width: 13rem"
-          /></label>
-          <button id="copy-seed" type="button">Copy seed</button>
-          <label class="opt"
-            >Pillar
-            <select data-run-config="true" id="pillar">
-              <option value="all">all</option>
-              <option value="functional">functional</option>
-              <option value="performance">performance</option>
-              <option value="robustness">robustness</option>
-            </select>
-          </label>
-          <label class="opt"
-            >Browser tag
-            <select data-run-config="true" id="browser-tag">
-              <option value="auto">auto-detect</option>
-              <option value="brave">brave</option>
-              <option value="chromium">chromium</option>
-              <option value="webkit">webkit</option>
-              <option value="firefox">firefox</option>
-            </select>
-          </label>
-          <label
-            class="opt"
-            title="Reuse previously stored results from this browser instead of running them again, regardless of result status."
-          >
-            <input data-run-config="true" id="reuse-data" type="checkbox" checked />
-            Reuse all data
-          </label>
-          <label
-            class="opt"
-            title="Shuffle the selected engine/scenario cells once at run start so the next pending test row is chosen randomly instead of scenario-major order."
-          >
-            <input data-run-config="true" id="randomize-order" type="checkbox" />
-            Randomize next test row
-          </label>
-          <label
-            class="opt"
-            title="Run every scenario against every eligible catalog input in the same order for every engine. Full coverage requires every file to be correct (PASS); mixed coverage is reported as Partial with each file retained. Metrics use their declared exhaustive aggregation policy."
-          >
-            <input data-run-config="true" id="exhaustive-media" type="checkbox" checked />
-            Exhaustive (all files per scenario)
-          </label>
-        </fieldset>
+      <div class="controls-heading">
+        <div>
+          <h2>Run setup</h2>
+          <p>Choose the coverage you need, tune execution, then review the exact workload before starting.</p>
+        </div>
       </div>
-      <div class="run-workspace">
+
+      <div class="controls" id="controls">
+        <div class="selection-grid">
+          <fieldset id="features-fs" class="picker-card" aria-describedby="scenario-intersection validation-message">
+            <legend class="picker-title">
+              <span>Features</span>
+              <span id="features-selection-count" class="selection-count">0 selected</span>
+            </legend>
+            <div class="picker-actions">
+              <button id="select-all-features" type="button" aria-label="Select all features">All</button>
+              <button id="clear-features" type="button" aria-label="Clear all features">None</button>
+            </div>
+            <div id="features-list" class="checklist-viewport muted">Registering feature groups…</div>
+          </fieldset>
+
+          <fieldset
+            id="scenarios-fs"
+            class="picker-card scenario-picker"
+            aria-describedby="scenario-intersection scenario-filter-status validation-message"
+          >
+            <legend class="picker-title">
+              <span>Scenarios</span>
+              <span id="scenarios-selection-count" class="selection-count">0 selected</span>
+            </legend>
+            <div class="scenario-tools">
+              <label class="picker-search" for="scenario-search">
+                <i class="ph ph-magnifying-glass" aria-hidden="true"></i>
+                <span class="sr-only">Filter scenarios</span>
+                <input
+                  data-run-config="true"
+                  id="scenario-search"
+                  type="search"
+                  placeholder="Filter 592 scenarios…"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+              <div class="picker-actions">
+                <button id="select-all-scn" type="button">Select shown</button>
+                <button id="clear-scenarios" type="button">Clear shown</button>
+              </div>
+            </div>
+            <p id="scenario-filter-status" class="picker-filter-status" aria-live="polite">Registering scenarios…</p>
+            <div id="scenarios-list" class="checklist-viewport muted">Registering scenarios…</div>
+          </fieldset>
+
+          <fieldset id="engines-fs" class="picker-card" aria-describedby="validation-message">
+            <legend class="picker-title">
+              <span>Engines</span>
+              <span id="engines-selection-count" class="selection-count">0 selected</span>
+            </legend>
+            <div class="picker-actions">
+              <button id="select-all-eng" type="button" aria-label="Select all engines">All</button>
+              <button id="clear-engines" type="button" aria-label="Clear all engines">None</button>
+            </div>
+            <div id="engines-list" class="checklist-viewport muted">Registering engines…</div>
+          </fieldset>
+
+          <fieldset id="operations-fs" class="picker-card" aria-describedby="scenario-intersection">
+            <legend class="picker-title">
+              <span>Operations</span>
+              <span id="operations-selection-count" class="selection-count">0 selected</span>
+            </legend>
+            <div class="picker-actions">
+              <button id="select-all-operations" type="button" aria-label="Select all operations">All</button>
+              <button id="clear-operations" type="button" aria-label="Clear all operations">None</button>
+            </div>
+            <div id="operations-list" class="checklist-viewport muted">Registering operations…</div>
+          </fieldset>
+        </div>
+
+        <fieldset id="options-fs" class="run-options-card" aria-describedby="validation-message next-run-note">
+          <legend>Run configuration</legend>
+          <p class="panel-help">These values are frozen when the run starts.</p>
+          <div class="option-field-grid">
+            <label class="control-field">
+              <span>Test pillar</span>
+              <select data-run-config="true" id="pillar">
+                <option value="all">All pillars</option>
+                <option value="functional">Functional</option>
+                <option value="performance">Performance</option>
+                <option value="robustness">Robustness</option>
+              </select>
+            </label>
+            <label class="control-field">
+              <span>Browser tag</span>
+              <select data-run-config="true" id="browser-tag">
+                <option value="auto">Auto-detect</option>
+                <option value="brave">Brave</option>
+                <option value="chromium">Chromium</option>
+                <option value="webkit">WebKit</option>
+                <option value="firefox">Firefox</option>
+              </select>
+            </label>
+            <label class="control-field">
+              <span>Warmup runs</span>
+              <input data-run-config="true" type="number" id="warmup" min="0" max="20" value="1" />
+            </label>
+            <label class="control-field">
+              <span>Measured iterations</span>
+              <input data-run-config="true" type="number" id="iters" min="1" max="50" value="1" />
+            </label>
+            <label class="control-field">
+              <span>Run timeout <small>ms</small></span>
+              <input data-run-config="true" type="number" id="timeout-ms" min="1000" max="86400000" value="86400000" />
+            </label>
+            <label class="control-field seed-field">
+              <span>Replay seed</span>
+              <span class="input-action">
+                <input
+                  data-run-config="true"
+                  type="text"
+                  id="random-seed"
+                  value=""
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button id="copy-seed" type="button" aria-label="Copy replay seed">
+                  <i class="ph ph-copy" aria-hidden="true"></i>
+                  <span>Copy</span>
+                </button>
+              </span>
+            </label>
+          </div>
+
+          <div class="option-toggle-grid">
+            <label class="toggle-card">
+              <input data-run-config="true" id="reuse-data" type="checkbox" checked />
+              <span class="toggle-copy">
+                <strong>Reuse compatible cached data</strong>
+                <small>Skip stored cells only when the browser, engine, inputs, and protocol still match.</small>
+              </span>
+            </label>
+            <label class="toggle-card">
+              <input data-run-config="true" id="randomize-order" type="checkbox" />
+              <span class="toggle-copy">
+                <strong>Randomize execution order</strong>
+                <small>Shuffle the pending cell queue once using the replay seed.</small>
+              </span>
+            </label>
+            <label class="toggle-card">
+              <input data-run-config="true" id="exhaustive-media" type="checkbox" checked />
+              <span class="toggle-copy">
+                <strong>Use every eligible media file</strong>
+                <small>Run each scenario across its full catalog instead of one seeded input.</small>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+
         <div class="run-command-head">
           <div class="run-command-copy">
+            <span class="run-command-eyebrow">Workload preview</span>
             <p id="scenario-intersection">Scenario intersection pending registration.</p>
+            <div class="run-facts" aria-label="Selected run summary">
+              <span><strong id="selected-cell-count">0</strong> engine × scenario cells</span>
+              <span id="reuse-summary">Compatible cache reuse on</span>
+              <span id="media-mode-summary">Every eligible media file</span>
+            </div>
             <p id="validation-message" class="configuration-message"></p>
             <p id="next-run-note" class="configuration-message"></p>
           </div>
@@ -1438,37 +1866,13 @@
             <span id="run-button-label" class="button-label">Run selected features</span>
           </button>
         </div>
+      </div>
 
-        <div class="run-toolbar" aria-label="Run selection and download actions">
-          <div class="selection-actions">
-            <div class="selection-action-group">
-              <span class="selection-action-label">Features</span>
-              <div class="selection-action-buttons">
-                <button id="select-all-features" type="button">Select all</button>
-                <button id="clear-features" type="button">Clear</button>
-              </div>
-            </div>
-            <div class="selection-action-group">
-              <span class="selection-action-label">Engines</span>
-              <div class="selection-action-buttons">
-                <button id="select-all-eng" type="button">Select all</button>
-                <button id="clear-engines" type="button">Clear</button>
-              </div>
-            </div>
-            <div class="selection-action-group">
-              <span class="selection-action-label">Scenarios</span>
-              <div class="selection-action-buttons">
-                <button id="select-all-scn" type="button">Select all</button>
-                <button id="clear-scenarios" type="button">Clear</button>
-              </div>
-            </div>
-            <div class="selection-action-group">
-              <span class="selection-action-label">Operations</span>
-              <div class="selection-action-buttons">
-                <button id="select-all-operations" type="button">Select all</button>
-                <button id="clear-operations" type="button">Clear</button>
-              </div>
-            </div>
+      <div class="run-workspace">
+        <div class="run-toolbar" aria-label="Result download actions">
+          <div class="toolbar-copy">
+            <strong>Results export</strong>
+            <span>Downloads unlock after a validated run.</span>
           </div>
           <div class="download-actions">
             <button id="download" type="button" disabled>

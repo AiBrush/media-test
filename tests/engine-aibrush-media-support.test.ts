@@ -217,7 +217,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     ).toEqual({ supported: true });
   });
 
-  test('admits and authors fragmented MP4 trim through the public framework option', async () => {
+  test('admits and authors fragmented MP4 trim through the public driver-author surface', async () => {
     const bytes = new Uint8Array(
       await Bun.file('fixtures/media/fragmented_cmaf.mp4').arrayBuffer(),
     );
@@ -273,11 +273,126 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       });
       expect(engine.configUsed).toMatchObject({
         operation: 'trim',
-        route: 'framework.trim',
+        route: 'core.prepared-iso-copy-trim',
       });
     } finally {
       await engine.dispose(context);
       restoreGlobal('fetch', fetchDescriptor);
+    }
+  });
+
+  test('returns exact source bytes for a declared same-container no-op trim', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/h264_1080p_30s.mp4').arrayBuffer(),
+    );
+    const input = rangeBackedInput('h264_1080p_30s.mp4', 'video/mp4', bytes);
+    const range = { startUs: 0, endUs: 30_000_000 };
+    const operationRequest = request('trim', 'mp4', [VIDEO, AUDIO], {
+      inputId: input.id,
+      outputContainer: 'mp4',
+      options: {
+        container: 'mp4',
+        frameAccurate: false,
+        invariant: 'trim-noop-semantic-identity',
+        range,
+      },
+      transforms: {
+        trim: {
+          ...range,
+          frameAccurate: false,
+        },
+      },
+    });
+    const context = directContext(operationRequest);
+    const engine = new AibrushMediaEngine();
+    try {
+      await engine.init(context);
+      const output = await engine.trim(
+        input,
+        range,
+        {
+          container: 'mp4',
+          frameAccurate: false,
+        },
+        context,
+      );
+      expect(output.bytes).toEqual(bytes);
+      expect(engine.configUsed).toMatchObject({
+        operation: 'trim',
+        route: 'adapter.exact-source-identity',
+      });
+    } finally {
+      await engine.dispose(context);
+    }
+  });
+
+  test('rejects intrinsic and past-EOF MP4 trim ranges through lightweight structural validation', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/h264_1080p_30s.mp4').arrayBuffer(),
+    );
+    for (const [scenarioId, range, route, reason] of [
+      [
+        'trim/robust_generic_negative_start',
+        { startUs: -1, endUs: 1_000_000 },
+        'adapter.intrinsic-range-validation',
+        'trim start must be non-negative',
+      ],
+      [
+        'trim/robust_generic_start_past_eof',
+        { startUs: 40_000_000, endUs: 45_000_000 },
+        'adapter.mp4-range-validation',
+        'trim start lies at or past media duration',
+      ],
+    ] as const) {
+      const input = rangeBackedInput('h264_1080p_30s.mp4', 'video/mp4', bytes);
+      const operationRequest = request('trim', 'mp4', [VIDEO, AUDIO], {
+        scenarioId,
+        inputId: input.id,
+        outputContainer: 'mp4',
+        options: {
+          container: 'mp4',
+          frameAccurate: false,
+          range,
+        },
+        transforms: {
+          trim: {
+            ...range,
+            frameAccurate: false,
+          },
+        },
+      });
+      const context = directContext(operationRequest);
+      const engine = new AibrushMediaEngine();
+      try {
+        await engine.init(context);
+        let thrown: unknown;
+        try {
+          await engine.trim(
+            input,
+            range,
+            {
+              container: 'mp4',
+              frameAccurate: false,
+            },
+            context,
+          );
+        } catch (error) {
+          thrown = error;
+        }
+        expect(isMalformedInputError(thrown)).toBe(true);
+        expect(thrown).toMatchObject({
+          reasonCode: 'AIBRUSH_REQUEST_REJECTED',
+          operation: 'trim',
+          stage: 'validate',
+          reason,
+        });
+        expect(engine.configUsed).toMatchObject({
+          operation: 'trim',
+          route,
+        });
+      } finally {
+        await engine.dispose(context);
+      }
     }
   });
 
@@ -350,7 +465,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       );
       expect(engine.configUsed).toMatchObject({
         operation: 'trim',
-        route: 'framework.trim',
+        route: 'core.prepared-iso-copy-trim',
       });
     } finally {
       await engine.dispose(context);
@@ -599,7 +714,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
   test('declares only lossy audio copy trims without exact presentation timing NA', () => {
     for (const [container, codec] of [
       ['mp4', 'aac'],
-      ['mp3', 'mp3'],
+      ['adts', 'aac'],
     ] as const) {
       expect(
         decideAibrushSupport(
@@ -620,12 +735,42 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
             },
           ),
         ),
-      ).toMatchObject({
+      ).toEqual({
         supported: false,
         status: 'NA_ENGINE',
         reasonCode: 'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+        reason:
+          'the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring',
       });
     }
+
+    expect(
+      decideAibrushSupport(
+        request(
+          'trim',
+          'mp3',
+          [
+            {
+              type: 'audio',
+              codec: 'mp3',
+              sampleRate: 44_100,
+              channels: 2,
+            },
+          ],
+          {
+            outputContainer: 'mp3',
+            audioCodec: 'mp3',
+            options: { invariant: 'trim-audio-content' },
+          },
+        ),
+      ),
+    ).toEqual({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED',
+      reason:
+        'MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable',
+    });
 
     expect(
       decideAibrushSupport(
@@ -669,6 +814,153 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         ),
       ),
     ).toEqual({ supported: true });
+  });
+
+  test('keeps ADTS AAC packet-copy trim NA when whole access units cannot express the decoded window', async () => {
+    const bytes = new Uint8Array(await Bun.file('fixtures/media/aac_adts.aac').arrayBuffer());
+    const input = rangeBackedInput('aac_adts.aac', 'audio/aac', bytes);
+    const range = { startUs: 2_000_000, endUs: 7_000_000 };
+    const operationRequest = request(
+      'trim',
+      'adts',
+      [
+        {
+          type: 'audio',
+          codec: 'aac',
+          sampleRate: 48_000,
+          channels: 2,
+        },
+      ],
+      {
+        inputId: input.id,
+        outputContainer: 'adts',
+        audioCodec: 'aac',
+        options: {
+          container: 'adts',
+          frameAccurate: false,
+          invariant: 'trim-audio-content',
+          range,
+        },
+        transforms: {
+          trim: {
+            ...range,
+            frameAccurate: false,
+          },
+        },
+      },
+    );
+    expect(decideAibrushSupport(operationRequest)).toEqual({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED',
+      reason:
+        'the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring',
+    });
+
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    installRangeFetch(bytes);
+    const context = directContext(operationRequest);
+    const engine = new AibrushMediaEngine();
+    try {
+      await engine.init(context);
+      const output = await engine.trim(
+        input,
+        range,
+        {
+          container: 'adts',
+          frameAccurate: false,
+        },
+        context,
+      );
+      const inspected = inspectTrimAudioContainer(output.bytes, 'adts');
+      expect(inspected).toEqual({
+        state: 'OK',
+        value: {
+          container: 'adts',
+          codec: 'aac',
+          sampleRate: 48_000,
+          channels: 2,
+          codedSampleFrames: 241_664,
+          presentationSampleFrames: 241_664,
+          primingSampleFrames: 0,
+          endTrimSampleFrames: 0,
+          precision: 'exact',
+          packetOrFrameCount: 236,
+        },
+      });
+      if (inspected.state !== 'OK') throw new Error(inspected.detail);
+      expect(inspected.value.presentationSampleFrames).not.toBe(
+        (range.endUs - range.startUs) * inspected.value.sampleRate / 1_000_000,
+      );
+      expect(engine.configUsed).toMatchObject({
+        operation: 'trim',
+        route: 'framework.trim',
+      });
+    } finally {
+      await engine.dispose(context);
+      restoreGlobal('fetch', fetchDescriptor);
+    }
+  });
+
+  test('keeps exact MP3 copy trim NA after auditing the Xing/LAME preroll limit', async () => {
+    const range = { startUs: 5_000_000, endUs: 10_000_000 };
+    const operationRequest = request(
+      'trim',
+      'mp3',
+      [
+        {
+          type: 'audio',
+          codec: 'mp3',
+          sampleRate: 44_100,
+          channels: 2,
+        },
+      ],
+      {
+        inputId: 'mp3_xing.mp3',
+        outputContainer: 'mp3',
+        audioCodec: 'mp3',
+        options: {
+          container: 'mp3',
+          frameAccurate: false,
+          invariant: 'trim-audio-content',
+          range,
+        },
+        transforms: {
+          trim: {
+            ...range,
+            frameAccurate: false,
+          },
+        },
+      },
+    );
+    expect(decideAibrushSupport(operationRequest)).toEqual({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED',
+      reason:
+        'MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable',
+    });
+
+    for (const file of ['02.mp3', '03.mp3', 'mp3_xing.mp3']) {
+      const bytes = new Uint8Array(
+        await Bun.file(`fixtures/media/scenarios/trim/audio_mp3_copy/${file}`).arrayBuffer(),
+      );
+      const inspected = inspectTrimAudioContainer(bytes, 'mp3');
+      expect(inspected.state).toBe('OK');
+      if (inspected.state !== 'OK') throw new Error(inspected.detail);
+      expect(inspected.value.precision).toBe('exact');
+      const samplesPerFrame =
+        inspected.value.codedSampleFrames / inspected.value.packetOrFrameCount;
+      expect(samplesPerFrame).toBe(1_152);
+      const requestedCodedStart =
+        inspected.value.primingSampleFrames + 5 * inspected.value.sampleRate;
+      const intraFrameLeading = requestedCodedStart % samplesPerFrame;
+      const maximumLegalPreroll = Math.floor((0xfff - intraFrameLeading) / samplesPerFrame);
+      expect(maximumLegalPreroll).toBe(2);
+      expect(intraFrameLeading + (maximumLegalPreroll + 1) * samplesPerFrame).toBeGreaterThan(
+        0xfff,
+      );
+    }
   });
 
   test('authors an exact decoded Ogg Opus copy-trim window through the framework route', async () => {

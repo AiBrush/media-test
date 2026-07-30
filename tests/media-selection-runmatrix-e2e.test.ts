@@ -18,6 +18,7 @@ import { defineScenario, type ScenarioResult } from '../src/core/scenario.ts';
 const encoder = new TextEncoder();
 const originalFetch = globalThis.fetch;
 
+const ENGINE_REGISTRATION_ID = 'selection-e2e-engine';
 const ENGINE_ID = 'selection-e2e-engine@1.0.0';
 const SCENARIO_ID = 'probe/selection-policy-e2e';
 const BAKED_ID = 'selection-policy-e2e-baked.mp4';
@@ -62,7 +63,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     const cache = validatedPersistentResultReuseStore();
     const baseOptions = {
       browser: 'chromium' as const,
-      engineIds: [ENGINE_ID],
+      engineIds: [ENGINE_REGISTRATION_ID],
       scenarioIds: [SCENARIO_ID],
       pillar: 'all' as const,
       benchOptions: {
@@ -139,6 +140,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     expect(reused[0]?.cacheReuse?.sourceRunId).toBe('selection-e2e-prior-run');
     expect(reused[0]?.exhaustive?.every((entry) => entry.reason?.startsWith('cached') === true)).toBe(true);
     expect(reused[0]?.selection?.runSeed).toBe(baseOptions.randomSeed);
+    expect(reused[0]?.env?.engineId).toBe(ENGINE_ID);
 
     await runMatrix({
       ...baseOptions,
@@ -510,7 +512,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
 });
 
 function registerAcceptanceSurface(): void {
-  registerEngine(ENGINE_ID, async () => acceptanceEngine());
+  registerEngine(ENGINE_REGISTRATION_ID, async () => acceptanceEngine());
   registerScenario(defineScenario({
     id: SCENARIO_ID,
     op: 'probe',

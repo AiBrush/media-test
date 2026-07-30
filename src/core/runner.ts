@@ -1759,6 +1759,7 @@ function restoreLogicalScenarioId(result: ScenarioResult, scenarioId: string): S
 function exactPersistedSelectionResult(
   cached: ScenarioResult | undefined,
   engineId: string,
+  environmentEngineId: string,
   browser: BrowserName,
   scenario: Scenario,
   selection: ScenarioSelection,
@@ -1781,7 +1782,20 @@ function exactPersistedSelectionResult(
     ? exhaustiveSelections
     : [selection];
   if (!selections.every(selectionAllowsExactPersistedReuse)) return undefined;
-  if (!cacheEnvironmentMatches(cached.env, { ...runEnvBase, engineId })) return undefined;
+  // Result identity uses the engine's canonical/versioned id. RunEnv is inconsistent at older
+  // aggregation boundaries: a single-file result records the registry id that constructed it (for
+  // example `mediabunny`), while an exhaustive aggregate records the canonical instance id
+  // (`mediabunny@1.48.0`). Admit only those two proven aliases, then compare the rest of the
+  // environment like-for-like. Comparing only to the canonical id silently rejected every early
+  // persistent hit for aliased single-file engines and forced media acquisition before reuse.
+  const cachedEnvironmentEngineId = cached.env?.engineId;
+  if (
+    !cachedEnvironmentEngineId ||
+    (cachedEnvironmentEngineId !== engineId && cachedEnvironmentEngineId !== environmentEngineId) ||
+    !cacheEnvironmentMatches(cached.env, { ...runEnvBase, engineId: cachedEnvironmentEngineId })
+  ) {
+    return undefined;
+  }
   if (!cacheMeasurementProtocolMatches(cached, scenario, pillar, benchOptions)) return undefined;
 
   let exhaustive: ScenarioResult['exhaustive'];
@@ -8094,6 +8108,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         ? exactPersistedSelectionResult(
             cachedCandidate ? restoreLogicalScenarioId(cachedCandidate, scenario.id) : undefined,
             engine.id,
+            engineId,
             opts.browser,
             scenario,
             selection,

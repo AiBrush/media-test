@@ -188,6 +188,7 @@ async function boot(): Promise<void> {
   renderRegistrationBanner(notes);
   ensureSeed();
   wireControls();
+  updateScenarioFilter();
   updateIntersectionCount();
   renderRunManifest(undefined);
   await refreshCacheStatus();
@@ -295,18 +296,31 @@ function wireControls(): void {
     }
     void runFromUi();
   });
-  const groupActions: Array<[string, string, boolean]> = [
+  const groupActions: Array<[string, string, boolean, boolean?]> = [
     ['select-all-features', 'features-list', true], ['clear-features', 'features-list', false],
     ['select-all-eng', 'engines-list', true], ['clear-engines', 'engines-list', false],
-    ['select-all-scn', 'scenarios-list', true], ['clear-scenarios', 'scenarios-list', false],
+    ['select-all-scn', 'scenarios-list', true, true], ['clear-scenarios', 'scenarios-list', false, true],
     ['select-all-operations', 'operations-list', true], ['clear-operations', 'operations-list', false],
   ];
-  for (const [buttonId, listId, checked] of groupActions) {
-    getEl<HTMLButtonElement>(buttonId).addEventListener('click', () => setAllChecked(listId, checked));
+  for (const [buttonId, listId, checked, visibleOnly] of groupActions) {
+    getEl<HTMLButtonElement>(buttonId).addEventListener(
+      'click',
+      () => setAllChecked(listId, checked, visibleOnly === true),
+    );
   }
-  for (const id of ['features-list', 'operations-list', 'scenarios-list']) {
+  for (const id of [
+    'features-list',
+    'operations-list',
+    'scenarios-list',
+    'engines-list',
+    'pillar',
+    'reuse-data',
+    'exhaustive-media',
+  ]) {
     getEl(id).addEventListener('change', updateIntersectionCount);
   }
+  getEl('scenarios-list').addEventListener('change', updateScenarioFilter);
+  getEl<HTMLInputElement>('scenario-search').addEventListener('input', updateScenarioFilter);
   getEl<HTMLButtonElement>('copy-seed').addEventListener('click', () => { void copySeed(); });
   getEl<HTMLSelectElement>('result-status-filter').addEventListener('change', (event) => {
     matrix.setResultFilter((event.currentTarget as HTMLSelectElement).value as ResultFilter);
@@ -363,12 +377,63 @@ function setRunButtonLabel(text: string): void {
 }
 
 function updateIntersectionCount(): void {
-  const features = new Set(getCheckedFeatures());
-  const operations = new Set(getCheckedOperations());
-  const selected = new Set(getCheckedScenarios());
+  const checkedFeatures = getCheckedFeatures();
+  const checkedOperations = getCheckedOperations();
+  const checkedScenarios = getCheckedScenarios();
+  const checkedEngines = getCheckedEngines();
+  const features = new Set(checkedFeatures);
+  const operations = new Set(checkedOperations);
+  const selected = new Set(checkedScenarios);
+  const pillar = getEl<HTMLSelectElement>('pillar').value as NonNullable<RunOptions['pillar']>;
   const matching = listScenarios().filter((scenario) =>
-    selected.has(scenario.id) && features.has(scenario.family) && operations.has(scenario.op)).length;
+    selected.has(scenario.id) &&
+    features.has(scenario.family) &&
+    operations.has(scenario.op) &&
+    scenarioMatchesPillar(scenario, pillar)).length;
   renderIntersectionCount(matching, listScenarios().length);
+  renderPickerCount(
+    'features-selection-count',
+    checkedFeatures.length,
+    new Set(listScenarios().map((scenario) => scenario.family)).size,
+  );
+  renderPickerCount('scenarios-selection-count', checkedScenarios.length, listScenarios().length);
+  renderPickerCount('engines-selection-count', checkedEngines.length, listScoredEngines().length);
+  renderPickerCount(
+    'operations-selection-count',
+    checkedOperations.length,
+    new Set(listScenarios().map((scenario) => scenario.op)).size,
+  );
+  getEl('selected-cell-count').textContent = String(matching * checkedEngines.length);
+  getEl('reuse-summary').textContent = getEl<HTMLInputElement>('reuse-data').checked
+    ? 'Compatible cache reuse on'
+    : 'Fresh execution; cache writes stay on';
+  getEl('media-mode-summary').textContent = getEl<HTMLInputElement>('exhaustive-media').checked
+    ? 'Every eligible media file'
+    : 'One seeded media file';
+}
+
+function renderPickerCount(id: string, selected: number, total: number): void {
+  const node = getEl(id);
+  node.textContent = `${selected} of ${total}`;
+  node.setAttribute('aria-label', `${selected} of ${total} selected`);
+}
+
+function updateScenarioFilter(): void {
+  const host = getEl('scenarios-list');
+  const query = getEl<HTMLInputElement>('scenario-search').value.trim().toLocaleLowerCase();
+  let visible = 0;
+  let visibleSelected = 0;
+  for (const label of host.querySelectorAll<HTMLLabelElement>('label.opt')) {
+    const input = label.querySelector<HTMLInputElement>('input[type=checkbox]');
+    const matches = !query || (input?.value ?? label.textContent ?? '').toLocaleLowerCase().includes(query);
+    label.hidden = !matches;
+    if (!matches) continue;
+    visible += 1;
+    if (input?.checked) visibleSelected += 1;
+  }
+  getEl('scenario-filter-status').textContent = query
+    ? `${visible} shown · ${visibleSelected} shown selected · hidden selections are preserved`
+    : `${visible} scenarios available`;
 }
 
 async function runFromUi(): Promise<ScenarioResult[]> {
@@ -542,7 +607,10 @@ async function runFromFilter(
   setCacheControlsDisabled(true);
   setRunButtonLabel('Stop run safely');
   setRunState('running');
-  setRunStatus(`Run ${runId} started on ${configuration.browser}.`);
+  setRunStatus(
+    `Run ${runId} started on ${configuration.browser} · ` +
+    (configuration.reuseData ? 'compatible cache reuse enabled' : 'fresh execution requested'),
+  );
   setCurrentWork(activeRunWorkText(activeRun.work));
 
   const opts: RunOptions = {
@@ -673,9 +741,12 @@ async function runFromFilter(
         : runContinuationAction(undefined).label);
     const summary = summarize(currentArtifact?.results ?? streamed);
     if (currentArtifact) {
+      const cacheSummary = configuration.reuseData
+        ? `${cache.hits.length} validated cache hit${cache.hits.length === 1 ? '' : 's'}`
+        : 'fresh execution';
       setRunStatus(terminalState === 'completed'
-        ? `Completed · ${summary}`
-        : `${terminalState}: ${partialReason ?? 'partial snapshot'} · ${summary}`);
+        ? `Completed · ${summary} · ${cacheSummary}`
+        : `${terminalState}: ${partialReason ?? 'partial snapshot'} · ${summary} · ${cacheSummary}`);
     }
     setCurrentWork(`Last completed run: ${currentManifest.runId}; ${currentManifest.observedCellCount} of ${currentManifest.expectedCellCount} cells observed.`);
     focusRunControl();

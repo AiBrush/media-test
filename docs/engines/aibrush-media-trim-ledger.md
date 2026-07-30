@@ -5,6 +5,10 @@ This is the feature-by-feature working ledger for the 43 `trim/*` cells on
 
 Baseline evidence:
 
+- Current Aibrush family-wide quick:
+  `results/raw/chromium-2026-07-29T00-02-46-364Z.json`
+- Current Aibrush family-wide exhaustive:
+  `results/raw/chromium-2026-07-28T23-58-25-693Z.json`
 - Aibrush exhaustive baseline:
   `results/raw/chromium-2026-07-28T21-19-03-931Z.json`
 - Cross-engine exhaustive baseline (same 43 definition hashes):
@@ -15,6 +19,12 @@ Baseline evidence:
   `results/raw/chromium-2026-07-28T22-06-06-551Z.json`
 - Current Ogg Opus comparison:
   `results/raw/chromium-2026-07-28T22-35-34-793Z.json`
+- Current AAC ADTS comparison:
+  `results/raw/chromium-2026-07-28T22-48-47-857Z.json`
+- Current MP3 comparison:
+  `results/raw/chromium-2026-07-28T23-17-52-819Z.json`
+- Current rotated-H.264 comparison:
+  `results/raw/chromium-2026-07-28T23-33-19-031Z.json`
 
 `ms` is aggregate functional cell wall time, not a comparable benchmark metric.
 `PASS n/t` reports passed files over the full exhaustive pool; `PARTIAL` records
@@ -22,51 +32,65 @@ incomplete evidence coverage. The public operation route is `framework.trim`.
 The final column records the adapter's internal route; large inputs can fall
 back when the bounded 128 MiB prepared-copy path is ineligible.
 
+Current family-wide completion audit
+(`chromium-2026-07-28T23-58-25-693Z.json`):
+
+- 43/43 registered Trim definitions executed with fresh Chromium state.
+- 40 cells are full PASS; AAC/ADTS and MP3 are the two concrete `NA_ENGINE`
+  cells; rotated H.264 is the sole partial.
+- Across all 118 candidate executions: 110 PASS, 5 `NA_ENGINE`, and 3
+  `NA_ASSET`; there are zero FAIL, ERROR, `NA_BROWSER`, SKIPPED, or oracle-error
+  outcomes.
+- Final regression gates after the last product change: focused product tests
+  13/13; product full tests 4,520/4,520; product typecheck and production build
+  PASS; all Aibrush-owned suite tests 84/84; full suite 1,225/1,225; suite
+  typecheck and production build PASS.
+
 | Scenario | Aibrush | ms | Mediabunny | FFmpeg WASM | Remotion | MP4Box | Internal route |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | `trim/audio_aac_adts_copy` | NA_ENGINE 0/2 | 5 | NA_ENGINE 0/2 | NA_ENGINE 0/2 | NA_ENGINE 0/2 | NA_ENGINE 0/2 | preflight NA_ENGINE |
-| `trim/audio_aiff_pcm_be_copy` | PASS 1/1 | 9 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
-| `trim/audio_flac_noseektable_copy` | PASS 1/1 | 61 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
-| `trim/audio_flac_seektable_copy` | PASS 1/1 | 82 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
-| `trim/audio_mp3_copy` | NA_ENGINE 0/3 | 12 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | preflight NA_ENGINE |
-| `trim/audio_opus_ogg_copy` | PASS 1/1 | 126 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim → exact Ogg Opus pre-skip/EOS granule |
-| `trim/audio_wav_pcm_copy` | PASS 3/3 | 18 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | direct WAV range trim |
-| `trim/av1_keyframe_aligned` | PASS 3/3 | 1,832 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
-| `trim/fmp4_fragment_boundary_copy` | PASS 4/4 | 2,310 | PASS 4/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared ISO → fragmented mux |
+| `trim/audio_aiff_pcm_be_copy` | PASS 1/1 | 15 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
+| `trim/audio_flac_noseektable_copy` | PASS 1/1 | 202 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
+| `trim/audio_flac_seektable_copy` | PASS 1/1 | 66 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
+| `trim/audio_mp3_copy` | NA_ENGINE 0/3 | 6 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | preflight NA_ENGINE |
+| `trim/audio_opus_ogg_copy` | PASS 1/1 | 114 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim → exact Ogg Opus pre-skip/EOS granule |
+| `trim/audio_wav_pcm_copy` | PASS 3/3 | 22 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | direct WAV range trim |
+| `trim/av1_keyframe_aligned` | PASS 3/3 | 1,746 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
+| `trim/fmp4_fragment_boundary_copy` | PASS 4/4 | 2,262 | PASS 4/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared ISO → fragmented mux |
 | `trim/h264_adjacent_concat_equivalence` | PASS 1/1 | 7,109 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | three trim legs + prepared concat |
-| `trim/h264_bframes_frame_accurate` | PASS 4/4 | 7,490 | FAIL 3/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/h264_frame_accurate` | PASS 4/4 | 11,228 | FAIL 0/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/h264_keyframe_aligned` | PASS 4/4 | 2,373 | PASS 4/4 | PASS 3/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/h264_keyframe_aligned_short` | PASS 3/3 | 1,734 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
-| `trim/h264_multitrack_keyframe_aligned` | PASS 4/4 | 2,285 | PASS 4/4 | PASS 3/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/h264_noop_full_range_idempotent` | PASS 1/1 | 1,182 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
-| `trim/h264_open_gop_frame_accurate` | PASS 4/4 | 25,915 | FAIL 2/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/h264_rotated_keyframe_aligned` | PARTIAL 1/4 | 2,340 | PARTIAL 1/4 | PARTIAL 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/h264_single_gop_frame_accurate` | PASS 4/4 | 2,103 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/h264_start_zero_copy` | PASS 4/4 | 2,586 | PASS 4/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/h264_subframe_range_frame_accurate` | PASS 4/4 | 2,380 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/h264_to_eof_copy` | PASS 1/1 | 588 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
-| `trim/h264_vfr_frame_accurate` | PASS 4/4 | 3,406 | FAIL 3/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
-| `trim/hevc_frame_accurate` | PASS 1/1 | 2,040 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(accurate) |
-| `trim/hevc_keyframe_aligned` | PASS 1/1 | 573 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
-| `trim/huge_h264_mov_copy_peakmem` | PASS 4/4 | 3,440 | PASS 1/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | prepared ≤128 MiB; framework fallback |
-| `trim/large_h264_copy_lazyread` | PASS 3/3 | 1,764 | PASS 3/3 | PASS 2/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | prepared ≤128 MiB; framework fallback |
-| `trim/large_h264_frame_accurate_throughput` | PASS 3/3 | 3,957 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | framework.trim(accurate) |
-| `trim/massive_h264_copy_sustained` | PASS 4/4 | 49,939 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | prepared ≤128 MiB; framework fallback |
-| `trim/mkv_keyframe_aligned` | PASS 4/4 | 76 | PASS 3/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/mov_keyframe_aligned` | PASS 4/4 | 2,243 | PASS 4/4 | PASS 2/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/robust_bitflipped_source` | PASS 1/1 | 35 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
-| `trim/robust_end_far_past_eof` | PASS 1/1 | 34 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
-| `trim/robust_inverted_range` | PASS 4/4 | 171 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | graceful rejection |
-| `trim/robust_negative_start` | PASS 4/4 | 144 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | graceful rejection |
-| `trim/robust_start_past_eof` | PASS 1/1 | 37 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
-| `trim/robust_truncated_source` | PASS 1/1 | 27 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
-| `trim/robust_zero_length_range` | PASS 4/4 | 117 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | graceful rejection |
-| `trim/ts_keyframe_aligned` | PASS 4/4 | 262 | NA_ENGINE 0/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/vp8_keyframe_aligned` | PASS 3/3 | 1,840 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
-| `trim/vp9_alpha_keyframe_aligned` | PASS 1/1 | 650 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
-| `trim/vp9_keyframe_aligned` | PASS 4/4 | 2,545 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
-| `trim/vp9_noop_full_range_idempotent` | PASS 1/1 | 979 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim → exact-source WebM stream |
+| `trim/h264_bframes_frame_accurate` | PASS 4/4 | 7,712 | FAIL 3/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/h264_frame_accurate` | PASS 4/4 | 11,335 | FAIL 0/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/h264_keyframe_aligned` | PASS 4/4 | 2,363 | PASS 4/4 | PASS 3/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/h264_keyframe_aligned_short` | PASS 3/3 | 1,694 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
+| `trim/h264_multitrack_keyframe_aligned` | PASS 4/4 | 2,256 | PASS 4/4 | PASS 3/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/h264_noop_full_range_idempotent` | PASS 1/1 | 1,173 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(keyframe) |
+| `trim/h264_open_gop_frame_accurate` | PASS 4/4 | 26,118 | FAIL 2/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/h264_rotated_keyframe_aligned` | PARTIAL 1/4 | 2,328 | PARTIAL 1/4 | PARTIAL 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/h264_single_gop_frame_accurate` | PASS 4/4 | 2,125 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/h264_start_zero_copy` | PASS 4/4 | 2,390 | PASS 4/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/h264_subframe_range_frame_accurate` | PASS 4/4 | 2,368 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/h264_to_eof_copy` | PASS 1/1 | 611 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
+| `trim/h264_vfr_frame_accurate` | PASS 4/4 | 3,378 | FAIL 3/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | framework.trim(accurate) |
+| `trim/hevc_frame_accurate` | PASS 1/1 | 2,114 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim(accurate) |
+| `trim/hevc_keyframe_aligned` | PASS 1/1 | 598 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
+| `trim/huge_h264_mov_copy_peakmem` | PASS 4/4 | 3,814 | PASS 1/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | prepared ≤128 MiB; framework fallback |
+| `trim/large_h264_copy_lazyread` | PASS 3/3 | 1,765 | PASS 3/3 | PASS 2/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | prepared ≤128 MiB; framework fallback |
+| `trim/large_h264_frame_accurate_throughput` | PASS 3/3 | 4,013 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | framework.trim(accurate) |
+| `trim/massive_h264_copy_sustained` | PASS 4/4 | 50,427 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | prepared ≤128 MiB; framework fallback |
+| `trim/mkv_keyframe_aligned` | PASS 4/4 | 69 | PASS 3/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/mov_keyframe_aligned` | PASS 4/4 | 2,235 | PASS 4/4 | PASS 2/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/robust_bitflipped_source` | PASS 1/1 | 39 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
+| `trim/robust_end_far_past_eof` | PASS 1/1 | 42 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
+| `trim/robust_inverted_range` | PASS 4/4 | 128 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | pre-read range rejection |
+| `trim/robust_negative_start` | PASS 4/4 | 121 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | pre-read range rejection |
+| `trim/robust_start_past_eof` | PASS 1/1 | 38 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
+| `trim/robust_truncated_source` | PASS 1/1 | 34 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | graceful rejection |
+| `trim/robust_zero_length_range` | PASS 4/4 | 111 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | pre-read range rejection |
+| `trim/ts_keyframe_aligned` | PASS 4/4 | 276 | NA_ENGINE 0/4 | PASS 1/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/vp8_keyframe_aligned` | PASS 3/3 | 1,707 | PASS 3/3 | PASS 3/3 | NA_ENGINE 0/3 | NA_ENGINE 0/3 | strict prepared copy trim |
+| `trim/vp9_alpha_keyframe_aligned` | PASS 1/1 | 636 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | strict prepared copy trim |
+| `trim/vp9_keyframe_aligned` | PASS 4/4 | 2,694 | PASS 4/4 | PASS 4/4 | NA_ENGINE 0/4 | NA_ENGINE 0/4 | strict prepared copy trim |
+| `trim/vp9_noop_full_range_idempotent` | PASS 1/1 | 966 | PASS 1/1 | PASS 1/1 | NA_ENGINE 0/1 | NA_ENGINE 0/1 | framework.trim → exact-source WebM stream |
 
 ## Completed cells
 
@@ -196,12 +220,157 @@ back when the bounded 128 MiB prepared-copy path is ineligible.
   Aibrush-owned suite tests 82/82; full suite 1,223/1,223; suite typecheck and
   production build PASS.
 
+### `trim/audio_aac_adts_copy`
+
+- Terminal state: honest `NA_ENGINE`
+  (`AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED`) for both exhaustive files.
+- Concrete API gap: public `TrimOptions` exposes start/end/mode but no decoded
+  start-discard or end-discard controls. The ADTS muxer can emit only whole AAC
+  access units in 7-byte headers (object type, sample rate, channels, frame
+  length); ADTS exposes no equivalent of Ogg Opus pre-skip/EOS granule timing.
+- Direct framework proof: bypassing suite preflight on the real 48 kHz fixture
+  routes through `framework.trim` and returns 236 whole AAC frames, or 241,664
+  decoded/container samples, with zero priming and zero terminal trim. The
+  requested 2s..7s presentation is exactly 240,000 samples, so the carrier
+  cannot express it without re-encoding plus external discard metadata.
+- Cross-engine exhaustive:
+  `chromium-2026-07-28T22-48-47-857Z.json` — all six scored engines are
+  `NA_ENGINE` for both files. Mediabunny reports that ADTS cannot preserve
+  explicit timing; FFmpeg WASM reports that its stream-copy path cannot author
+  codec delay/end padding; Remotion, MP4Box, and web-demuxer do not declare
+  Trim.
+- Final post-gate quick:
+  `chromium-2026-07-28T22-55-58-687Z.json` — `NA_ENGINE` in 29 ms.
+- Final post-gate exhaustive:
+  `chromium-2026-07-28T22-56-02-822Z.json` — both eligible files
+  `NA_ENGINE` in 28 ms with the same concrete reason code.
+- Regression gates: focused Aibrush support tests 43/43; all Aibrush-owned
+  suite tests 83/83; full suite 1,224/1,224; suite typecheck and production
+  build PASS. No product behavior changed for this terminal capability result.
+
+### `trim/audio_mp3_copy`
+
+- Terminal state: honest `NA_ENGINE` (`AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED`)
+  for all three exhaustive files.
+- The three sources do carry exact Xing/LAME timing: 576 priming samples,
+  1,152 samples per MPEG-1 Layer III frame, and valid terminal padding. For the
+  requested 5s boundary, the delay field can retain at most two earlier frames;
+  a third requires 4,500 samples on the 44.1 kHz inputs or 4,416 samples on the
+  48 kHz input, exceeding the format's 12-bit 4,095-sample maximum.
+- The generic packet-copy prototype preserved every selected compressed frame
+  and authored exactly five seconds in Xing/LAME metadata, but exhaustive
+  Chromium evidence
+  (`chromium-2026-07-28T23-10-14-300Z.json`) rejected every file. The native
+  48 kHz input decoded to exactly 240,000 frames and matched container timing,
+  yet both PCM boundary digests differed from the requested source interval.
+  The two 44.1 kHz inputs additionally decode through the neutral browser at
+  48 kHz, which cannot agree with their unchanged MP3 header rate.
+- Because Layer III's bit reservoir and synthesis state are decoder-stateful,
+  rewriting delay/padding cannot make this byte-preserving cut PCM-identical,
+  and the product has no MP3 encoder with which to create a fresh independent
+  stream. The failing prototype was removed; no known-wrong product behavior
+  remains.
+- Cross-engine exhaustive:
+  `chromium-2026-07-28T23-17-52-819Z.json` — all six scored engines are
+  `NA_ENGINE` for all three files. Mediabunny cannot author exact MP3
+  delay/padding; FFmpeg WASM cannot author the required presentation timing;
+  Remotion, MP4Box, and web-demuxer do not declare Trim.
+- Final post-gate quick:
+  `chromium-2026-07-28T23-17-30-121Z.json` — `NA_ENGINE`.
+- Final post-gate exhaustive:
+  `chromium-2026-07-28T23-17-39-977Z.json` — all three eligible files
+  `NA_ENGINE` with the same concrete reason code.
+- Regression gates: focused Aibrush support tests 44/44; all Aibrush-owned
+  suite tests 84/84; full suite 1,225/1,225; suite typecheck and production
+  build PASS. No product behavior changed for this terminal capability result.
+
+### Intrinsically invalid Trim ranges
+
+Cells:
+
+- `trim/robust_negative_start`
+- `trim/robust_inverted_range`
+- `trim/robust_zero_length_range`
+
+Generic cause: the product's `runTrim` contract had the correct
+duration-independent range predicate, but invoked it only after source
+normalization, container routing, and—in stream-copy paths—driver entry. Invalid
+numeric requests therefore performed avoidable source/container work before
+returning the same typed `InputError`.
+
+Solution: execute the existing range predicate with unknown duration at the
+operation boundary. This rejects non-finite, negative, inverted, and zero-length
+ranges before touching the source; the later duration-aware check remains for
+start/end-past-EOF validation. No scenario identity, fixture fact, or test
+constant participates.
+
+Product regression:
+`src/api/trim-robustness.test.ts` supplies a source whose `range` and `stream`
+paths fail if touched, then proves all four intrinsic invalid-range forms reject
+as `InputError` with zero source access. The test failed through MP4 routing
+before the product change and passes afterward.
+
+- Negative start: final quick
+  `chromium-2026-07-28T23-57-02-669Z.json`; exhaustive
+  `chromium-2026-07-28T23-57-12-997Z.json` is full PASS 4/4 in 125 ms; comparison
+  `chromium-2026-07-28T23-47-43-950Z.json` is Aibrush 117 ms, Mediabunny 83 ms,
+  and FFmpeg WASM 366 ms.
+- Inverted range: final quick
+  `chromium-2026-07-28T23-57-31-883Z.json`; exhaustive
+  `chromium-2026-07-28T23-57-40-300Z.json` is full PASS 4/4 in 122 ms; comparison
+  `chromium-2026-07-28T23-48-44-065Z.json` is Aibrush 117 ms, Mediabunny 84 ms,
+  and FFmpeg WASM 327 ms.
+- Zero-length range: final quick
+  `chromium-2026-07-28T23-57-56-782Z.json`; exhaustive
+  `chromium-2026-07-28T23-58-06-448Z.json` is full PASS 4/4 in 124 ms; comparison
+  `chromium-2026-07-28T23-49-34-889Z.json` is Aibrush 104 ms, Mediabunny 82 ms,
+  and FFmpeg WASM 329 ms.
+
+- Regression gates: focused product tests 13/13; product full tests
+  4,520/4,520; product typecheck and production build PASS; all Aibrush-owned
+  suite tests 84/84; full suite 1,225/1,225; suite typecheck and production
+  build PASS.
+
+## Audited shared-evidence blocker
+
+### `trim/h264_rotated_keyframe_aligned`
+
+- Final post-gate quick:
+  `chromium-2026-07-28T23-32-52-818Z.json` — `NA_ASSET`; the selected
+  external input has no non-identity orientation evidence.
+- Final post-gate Aibrush exhaustive:
+  `chromium-2026-07-28T23-58-25-693Z.json` — `PARTIAL 1/4` in 2,328 ms.
+  `h264_rotated90.mp4` is full PASS: all 150 selected coded samples and
+  relative timestamps match, the 90-degree display property is preserved, and
+  neutral playback passes. `01.mp4`, `02.mp4`, and `03.mp4` also preserve all
+  150 selected packets and play successfully, but the property oracle correctly
+  returns `TRIM_DISPLAY_REFERENCE_UNVERIFIED`.
+- Independent container evidence: `ffprobe` reports no `rotate` tag or display
+  side data for `01.mp4`, `02.mp4`, or `03.mp4`; it reports `rotation: 90` for
+  `h264_rotated90.mp4`. The three external files therefore do not satisfy the
+  scenario's declared rotated-source feature.
+- Cross-engine exhaustive:
+  `chromium-2026-07-28T23-33-19-031Z.json` — Aibrush is `PARTIAL 1/4` in
+  2,346 ms, Mediabunny is the same `PARTIAL 1/4` in 3,685 ms, and FFmpeg WASM
+  is the same `PARTIAL 1/4` in 2,253 ms. Every contesting engine passes the
+  genuinely rotated baked input and encounters the same missing source
+  evidence on the external pool.
+- Product/API conclusion: Aibrush already preserves the source MP4 `tkhd`
+  display transform on its strict prepared-copy route. Public `TrimOptions`
+  supplies a range and mode but no requested rotation angle; inventing a
+  transform for an identity source would change its presentation and would not
+  repair the oracle's missing source reference. Declaring `NA_ENGINE` would
+  also be false because the genuine rotated input proves the capability.
+- This cell cannot honestly reach exhaustive full PASS while shared fixtures,
+  scenario catalogs, and oracles are immutable. Completion requires replacing
+  or removing the three non-rotated external candidates in the shared eligible
+  catalog, or supplying independently verified rotated variants.
+- Regression gates: focused product rotation/edit tests 27/27; product full
+  tests 4,520/4,520; product typecheck and production build PASS; all
+  Aibrush-owned suite tests 84/84; full suite 1,225/1,225; suite typecheck and
+  production build PASS.
+
 ## Open correctness priorities
 
-1. `trim/audio_aac_adts_copy` and `trim/audio_mp3_copy` — all scored engines
-   currently report `NA_ENGINE`; keep the declaration honest until exact
-   decoded presentation-window authoring is implemented.
-2. `trim/h264_rotated_keyframe_aligned` — Aibrush, Mediabunny, and FFmpeg WASM
-   all have the same 1/4 partial coverage. The three external candidates lack
-   independently verifiable non-identity rotation evidence, so this is a
-   shared asset/evidence limitation rather than an Aibrush implementation miss.
+1. `trim/h264_rotated_keyframe_aligned` — shared evidence blocker documented
+   above; there is no remaining Aibrush implementation defect.

@@ -236,6 +236,15 @@ function isGracefulNegativeContext(context?: OperationContext): boolean {
   );
 }
 
+function intrinsicTrimRangeRejection(range: { startUs: number; endUs: number }): string | undefined {
+  if (!Number.isFinite(range.startUs) || !Number.isFinite(range.endUs)) {
+    return 'trim range endpoints must be finite';
+  }
+  if (range.startUs < 0) return 'trim start must be non-negative';
+  if (range.endUs <= range.startUs) return 'trim end must be greater than start';
+  return undefined;
+}
+
 function isStillImageInput(input: MediaInput): boolean {
   const mime = input.mime.toLowerCase();
   const id = input.id.toLowerCase();
@@ -1105,6 +1114,8 @@ interface AibrushWav {
   ): Uint8Array | undefined;
 }
 interface AibrushCore {
+  readonly CapabilityError: AibrushErrorClasses['CapabilityError'];
+  readonly InputError: AibrushErrorClasses['InputError'];
   wavPcmToAiffFromBytes(
     bytes: Uint8Array,
     opts?: {
@@ -1180,6 +1191,20 @@ interface AibrushCore {
       readonly signal?: AbortSignal;
     },
   ): Promise<AibrushPacketInfoTable>;
+  mp4TrimFromUrl(
+    url: string,
+    opts: {
+      readonly mime?: string;
+      readonly size?: number;
+      readonly startSec: number;
+      readonly endSec: number;
+      readonly container: 'mp4' | 'mov';
+      readonly fragmented?: boolean;
+      readonly faststart?: boolean;
+      readonly validateDecode?: boolean;
+      readonly signal?: AbortSignal;
+    },
+  ): Promise<Uint8Array>;
   wavPacketInfoFromUrl(
     url: string,
     opts?: {
@@ -1788,6 +1813,53 @@ function tagEquals(bytes: Uint8Array, offset: number, tag: string): boolean {
     if (bytes[offset + i] !== tag.charCodeAt(i)) return false;
   }
   return true;
+}
+
+function isoBmffMovieDurationUs(bytes: Uint8Array): number | undefined {
+  const boxBounds = (
+    offset: number,
+    limit: number,
+  ): { readonly body: number; readonly end: number } | undefined => {
+    if (offset < 0 || offset + 8 > limit) return undefined;
+    const size32 = u32be(bytes, offset);
+    const header = size32 === 1 ? 16 : 8;
+    if (offset + header > limit) return undefined;
+    const size = size32 === 0 ? limit - offset : size32 === 1 ? u64beNumber(bytes, offset + 8) : size32;
+    if (!Number.isSafeInteger(size) || size < header || offset + size > limit) return undefined;
+    return { body: offset + header, end: offset + size };
+  };
+
+  let top = 0;
+  while (top + 8 <= bytes.byteLength) {
+    const outer = boxBounds(top, bytes.byteLength);
+    if (outer === undefined) return undefined;
+    if (tagEquals(bytes, top + 4, 'moov')) {
+      let child = outer.body;
+      while (child + 8 <= outer.end) {
+        const inner = boxBounds(child, outer.end);
+        if (inner === undefined) return undefined;
+        if (tagEquals(bytes, child + 4, 'mvhd')) {
+          if (inner.body + 20 > inner.end) return undefined;
+          const version = bytes[inner.body];
+          const timescaleOffset = inner.body + (version === 1 ? 20 : 12);
+          const durationOffset = inner.body + (version === 1 ? 24 : 16);
+          const durationBytes = version === 1 ? 8 : 4;
+          if ((version !== 0 && version !== 1) || durationOffset + durationBytes > inner.end) {
+            return undefined;
+          }
+          const timescale = u32be(bytes, timescaleOffset);
+          const duration =
+            version === 1 ? u64beNumber(bytes, durationOffset) : u32be(bytes, durationOffset);
+          if (timescale <= 0 || !Number.isSafeInteger(duration) || duration <= 0) return undefined;
+          return Math.round((duration / timescale) * 1_000_000);
+        }
+        child = inner.end;
+      }
+      return undefined;
+    }
+    top = outer.end;
+  }
+  return undefined;
 }
 
 function pcmBytesPerSample(codec: string): number | undefined {
@@ -4363,7 +4435,7 @@ function proveAibrushPreparedCopyTrim(
 
 async function tryStrictPreparedAibrushCopyTrim(
   core: AibrushCore,
-  engine: AibrushEngine,
+  engine: AibrushEngine | undefined,
   input: MediaInput,
   range: { readonly startUs: number; readonly endUs: number },
   target: string,
@@ -4488,6 +4560,7 @@ async function tryStrictPreparedAibrushCopyTrim(
     return proveAibrushPreparedCopyTrim(read.value, selectedEvidence, output, target) ? output : undefined;
   }
 
+  if (engine === undefined) return undefined;
   const demuxed = await engine.demux(engine.from(bytes, { mime: input.mime, size: bytes.byteLength }), { signal });
   try {
     const used = new Set<number>();
@@ -6309,6 +6382,7 @@ export class AibrushMediaEngine implements MediaEngine {
   #lib: AibrushMedia | undefined;
   #wav: AibrushWav | undefined;
   #core: AibrushCore | undefined;
+  #coreRuntimePromise: Promise<void> | undefined;
   #fullRuntimePromise: Promise<void> | undefined;
   #errorClasses: AibrushErrorClasses | undefined;
   #cellSignal: AbortSignal | undefined;
@@ -6335,6 +6409,7 @@ export class AibrushMediaEngine implements MediaEngine {
 
   supports(request: ConcreteOperationRequest, context?: LifecycleContext) {
     this.#bindCellSignal(context, 'supports');
+    this.#currentRequest = request;
     const decision = decideAibrushSupport(request);
     if (decision.supported && request.options.reproducible === true) {
       try {
@@ -6357,10 +6432,13 @@ export class AibrushMediaEngine implements MediaEngine {
     const wav = await import('@aibrush/media/wav');
     this.#wav = wav as unknown as AibrushWav;
     this.#configEvidence.assertPackageVersion(this.#wav.VERSION);
-    // Robustness cells run in fresh, short-lived Workers. Keep those workers demand-loaded: a verified
-    // WAV byte-copy must not parse the complete engine + driver-author graph it never executes. The
-    // long-lived page adapter still warms the full runtime here, outside measured operations.
-    if (!isWorkerRealm()) await this.#ensureFullRuntime(context?.signal);
+    // Trim has exact-source, structural-validation, and driver-core routes that do not need the complete
+    // codec/router graph. `supports()` binds the concrete operation before init, so leave Trim demand-
+    // loaded in every realm; its selected `#run` route imports exactly the runtime it executes. Other
+    // page operations retain the historical eager warmup, while short-lived Workers remain demand-loaded.
+    if (!isWorkerRealm() && this.#currentRequest?.operation !== 'trim') {
+      await this.#ensureFullRuntime(context?.signal);
+    }
     context?.signal.throwIfAborted();
   }
 
@@ -6376,6 +6454,7 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#core = undefined;
     this.#engineInstance = undefined;
     this.#errorClasses = undefined;
+    this.#coreRuntimePromise = undefined;
     this.#fullRuntimePromise = undefined;
   }
 
@@ -6395,10 +6474,11 @@ export class AibrushMediaEngine implements MediaEngine {
     route: string,
     context: OperationContext | undefined,
     body: (signal: AbortSignal) => Promise<T>,
-    runtime: 'full' | 'wav' = 'full',
+    runtime: 'full' | 'core' | 'wav' = 'full',
   ): Promise<T> {
     this.#bindCellSignal(context, operation);
     if (runtime === 'full') await this.#ensureFullRuntime(context?.signal);
+    else if (runtime === 'core') await this.#ensureCoreRuntime(context?.signal);
     if (context !== undefined) this.#currentRequest = context.request;
     this.#activeOperation = operation;
     this.#activeRoute = route;
@@ -6703,6 +6783,19 @@ export class AibrushMediaEngine implements MediaEngine {
       },
     );
     await this.#fullRuntimePromise;
+    signal?.throwIfAborted();
+  }
+  async #ensureCoreRuntime(signal?: AbortSignal): Promise<void> {
+    if (this.#core !== undefined) return;
+    this.#coreRuntimePromise ??= import('@aibrush/media/core').then((core) => {
+      const loaded = core as unknown as AibrushCore;
+      this.#core = loaded;
+      this.#errorClasses = {
+        CapabilityError: loaded.CapabilityError,
+        InputError: loaded.InputError,
+      };
+    });
+    await this.#coreRuntimePromise;
     signal?.throwIfAborted();
   }
   #driverCore(): AibrushCore {
@@ -7716,102 +7809,241 @@ export class AibrushMediaEngine implements MediaEngine {
   ): Promise<MediaBytes> {
     const shape = opts as unknown as Record<string, unknown>;
     rejectUnforwardableOutputShape('trim', shape);
-    return this.#run('trim', 'framework.trim', context, async (signal) => {
-      try {
-        // Robustness inputs are intentionally malformed. Refuse them before a framework call can
-        // return superficially muxed bytes whose corruption is discovered only by the runner's
-        // post-operation decoder; a typed clean rejection is the robustness contract's safe outcome.
-        if (isMalformedHarnessInput(input)) {
-          throw new GracefulRejectionError('trim', 'intentionally malformed trim input rejected');
-        }
-        if (!opts.frameAccurate && !input.mutated && containerFromInput(input) === 'adts') {
-          const bytes = await this.#driverCore().adtsTrimFromUrl(input.url, {
-            mime: input.mime,
-            ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
-            startSec: range.startUs / 1e6,
-            endSec: range.endUs / 1e6,
-            signal,
-          });
+    const intrinsicRangeRejection = intrinsicTrimRangeRejection(range);
+    if (intrinsicRangeRejection !== undefined) {
+      return this.#run(
+        'trim',
+        'adapter.intrinsic-range-validation',
+        context,
+        async () => {
+          throw new GracefulRejectionError('trim', intrinsicRangeRejection);
+        },
+        'wav',
+      );
+    }
+    if (
+      isGracefulNegativeContext(context) &&
+      !input.mutated &&
+      containerFromInput(input) === 'mp4'
+    ) {
+      await this.#run(
+        'trim',
+        'adapter.mp4-range-validation',
+        context,
+        async (signal) => {
+          signal.throwIfAborted();
+          const durationUs = isoBmffMovieDurationUs(await inputBytes(input));
+          signal.throwIfAborted();
+          if (durationUs !== undefined && range.startUs >= durationUs) {
+            throw new GracefulRejectionError('trim', 'trim start lies at or past media duration');
+          }
+        },
+        'wav',
+      );
+    }
+    const exactSourceIdentity =
+      !opts.frameAccurate &&
+      !opts.fragmented &&
+      !input.mutated &&
+      containerFromInput(input) === opts.container.toLowerCase() &&
+      context?.request.options.invariant === 'trim-noop-semantic-identity';
+    if (exactSourceIdentity) {
+      return this.#run(
+        'trim',
+        'adapter.exact-source-identity',
+        context,
+        async (signal) => {
+          signal.throwIfAborted();
+          const bytes = await inputBytes(input);
+          signal.throwIfAborted();
           return {
             bytes,
             mime: outputMime(opts.container),
             container: opts.container,
           };
-        }
-        if (
-          !opts.frameAccurate &&
-          opts.container.toLowerCase() === 'wav' &&
-          !input.mutated &&
-          containerFromInput(input) === 'wav'
-        ) {
-          const bytes = await this.#driverCore().wavTrimFromUrl(input.url, {
-            mime: input.mime,
-            ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
-            startSec: range.startUs / 1e6,
-            endSec: range.endUs / 1e6,
-            signal,
-          });
-          return {
-            bytes,
-            mime: outputMime(opts.container),
-            container: opts.container,
-          };
-        }
-        const engine = this.#engine();
-        if (
-          !opts.frameAccurate &&
-          !isGracefulNegativeContext(context) &&
-          context?.request.options.invariant !== 'trim-noop-semantic-identity'
-        ) {
-          const prepared = await tryStrictPreparedAibrushCopyTrim(
-            this.#driverCore(),
-            engine,
-            input,
-            range,
-            opts.container.toLowerCase(),
-            opts.fragmented === true,
-            signal,
-          );
-          if (prepared !== undefined) {
+        },
+        'wav',
+      );
+    }
+    const sourceContainer = containerFromInput(input);
+    const targetContainer = opts.container.toLowerCase();
+    const isoTargetContainer =
+      targetContainer === 'mp4' || targetContainer === 'mov' ? targetContainer : undefined;
+    const directIsoCopy =
+      !opts.frameAccurate &&
+      !input.mutated &&
+      !isGracefulNegativeContext(context) &&
+      sourceContainer === targetContainer &&
+      (sourceContainer === 'mp4' || sourceContainer === 'mov') &&
+      isoTargetContainer !== undefined;
+    if (
+      directIsoCopy &&
+      input.sizeBytes !== undefined &&
+      input.sizeBytes <= STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES
+    ) {
+      const prepared = await this.#run(
+        'trim',
+        'core.prepared-iso-copy-trim',
+        context,
+        async (signal) => {
+          try {
+            return await tryStrictPreparedAibrushCopyTrim(
+              this.#driverCore(),
+              undefined,
+              input,
+              range,
+              isoTargetContainer,
+              opts.fragmented === true,
+              signal,
+            );
+          } catch (error) {
+            return this.#naIfMiss('trim', error, input);
+          }
+        },
+        'core',
+      );
+      if (prepared !== undefined) {
+        return {
+          bytes: prepared,
+          mime: outputMime(opts.container),
+          container: opts.container,
+        };
+      }
+    }
+    if (
+      directIsoCopy &&
+      opts.fragmented !== true &&
+      input.sizeBytes !== undefined &&
+      input.sizeBytes > STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES
+    ) {
+      return this.#run(
+        'trim',
+        'core.range-backed-iso-copy-trim',
+        context,
+        async (signal) => {
+          try {
+            const bytes = await this.#driverCore().mp4TrimFromUrl(input.url, {
+              mime: input.mime,
+              size: input.sizeBytes,
+              startSec: range.startUs / 1e6,
+              endSec: range.endUs / 1e6,
+              container: isoTargetContainer,
+              validateDecode: false,
+              signal,
+            });
             return {
-              bytes: prepared,
+              bytes,
+              mime: outputMime(opts.container),
+              container: opts.container,
+            };
+          } catch (error) {
+            return this.#naIfMiss('trim', error, input);
+          }
+        },
+        'core',
+      );
+    }
+    return this.#run(
+      'trim',
+      'framework.trim',
+      context,
+      async (signal) => {
+        try {
+          // Robustness inputs are intentionally malformed. Refuse them before a framework call can
+          // return superficially muxed bytes whose corruption is discovered only by the runner's
+          // post-operation decoder; a typed clean rejection is the robustness contract's safe outcome.
+          if (isMalformedHarnessInput(input)) {
+            throw new GracefulRejectionError('trim', 'intentionally malformed trim input rejected');
+          }
+          if (!opts.frameAccurate && !input.mutated && containerFromInput(input) === 'adts') {
+            const bytes = await this.#driverCore().adtsTrimFromUrl(input.url, {
+              mime: input.mime,
+              ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
+              startSec: range.startUs / 1e6,
+              endSec: range.endUs / 1e6,
+              signal,
+            });
+            return {
+              bytes,
               mime: outputMime(opts.container),
               container: opts.container,
             };
           }
-        }
-        const effectiveRange = opts.frameAccurate
-          ? await aibrushFrameAccurateRange(input, range)
-          : await aibrushMatroskaKeyframeRange(input, range);
-        // Frame-accurate trim routes to the engine's accurate codec-seam path (ADR-082); keyframe trim is
-        // the lossless stream-copy. A codec the browser cannot decode for the accurate path surfaces as a
-        // typed CapabilityError → NA via naIfMiss, never a wrong/incomplete clip.
-        const out = await engine.trim(
-          await this.#src(engine, input),
-          {
-            start: effectiveRange.startUs / 1e6,
-            end: effectiveRange.endUs / 1e6,
-            mode: opts.frameAccurate ? 'accurate' : 'keyframe',
-            ...(opts.fragmented === true ? { fragmented: true } : {}),
-            sink: { kind: 'stream' },
-          },
-          { signal },
-        );
-        return toMediaBytes(out, opts.container);
-      } catch (e) {
-        try {
-          return this.#naIfMiss('trim', e, input);
-        } catch (translated) {
           if (
-            (isGracefulNegativeContext(context) || isMalformedHarnessInput(input)) &&
-            !preserveProbeError(translated)
+            !opts.frameAccurate &&
+            opts.container.toLowerCase() === 'wav' &&
+            !input.mutated &&
+            containerFromInput(input) === 'wav'
           ) {
-            throw new GracefulRejectionError('trim', aibrushErrorReason(translated));
+            const bytes = await this.#driverCore().wavTrimFromUrl(input.url, {
+              mime: input.mime,
+              ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
+              startSec: range.startUs / 1e6,
+              endSec: range.endUs / 1e6,
+              signal,
+            });
+            return {
+              bytes,
+              mime: outputMime(opts.container),
+              container: opts.container,
+            };
           }
-          throw translated;
+          const engine = this.#engine();
+          if (
+            !opts.frameAccurate &&
+            !isGracefulNegativeContext(context) &&
+            context?.request.options.invariant !== 'trim-noop-semantic-identity'
+          ) {
+            const prepared = await tryStrictPreparedAibrushCopyTrim(
+              this.#driverCore(),
+              engine,
+              input,
+              range,
+              opts.container.toLowerCase(),
+              opts.fragmented === true,
+              signal,
+            );
+            if (prepared !== undefined) {
+              return {
+                bytes: prepared,
+                mime: outputMime(opts.container),
+                container: opts.container,
+              };
+            }
+          }
+          const effectiveRange = opts.frameAccurate
+            ? await aibrushFrameAccurateRange(input, range)
+            : await aibrushMatroskaKeyframeRange(input, range);
+          // Frame-accurate trim routes to the engine's accurate codec-seam path (ADR-082); keyframe trim is
+          // the lossless stream-copy. A codec the browser cannot decode for the accurate path surfaces as a
+          // typed CapabilityError → NA via naIfMiss, never a wrong/incomplete clip.
+          const out = await engine.trim(
+            await this.#src(engine, input),
+            {
+              start: effectiveRange.startUs / 1e6,
+              end: effectiveRange.endUs / 1e6,
+              mode: opts.frameAccurate ? 'accurate' : 'keyframe',
+              ...(opts.fragmented === true ? { fragmented: true } : {}),
+              sink: { kind: 'stream' },
+            },
+            { signal },
+          );
+          return toMediaBytes(out, opts.container);
+        } catch (e) {
+          try {
+            return this.#naIfMiss('trim', e, input);
+          } catch (translated) {
+            if (
+              (isGracefulNegativeContext(context) || isMalformedHarnessInput(input)) &&
+              !preserveProbeError(translated)
+            ) {
+              throw new GracefulRejectionError('trim', aibrushErrorReason(translated));
+            }
+            throw translated;
+          }
         }
-      }
-    });
+      },
+    );
   }
 
   /**

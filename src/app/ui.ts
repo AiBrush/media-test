@@ -335,9 +335,10 @@ export function renderOperationPicker(operations: readonly Operation[]): () => s
   })));
 }
 
-export function setAllChecked(containerId: string, checked: boolean): void {
+export function setAllChecked(containerId: string, checked: boolean, visibleOnly = false): void {
   const host = $(containerId);
   for (const input of host.querySelectorAll<HTMLInputElement>('input[type=checkbox]')) {
+    if (visibleOnly && input.closest('label')?.hidden) continue;
     if (!input.disabled) input.checked = checked;
   }
   host.dispatchEvent(new Event('change', { bubbles: true }));
