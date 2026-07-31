@@ -38,12 +38,14 @@ import type {
   MediaBytes,
   MediaEngine,
   MediaInput,
+  MediaInputContentAttestation,
   MuxWriteTraceEvidence,
   MuxOptions,
   LifecycleContext,
   NormalizedMetadata,
   NormalizedTrack,
   OperationContext,
+  OperationFinalCounters,
   PacketInfo,
   RemuxOptions,
   TrimOptions,
@@ -53,6 +55,7 @@ import type {
   TranscodeVideoOptions,
 } from '../../core/engine.ts';
 import {
+  AUTHENTICATED_RANGE_INPUT_FEATURE,
   createNotApplicableError,
   DECODE_TRACK_SELECTOR_SCHEMA,
   isBrowserNotSupportedError,
@@ -60,9 +63,11 @@ import {
   isNotApplicableError,
   MalformedInputError,
 } from '../../core/engine.ts';
+import { CorpusDeliveryIntegrityError } from '../../core/selection-integrity.ts';
 import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
 import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
+import { demuxScaleContractFromOptions } from '../../features/demux/scale.ts';
 import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
 import { compareStrictRemuxPrograms } from '../../features/remux/strict-copy.ts';
 import { readIsoBmffPresentationTimeline, selectIsoBmffTrimWindows } from '../../features/trim/isobmff-timeline.ts';
@@ -236,6 +241,25 @@ function isGracefulNegativeContext(context?: OperationContext): boolean {
   );
 }
 
+function canStartDemuxWithMp4PacketInfoRuntime(
+  request: ConcreteOperationRequest | undefined,
+): boolean {
+  if (
+    request?.operation !== 'demux' ||
+    request.options.invariant === 'demux-scale-budgets' ||
+    request.inputs.length !== 1
+  ) {
+    return false;
+  }
+  const input = request.inputs[0];
+  return (
+    input !== undefined &&
+    (input.container === 'mp4' || input.container === 'mov') &&
+    input.mutated !== true &&
+    !MALFORMED_INPUT_RE.test(input.id)
+  );
+}
+
 function intrinsicTrimRangeRejection(range: { startUs: number; endUs: number }): string | undefined {
   if (!Number.isFinite(range.startUs) || !Number.isFinite(range.endUs)) {
     return 'trim range endpoints must be finite';
@@ -256,10 +280,15 @@ function isStillImageInput(input: MediaInput): boolean {
 // signal into every framework call it can cancel.
 const BUFFER_TARGET_MAX_SOURCE_BYTES = 512 * 1024 * 1024;
 const PACKET_INFO_PREP_MAX_SOURCE_BYTES = 128 * 1024 * 1024;
-const MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES = 512 * 1024;
+// When the runner has already materialized bounded, verified evidence bytes, reuse that immutable
+// snapshot for packet planning. Re-opening its URL paid a second transport/parser setup and retained
+// both representations, while providing no additional truth. Larger inputs never materialize here
+// and keep the range/batch path.
+const MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES = PACKET_INFO_PREP_MAX_SOURCE_BYTES;
 const ISO_BMFF_BUFFER_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const STREAM_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const NON_ISO_STREAM_TARGET_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+const PREALLOCATED_REMUX_OUTPUT_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
 // Below this size, decode/seek feed the engine one bulk-fetched in-memory buffer instead of a fresh
 // per-call URL range source. A small clip's decode/seek reads the whole (or nearly all) file anyway, so a
 // single GET beats the routeContainer-head + moov + sample range round-trips that dominate a tiny op's
@@ -284,6 +313,7 @@ interface AibrushTrack {
   id: number;
   type: 'video' | 'audio';
   codec: string;
+  defaultDisposition?: boolean;
   durationSec?: number;
   width?: number;
   height?: number;
@@ -364,6 +394,11 @@ interface AibrushPacketInfoMetadata {
 interface AibrushPacketInfoTable {
   tracks: ReadonlyArray<AibrushTrackInfo>;
   packets: ReadonlyArray<AibrushPacketInfoMetadata>;
+}
+interface AibrushPacketInfoBatchStream
+  extends AsyncIterable<ReadonlyArray<AibrushPacketInfoMetadata>> {
+  readonly tracks: ReadonlyArray<AibrushTrackInfo>;
+  cancel(reason?: unknown): Promise<void>;
 }
 
 /**
@@ -855,6 +890,7 @@ interface AibrushTrackInfo {
   codec?: string;
   nonMedia?: true;
   durationSec?: number;
+  language?: string;
   rotation?: number;
   fps?: number;
   alpha?: boolean;
@@ -959,6 +995,10 @@ interface AibrushEngine {
   probe(input: unknown, o?: AibrushCallOptions): Promise<AibrushInfo>;
   probeContainer?(input: unknown, container: string, o?: AibrushCallOptions): Promise<AibrushInfo>;
   packetInfo?(input: unknown, o?: AibrushCallOptions): Promise<AibrushPacketInfoTable>;
+  packetInfoBatches?(
+    input: unknown,
+    o?: AibrushCallOptions & { readonly batchSize?: number },
+  ): Promise<AibrushPacketInfoBatchStream>;
   demux(input: unknown, o?: AibrushCallOptions): Promise<AibrushDemuxed>;
   remux(
     input: unknown,
@@ -1290,9 +1330,28 @@ interface AibrushCore {
     readonly container: string;
   }): Uint8Array;
 }
+type AibrushMp4PacketInfoRuntime = Pick<
+  AibrushCore,
+  'CapabilityError' | 'InputError' | 'mp4PacketInfoFromBytes' | 'mp4PacketInfoFromUrl'
+>;
 interface AibrushSourceLike {
   readonly mimeHint?: string;
   stream(): ReadableStream<Uint8Array>;
+}
+
+export interface AibrushAuthenticatedSource extends AibrushSourceLike {
+  readonly __media: 'source';
+  readonly kind: 'url';
+  readonly size: number;
+  readonly rangesHonored: true;
+  range(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
+  releaseRange?(bytes: Uint8Array): void;
+}
+
+export interface AibrushAuthenticatedRangeTrace {
+  bytesRead: number;
+  rangeRequests: number;
+  blockRequests: number;
 }
 interface AibrushHlsKey {
   readonly method: 'NONE' | 'AES-128' | 'SAMPLE-AES' | 'SAMPLE-AES-CTR';
@@ -1433,17 +1492,99 @@ function demuxResultFromPacketInfo(
   );
 }
 
+function emitAibrushDemuxScalePacketBoundary(
+  context: OperationContext | undefined,
+): number | undefined {
+  if (context === undefined || context.signal.aborted) return undefined;
+  const atMs =
+    context.operationStartMs === undefined
+      ? 0
+      : Math.max(0, nowMs() - context.operationStartMs);
+  context.emit({ type: 'progress', atMs, determinate: false });
+  return atMs;
+}
+
+async function demuxAibrushPacketInfoBatches(
+  engine: AibrushEngine,
+  input: MediaInput,
+  source: unknown,
+  container: string,
+  signal: AbortSignal,
+  context: OperationContext | undefined,
+): Promise<DemuxResult> {
+  const open = engine.packetInfoBatches;
+  if (open === undefined) {
+    throw createNotApplicableError(
+      ENGINE_ID,
+      'demux',
+      'the installed framework build does not expose pull-driven packet-info batches',
+      {},
+      'AIBRUSH_DEMUX_PACKET_BATCHES_UNAVAILABLE',
+    );
+  }
+  const batches = await open.call(engine, source, {
+    signal,
+    container,
+  });
+  const packets: AibrushPacketInfoMetadata[] = [];
+  let emittedFirst = false;
+  try {
+    for await (const batch of batches) {
+      signal.throwIfAborted();
+      if (batch.length === 0) continue;
+      packets.push(...batch);
+      if (!emittedFirst) {
+        emittedFirst = true;
+        emitAibrushDemuxScalePacketBoundary(context);
+      }
+    }
+  } catch (error) {
+    await batches.cancel(error).catch(() => undefined);
+    throw error;
+  }
+  await batches.cancel(signal.reason);
+  if (packets.length > 1) emitAibrushDemuxScalePacketBoundary(context);
+  return demuxResultFromPacketInfo(input, {
+    tracks: batches.tracks,
+    packets,
+  });
+}
+
 async function inputBytes(input: MediaInput): Promise<Uint8Array> {
   return new Uint8Array(await input.arrayBuffer());
 }
 
+const observedAibrushInputFetches = new WeakMap<MediaInput, (bytes: number) => void>();
+
+function observeAibrushWholeFileInput(
+  input: MediaInput,
+  onSourceRead: (bytes: number) => void,
+): MediaInput {
+  const observed: MediaInput = {
+    ...input,
+    async arrayBuffer(): Promise<ArrayBuffer> {
+      const bytes = await input.arrayBuffer();
+      onSourceRead(bytes.byteLength);
+      return bytes;
+    },
+    async blob(): Promise<Blob> {
+      const blob = await input.blob();
+      onSourceRead(blob.size);
+      return blob;
+    },
+  };
+  observedAibrushInputFetches.set(observed, onSourceRead);
+  return observed;
+}
+
 async function inputBytesIfAtMost(input: MediaInput, maxBytes: number): Promise<Uint8Array | undefined> {
-  if (input.mutated || maxBytes <= 0) return undefined;
+  if (input.mutated || input.contentAttestation !== undefined || maxBytes <= 0) return undefined;
   const response = await fetch(input.url, {
     headers: { Range: `bytes=0-${maxBytes - 1}` },
   });
   if (!response.ok && response.status !== 206) return undefined;
   const bytes = new Uint8Array(await response.arrayBuffer());
+  observedAibrushInputFetches.get(input)?.(bytes.byteLength);
   const total =
     response.status === 206
       ? parseHttpRangeTotal(response.headers.get('Content-Range'))
@@ -1748,8 +1889,285 @@ function parseHttpRangeTotal(value: string | null): number | undefined {
   const n = Number(total);
   return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
+
+const AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS = 16;
+const AIBRUSH_AUTHENTICATED_RANGE_PARALLEL_BLOCKS = 4;
+
+function aibrushDeliveryError(
+  attestation: MediaInputContentAttestation,
+  reasonCode: string,
+  detail: string,
+): CorpusDeliveryIntegrityError {
+  return new CorpusDeliveryIntegrityError(reasonCode, attestation.logicalPath, detail);
+}
+
+function validateAibrushAttestation(
+  input: MediaInput,
+  attestation: MediaInputContentAttestation,
+): void {
+  const expectedBlocks = Math.ceil(attestation.sizeBytes / attestation.chunkSizeBytes);
+  if (
+    attestation.schema !== 'media-test/url-content-attestation@1' ||
+    !Number.isSafeInteger(attestation.sizeBytes) ||
+    attestation.sizeBytes < 0 ||
+    !Number.isSafeInteger(attestation.chunkSizeBytes) ||
+    attestation.chunkSizeBytes <= 0 ||
+    attestation.chunkSha256.length !== expectedBlocks ||
+    (input.sizeBytes !== undefined && input.sizeBytes !== attestation.sizeBytes)
+  ) {
+    throw aibrushDeliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_ATTESTATION_INVALID',
+      `'${attestation.logicalPath}' has an invalid authenticated range contract`,
+    );
+  }
+}
+
+/**
+ * Product-native Source that exposes only digest-bound fixed-block delivery. Every physical fetch is
+ * an exact RFC range, verified before its bytes enter the framework. The small LRU avoids re-fetching
+ * MP4 header/table blocks while keeping retained source memory independent of asset size.
+ */
+export function createAibrushAuthenticatedSource(
+  input: MediaInput,
+  fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
+  trace: AibrushAuthenticatedRangeTrace = { bytesRead: 0, rangeRequests: 0, blockRequests: 0 },
+  onSourceRead?: (bytes: number) => void,
+): AibrushAuthenticatedSource {
+  const attestation = input.contentAttestation;
+  if (attestation === undefined) {
+    throw new Error('createAibrushAuthenticatedSource requires MediaInput.contentAttestation');
+  }
+  validateAibrushAttestation(input, attestation);
+  const cache = new Map<number, Uint8Array>();
+  const rangeOutputs = new WeakSet<Uint8Array>();
+
+  const block = async (blockIndex: number, signal?: AbortSignal): Promise<Uint8Array> => {
+    signal?.throwIfAborted();
+    const cached = cache.get(blockIndex);
+    if (cached !== undefined) {
+      cache.delete(blockIndex);
+      cache.set(blockIndex, cached);
+      return cached;
+    }
+    const blockStart = blockIndex * attestation.chunkSizeBytes;
+    const blockEndExclusive = Math.min(
+      attestation.sizeBytes,
+      blockStart + attestation.chunkSizeBytes,
+    );
+    const blockEnd = blockEndExclusive - 1;
+    const response = await fetchImpl(input.url, {
+      cache: 'no-store',
+      headers: { Range: `bytes=${blockStart}-${blockEnd}` },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (response.status !== 206) {
+      response.body?.cancel().catch(() => undefined);
+      throw aibrushDeliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_UNAVAILABLE',
+        `'${attestation.logicalPath}' returned HTTP ${response.status} for authenticated range ${blockStart}-${blockEnd}`,
+      );
+    }
+    const contentRange = response.headers.get('Content-Range');
+    const expectedContentRange = `bytes ${blockStart}-${blockEnd}/${attestation.sizeBytes}`;
+    if (contentRange !== expectedContentRange) {
+      response.body?.cancel().catch(() => undefined);
+      throw aibrushDeliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_SHAPE_MISMATCH',
+        `'${attestation.logicalPath}' returned Content-Range '${contentRange ?? 'missing'}', expected '${expectedContentRange}'`,
+      );
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    trace.blockRequests += 1;
+    trace.bytesRead += bytes.byteLength;
+    onSourceRead?.(bytes.byteLength);
+    const expectedSize = blockEndExclusive - blockStart;
+    if (bytes.byteLength !== expectedSize) {
+      throw aibrushDeliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_SIZE_MISMATCH',
+        `'${attestation.logicalPath}' block ${blockIndex} has ${bytes.byteLength} bytes, expected ${expectedSize}`,
+      );
+    }
+    const expectedSha256 = attestation.chunkSha256[blockIndex];
+    if (expectedSha256 === undefined || (await sha256Hex(bytes)) !== expectedSha256) {
+      throw aibrushDeliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH',
+        `'${attestation.logicalPath}' block ${blockIndex} no longer matches the admitted content snapshot`,
+      );
+    }
+    cache.set(blockIndex, bytes);
+    while (cache.size > AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS) {
+      const oldest = cache.keys().next().value as number | undefined;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+    return bytes;
+  };
+
+  const range = async (start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> => {
+    signal?.throwIfAborted();
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+      throw aibrushDeliveryError(
+        attestation,
+        'CORPUS_AUTHENTICATED_RANGE_REQUEST_INVALID',
+        `'${attestation.logicalPath}' received a non-integer range [${start}, ${end})`,
+      );
+    }
+    const boundedStart = Math.max(0, Math.min(start, attestation.sizeBytes));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, attestation.sizeBytes));
+    const output = new Uint8Array(boundedEnd - boundedStart);
+    if (output.byteLength === 0) return output;
+    trace.rangeRequests += 1;
+    const firstBlock = Math.floor(boundedStart / attestation.chunkSizeBytes);
+    const lastBlock = Math.floor((boundedEnd - 1) / attestation.chunkSizeBytes);
+    for (
+      let batchStart = firstBlock;
+      batchStart <= lastBlock;
+      batchStart += AIBRUSH_AUTHENTICATED_RANGE_PARALLEL_BLOCKS
+    ) {
+      const batchEnd = Math.min(
+        lastBlock + 1,
+        batchStart + AIBRUSH_AUTHENTICATED_RANGE_PARALLEL_BLOCKS,
+      );
+      const indices = Array.from(
+        { length: batchEnd - batchStart },
+        (_, index) => batchStart + index,
+      );
+      const blocks = await Promise.all(indices.map((index) => block(index, signal)));
+      for (let index = 0; index < blocks.length; index++) {
+        const blockIndex = indices[index]!;
+        const bytes = blocks[index]!;
+        const blockStart = blockIndex * attestation.chunkSizeBytes;
+        const copyStart = Math.max(boundedStart, blockStart);
+        const copyEnd = Math.min(boundedEnd, blockStart + bytes.byteLength);
+        output.set(
+          bytes.subarray(copyStart - blockStart, copyEnd - blockStart),
+          copyStart - boundedStart,
+        );
+      }
+    }
+    signal?.throwIfAborted();
+    rangeOutputs.add(output);
+    return output;
+  };
+
+  const releaseRange = (bytes: Uint8Array): void => {
+    if (!rangeOutputs.delete(bytes)) return;
+    const buffer = bytes.buffer;
+    if (
+      buffer instanceof ArrayBuffer &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === buffer.byteLength
+    ) {
+      const transfer = (
+        buffer as ArrayBuffer & {
+          transfer?: (newByteLength?: number) => ArrayBuffer;
+        }
+      ).transfer;
+      if (typeof transfer === 'function') transfer.call(buffer, 0);
+    }
+  };
+
+  return {
+    __media: 'source',
+    kind: 'url',
+    size: attestation.sizeBytes,
+    mimeHint: input.mime,
+    rangesHonored: true,
+    range,
+    releaseRange,
+    stream(): ReadableStream<Uint8Array> {
+      const cancellation = new AbortController();
+      let cursor = 0;
+      return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (cursor >= attestation.sizeBytes) {
+            controller.close();
+            return;
+          }
+          try {
+            const end = Math.min(
+              attestation.sizeBytes,
+              cursor + attestation.chunkSizeBytes,
+            );
+            const bytes = await range(cursor, end, cancellation.signal);
+            cursor = end;
+            controller.enqueue(bytes);
+          } catch (error) {
+            controller.error(error);
+          }
+        },
+        cancel(reason) {
+          cancellation.abort(reason);
+        },
+      });
+    },
+  };
+}
+
+async function createAibrushCountingSource(
+  input: MediaInput,
+  onSourceRead: (bytes: number) => void,
+): Promise<AibrushAuthenticatedSource> {
+  const sourceBytes = new Uint8Array(await input.arrayBuffer());
+  const range = async (
+    start: number,
+    end: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> => {
+    signal?.throwIfAborted();
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+      throw new RangeError(`aibrush counting source requires integer range bounds, got [${start}, ${end})`);
+    }
+    const boundedStart = Math.max(0, Math.min(start, sourceBytes.byteLength));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, sourceBytes.byteLength));
+    const output = sourceBytes.slice(boundedStart, boundedEnd);
+    onSourceRead(output.byteLength);
+    signal?.throwIfAborted();
+    return output;
+  };
+  return {
+    __media: 'source',
+    kind: 'url',
+    size: sourceBytes.byteLength,
+    mimeHint: input.mime,
+    rangesHonored: true,
+    range,
+    stream(): ReadableStream<Uint8Array> {
+      const cancellation = new AbortController();
+      let cursor = 0;
+      return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (cursor >= sourceBytes.byteLength) {
+            controller.close();
+            return;
+          }
+          try {
+            const end = Math.min(sourceBytes.byteLength, cursor + 1024 * 1024);
+            const bytes = await range(cursor, end, cancellation.signal);
+            cursor = end;
+            controller.enqueue(bytes);
+          } catch (error) {
+            controller.error(error);
+          }
+        },
+        cancel(reason) {
+          cancellation.abort(reason);
+        },
+      });
+    },
+  };
+}
+
 async function inputSize(input: MediaInput): Promise<number | undefined> {
   if (input.mutated) return undefined;
+  if (Number.isSafeInteger(input.sizeBytes) && Number(input.sizeBytes) >= 0) {
+    return Number(input.sizeBytes);
+  }
   const url = inputUrl(input);
   try {
     const head = await fetch(url, { method: 'HEAD', cache: 'no-store' });
@@ -2159,6 +2577,58 @@ function nowMs(): number {
   return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
 }
 
+interface AibrushSourceReadObserver {
+  readonly onRead: (bytes: number) => void;
+  readonly bytesRead: number;
+}
+
+function operationSourceReadObserver(
+  context: OperationContext | undefined,
+): AibrushSourceReadObserver | undefined {
+  if (context === undefined) return undefined;
+  let bytesRead = 0;
+  return {
+    get bytesRead() {
+      return bytesRead;
+    },
+    onRead(bytes) {
+      bytesRead += bytes;
+      const atMs =
+        context.operationStartMs === undefined
+          ? 0
+          : Math.max(0, nowMs() - context.operationStartMs);
+      context.emit({ type: 'bytes-read', atMs, bytes: bytesRead });
+    },
+  };
+}
+
+function shouldObserveAibrushSourceReads(
+  input: MediaInput,
+  context: OperationContext | undefined,
+): boolean {
+  return context !== undefined && (
+    input.contentAttestation !== undefined ||
+    context.phase === 'warmup' ||
+    context.phase === 'measured' ||
+    demuxScaleContractFromOptions(context.request.options) !== undefined
+  );
+}
+
+function attachSourceReadTelemetry<T extends object>(
+  value: T,
+  observer: AibrushSourceReadObserver | undefined,
+): T {
+  if (observer === undefined) return value;
+  const existing = (value as { readonly telemetry?: OperationFinalCounters }).telemetry;
+  return {
+    ...value,
+    telemetry: {
+      ...existing,
+      bytesRead: observer.bytesRead,
+    },
+  } as T;
+}
+
 interface AibrushOutputTelemetry {
   readonly sink: AibrushSink;
   mediaBytes(output: AibrushOutput, container: string): Promise<MediaBytes>;
@@ -2169,6 +2639,8 @@ interface AibrushOutputRuntimeIdentity {
   readonly emit?: OperationContext['emit'];
   readonly resolvedRepresentation?: AibrushStreamingRuntimeEvidence['resolvedRepresentation'];
   readonly captureMuxWriteTrace?: boolean;
+  /** Lossless remux estimate used to avoid retaining N bytes of chunks plus an N-byte final copy. */
+  readonly expectedOutputBytes?: number;
 }
 
 interface AibrushOutputObservation {
@@ -2269,7 +2741,9 @@ function instrumentedAibrushSink(
     sink,
     async mediaBytes(output, container) {
       const recorder = new AibrushSinkTraceRecorder({
-        operationStartMs: runtime.operationStartMs,
+        ...(target === 'buffer' && runtime.operationStartMs !== undefined
+          ? { operationStartMs: runtime.operationStartMs }
+          : {}),
       });
       const retained = await toMediaBytesWithRetention(output, container, recorder, () => {
         if (runtime.operationStartMs === undefined || runtime.emit === undefined) return;
@@ -2284,11 +2758,21 @@ function instrumentedAibrushSink(
           atMs,
           count: recorder.writeCount,
         });
-      });
+      }, runtime.expectedOutputBytes);
       const media = retained.media;
       recorder.beginFinalize();
       const trace = recorder.complete('buffer', retained.peakRetainedBytes);
-      const withEvidence = attachStreamingEvidence(media, trace, runtime, 'buffer');
+      const withEvidence =
+        trace === undefined
+          ? {
+              ...media,
+              targetWrites: recorder.writeCount,
+              telemetry: {
+                bytesWritten: recorder.bytesWritten,
+                writeCount: recorder.writeCount,
+              },
+            }
+          : attachStreamingEvidence(media, trace, runtime, 'buffer');
       if (withEvidence.firstByteMs !== undefined && runtime.emit !== undefined) {
         runtime.emit({ type: 'first-byte', atMs: withEvidence.firstByteMs });
       }
@@ -2354,6 +2838,7 @@ async function toMediaBytesWithRetention(
   container: string,
   recorder?: AibrushSinkTraceRecorder,
   onWrite?: () => void,
+  expectedOutputBytes?: number,
 ): Promise<{ media: MediaBytes; peakRetainedBytes: number }> {
   if (output === undefined) {
     throw new Error('aibrush output was written to a target but no target telemetry was attached');
@@ -2376,6 +2861,101 @@ async function toMediaBytesWithRetention(
     };
   }
   const reader = output.getReader();
+  if (
+    Number.isSafeInteger(expectedOutputBytes) &&
+    expectedOutputBytes !== undefined &&
+    expectedOutputBytes > 0
+  ) {
+    const maxResizableBytes = Math.max(
+      expectedOutputBytes,
+      Math.min(
+        0x7fff_ffff,
+        expectedOutputBytes +
+          Math.max(256 * 1024 * 1024, Math.floor(expectedOutputBytes / 2)),
+        ),
+    );
+    interface ResizableArrayBuffer extends ArrayBuffer {
+      readonly resizable: boolean;
+      readonly maxByteLength: number;
+      resize(newByteLength: number): void;
+      transferToFixedLength(newByteLength?: number): ArrayBuffer;
+    }
+    type ResizableArrayBufferConstructor = new (
+      byteLength: number,
+      options: { maxByteLength: number },
+    ) => ResizableArrayBuffer;
+    let retainedBuffer: ArrayBuffer;
+    let resizableBuffer: ResizableArrayBuffer | undefined;
+    try {
+      const candidate = new (ArrayBuffer as unknown as ResizableArrayBufferConstructor)(
+        expectedOutputBytes,
+        { maxByteLength: maxResizableBytes },
+      );
+      retainedBuffer = candidate;
+      if (candidate.resizable === true && typeof candidate.resize === 'function') {
+        resizableBuffer = candidate;
+      }
+    } catch {
+      retainedBuffer = new ArrayBuffer(expectedOutputBytes);
+    }
+    let retained = new Uint8Array(retainedBuffer);
+    let length = 0;
+    let peakRetainedBytes = retained.byteLength;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const required = length + value.byteLength;
+        if (!Number.isSafeInteger(required)) {
+          throw new RangeError('aibrush output exceeds the safe byte length');
+        }
+        if (required > retained.byteLength) {
+          const grownLength = Math.max(
+            required,
+            retained.byteLength + Math.max(64 * 1024 * 1024, Math.floor(retained.byteLength / 4)),
+          );
+          if (resizableBuffer !== undefined && grownLength <= resizableBuffer.maxByteLength) {
+            resizableBuffer.resize(grownLength);
+            retainedBuffer = resizableBuffer;
+            retained = new Uint8Array(retainedBuffer);
+            peakRetainedBytes = Math.max(peakRetainedBytes, retained.byteLength);
+          } else {
+            const grownBuffer = new ArrayBuffer(grownLength);
+            const grown = new Uint8Array(grownBuffer);
+            peakRetainedBytes = Math.max(peakRetainedBytes, retained.byteLength + grown.byteLength);
+            grown.set(retained.subarray(0, length));
+            retainedBuffer = grownBuffer;
+            retained = grown;
+            resizableBuffer = undefined;
+          }
+        }
+        retained.set(value, length);
+        length = required;
+        recorder?.write(value, recorder.bytesWritten);
+        onWrite?.();
+      }
+    } catch (error) {
+      await reader.cancel(error).catch(() => undefined);
+      throw error;
+    } finally {
+      reader.releaseLock();
+    }
+    let bytes: Uint8Array;
+    if (length === retained.byteLength) {
+      bytes = retained;
+    } else if (resizableBuffer !== undefined) {
+      retainedBuffer = resizableBuffer.transferToFixedLength(length);
+      resizableBuffer = undefined;
+      bytes = new Uint8Array(retainedBuffer);
+    } else {
+      bytes = retained.slice(0, length);
+      peakRetainedBytes = Math.max(peakRetainedBytes, retained.byteLength + bytes.byteLength);
+    }
+    return {
+      media: { bytes, mime: outputMime(container), container },
+      peakRetainedBytes,
+    };
+  }
   const accumulator = new AibrushCallbackAccumulator();
   try {
     for (;;) {
@@ -6372,7 +6952,10 @@ export class AibrushMediaEngine implements MediaEngine {
       sampleImmediatelyDuringOperation: true,
       maxOperationSamples: 1,
       settleWindowMs: 0,
-      sampleTimeoutMs: 1_000,
+      // Chromium's cross-process heap walk routinely exceeds one second once a long-form output is
+      // resident. Keep the request bounded by the harness's audited endpoint deadline without
+      // misclassifying a responsive large-heap sample as a protocol failure.
+      sampleTimeoutMs: 30_000,
     },
   } as const;
   readonly #configEvidence = new AibrushConfigEvidence();
@@ -6382,8 +6965,10 @@ export class AibrushMediaEngine implements MediaEngine {
   #lib: AibrushMedia | undefined;
   #wav: AibrushWav | undefined;
   #core: AibrushCore | undefined;
+  #mp4PacketInfo: AibrushMp4PacketInfoRuntime | undefined;
   #coreRuntimePromise: Promise<void> | undefined;
   #fullRuntimePromise: Promise<void> | undefined;
+  #mp4PacketInfoRuntimePromise: Promise<void> | undefined;
   #errorClasses: AibrushErrorClasses | undefined;
   #cellSignal: AbortSignal | undefined;
   #currentRequest: ConcreteOperationRequest | undefined;
@@ -6433,11 +7018,15 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#wav = wav as unknown as AibrushWav;
     this.#configEvidence.assertPackageVersion(this.#wav.VERSION);
     // Trim has exact-source, structural-validation, and driver-core routes that do not need the complete
-    // codec/router graph. `supports()` binds the concrete operation before init, so leave Trim demand-
-    // loaded in every realm; its selected `#run` route imports exactly the runtime it executes. Other
-    // page operations retain the historical eager warmup, while short-lived Workers remain demand-loaded.
+    // codec/router graph. Clean MP4/MOV demux has a focused public packet-info runtime for the same
+    // reason. `supports()` binds the concrete operation before init, so load the smallest exact surface;
+    // fallback branches upgrade to the complete runtime before using it.
     if (!isWorkerRealm() && this.#currentRequest?.operation !== 'trim') {
-      await this.#ensureFullRuntime(context?.signal);
+      if (canStartDemuxWithMp4PacketInfoRuntime(this.#currentRequest)) {
+        await this.#ensureMp4PacketInfoRuntime(context?.signal);
+      } else {
+        await this.#ensureFullRuntime(context?.signal);
+      }
     }
     context?.signal.throwIfAborted();
   }
@@ -6452,10 +7041,12 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#preparedTsMuxOutput = undefined;
     this.#dropDirectDecoder();
     this.#core = undefined;
+    this.#mp4PacketInfo = undefined;
     this.#engineInstance = undefined;
     this.#errorClasses = undefined;
     this.#coreRuntimePromise = undefined;
     this.#fullRuntimePromise = undefined;
+    this.#mp4PacketInfoRuntimePromise = undefined;
   }
 
   #bindCellSignal(context: LifecycleContext | undefined, operation: string): void {
@@ -6474,11 +7065,14 @@ export class AibrushMediaEngine implements MediaEngine {
     route: string,
     context: OperationContext | undefined,
     body: (signal: AbortSignal) => Promise<T>,
-    runtime: 'full' | 'core' | 'wav' = 'full',
+    runtime: 'full' | 'core' | 'mp4-packet-info' | 'wav' = 'full',
   ): Promise<T> {
     this.#bindCellSignal(context, operation);
     if (runtime === 'full') await this.#ensureFullRuntime(context?.signal);
     else if (runtime === 'core') await this.#ensureCoreRuntime(context?.signal);
+    else if (runtime === 'mp4-packet-info') {
+      await this.#ensureMp4PacketInfoRuntime(context?.signal);
+    }
     if (context !== undefined) this.#currentRequest = context.request;
     this.#activeOperation = operation;
     this.#activeRoute = route;
@@ -6798,9 +7392,29 @@ export class AibrushMediaEngine implements MediaEngine {
     await this.#coreRuntimePromise;
     signal?.throwIfAborted();
   }
+  async #ensureMp4PacketInfoRuntime(signal?: AbortSignal): Promise<void> {
+    if (this.#core !== undefined || this.#mp4PacketInfo !== undefined) return;
+    this.#mp4PacketInfoRuntimePromise ??= import('@aibrush/media/mp4-packet-info').then(
+      (runtime) => {
+        const loaded = runtime as unknown as AibrushMp4PacketInfoRuntime;
+        this.#mp4PacketInfo = loaded;
+        this.#errorClasses = {
+          CapabilityError: loaded.CapabilityError,
+          InputError: loaded.InputError,
+        };
+      },
+    );
+    await this.#mp4PacketInfoRuntimePromise;
+    signal?.throwIfAborted();
+  }
   #driverCore(): AibrushCore {
     if (!this.#core) throw new Error('aibrush-media core not initialized');
     return this.#core;
+  }
+  #mp4PacketInfoRuntime(): AibrushMp4PacketInfoRuntime {
+    const runtime = this.#core ?? this.#mp4PacketInfo;
+    if (!runtime) throw new Error('aibrush-media MP4 packet-info runtime not initialized');
+    return runtime;
   }
   #streamSink(): AibrushStreamSink {
     if (!this.#lib) throw new Error('aibrush-media not initialized');
@@ -6853,14 +7467,24 @@ export class AibrushMediaEngine implements MediaEngine {
       ...(signal !== undefined ? { signal } : {}),
     });
   }
-  async #src(engine: AibrushEngine, input: MediaInput): Promise<unknown> {
+  async #src(
+    engine: AibrushEngine,
+    input: MediaInput,
+    onSourceRead?: (bytes: number) => void,
+  ): Promise<unknown> {
     if (isHlsAsset(input)) {
       // HLS: resolve the .m3u8 playlist to a single stitched MPEG-TS/MP4 Source (parse → fetch segments →
       // AES-128 decrypt → concat) that the unmodified engine then probes/demuxes/decodes. The resolver lives
       // in the driver-author surface (core.js), lazy-loaded only for HLS inputs so the eager path is untouched.
       return engine.from(await this.#resolveHlsSource(input));
     }
+    if (input.contentAttestation !== undefined) {
+      return engine.from(createAibrushAuthenticatedSource(input, globalThis.fetch.bind(globalThis), undefined, onSourceRead));
+    }
     if (input.mutated) return engine.from(await inputBytes(input), { mime: input.mime });
+    if (onSourceRead !== undefined) {
+      return engine.from(await createAibrushCountingSource(input, onSourceRead));
+    }
     return engine.from(inputUrl(input), {
       mime: input.mime,
       rangeRequests: true,
@@ -7097,6 +7721,7 @@ export class AibrushMediaEngine implements MediaEngine {
         'trim:massive-lazy-read',
         'hls:aes128',
         'probe:resource-trace',
+        AUTHENTICATED_RANGE_INPUT_FEATURE,
       ],
       probeReadModes: ['range', 'whole-file'],
     };
@@ -7163,11 +7788,27 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
+    const container = containerFromInput(input);
+    const scaleContract = demuxScaleContractFromOptions(context?.request.options);
+    const startWithMp4PacketInfoRuntime =
+      scaleContract === undefined &&
+      (container === 'mp4' || container === 'mov') &&
+      !isMalformedHarnessInput(input);
     return this.#run('demux', 'framework.demux+packet-info', context, async (signal) => {
       try {
-        const container = containerFromInput(input);
+        const fullEngine = async (): Promise<AibrushEngine> => {
+          await this.#ensureFullRuntime(signal);
+          return this.#engine();
+        };
+        const sourceRead = shouldObserveAibrushSourceReads(input, context)
+          ? operationSourceReadObserver(context)
+          : undefined;
         const evidenceBytes =
-          input.sizeBytes !== undefined && input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES && !isHlsAsset(input)
+          sourceRead === undefined &&
+          input.contentAttestation === undefined &&
+          input.sizeBytes !== undefined &&
+          input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES &&
+          !isHlsAsset(input)
             ? await inputBytes(input)
             : undefined;
         if (isPcmAggregateInput(input)) {
@@ -7175,7 +7816,25 @@ export class AibrushMediaEngine implements MediaEngine {
           if (pcmTrack(metadata) === undefined) {
             throw new Error(`aibrush PCM aggregate input ${input.id} has no PCM track`);
           }
-          return { metadata, packets: await pcmPacketTable(input, metadata) };
+          return attachSourceReadTelemetry(
+            { metadata, packets: await pcmPacketTable(input, metadata) },
+            sourceRead,
+          );
+        }
+        if (scaleContract !== undefined && (container === 'mp4' || container === 'mov')) {
+          const engine = await fullEngine();
+          const source = await this.#src(engine, input, sourceRead?.onRead);
+          return attachSourceReadTelemetry(
+            await demuxAibrushPacketInfoBatches(
+              engine,
+              input,
+              source,
+              container,
+              signal,
+              context,
+            ),
+            sourceRead,
+          );
         }
         if (
           (container === 'mp4' || container === 'mov') &&
@@ -7184,17 +7843,29 @@ export class AibrushMediaEngine implements MediaEngine {
           input.sizeBytes <= MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES
         ) {
           const bytes = evidenceBytes ?? (await inputBytes(input));
-          const packetInfo = await this.#driverCore().mp4PacketInfoFromBytes(bytes);
-          if (packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo, bytes);
+          const packetInfo = await this.#mp4PacketInfoRuntime().mp4PacketInfoFromBytes(bytes);
+          if (packetInfo.packets.length > 0) {
+            return attachSourceReadTelemetry(
+              demuxResultFromPacketInfo(input, packetInfo, bytes),
+              sourceRead,
+            );
+          }
         }
-        if ((container === 'mp4' || container === 'mov') && !isMalformedHarnessInput(input)) {
-          const packetInfo = await this.#driverCore().mp4PacketInfoFromUrl(input.url, {
+        if (
+          (container === 'mp4' || container === 'mov') &&
+          !isMalformedHarnessInput(input) &&
+          input.contentAttestation === undefined
+        ) {
+          const packetInfo = await this.#mp4PacketInfoRuntime().mp4PacketInfoFromUrl(input.url, {
             mime: input.mime,
             ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
             signal,
           });
           if (packetInfo.packets.length > 0) {
-            return demuxResultFromPacketInfo(input, packetInfo, evidenceBytes);
+            return attachSourceReadTelemetry(
+              demuxResultFromPacketInfo(input, packetInfo, evidenceBytes),
+              sourceRead,
+            );
           }
         }
         if (
@@ -7205,7 +7876,12 @@ export class AibrushMediaEngine implements MediaEngine {
         ) {
           const bytes = evidenceBytes ?? (await inputBytes(input));
           const packetInfo = this.#driverCore().mp3PacketInfoFromBytes(bytes);
-          if (packetInfo.packets.length > 0) return demuxResultFromPacketInfo(input, packetInfo, bytes);
+          if (packetInfo.packets.length > 0) {
+            return attachSourceReadTelemetry(
+              demuxResultFromPacketInfo(input, packetInfo, bytes),
+              sourceRead,
+            );
+          }
         }
         if (
           (container === 'mp4' ||
@@ -7215,21 +7891,24 @@ export class AibrushMediaEngine implements MediaEngine {
             container === 'mp3') &&
           !isMalformedHarnessInput(input)
         ) {
-          const engine = this.#engine();
-          const src = await this.#src(engine, input);
+          const engine = await fullEngine();
+          const src = await this.#src(engine, input, sourceRead?.onRead);
           const packetInfo = await engine.packetInfo?.(src, {
             signal,
             container,
           });
           if (packetInfo !== undefined && packetInfo.packets.length > 0) {
-            return demuxResultFromPacketInfo(input, packetInfo, evidenceBytes);
+            return attachSourceReadTelemetry(
+              demuxResultFromPacketInfo(input, packetInfo, evidenceBytes),
+              sourceRead,
+            );
           }
         }
-        const engine = this.#engine();
+        const engine = await fullEngine();
         const source =
           isMalformedHarnessInput(input) && !input.mutated
             ? engine.from(evidenceBytes ?? (await inputBytes(input)))
-            : await this.#src(engine, input);
+            : await this.#src(engine, input, sourceRead?.onRead);
         const demuxed = await engine.demux(source, { signal });
         const rawMetadata = metadataFromDemuxed(input, demuxed);
         const metadata =
@@ -7304,7 +7983,14 @@ export class AibrushMediaEngine implements MediaEngine {
         if (!packetTableFastPath) {
           packets.sort((a, b) => (a.dtsUs ?? a.ptsUs) - (b.dtsUs ?? b.ptsUs) || a.trackIndex - b.trackIndex);
         }
-        return buildAibrushDemuxResult(metadata, demuxed.tracks, packets);
+        if (scaleContract !== undefined && packets.length > 0) {
+          emitAibrushDemuxScalePacketBoundary(context);
+          if (packets.length > 1) emitAibrushDemuxScalePacketBoundary(context);
+        }
+        return attachSourceReadTelemetry(
+          buildAibrushDemuxResult(metadata, demuxed.tracks, packets),
+          sourceRead,
+        );
       } catch (e) {
         try {
           return this.#naIfMiss('demux', e, input);
@@ -7315,7 +8001,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw translated;
         }
       }
-    });
+    }, startWithMp4PacketInfoRuntime ? 'mp4-packet-info' : 'full');
   }
 
   /**
@@ -7368,18 +8054,29 @@ export class AibrushMediaEngine implements MediaEngine {
     return this.#run('remux', 'framework.remux', context, async (signal) => {
       try {
         const engine = this.#engine();
+        const sourceRead = shouldObserveAibrushSourceReads(input, context)
+          ? operationSourceReadObserver(context)
+          : undefined;
+        const preparedInput = sourceRead === undefined
+          ? input
+          : observeAibrushWholeFileInput(input, sourceRead.onRead);
         const telemetry = this.#outputTelemetry(opts as Record<string, unknown>, {
           operationStartMs: context?.operationStartMs,
           emit: context?.emit,
           resolvedRepresentation: resolvedStreamingRepresentation(target, opts, fragmented),
+          ...(input.sizeBytes !== undefined &&
+          input.sizeBytes >= PREALLOCATED_REMUX_OUTPUT_MIN_SOURCE_BYTES
+            ? { expectedOutputBytes: input.sizeBytes }
+            : {}),
         });
         const prepared =
-          (await tryPreparedAibrushMatroskaTagRewrite(input, target, opts)) ??
-          (await tryStrictPreparedAibrushRemux(this.#driverCore(), engine, input, opts, signal));
+          (await tryPreparedAibrushMatroskaTagRewrite(preparedInput, target, opts)) ??
+          (await tryStrictPreparedAibrushRemux(this.#driverCore(), engine, preparedInput, opts, signal));
         const out =
           prepared ??
           (await engine.remux(
-            (await finiteWebmClusterSource(engine, input)) ?? (await this.#src(engine, input)),
+            (await finiteWebmClusterSource(engine, preparedInput)) ??
+              (await this.#src(engine, input, sourceRead?.onRead)),
             {
               to: opts.container,
               faststart: faststartFrom(opts),
@@ -7389,7 +8086,10 @@ export class AibrushMediaEngine implements MediaEngine {
             },
             { signal },
           ));
-        const media = await telemetry.mediaBytes(out, opts.container);
+        const media = attachSourceReadTelemetry(
+          await telemetry.mediaBytes(out, opts.container),
+          sourceRead,
+        );
         const repairedOgg = target === 'ogg' ? repairAibrushOggContinuationFlags(media.bytes) : undefined;
         return verifyRequestedIsoShape(
           repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },

@@ -47,6 +47,32 @@ interface FragmentDefaults {
   flags?: number;
 }
 
+export interface IsoBmffRangeSource {
+  readonly size: number;
+  range(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
+}
+
+export interface IsoBmffRangeSampleEvidence extends Omit<RemuxSampleEvidence, 'payload'> {
+  readonly byteLength: number;
+  readonly fileOffset: number;
+}
+
+export interface IsoBmffRangeTrackEvidence extends Omit<RemuxTrackEvidence, 'samples'> {
+  readonly samples: readonly IsoBmffRangeSampleEvidence[];
+}
+
+export interface IsoBmffRangeProgramEvidence
+  extends Omit<RemuxProgramEvidence, 'tracks'> {
+  readonly tracks: readonly IsoBmffRangeTrackEvidence[];
+}
+
+export type IsoBmffRangeReadResult =
+  | Readonly<{ state: 'OK'; value: IsoBmffRangeProgramEvidence }>
+  | Readonly<{
+      state: 'UNSUPPORTED_STRUCTURE' | 'MALFORMED' | 'INCOMPLETE';
+      reasonCode: string;
+    }>;
+
 const MAX_BOXES_PER_LEVEL = 1_000_000;
 
 function boxes(bytes: Uint8Array, start: number, end: number): Box[] | undefined {
@@ -601,6 +627,200 @@ function classicSamples(bytes: Uint8Array, track: TrackTables, mdats: readonly B
     dts += durations[i]!;
   }
   return out;
+}
+
+function classicRangeSamples(
+  bytes: Uint8Array,
+  track: TrackTables,
+  mdats: readonly Box[],
+): IsoBmffRangeSampleEvidence[] | undefined {
+  const sizes = sampleSizes(bytes, track.stbl);
+  const stts = child(bytes, track.stbl, 'stts');
+  if (!sizes || !stts || sizes.some((size) => size <= 0)) return undefined;
+  const durations = expandedRunTable(bytes, stts, false);
+  if (!durations || durations.length !== sizes.length) return undefined;
+  const ctts = child(bytes, track.stbl, 'ctts');
+  const offsets = ctts ? expandedRunTable(bytes, ctts, true) : new Array(sizes.length).fill(0);
+  const positions = sampleOffsets(bytes, track.stbl, sizes);
+  const sync = syncSamples(bytes, track.stbl, sizes.length);
+  if (!offsets || offsets.length !== sizes.length || !positions) return undefined;
+  const out: IsoBmffRangeSampleEvidence[] = [];
+  let dts = 0;
+  for (let index = 0; index < sizes.length; index++) {
+    const byteLength = sizes[index]!;
+    const fileOffset = positions[index]!;
+    if (!inMdat(fileOffset, byteLength, mdats)) return undefined;
+    const edit = track.edit;
+    const toUs = (value: number): number =>
+      Math.round((value / track.timescale) * 1_000_000);
+    const mediaStart = edit?.mediaStart ?? 0;
+    const presentationStartUs = edit?.presentationStartUs ?? 0;
+    out.push({
+      byteLength,
+      fileOffset,
+      dtsUs: presentationStartUs + toUs(dts - mediaStart),
+      ptsUs: presentationStartUs + toUs(dts + offsets[index]! - mediaStart),
+      durationUs: toUs(durations[index]!),
+      keyframe: sync ? sync.has(index + 1) : track.type === 'audio' ? true : undefined,
+      framing:
+        track.codec === 'h264' || track.codec === 'hevc'
+          ? 'length-prefixed'
+          : 'raw',
+    });
+    dts += durations[index]!;
+  }
+  return out;
+}
+
+async function topLevelRangeBoxes(
+  source: IsoBmffRangeSource,
+  signal?: AbortSignal,
+): Promise<Box[] | undefined> {
+  const result: Box[] = [];
+  let offset = 0;
+  while (offset < source.size) {
+    if (result.length >= MAX_BOXES_PER_LEVEL || offset + 8 > source.size) return undefined;
+    signal?.throwIfAborted();
+    const headerBytes = await source.range(offset, Math.min(source.size, offset + 16), signal);
+    if (headerBytes.byteLength < 8) return undefined;
+    const size32 = u32be(headerBytes, 0);
+    const type = ascii(headerBytes, 4, 4);
+    let header = 8;
+    let size: number | undefined = size32;
+    if (size32 === 1) {
+      if (headerBytes.byteLength < 16) return undefined;
+      size = u64beSafe(headerBytes, 8);
+      header = 16;
+    } else if (size32 === 0) {
+      size = source.size - offset;
+    }
+    if (
+      size === undefined ||
+      size < header ||
+      !Number.isSafeInteger(size) ||
+      offset + size > source.size
+    ) {
+      return undefined;
+    }
+    result.push({
+      type,
+      start: offset,
+      body: offset + header,
+      end: offset + size,
+      header,
+    });
+    offset += size;
+  }
+  return offset === source.size ? result : undefined;
+}
+
+/**
+ * Range-native classic ISO-BMFF reader used by large remux correctness. It retains only top-level
+ * headers plus `moov`; sample payloads remain address descriptors and are fetched/compared lazily.
+ */
+export async function readIsoBmffRangeProgram(
+  source: IsoBmffRangeSource,
+  hint = 'mp4',
+  signal?: AbortSignal,
+): Promise<IsoBmffRangeReadResult> {
+  try {
+    if (!Number.isSafeInteger(source.size) || source.size < 8) {
+      return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_INPUT_INCOMPLETE' };
+    }
+    const top = await topLevelRangeBoxes(source, signal);
+    if (!top) {
+      return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_BOX_INCOMPLETE' };
+    }
+    if (top.some((box) => box.type === 'moof')) {
+      return {
+        state: 'UNSUPPORTED_STRUCTURE',
+        reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENTED_UNSUPPORTED',
+      };
+    }
+    const moov = top.find((box) => box.type === 'moov');
+    const mdats = top.filter((box) => box.type === 'mdat');
+    if (!moov || mdats.length === 0) {
+      return {
+        state: 'MALFORMED',
+        reasonCode: 'REMUX_ISOBMFF_RANGE_REQUIRED_BOX_MISSING',
+      };
+    }
+    signal?.throwIfAborted();
+    const moovBytes = await source.range(moov.start, moov.end, signal);
+    const localMoov = boxes(moovBytes, 0, moovBytes.byteLength)?.find(
+      (box) => box.type === 'moov',
+    );
+    if (!localMoov) {
+      return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_MOOV_INCOMPLETE' };
+    }
+    const tables = parseTracks(moovBytes, localMoov);
+    if (!tables) {
+      return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_TRACK_TABLE_INVALID' };
+    }
+    const tracks: IsoBmffRangeTrackEvidence[] = [];
+    for (const table of tables) {
+      const samples = classicRangeSamples(moovBytes, table, mdats);
+      if (!samples || samples.length === 0) {
+        return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_SAMPLES_INCOMPLETE' };
+      }
+      tracks.push({
+        id: `isobmff:${table.id}`,
+        type: table.type,
+        codec: table.codec,
+        timescale: table.timescale,
+        ...(table.language ? { language: table.language } : {}),
+        ...(table.width ? { width: table.width } : {}),
+        ...(table.height ? { height: table.height } : {}),
+        ...(table.sampleRate ? { sampleRate: table.sampleRate } : {}),
+        ...(table.channels ? { channels: table.channels } : {}),
+        ...(table.codecPrivate ? { codecPrivate: table.codecPrivate } : {}),
+        samples,
+      });
+    }
+    let minimumPtsUs = Number.POSITIVE_INFINITY;
+    let maximumEndUs = Number.NEGATIVE_INFINITY;
+    for (const track of tracks) {
+      for (const sample of track.samples) {
+        if (sample.ptsUs === undefined) continue;
+        minimumPtsUs = Math.min(minimumPtsUs, sample.ptsUs);
+        maximumEndUs = Math.max(
+          maximumEndUs,
+          sample.ptsUs + (sample.durationUs ?? 0),
+        );
+      }
+    }
+    const codedDurationUs =
+      Number.isFinite(minimumPtsUs) && Number.isFinite(maximumEndUs)
+        ? maximumEndUs - minimumPtsUs
+        : undefined;
+    const editedDurationUs = tables
+      .map((table) => table.edit?.presentationDurationUs)
+      .filter((duration): duration is number => duration !== undefined && duration >= 0)
+      .reduce<number | undefined>(
+        (maximum, duration) =>
+          maximum === undefined ? duration : Math.max(maximum, duration),
+        undefined,
+      );
+    const durationUs =
+      editedDurationUs !== undefined &&
+      codedDurationUs !== undefined &&
+      Math.abs(editedDurationUs - codedDurationUs) > 50_000
+        ? editedDurationUs
+        : codedDurationUs ?? editedDurationUs;
+    return {
+      state: 'OK',
+      value: {
+        schema: 'media-test/remux-program@1',
+        container: hint.toLowerCase() === 'mov' ? 'mov' : 'mp4',
+        byteLength: source.size,
+        ...(durationUs !== undefined && durationUs >= 0 ? { durationUs } : {}),
+        tracks,
+        representation: { fragmented: false },
+      },
+    };
+  } catch {
+    return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_PARSE_GUARD' };
+  }
 }
 
 function trexDefaults(bytes: Uint8Array, moov: Box): Map<number, FragmentDefaults> {

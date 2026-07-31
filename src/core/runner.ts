@@ -54,6 +54,7 @@ import type {
   SeekResult,
 } from './engine.ts';
 import {
+  AUTHENTICATED_RANGE_INPUT_FEATURE,
   AUTHENTICATED_RANGE_PROBE_FEATURE,
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
@@ -781,7 +782,7 @@ export interface RunOneOptions extends Partial<RunOptions> {
   selectionEvidencePlan?: CandidateOracleEvidencePlan;
   /** Exact bytes verified once at the run boundary, shared across every engine for this candidate. */
   verifiedContents?: readonly VerifiedContent[];
-  /** Non-retained authenticated URL snapshot, valid only for bounded unmutated scale probes. */
+  /** Non-retained authenticated URL snapshot for an admitted unmutated range-capable input. */
   verifiedStreamContents?: readonly VerifiedStreamContent[];
   /** Engine-facing key bytes admitted by the source-record parity preflight. Scenario provenance is
    * retained for fingerprints/oracles but is never forwarded through the adapter key object. */
@@ -1283,22 +1284,41 @@ function buildAttestedStreamMediaInput(
   };
 }
 
-function boundedProbeStreamTransportEligible(
+const LARGE_AUTHENTICATED_RANGE_INPUT_MIN_BYTES = 256 * 1024 * 1024;
+
+function commonAuthenticatedStreamTransportEligible(
   scenario: Scenario,
   resolvedInputs: readonly ResolvedInput[],
 ): boolean {
   if (resolvedInputs.length !== 1) return false;
   const root = resolvedInputs[0]!;
   const scheme = objectOptionRoot(scenario.options).scheme;
-  return scenario.op === 'probe' &&
-    probeBudgetFromOptions(scenario.options) !== undefined &&
-    typeof scenario.mutate !== 'function' &&
+  return typeof scenario.mutate !== 'function' &&
     root.transport === undefined &&
     scheme !== 'hls-aes128' &&
     scheme !== 'hls-sample-aes' &&
     hlsResourceIndexFromOptions(scenario.options) === undefined &&
     !/\.m3u8?(?:$|[?#])/i.test(root.id) &&
     !/\.m3u8?(?:$|[?#])/i.test(root.urlAssetPath);
+}
+
+function authenticatedStreamTransportFeature(
+  scenario: Scenario,
+  resolvedInputs: readonly ResolvedInput[],
+): typeof AUTHENTICATED_RANGE_PROBE_FEATURE | typeof AUTHENTICATED_RANGE_INPUT_FEATURE | undefined {
+  if (!commonAuthenticatedStreamTransportEligible(scenario, resolvedInputs)) return undefined;
+  if (scenario.op === 'probe' && probeBudgetFromOptions(scenario.options) !== undefined) {
+    return AUTHENTICATED_RANGE_PROBE_FEATURE;
+  }
+  const sizeBytes = resolvedInputs[0]?.sizeBytes;
+  if (
+    (scenario.op === 'remux' || scenario.op === 'demux') &&
+    Number.isSafeInteger(sizeBytes) &&
+    Number(sizeBytes) > LARGE_AUTHENTICATED_RANGE_INPUT_MIN_BYTES
+  ) {
+    return AUTHENTICATED_RANGE_INPUT_FEATURE;
+  }
+  return undefined;
 }
 
 /**
@@ -1332,6 +1352,19 @@ function hlsClosureOptions(options: unknown, root: ResolvedInput): unknown | und
 
 function supportsAuthenticatedRangeProbeTransport(capabilities: CapabilitySet): boolean {
   return capabilities.features.includes(AUTHENTICATED_RANGE_PROBE_FEATURE);
+}
+
+function supportsAuthenticatedRangeInputTransport(capabilities: CapabilitySet): boolean {
+  return capabilities.features.includes(AUTHENTICATED_RANGE_INPUT_FEATURE);
+}
+
+function supportsAuthenticatedStreamTransport(
+  capabilities: CapabilitySet,
+  feature: typeof AUTHENTICATED_RANGE_PROBE_FEATURE | typeof AUTHENTICATED_RANGE_INPUT_FEATURE,
+): boolean {
+  return feature === AUTHENTICATED_RANGE_PROBE_FEATURE
+    ? supportsAuthenticatedRangeProbeTransport(capabilities)
+    : supportsAuthenticatedRangeInputTransport(capabilities);
 }
 
 /** HLS URL consumers receive a closed object-URL graph: verified sidecar blobs first, then a
@@ -3578,7 +3611,10 @@ async function executeOp(
   request: ConcreteOperationRequest,
   signal: AbortSignal,
   phase: OperationPhase,
-  observers?: { onDemuxTelemetry?: (events: readonly OperationTelemetry[]) => void },
+  observers?: {
+    onDemuxTelemetry?: (events: readonly OperationTelemetry[]) => void;
+    onTelemetry?: (events: readonly OperationTelemetry[]) => void;
+  },
 ): Promise<OpResult> {
   const op: Operation = scenario.op;
   const input = inputs[0]!;
@@ -3628,6 +3664,7 @@ async function executeOp(
             phase,
             (context) => engine.demux(invariantInput, context),
             allowEmptyBytes,
+            observers?.onTelemetry,
           ),
           scenario.tolerances?.seekToleranceUs,
         );
@@ -3645,7 +3682,10 @@ async function executeOp(
           phase,
           (context) => engine.demux(input, context),
           allowEmptyBytes,
-          observers?.onDemuxTelemetry,
+          (events) => {
+            observers?.onDemuxTelemetry?.(events);
+            observers?.onTelemetry?.(events);
+          },
         ),
       };
     }
@@ -3661,6 +3701,7 @@ async function executeOp(
           phase,
           (context) => engine.remux(input, asRemuxOpts(scenario.options), context),
           allowEmptyBytes,
+          observers?.onTelemetry,
         );
         const streamingRuntimeEvidence = await observeStreamingRuntimeEvidence(
           scenario,
@@ -3684,6 +3725,7 @@ async function executeOp(
             phase,
             (context) => engine.remux(legInput, options, context),
             allowEmptyBytes,
+            observers?.onTelemetry,
           );
         });
       const streamingRuntimeEvidence = await observeStreamingRuntimeEvidence(
@@ -4088,9 +4130,17 @@ function mediaSecFromContext(
   golden: GoldenStore,
   opResult: OpResult,
   scenario: Scenario,
+  resolvedInputs?: readonly ResolvedInput[],
 ): number | undefined {
   const goldenDur = golden.meta?.durationSec;
   const probedDur = opResult.metadata?.durationSec;
+  const selectedDur =
+    resolvedInputs?.length === 1 &&
+    typeof resolvedInputs[0]?.durationSec === 'number' &&
+    Number.isFinite(resolvedInputs[0].durationSec) &&
+    resolvedInputs[0].durationSec > 0
+      ? resolvedInputs[0].durationSec
+      : undefined;
   if (scenario.op === 'decrypt') {
     const selected = objectOptionRoot(scenario.options).selectedDurationSec;
     const duration = resolveDecryptDuration({
@@ -4102,6 +4152,7 @@ function mediaSecFromContext(
     return duration.state === 'READY' ? duration.durationSec : undefined;
   }
   if (typeof goldenDur === 'number' && goldenDur > 0) return goldenDur;
+  if (selectedDur !== undefined) return selectedDur;
   if (typeof probedDur === 'number' && probedDur > 0) return probedDur;
   return undefined;
 }
@@ -5133,18 +5184,19 @@ export async function runOne(
       return finalize('ERROR', [], '[CORPUS_VERIFIED_TRANSPORT_AMBIGUOUS] retained and stream verification were both supplied');
     }
     if (resolvedInputs && resolvedInputs.length > 0 && opts?.verifiedStreamContents) {
-      if (!boundedProbeStreamTransportEligible(scenario, resolvedInputs)) {
+      const requiredFeature = authenticatedStreamTransportFeature(scenario, resolvedInputs);
+      if (requiredFeature === undefined) {
         return finalize(
           'ERROR',
           [],
-          '[CORPUS_STREAM_TRANSPORT_FORBIDDEN] authenticated URL transport is limited to unmutated single-file scale probes',
+          '[CORPUS_STREAM_TRANSPORT_FORBIDDEN] authenticated URL transport is limited to eligible unmutated single-file operations',
         );
       }
-      if (!supportsAuthenticatedRangeProbeTransport(caps)) {
+      if (!supportsAuthenticatedStreamTransport(caps, requiredFeature)) {
         return finalize(
           'ERROR',
           [],
-          `[CORPUS_STREAM_TRANSPORT_ADAPTER_UNAUTHENTICATED] adapter must declare '${AUTHENTICATED_RANGE_PROBE_FEATURE}' before receiving a digest-bound URL`,
+          `[CORPUS_STREAM_TRANSPORT_ADAPTER_UNAUTHENTICATED] adapter must declare '${requiredFeature}' before receiving a digest-bound URL`,
         );
       }
       const declared = resolvedContentIdentities(resolvedInputs);
@@ -5708,7 +5760,16 @@ export async function runOne(
         ),
       };
     }
-    const ctx = buildOracleContext(scenario, primaryInput, inputs, opResult, golden, engine, opts);
+    const ctx = buildOracleContext(
+      scenario,
+      primaryInput,
+      inputs,
+      opResult,
+      golden,
+      engine,
+      opts,
+      cancellation.signal,
+    );
 
     // 7) Run every declared oracle and reduce through the order-independent typed contract.
     const oracleOutcomes: OracleOutcome[] = [];
@@ -6016,6 +6077,7 @@ function buildOracleContext(
   golden: GoldenStore,
   engine: MediaEngine,
   opts: RunOneOptions | undefined,
+  signal?: AbortSignal,
 ): OracleContext {
   const missingHook =
     (label: string) =>
@@ -6051,6 +6113,7 @@ function buildOracleContext(
     inputs,
     engine,
     golden,
+    ...(signal !== undefined ? { signal } : {}),
     ...(opts?.fixtureIntegrityRuntime
       ? {
           goldenLoader: (assetId: string) => loadGoldenForRun(
@@ -6486,7 +6549,16 @@ async function runRobustness(
     }], detail);
   }
 
-  const ctx = buildOracleContext(scenario, input, inputs, robustnessOpResult, golden, engine, opts);
+  const ctx = buildOracleContext(
+    scenario,
+    input,
+    inputs,
+    robustnessOpResult,
+    golden,
+    engine,
+    opts,
+    cancellation.signal,
+  );
 
   const oracleOutcomes: OracleOutcome[] = [];
   const substantiveOracles = [...new Set([
@@ -6784,9 +6856,6 @@ async function runBench(
       'complete JS/WASM/worker/codec-core bundle evidence must be joined before report construction',
     );
   }
-  if (scenario.metrics.includes('sourceReads')) {
-    requirePerformanceEvidence(sourceReadEvidence({}), 'sourceReads');
-  }
   preflightLongTaskMeasurement(scenario.metrics.includes('longtasks'));
   const memorySampler = scenario.metrics.includes('peakMemory')
     ? requirePerformanceEvidence(memorySamplerEvidence ?? userAgentSpecificMemorySampler(), 'peakMemory')
@@ -6927,6 +6996,7 @@ async function runBenchBatch(
   const timed = async (): Promise<{ sample: MetricSample; meter: MeterEvidence }> => {
     meter.begin();
     for (let inner = 0; inner < batch.innerIterations; inner++) {
+      const telemetryBatches: Array<readonly OperationTelemetry[]> = [];
       const freshInputs = resolvedInputs && resolvedInputs.length > 0
         ? inputs
         : inputs.map((input) => buildMediaInput(
@@ -6940,11 +7010,32 @@ async function runBenchBatch(
           request,
           cancellation.signal,
           batch.phase === 'measured' ? 'measured' : 'warmup',
+          scenario.metrics.includes('sourceReads')
+            ? { onTelemetry: (events) => telemetryBatches.push(events) }
+            : undefined,
         ),
         scenario.timeoutMs,
       );
       ctx.ops = (ctx.ops ?? 0) + 1;
       const telemetry = operationTelemetry(opResult);
+
+      if (scenario.metrics.includes('sourceReads')) {
+        const readEvents = telemetryBatches.flatMap((events) =>
+          events.filter(
+            (event): event is Extract<OperationTelemetry, { type: 'bytes-read' }> =>
+              event.type === 'bytes-read',
+          ),
+        );
+        const readEvidence = requirePerformanceEvidence(
+          sourceReadEvidence({
+            sourceMode: 'random-access',
+            reads: readEvents.length,
+            crossedAdapterBoundary: readEvents.length > 0,
+          }),
+          'sourceReads',
+        );
+        ctx.sourceReads = (ctx.sourceReads ?? 0) + readEvidence.reads;
+      }
 
       if (opResult.output) {
         ctx.bytesOut = (ctx.bytesOut ?? 0) + outputByteLength(opResult.output);
@@ -7012,7 +7103,7 @@ async function runBenchBatch(
 
       if (scenario.metrics.includes('throughputRealtime')) {
         const observed = requirePerformanceEvidence(
-          benchmarkPresentationDuration(golden, opResult, scenario),
+          benchmarkPresentationDuration(golden, opResult, scenario, resolvedInputs),
           'presentation duration',
         );
         if (duration && (duration.basis !== observed.basis || duration.policy !== observed.policy)) {
@@ -7175,8 +7266,9 @@ function benchmarkPresentationDuration(
   golden: GoldenStore,
   result: OpResult,
   scenario: Scenario,
+  resolvedInputs?: readonly ResolvedInput[],
 ): PerformanceEvidence<PresentationDuration> {
-  const sourceSec = mediaSecFromContext(golden, result, scenario);
+  const sourceSec = mediaSecFromContext(golden, result, scenario, resolvedInputs);
   const rational = golden.meta?.tracks.find((track) => track.type === 'video')?.fpsProvenance?.rational;
   if (scenario.op === 'trim') {
     const range = asTrimRange(scenario.options);
@@ -7203,6 +7295,16 @@ function benchmarkPresentationDuration(
         ...(rational ? { sourceRational: rational } : {}),
       },
       'digest-verified selected encrypted source presentation duration',
+    );
+  }
+  if (scenario.op === 'remux' && sourceSec !== undefined) {
+    return resolvePresentationDuration(
+      'source-presentation',
+      {
+        sourcePresentationUs: sourceSec * 1_000_000,
+        ...(rational ? { sourceRational: rational } : {}),
+      },
+      'digest-bound selected source presentation timeline for lossless remux throughput',
     );
   }
   if (result.output) return inspectOutputPresentation(result.output).duration;
@@ -7561,12 +7663,16 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
     selection: ScenarioSelection,
     prepareOptions: PrepareSelectionOptions = {},
   ): Promise<PreparedSelection> => {
-    const useStreamTransport = prepareOptions.authenticatedStreamTransport === true &&
-      boundedProbeStreamTransportEligible(selection.effectiveScenario, selection.resolvedInputs);
+    const streamTransportFeature = authenticatedStreamTransportFeature(
+      selection.effectiveScenario,
+      selection.resolvedInputs,
+    );
+    const useStreamTransport =
+      prepareOptions.authenticatedStreamTransport === true && streamTransportFeature !== undefined;
     // Transport mode is part of preparation identity: retained bytes and an authenticated URL are
     // different adapter-visible contracts and must never share an in-flight or blocked result.
     const selectionKey = `${selectionPreparationKey(selection)}\u0000transport:${
-      useStreamTransport ? AUTHENTICATED_RANGE_PROBE_FEATURE : 'retained-bytes'
+      useStreamTransport ? streamTransportFeature : 'retained-bytes'
     }`;
     const blocked = blockedPreparations.get(selectionKey);
     if (blocked) return Promise.resolve(blocked);
@@ -8036,22 +8142,50 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
+      const transportSelections = exhaustiveList && exhaustiveList.length > 0
+        ? exhaustiveList
+        : [selection];
+      const requiresAuthenticatedRangeInput = transportSelections.some(
+        (candidate) =>
+          authenticatedStreamTransportFeature(candidate.effectiveScenario, candidate.resolvedInputs) ===
+          AUTHENTICATED_RANGE_INPUT_FEATURE,
+      );
+      const authenticatedStreamTransport =
+        scenario.op === 'probe'
+          ? supportsAuthenticatedRangeProbeTransport(validatedCapabilities)
+          : supportsAuthenticatedRangeInputTransport(validatedCapabilities);
+      if (requiresAuthenticatedRangeInput && !authenticatedStreamTransport) {
+        result = matrixSelectionStatusResult(
+          engine.id,
+          opts.browser,
+          scenario,
+          'NA_ENGINE',
+          `[AUTHENTICATED_RANGE_INPUT_TRANSPORT_UNAVAILABLE] adapter must declare '${AUTHENTICATED_RANGE_INPUT_FEATURE}' before a large immutable input can be delivered without whole-body browser retention`,
+          selection,
+          exhaustiveList,
+          runEnvBase,
+          opts.randomSeed,
+        );
+        if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${label} (authenticated range unavailable)`);
+        continue;
+      }
+
       // Scale-probe read-mode applicability is capability-only and must precede content
       // preparation. In exhaustive mode a candidate set can span many GiB; fetching and hashing
       // every body before returning the already-known whole-file-only NA_ENGINE is both wasteful and
       // capable of exhausting the browser. Preserve the selected identities in the aggregate while
       // deciding the cell from declared adapter read modes alone.
       const matrixProbeBudget = probeBudgetFromOptions(scenario.options);
-      const authenticatedStreamTransport = supportsAuthenticatedRangeProbeTransport(
-        validatedCapabilities,
-      );
       if (matrixProbeBudget) {
-        const budgetSelections = exhaustiveList && exhaustiveList.length > 0
-          ? exhaustiveList
-          : [selection];
         const inputSizeBytes = Math.max(
           0,
-          ...budgetSelections.map((candidate) => {
+          ...transportSelections.map((candidate) => {
             const size = candidate.resolvedInputs[0]?.sizeBytes;
             return Number.isSafeInteger(size) && Number(size) >= 0 ? Number(size) : 0;
           }),

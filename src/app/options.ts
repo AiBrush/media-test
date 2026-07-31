@@ -11,6 +11,12 @@ export const RUN_OPTION_LIMITS = Object.freeze({
   timeoutMs: Object.freeze({ min: 1_000, max: 86_400_000, default: 86_400_000 }),
 });
 
+/**
+ * Fresh launcher pages must select the same catalog inputs by default or an IndexedDB cache hit is
+ * left to chance. The interactive UI still generates its own seed; this default is CLI-only.
+ */
+export const DEFAULT_LAUNCHER_RANDOM_SEED = 'media-test-launcher-default';
+
 export const RUN_OPTION_DEFINITIONS = Object.freeze([
   Object.freeze({ cli: '--browser', field: 'browser', value: 'brave|chromium|webkit|firefox', repeatable: false }),
   Object.freeze({ cli: '--engine', field: 'engineIds', value: 'id', repeatable: true }),

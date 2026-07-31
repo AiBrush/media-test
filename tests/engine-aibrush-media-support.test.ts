@@ -10,6 +10,7 @@ import {
   type MediaInput,
   type NormalizedTrack,
   type OperationContext,
+  type OperationTelemetry,
   type TranscodeAudioOptions,
 } from '../src/core/engine.ts';
 import {
@@ -20,7 +21,12 @@ import {
 import { classifyAibrushFrameworkError, translateAibrushFrameworkError } from '../src/engines/aibrush-media/errors.ts';
 import { sha256Hex } from '../src/engines/platform/digest.ts';
 import { decideAibrushSupport } from '../src/engines/aibrush-media/support.ts';
+import {
+  buildAibrushDemuxResult,
+  normalizeAibrushTrack,
+} from '../src/engines/aibrush-media/representation.ts';
 import { decodeNativePcm } from '../src/features/audio-dsp/index.ts';
+import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
 import { inspectTrimAudioContainer } from '../src/features/trim/audio.ts';
 import { assessFragmentedTrimOutput } from '../src/features/trim/fragmented.ts';
 import { readNeutralRemuxProgram } from '../src/features/remux/readers.ts';
@@ -62,7 +68,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         sampleImmediatelyDuringOperation: true,
         maxOperationSamples: 1,
         settleWindowMs: 0,
-        sampleTimeoutMs: 1_000,
+        sampleTimeoutMs: 30_000,
       },
     });
   });
@@ -517,21 +523,52 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     expect(decideAibrushSupport(malformed)).toEqual({ supported: true });
   });
 
-  test('declares demux scale rows NA when no first-packet boundary is observable', () => {
+  test('admits demux scale rows through the framework packet-batch boundary', () => {
     expect(
       decideAibrushSupport(
         request('demux', 'mp4', [VIDEO, AUDIO], {
           options: { invariant: 'demux-scale-budgets' },
         }),
       ),
-    ).toMatchObject({
-      supported: false,
-      status: 'NA_ENGINE',
-      reasonCode: 'AIBRUSH_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
-    });
+    ).toEqual({ supported: true });
   });
 
-  test('declares source layouts with unrepresentable demux tracks NA', () => {
+  test('emits honest first/last packet boundaries from pull-driven demux batches', async () => {
+    const input = await fixtureInput('tiny_h264_360p_2s.mp4', 'video/mp4');
+    const operationRequest = request('demux', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'demux/scale-packet-batch-test',
+      inputId: input.id,
+      options: {
+        invariant: 'demux-scale-budgets',
+        robustness: defineDemuxScaleContract('large'),
+      },
+    });
+    operationRequest.inputs[0]!.sizeBytes = input.sizeBytes;
+    const telemetry: OperationTelemetry[] = [];
+    const operationContext: OperationContext = {
+      ...directContext(operationRequest),
+      operationStartMs: performance.now(),
+      emit: (event) => telemetry.push(event),
+    };
+    const engine = new AibrushMediaEngine();
+    await engine.init(operationContext);
+    try {
+      const result = await engine.demux(input, operationContext);
+      const boundaries = telemetry.filter(
+        (event): event is Extract<OperationTelemetry, { type: 'progress' }> =>
+          event.type === 'progress' && event.determinate === false,
+      );
+      expect(result.packets.length).toBeGreaterThan(1);
+      expect(result.packets.every((packet) => packet.payload === undefined)).toBe(true);
+      expect(boundaries).toHaveLength(2);
+      expect(boundaries[0]!.atMs).toBeLessThanOrEqual(boundaries[1]!.atMs);
+      expect(result.telemetry?.bytesRead).toBeGreaterThan(0);
+    } finally {
+      await engine.dispose(operationContext);
+    }
+  });
+
+  test('admits declared non-media demux tracks and preserves their packet-table identity', () => {
     expect(
       decideAibrushSupport(
         request('demux', 'mkv', [
@@ -543,11 +580,53 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
           },
         ]),
       ),
-    ).toMatchObject({
-      supported: false,
-      status: 'NA_ENGINE',
-      reasonCode: 'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
+    ).toEqual({ supported: true });
+
+    const tracks = [
+      { id: 1, mediaType: 'video' as const, codec: 'vp9' },
+      {
+        id: 2,
+        mediaType: 'video' as const,
+        nonMedia: true as const,
+        codec: '',
+        language: 'eng',
+      },
+    ];
+    const metadata = {
+      container: 'mov',
+      durationSec: 1,
+      tracks: tracks.map(normalizeAibrushTrack),
+    };
+    const result = buildAibrushDemuxResult(metadata, tracks, [
+      {
+        trackIndex: 1,
+        size: 4,
+        ptsUs: 0,
+        dtsUs: 0,
+        keyframe: true,
+      },
+    ]);
+    expect(result.metadata.tracks[1]).toMatchObject({
+      type: 'other',
+      codec: 'unknown',
+      language: 'eng',
     });
+    expect(result.packets[0]).toMatchObject({ trackIndex: 1, trackType: 'other' });
+    expect(result.packets[0]?.codec).toBeUndefined();
+    expect(result.representations?.map((representation) => representation.trackIndex)).toEqual([0]);
+  });
+
+  test('still rejects subtitle and unsupported media demux tracks', () => {
+    for (const track of [
+      { type: 'subtitle' as const, codec: 'subrip' },
+      { type: 'video' as const, codec: 'mjpeg', width: 480, height: 360 },
+    ]) {
+      expect(decideAibrushSupport(request('demux', 'mkv', [VIDEO, AUDIO, track]))).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
+      });
+    }
   });
 
   test('declares a probe with an auxiliary non-canonical video codec NA', () => {

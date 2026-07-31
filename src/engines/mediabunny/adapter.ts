@@ -159,6 +159,7 @@ type WithoutSequence<T> = T extends unknown ? Omit<T, 'sequence'> : never;
 type UnsequencedSinkTraceEvent = WithoutSequence<SinkTraceEvent>;
 
 import {
+  AUTHENTICATED_RANGE_INPUT_FEATURE,
   AUTHENTICATED_RANGE_PROBE_FEATURE,
   DECODE_TRACK_SELECTOR_SCHEMA,
   createBrowserNotSupportedError,
@@ -210,6 +211,7 @@ interface PreparedMuxTrackCandidate {
 interface MediabunnyPreparedTracks extends EncodedTracks {
   metadataTags?: MetadataTags;
   sourceTrackCount?: number;
+  sourceReadBytes?: number;
 }
 
 type AlphaMode = 'discard' | 'keep';
@@ -2334,6 +2336,30 @@ function nowMs(): number {
     : Date.now();
 }
 
+interface MediabunnySourceReadObserver {
+  readonly onRead: (bytes: number) => void;
+  readonly bytesRead: number;
+}
+
+function operationSourceReadObserver(
+  context: OperationContext | undefined,
+): MediabunnySourceReadObserver | undefined {
+  if (context === undefined) return undefined;
+  let bytesRead = 0;
+  return {
+    get bytesRead() {
+      return bytesRead;
+    },
+    onRead(bytes) {
+      bytesRead += bytes;
+      const atMs = context.operationStartMs === undefined
+        ? 0
+        : Math.max(0, nowMs() - context.operationStartMs);
+      context.emit({ type: 'bytes-read', atMs, bytes: bytesRead });
+    },
+  };
+}
+
 /**
  * A single-owned positioned spool: individual native chunk objects are released immediately, but
  * the complete output allocation remains retained. This is not a bounded-memory benchmark sink.
@@ -3588,7 +3614,7 @@ export class MediabunnyEngine implements MediaEngine {
       sampleImmediatelyDuringOperation: true,
       maxOperationSamples: 1,
       settleWindowMs: 0,
-      sampleTimeoutMs: 1_000,
+      sampleTimeoutMs: 30_000,
     },
   } as const;
 
@@ -3726,6 +3752,7 @@ export class MediabunnyEngine implements MediaEngine {
         'hls:aes128', // read/probe/decrypt AES-128 HLS playlists via EXT-X-KEY segment decryption
         'probe:resource-trace', // adapter-owned successful/missing/error HLS resource observations
         AUTHENTICATED_RANGE_PROBE_FEATURE, // UrlSource fetchFn verifies every delivered fixed block
+        AUTHENTICATED_RANGE_INPUT_FEATURE, // the same verified UrlSource is safe for large remux/demux inputs
         'remux:mp3-in-mp4', // MP3 frame copy into MP4, not AAC transcode
         'remux:av1-opus-in-mp4', // AV1+Opus WebM -> MP4 copy
         'remux:av1-opus-in-webm', // AV1+Opus WebM identity copy
@@ -4108,12 +4135,23 @@ export class MediabunnyEngine implements MediaEngine {
     let metadataTags: MetadataTags | undefined;
     let sourceTrackCount = 0;
     let bytesRead = 0;
+    const sourceRead =
+      context !== undefined &&
+      (
+        context.phase === 'warmup' ||
+        context.phase === 'measured' ||
+        inputs.some((input) => input.contentAttestation !== undefined)
+      )
+        ? operationSourceReadObserver(context)
+        : undefined;
 
     for (let inputIndex = 0; inputIndex < inputs.length; inputIndex++) {
       if (context?.signal.aborted) throw abortError(context.signal.reason);
       const input = inputs[inputIndex];
       if (!input) continue;
-      const mbInput = await openInput(this.lib, input);
+      const mbInput = await openInput(this.lib, input, undefined, {
+        ...(sourceRead ? { onSourceRead: sourceRead.onRead } : {}),
+      });
       const unbindAbort = bindAbortToInput(mbInput, context?.signal);
       try {
         const prepared = await prepareOpenedInput(
@@ -4160,6 +4198,9 @@ export class MediabunnyEngine implements MediaEngine {
       tracks: selected,
       telemetry: { bytesRead },
       sourceTrackCount,
+      ...(sourceRead !== undefined && sourceRead.bytesRead > 0
+        ? { sourceReadBytes: sourceRead.bytesRead }
+        : {}),
       ...(metadataTags ? { metadataTags } : {}),
     };
     return result;
@@ -4179,7 +4220,16 @@ export class MediabunnyEngine implements MediaEngine {
         `mediabunny strict remux track-accounting violation: selected ${prepared.sourceTrackCount ?? '?'} but prepared ${prepared.tracks.length}`,
       );
     }
-    return this.mux(prepared, opts, context);
+    const media = await this.mux(prepared, opts, context);
+    return prepared.sourceReadBytes === undefined
+      ? media
+      : {
+          ...media,
+          telemetry: {
+            ...(media.telemetry ?? {}),
+            bytesRead: prepared.sourceReadBytes,
+          },
+        };
   }
 
   // ── transcode ──────────────────────────────────────────────────────────────────────────────

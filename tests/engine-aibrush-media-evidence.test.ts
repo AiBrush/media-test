@@ -18,6 +18,7 @@ import {
   buildAibrushDemuxResult,
   normalizeAibrushTrack,
   representationForAibrushTrack,
+  withObservedCadence,
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
@@ -169,7 +170,7 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     expect(pcm.tracks[0]?.bitrate).toBe(1_411_200);
   });
 
-  test('retains AVC description/framing, semantic payload, and absent DTS without synthesis', () => {
+  test('retains AVC description/framing, semantic payload, and absent DTS without a redundant self-digest', () => {
     const description = new Uint8Array([1, 100, 0, 40, 0xff, 0xe1]);
     const track = {
       id: 7,
@@ -194,8 +195,8 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     expect(result.packets[0]).toMatchObject({
       trackType: 'video', codec: 'h264', framing: 'avc', randomAccessKind: 'sync-sample',
       payload: new Uint8Array([1, 2, 3, 4]),
-      payloadDigest: '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a',
     });
+    expect(result.packets[0]?.payloadDigest).toBeUndefined();
     expect(result.packets[0]?.dtsUs).toBeUndefined();
     expect(result.metadata.tracks[0]).toMatchObject({
       codec: 'h264', nativeCodecTag: 'avc1.640028', fps: 25,
@@ -242,6 +243,33 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     expect(result.metadata.tracks[0]?.fpsProvenance).toMatchObject({
       sampleCount: 3,
       observedIntervalUs: 100_000.5,
+    });
+  });
+
+  test('reduces a massive observed cadence without a variadic-call stack ceiling', () => {
+    const packetCount = 150_000;
+    const metadata: NormalizedMetadata = {
+      container: 'mp4',
+      durationSec: null,
+      tracks: [{ type: 'video', codec: 'h264' }],
+    };
+    const packets = Array.from({ length: packetCount }, (_, index) => ({
+      trackIndex: 0,
+      size: 1,
+      ptsUs: index * 33_333,
+      durationUs: 33_333,
+      keyframe: index === 0,
+    }));
+
+    const observed = withObservedCadence(metadata, packets);
+    expect(observed.tracks[0]?.fpsProvenance).toMatchObject({
+      source: 'observed',
+      cadence: 'CFR',
+      sampleCount: packetCount,
+      envelope: {
+        minFps: 1_000_000 / 33_333,
+        maxFps: 1_000_000 / 33_333,
+      },
     });
   });
 

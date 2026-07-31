@@ -7,7 +7,10 @@ import type {
   MediaInput,
   NormalizedMetadata,
 } from '../src/core/engine.ts';
-import { AUTHENTICATED_RANGE_PROBE_FEATURE } from '../src/core/engine.ts';
+import {
+  AUTHENTICATED_RANGE_INPUT_FEATURE,
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
+} from '../src/core/engine.ts';
 import type { ActiveFixtureRuntime } from '../src/core/fixture-integrity.ts';
 import { sha256Hex } from '../src/core/media-selection.ts';
 import { registerEngine, registerScenario } from '../src/core/registry.ts';
@@ -321,6 +324,110 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
       supportsCalls: 0,
       initCalls: 0,
       probeCalls: 0,
+    });
+  });
+
+  test('large remux preflight rejects unauthenticated adapters before fetching the media body', async () => {
+    const registrationId = 'selection-large-remux-preflight-engine';
+    const engineId = `${registrationId}@1.0.0`;
+    const scenarioId = 'remux/selection-large-range-preflight';
+    const assetId = 'selection-large-range-preflight.mp4';
+    let mediaAssetRequests = 0;
+    let supportsCalls = 0;
+    let initCalls = 0;
+    let remuxCalls = 0;
+
+    registerEngine(registrationId, async (): Promise<MediaEngine> => ({
+      id: engineId,
+      capabilities: (): CapabilitySet => ({
+        operations: { remux: true },
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        audioCodecs: [],
+        encryption: [],
+        features: ['webcodecs:independent'],
+      }),
+      supports: async () => {
+        supportsCalls += 1;
+        return { supported: true };
+      },
+      init: async () => {
+        initCalls += 1;
+      },
+      probe: async () => structuredClone(exactMetadata),
+      demux: async () => ({ packets: [], tracks: [], ordering: 'decode' }),
+      remux: async () => {
+        remuxCalls += 1;
+        return { bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' };
+      },
+      transcode: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+      decodeFrames: async () => ({ frames: [] }),
+      seek: async () => ({
+        landedPtsUs: 0,
+        frame: { index: 0, ptsUs: 0, sha256: '0'.repeat(64) },
+      }),
+      trim: async () => ({ bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' }),
+    }));
+    registerScenario(defineScenario({
+      id: scenarioId,
+      op: 'remux',
+      input: assetId,
+      requires: {
+        operations: ['remux'],
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+      },
+      options: { container: 'mp4' },
+      oracles: ['playback-smoke'],
+      metrics: [],
+    }));
+
+    const manifest = {
+      suiteCorpusVersion: 'selection-large-remux-preflight-v1',
+      assets: [{
+        id: assetId,
+        sha256: '4'.repeat(64),
+        sizeBytes: 512 * 1024 * 1024,
+        source: 'declared-only large remux preflight fixture',
+        family: 'remux',
+        container: 'mp4',
+        codecs: ['h264'],
+        sizeBucket: 'huge',
+        genMethod: 'selection-large-remux-preflight@1',
+      }],
+    };
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/fixtures/media/scenarios/_sources.ndjson')) {
+        return new Response(null, { status: 404, statusText: 'catalog intentionally absent' });
+      }
+      if (url.includes('/fixtures/manifest.json')) return Response.json(manifest);
+      if (url.includes('/fixtures/media/')) {
+        mediaAssetRequests += 1;
+        return new Response(null, { status: 500, statusText: 'media body must not be requested' });
+      }
+      return new Response(null, { status: 404, statusText: 'Not Found' });
+    }) as typeof fetch;
+
+    const results = await runMatrix({
+      browser: 'chromium',
+      engineIds: [registrationId],
+      scenarioIds: [scenarioId],
+      pillar: 'all',
+      randomSeed: 'selection-large-remux-preflight-v1',
+      rotateMedia: false,
+      fixtureIntegrityRuntime: fakeFixtureRuntime,
+    });
+    expect(results[0]).toMatchObject({
+      status: 'NA_ENGINE',
+      reason: expect.stringContaining(AUTHENTICATED_RANGE_INPUT_FEATURE),
+    });
+    expect({ mediaAssetRequests, supportsCalls, initCalls, remuxCalls }).toEqual({
+      mediaAssetRequests: 0,
+      supportsCalls: 0,
+      initCalls: 0,
+      remuxCalls: 0,
     });
   });
 

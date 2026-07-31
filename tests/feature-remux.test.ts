@@ -18,6 +18,7 @@ import {
   mp3FrameAudioConfig,
   parseIsoAudioSampleEntryHeader,
   parseIsoVisualSampleEntryHeader,
+  readIsoBmffRangeProgram,
   readNeutralRemuxProgram,
   remuxFixtureAvailability,
   remuxRoundTripContractFromOptions,
@@ -486,6 +487,43 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
     const unsupported = evaluateStrictStreamCopy(source, 'mp4', new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 'avi');
     expect(unsupported.outcome.state).toBe('ERROR');
     expect(unsupported.outcome.reasonCode).toBe('REMUX_NEUTRAL_FORMAT_UNSUPPORTED');
+  });
+
+  test('classic ISO-BMFF range reader retains only tables and exact sample descriptors', async () => {
+    const source = bytesAt('fixtures/media/micro_h264_1frame.mp4');
+    const whole = readNeutralRemuxProgram(source, 'mp4');
+    const ranged = await readIsoBmffRangeProgram({
+      size: source.byteLength,
+      range: async (start, end) => source.slice(start, end),
+    });
+    expect(whole.state).toBe('OK');
+    expect(ranged.state).toBe('OK');
+    if (whole.state !== 'OK' || ranged.state !== 'OK') return;
+    expect(ranged.value.byteLength).toBe(source.byteLength);
+    expect(ranged.value.durationUs).toBe(whole.value.durationUs);
+    expect(ranged.value.tracks.map((track) => ({
+      type: track.type,
+      codec: track.codec,
+      samples: track.samples.length,
+    }))).toEqual(whole.value.tracks.map((track) => ({
+      type: track.type,
+      codec: track.codec,
+      samples: track.samples.length,
+    })));
+    for (let trackIndex = 0; trackIndex < ranged.value.tracks.length; trackIndex++) {
+      const rangeTrack = ranged.value.tracks[trackIndex]!;
+      const wholeTrack = whole.value.tracks[trackIndex]!;
+      for (const sampleIndex of [0, rangeTrack.samples.length - 1]) {
+        const descriptor = rangeTrack.samples[sampleIndex]!;
+        const payload = source.slice(
+          descriptor.fileOffset,
+          descriptor.fileOffset + descriptor.byteLength,
+        );
+        expect(payload).toEqual(wholeTrack.samples[sampleIndex]!.payload);
+        expect(descriptor.ptsUs).toBe(wholeTrack.samples[sampleIndex]!.ptsUs);
+        expect(descriptor.dtsUs).toBe(wholeTrack.samples[sampleIndex]!.dtsUs);
+      }
+    }
   });
 
   test('real fixtures are self-identical and payload corruption is never a representation DIFF', () => {

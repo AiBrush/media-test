@@ -81,8 +81,9 @@ await window.__SUITE__.run({ engineIds: ['mp4box'], featureIds: ['trim'],
 
 - Secure context: only `http://127.0.0.1:5151` (serve.sh also sets COOP/COEP, required
   for memory measurement and multithreaded ffmpeg.wasm). LAN-HTTP ⇒ every cell ERRORs.
-- `run.sh` auto-picks a free port unless `--port` is pinned ⇒ new origin ⇒ empty
-  IndexedDB result cache. Pin `--port 5151`; use `--no-reuse` to force a fresh run.
+- `run.sh` remembers and reuses its last free cache-origin port. If that port is busy it announces
+  a temporary origin with a separate IndexedDB cache. Pin `--port 5151` when an exact origin is
+  required; use `--no-reuse` to force a fresh run.
 - Fixtures must exist (`fixtures/manifest.json`); baking (`bun run bake`) needs native
   ffmpeg and is the only place native ffmpeg is allowed.
 

@@ -12,10 +12,9 @@
 #   --operation <op>     run only this operation (probe|demux|remux|...). Repeatable / CSV.
 #   --pillar <name>      functional|performance|robustness|all. Default: all.
 #   --scenario <id>      run only this scenario (repeatable / comma-separated).
-#   --port <n>           static server port. Default: an EPHEMERAL FREE port is auto-selected (so a
-#                        stale dev server from a prior run can never be silently reused). Pass --port
-#                        to pin one; if a pinned port is already taken the run aborts (it will NOT
-#                        reuse a foreign server).
+#   --port <n>           static server port. Default: reuse the last cache-origin port when free,
+#                        otherwise choose a temporary free port. Pass --port to pin one; if a pinned
+#                        port is already taken the run aborts (it will NOT reuse a foreign server).
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 86400000 = 24 hours).
 #   --random-seed <text> deterministic execution/media-selection seed for exact replay.
@@ -41,7 +40,7 @@ FEATURES=()
 OPERATIONS=()
 SCENARIOS=()
 PILLAR="all"
-PORT=""            # empty ⇒ auto-select a free ephemeral port (see port selection below)
+PORT=""            # empty ⇒ prefer the remembered cache-origin port (see port selection below)
 PORT_EXPLICIT=0   # set when the user pins --port (we then refuse to reuse a foreign server on it)
 WARMUP=""
 ITERS=""
@@ -52,6 +51,8 @@ BASE_URL=""
 NO_REUSE=0
 RANDOM_SEED=""
 EXHAUSTIVE=0
+CACHE_PROFILE_DIR="${ROOT_DIR}/results/.browser-cache"
+PORT_STATE_FILE="${CACHE_PROFILE_DIR}/runner-origin-port"
 
 # bash 3.2-compatible CSV-append into a named array (macOS ships bash 3.2 — no `local -n` namerefs).
 append_csv() { local _name="$1" _val="$2" _p; IFS=',' read -ra _parts <<< "$_val"; for _p in "${_parts[@]}"; do [[ -n "$_p" ]] && eval "${_name}+=(\"\$_p\")"; done; }
@@ -64,7 +65,7 @@ print_help() {
   echo "Default run deadline: 86400000 ms (24 hours)."
   printf '%s\n' \
     "Wrapper options:" \
-    "  --port <n>         pin the suite server port (default: choose a free port)" \
+    "  --port <n>         pin the suite server port (default: reuse the last cache-origin port)" \
     "  --no-serve         use an already-running suite server" \
     "  --base-url <URL>   server URL; implies --no-serve" \
     "  --keep-serving     leave a server started by this wrapper running"
@@ -117,15 +118,46 @@ pids_on_port() {
   command -v lsof >/dev/null 2>&1 && lsof -ti "tcp:$1" -sTCP:LISTEN 2>/dev/null | tr '\n' ' '
 }
 
-# pick_free_port → echo a TCP port nothing is listening on. Tries 5151 first (the app's dev port),
-# then a spread of candidates so concurrent runs/agents don't collide. Bash 3.2-safe (no $RANDOM
-# arithmetic surprises — we still seed from $$ + $RANDOM for spread). Exits non-zero if none free.
+# valid_port <value> → 0 only for a decimal TCP port in range.
+valid_port() {
+  local value="$1" decimal
+  case "${value}" in ''|*[!0-9]*) return 1 ;; esac
+  [[ "${#value}" -le 5 ]] || return 1
+  decimal=$((10#${value}))
+  [[ "${decimal}" -ge 1 && "${decimal}" -le 65535 ]]
+}
+
+# read_remembered_port → echo the last origin port selected by this wrapper, if valid.
+read_remembered_port() {
+  local value=""
+  [[ -f "${PORT_STATE_FILE}" ]] || return 0
+  IFS= read -r value < "${PORT_STATE_FILE}" || true
+  valid_port "${value}" && echo "${value}"
+}
+
+# remember_origin_port <port> → best-effort persistence under the already-ignored browser profile.
+remember_origin_port() {
+  local value="$1" temporary
+  valid_port "${value}" || return 1
+  mkdir -p "${CACHE_PROFILE_DIR}" || return 1
+  temporary="${PORT_STATE_FILE}.tmp.$$"
+  printf '%s\n' "${value}" > "${temporary}" || return 1
+  mv "${temporary}" "${PORT_STATE_FILE}"
+}
+
+# pick_free_port [preferred] → echo a TCP port nothing is listening on. The remembered origin is
+# tried first, then 5151 and a spread of candidates so concurrent runs don't collide. Bash 3.2-safe.
 pick_free_port() {
-  local cand seed
+  local preferred="${1:-}" cand seed
+  if valid_port "${preferred}" && ! port_in_use "${preferred}"; then
+    echo "${preferred}"
+    return 0
+  fi
   seed=$(( ( $$ + ${RANDOM:-0} ) % 4000 ))
   # Candidate list: the app's 5151 default, then a deterministic-ish spread in the 49152–65535 ephemeral
   # range so we avoid well-known ports and reduce collision odds across parallel launchers.
   for cand in 5151 5152 5153 $((49152 + seed)) $((50000 + seed)) $((51000 + seed)) $((52000 + seed)) $((53000 + seed)) $((54000 + seed)) $((55000 + seed)); do
+    [[ "${cand}" == "${preferred}" ]] && continue
     if ! port_in_use "${cand}"; then echo "${cand}"; return 0; fi
   done
   return 1
@@ -133,17 +165,31 @@ pick_free_port() {
 
 # ── select the static-server port (only relevant when we actually serve) ─────────────────────────
 if [[ "${NO_SERVE}" -ne 1 ]]; then
+  REMEMBERED_PORT="$(read_remembered_port)"
   if [[ "${PORT_EXPLICIT}" -eq 1 ]]; then
+    if ! valid_port "${PORT}"; then
+      echo "[run] --port must be an integer from 1 to 65535." >&2
+      exit 2
+    fi
     # User pinned a port. NEVER reuse a foreign server already on it — abort with guidance instead.
     if port_in_use "${PORT}"; then
       echo "[run] port ${PORT} is already in use$( [[ -n "$(pids_on_port "${PORT}")" ]] && echo " (pid(s): $(pids_on_port "${PORT}"))" )." >&2
       echo "[run] refusing to reuse a server we did not start. Free it (e.g. kill the pid above), or omit --port to auto-pick a free one." >&2
       exit 1
     fi
+    remember_origin_port "${PORT}" || echo "[run] warning: could not remember cache-origin port ${PORT}." >&2
   else
-    # Auto-select a free ephemeral port so a stale dev server from a prior run is never reused.
-    PORT="$(pick_free_port)" || { echo "[run] could not find a free port to serve on." >&2; exit 1; }
-    echo "[run] auto-selected free port :${PORT}"
+    # Prefer the previous origin so persistent IndexedDB remains addressable without reusing a
+    # foreign listener. If it is occupied, use a temporary origin but retain the remembered one.
+    PORT="$(pick_free_port "${REMEMBERED_PORT}")" || { echo "[run] could not find a free port to serve on." >&2; exit 1; }
+    if [[ -n "${REMEMBERED_PORT}" && "${PORT}" == "${REMEMBERED_PORT}" ]]; then
+      echo "[run] reusing cache-origin port :${PORT}"
+    elif [[ -n "${REMEMBERED_PORT}" ]]; then
+      echo "[run] cache-origin port :${REMEMBERED_PORT} is busy; using temporary origin :${PORT}. Its IndexedDB cache is separate." >&2
+    else
+      echo "[run] selected and remembered cache-origin port :${PORT}"
+      remember_origin_port "${PORT}" || echo "[run] warning: could not remember cache-origin port ${PORT}." >&2
+    fi
   fi
 fi
 

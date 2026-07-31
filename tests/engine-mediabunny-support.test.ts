@@ -186,12 +186,12 @@ describe('REQ-ENG-01: full Mediabunny output tuple capability', () => {
     expect(new MediabunnyEngine().benchmarkLimits).toEqual({
       maxInnerIterations: 1,
       memoryWindow: {
-        sampleImmediatelyDuringOperation: true,
-        maxOperationSamples: 1,
-        settleWindowMs: 0,
-        sampleTimeoutMs: 1_000,
-      },
-    });
+      sampleImmediatelyDuringOperation: true,
+      maxOperationSamples: 1,
+      settleWindowMs: 0,
+      sampleTimeoutMs: 30_000,
+    },
+  });
   });
 
   test('declares authenticated range transport only alongside bounded probe modes', () => {

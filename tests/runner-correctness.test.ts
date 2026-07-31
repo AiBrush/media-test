@@ -10,6 +10,7 @@ import type {
   NormalizedMetadata,
 } from '../src/core/engine.ts';
 import {
+  AUTHENTICATED_RANGE_INPUT_FEATURE,
   AUTHENTICATED_RANGE_PROBE_FEATURE,
   createMalformedInputError,
   createNotApplicableError,
@@ -232,6 +233,40 @@ function streamVerifiedProbeInput(): {
       actualSizeBytes: probeBytes.byteLength,
       chunkSizeBytes: probeBytes.byteLength,
       chunkSha256: [probeSha256],
+      retainedBytes: 0,
+    }],
+  };
+}
+
+const LARGE_AUTHENTICATED_INPUT_BYTES = 256 * 1024 * 1024 + 1;
+const largeInputSha256 = 'ab'.repeat(32);
+
+function streamVerifiedLargeInput(
+  sizeBytes = LARGE_AUTHENTICATED_INPUT_BYTES,
+): {
+  resolvedInputs: ResolvedInput[];
+  verifiedStreamContents: VerifiedStreamContent[];
+} {
+  const identity = {
+    logicalPath: 'large-input.mp4',
+    sha256: largeInputSha256,
+    sizeBytes,
+  };
+  return {
+    resolvedInputs: [{
+      id: 'large-input.mp4',
+      urlAssetPath: identity.logicalPath,
+      sha256: identity.sha256,
+      sizeBytes,
+      integrity: 'VERIFIED',
+    }],
+    verifiedStreamContents: [{
+      state: 'VERIFIED_STREAM',
+      identity,
+      actualSha256: identity.sha256,
+      actualSizeBytes: sizeBytes,
+      chunkSizeBytes: sizeBytes,
+      chunkSha256: [identity.sha256],
       retainedBytes: 0,
     }],
   };
@@ -994,7 +1029,7 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     expect({ supportsCalls, probeCalls }).toEqual({ supportsCalls: 2, probeCalls: 1 });
   });
 
-  test('authenticated URL delivery is exclusive to unmutated scale probes and preserves identity', async () => {
+  test('authenticated URL delivery admits bounded probes and large immutable operations only', async () => {
     installProbeGoldenFetch();
     let observedInput: MediaInput | undefined;
     const engine = baseEngine('probe', {
@@ -1027,6 +1062,52 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     });
     expect(accepted.status).toBe('PASS');
     expect(observedInput?.contentAttestation?.sha256).toBe(probeSha256);
+
+    let observedLargeInput: MediaInput | undefined;
+    const largeRemux = await runOne(baseEngine('remux', {
+      capabilities: () => ({
+        ...caps('remux'),
+        features: [...caps('remux').features, AUTHENTICATED_RANGE_INPUT_FEATURE],
+      }),
+      supports: async () => ({ supported: true }),
+      remux: async (input) => {
+        observedLargeInput = input;
+        expect(input.url).toBe('http://localhost/fixtures/media/large-input.mp4');
+        expect(input.contentAttestation).toMatchObject({
+          sha256: largeInputSha256,
+          sizeBytes: LARGE_AUTHENTICATED_INPUT_BYTES,
+        });
+        await expect(input.blob()).rejects.toThrow('ATTESTED_URL_WHOLE_FILE_FORBIDDEN');
+        return bytes();
+      },
+    }), remuxScenario('remux/large-authenticated-range'), browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      ...streamVerifiedLargeInput(),
+    });
+    expect(largeRemux.status).toBe('PASS');
+    expect(observedLargeInput?.contentAttestation?.sha256).toBe(largeInputSha256);
+
+    let unauthenticatedLargeCalls = 0;
+    const unauthenticatedLarge = await runOne(baseEngine('remux', {
+      capabilities: () => ({
+        ...caps('remux'),
+        features: [...caps('remux').features, AUTHENTICATED_RANGE_PROBE_FEATURE],
+      }),
+      remux: async () => {
+        unauthenticatedLargeCalls += 1;
+        return bytes();
+      },
+    }), remuxScenario('remux/large-authenticated-range-missing-capability'), browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      ...streamVerifiedLargeInput(),
+    });
+    expect(unauthenticatedLarge).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining(AUTHENTICATED_RANGE_INPUT_FEATURE),
+    });
+    expect(unauthenticatedLargeCalls).toBe(0);
 
     let nonScaleCalls = 0;
     const nonScale = await runOne(baseEngine('probe', {

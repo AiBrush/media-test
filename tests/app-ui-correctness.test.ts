@@ -5,6 +5,7 @@ import { join, relative, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import {
+  DEFAULT_LAUNCHER_RANDOM_SEED,
   RUN_OPTION_DEFINITIONS,
   RUN_OPTION_LIMITS,
   RunOptionValidationError,
@@ -718,7 +719,11 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(wrapper).toContain('visible window');
     expect(server).toContain('loopback by default');
     expect(RUN_OPTION_LIMITS.timeoutMs.default).toBe(86_400_000);
+    expect(DEFAULT_LAUNCHER_RANDOM_SEED).toBe('media-test-launcher-default');
+    expect(launcher).toContain(`Default replay seed when omitted: ${DEFAULT_LAUNCHER_RANDOM_SEED}`);
+    expect(wrapper).toContain(`Default replay seed when omitted: ${DEFAULT_LAUNCHER_RANDOM_SEED}`);
     expect(wrapper).toContain('Default run deadline: 86400000 ms (24 hours).');
+    expect(wrapper).toContain('reuse the last cache-origin port');
   });
 
   test('run.sh accepts and forwards every canonical value exactly once', () => {

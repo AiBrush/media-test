@@ -13,6 +13,9 @@ export type BrowserName = 'brave' | 'chromium' | 'webkit' | 'firefox';
 /** Adapter promises that URL probe reads enforce MediaInput.contentAttestation block-by-block. */
 export const AUTHENTICATED_RANGE_PROBE_FEATURE = 'probe:authenticated-range' as const;
 
+/** Adapter promises that large operation inputs enforce MediaInput.contentAttestation block-by-block. */
+export const AUTHENTICATED_RANGE_INPUT_FEATURE = 'input:authenticated-range' as const;
+
 /**
  * Authenticated fixed-block snapshot for a large URL input. Adapters may use the URL only through a
  * fetch surface that verifies each delivered block against this map.
@@ -37,7 +40,7 @@ export interface MediaInput {
   sizeBytes?: number;
   /** true when robustness logic rewrites bytes before the engine receives them */
   mutated?: boolean;
-  /** Present only on bounded, unmutated URL transport admitted by incremental full-body hashing. */
+  /** Present only on unmutated URL transport admitted by incremental full-body hashing. */
   contentAttestation?: MediaInputContentAttestation;
   blob(): Promise<Blob>;
   arrayBuffer(): Promise<ArrayBuffer>;

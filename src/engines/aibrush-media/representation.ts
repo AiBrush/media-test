@@ -6,13 +6,16 @@ import type {
   PacketInfo,
   TrackType,
 } from '../../core/engine.ts';
-import { sha256Hex } from '../../core/seeded-rng.ts';
 
 export interface AibrushObservedTrack {
   readonly id: number;
   readonly mediaType: 'video' | 'audio';
+  /** Product TrackInfo uses a nominal mediaType for declared data/timecode tracks. */
+  readonly nonMedia?: true;
   readonly codec?: string;
+  readonly defaultDisposition?: boolean;
   readonly durationSec?: number;
+  readonly language?: string;
   readonly rotation?: number;
   readonly config?: {
     readonly codec?: string;
@@ -47,17 +50,22 @@ export function canonicalAibrushCodec(codec: string): string {
 }
 
 export function normalizeAibrushTrack(track: AibrushObservedTrack): NormalizedTrack {
-  const nativeCodecTag = track.codec ?? track.config?.codec ?? 'unknown';
+  const declaredCodecTag = track.codec ?? track.config?.codec ?? '';
+  const nativeCodecTag = declaredCodecTag.length > 0 ? declaredCodecTag : 'unknown';
+  const nonMedia = track.nonMedia === true;
   const normalized: NormalizedTrack = {
-    type: track.mediaType,
-    codec: canonicalAibrushCodec(nativeCodecTag),
-    nativeCodecTag,
+    type: nonMedia ? 'other' : track.mediaType,
+    codec: nonMedia ? nativeCodecTag : canonicalAibrushCodec(nativeCodecTag),
+    ...(declaredCodecTag.length > 0 ? { nativeCodecTag: declaredCodecTag } : {}),
     ...(track.config?.codedWidth !== undefined ? { width: track.config.codedWidth } : {}),
     ...(track.config?.codedHeight !== undefined ? { height: track.config.codedHeight } : {}),
     ...(track.config?.sampleRate !== undefined ? { sampleRate: track.config.sampleRate } : {}),
     ...(track.config?.numberOfChannels !== undefined ? { channels: track.config.numberOfChannels } : {}),
+    ...(track.defaultDisposition !== undefined
+      ? { defaultDisposition: track.defaultDisposition }
+      : {}),
     bitrate: null,
-    language: null,
+    language: track.language ?? null,
   };
   return normalized;
 }
@@ -124,12 +132,21 @@ export function buildAibrushDemuxResult(
   const packets: PacketInfo[] = rawPackets.map((packet) => {
     const payload = packet.payload?.byteLength === packet.size ? packet.payload : undefined;
     const track = tracks[packet.trackIndex];
-    const codec = track === undefined
-      ? metadata.tracks[packet.trackIndex]?.codec
-      : canonicalAibrushCodec(track.codec ?? track.config?.codec ?? 'unknown');
+    const codec =
+      track?.nonMedia === true
+        ? undefined
+        : track === undefined
+          ? metadata.tracks[packet.trackIndex]?.codec
+          : canonicalAibrushCodec(track.codec ?? track.config?.codec ?? 'unknown');
     const representation = track === undefined
       ? undefined
-      : representationForAibrushTrack(track, packet.trackIndex, packet.dtsUs === undefined ? 'presentation' : 'decode');
+      : track.nonMedia === true
+        ? undefined
+        : representationForAibrushTrack(
+            track,
+            packet.trackIndex,
+            packet.dtsUs === undefined ? 'presentation' : 'decode',
+          );
     return {
       trackIndex: packet.trackIndex,
       size: packet.size,
@@ -137,10 +154,16 @@ export function buildAibrushDemuxResult(
       ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
       ...(packet.durationUs !== undefined ? { durationUs: packet.durationUs } : {}),
       keyframe: packet.keyframe,
-      ...(track !== undefined ? { trackType: track.mediaType as TrackType } : {}),
+      ...(track !== undefined
+        ? { trackType: (track.nonMedia === true ? 'other' : track.mediaType) as TrackType }
+        : {}),
       ...(codec !== undefined ? { codec } : {}),
       ...(payload !== undefined
-        ? { payload: payload.slice(), payloadDigest: sha256Hex(payload) }
+        // The bytes are the authoritative evidence. Do not also publish a digest derived from the
+        // same buffer: an independent oracle must distrust and re-hash that self-assertion anyway.
+        // Semantic goldens hash `payload` when required; scalar goldens can skip a redundant
+        // full-source digest pass while retaining the exact coded bytes for downstream consumers.
+        ? { payload: payload.slice() }
         : {}),
       ...(representation !== undefined ? { framing: representation.framing } : {}),
       ...(track !== undefined && nalLengthSize(track) !== undefined ? { nalLengthSize: nalLengthSize(track) } : {}),
@@ -149,15 +172,21 @@ export function buildAibrushDemuxResult(
     };
   });
   const metadataWithCadence = withObservedCadence(metadata, packets);
-  const representations = tracks.map((track, trackIndex) => {
+  const representations = tracks.flatMap((track, trackIndex) => {
+    if (track.nonMedia === true) return [];
     const hasDts = packets.some((packet) => packet.trackIndex === trackIndex && packet.dtsUs !== undefined);
-    return representationForAibrushTrack(track, trackIndex, hasDts ? 'decode' : 'presentation');
+    return [representationForAibrushTrack(track, trackIndex, hasDts ? 'decode' : 'presentation')];
   });
-  const packetOrdering = representations.every((representation) => representation.packetOrdering === 'decode')
-    ? 'decode'
-    : representations.every((representation) => representation.packetOrdering === 'presentation')
-      ? 'presentation'
-      : undefined;
+  const packetOrdering =
+    representations.length === 0
+      ? undefined
+      : representations.every((representation) => representation.packetOrdering === 'decode')
+        ? 'decode'
+        : representations.every(
+              (representation) => representation.packetOrdering === 'presentation',
+            )
+          ? 'presentation'
+          : undefined;
   return {
     metadata: metadataWithCadence,
     packets,
@@ -194,12 +223,19 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
     );
     const observedIntervalUs = endUs - startUs;
     if (!(observedIntervalUs > 0)) return { ...track };
-    const intervals: number[] = [];
+    let intervalCount = 0;
+    let intervalSum = 0;
+    let minInterval = Number.POSITIVE_INFINITY;
+    let maxInterval = Number.NEGATIVE_INFINITY;
     for (let index = 1; index < ordered.length; index++) {
       const interval = ordered[index]!.ptsUs - ordered[index - 1]!.ptsUs;
-      if (interval > 0) intervals.push(interval);
+      if (interval <= 0) continue;
+      intervalCount++;
+      intervalSum += interval;
+      minInterval = Math.min(minInterval, interval);
+      maxInterval = Math.max(maxInterval, interval);
     }
-    if (intervals.length === 0) {
+    if (intervalCount === 0) {
       return {
         ...track,
         fps: ordered.length * 1_000_000 / observedIntervalUs,
@@ -211,9 +247,7 @@ export function withObservedCadence(metadata: NormalizedMetadata, packets: reado
         },
       };
     }
-    const minInterval = Math.min(...intervals);
-    const maxInterval = Math.max(...intervals);
-    const meanInterval = intervals.reduce((sum, value) => sum + value, 0) / intervals.length;
+    const meanInterval = intervalSum / intervalCount;
     const fps = 1_000_000 / meanInterval;
     const cadenceObservedIntervalUs = ordered.length * meanInterval;
     return {

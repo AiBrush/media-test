@@ -82,24 +82,17 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   const appendOnly = options.appendOnly === true;
   const target = options.target;
 
-  if (operation === 'demux' && options.invariant === 'demux-scale-budgets') {
-    return reject(
-      'AIBRUSH_DEMUX_SCALE_PACKET_BOUNDARY_UNAVAILABLE',
-      'the framework materializes a complete packet table and does not expose the first-packet boundary required by demux scale timing',
-    );
-  }
-
   if (
     operation === 'demux' &&
     inputs.some((input) => input.tracks.some((track) =>
-      (track.type !== 'video' && track.type !== 'audio') ||
+      (track.type !== 'video' && track.type !== 'audio' && track.type !== 'other') ||
       (track.type === 'video' && !VIDEO_ENCODERS.has(track.codec)) ||
       (track.type === 'audio' && !DEMUX_AUDIO_CODECS.has(track.codec))
     ))
   ) {
     return reject(
       'AIBRUSH_DEMUX_TRACK_REPRESENTATION_UNSUPPORTED',
-      'the framework demux surface cannot expose every declared source track as a canonical audio/video packet stream',
+      'the framework demux surface cannot expose every declared source media track in the normalized vocabulary',
     );
   }
 

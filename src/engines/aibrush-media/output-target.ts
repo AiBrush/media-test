@@ -2,8 +2,9 @@ import type { StreamingRepresentation } from '../../features/streaming-output/co
 import type { SinkTrace, SinkTraceEvent } from '../../features/streaming-output/types.ts';
 
 const DEFAULT_VALIDATION_WINDOW_BYTES = 4_096;
-const FNV1A64_OFFSET = 0xcbf29ce484222325n;
-const FNV1A64_PRIME = 0x100000001b3n;
+const FNV1A64_OFFSET_HIGH = 0xcbf29ce4;
+const FNV1A64_OFFSET_LOW = 0x84222325;
+const FNV1A64_PRIME_LOW = 0x1b3;
 
 export interface AibrushCallbackRetentionEvidence {
   readonly callbackWriteCount: number;
@@ -44,7 +45,8 @@ export class AibrushSinkTraceRecorder {
   #writeCount = 0;
   #maximumQueuedBytes = 0;
   #lastWriteAtMs: number | undefined;
-  #hash = FNV1A64_OFFSET;
+  #hashHigh = FNV1A64_OFFSET_HIGH;
+  #hashLow = FNV1A64_OFFSET_LOW;
   #prefix = new Uint8Array(0);
   #tail = new Uint8Array(0);
   #finalizeStarted = false;
@@ -106,8 +108,8 @@ export class AibrushSinkTraceRecorder {
     // The callback itself is synchronous. One native chunk is being accepted at this event; there is no
     // adapter-side asynchronous queue or unawaited write promise.
     this.#maximumQueuedBytes = Math.max(this.#maximumQueuedBytes, chunk.byteLength);
-    this.#consume(chunk);
     if (!this.enabled) return;
+    this.#consume(chunk);
     const atMs = this.#readNow();
     this.#lastWriteAtMs = atMs;
     this.#events.push({
@@ -160,7 +162,9 @@ export class AibrushSinkTraceRecorder {
       maximumOutstandingWritePromises: this.#writeCount > 0 ? 1 : 0,
       maximumQueuedBytes: this.#maximumQueuedBytes,
       retainedOutputBytes: nonNegativeInteger(retainedOutputBytes, 'retainedOutputBytes'),
-      rollingHash: this.#hash.toString(16).padStart(16, '0'),
+      rollingHash:
+        this.#hashHigh.toString(16).padStart(8, '0') +
+        this.#hashLow.toString(16).padStart(8, '0'),
       rollingHashAlgorithm: 'fnv1a64' as const,
       validationPrefix: this.#prefix.slice(),
       validationTail: this.#tail.slice(),
@@ -168,10 +172,20 @@ export class AibrushSinkTraceRecorder {
   }
 
   #consume(bytes: Uint8Array): void {
-    for (const byte of bytes) {
-      this.#hash ^= BigInt(byte);
-      this.#hash = BigInt.asUintN(64, this.#hash * FNV1A64_PRIME);
+    let high = this.#hashHigh;
+    let low = this.#hashLow;
+    for (let index = 0; index < bytes.byteLength; index++) {
+      low = (low ^ bytes[index]!) >>> 0;
+      const lowProduct = low * FNV1A64_PRIME_LOW;
+      high =
+        (Math.imul(high, FNV1A64_PRIME_LOW) +
+          Math.floor(lowProduct / 0x1_0000_0000) +
+          Math.imul(low, 0x100)) >>>
+        0;
+      low = lowProduct >>> 0;
     }
+    this.#hashHigh = high;
+    this.#hashLow = low;
     if (this.#prefix.byteLength < this.#prefixLimit) {
       const count = Math.min(this.#prefixLimit - this.#prefix.byteLength, bytes.byteLength);
       this.#prefix = concatBounded(this.#prefix, bytes.subarray(0, count), this.#prefixLimit, false);

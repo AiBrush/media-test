@@ -440,7 +440,15 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
       representation: { lacing, unknownSizeSegment: segment.unknown },
     };
     return { state: 'OK', value, evidence: { ...evidence, parsedTracks: outputTracks.length, parsedSamples } };
-  } catch {
-    return { state: 'MALFORMED', reasonCode: 'REMUX_EBML_PARSE_GUARD', evidence };
+  } catch (error) {
+    const diagnostic =
+      error instanceof Error
+        ? `${error.name}: ${error.message}`.slice(0, 240)
+        : String(error).slice(0, 240);
+    return {
+      state: 'MALFORMED',
+      reasonCode: 'REMUX_EBML_PARSE_GUARD',
+      evidence: { ...evidence, markers: [`guard:${diagnostic}`] },
+    };
   }
 }

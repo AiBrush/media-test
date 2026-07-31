@@ -4,7 +4,11 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { RUN_OPTION_DEFINITIONS, RUN_OPTION_LIMITS } from '../src/app/options.ts';
+import {
+  DEFAULT_LAUNCHER_RANDOM_SEED,
+  RUN_OPTION_DEFINITIONS,
+  RUN_OPTION_LIMITS,
+} from '../src/app/options.ts';
 import {
   isLauncherRunDone,
   isLauncherRunPending,
@@ -26,7 +30,7 @@ const opts = {
   iters: undefined,
   timeoutMs: RUN_OPTION_LIMITS.timeoutMs.default,
   reuseData: true,
-  randomSeed: undefined,
+  randomSeed: DEFAULT_LAUNCHER_RANDOM_SEED,
   exhaustive: false,
 };
 
@@ -85,6 +89,7 @@ function printCanonicalHelp() {
     const takesValue = option.value !== 'boolean' && option.value !== 'false';
     console.log(`  ${option.cli}${takesValue ? ` <${option.value}>` : ''}${option.repeatable ? ' (repeatable or CSV)' : ''}`);
   }
+  console.log(`Default replay seed when omitted: ${DEFAULT_LAUNCHER_RANDOM_SEED}`);
 }
 
 function validateNumericOption(name, value, limits) {
@@ -120,6 +125,7 @@ const launchOptions = { headless: false };
 if (browserDefinition.executablePath) launchOptions.executablePath = browserDefinition.executablePath;
 console.log(`[launch] ${opts.browser} (visible browser window) → ${pageUrl}`);
 console.log(`[launch] cache reuse is origin-scoped to ${new URL(opts.baseUrl).origin}; cross-port import is explicit`);
+console.log(`[launch] replay seed: ${opts.randomSeed}`);
 
 const userDataDir = resolve(ROOT, 'results/.browser-cache', opts.browser);
 mkdirSync(userDataDir, { recursive: true });

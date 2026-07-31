@@ -33,6 +33,8 @@ import type {
 } from './engine.ts';
 import type { MediaEngine, PacketInfo } from './engine.ts';
 import { isNotApplicableError } from './engine.ts';
+import { createAuthenticatedMediaInputReader } from './authenticated-range.ts';
+import { isCorpusDeliveryIntegrityError } from './selection-integrity.ts';
 import type { OracleId, OracleOutcome, OracleTolerances, Scenario } from './scenario.ts';
 import { canonicalizeJson, sha256Hex as sha256HexSync, type JsonObject } from './canonical-json.ts';
 import {
@@ -81,9 +83,15 @@ import {
   compareStrictRemuxPrograms,
   evaluateStrictStreamCopy,
   normalizeRemuxTrackForTest,
+  normalizeRemuxTrackForStreamingComparison,
+  readIsoBmffRangeProgram,
   readNeutralRemuxProgram,
   remuxRoundTripContractFromOptions,
   validateReturnedPartialRemux,
+} from '../features/remux/index.ts';
+import type {
+  IsoBmffRangeTrackEvidence,
+  NormalizedRemuxTrackEvidence,
 } from '../features/remux/index.ts';
 import { assessDemuxDts, demuxScaleContractFromOptions } from '../features/demux/index.ts';
 import {
@@ -700,6 +708,8 @@ export interface OracleContext {
   verifiedResources?: Readonly<Record<string, Uint8Array>>;
   /** Current browser, when the runner provides it. Used only for browser-baked frame-golden sidecars. */
   browser?: BrowserName;
+  /** The runner's one cancellation/deadline signal, threaded into neutral range oracles. */
+  signal?: AbortSignal;
   /** injected by runner: decode arbitrary bytes with the platform engine (WebCodecs) → frames */
   decodeWithPlatform: (
     bytes: MediaBytes,
@@ -979,6 +989,9 @@ export async function runOracle(
     }
   } catch (err) {
     if (isNotApplicableError(err)) throw err;
+    if (isCorpusDeliveryIntegrityError(err)) {
+      return unavailable(oracle, 'NA_ASSET', err.reasonCode, err.detail);
+    }
     // graceful-failure treats a throw differently; let it own the catch.
     if (oracle === 'graceful-failure') {
       return pass(oracle, `operation threw/rejected as required: ${errMsg(err)}`);
@@ -3306,6 +3319,384 @@ function matchByPts(got: FrameDigest[], ptsUs: number): FrameDigest | undefined 
 
 // ── reference-reimport ───────────────────────────────────────────────────────────────────────
 
+function remuxCodecKey(track: { readonly type: string; readonly codec: string }): string {
+  const codec =
+    canonicalCodecToken(track.codec) ??
+    track.codec.trim().toLowerCase().replace(/[^a-z0-9.-]+/g, '-');
+  return `${track.type}:${codec}`;
+}
+
+function remuxBytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function addUniqueRemuxBytes(target: Uint8Array[], values: readonly Uint8Array[]): void {
+  for (const value of values) {
+    if (!target.some((candidate) => remuxBytesEqual(candidate, value))) {
+      target.push(value.slice());
+    }
+  }
+}
+
+function sameRemuxByteSet(left: readonly Uint8Array[], right: readonly Uint8Array[]): boolean {
+  const a: Uint8Array[] = [];
+  const b: Uint8Array[] = [];
+  addUniqueRemuxBytes(a, left);
+  addUniqueRemuxBytes(b, right);
+  return (
+    a.length === b.length &&
+    a.every((value) => b.some((candidate) => remuxBytesEqual(value, candidate)))
+  );
+}
+
+interface RangeRemuxPair {
+  readonly source: IsoBmffRangeTrackEvidence;
+  readonly output: RemuxTrackEvidence;
+  readonly normalizedOutput: NormalizedRemuxTrackEvidence;
+  readonly sourceOriginUs?: number;
+  readonly outputOriginUs?: number;
+  readonly sourceDtsOriginUs?: number;
+  readonly outputDtsOriginUs?: number;
+  readonly sourceParameterSets: Uint8Array[];
+  readonly sourceFraming: Set<string>;
+  readonly sourceGrouping: number[];
+  outputUnitIndex: number;
+  failed: boolean;
+}
+
+function remuxTrackPairScore(
+  source: IsoBmffRangeTrackEvidence,
+  output: RemuxTrackEvidence,
+): number {
+  let score = source.samples.length === output.samples.length ? 10_000 : 0;
+  for (const key of ['language', 'sampleRate', 'channels', 'width', 'height'] as const) {
+    if (source[key] !== undefined && source[key] === output[key]) score += 100;
+  }
+  return score;
+}
+
+function pairRangeRemuxTracks(
+  source: readonly IsoBmffRangeTrackEvidence[],
+  output: readonly RemuxTrackEvidence[],
+): { pairs?: Array<[IsoBmffRangeTrackEvidence, RemuxTrackEvidence]>; failure?: string } {
+  const sourceMedia = source.filter((track) => track.type === 'video' || track.type === 'audio');
+  const outputMedia = output.filter((track) => track.type === 'video' || track.type === 'audio');
+  if (sourceMedia.length !== outputMedia.length) {
+    return {
+      failure: `required media-track count changed: ${sourceMedia.length} -> ${outputMedia.length}`,
+    };
+  }
+  const remaining = [...outputMedia];
+  const pairs: Array<[IsoBmffRangeTrackEvidence, RemuxTrackEvidence]> = [];
+  for (const sourceTrack of sourceMedia) {
+    let bestIndex = -1;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < remaining.length; index++) {
+      const candidate = remaining[index]!;
+      if (remuxCodecKey(sourceTrack) !== remuxCodecKey(candidate)) continue;
+      const score = remuxTrackPairScore(sourceTrack, candidate);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex < 0) {
+      return { failure: `track membership '${remuxCodecKey(sourceTrack)}' changed` };
+    }
+    pairs.push([sourceTrack, remaining.splice(bestIndex, 1)[0]!]);
+  }
+  return remaining.length === 0 ? { pairs } : { failure: 'output contains unmatched media tracks' };
+}
+
+function minimumDefined(values: readonly (number | undefined)[]): number | undefined {
+  let result = Number.POSITIVE_INFINITY;
+  for (const value of values) {
+    if (value !== undefined) result = Math.min(result, value);
+  }
+  return Number.isFinite(result) ? result : undefined;
+}
+
+async function authenticatedRangeRemuxReference(
+  ctx: OracleContext,
+  sourceContainer: string,
+  expectedTarget: string,
+  surfaceRepresentationDifferences: boolean,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'reference-reimport';
+  const output = ctx.output;
+  if (!output) return fail(oracle, 'no ctx.output bytes to re-import');
+  const reader = createAuthenticatedMediaInputReader(ctx.input);
+  const sourceRead = await readIsoBmffRangeProgram(
+    reader,
+    sourceContainer,
+    ctx.signal,
+  );
+  if (sourceRead.state !== 'OK') {
+    return oracleError(
+      oracle,
+      'REMUX_SOURCE_RANGE_EVIDENCE_INVALID',
+      `source neutral range reader ${sourceRead.state} [${sourceRead.reasonCode}]`,
+    );
+  }
+  const outputRead = readNeutralRemuxProgram(output.bytes, output.container);
+  if (outputRead.state !== 'OK') {
+    const diagnostic = outputRead.evidence.markers?.length
+      ? ` (${outputRead.evidence.markers.join(', ')})`
+      : '';
+    return outputRead.state === 'MALFORMED' || outputRead.state === 'INCOMPLETE'
+      ? {
+          state: 'VERDICT',
+          oracle,
+          verdict: 'FAIL',
+          reasonCode: 'REMUX_OUTPUT_INVALID',
+          detail: `output neutral remux reader ${outputRead.state} [${outputRead.reasonCode}]${diagnostic}`,
+        }
+      : oracleError(
+          oracle,
+          'REMUX_OUTPUT_READER_COVERAGE_ERROR',
+          `output neutral remux reader ${outputRead.state} [${outputRead.reasonCode}]${diagnostic}`,
+        );
+  }
+
+  const failures: string[] = [];
+  const differences: string[] = [];
+  const addFailure = (detail: string): void => {
+    if (failures.length < 16) failures.push(detail);
+  };
+  const addDifference = (detail: string): void => {
+    if (differences.length < 32 && !differences.includes(detail)) differences.push(detail);
+  };
+  if (resolveContainer(output.container, '') !== resolveContainer(expectedTarget, '')) {
+    addFailure(`returned container '${output.container}', expected '${expectedTarget}'`);
+  }
+  const matched = pairRangeRemuxTracks(sourceRead.value.tracks, outputRead.value.tracks);
+  if (matched.failure) addFailure(matched.failure);
+  const pairStates: RangeRemuxPair[] = [];
+  for (const [sourceTrack, outputTrack] of matched.pairs ?? []) {
+    const label = remuxCodecKey(sourceTrack).replace(':', '/');
+    const normalizedOutput = normalizeRemuxTrackForStreamingComparison(outputTrack);
+    if (!normalizedOutput) {
+      addFailure(`${label} output coded framing is malformed or ambiguous`);
+      continue;
+    }
+    if (sourceTrack.samples.length !== outputTrack.samples.length) {
+      addFailure(
+        `${label} coded sample count changed: ${sourceTrack.samples.length} -> ${outputTrack.samples.length}`,
+      );
+    }
+    for (const key of ['language', 'sampleRate', 'channels', 'width', 'height'] as const) {
+      if (
+        sourceTrack[key] !== undefined &&
+        outputTrack[key] !== undefined &&
+        sourceTrack[key] !== outputTrack[key]
+      ) {
+        addFailure(`${label} ${key} changed ${String(sourceTrack[key])} -> ${String(outputTrack[key])}`);
+      } else if (sourceTrack[key] !== undefined && outputTrack[key] === undefined) {
+        addDifference(`${label} ${key} evidence is unavailable in the target reader`);
+      }
+    }
+    pairStates.push({
+      source: sourceTrack,
+      output: outputTrack,
+      normalizedOutput,
+      sourceOriginUs: minimumDefined(sourceTrack.samples.map((sample) => sample.ptsUs)),
+      outputOriginUs: minimumDefined(normalizedOutput.units.map((unit) => unit.ptsUs)),
+      sourceDtsOriginUs: minimumDefined(sourceTrack.samples.map((sample) => sample.dtsUs)),
+      outputDtsOriginUs: minimumDefined(normalizedOutput.units.map((unit) => unit.dtsUs)),
+      sourceParameterSets: [],
+      sourceFraming: new Set(),
+      sourceGrouping: [],
+      outputUnitIndex: 0,
+      failed: false,
+    });
+  }
+
+  const jobs = pairStates
+    .flatMap((pair) => pair.source.samples.map((sample) => ({ pair, sample })))
+    .sort((left, right) => left.sample.fileOffset - right.sample.fileOffset);
+  for (const { pair, sample } of jobs) {
+    if (pair.failed) continue;
+    ctx.signal?.throwIfAborted();
+    const payload = await reader.range(
+      sample.fileOffset,
+      sample.fileOffset + sample.byteLength,
+      ctx.signal,
+    );
+    const sourceSample = { ...sample, payload };
+    const normalizedSource = normalizeRemuxTrackForStreamingComparison({
+      ...pair.source,
+      samples: [sourceSample],
+    });
+    const label = remuxCodecKey(pair.source).replace(':', '/');
+    if (!normalizedSource) {
+      addFailure(`${label} source coded framing is malformed or ambiguous`);
+      pair.failed = true;
+      continue;
+    }
+    addUniqueRemuxBytes(pair.sourceParameterSets, normalizedSource.parameterSets);
+    pair.sourceFraming.add(sample.framing);
+    pair.sourceGrouping.push(...normalizedSource.grouping);
+    for (const sourceUnit of normalizedSource.units) {
+      const outputUnit = pair.normalizedOutput.units[pair.outputUnitIndex];
+      const unitIndex = pair.outputUnitIndex++;
+      if (outputUnit === undefined || !remuxBytesEqual(sourceUnit.payload, outputUnit.payload)) {
+        addFailure(`${label} normalized coded access-unit content changed at unit ${unitIndex}`);
+        pair.failed = true;
+        break;
+      }
+      const compareAxis = (
+        axis: 'PTS' | 'DTS',
+        sourceValue: number | undefined,
+        outputValue: number | undefined,
+        sourceOrigin: number | undefined,
+        outputOrigin: number | undefined,
+      ): void => {
+        if (sourceValue === undefined && outputValue === undefined) return;
+        if (
+          sourceValue === undefined ||
+          outputValue === undefined ||
+          sourceOrigin === undefined ||
+          outputOrigin === undefined
+        ) {
+          addDifference(`${label} ${axis} provenance differs`);
+          return;
+        }
+        const delta = Math.abs(
+          (sourceValue - sourceOrigin) - (outputValue - outputOrigin),
+        );
+        if (delta > 2_000) addFailure(`${label} ${axis}[${unitIndex}] drift ${delta}us > 2000us`);
+        else if (delta > 0) addDifference(`${label} ${axis} rounded within tolerance`);
+      };
+      compareAxis(
+        'PTS',
+        sourceUnit.ptsUs,
+        outputUnit.ptsUs,
+        pair.sourceOriginUs,
+        pair.outputOriginUs,
+      );
+      compareAxis(
+        'DTS',
+        sourceUnit.dtsUs,
+        outputUnit.dtsUs,
+        pair.sourceDtsOriginUs,
+        pair.outputDtsOriginUs,
+      );
+      if (sourceUnit.durationUs !== undefined && outputUnit.durationUs !== undefined) {
+        const durationDelta = Math.abs(sourceUnit.durationUs - outputUnit.durationUs);
+        if (durationDelta > 50_000) {
+          addFailure(`${label} duration[${unitIndex}] drift ${durationDelta}us > 50000us`);
+        } else if (durationDelta > 0) {
+          addDifference(`${label} duration rounded within tolerance`);
+        }
+      } else if (sourceUnit.durationUs !== outputUnit.durationUs) {
+        addDifference(`${label} coded-duration provenance differs`);
+      }
+    }
+  }
+
+  for (const pair of pairStates) {
+    const label = remuxCodecKey(pair.source).replace(':', '/');
+    if (pair.outputUnitIndex !== pair.normalizedOutput.units.length) {
+      addFailure(
+        `${label} normalized coded unit count changed: ${pair.outputUnitIndex} -> ${pair.normalizedOutput.units.length}`,
+      );
+    }
+    if (!sameRemuxByteSet(pair.sourceParameterSets, pair.normalizedOutput.parameterSets)) {
+      addFailure(`${label} codec parameter-set content changed`);
+    }
+    if (
+      [...pair.sourceFraming].join(',') !==
+      [...pair.normalizedOutput.framing].join(',')
+    ) {
+      addDifference(`${label} framing changed`);
+    }
+    if (pair.sourceGrouping.join(',') !== pair.normalizedOutput.grouping.join(',')) {
+      addDifference(`${label} legal access-unit grouping changed`);
+    }
+    const sourceFlags = pair.source.samples.map((sample) => sample.keyframe);
+    const outputFlags = pair.output.samples.map((sample) => sample.keyframe);
+    if (
+      sourceFlags.length === outputFlags.length &&
+      sourceFlags.some((value, index) => value !== outputFlags[index])
+    ) {
+      addDifference(`${label} container keyframe flags differ while coded units match`);
+    }
+    if (pair.source.id !== pair.output.id) {
+      addDifference(`${label} container track identity/order differs`);
+    }
+    if (
+      pair.source.codecPrivate &&
+      pair.output.codecPrivate &&
+      !remuxBytesEqual(pair.source.codecPrivate, pair.output.codecPrivate)
+    ) {
+      addDifference(`${label} codec configuration placement/representation differs`);
+    }
+  }
+
+  if (
+    sourceRead.value.durationUs !== undefined &&
+    outputRead.value.durationUs !== undefined
+  ) {
+    const durationDelta = Math.abs(
+      sourceRead.value.durationUs - outputRead.value.durationUs,
+    );
+    if (durationDelta > 50_000) {
+      addFailure(`program duration drift ${durationDelta}us > 50000us`);
+    } else if (durationDelta > 0) {
+      addDifference('program duration differs only within declared container tolerance');
+    }
+  }
+  if (
+    resolveContainer(sourceRead.value.container, '') !==
+    resolveContainer(outputRead.value.container, '')
+  ) {
+    addDifference(`wrapper changed ${sourceRead.value.container} -> ${outputRead.value.container}`);
+  }
+  const measurements = {
+    sourceTracks: sourceRead.value.tracks.length,
+    outputTracks: outputRead.value.tracks.length,
+    matchedTracks: pairStates.length,
+    sourceSamples: sourceRead.value.tracks.reduce(
+      (sum, track) => sum + track.samples.length,
+      0,
+    ),
+    outputSamples: outputRead.value.tracks.reduce(
+      (sum, track) => sum + track.samples.length,
+      0,
+    ),
+    sourceRangeBytesRead: reader.trace.bytesRead,
+    sourceRangeBlockRequests: reader.trace.blockRequests,
+    representationDifferences: differences.length,
+  };
+  if (failures.length > 0) {
+    return {
+      state: 'VERDICT',
+      oracle,
+      verdict: 'FAIL',
+      reasonCode: 'REMUX_STRICT_COPY_VIOLATION',
+      detail: failures.join('; '),
+      measurements,
+    };
+  }
+  return {
+    state: 'VERDICT',
+    oracle,
+    verdict: 'PASS',
+    reasonCode:
+      differences.length > 0 && surfaceRepresentationDifferences
+        ? 'REMUX_VALID_REPRESENTATION_DIFFERENCE'
+        : 'REMUX_STRICT_COPY_PRESERVED',
+    detail:
+      differences.join('; ') ||
+      'all required coded tracks, content and timelines are preserved',
+    measurements,
+  };
+}
+
 async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerances>): Promise<OracleOutcome> {
   const oracle: OracleId = 'reference-reimport';
   if (!ctx.output) return fail(oracle, 'no ctx.output bytes to re-import');
@@ -3313,17 +3704,25 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
   // REMUX: re-read the engine's OWN output structure with the no-engine byte reader and check its
   // track layout + duration against golden (plus the Ogg-FLAC byte-parse subpath). No scored engine.
   if (ctx.scenario.op === 'remux') {
-    const source = new Uint8Array(await ctx.input.arrayBuffer());
     const sourceContainer = ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
     const expectedTarget = remuxRoundTripContractFromOptions(ctx.scenario.options)?.backTo ??
       readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
-    const structural = evaluateStrictStreamCopy(
-      source,
-      sourceContainer,
-      ctx.output.bytes,
-      ctx.output.container,
-      { expectedTargetContainer: expectedTarget, surfaceRepresentationDifferences: true },
-    ).outcome;
+    const structural =
+      ctx.input.contentAttestation !== undefined &&
+      (sourceContainer === 'mp4' || sourceContainer === 'mov')
+        ? await authenticatedRangeRemuxReference(
+            ctx,
+            sourceContainer,
+            expectedTarget,
+            true,
+          )
+        : evaluateStrictStreamCopy(
+            new Uint8Array(await ctx.input.arrayBuffer()),
+            sourceContainer,
+            ctx.output.bytes,
+            ctx.output.container,
+            { expectedTargetContainer: expectedTarget, surfaceRepresentationDifferences: true },
+          ).outcome;
     const tagContract = metadataTagContractFromOptions(ctx.scenario.options);
     if (!tagContract) return structural;
     const tags = verifyMetadataTagsByNeutralReprobe({
@@ -6404,6 +6803,52 @@ function anchoredRemuxSampleTimesSec(
 }
 
 /**
+ * Prefer the deterministic inline WebCodecs prefix when both wrappers expose the same decode-order
+ * video essence. HTMLMediaElement seeking is still required for transformed/fragmented or genuinely
+ * different presentation domains, but it can return a stale compositor frame immediately after a
+ * `seeked` event. Exact payload/configuration parity makes sequential decode the stronger oracle.
+ */
+function remuxProgramsShareDecodePrefix(
+  source: RemuxProgramEvidence,
+  output: RemuxProgramEvidence,
+  maxFrames: number,
+): boolean {
+  const sourceVideos = source.tracks.filter((track) => track.type === 'video');
+  const outputVideos = output.tracks.filter((track) => track.type === 'video');
+  if (sourceVideos.length !== 1 || outputVideos.length !== 1) return false;
+  const sourceVideo = sourceVideos[0]!;
+  const outputVideo = outputVideos[0]!;
+  if (remuxCodecKey(sourceVideo) !== remuxCodecKey(outputVideo)) return false;
+  if (
+    sourceVideo.codecPrivate === undefined ||
+    outputVideo.codecPrivate === undefined ||
+    !remuxBytesEqual(sourceVideo.codecPrivate, outputVideo.codecPrivate)
+  ) {
+    return false;
+  }
+  const compared = Math.min(
+    sourceVideo.samples.length,
+    outputVideo.samples.length,
+    Math.max(1, Math.floor(maxFrames)) + 16,
+  );
+  if (compared === 0) return false;
+  for (let index = 0; index < compared; index++) {
+    const left = sourceVideo.samples[index]!;
+    const right = outputVideo.samples[index]!;
+    if (
+      left.ptsUs === undefined ||
+      right.ptsUs === undefined ||
+      Math.abs(left.ptsUs - right.ptsUs) > 1_000 ||
+      left.keyframe !== right.keyframe ||
+      !remuxBytesEqual(left.payload, right.payload)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Compute a metamorphic invariant in-browser using the injected helpers + frame digests. The
  * specific invariant is selected by scenario.options.invariant (or notes):
  *   - 'decode-remux'     : decode(remux(x)) == decode(x)            (frame digests equal)
@@ -6717,16 +7162,22 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
         : [];
       const sourceStructure = readOutputStructureResult(sourceBytes, sourceContainer);
       const outputStructure = readOutputStructureResult(ctx.output.bytes, ctx.output.container);
+      const outputRead = readNeutralRemuxProgram(ctx.output.bytes, ctx.output.container);
       const hasDisplayTransform = [sourceStructure, outputStructure].some((structure) =>
         structure.state === 'OK' && structure.value.tracks.some((track) =>
           typeof track.rotation === 'number' && track.rotation !== 0));
+      const stableInlinePrefix =
+        !hasDisplayTransform &&
+        sourceRead.state === 'OK' &&
+        outputRead.state === 'OK' &&
+        remuxProgramsShareDecodePrefix(sourceRead.value, outputRead.value, 60);
       // Inline WebCodecs decoding yields a leading prefix, while the HTMLVideoElement fallback
       // samples uniformly across presentation time. A source and remux target can take different
       // decode paths even though their essence is identical (for example an edit-list MP4 source
       // and an inline-demuxable Matroska output). Force both sides onto one presentation-time domain
       // for transformed media. Plain metadata remuxes instead use sequential WebCodecs prefixes:
       // repeated HTMLMediaElement seeks can land on an adjacent frame at a rounded wrapper boundary.
-      liveReferenceDecodeOptions = preferLiveMetadataReference && !hasDisplayTransform
+      liveReferenceDecodeOptions = (preferLiveMetadataReference && !hasDisplayTransform) || stableInlinePrefix
         ? {
             maxFrames: sampleTimesSec.length || 60,
             sampling: 'prefix',

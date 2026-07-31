@@ -8,6 +8,14 @@ export {
   aacLcChannelsFromEsds,
   parseIsoAudioSampleEntryHeader,
   parseIsoVisualSampleEntryHeader,
+  readIsoBmffRangeProgram,
+} from './reader-isobmff.ts';
+export type {
+  IsoBmffRangeProgramEvidence,
+  IsoBmffRangeReadResult,
+  IsoBmffRangeSampleEvidence,
+  IsoBmffRangeSource,
+  IsoBmffRangeTrackEvidence,
 } from './reader-isobmff.ts';
 import { readMp3Program } from './reader-mp3.ts';
 export { mp3FrameAudioConfig } from './reader-mp3.ts';

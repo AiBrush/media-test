@@ -83,6 +83,8 @@ export interface ResolvedInput {
   urlAssetPath: string;
   sha256?: string;
   sizeBytes?: number;
+  /** Catalog-observed presentation duration; never inferred from a filename or byte size. */
+  durationSec?: number;
   /** Set only after the runner verifies and retains these exact bytes. */
   integrity?: 'DECLARED' | 'VERIFIED' | 'UNVERIFIED';
   /** Digest-bound URL dependency. Transport resources are verified and sealed into the primary
@@ -1173,13 +1175,20 @@ function makeSelection(
   sources: ReadonlyMap<string, ScenarioSourceRow>,
 ): ScenarioSelection {
   const isBaked = candidate.kind === 'baked';
-  const resolvedInputs = candidate.inputs.map((input): ResolvedInput => ({
+  const resolvedInputs = candidate.inputs.map((input, index): ResolvedInput => ({
     id: input.id,
     urlAssetPath: input.urlAssetPath,
     // Both baked-manifest and catalog candidates are content-addressed declarations. UNVERIFIED is
     // a byte state, not permission to discard the identity needed to verify those bytes.
     sha256: input.sha256,
     sizeBytes: input.sizeBytes,
+    ...(index === 0 &&
+    candidate.inputs.length === 1 &&
+    typeof candidate.sourceFile?.durationSec === 'number' &&
+    Number.isFinite(candidate.sourceFile.durationSec) &&
+    candidate.sourceFile.durationSec > 0
+      ? { durationSec: candidate.sourceFile.durationSec }
+      : {}),
     integrity: 'DECLARED',
   }));
   const row = sources.get(scenario.id);

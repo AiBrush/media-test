@@ -12,7 +12,7 @@ import type {
   StrictRemuxTolerance,
 } from './types.ts';
 
-interface SemanticUnit {
+export interface NormalizedRemuxSemanticUnit {
   payload: Uint8Array;
   ptsUs?: number;
   dtsUs?: number;
@@ -22,8 +22,8 @@ interface SemanticUnit {
   kind?: number;
 }
 
-interface NormalizedTrack {
-  units: SemanticUnit[];
+export interface NormalizedRemuxTrackEvidence {
+  units: NormalizedRemuxSemanticUnit[];
   parameterSets: Uint8Array[];
   framing: Set<string>;
   grouping: number[];
@@ -157,10 +157,10 @@ function nalRandomAccess(codec: string, kind: number): boolean {
   return codec === 'h264' ? kind === 5 : kind >= 16 && kind <= 23;
 }
 
-function normalizeTrack(track: RemuxTrackEvidence): NormalizedTrack | undefined {
+function normalizeTrack(track: RemuxTrackEvidence): NormalizedRemuxTrackEvidence | undefined {
   const codec = canonicalCodec(track.codec);
   const parameterSets = parameterSetsFromPrivate(codec, track.codecPrivate);
-  const units: SemanticUnit[] = [];
+  const units: NormalizedRemuxSemanticUnit[] = [];
   const framing = new Set<string>();
   const grouping: number[] = [];
   for (let sampleIndex = 0; sampleIndex < track.samples.length; sampleIndex++) {
@@ -405,7 +405,7 @@ function relativeAxisAligned(
   return a.every((value, index) => Math.abs((value - originA) - (b[index]! - originB)) <= toleranceUs);
 }
 
-function presentationSpan(track: NormalizedTrack): number | undefined {
+function presentationSpan(track: NormalizedRemuxTrackEvidence): number | undefined {
   if (track.units.length === 0 || track.units.some((unit) => unit.ptsUs === undefined || unit.durationUs === undefined)) {
     return undefined;
   }
@@ -419,8 +419,8 @@ function presentationSpan(track: NormalizedTrack): number | undefined {
 }
 
 function compareTimeline(
-  source: NormalizedTrack,
-  output: NormalizedTrack,
+  source: NormalizedRemuxTrackEvidence,
+  output: NormalizedRemuxTrackEvidence,
   tolerance: StrictRemuxTolerance,
   failures: string[],
   differences: string[],
@@ -538,7 +538,7 @@ export function compareStrictRemuxPrograms(
     if (!sameByteSet(normalizedSource.parameterSets, normalizedOutput.parameterSets)) {
       failures.push(`${label} codec parameter-set content changed`);
     }
-    const semanticOrigin = (track: NormalizedTrack): number | undefined => {
+    const semanticOrigin = (track: NormalizedRemuxTrackEvidence): number | undefined => {
       let minimum = Number.POSITIVE_INFINITY;
       for (const unit of track.units) {
         if (unit.ptsUs !== undefined) minimum = Math.min(minimum, unit.ptsUs);
@@ -660,4 +660,11 @@ export function normalizeRemuxTrackForTest(track: RemuxTrackEvidence): Readonly<
     parameterSets: setOfUniqueBytes(normalized.parameterSets),
     grouping: normalized.grouping,
   };
+}
+
+/** Range-oracle seam: expose the same canonical units used by the strict whole-buffer comparator. */
+export function normalizeRemuxTrackForStreamingComparison(
+  track: RemuxTrackEvidence,
+): NormalizedRemuxTrackEvidence | undefined {
+  return normalizeTrack(track);
 }

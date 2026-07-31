@@ -17,6 +17,7 @@ import {
 import { readOutputPacketsResult, readOutputStructure } from '../src/core/box-readers.ts';
 import { demuxMp4Video } from '../src/engines/platform/demux-mp4.ts';
 import { sha256Hex as sha256HexSync } from '../src/core/canonical-json.ts';
+import { sha256Hex as rawSha256Hex } from '../src/core/media-selection.ts';
 import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
 import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
 
@@ -143,6 +144,71 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
     expect(verdict(outcome)).toBe('PASS');
   });
 
+  test('authenticated reference re-import compares ISO samples through fixed ranges only', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
+    const chunkSizeBytes = 1024;
+    const wholeFileCalls = { count: 0 };
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    const remuxInput: MediaInput = {
+      id: 'micro_h264_1frame.mp4',
+      url: 'https://fixtures.test/micro_h264_1frame.mp4',
+      mime: 'video/mp4',
+      sizeBytes: bytes.byteLength,
+      contentAttestation: {
+        schema: 'media-test/url-content-attestation@1',
+        logicalPath: 'micro_h264_1frame.mp4',
+        sha256: rawSha256Hex(bytes),
+        sizeBytes: bytes.byteLength,
+        chunkSizeBytes,
+        chunkSha256: Array.from(
+          { length: Math.ceil(bytes.byteLength / chunkSizeBytes) },
+          (_, index) => rawSha256Hex(
+            bytes.subarray(index * chunkSizeBytes, (index + 1) * chunkSizeBytes),
+          ),
+        ),
+      },
+      async blob() {
+        wholeFileCalls.count += 1;
+        throw new Error('whole-file blob access forbidden');
+      },
+      async arrayBuffer() {
+        wholeFileCalls.count += 1;
+        throw new Error('whole-file byte access forbidden');
+      },
+    };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(
+        new Headers(init?.headers).get('Range') ?? '',
+      );
+      if (!match) return new Response(null, { status: 400 });
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      physicalRanges.push({ start, end });
+      return new Response(bytes.slice(start, end + 1), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}` },
+      });
+    }) as typeof fetch;
+    try {
+      const outcome = await runOracle('reference-reimport', context({
+        scenario: scenario('remux', 'reference-reimport', { container: 'mp4' }),
+        input: remuxInput,
+        output: { bytes: bytes.slice(), mime: 'video/mp4', container: 'mp4' },
+      }));
+      expect(verdict(outcome)).toBe('PASS');
+      expect(wholeFileCalls.count).toBe(0);
+      expect(physicalRanges.length).toBeGreaterThan(0);
+      expect(
+        physicalRanges.every(({ start, end }) => end - start + 1 <= chunkSizeBytes),
+      ).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test('decode-remux falls back to same-browser source decode when frame cache is pending', async () => {
     const source = new Uint8Array(
       await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
@@ -194,6 +260,36 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
           sampleTimesSec: [0.5],
         },
       },
+    ]);
+  });
+
+  test('decode-remux uses sequential WebCodecs when both wrappers expose the same decode prefix', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
+    const remuxInput: MediaInput = {
+      id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    const decodeCalls: Array<{ container: string; sampling?: 'prefix' | 'uniform' }> = [];
+    const outcome = await runOracle('property-invariant', context({
+      scenario: scenario('remux', 'property-invariant', {
+        container: 'mp4',
+        invariant: 'decode(remux(x))==decode(x)',
+      }),
+      input: remuxInput,
+      output: { bytes: source.slice(), mime: 'video/mp4', container: 'mp4' },
+      golden: golden({ container: 'mp4', durationSec: 1, tracks: [] }),
+      decodeWithPlatform: async (media, options) => {
+        decodeCalls.push({ container: media.container, sampling: options?.sampling });
+        return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
+      },
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodeCalls).toEqual([
+      { container: 'mp4', sampling: 'prefix' },
+      { container: 'mp4', sampling: 'prefix' },
     ]);
   });
 
