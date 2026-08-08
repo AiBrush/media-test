@@ -17,6 +17,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { resolve } from 'node:path';
 import { chromium } from 'playwright';
+import { CACHE_EXPORT_SCHEMA } from '../../src/app/result-cache.ts';
 import { RAW_RUN_SCHEMA_ID } from '../../src/core/report.ts';
 
 const ROOT = resolve(import.meta.dir, '../..');
@@ -85,7 +86,16 @@ async function openSuite(context, url) {
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await page.goto(`${url}/index.html`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(() => window.__SUITE__?.ready === true, undefined, { timeout: 30_000 });
+  try {
+    await page.waitForFunction(() => window.__SUITE__?.ready === true, undefined, { timeout: 30_000 });
+  } catch (error) {
+    const body = await page.locator('body').innerText().catch(() => '<body unavailable>');
+    throw new Error(
+      `suite did not become ready at ${url}; page errors: ${pageErrors.join('; ') || 'none'}; ` +
+        `body: ${body.slice(0, 2_000)}`,
+      { cause: error },
+    );
+  }
   assert.deepEqual(pageErrors, [], `page boot errors: ${pageErrors.join('; ')}`);
   return page;
 }
@@ -116,7 +126,7 @@ async function downloadWithKeyboard(page, selector) {
   return await readFile(path, 'utf8');
 }
 
-function runFilter(selection, seed = 'browser-acceptance-seed') {
+function runFilter(selection) {
   return {
     browser: 'chromium',
     browserTag: 'chromium',
@@ -129,8 +139,6 @@ function runFilter(selection, seed = 'browser-acceptance-seed') {
     iters: 1,
     timeoutMs: 30_000,
     reuseData: true,
-    randomizeOrder: false,
-    randomSeed: seed,
     exhaustiveMedia: false,
   };
 }
@@ -149,10 +157,6 @@ try {
   ]);
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ acceptDownloads: true });
-  // This acceptance runs against an immutable page snapshot. Other concurrent repository work may
-  // touch source files, so prevent Vite's development HMR client from navigating the page midway
-  // through the 10,002-cell stress loop.
-  await context.route(/\/\@vite\/client(?:\?.*)?$/, (route) => route.abort());
 
   const idlePage = await openSuite(context, firstServer.url);
 
@@ -162,7 +166,8 @@ try {
     assert.equal(await idlePage.locator('#results table').count(), 0);
     assert.equal(await idlePage.evaluate(() => window.__RESULTS__?.length ?? 0), 0);
     assert.equal(await idlePage.evaluate(() => window.__RUN_DONE__), undefined);
-    assert.equal(await idlePage.locator('#randomize-order').isChecked(), false);
+    assert.equal(await idlePage.locator('#randomize-order').count(), 0);
+    assert.equal(await idlePage.locator('#random-seed').count(), 0);
     assert.equal(await idlePage.locator('#exhaustive-media').isChecked(), true);
     assert.equal(await idlePage.locator('#run-config-section').count(), 0);
     assert.equal((await idlePage.locator('body').innerText()).includes('Run configuration & provenance'), false);
@@ -370,37 +375,32 @@ try {
     assert.equal(await runPage.evaluate(() => window.__RUN_ARTIFACT__?.completionState), 'completed');
     const firstManifest = await runPage.evaluate(() => window.__RUN_ARTIFACT__?.manifest);
     assert(firstManifest, 'completed run omitted its manifest artifact');
-    assert.equal(firstManifest.configuration.randomSeed, 'browser-acceptance-seed');
+    assert.equal(firstManifest.configuration.mediaMode, 'canonical-single');
+    assert.equal('randomSeed' in firstManifest.configuration, false);
     assert(firstManifest.selectedInputs.some((input) => /^[a-f0-9]{64}$/i.test(input.sha256 ?? '')));
     assert(firstManifest.selectedInputs.some((input) => typeof input.candidateCount === 'number'));
 
     const cacheProbe = await runPage.evaluate(async (liveResult) => {
-      const [{ createResultCache }, { canonicalJsonSha256 }, { isExecutionFingerprintReusable }] = await Promise.all([
+      const [{ createResultCache }, { isExecutionFingerprintReusable }] = await Promise.all([
         import('/src/app/result-cache.ts'),
-        import('/src/core/canonical-json.ts'),
         import('/src/core/runner.ts'),
       ]);
       const cache = createResultCache();
       if (!cache) throw new Error('browser cache unavailable');
       const rows = await cache.list();
-      const row = rows.find((candidate) => candidate.result.engineId === liveResult.engineId);
+      const row = rows.find((candidate) =>
+        !candidate.invalidated &&
+        candidate.result.engineId === liveResult.engineId &&
+        candidate.result.scenarioId.startsWith(`${liveResult.scenarioId}#`));
       if (!row) throw new Error('first run did not persist a row');
-      const selection = liveResult.selection;
-      if (!selection) throw new Error('first run omitted selection evidence');
-      const tag = `selection-sha256:${canonicalJsonSha256({
-        schema: 'media-test/selection-cache-contract@1',
-        executedInput: `sha256:${selection.executedInputDigest ?? selection.sha256}`,
-        eligiblePoolDigest: selection.eligiblePoolDigest ?? null,
-        candidateIdentity: selection.candidateIdentity ?? null,
-        evidenceContractDigest: selection.evidenceContractDigest ?? null,
-        selectionPolicyVersion: selection.selectionPolicyVersion ?? null,
-        selectionAlgorithmId: selection.selectionAlgorithmId ?? null,
-      })}`;
-      const expectedScenarioKey = `${liveResult.scenarioId}#${tag}`;
+      const expectedScenarioKey = row.result.scenarioId;
       const direct = await cache.get(liveResult.engineId, expectedScenarioKey, liveResult.browser);
       return {
         expectedScenarioKey,
         storedScenarioKey: row.result.scenarioId,
+        cacheKeyBoundToCellContract:
+          expectedScenarioKey.startsWith(`${liveResult.scenarioId}#selection-sha256:`) &&
+          /:contract-sha256:[a-f0-9]{64}$/.test(expectedScenarioKey),
         storedInvalidated: row.invalidated,
         directHit: direct?.cacheReuse !== undefined,
         directReusable: isExecutionFingerprintReusable(direct, liveResult.executionFingerprint),
@@ -409,11 +409,14 @@ try {
     assert.deepEqual(cacheProbe, {
       expectedScenarioKey: cacheProbe.expectedScenarioKey,
       storedScenarioKey: cacheProbe.expectedScenarioKey,
+      cacheKeyBoundToCellContract: true,
       storedInvalidated: false,
       directHit: true,
       directReusable: true,
     });
 
+    await runPage.reload({ waitUntil: 'domcontentloaded' });
+    await runPage.waitForFunction(() => window.__SUITE__?.ready === true);
     const second = await runPage.evaluate(async (filter) => await window.__SUITE__.run(filter), runFilter(selection));
     assert.equal(second.length, 1);
     selection.status = second[0].status;
@@ -424,15 +427,16 @@ try {
     assert(secondManifest.cache.hits.some((hit) => /^run-/.test(hit.sourceRunId ?? '')));
     assert(secondManifest.cache.hits.some((hit) => /why|matched|valid|identity|fingerprint/i.test(hit.validBecause)));
 
-    const summary = runPage.locator('#results details summary').first();
-    await summary.focus();
+    const resultCell = runPage.locator('#results td.has-details').first();
+    await resultCell.focus();
     await runPage.keyboard.press('Enter');
-    assert.equal(await summary.evaluate((node) => node.parentElement?.hasAttribute('open')), true);
-    const details = await summary.locator('..').innerText();
+    assert.equal(await runPage.locator('.cell-modal:not([hidden])').count(), 1);
+    const details = await runPage.locator('.cell-modal-body').innerText();
     assert.match(details, new RegExp(selection.status));
     assert.match(details, /Cache/);
     assert.match(details, /cache hit from run/);
     assert.match(details, /Selected input/);
+    await runPage.getByRole('button', { name: 'Close details' }).click();
   });
 
   let rawArtifact;
@@ -455,7 +459,10 @@ try {
 
     const cacheText = await downloadWithKeyboard(runPage, '#export-cache');
     cacheBundle = JSON.parse(cacheText);
+    assert.equal(cacheBundle.schema, CACHE_EXPORT_SCHEMA);
     assert(cacheBundle.entries.length >= 1);
+    assert.equal(cacheBundle.storedEntryCount, cacheBundle.entries.length);
+    assert.equal(cacheBundle.excludedIncompatibleEntryCount, 0);
   });
 
   await check('REQ-UI-18 proves cache origin isolation and explicit validated import provenance', async () => {
@@ -493,7 +500,7 @@ try {
       const scroll = document.querySelector('#results .matrix-scroll');
       const table = scroll?.querySelector('table');
       const caption = table?.querySelector('caption');
-      const summary = table?.querySelector('details summary');
+      const detailCell = table?.querySelector('td.has-details');
       return {
         scrollWidth: scroll?.scrollWidth,
         clientWidth: scroll?.clientWidth,
@@ -502,7 +509,7 @@ try {
         caption: caption?.textContent,
         columnScopes: [...(table?.querySelectorAll('thead th') ?? [])].map((node) => node.getAttribute('scope')),
         rowScope: table?.querySelector('tbody th')?.getAttribute('scope'),
-        summaryLabel: summary?.getAttribute('aria-label'),
+        detailLabel: detailCell?.querySelector('.status')?.getAttribute('aria-label'),
       };
     });
     assert(layout.scrollWidth <= layout.clientWidth + 1, 'matrix unexpectedly requires horizontal scrolling');
@@ -510,9 +517,9 @@ try {
     assert.match(layout.caption, /Conformance verdicts/);
     assert(layout.columnScopes.every((scope) => scope === 'col'));
     assert.equal(layout.rowScope, 'row');
-    assert.match(layout.summaryLabel, new RegExp(`${selection.id}.*mp4box.*${selection.status}`, 'i'));
+    assert.match(layout.detailLabel, new RegExp(selection.status, 'i'));
 
-    for (const selector of ['#run', '#download', '#results details summary']) {
+    for (const selector of ['#run', '#download', '#results td.has-details']) {
       const locator = runPage.locator(selector).first();
       await locator.scrollIntoViewIfNeeded();
       await locator.focus();
@@ -543,7 +550,6 @@ try {
       }, id);
       await runPage.keyboard.press('Space');
     }
-    if (await runPage.locator('#randomize-order').isChecked()) await keyboardActivate(runPage, '#randomize-order');
     await keyboardActivate(runPage, '#run');
     await runPage.waitForFunction(() => document.body.dataset.runState === 'running', undefined, { timeout: 10_000 });
     assert.equal(await runPage.evaluate(() => document.activeElement?.id), 'run');

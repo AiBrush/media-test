@@ -69,7 +69,6 @@ export interface RobustnessWorkerRequest {
     selectionEvidencePlan?: CandidateOracleEvidencePlan;
     verifiedContents?: readonly VerifiedContent[];
     decryptKeyOverride?: DecryptKey;
-    runSeed?: string;
     pixelBehavior: PixelBehaviorEvidence;
     cachedResult?: ScenarioResult;
     resourceLimits?: RobustnessWorkerResourceLimits;

@@ -304,7 +304,11 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
         options: { audio: { codec: 'pcm-s16', channels: 2 } },
       });
       tuple.scenarioId = scenarioId;
-      expect(reason(tuple), scenarioId).toBe('FFMPEG_AUDIO_MIX_MATRIX_UNSUPPORTED');
+      expect(decideFfmpegSupport(tuple, RUNTIME), scenarioId).toMatchObject({
+        supported: false,
+        reasonCode: 'FFMPEG_AUDIO_MIX_MATRIX_UNSUPPORTED',
+        preContent: true,
+      });
     }
 
     const fade = request('transcode', 'wav', [audio('pcm-f32')], {
@@ -312,7 +316,11 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
       options: { audio: { codec: 'pcm-f32', fade: { inSec: 1, outSec: 1, curve: 'linear' } } },
     });
     fade.scenarioId = 'audio-dsp/fade_in_out_f32';
-    expect(reason(fade)).toBe('FFMPEG_AUDIO_FADE_ENVELOPE_PRECISION_UNSUPPORTED');
+    expect(decideFfmpegSupport(fade, RUNTIME)).toMatchObject({
+      supported: false,
+      reasonCode: 'FFMPEG_AUDIO_FADE_ENVELOPE_PRECISION_UNSUPPORTED',
+      preContent: true,
+    });
 
     const supported = request('transcode', 'wav', [audio('pcm-s16')], {
       output: { container: 'wav', audioCodec: 'pcm-s16' },

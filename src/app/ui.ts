@@ -403,7 +403,7 @@ export function renderRunManifest(manifest: RunManifest | undefined): void {
     : 'pending or not reported');
   row('Filters', `pillar=${manifest.configuration.pillar}; features=${listOrAll(manifest.configuration.featureIds)}; operations=${listOrAll(manifest.configuration.operations)}; scenarios=${listOrAll(manifest.configuration.scenarioIds)}`);
   row('Timing', `warmup=${manifest.configuration.warmup}; iterations=${manifest.configuration.iters}; timeout=${manifest.configuration.timeoutMs} ms`);
-  row('Seed / ordering', `${manifest.configuration.randomSeed}; ${manifest.configuration.randomizeOrder ? 'randomized' : 'scenario-major'}; order ${manifest.executionOrderDigest}`);
+  row('Execution order', `deterministic scenario-major; order ${manifest.executionOrderDigest}`);
   row('Definition digests', `scenarios ${manifest.scenarioDefinitionDigest}; oracles/tolerances ${manifest.oracleDefinitionDigest}`);
   row('Media', `${manifest.configuration.mediaMode}; corpus ${manifest.corpusChecksum ?? 'pending'}`);
   row('Cache', [

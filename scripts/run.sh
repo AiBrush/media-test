@@ -17,7 +17,6 @@
 #                        port is already taken the run aborts (it will NOT reuse a foreign server).
 #   --warmup <n> --iters <n>   bench protocol overrides forwarded to the page.
 #   --timeout-ms <ms>    per-browser run cap (default 86400000 = 24 hours).
-#   --random-seed <text> deterministic execution/media-selection seed for exact replay.
 #   --exhaustive         run every eligible catalog input for each selected scenario.
 #   --no-reuse           force every selected executable cell to run instead of reusing stored
 #                        results from prior runs.
@@ -49,7 +48,6 @@ NO_SERVE=0
 KEEP_SERVING=0
 BASE_URL=""
 NO_REUSE=0
-RANDOM_SEED=""
 EXHAUSTIVE=0
 CACHE_PROFILE_DIR="${ROOT_DIR}/results/.browser-cache"
 PORT_STATE_FILE="${CACHE_PROFILE_DIR}/runner-origin-port"
@@ -83,7 +81,6 @@ while [[ $# -gt 0 ]]; do
     --warmup) WARMUP="$2"; shift 2 ;;
     --iters) ITERS="$2"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
-    --random-seed) RANDOM_SEED="$2"; shift 2 ;;
     --exhaustive) EXHAUSTIVE=1; shift ;;
     --no-reuse) NO_REUSE=1; shift ;;
     --no-serve) NO_SERVE=1; shift ;;
@@ -148,15 +145,15 @@ remember_origin_port() {
 # pick_free_port [preferred] → echo a TCP port nothing is listening on. The remembered origin is
 # tried first, then 5151 and a spread of candidates so concurrent runs don't collide. Bash 3.2-safe.
 pick_free_port() {
-  local preferred="${1:-}" cand seed
+  local preferred="${1:-}" cand offset
   if valid_port "${preferred}" && ! port_in_use "${preferred}"; then
     echo "${preferred}"
     return 0
   fi
-  seed=$(( ( $$ + ${RANDOM:-0} ) % 4000 ))
+  offset=$(( ( $$ + ${RANDOM:-0} ) % 4000 ))
   # Candidate list: the app's 5151 default, then a deterministic-ish spread in the 49152–65535 ephemeral
   # range so we avoid well-known ports and reduce collision odds across parallel launchers.
-  for cand in 5151 5152 5153 $((49152 + seed)) $((50000 + seed)) $((51000 + seed)) $((52000 + seed)) $((53000 + seed)) $((54000 + seed)) $((55000 + seed)); do
+  for cand in 5151 5152 5153 $((49152 + offset)) $((50000 + offset)) $((51000 + offset)) $((52000 + offset)) $((53000 + offset)) $((54000 + offset)) $((55000 + offset)); do
     [[ "${cand}" == "${preferred}" ]] && continue
     if ! port_in_use "${cand}"; then echo "${cand}"; return 0; fi
   done
@@ -280,7 +277,6 @@ mkdir -p results/raw
 LAUNCH_COMMON=(--base-url "${BASE_URL}" --pillar "${PILLAR}" --out "results/raw" --timeout-ms "${TIMEOUT_MS}")
 [[ "${NO_REUSE}" -eq 1 ]] && LAUNCH_COMMON+=(--no-reuse)
 [[ "${EXHAUSTIVE}" -eq 1 ]] && LAUNCH_COMMON+=(--exhaustive)
-[[ -n "${RANDOM_SEED}" ]] && LAUNCH_COMMON+=(--random-seed "${RANDOM_SEED}")
 [[ -n "${WARMUP}" ]] && LAUNCH_COMMON+=(--warmup "${WARMUP}")
 [[ -n "${ITERS}" ]] && LAUNCH_COMMON+=(--iters "${ITERS}")
 # bash 3.2 + set -u: expanding an EMPTY array as "${arr[@]}" raises 'unbound variable', so guard on

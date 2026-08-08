@@ -22,6 +22,7 @@ import {
   isExecutionFingerprintReusable,
   ORACLE_MODEL_VERSION,
   aggregateExhaustive,
+  buildExecutionOrder,
   reduceExhaustiveStatuses,
   runOne,
   runPixelBehaviorSelfTest,
@@ -904,10 +905,8 @@ describe('REQ-RUN-01/02/04 staged concrete applicability', () => {
           eligiblePoolDigest: '11'.repeat(32),
           executedInputDigest: '22'.repeat(32),
           candidateIdentity: '33'.repeat(32),
-          selectionPolicyVersion: 'selection-policy@1',
-          selectionAlgorithmId: 'sha256-hrw@1',
-          score: '55'.repeat(32),
-          probability: { numerator: 1, denominator: 3, weight: 1 },
+          selectionPolicyVersion: 'canonical-candidate@1',
+          selectionAlgorithmId: 'candidate-identity-lexicographic-min-v1',
           evidenceContractDigest: evidencePlan.contractDigest,
           catalogState: 'ready',
         },
@@ -936,7 +935,6 @@ describe('REQ-RUN-01/02/04 staged concrete applicability', () => {
       executedInputDigest: '22'.repeat(32),
       candidateIdentity: '33'.repeat(32),
       evidenceContractDigest: evidencePlan.contractDigest,
-      probability: { numerator: 1, denominator: 3, weight: 1 },
     });
     expect(result.bench).toBeUndefined();
   });
@@ -1809,6 +1807,15 @@ describe('REQ-RUN-03 three-way performance admission', () => {
 describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
   const statuses = ['PASS', 'FAIL', 'FAIL'] as const;
 
+  test('execution order is always deterministic and scenario-major', () => {
+    expect(buildExecutionOrder(['engine-b', 'engine-a'], ['scenario/2', 'scenario/1'])).toEqual([
+      { engineId: 'engine-b', scenarioId: 'scenario/2' },
+      { engineId: 'engine-a', scenarioId: 'scenario/2' },
+      { engineId: 'engine-b', scenarioId: 'scenario/1' },
+      { engineId: 'engine-a', scenarioId: 'scenario/1' },
+    ]);
+  });
+
   test('status permutations preserve FAIL + partial 1/3', () => {
     for (const order of permutations(statuses)) {
       expect(reduceExhaustiveStatuses(order)).toMatchObject({
@@ -1890,7 +1897,6 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
         { sel: makeSelection('03.mp4'), result: makeResult('FAIL', '03.mp4') },
       ],
       { suiteVersion: 'test', engineId: 'runner-fake@1.0.0', browser },
-      'seed',
     );
     expect(aggregate.status).toBe('FAIL');
     expect(aggregate.coverage).toMatchObject({ valid: 1, total: 3, grade: 'partial' });
@@ -1937,7 +1943,6 @@ describe('REQ-RUN-05 deterministic exhaustive coverage', () => {
       scenario,
       [{ sel: makeSelection('01.mp4'), result: makeResult('PASS', '01.mp4') }],
       { suiteVersion: 'test', engineId: 'runner-fake@1.0.0', browser },
-      'seed',
     );
     expect(passingAggregate.status).toBe('PASS');
     expect(passingAggregate.bench?.wall).toMatchObject({ aggregate: 10, samples: [10] });
@@ -2167,15 +2172,21 @@ describe('REQ-RUN-08 content-addressed reuse', () => {
       file: '01.mp4', sha256: '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a',
       isBaked: false, candidateCount: 2, eligiblePoolDigest: '11'.repeat(32),
       executedInputDigest: '22'.repeat(32), candidateIdentity: '33'.repeat(32),
-      selectionPolicyVersion: 'selection-policy@1', selectionAlgorithmId: 'sha256-hrw@1',
+      selectionPolicyVersion: 'canonical-candidate@1',
+      selectionAlgorithmId: 'candidate-identity-lexicographic-min-v1',
       evidenceContractDigest: '44'.repeat(32), catalogState: 'ready' as const,
     };
-    const env = { suiteVersion: '0.1.0', engineId: 'runner-fake@1.0.0', browser } as const;
+    const env = {
+      suiteVersion: '0.1.0',
+      engineId: 'runner-fake@1.0.0',
+      browser,
+      corpusChecksum: 'source-subset',
+    } as const;
+    const currentEnv = { ...env, corpusChecksum: 'current-superset' } as const;
     const first = await runOne(makeEngine(), scenario, browser, support, {
       pixelBehavior: pixelPass,
       playbackSmoke: async () => true,
       selection,
-      runSeed: 'old-seed',
       env,
     });
     expect(first.status).toBe('PASS');
@@ -2184,8 +2195,7 @@ describe('REQ-RUN-08 content-addressed reuse', () => {
       pixelBehavior: pixelPass,
       playbackSmoke: async () => true,
       selection,
-      runSeed: 'new-seed',
-      env,
+      env: currentEnv,
       cachedResult: {
         ...first,
         cacheReuse: {
@@ -2205,11 +2215,11 @@ describe('REQ-RUN-08 content-addressed reuse', () => {
     expect(second.status).toBe('PASS');
     expect(second.reason).toContain('cached');
     expect(operations).toBe(1);
-    expect(second.selection?.runSeed).toBe('new-seed');
+    expect(second.selection).not.toHaveProperty('runSeed');
     expect(second.selection?.eligiblePoolDigest).toBe(selection.eligiblePoolDigest);
-    expect(second.env).toEqual(env);
+    expect(second.env).toEqual(currentEnv);
     expect(second.cacheReuse?.sourceRunId).toBe('old-run');
-    expect(second.cacheReuse?.selectionEnvelope?.runSeed).toBe('old-seed');
+    expect(second.cacheReuse?.selectionEnvelope).not.toHaveProperty('runSeed');
   });
 
   test('phase-mutable post-operation config remains evidence without poisoning preflight reuse', async () => {

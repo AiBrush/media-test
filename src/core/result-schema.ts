@@ -712,27 +712,16 @@ function validateSelection(value: unknown, path: string, add: AddDiagnostic): vo
     add(`${path}.sha256`, 'SELECTION_SHA256', 'must be a SHA-256 digest');
   }
   if (typeof value.isBaked !== 'boolean') add(`${path}.isBaked`, 'SELECTION_BAKED', 'must be boolean');
-  optionalString(value.runSeed, `${path}.runSeed`, add);
   if (value.candidateCount !== undefined && !nonNegativeInteger(value.candidateCount)) {
     add(`${path}.candidateCount`, 'SELECTION_CANDIDATES', 'must be a non-negative integer');
   }
-  for (const field of ['eligiblePoolDigest', 'executedInputDigest', 'candidateIdentity', 'score', 'evidenceContractDigest'] as const) {
+  for (const field of ['eligiblePoolDigest', 'executedInputDigest', 'candidateIdentity', 'evidenceContractDigest'] as const) {
     if (value[field] !== undefined && (typeof value[field] !== 'string' || !SHA256_PATTERN.test(value[field] as string))) {
       add(`${path}.${field}`, 'SELECTION_DIGEST', 'must be a SHA-256 digest');
     }
   }
   optionalString(value.selectionPolicyVersion, `${path}.selectionPolicyVersion`, add);
   optionalString(value.selectionAlgorithmId, `${path}.selectionAlgorithmId`, add);
-  if (value.probability !== undefined) {
-    if (!isRecord(value.probability)) {
-      add(`${path}.probability`, 'SELECTION_PROBABILITY', 'must be an object');
-    } else {
-      rejectUnknown(value.probability, PROBABILITY_KEYS, `${path}.probability`, add);
-      if (value.probability.numerator !== 1) add(`${path}.probability.numerator`, 'SELECTION_PROBABILITY', 'must equal 1');
-      if (!validPositiveInteger(value.probability.denominator)) add(`${path}.probability.denominator`, 'SELECTION_PROBABILITY', 'must be positive');
-      if (value.probability.weight !== 1) add(`${path}.probability.weight`, 'SELECTION_PROBABILITY', 'must equal 1');
-    }
-  }
   if (value.catalogState !== undefined && value.catalogState !== 'ready' && value.catalogState !== 'fallback') {
     add(`${path}.catalogState`, 'SELECTION_CATALOG_STATE', "must be 'ready' or 'fallback'");
   }
@@ -1135,11 +1124,10 @@ const CACHE_REUSE_KEYS = new Set([
   'validationEpoch', 'validBecause', 'importedFrom', 'sourceEnvironment', 'selectionEnvelope',
 ]);
 const SELECTION_KEYS = new Set([
-  'file', 'sha256', 'isBaked', 'runSeed', 'candidateCount', 'eligiblePoolDigest',
+  'file', 'sha256', 'isBaked', 'candidateCount', 'eligiblePoolDigest',
   'executedInputDigest', 'candidateIdentity', 'selectionPolicyVersion', 'selectionAlgorithmId',
-  'score', 'probability', 'evidenceContractDigest', 'catalogState', 'catalogReason',
+  'evidenceContractDigest', 'catalogState', 'catalogReason',
 ]);
-const PROBABILITY_KEYS = new Set(['numerator', 'denominator', 'weight']);
 const CATALOG_REASON_KEYS = new Set(['reasonCode', 'detail']);
 const NATIVE_ERROR_KEYS = new Set(['name', 'code']);
 const RESOURCE_KEYS = new Set(['kind', 'observed', 'limit', 'unit']);

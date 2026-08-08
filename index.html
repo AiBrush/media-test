@@ -392,29 +392,9 @@
         color: inherit;
         background: var(--control-subtle);
       }
-      .seed-field {
-        grid-column: span 2;
-      }
-      .input-action {
-        display: flex;
-        min-width: 0;
-      }
-      .input-action input {
-        min-width: 0;
-        border-radius: 7px 0 0 7px;
-      }
-      .input-action button {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        gap: 0.35rem;
-        min-width: 4.8rem;
-        margin-left: -1px;
-        border-radius: 0 7px 7px 0;
-      }
       .option-toggle-grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 0.7rem;
         margin-top: 0.85rem;
       }
@@ -1537,9 +1517,6 @@
         .scenario-tools .picker-actions {
           justify-content: flex-start;
         }
-        .seed-field {
-          grid-column: auto;
-        }
         .run-facts {
           flex-direction: column;
           gap: 0.28rem;
@@ -1805,23 +1782,6 @@
               <span>Run timeout <small>ms</small></span>
               <input data-run-config="true" type="number" id="timeout-ms" min="1000" max="86400000" value="86400000" />
             </label>
-            <label class="control-field seed-field">
-              <span>Replay seed</span>
-              <span class="input-action">
-                <input
-                  data-run-config="true"
-                  type="text"
-                  id="random-seed"
-                  value=""
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-                <button id="copy-seed" type="button" aria-label="Copy replay seed">
-                  <i class="ph ph-copy" aria-hidden="true"></i>
-                  <span>Copy</span>
-                </button>
-              </span>
-            </label>
           </div>
 
           <div class="option-toggle-grid">
@@ -1833,17 +1793,10 @@
               </span>
             </label>
             <label class="toggle-card">
-              <input data-run-config="true" id="randomize-order" type="checkbox" />
-              <span class="toggle-copy">
-                <strong>Randomize execution order</strong>
-                <small>Shuffle the pending cell queue once using the replay seed.</small>
-              </span>
-            </label>
-            <label class="toggle-card">
               <input data-run-config="true" id="exhaustive-media" type="checkbox" checked />
               <span class="toggle-copy">
                 <strong>Use every eligible media file</strong>
-                <small>Run each scenario across its full catalog instead of one seeded input.</small>
+                <small>Run each scenario across its full catalog instead of its canonical input.</small>
               </span>
             </label>
           </div>

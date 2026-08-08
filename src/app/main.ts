@@ -186,7 +186,6 @@ async function boot(): Promise<void> {
   for (const entry of registration.scenarioFamilies) if (!entry.ok) notes.push(`scenarios ${entry.family}: ${entry.reason}`);
   notes.push(`${listScoredEngines().length} scored engines; platform is one unscored instrument; ${registration.scenarioCount} scenarios registered`);
   renderRegistrationBanner(notes);
-  ensureSeed();
   wireControls();
   updateScenarioFilter();
   updateIntersectionCount();
@@ -321,7 +320,6 @@ function wireControls(): void {
   }
   getEl('scenarios-list').addEventListener('change', updateScenarioFilter);
   getEl<HTMLInputElement>('scenario-search').addEventListener('input', updateScenarioFilter);
-  getEl<HTMLButtonElement>('copy-seed').addEventListener('click', () => { void copySeed(); });
   getEl<HTMLSelectElement>('result-status-filter').addEventListener('change', (event) => {
     matrix.setResultFilter((event.currentTarget as HTMLSelectElement).value as ResultFilter);
   });
@@ -342,28 +340,6 @@ function wireControls(): void {
 function shouldAutoStart(): boolean {
   const autorun = new URLSearchParams(window.location.search).get('autorun');
   return autorun === '1' || autorun === 'true';
-}
-
-function ensureSeed(): string {
-  const input = getEl<HTMLInputElement>('random-seed');
-  if (!input.value.trim()) input.value = createSeed();
-  return input.value.trim();
-}
-
-function createSeed(): string {
-  if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
-async function copySeed(): Promise<void> {
-  const seed = ensureSeed();
-  try {
-    await navigator.clipboard.writeText(seed);
-    setRunStatus('Replay seed copied.');
-  } catch {
-    getEl<HTMLInputElement>('random-seed').select();
-    setRunStatus('Clipboard unavailable; replay seed selected for copying.');
-  }
 }
 
 function setRunButtonLabel(text: string): void {
@@ -409,7 +385,7 @@ function updateIntersectionCount(): void {
     : 'Fresh execution; cache writes stay on';
   getEl('media-mode-summary').textContent = getEl<HTMLInputElement>('exhaustive-media').checked
     ? 'Every eligible media file'
-    : 'One seeded media file';
+    : 'One canonical media file';
 }
 
 function renderPickerCount(id: string, selected: number, total: number): void {
@@ -450,8 +426,6 @@ async function runFromUi(): Promise<ScenarioResult[]> {
     iters: getEl<HTMLInputElement>('iters').valueAsNumber,
     timeoutMs: getEl<HTMLInputElement>('timeout-ms').valueAsNumber,
     reuseData: getEl<HTMLInputElement>('reuse-data').checked,
-    randomizeOrder: getEl<HTMLInputElement>('randomize-order').checked,
-    randomSeed: ensureSeed(),
     exhaustiveMedia: getEl<HTMLInputElement>('exhaustive-media').checked,
   });
 }
@@ -523,7 +497,6 @@ async function runFromFilter(
       featureIds: [...new Set(listScenarios().map((scenario) => scenario.family))],
       scenarioIds: listScenarios().map((scenario) => scenario.id),
       operations: [...new Set(listScenarios().map((scenario) => scenario.op))],
-      seedFactory: createSeed,
     });
   } catch (error) {
     handleValidationError(error);
@@ -535,14 +508,9 @@ async function runFromFilter(
   const controller = new AbortController();
   const startedAtIso = new Date().toISOString();
   const drawEngines = await resolveEngineInstanceIds(configuration.engineIds);
-  // The runner shuffles registry keys, then constructed adapters report their canonical instance
-  // ids. Mirror that exact sequence here: shuffling the versioned ids directly can produce a
-  // different order for the same seed (for example `mediabunny` vs `mediabunny@1.48.0`).
   const registryExecutionOrder = buildExecutionOrder(
     [...configuration.engineIds],
     configuration.scenarioIds as string[],
-    configuration.randomizeOrder,
-    configuration.randomSeed,
   );
   const instanceIdByRegistryId = new Map(configuration.engineIds.map((id, index) => [id, drawEngines[index] ?? id]));
   const executionOrder = registryExecutionOrder.map((cell) => ({
@@ -551,7 +519,6 @@ async function runFromFilter(
   }));
   const runId = `run-${canonicalContentHash({
     startedAtIso,
-    seed: configuration.randomSeed,
     browser: configuration.browser,
     executionOrder,
   })}`;
@@ -619,8 +586,6 @@ async function runFromFilter(
     scenarioIds: [...configuration.scenarioIds],
     pillar: configuration.pillar,
     benchOptions: { warmup: configuration.warmup, iters: configuration.iters },
-    randomizeOrder: configuration.randomizeOrder,
-    randomSeed: configuration.randomSeed,
     exhaustiveMedia: configuration.exhaustiveMedia,
     signal: controller.signal,
     onResult: (result) => {
@@ -933,12 +898,23 @@ async function downloadCachedResults(): Promise<void> {
     setRunStatus('Cache unavailable: IndexedDB is not available.');
     return;
   }
+  const exportButton = getEl<HTMLButtonElement>('export-cache');
+  exportButton.disabled = true;
+  setRunStatus('Preparing a validated current-schema cache bundle…');
   try {
     const bundle = await resultCache.exportBundle();
     downloadText(stablePrettyJson(bundle), `cache-${env.browser}-${Date.now()}.json`, 'application/json');
-    setRunStatus(`Validated cache bundle export started with ${bundle.entries.length} entries.`);
+    const excluded = bundle.excludedIncompatibleEntryCount;
+    setRunStatus(
+      `Validated cache bundle export started with ${bundle.entries.length} current-schema entries. ` +
+      (excluded === 0
+        ? 'No incompatible prior-epoch entries were present.'
+        : `Excluded ${excluded} incompatible prior-epoch entr${excluded === 1 ? 'y' : 'ies'}.`),
+    );
   } catch (error) {
     setRunStatus(`Cache export failed without changing live verdicts: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    exportButton.disabled = activeRun !== undefined;
   }
 }
 

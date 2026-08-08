@@ -1600,10 +1600,8 @@ export interface ScenarioResult {
    */
   primaryMetric?: MetricId;
   /**
-   * Per-scenario file rotation provenance (scenario-media-test-update-instructions §10). Records which
-   * input file this cell was actually run against so a result is reproducible from (runSeed, corpus)
-   * and a FAIL on a rotated real file is traceable to the exact bytes. Purely additive — NOT consumed
-   * by isAdmissible/scoring. Absent on legacy results (falls back to the scenario's baked input).
+   * Per-scenario file-selection provenance. Records the exact input used by this cell so cache
+   * identity and failures remain traceable to the selected bytes.
    */
   selection?: ResultSelection;
   /**
@@ -1657,8 +1655,7 @@ export interface ExhaustiveFileResult {
 /**
  * Which input file a result cell was run against under per-scenario file rotation (§6/§10).
  * `isBaked` distinguishes the golden-backed baked fixture (full oracle set) from a rotated real
- * download (survivor oracles only; golden-keyed oracles → NA_ASSET). Every rotating cell in one run
- * shares the same `runSeed`, so the pick is replayable.
+ * download (survivor oracles only; golden-keyed oracles → NA_ASSET).
  */
 export interface ResultSelection {
   /** on-disk file name actually fed to the engine: baked flat asset id, or a real download 'NN.ext'. */
@@ -1667,8 +1664,6 @@ export interface ResultSelection {
   sha256?: string;
   /** true ⇒ the golden-backed baked fixture was selected; false ⇒ a rotated real internet file. */
   isBaked: boolean;
-  /** the run's selection seed (RunOptions.randomSeed), so (runSeed, corpus) replays the pick byte-for-byte. */
-  runSeed?: string;
   /** total candidate files considered for this scenario this run (baked + shape-passing real files). */
   candidateCount?: number;
   /** Full canonical identity of the eligible candidate pool used for fairness/replay. */
@@ -1679,9 +1674,6 @@ export interface ResultSelection {
   candidateIdentity?: string;
   selectionPolicyVersion?: string;
   selectionAlgorithmId?: string;
-  /** Full HRW score used for the selected candidate. */
-  score?: string;
-  probability?: { numerator: 1; denominator: number; weight: 1 };
   /** Typed oracle evidence-plan contract included in cache/replay identity. */
   evidenceContractDigest?: string;
   catalogState?: 'ready' | 'fallback';

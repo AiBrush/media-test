@@ -4,8 +4,8 @@
  * media-file rotation, scenario-media-test-update-instructions §6). Run: `bun scripts/test-media-selection.mjs`.
  *
  * Pure + in-memory (no dev server, no corpus on disk) except one graceful-fallback probe of
- * loadScenarioSources against an unreachable URL. Covers: seeded determinism + that rotation touches
- * BOTH the baked fixture and real files; the §6.3 input-shape gate (drop + warn, never selected);
+ * loadScenarioSources against an unreachable URL. Covers: canonical determinism + complete candidate
+ * enumeration; the §6.3 input-shape gate (drop + warn, never selected);
  * fixture-bound policy and contract-gated robustness variants (plus streaming-output / multi-input /
  * SYNTHETIC / STREAMING / HLS-DERIVED exclusions);
  * §6.4 id/url decoupling; DERIVED-CENC option + oracle surgery; and the checksum / cache-tag helpers.
@@ -16,6 +16,7 @@
 import {
   loadScenarioSources,
   selectForRun,
+  candidatesForRun,
   selectionCacheTag,
   computeCorpusChecksum,
   DECRYPT_METAMORPHIC_INVARIANT,
@@ -40,18 +41,8 @@ function sourcesOf(...rows) {
   return new Map(rows.map((r) => [r.scenarioId, r]));
 }
 
-/** Scan seeds until one yields a selection matching `pred`; returns { seed, sel }. */
-function firstSeedWhere(scenarios, sources, scenarioId, pred, opts) {
-  for (let i = 0; i < 5000; i++) {
-    const seed = `seed-${i}`;
-    const sel = selectForRun(scenarios, seed, sources, opts).get(scenarioId);
-    if (sel && pred(sel)) return { seed, sel };
-  }
-  throw new Error(`no seed found matching predicate for ${scenarioId} within 5000 tries`);
-}
-
 // ──────────────────────────────────────────────────────────────────────────────────────────────
-section('determinism + rotation touches baked AND real');
+section('canonical determinism + complete candidate enumeration');
 {
   const scenario = {
     id: 'probe/rot',
@@ -72,28 +63,16 @@ section('determinism + rotation touches baked AND real');
     ],
   });
 
-  // determinism: same seed → same pick, twice.
-  const a = selectForRun([scenario], 'seedX', sources).get('probe/rot');
-  const b = selectForRun([scenario], 'seedX', sources).get('probe/rot');
-  assert(a.selectedFile === b.selectedFile, 'same seed yields same selectedFile');
+  const a = selectForRun([scenario], sources).get('probe/rot');
+  const b = selectForRun([scenario], sources).get('probe/rot');
+  assert(a.selectedFile === b.selectedFile, 'repeated selection yields the same selectedFile');
   assert(a.candidateCount === 3, `candidateCount is baked+2 real = 3 (got ${a.candidateCount})`);
   ok(`deterministic; candidateCount=${a.candidateCount}`);
 
-  // distribution over 256 seeds touches baked AND ≥1 real file.
-  let baked = 0;
-  const realFiles = new Set();
-  for (let i = 0; i < 256; i++) {
-    const sel = selectForRun([scenario], `seed-${i}`, sources).get('probe/rot');
-    if (sel.isBaked) {
-      baked++;
-      assert(sel.selectedFile === 'baked_rot.mp4', 'baked pick reports the flat baked name');
-    } else {
-      realFiles.add(sel.selectedFile);
-    }
-  }
-  assert(baked > 0, `baked fixture selected at least once (got ${baked})`);
-  assert(realFiles.size >= 1, `≥1 distinct real file selected (got ${realFiles.size}: ${[...realFiles]})`);
-  ok(`over 256 seeds: baked=${baked}, real picks=${256 - baked}, distinct real files=${[...realFiles].join(',')}`);
+  const candidates = candidatesForRun([scenario], sources).get('probe/rot');
+  assert(candidates.some((selection) => selection.isBaked), 'candidate set includes the baked fixture');
+  assert(candidates.filter((selection) => !selection.isBaked).length === 2, 'candidate set includes both real files');
+  ok(`canonical=${a.selectedFile}; candidates=${candidates.map((selection) => selection.selectedFile).join(',')}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -118,19 +97,17 @@ section('§6.3 shape gate: wrong-container real file dropped + warned + never se
     ],
   });
 
-  const sel = selectForRun([scenario], 'seedShape', sources).get('probe/shape');
+  const sel = selectForRun([scenario], sources).get('probe/shape');
   assert(sel.shapeWarnings.length === 1, `exactly one shape warning (got ${sel.shapeWarnings.length})`);
   assert(sel.shapeWarnings[0].includes('02.webm'), 'warning names the dropped file 02.webm');
   assert(sel.shapeWarnings[0].includes('container'), 'warning explains the container mismatch');
   assert(sel.candidateCount === 2, `candidateCount = baked + 1 shape-passing real (got ${sel.candidateCount})`);
   ok(`warning: ${sel.shapeWarnings[0]}`);
 
-  // 02.webm must never be selected across many seeds.
-  const picks = new Set();
-  for (let i = 0; i < 300; i++) picks.add(selectForRun([scenario], `s${i}`, sources).get('probe/shape').selectedFile);
+  const picks = new Set(candidatesForRun([scenario], sources).get('probe/shape').map((entry) => entry.selectedFile));
   assert(!picks.has('02.webm'), 'dropped 02.webm is never selected');
-  assert(picks.has('baked_shape.mp4') && picks.has('01.mp4'), 'both surviving candidates are reachable');
-  ok(`reachable picks: ${[...picks].join(', ')}`);
+  assert(picks.has('baked_shape.mp4') && picks.has('01.mp4'), 'both surviving candidates are enumerated');
+  ok(`eligible candidates: ${[...picks].join(', ')}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -168,22 +145,16 @@ section('contract/policy exclusions: undeclared robustness / streaming-output / 
 
   for (const c of cases) {
     const sources = sourcesOf(c.row);
-    let allBaked = true;
-    let cc = 0;
-    for (let i = 0; i < 128; i++) {
-      const sel = selectForRun([c.scn], `p${i}`, sources).get(c.scn.id);
-      cc = sel.candidateCount;
-      if (!sel.isBaked) { allBaked = false; break; }
-    }
-    assert(allBaked, `${c.name}: always baked`);
-    assert(cc === 1, `${c.name}: candidateCount === 1 (got ${cc})`);
+    const sel = selectForRun([c.scn], sources).get(c.scn.id);
+    assert(sel.isBaked, `${c.name}: canonical candidate is baked`);
+    assert(sel.candidateCount === 1, `${c.name}: candidateCount === 1 (got ${sel.candidateCount})`);
     ok(`${c.name}: candidate rejected by contract/policy, candidateCount=1`);
   }
 
   // multi-input mux: baked-only + one ResolvedInput per input, ids are the flat names.
   const mux = { id: 'mux/two', family: 'mux', op: 'mux', input: ['a.mp4', 'b.mp4'], options: {}, oracles: ['reference-reimport'], metrics: ['wall'] };
   const muxRow = { scenarioId: 'mux/two', class: 'REAL', requires: { container: 'mp4', video: true, videoCodecs: ['h264'], audioCodecs: ['aac'] }, files: [{ file: '01.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'], sha256: digest('m1'), sizeBytes: 10 }] };
-  const msel = selectForRun([mux], 'seedMux', sourcesOf(muxRow)).get('mux/two');
+  const msel = selectForRun([mux], sourcesOf(muxRow)).get('mux/two');
   assert(msel.isBaked === true, 'multi-input mux stays baked');
   assert(msel.resolvedInputs.length === 2, 'multi-input yields 2 resolved inputs');
   assert(msel.resolvedInputs[0].id === 'a.mp4' && msel.resolvedInputs[1].id === 'b.mp4', 'resolved ids are the flat names');
@@ -194,9 +165,8 @@ section('contract/policy exclusions: undeclared robustness / streaming-output / 
   // rotate:false forces baked even for a rotatable REAL row.
   const rotScn = { id: 'probe/rot', family: 'probe', op: 'probe', input: 'baked_rot.mp4', options: {}, oracles: ['golden-metadata'], metrics: ['wall'] };
   const rotRow = { scenarioId: 'probe/rot', class: 'REAL', requires: { container: 'mp4', video: true, videoCodecs: ['h264'], audioCodecs: ['aac'] }, files: [{ file: '01.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'], sha256: digest('z1'), sizeBytes: 10 }] };
-  let forcedBaked = true;
-  for (let i = 0; i < 64; i++) if (!selectForRun([rotScn], `f${i}`, sourcesOf(rotRow), { rotate: false }).get('probe/rot').isBaked) { forcedBaked = false; break; }
-  assert(forcedBaked, 'rotate:false forces baked for every seed');
+  const forcedBaked = selectForRun([rotScn], sourcesOf(rotRow), { rotate: false }).get('probe/rot').isBaked;
+  assert(forcedBaked, 'rotate:false forces the baked candidate');
   ok('rotate:false → always baked');
 }
 
@@ -212,7 +182,7 @@ section('§6.4 id/url decoupling: baked id = flat asset id (url into scenario di
   });
 
   // baked (forced): id is the FLAT asset id, url points into the scenario dir.
-  const bakedSel = selectForRun([scenario], 'anything', sources, { rotate: false }).get('probe/rot');
+  const bakedSel = selectForRun([scenario], sources, { rotate: false }).get('probe/rot');
   const bi = bakedSel.resolvedInputs[0];
   assert(bi.id === 'baked_rot.mp4', `baked ResolvedInput.id is the flat asset id (got ${bi.id})`);
   assert(bi.urlAssetPath === 'scenarios/probe/rot/baked_rot.mp4', `baked url points into the scenario dir (got ${bi.urlAssetPath})`);
@@ -221,7 +191,8 @@ section('§6.4 id/url decoupling: baked id = flat asset id (url into scenario di
   ok(`baked: id='${bi.id}', url='${bi.urlAssetPath}', sha=${bi.sha256}`);
 
   // real: id starts 'scenarios/', equals url, carries sha+size from the catalog.
-  const { sel: realSel } = firstSeedWhere([scenario], sources, 'probe/rot', (s) => !s.isBaked);
+  const realSel = candidatesForRun([scenario], sources).get('probe/rot').find((selection) => !selection.isBaked);
+  assert(realSel, 'real candidate is present');
   const ri = realSel.resolvedInputs[0];
   assert(ri.id.startsWith('scenarios/'), `real ResolvedInput.id starts 'scenarios/' (got ${ri.id})`);
   assert(ri.id === 'scenarios/probe/rot/01.mp4', `real id is the scenario-dir path (got ${ri.id})`);
@@ -285,7 +256,9 @@ section('DERIVED CENC-MP4 surgery: exact key/base-bound invariant only');
   });
 
   // --- when the REAL derived file is picked: full surgery ---
-  const { sel: realSel } = firstSeedWhere([scenario], sources, 'encryption/cenc_ctr_decrypt', (s) => !s.isBaked);
+  const derivedCandidates = candidatesForRun([scenario], sources).get('encryption/cenc_ctr_decrypt');
+  const realSel = derivedCandidates.find((selection) => !selection.isBaked);
+  assert(realSel, 'derived real candidate is present');
   const eff = realSel.effectiveScenario;
   assert(eff.options.key.keyHex === realKeys.keyHex, `options.key.keyHex ← real file key (got ${eff.options.key.keyHex})`);
   assert(eff.options.key.kid === realKeys.kid, 'options.key.kid ← real file kid');
@@ -305,7 +278,8 @@ section('DERIVED CENC-MP4 surgery: exact key/base-bound invariant only');
   ok(`real derived: re-keyed, invariant='${eff.options.invariant}', oracles=[${eff.oracles.join(', ')}]`);
 
   // --- when the BAKED twin is picked: options + oracles untouched ---
-  const { sel: bakedSel } = firstSeedWhere([scenario], sources, 'encryption/cenc_ctr_decrypt', (s) => s.isBaked);
+  const bakedSel = derivedCandidates.find((selection) => selection.isBaked);
+  assert(bakedSel, 'derived baked candidate is present');
   const beff = bakedSel.effectiveScenario;
   assert(beff.options.cleartextAsset === 'cenc_ctr_clear.mp4', 'baked keeps cleartextAsset');
   assert(beff.options.key.keyHex === '00112233445566778899aabbccddeeff', 'baked keeps the baked key');
@@ -358,11 +332,10 @@ section('§6.3 duration gate: trim drops real files too short for the range targ
     ],
   });
   // The 1.0s file is dropped with a duration warning; the 10.0s file survives.
-  const anySel = selectForRun([trim], 'seed-0', sources).get('trim/copy');
+  const anySel = selectForRun([trim], sources).get('trim/copy');
   assert(anySel.shapeWarnings.some((w) => w.includes('01.mp4') && /too short/.test(w)), 'too-short 01.mp4 dropped with a duration warning');
   assert(anySel.candidateCount === 2, `candidateCount = baked + 1 long-enough real (got ${anySel.candidateCount})`);
-  const picks = new Set();
-  for (let i = 0; i < 256; i++) picks.add(selectForRun([trim], `s-${i}`, sources).get('trim/copy').selectedFile);
+  const picks = new Set(candidatesForRun([trim], sources).get('trim/copy').map((selection) => selection.selectedFile));
   assert(!picks.has('01.mp4'), 'the too-short file is NEVER selected');
   assert(picks.has('02.mp4') && picks.has('baked_trim.mp4'), 'baked and the long-enough real file are both reachable');
   ok('trim duration gate drops too-short files, keeps long-enough + baked');
@@ -384,12 +357,8 @@ section('§8 "seek: Caution" — seek scenarios never rotate (baked-only)');
       { file: '02.mp4', container: 'mp4', videoCodecs: ['h264'], audioCodecs: ['aac'], sha256: digest('seekf222'), sizeBytes: 600, durationSec: 30.0 },
     ],
   });
-  let allBaked = true;
-  for (let i = 0; i < 256; i++) {
-    const sel = selectForRun([seek], `sk-${i}`, sources).get('decode-seek/seek_kf');
-    if (!sel.isBaked || sel.candidateCount !== 1) allBaked = false;
-  }
-  assert(allBaked, 'op=seek is baked-only for every seed (candidateCount === 1), despite long-enough real files');
+  const sel = selectForRun([seek], sources).get('decode-seek/seek_kf');
+  assert(sel.isBaked && sel.candidateCount === 1, 'op=seek is baked-only despite long-enough real files');
   ok('seek scenarios stay baked (no signal on real + spurious op errors avoided)');
 }
 

@@ -86,7 +86,7 @@ export function normalizeScenarioResult(
       suiteVersion: result.env?.suiteVersion ?? null,
       browser: result.browser,
       environment,
-      selectionSeed: result.selection?.runSeed ?? null,
+      selectedInput: result.selection?.executedInputDigest ?? result.selection?.sha256 ?? null,
     })}`;
   const observationId = firstString(source.observationId, reporting.observationId)
     ?? `obs-${canonicalContentHash({ runId, engineId: result.engineId, browser: result.browser, scenarioId: result.scenarioId })}`;
@@ -491,7 +491,6 @@ function deriveCohortInput(
     corpusChecksum: result.env?.corpusChecksum,
     selectedFileSetHash: canonicalContentHash(selectedFiles),
     mutationHash: mutationEvidence ? canonicalContentHash(mutationEvidence) : undefined,
-    rotationSeed: result.selection?.runSeed,
     primaryMetric,
     primaryUnit: primary?.unit,
     metricDirection: primary?.direction,
@@ -868,7 +867,6 @@ const COHORT_DIMENSION_KEYS: readonly (keyof CohortDimensions)[] = [
   'corpusChecksum',
   'selectedFileSetHash',
   'mutationHash',
-  'rotationSeed',
   'runSelectionHash',
   'primaryMetric',
   'primaryUnit',

@@ -124,10 +124,7 @@ import {
 } from './fixture-integrity.ts';
 import { readOutputPacketsResult, readOutputStructureResult } from './box-readers.ts';
 import { disabledCellReason } from './disabled-cells.ts';
-// Per-scenario media-file rotation (§6/§10): the ONE seeded RNG shared with media-selection, plus the
-// selection API. The runner only decides WHICH file is fetched — it never mutates bytes, softens an
-// oracle, or routes a real defect to NA (hard rules R1/R2/R3).
-import { mulberry32, hashSeed, sha256Hex } from './seeded-rng.ts';
+import { sha256Hex } from './seeded-rng.ts';
 import {
   loadScenarioSources,
   selectForRun,
@@ -674,21 +671,16 @@ export interface RunOptions {
   operations?: Operation[]; // optional op-level filter, e.g. demux|remux
   pillar?: 'functional' | 'performance' | 'robustness' | 'all'; // default 'all'
   benchOptions?: BenchOptions;
-  /** Shuffle the engine/scenario cell queue once at run start. */
-  randomizeOrder?: boolean;
-  /** Optional seed used when randomizeOrder is enabled, so UI highlighting can mirror the runner. */
-  randomSeed?: string;
   /**
-   * Per-scenario media-file rotation (§6/§10). true (default) ⇒ pick ONE input per scenario from
-   * {baked fixture} ∪ {shape-matching real files}, seeded on randomSeed. false ⇒ force the baked
-   * fixture everywhere (baked-canonical audit / debug). Never mutates a file, never softens an oracle.
+   * Per-scenario media-file selection. true (default) ⇒ pick the canonical input from
+   * {baked fixture} ∪ {shape-matching real files}. false ⇒ force the baked fixture everywhere.
    */
   rotateMedia?: boolean;
   /**
    * Exhaustive media mode (§6.2). true ⇒ run EVERY candidate file (baked + all shape/duration-passing
    * real files) per scenario, in the same order for every engine, and aggregate: the cell PASSes only
    * if ALL files pass (any file FAIL/ERROR ⇒ cell FAIL, naming the file), and the bench is the MEDIAN
-   * across the passing files (+ per-file spread). Default off (one seeded file per run, ~constant time).
+   * across the passing files (+ per-file spread). Default off (one canonical file per run).
    */
   exhaustiveMedia?: boolean;
   onResult?: (r: ScenarioResult) => void;
@@ -727,14 +719,11 @@ export interface MatrixCellRef {
 export function buildExecutionOrder(
   engineIds: string[],
   scenarioIds: string[],
-  randomizeOrder = false,
-  randomSeed = '',
 ): MatrixCellRef[] {
   const order: MatrixCellRef[] = [];
   for (const scenarioId of scenarioIds) {
     for (const engineId of engineIds) order.push({ engineId, scenarioId });
   }
-  if (randomizeOrder && order.length > 1) shuffleInPlace(order, randomSeed);
   return order;
 }
 
@@ -772,8 +761,6 @@ export interface RunOneOptions extends Partial<RunOptions> {
     candidateIdentity?: string;
     selectionPolicyVersion?: string;
     selectionAlgorithmId?: string;
-    score?: string;
-    probability?: { numerator: 1; denominator: number; weight: 1 };
     evidenceContractDigest?: string;
     catalogState?: 'ready' | 'fallback';
     catalogReason?: { reasonCode: string; detail: string };
@@ -787,8 +774,6 @@ export interface RunOneOptions extends Partial<RunOptions> {
   /** Engine-facing key bytes admitted by the source-record parity preflight. Scenario provenance is
    * retained for fingerprints/oracles but is never forwarded through the adapter key object. */
   decryptKeyOverride?: DecryptKey;
-  /** the run's selection seed (RunOptions.randomSeed), recorded in the result's selection for replay. */
-  runSeed?: string;
   /** Cache candidate is validated only after current engine/browser/asset/golden preflight. */
   cachedResult?: ScenarioResult;
   /** Run-wide executed behavior evidence; direct runOne callers may omit it and execute locally. */
@@ -876,7 +861,6 @@ function preContentBlockedResult(
   selection: ScenarioSelection,
   blocker: PreContentSupportBlocker,
   env: RunEnv,
-  runSeed?: string,
 ): ScenarioResult {
   const result = selectedStatusResult(
     engineId,
@@ -886,7 +870,6 @@ function preContentBlockedResult(
     blocker.decision.status,
     `[${blocker.decision.reasonCode}] ${blocker.decision.reason}`,
     env,
-    runSeed,
   );
   result.support = {
     request: blocker.request,
@@ -1762,9 +1745,32 @@ function scenarioRequiresRobustnessIsolation(scenario: Scenario): boolean {
   );
 }
 
+function benchmarkProtocolIdentity(
+  scenario: Scenario,
+  pillar: RunOptions['pillar'],
+  options: BenchOptions | undefined,
+): unknown {
+  return {
+    schema: 'media-test/benchmark-protocol@2',
+    pillar: pillar ?? 'all',
+    metrics: scenario.metrics,
+    primaryMetric: scenario.primaryMetric ?? null,
+    adaptiveTiming: {
+      schema: 'media-test/adaptive-timing@1',
+      warmup: options?.warmup ?? DEFAULT_BENCH.warmup,
+      iters: options?.iters ?? DEFAULT_BENCH.iters,
+      noiseBandPct: options?.noiseBandPct ?? DEFAULT_BENCH.noiseBandPct,
+      minDurationMs: options?.minDurationMs ?? DEFAULT_BENCH.minDurationMs,
+      minRepetitions: options?.minRepetitions ?? DEFAULT_BENCH.minRepetitions,
+      slowRepetitions: options?.slowRepetitions ?? DEFAULT_BENCH.slowRepetitions,
+      maxInnerIterations: options?.maxInnerIterations ?? DEFAULT_BENCH.maxInnerIterations,
+    },
+  };
+}
+
 function fullSelectionCacheTag(selection: ScenarioSelection): string {
   return `selection-sha256:${canonicalJsonSha256({
-    schema: 'media-test/selection-cache-contract@1',
+    schema: 'media-test/selection-cache-contract@2',
     executedInput: selectionCacheTag(selection),
     eligiblePoolDigest: selection.eligiblePoolDigest ?? null,
     candidateIdentity: selection.candidateIdentity ?? null,
@@ -1786,8 +1792,11 @@ function restoreLogicalScenarioId(result: ScenarioResult, scenarioId: string): S
  * A persistent result-cache hit is already bound to the exact selected-input key and has passed the
  * cache's validation epoch/TTL policy. For immutable, digest-declared selections, re-downloading the
  * complete body before accepting that hit defeats the cache (the long-form audio exhaustive set is
- * roughly 800 MB). Keep the strict runOne fingerprint path for untrusted/in-memory stores and for
- * selection types whose complete resource closure is discovered from the body itself.
+ * roughly 800 MB). The persistent lookup key also binds the complete current cell contract,
+ * including benchmark options, so an unavailable measurement is still a valid reusable observation
+ * rather than a reason to fetch the media again. Keep the strict runOne fingerprint path for
+ * untrusted/in-memory stores and for selection types whose complete resource closure is discovered
+ * from the body itself.
  */
 function exactPersistedSelectionResult(
   cached: ScenarioResult | undefined,
@@ -1798,9 +1807,7 @@ function exactPersistedSelectionResult(
   selection: ScenarioSelection,
   exhaustiveSelections: readonly ScenarioSelection[] | undefined,
   runEnvBase: RunEnv,
-  runSeed: string | undefined,
   pillar: RunOptions['pillar'],
-  benchOptions: BenchOptions | undefined,
   cacheLookupDurationMs: number,
 ): ScenarioResult | undefined {
   if (!cached?.cacheReuse || cached.cacheReuse.schema !== 'media-test/cache-reuse@1') return undefined;
@@ -1829,33 +1836,28 @@ function exactPersistedSelectionResult(
   ) {
     return undefined;
   }
-  if (!cacheMeasurementProtocolMatches(cached, scenario, pillar, benchOptions)) return undefined;
-
   let exhaustive: ScenarioResult['exhaustive'];
   let currentSelection: ScenarioResult['selection'];
   if (exhaustiveSelections && exhaustiveSelections.length > 0) {
-    if (!cached.exhaustive || !cachedExhaustiveSetMatches(cached.exhaustive, exhaustiveSelections)) {
+    if (
+      !cached.exhaustive ||
+      cached.exhaustive.some((entry) => entry.status === 'SKIPPED') ||
+      !cachedExhaustiveSetMatches(cached.exhaustive, exhaustiveSelections)
+    ) {
       return undefined;
     }
     exhaustive = cached.exhaustive.map((entry) => ({
       ...entry,
       reason: cachedResultReason(entry.reason, entry.status),
-      ...(entry.selection
-        ? { selection: replaceSelectionRunSeed(entry.selection, runSeed) }
-        : {}),
+      ...(entry.selection ? { selection: entry.selection } : {}),
       ...(entry.cacheReuse
         ? { cacheReuse: exactSelectionCacheReuse(entry.cacheReuse) }
         : {}),
     }));
-    currentSelection = cached.selection
-      ? replaceSelectionRunSeed(cached.selection, runSeed)
-      : undefined;
+    currentSelection = cached.selection;
   } else {
     if (cached.exhaustive || !cachedSelectionMatches(selection, cached.selection)) return undefined;
-    currentSelection = {
-      ...resultSelectionFor(selection),
-      ...(runSeed !== undefined ? { runSeed } : {}),
-    };
+    currentSelection = resultSelectionFor(selection);
   }
 
   const result: ScenarioResult = {
@@ -1909,83 +1911,19 @@ function selectionAllowsExactPersistedReuse(selection: ScenarioSelection): boole
 
 function cacheEnvironmentMatches(cached: RunEnv | undefined, current: RunEnv): boolean {
   if (!cached) return false;
+  // corpusChecksum describes every scenario selected for a run. It is report provenance, not an
+  // individual cell input: adding an unrelated scenario changes it even though this cell's exact
+  // selection key, selected bytes, browser, and engine are unchanged. Comparing it here turned a
+  // subset -> superset run into a cache miss for every previously completed cell.
   const identity = (env: RunEnv): unknown => ({
     suiteVersion: env.suiteVersion,
     engineId: env.engineId,
     browser: env.browser,
     browserVersion: env.browserVersion ?? null,
     userAgent: env.userAgent ?? null,
-    corpusChecksum: env.corpusChecksum ?? null,
     pixelBehavior: env.pixelBehavior ?? null,
   });
   return stableCanonicalString(identity(cached)) === stableCanonicalString(identity(current));
-}
-
-function cacheMeasurementProtocolMatches(
-  cached: ScenarioResult,
-  scenario: Scenario,
-  pillar: RunOptions['pillar'],
-  benchOptions: BenchOptions | undefined,
-): boolean {
-  const wantsPerformance = (pillar ?? 'all') === 'all' || pillar === 'performance';
-  if (!wantsPerformance || scenario.metrics.length === 0) return true;
-  const observations = cached.exhaustive ?? [cached];
-  for (const observation of observations) {
-    if (observation.status !== 'PASS') continue;
-    if (observation.measurement?.state !== 'AVAILABLE' || !observation.bench) return false;
-    for (const metric of scenario.metrics) {
-      const summary = observation.bench[metric];
-      if (!summary || !adaptiveTimingProtocolMatches(summary, benchOptions)) return false;
-    }
-    if (
-      scenario.op === 'probe' &&
-      probeBudgetFromOptions(scenario.options) !== undefined &&
-      scenario.metrics.includes('peakMemory')
-    ) {
-      const primary = observation.bench[scenario.primaryMetric ?? scenario.metrics[0]!];
-      if (!primary || !authenticatedScaleProbeMemoryProtocolMatches(primary)) return false;
-    }
-  }
-  return true;
-}
-
-function authenticatedScaleProbeMemoryProtocolMatches(summary: BenchSummary): boolean {
-  const evidence = recordOption(summary.protocolEvidence);
-  const memory = evidence?.memory;
-  if (!Array.isArray(memory) || memory.length !== summary.n) return false;
-  return memory.every((value) => {
-    const observation = recordOption(value);
-    if (
-      observation?.schema !== 'media-test/memory-window@1' ||
-      observation?.immediateOperationSample !== true ||
-      observation.operationSampleLimit !== 1 ||
-      observation.settleWindowMs !== 0 ||
-      observation.sampleTimeoutMs !== DEFAULT_MEMORY_SAMPLE_TIMEOUT_MS
-    ) return false;
-    const samples = observation.samples;
-    if (!Array.isArray(samples) || samples.length !== 3) return false;
-    return samples.map((sample) => recordOption(sample)?.phase).join(',') === 'baseline,operation,end';
-  });
-}
-
-function adaptiveTimingProtocolMatches(summary: BenchSummary, options: BenchOptions | undefined): boolean {
-  const evidence = recordOption(summary.protocolEvidence);
-  const timing = recordOption(evidence?.timingProtocol);
-  if (timing?.schema !== 'media-test/adaptive-timing@1') return false;
-  const warmup = options?.warmup ?? DEFAULT_BENCH.warmup;
-  const requested = options?.iters ?? DEFAULT_BENCH.iters;
-  const minDurationMs = options?.minDurationMs ?? DEFAULT_BENCH.minDurationMs;
-  const minRepetitions = options?.minRepetitions ?? DEFAULT_BENCH.minRepetitions;
-  const slowRepetitions = options?.slowRepetitions ?? DEFAULT_BENCH.slowRepetitions;
-  const slowOperation = timing.slowOperation === true;
-  const measuredCount = Math.max(requested, slowOperation ? slowRepetitions : minRepetitions);
-  return (
-    timing.warmupCount === warmup &&
-    timing.minDurationMs === minDurationMs &&
-    timing.measuredCount === measuredCount &&
-    summary.warmup === warmup &&
-    summary.n === measuredCount
-  );
 }
 
 function cachedExhaustiveSetMatches(
@@ -2042,17 +1980,6 @@ function cachedSelectionMatches(
     catalogState: expected.catalogState ?? null,
     catalogReason: expected.catalogReason ?? null,
   });
-}
-
-function replaceSelectionRunSeed(
-  selection: NonNullable<ScenarioResult['selection']>,
-  runSeed: string | undefined,
-): NonNullable<ScenarioResult['selection']> {
-  const { runSeed: _priorRunSeed, ...withoutPriorSeed } = selection;
-  return {
-    ...withoutPriorSeed,
-    ...(runSeed !== undefined ? { runSeed } : {}),
-  };
 }
 
 function exactSelectionCacheReuse(
@@ -2245,7 +2172,6 @@ function blockedSelectionResult(
   selection: ScenarioSelection,
   prepared: Exclude<PreparedSelection, { state: 'VERIFIED' }>,
   env: RunEnv,
-  runSeed?: string,
 ): ScenarioResult {
   return selectedStatusResult(
     engineId,
@@ -2255,7 +2181,6 @@ function blockedSelectionResult(
     prepared.state,
     prepared.reason,
     env,
-    runSeed,
   );
 }
 
@@ -2267,7 +2192,6 @@ function selectedStatusResult(
   status: ScenarioResult['status'],
   reason: string,
   env: RunEnv,
-  runSeed?: string,
 ): ScenarioResult {
   const oracleOutcomes: OracleOutcome[] = [];
   const result: ScenarioResult = {
@@ -2278,10 +2202,7 @@ function selectedStatusResult(
     status,
     oracleOutcomes,
     reason,
-    selection: {
-      ...resultSelectionFor(selection),
-      ...(runSeed !== undefined ? { runSeed } : {}),
-    },
+    selection: resultSelectionFor(selection),
     env: { ...env, engineId },
     measurement: { state: 'NOT_REQUESTED' },
   };
@@ -2303,7 +2224,6 @@ function matrixSelectionStatusResult(
   selection: ScenarioSelection,
   exhaustiveSelections: readonly ScenarioSelection[] | undefined,
   env: RunEnv,
-  runSeed?: string,
 ): ScenarioResult {
   if (exhaustiveSelections && exhaustiveSelections.length > 0) {
     return aggregateExhaustive(
@@ -2320,14 +2240,12 @@ function matrixSelectionStatusResult(
           status,
           reason,
           env,
-          runSeed,
         ),
       })),
       env,
-      runSeed,
     );
   }
-  return selectedStatusResult(engineId, browser, scenario, selection, status, reason, env, runSeed);
+  return selectedStatusResult(engineId, browser, scenario, selection, status, reason, env);
 }
 
 function resultSelectionFor(
@@ -2348,8 +2266,6 @@ function resultSelectionFor(
     ...(selection.selectionAlgorithmId
       ? { selectionAlgorithmId: selection.selectionAlgorithmId }
       : {}),
-    ...(selection.score ? { score: selection.score } : {}),
-    ...(selection.probability ? { probability: selection.probability } : {}),
     ...(selection.evidencePlan?.contractDigest
       ? { evidenceContractDigest: selection.evidencePlan.contractDigest }
       : {}),
@@ -2408,7 +2324,6 @@ export async function runRobustnessCellInWorker(
         : {}),
       ...(runOneOpts.verifiedContents ? { verifiedContents: runOneOpts.verifiedContents } : {}),
       ...(runOneOpts.decryptKeyOverride ? { decryptKeyOverride: runOneOpts.decryptKeyOverride } : {}),
-      ...(runOneOpts.runSeed !== undefined ? { runSeed: runOneOpts.runSeed } : {}),
       pixelBehavior: runOneOpts.pixelBehavior ?? {
         state: 'UNSUPPORTED',
         reasonCode: 'PIXEL_API_UNAVAILABLE',
@@ -2976,14 +2891,11 @@ export interface ExecutionFingerprintComponents {
     sizeBytes?: number;
     transport?: ResolvedInput['transport'];
   }>;
-  /**
-   * Selection/evidence identity for the observation.  Deliberately excludes the run seed: two
-   * seeds that resolve to the same verified bytes may reuse an observation, while a changed pool,
-   * candidate, or evidence contract may not retain stale provenance.
-   */
+  /** Selection/evidence identity for the observation and persistent cache. */
   selectionContract?: unknown;
   /** Performance protocol is part of an observation, even when correctness inputs are unchanged. */
   benchmarkProtocol?: unknown;
+  /** Optional cell-local corpus identity. Never pass the run-wide selected-scenario aggregate here. */
   corpusChecksum?: string;
   goldenHashes: Array<{ assetId: string; kind: string; sha256: string }>;
 }
@@ -3174,18 +3086,119 @@ async function buildCellExecutionFingerprint(
           },
         }
       : {}),
-    benchmarkProtocol: {
-      schema: 'media-test/benchmark-protocol@1',
-      pillar: opts?.pillar ?? 'all',
-      metrics: scenario.metrics,
-      primaryMetric: scenario.primaryMetric ?? null,
-      warmup: opts?.benchOptions?.warmup ?? DEFAULT_BENCH.warmup,
-      iters: opts?.benchOptions?.iters ?? DEFAULT_BENCH.iters,
-      noiseBandPct: opts?.benchOptions?.noiseBandPct ?? DEFAULT_BENCH.noiseBandPct,
-    },
-    ...(opts?.env?.corpusChecksum ? { corpusChecksum: opts.env.corpusChecksum } : {}),
+    benchmarkProtocol: benchmarkProtocolIdentity(scenario, opts?.pillar, opts?.benchOptions),
+    // RunEnv.corpusChecksum is a run-wide reporting aggregate. selectedAssets and
+    // selectionContract already bind the exact inputs for this observation; including the aggregate
+    // would invalidate this cell merely because another scenario was added to the run.
     goldenHashes,
   });
+}
+
+interface MatrixPreflightFingerprintOptions {
+  engine: MediaEngine;
+  capabilities: CapabilitySet;
+  scenario: Scenario;
+  browser: BrowserName;
+  environment: RunEnv;
+  pixelBehavior: PixelBehaviorEvidence;
+  selection: ScenarioSelection;
+  exhaustiveSelections?: readonly ScenarioSelection[];
+  pillar?: RunOptions['pillar'];
+  benchOptions?: BenchOptions;
+  stage: string;
+  outcome: unknown;
+}
+
+/**
+ * Capability-only terminal cells are real observations too. Give them the same content-addressed
+ * identity discipline as executed cells so a persisted NA_ENGINE does not become an invalid cache
+ * row and force the next run through the same matrix cell again.
+ */
+async function buildMatrixPreflightFingerprint(
+  options: MatrixPreflightFingerprintOptions,
+): Promise<ExecutionFingerprint> {
+  const selections = options.exhaustiveSelections?.length
+    ? [...options.exhaustiveSelections]
+    : [options.selection];
+  selections.sort((left, right) => fullSelectionCacheTag(left).localeCompare(fullSelectionCacheTag(right)));
+  const selectedAssets: ExecutionFingerprintComponents['selectedAssets'] = selections.flatMap((selection) =>
+    selection.resolvedInputs.map((resolved, index) => ({
+      id: `${selection.selectedFile}\u0000${index}\u0000${resolved.id}`,
+      ...(resolved.sha256 ? { sha256: resolved.sha256 } : {}),
+      ...(resolved.sizeBytes !== undefined ? { sizeBytes: resolved.sizeBytes } : {}),
+      ...(resolved.transport ? { transport: resolved.transport } : {}),
+    })));
+  return buildExecutionFingerprint({
+    suiteVersion: options.environment.suiteVersion,
+    resultSchema: EXECUTION_RESULT_SCHEMA,
+    oracleModelVersion: ORACLE_MODEL_VERSION,
+    scenarioDefinition: options.scenario,
+    engine: {
+      id: options.engine.id,
+      ...(options.engine.configUsed !== undefined ? { config: options.engine.configUsed } : {}),
+      capabilities: options.capabilities,
+      ...(options.engine.benchmarkLimits !== undefined
+        ? { benchmarkLimits: options.engine.benchmarkLimits }
+        : {}),
+    },
+    browser: {
+      family: options.browser,
+      ...(options.environment.browserVersion ? { version: options.environment.browserVersion } : {}),
+      ...(options.environment.userAgent ? { userAgent: options.environment.userAgent } : {}),
+      pixelBehavior: options.pixelBehavior,
+    },
+    supportDecision: {
+      schema: 'media-test/matrix-preflight@1',
+      stage: options.stage,
+      outcome: options.outcome,
+    },
+    selectedAssets,
+    selectionContract: {
+      schema: 'media-test/matrix-preflight-selection@1',
+      selections: selections.map((selection) => fullSelectionCacheTag(selection)),
+    },
+    benchmarkProtocol: benchmarkProtocolIdentity(
+      options.scenario,
+      options.pillar,
+      options.benchOptions,
+    ),
+    goldenHashes: [],
+  });
+}
+
+function reuseFingerprintedMatrixPreflight(
+  current: ScenarioResult,
+  cached: ScenarioResult | undefined,
+  logicalScenarioId: string,
+  fingerprint: ExecutionFingerprint,
+): ScenarioResult {
+  const fingerprinted: ScenarioResult = { ...current, executionFingerprint: fingerprint };
+  const candidate = cached ? restoreLogicalScenarioId(cached, logicalScenarioId) : undefined;
+  if (
+    !candidate?.cacheReuse ||
+    candidate.engineId !== current.engineId ||
+    candidate.browser !== current.browser ||
+    candidate.family !== current.family ||
+    candidate.status !== current.status ||
+    !isExecutionFingerprintReusable(candidate, fingerprint)
+  ) {
+    return fingerprinted;
+  }
+  const cacheReuse = exactSelectionCacheReuse(candidate.cacheReuse);
+  return {
+    ...fingerprinted,
+    reason: cachedResultReason(current.reason, current.status),
+    cacheReuse,
+    ...(current.exhaustive
+      ? {
+          exhaustive: current.exhaustive.map((entry) => ({
+            ...entry,
+            reason: cachedResultReason(entry.reason, entry.status),
+            cacheReuse,
+          })),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -4417,6 +4430,7 @@ async function runExhaustiveCell(
   scenario: Scenario,
   opts: RunOptions,
   support: CodecSupport,
+  capabilities: CapabilitySet,
   runEnvBase: RunEnv,
   pillar: NonNullable<RunOptions['pillar']>,
   pixelBehavior: PixelBehaviorEvidence,
@@ -4465,16 +4479,29 @@ async function runExhaustiveCell(
       }
       const preContentBlock = preContentBlockers.get(candidate);
       if (preContentBlock) {
+        const blocked = preContentBlockedResult(
+          instanceId,
+          opts.browser,
+          candidate,
+          preContentBlock,
+          runEnvBase,
+        );
+        blocked.executionFingerprint = await buildMatrixPreflightFingerprint({
+          engine: firstEngine,
+          capabilities,
+          scenario: candidate.effectiveScenario,
+          browser: opts.browser,
+          environment: runEnvBase,
+          pixelBehavior,
+          selection: candidate,
+          pillar: opts.pillar,
+          benchOptions: opts.benchOptions,
+          stage: 'adapter-pre-content-support',
+          outcome: preContentBlock.decision,
+        });
         perFile.push({
           sel: candidate,
-          result: preContentBlockedResult(
-            instanceId,
-            opts.browser,
-            candidate,
-            preContentBlock,
-            runEnvBase,
-            opts.randomSeed,
-          ),
+          result: blocked,
         });
         continue;
       }
@@ -4492,7 +4519,6 @@ async function runExhaustiveCell(
             candidate,
             prepared,
             runEnvBase,
-            opts.randomSeed,
           ),
         });
         continue;
@@ -4507,7 +4533,6 @@ async function runExhaustiveCell(
           resolvedInputs: [...prepared.resolvedInputs],
           selection: resultSelectionFor(sel, candidates.length),
           ...(sel.evidencePlan ? { selectionEvidencePlan: sel.evidencePlan } : {}),
-          ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
           pixelBehavior,
           ...(prepared.verifiedStreamContents
@@ -4563,7 +4588,6 @@ async function runExhaustiveCell(
         resolvedInputs: [...prepared.resolvedInputs],
         selection: resultSelectionFor(sel, candidates.length),
         ...(sel.evidencePlan ? { selectionEvidencePlan: sel.evidencePlan } : {}),
-        ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
         pixelBehavior,
         fixtureIntegrityRuntime,
@@ -4598,7 +4622,7 @@ async function runExhaustiveCell(
 
   if (firstEngineAvailable) await disposeConstructedEngine(firstEngine, opts.signal);
 
-  return aggregateExhaustive(instanceId, opts.browser, scenario, perFile, runEnvBase, opts.randomSeed);
+  return aggregateExhaustive(instanceId, opts.browser, scenario, perFile, runEnvBase);
 }
 
 function cachedExhaustiveVariant(
@@ -4716,7 +4740,6 @@ export function aggregateExhaustive(
   scenario: Scenario,
   perFile: Array<{ sel: ScenarioSelection; result: ScenarioResult }>,
   runEnvBase: RunEnv,
-  runSeed: string | undefined,
 ): ScenarioResult {
   type DetailedFile = ExhaustiveFileResult & {
     oracleOutcomes: OracleOutcome[];
@@ -4819,7 +4842,6 @@ export function aggregateExhaustive(
   const aggregateSelection: NonNullable<ScenarioResult['selection']> = {
     file: `${perFile.length} files (exhaustive)`,
     isBaked: files.length > 0 && files.every((f) => f.isBaked),
-    ...(runSeed !== undefined ? { runSeed } : {}),
     candidateCount: perFile.length,
     ...(firstSelection?.eligiblePoolDigest
       ? { eligiblePoolDigest: firstSelection.eligiblePoolDigest }
@@ -4973,15 +4995,13 @@ export async function runOne(
     family: scenario.family,
     startedAtIso,
     ...(opts?.env ? { env: opts.env } : {}),
-    // §10 provenance: record WHICH file this cell ran against so a result replays from (runSeed, corpus)
-    // and a FAIL on a rotated real file traces to the exact bytes. Purely additive — not read by scoring.
+    // Record the exact selected file so cache identity and failures trace to the selected bytes.
     ...(opts?.selection
       ? {
           selection: {
             file: opts.selection.file,
             ...(opts.selection.sha256 ? { sha256: opts.selection.sha256 } : {}),
             isBaked: opts.selection.isBaked,
-            ...(opts?.runSeed ? { runSeed: opts.runSeed } : {}),
             ...(opts.selection.candidateCount !== undefined
               ? { candidateCount: opts.selection.candidateCount }
               : {}),
@@ -5000,8 +5020,6 @@ export async function runOne(
             ...(opts.selection.selectionAlgorithmId
               ? { selectionAlgorithmId: opts.selection.selectionAlgorithmId }
               : {}),
-            ...(opts.selection.score ? { score: opts.selection.score } : {}),
-            ...(opts.selection.probability ? { probability: opts.selection.probability } : {}),
             ...(opts.selection.evidenceContractDigest
               ? { evidenceContractDigest: opts.selection.evidenceContractDigest }
               : {}),
@@ -7428,8 +7446,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
   const fixtureIntegrityRuntime = opts.fixtureIntegrityRuntime ?? createRunFixtureIntegrityRuntime();
   const integrityMirrorPaths = new Map<string, string[]>();
 
-  // §6/§10 Per-scenario media-file rotation: pick ONE input per scenario for THIS run (seeded on
-  // randomSeed, reproducible), shared by every engine so a run replays from (runSeed, corpus). A
+  // Pick one stable canonical input per scenario, shared by every engine. A
   // selection-subsystem failure NEVER executes an unverified fallback — every expected cell is retained
   // as NA_ASSET with one shared corpus diagnostic. corpusChecksum makes the picked corpus visible in every result's env; §6.3
   // shape warnings surface corpus bugs instead of hiding them (a dropped real file is a corpus bug,
@@ -7455,7 +7472,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
     const scenarioContractDigests = new Map(
       scenarios.map((scenario) => [scenario.id, scenario.definitionHash] as const),
     );
-    selections = selectForRun(scenarios, opts.randomSeed ?? '', mediaSources, {
+    selections = selectForRun(scenarios, mediaSources, {
       rotate,
       scenarioContractDigests,
     });
@@ -7931,26 +7948,27 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
     console.info(
       `media-selection: ${selections.size} scenarios — ${rotatedReal} rotated-real, ${bakedCount} baked ` +
         `(rotate=${rotate}, exhaustive=${exhaustive}${exhaustive ? ` [${exhaustiveFiles} file-runs]` : ''}, ` +
-        `seed='${opts.randomSeed ?? ''}', corpus=${runEnvBase.corpusChecksum})`,
+        `selection=canonical, corpus=${runEnvBase.corpusChecksum})`,
     );
   }
 
   const executionOrder = buildExecutionOrder(
     engineIds,
     scenarios.map((scenario) => scenario.id),
-    opts.randomizeOrder === true,
-    opts.randomSeed ?? '',
   );
   const total = executionOrder.length;
   let done = 0;
 
   for (const cell of executionOrder) {
     if (opts.signal?.aborted) break;
-    // Use the selection's effectiveScenario downstream (negotiate/disabled/reuse/runOne). Its id/family/
-    // requires are UNCHANGED (so those behave identically); only `input` and, for a rotated DERIVED file,
-    // `options`/`oracles` differ. Falls back to the registry scenario if selection is unavailable.
+    // Single-file cells use the selected candidate's effective scenario. Exhaustive aggregate cache
+    // contracts use the registry scenario because no one candidate may define the aggregate identity;
+    // each concrete variant still executes its own effective scenario inside runExhaustiveCell().
     const selection = selections.get(cell.scenarioId);
-    const scenario = selection?.effectiveScenario ?? scenarioById.get(cell.scenarioId);
+    const registeredScenario = scenarioById.get(cell.scenarioId);
+    const scenario = exhaustive
+      ? registeredScenario
+      : selection?.effectiveScenario ?? registeredScenario;
     if (!scenario) continue;
     const engineId = cell.engineId;
     const exhaustiveList = exhaustive
@@ -7969,7 +7987,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             selection,
             exhaustiveList,
             runEnvBase,
-            opts.randomSeed,
           )
         : {
             engineId,
@@ -8026,7 +8043,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           exhaustiveList,
           runEnvBase,
-          opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await opts.resultReuse?.put(result).catch(() => undefined);
@@ -8056,7 +8072,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           exhaustiveList,
           runEnvBase,
-          opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await opts.resultReuse?.put(result).catch(() => undefined);
@@ -8067,33 +8082,15 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         continue;
       }
 
-      // §10 STALE-PASS guard: fold the selected input(s) into the reuse key so a run that picked a
-      // DIFFERENT file — or, in exhaustive mode, a different candidate SET — can never reuse a prior PASS
-      // validated against other bytes. Non-exhaustive → the single pick's `selectionCacheTag` ('baked' or
-      // the sha prefix). Exhaustive → `exhaustive:<n>:<tag,tag,…>` over the FULL ordered candidate list, so
-      // the aggregate PASS is reused ONLY when EVERY file in the set is unchanged (honest: a single-file
-      // PASS is never enough to satisfy an all-files audit). The store keys `put` off result.scenarioId, so
-      // we stamp the composite key onto the STORED copy only (via withCacheKey) and restore the true
-      // scenarioId on the cache-hit read path — live results always carry the real id.
-      const cacheTag =
-        exhaustiveList && exhaustiveList.length > 0
-          ? `exhaustive:${exhaustiveList.length}:${exhaustiveList.map(fullSelectionCacheTag).sort().join(',')}`
-          : selection
-            ? fullSelectionCacheTag(selection)
-            : undefined;
-      let cacheScenarioKey = cacheTag ? `${scenario.id}#${cacheTag}` : scenario.id;
+      // The store keys `put` off result.scenarioId, so cache-only identity is stamped onto the stored
+      // copy and stripped from live results. Begin with the logical key so capability-schema errors can
+      // still be recorded; once capabilities are validated below, the key is replaced with the exact
+      // selected-input + current-cell contract key.
+      let cacheScenarioKey = scenario.id;
       const withCacheKey = (r: ScenarioResult): ScenarioResult =>
         cacheScenarioKey === scenario.id ? r : { ...r, scenarioId: cacheScenarioKey };
-
-      // Read a candidate keyed by the selected input(s). The validated persistent cache may satisfy
-      // an exact immutable selection below; every other store/candidate continues through runOne,
-      // which reruns current tuple/browser/asset/golden preflight and validates the fingerprint.
-      // Old boolean rows and stale cached NAs therefore cannot bypass changed support evidence.
-      const cacheLookupStartedAt = performance.now();
-      let cachedCandidate = await opts.resultReuse
-        ?.get(engine.id, cacheScenarioKey, opts.browser)
-        .catch(() => undefined);
-      const cacheLookupDurationMs = performance.now() - cacheLookupStartedAt;
+      let cachedCandidate: ScenarioResult | undefined;
+      let cacheLookupDurationMs = 0;
 
       let validatedCapabilities: CapabilitySet;
       try {
@@ -8108,7 +8105,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           exhaustiveList,
           runEnvBase,
-          opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
@@ -8119,6 +8115,71 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         opts.onProgress?.(done, total, label);
         continue;
       }
+
+      // §10 STALE-PASS guard: bind both the complete selected input set and all current cell inputs
+      // that can change correctness/applicability (scenario definition, engine config/capabilities,
+      // browser support, pixel behavior, and the fully-resolved benchmark protocol). A validated
+      // persistent hit can then be accepted before fetching immutable media bodies. A changed subset
+      // elsewhere in the run is deliberately absent from this cell-local contract.
+      const cacheScenarioKeyFor = async (
+        currentSelection: ScenarioSelection,
+        currentExhaustive?: readonly ScenarioSelection[],
+      ): Promise<string> => {
+        const selectionTag = currentExhaustive?.length
+          ? `exhaustive:${currentExhaustive.length}:${currentExhaustive
+              .map(fullSelectionCacheTag)
+              .sort()
+              .join(',')}`
+          : fullSelectionCacheTag(currentSelection);
+        const contract = await buildMatrixPreflightFingerprint({
+          engine,
+          capabilities: validatedCapabilities,
+          scenario,
+          browser: opts.browser,
+          environment: runEnvBase,
+          pixelBehavior,
+          selection: currentSelection,
+          ...(currentExhaustive?.length ? { exhaustiveSelections: currentExhaustive } : {}),
+          pillar: opts.pillar,
+          benchOptions: opts.benchOptions,
+          stage: 'persistent-cache-lookup',
+          outcome: { browserSupport: support },
+        });
+        return `${scenario.id}#${selectionTag}:contract-sha256:${contract.hash}`;
+      };
+      cacheScenarioKey = await cacheScenarioKeyFor(selection, exhaustiveList);
+
+      // The browser cache validates epoch/TTL before returning a candidate. Generic/in-memory stores
+      // still continue through runOne's full asset/golden execution fingerprint below.
+      const cacheLookupStartedAt = performance.now();
+      cachedCandidate = await opts.resultReuse
+        ?.get(engine.id, cacheScenarioKey, opts.browser)
+        .catch(() => undefined);
+      cacheLookupDurationMs = performance.now() - cacheLookupStartedAt;
+
+      const fingerprintMatrixPreflight = async (
+        current: ScenarioResult,
+        stage: string,
+        outcome: unknown,
+      ): Promise<ScenarioResult> => reuseFingerprintedMatrixPreflight(
+        current,
+        cachedCandidate,
+        scenario.id,
+        await buildMatrixPreflightFingerprint({
+          engine,
+          capabilities: validatedCapabilities,
+          scenario,
+          browser: opts.browser,
+          environment: runEnvBase,
+          pixelBehavior,
+          selection,
+          ...(exhaustiveList?.length ? { exhaustiveSelections: exhaustiveList } : {}),
+          pillar: opts.pillar,
+          benchOptions: opts.benchOptions,
+          stage,
+          outcome,
+        }),
+      );
       const preNeg = negotiateCoarseEngine(validatedCapabilities, scenario.requires);
       if (!preNeg.ok) {
         result = matrixSelectionStatusResult(
@@ -8130,8 +8191,8 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           exhaustiveList,
           runEnvBase,
-          opts.randomSeed,
         );
+        result = await fingerprintMatrixPreflight(result, 'coarse-engine-capability', preNeg);
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
         await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
@@ -8164,8 +8225,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           exhaustiveList,
           runEnvBase,
-          opts.randomSeed,
         );
+        result = await fingerprintMatrixPreflight(result, 'authenticated-range-capability', {
+          requiredFeature: AUTHENTICATED_RANGE_INPUT_FEATURE,
+          supported: false,
+        });
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
         await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
@@ -8214,8 +8278,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             selection,
             exhaustiveList,
             runEnvBase,
-            opts.randomSeed,
           );
+          result = await fingerprintMatrixPreflight(result, 'bounded-probe-capability', {
+            budgetPreflight,
+            transportFailure,
+          });
           if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
           await disposeConstructedEngine(engine, opts.signal);
           await opts.resultReuse?.put(withCacheKey(result)).catch(() => undefined);
@@ -8248,9 +8315,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
             selection,
             exhaustiveList,
             runEnvBase,
-            opts.randomSeed,
             opts.pillar,
-            opts.benchOptions,
             cacheLookupDurationMs,
           )
         : undefined;
@@ -8291,6 +8356,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
               scenario,
               opts,
               support,
+              validatedCapabilities,
               runEnvBase,
               pillar,
               pixelBehavior,
@@ -8312,7 +8378,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
               selection,
               list,
               runEnvBase,
-              opts.randomSeed,
             );
           }
           if (scenario.primaryMetric !== undefined && result.primaryMetric === undefined) {
@@ -8342,7 +8407,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           preContentBlock,
           runEnvBase,
-          opts.randomSeed,
+        );
+        result = await fingerprintMatrixPreflight(
+          result,
+          'adapter-pre-content-support',
+          preContentBlock.decision,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
@@ -8367,7 +8436,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           'ERROR',
           `[CELL_PREPARATION_ERROR] ${errMessage(error)}`,
           runEnvBase,
-          opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
@@ -8386,7 +8454,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           selection,
           prepared,
           runEnvBase,
-          opts.randomSeed,
         );
         if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
         await disposeConstructedEngine(engine, opts.signal);
@@ -8399,7 +8466,7 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       }
       const executionSelection = prepared.selection;
       const executionScenario = executionSelection.effectiveScenario;
-      const executionCacheScenarioKey = `${scenario.id}#${fullSelectionCacheTag(executionSelection)}`;
+      const executionCacheScenarioKey = await cacheScenarioKeyFor(executionSelection);
       if (executionCacheScenarioKey !== cacheScenarioKey) {
         cacheScenarioKey = executionCacheScenarioKey;
         cachedCandidate = await opts.resultReuse
@@ -8429,7 +8496,6 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
           ? { verifiedStreamContents: prepared.verifiedStreamContents }
           : { verifiedContents: prepared.verified }),
         ...(prepared.decryptKeyOverride ? { decryptKeyOverride: prepared.decryptKeyOverride } : {}),
-        ...(opts.randomSeed !== undefined ? { runSeed: opts.randomSeed } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
         pixelBehavior,
         fixtureIntegrityRuntime,
@@ -8514,14 +8580,6 @@ async function resolveEngineIds(requested: string[], registered: RegisteredEngin
     }
   }
   return resolved;
-}
-
-function shuffleInPlace<T>(items: T[], seed: string): void {
-  const rand = mulberry32(hashSeed(seed));
-  for (let i = items.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [items[i], items[j]] = [items[j]!, items[i]!];
-  }
 }
 
 interface EngineIdCandidate {

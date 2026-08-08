@@ -460,10 +460,10 @@ describe('REQ-DSL-03/06: result schema v2 and explicit v1 migration', () => {
     const source = resultV2('NA_ASSET', [verdicts.pass], {
       reason: '[EVIDENCE_NO_SUFFICIENT_SET] required golden missing',
       selection: {
-        file: '01.mp4', sha256: SHA_A, isBaked: false, runSeed: 'seed-1', candidateCount: 2,
+        file: '01.mp4', sha256: SHA_A, isBaked: false, candidateCount: 2,
         eligiblePoolDigest: SHA_B, executedInputDigest: 'c'.repeat(64), candidateIdentity: 'd'.repeat(64),
-        selectionPolicyVersion: 'selection-policy@1', selectionAlgorithmId: 'sha256-hrw@1',
-        score: 'e'.repeat(64), probability: { numerator: 1, denominator: 2, weight: 1 },
+        selectionPolicyVersion: 'canonical-candidate@1',
+        selectionAlgorithmId: 'candidate-identity-lexicographic-min-v1',
         evidenceContractDigest: 'f'.repeat(64), catalogState: 'ready',
       },
       candidateEvidence: {
@@ -482,7 +482,7 @@ describe('REQ-DSL-03/06: result schema v2 and explicit v1 migration', () => {
           suiteVersion: '0.1.0', engineId: 'dsl-fixture@1.0.0', browser: 'chromium',
         },
         selectionEnvelope: {
-          file: '01.mp4', sha256: SHA_A, isBaked: false, runSeed: 'prior-seed', candidateCount: 2,
+          file: '01.mp4', sha256: SHA_A, isBaked: false, candidateCount: 2,
         },
       },
     });
@@ -490,6 +490,10 @@ describe('REQ-DSL-03/06: result schema v2 and explicit v1 migration', () => {
     expect(parsed.selection).toEqual(source.selection);
     expect(parsed.candidateEvidence).toEqual(source.candidateEvidence);
     expect(parsed.cacheReuse).toEqual(source.cacheReuse);
+    expect(validateScenarioResultV2({
+      ...source,
+      selection: { ...source.selection!, runSeed: 'removed-field' } as never,
+    }).some((entry) => entry.code === 'SCHEMA_ADDITIONAL_PROPERTY')).toBe(true);
     expect(validateScenarioResultV2({
       ...source,
       candidateEvidence: { ...source.candidateEvidence!, sufficient: 'yes' },

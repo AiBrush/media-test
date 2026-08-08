@@ -136,7 +136,6 @@ export interface CohortDimensions {
   corpusChecksum: string;
   selectedFileSetHash: string;
   mutationHash: string;
-  rotationSeed: string;
   runSelectionHash: string;
   primaryMetric: MetricId;
   primaryUnit: string;

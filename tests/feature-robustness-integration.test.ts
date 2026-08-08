@@ -71,7 +71,6 @@ describe('REQ-FEAT-76 / REQ-ENG-31 production three-file robustness acceptance',
       scenarioIds: [SCENARIO_ID],
       pillar: 'robustness',
       exhaustiveMedia: true,
-      randomSeed: 'robustness-three-file-v1',
       fixtureIntegrityRuntime: fixtureRuntime,
       robustnessWorkerFactory: () => new Worker(
         new URL('./feature-robustness-integration.worker.ts', import.meta.url),

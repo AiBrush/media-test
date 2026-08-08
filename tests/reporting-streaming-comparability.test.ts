@@ -216,7 +216,6 @@ function completeDimensions(result: ScenarioResult): CohortDimensions {
     corpusChecksum: 'corpus-v1',
     selectedFileSetHash: 'selected-files-hash',
     mutationHash: 'no-mutation',
-    rotationSeed: 'rotation-seed',
     runSelectionHash: 'selection-hash',
     primaryMetric: 'wall',
     primaryUnit: 'ms',

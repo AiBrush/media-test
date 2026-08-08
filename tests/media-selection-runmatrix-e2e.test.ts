@@ -24,11 +24,14 @@ const originalFetch = globalThis.fetch;
 const ENGINE_REGISTRATION_ID = 'selection-e2e-engine';
 const ENGINE_ID = 'selection-e2e-engine@1.0.0';
 const SCENARIO_ID = 'probe/selection-policy-e2e';
+const SUPERSET_SCENARIO_ID = 'probe/selection-policy-e2e-superset';
 const BAKED_ID = 'selection-policy-e2e-baked.mp4';
+const SUPERSET_BAKED_ID = 'selection-policy-e2e-superset-baked.mp4';
 const REAL_PREFIX = `scenarios/${SCENARIO_ID}`;
 
 const media = new Map<string, Uint8Array>([
   [BAKED_ID, encoder.encode('pass')],
+  [SUPERSET_BAKED_ID, encoder.encode('superset-pass')],
   [`${REAL_PREFIX}/01-diff.mp4`, encoder.encode('diff')],
   [`${REAL_PREFIX}/02-fail.mp4`, encoder.encode('fail')],
   [`${REAL_PREFIX}/03-na.mp4`, encoder.encode('na')],
@@ -57,7 +60,7 @@ afterEach(() => {
 });
 
 describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () => {
-  test('seeded-single and exhaustive runs preserve PASS/FAIL/NA identities through report JSON', async () => {
+  test('canonical-single, subset-to-superset cache reuse, and exhaustive runs preserve result identities', async () => {
     registerAcceptanceSurface();
     installAcceptanceFetch();
     probeCalls = 0;
@@ -77,25 +80,37 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
         slowRepetitions: 3,
         maxInnerIterations: 1,
       },
-      randomSeed: 'selection-policy-e2e-seed-v1',
       resultReuse: cache,
       fixtureIntegrityRuntime: fakeFixtureRuntime,
     };
 
-    const seeded = await runMatrix({ ...baseOptions, exhaustiveMedia: false });
-    expect(seeded).toHaveLength(1);
-    expect(seeded[0]?.selection).toMatchObject({
-      runSeed: baseOptions.randomSeed,
+    const canonical = await runMatrix({ ...baseOptions, exhaustiveMedia: false });
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]?.selection).toMatchObject({
       candidateCount: 4,
-      selectionPolicyVersion: 'hrw-sha256@1',
+      selectionPolicyVersion: 'canonical-candidate@1',
+      selectionAlgorithmId: 'candidate-identity-lexicographic-min-v1',
     });
-    const seededJson = JSON.parse(serializeReportJson(buildReport({
-      results: seeded,
+
+    const canonicalSuperset = await runMatrix({
+      ...baseOptions,
+      scenarioIds: [SCENARIO_ID, SUPERSET_SCENARIO_ID],
+      exhaustiveMedia: false,
+    });
+    expect(canonicalSuperset).toHaveLength(2);
+    expect(canonicalSuperset.find((result) => result.scenarioId === SCENARIO_ID)?.cacheReuse?.sourceRunId)
+      .toBe('selection-e2e-prior-run');
+    expect(canonicalSuperset.find((result) => result.scenarioId === SCENARIO_ID)?.selection?.file)
+      .toBe(canonical[0]?.selection?.file);
+    expect(canonicalSuperset.find((result) => result.scenarioId === SUPERSET_SCENARIO_ID)?.cacheReuse)
+      .toBeUndefined();
+    const canonicalJson = JSON.parse(serializeReportJson(buildReport({
+      results: canonical,
       generatedAtIso: '2026-07-16T00:00:00.000Z',
     }).json)) as ReturnType<typeof buildReport>['json'];
-    expect(seededJson.observations).toHaveLength(1);
-    expect(seededJson.observations[0]?.variants).toHaveLength(1);
-    expect(seededJson.observations[0]?.variants[0]?.file).toBe(seeded[0]?.selection?.file);
+    expect(canonicalJson.observations).toHaveLength(1);
+    expect(canonicalJson.observations[0]?.variants).toHaveLength(1);
+    expect(canonicalJson.observations[0]?.variants[0]?.file).toBe(canonical[0]?.selection?.file);
 
     const exhaustive = await runMatrix({ ...baseOptions, exhaustiveMedia: true });
     expect(exhaustive).toHaveLength(1);
@@ -137,12 +152,17 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
 
     const callsAfterFirstExhaustive = probeCalls;
     const fetchesAfterFirstExhaustive = mediaBodyFetches;
+    cache.markPassMeasurementsUnavailable();
     const reused = await runMatrix({ ...baseOptions, exhaustiveMedia: true });
     expect(probeCalls).toBe(callsAfterFirstExhaustive);
     expect(mediaBodyFetches).toBe(fetchesAfterFirstExhaustive);
     expect(reused[0]?.cacheReuse?.sourceRunId).toBe('selection-e2e-prior-run');
     expect(reused[0]?.exhaustive?.every((entry) => entry.reason?.startsWith('cached') === true)).toBe(true);
-    expect(reused[0]?.selection?.runSeed).toBe(baseOptions.randomSeed);
+    expect(reused[0]?.exhaustive
+      ?.filter((entry) => entry.status === 'PASS')
+      .every((entry) => entry.measurement?.state === 'UNAVAILABLE' && entry.bench === undefined))
+      .toBe(true);
+    expect(reused[0]?.selection).not.toHaveProperty('runSeed');
     expect(reused[0]?.env?.engineId).toBe(ENGINE_ID);
 
     await runMatrix({
@@ -153,7 +173,170 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     expect(mediaBodyFetches).toBeGreaterThan(fetchesAfterFirstExhaustive);
   });
 
-  test('scale-probe preflight blocks seeded and exhaustive whole-file rows before media operations', async () => {
+  test('an identical exhaustive restart reuses a capability-only NA_ENGINE cell', async () => {
+    const registrationId = 'selection-na-cache-engine';
+    const engineId = `${registrationId}@1.0.0`;
+    const scenarioId = 'probe/selection-na-cache';
+    const bakedId = 'selection-na-cache.mp4';
+    const baked = encoder.encode('capability-only-cache');
+    let probeOperations = 0;
+    registerEngine(registrationId, async (): Promise<MediaEngine> => ({
+      ...acceptanceEngine(),
+      id: engineId,
+      capabilities: (): CapabilitySet => ({
+        operations: {},
+        containersIn: ['mp4'],
+        containersOut: [],
+        videoCodecs: ['h264'],
+        audioCodecs: [],
+        encryption: [],
+        features: [],
+      }),
+      probe: async () => {
+        probeOperations += 1;
+        return structuredClone(exactMetadata);
+      },
+    }));
+    registerScenario(defineScenario({
+      id: scenarioId,
+      op: 'probe',
+      input: bakedId,
+      options: {},
+      requires: { operations: ['probe'], containersIn: ['mp4'] },
+      oracles: ['golden-metadata'],
+      metrics: [],
+    }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/fixtures/media/scenarios/_sources.ndjson')) {
+        return new Response(null, { status: 404, statusText: 'Not Found' });
+      }
+      if (url.includes('/fixtures/manifest.json')) {
+        return Response.json({
+          suiteCorpusVersion: 'selection-na-cache-v1',
+          assets: [{
+            id: bakedId,
+            sha256: sha256Hex(baked),
+            sizeBytes: baked.byteLength,
+            source: 'generated capability cache fixture',
+            family: 'probe',
+            container: 'mp4',
+            codecs: ['h264'],
+            sizeBucket: 'micro',
+            genMethod: 'selection-na-cache@1',
+          }],
+        });
+      }
+      return new Response(null, { status: 500, statusText: 'preflight cache test must not fetch media' });
+    }) as typeof fetch;
+
+    const cache = validatedPersistentResultReuseStore();
+    const options = {
+      browser: 'chromium' as const,
+      engineIds: [registrationId],
+      scenarioIds: [scenarioId],
+      pillar: 'all' as const,
+      exhaustiveMedia: true,
+      resultReuse: cache,
+      fixtureIntegrityRuntime: fakeFixtureRuntime,
+    };
+    const first = await runMatrix(options);
+    expect(first[0]).toMatchObject({ status: 'NA_ENGINE' });
+    expect(first[0]?.executionFingerprint?.hash).toHaveLength(64);
+    expect(first[0]?.cacheReuse).toBeUndefined();
+    expect(probeOperations).toBe(0);
+
+    const second = await runMatrix(options);
+    expect(second[0]).toMatchObject({ status: 'NA_ENGINE' });
+    expect(second[0]?.reason).toStartWith('cached:');
+    expect(second[0]?.cacheReuse?.sourceRunId).toBe('selection-e2e-prior-run');
+    expect(second[0]?.exhaustive?.every((entry) => entry.cacheReuse !== undefined)).toBe(true);
+    expect(probeOperations).toBe(0);
+  });
+
+  test('an identical exhaustive restart reuses an adapter pre-content NA_ENGINE cell', async () => {
+    const registrationId = 'selection-pre-content-cache-engine';
+    const engineId = `${registrationId}@1.0.0`;
+    const scenarioId = 'probe/selection-pre-content-cache';
+    const bakedId = 'selection-pre-content-cache.mp4';
+    const baked = encoder.encode('pre-content-cache');
+    let supportsCalls = 0;
+    let probeOperations = 0;
+    registerEngine(registrationId, async (): Promise<MediaEngine> => ({
+      ...acceptanceEngine(),
+      id: engineId,
+      supports: async () => {
+        supportsCalls += 1;
+        return {
+          supported: false,
+          status: 'NA_ENGINE',
+          reasonCode: 'TEST_PRE_CONTENT_UNSUPPORTED',
+          reason: 'the declared input tuple is unsupported',
+          preContent: true,
+        };
+      },
+      probe: async () => {
+        probeOperations += 1;
+        return structuredClone(exactMetadata);
+      },
+    }));
+    registerScenario(defineScenario({
+      id: scenarioId,
+      op: 'probe',
+      input: bakedId,
+      options: {},
+      requires: { operations: ['probe'], containersIn: ['mp4'] },
+      oracles: ['golden-metadata'],
+      metrics: [],
+    }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/fixtures/media/scenarios/_sources.ndjson')) {
+        return new Response(null, { status: 404, statusText: 'Not Found' });
+      }
+      if (url.includes('/fixtures/manifest.json')) {
+        return Response.json({
+          suiteCorpusVersion: 'selection-pre-content-cache-v1',
+          assets: [{
+            id: bakedId,
+            sha256: sha256Hex(baked),
+            sizeBytes: baked.byteLength,
+            source: 'generated pre-content cache fixture',
+            family: 'probe',
+            container: 'mp4',
+            codecs: ['h264'],
+            sizeBucket: 'micro',
+            genMethod: 'selection-pre-content-cache@1',
+          }],
+        });
+      }
+      return new Response(null, { status: 500, statusText: 'pre-content cache test must not fetch media' });
+    }) as typeof fetch;
+
+    const cache = validatedPersistentResultReuseStore();
+    const options = {
+      browser: 'chromium' as const,
+      engineIds: [registrationId],
+      scenarioIds: [scenarioId],
+      pillar: 'all' as const,
+      exhaustiveMedia: true,
+      resultReuse: cache,
+      fixtureIntegrityRuntime: fakeFixtureRuntime,
+    };
+    const first = await runMatrix(options);
+    expect(first[0]).toMatchObject({ status: 'NA_ENGINE' });
+    expect(first[0]?.exhaustive?.[0]?.executionFingerprint?.hash).toHaveLength(64);
+    expect(supportsCalls).toBe(1);
+    expect(probeOperations).toBe(0);
+
+    const second = await runMatrix(options);
+    expect(second[0]).toMatchObject({ status: 'NA_ENGINE' });
+    expect(second[0]?.cacheReuse?.sourceRunId).toBe('selection-e2e-prior-run');
+    expect(supportsCalls).toBe(1);
+    expect(probeOperations).toBe(0);
+  });
+
+  test('scale-probe preflight blocks canonical and exhaustive whole-file rows before media operations', async () => {
     const engineId = 'selection-scale-preflight-engine@1.0.0';
     const scenarioId = 'probe/selection-scale-preflight';
     const bakedId = 'selection-scale-preflight-baked.mp4';
@@ -279,19 +462,18 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
       engineIds: [engineId],
       scenarioIds: [scenarioId],
       pillar: 'all' as const,
-      randomSeed: 'selection-scale-preflight-seed-v1',
       fixtureIntegrityRuntime: fakeFixtureRuntime,
     };
-    const seeded = await runMatrix({ ...baseOptions, exhaustiveMedia: false });
-    expect(seeded).toHaveLength(1);
-    expect(seeded[0]).toMatchObject({
+    const canonical = await runMatrix({ ...baseOptions, exhaustiveMedia: false });
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]).toMatchObject({
       status: 'NA_ENGINE',
       reason: expect.stringContaining('PROBE_BOUNDED_READ_MODE_UNAVAILABLE'),
     });
-    expect(identities.get(seeded[0]!.selection!.file)).toMatchObject({
-      sha256: seeded[0]!.selection!.sha256,
+    expect(identities.get(canonical[0]!.selection!.file)).toMatchObject({
+      sha256: canonical[0]!.selection!.sha256,
     });
-    expect(seeded[0]?.selection?.candidateIdentity).toHaveLength(64);
+    expect(canonical[0]?.selection?.candidateIdentity).toHaveLength(64);
     expect({ mediaAssetRequests, goldenRequests, supportsCalls, initCalls, probeCalls }).toEqual({
       mediaAssetRequests: 0,
       goldenRequests: 0,
@@ -415,7 +597,6 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
       engineIds: [registrationId],
       scenarioIds: [scenarioId],
       pillar: 'all',
-      randomSeed: 'selection-large-remux-preflight-v1',
       rotateMedia: false,
       fixtureIntegrityRuntime: fakeFixtureRuntime,
     });
@@ -575,7 +756,6 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
         engineIds: [engineId],
         scenarioIds: [scenarioId],
         pillar: 'performance' as const,
-        randomSeed: 'selection-scale-range-seed-v1',
         rotateMedia: false,
         fixtureIntegrityRuntime: fakeFixtureRuntime,
       };
@@ -629,6 +809,16 @@ function registerAcceptanceSurface(): void {
     oracles: ['golden-metadata'],
     metrics: ['wall'],
     notes: 'REQ-SEL-08 real selection/runner/cache/report acceptance surface.',
+  }));
+  registerScenario(defineScenario({
+    id: SUPERSET_SCENARIO_ID,
+    op: 'probe',
+    input: SUPERSET_BAKED_ID,
+    options: {},
+    requires: { operations: ['probe'], containersIn: ['mp4'] },
+    oracles: ['golden-metadata'],
+    metrics: ['wall'],
+    notes: 'Regression surface for reusing a cached cell when a later run adds scenarios.',
   }));
 }
 
@@ -684,19 +874,23 @@ function installAcceptanceFetch(): void {
     files: sourceFiles,
   });
   const bakedBytes = media.get(BAKED_ID)!;
+  const supersetBakedBytes = media.get(SUPERSET_BAKED_ID)!;
   const manifest = {
     suiteCorpusVersion: 'selection-e2e-v1',
-    assets: [{
-      id: BAKED_ID,
-      sha256: sha256Hex(bakedBytes),
-      sizeBytes: bakedBytes.byteLength,
-      source: 'generated selection acceptance fixture',
-      family: 'probe',
-      container: 'mp4',
-      codecs: ['h264'],
-      sizeBucket: 'micro',
-      genMethod: 'selection-e2e-generator@1',
-    }],
+    assets: [BAKED_ID, SUPERSET_BAKED_ID].map((id) => {
+      const bytes = id === BAKED_ID ? bakedBytes : supersetBakedBytes;
+      return {
+        id,
+        sha256: sha256Hex(bytes),
+        sizeBytes: bytes.byteLength,
+        source: 'generated selection acceptance fixture',
+        family: 'probe',
+        container: 'mp4',
+        codecs: ['h264'],
+        sizeBucket: 'micro',
+        genMethod: 'selection-e2e-generator@1',
+      };
+    }),
   };
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -745,7 +939,11 @@ function sourceRecord(file: string, bytes: Uint8Array): Record<string, unknown> 
   };
 }
 
-function validatedPersistentResultReuseStore(): ResultReuseStore {
+interface ValidatedPersistentResultReuseStore extends ResultReuseStore {
+  markPassMeasurementsUnavailable(): void;
+}
+
+function validatedPersistentResultReuseStore(): ValidatedPersistentResultReuseStore {
   const rows = new Map<string, ScenarioResult>();
   const key = (engineId: string, scenarioId: string, browser: string): string =>
     `${engineId}\u0000${scenarioId}\u0000${browser}`;
@@ -789,6 +987,33 @@ function validatedPersistentResultReuseStore(): ResultReuseStore {
         });
       }
       rows.set(key(result.engineId, result.scenarioId, result.browser), stored);
+    },
+    markPassMeasurementsUnavailable: () => {
+      for (const [rowKey, row] of rows) {
+        const unavailable = structuredClone(row);
+        if (unavailable.status === 'PASS') {
+          delete unavailable.bench;
+          unavailable.measurement = {
+            state: 'UNAVAILABLE',
+            reasonCode: 'TEST_INSTRUMENT_UNAVAILABLE',
+            detail: 'correctness passed but the requested performance instrument was unavailable',
+          };
+        }
+        if (unavailable.exhaustive) {
+          unavailable.exhaustive = unavailable.exhaustive.map((entry) => {
+            if (entry.status !== 'PASS') return entry;
+            const pass = { ...entry };
+            delete pass.bench;
+            pass.measurement = {
+              state: 'UNAVAILABLE',
+              reasonCode: 'TEST_INSTRUMENT_UNAVAILABLE',
+              detail: 'correctness passed but the requested performance instrument was unavailable',
+            };
+            return pass;
+          });
+        }
+        rows.set(rowKey, unavailable);
+      }
     },
   };
 }

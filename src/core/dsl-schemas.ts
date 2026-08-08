@@ -272,21 +272,13 @@ export const RESULTS_V2_JSON_SCHEMA = {
       type: 'object', additionalProperties: false, required: ['file', 'isBaked'],
       properties: {
         file: { type: 'string', minLength: 1 }, sha256: { $ref: '#/$defs/sha256' },
-        isBaked: { type: 'boolean' }, runSeed: { type: 'string' },
+        isBaked: { type: 'boolean' },
         candidateCount: { type: 'integer', minimum: 0 },
         eligiblePoolDigest: { $ref: '#/$defs/sha256' },
         executedInputDigest: { $ref: '#/$defs/sha256' },
         candidateIdentity: { $ref: '#/$defs/sha256' },
         selectionPolicyVersion: { type: 'string', minLength: 1 },
         selectionAlgorithmId: { type: 'string', minLength: 1 },
-        score: { $ref: '#/$defs/sha256' },
-        probability: {
-          type: 'object', additionalProperties: false,
-          required: ['numerator', 'denominator', 'weight'],
-          properties: {
-            numerator: { const: 1 }, denominator: { type: 'integer', minimum: 1 }, weight: { const: 1 },
-          },
-        },
         evidenceContractDigest: { $ref: '#/$defs/sha256' },
         catalogState: { enum: ['ready', 'fallback'] },
         catalogReason: {

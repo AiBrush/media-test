@@ -26,7 +26,7 @@ import type { RegistrationReport } from './register.ts';
 import type { FrozenRunConfiguration } from './options.ts';
 
 export const APP_STATUS_MODEL_VERSION = 'media-test/status-model@pass-diff-fail-na-v1' as const;
-export const APP_RUN_MANIFEST_SCHEMA = 'media-test/run-manifest@1' as const;
+export const APP_RUN_MANIFEST_SCHEMA = 'media-test/run-manifest@2' as const;
 export const APP_CACHE_POLICY_SCHEMA = 'media-test/browser-cache-policy@2' as const;
 
 export type RunCompletionState =
@@ -348,6 +348,17 @@ export function validateRunManifest(value: unknown): RunManifest {
     if (!manifest[field] || typeof manifest[field] !== 'object' || Array.isArray(manifest[field])) {
       throw new Error(`run manifest ${field} must be an object`);
     }
+  }
+  const configuration = manifest.configuration as Record<string, unknown>;
+  const configurationKeys = new Set([
+    'browser', 'browserTag', 'engineIds', 'featureIds', 'scenarioIds', 'operations', 'pillar',
+    'warmup', 'iters', 'timeoutMs', 'reuseData', 'exhaustiveMedia', 'mediaMode',
+  ]);
+  for (const key of Object.keys(configuration)) {
+    if (!configurationKeys.has(key)) throw new Error(`run manifest configuration contains unknown field '${key}'`);
+  }
+  if (configuration.mediaMode !== 'canonical-single' && configuration.mediaMode !== 'exhaustive') {
+    throw new Error('run manifest configuration mediaMode is invalid');
   }
   for (const field of ['expectedCellCount', 'observedCellCount'] as const) {
     if (!Number.isSafeInteger(manifest[field]) || (manifest[field] as number) < 0) {

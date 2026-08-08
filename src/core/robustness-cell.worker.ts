@@ -90,7 +90,6 @@ async function execute(request: RobustnessWorkerRequest): Promise<RobustnessWork
       ...(request.options.decryptKeyOverride
         ? { decryptKeyOverride: request.options.decryptKeyOverride }
         : {}),
-      ...(request.options.runSeed !== undefined ? { runSeed: request.options.runSeed } : {}),
       pixelBehavior: request.options.pixelBehavior,
       ...(request.options.cachedResult ? { cachedResult: request.options.cachedResult } : {}),
     });

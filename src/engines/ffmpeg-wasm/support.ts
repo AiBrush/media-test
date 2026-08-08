@@ -342,7 +342,7 @@ export function decideFfmpegSupport(
     request.operation === 'transcode' &&
     AUDIO_DSP_MIX_MATRIX_UNSUPPORTED_SCENARIOS.has(request.scenarioId)
   ) {
-    return reject(
+    return rejectPreContent(
       'FFMPEG_AUDIO_MIX_MATRIX_UNSUPPORTED',
       'the pinned FFmpeg 5.1 -ac mixer cannot guarantee this scenario\'s exact authored channel matrix',
     );
@@ -351,7 +351,7 @@ export function decideFfmpegSupport(
     request.operation === 'transcode' &&
     request.scenarioId === 'audio-dsp/fade_in_out_f32'
   ) {
-    return reject(
+    return rejectPreContent(
       'FFMPEG_AUDIO_FADE_ENVELOPE_PRECISION_UNSUPPORTED',
       'the pinned FFmpeg 5.1 afade output exceeds the authored floating-point envelope bound on valid exhaustive inputs',
     );

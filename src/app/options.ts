@@ -11,12 +11,6 @@ export const RUN_OPTION_LIMITS = Object.freeze({
   timeoutMs: Object.freeze({ min: 1_000, max: 86_400_000, default: 86_400_000 }),
 });
 
-/**
- * Fresh launcher pages must select the same catalog inputs by default or an IndexedDB cache hit is
- * left to chance. The interactive UI still generates its own seed; this default is CLI-only.
- */
-export const DEFAULT_LAUNCHER_RANDOM_SEED = 'media-test-launcher-default';
-
 export const RUN_OPTION_DEFINITIONS = Object.freeze([
   Object.freeze({ cli: '--browser', field: 'browser', value: 'brave|chromium|webkit|firefox', repeatable: false }),
   Object.freeze({ cli: '--engine', field: 'engineIds', value: 'id', repeatable: true }),
@@ -27,7 +21,6 @@ export const RUN_OPTION_DEFINITIONS = Object.freeze([
   Object.freeze({ cli: '--warmup', field: 'warmup', value: '0..20', repeatable: false }),
   Object.freeze({ cli: '--iters', field: 'iters', value: '1..50', repeatable: false }),
   Object.freeze({ cli: '--timeout-ms', field: 'timeoutMs', value: '1000..86400000', repeatable: false }),
-  Object.freeze({ cli: '--random-seed', field: 'randomSeed', value: 'text', repeatable: false }),
   Object.freeze({ cli: '--exhaustive', field: 'exhaustiveMedia', value: 'boolean', repeatable: false }),
   Object.freeze({ cli: '--no-reuse', field: 'reuseData', value: 'false', repeatable: false }),
 ] as const);
@@ -52,8 +45,6 @@ export interface SuiteRunFilter {
   reuseData?: boolean;
   /** Backward-compatible alias; normalized immediately and never exported. */
   reuseSuccessful?: boolean;
-  randomizeOrder?: boolean;
-  randomSeed?: string;
   exhaustiveMedia?: boolean;
 }
 
@@ -69,10 +60,8 @@ export interface FrozenRunConfiguration {
   iters: number;
   timeoutMs: number;
   reuseData: boolean;
-  randomizeOrder: boolean;
-  randomSeed: string;
   exhaustiveMedia: boolean;
-  mediaMode: 'seeded-single' | 'exhaustive';
+  mediaMode: 'canonical-single' | 'exhaustive';
 }
 
 export interface RunFilterDefaults {
@@ -82,11 +71,10 @@ export interface RunFilterDefaults {
   featureIds: readonly ScenarioFamily[];
   scenarioIds: readonly string[];
   operations?: readonly Operation[];
-  seedFactory?: () => string;
 }
 
 export class RunOptionValidationError extends Error {
-  readonly field: 'engines' | 'scenarios' | 'warmup' | 'iters' | 'timeout' | 'seed' | 'browser' | 'pillar';
+  readonly field: 'engines' | 'scenarios' | 'warmup' | 'iters' | 'timeout' | 'browser' | 'pillar';
   readonly fieldsetId: string;
 
   constructor(
@@ -111,9 +99,8 @@ export function freezeRunConfiguration(
     throw new RunOptionValidationError('engines', 'Select at least one engine.', 'engines-fs');
   }
 
-  // Sort the selected scenarios alphabetically so both the rendered matrix rows AND the scenario-major
-  // execution order share one order: with "Randomize next test row" off, the run fills the table
-  // top-to-bottom starting from the first row instead of leading with the probe/ family.
+  // Sort the selected scenarios alphabetically so both the rendered matrix rows and the deterministic
+  // scenario-major execution order fill the table top-to-bottom.
   const scenarioIds = (filter.scenarioIds === undefined ? [...defaults.scenarioIds] : uniqueStrings(filter.scenarioIds))
     .slice()
     .sort((a, b) => a.localeCompare(b));
@@ -130,10 +117,6 @@ export function freezeRunConfiguration(
   const warmup = boundedInteger(filter.warmup ?? RUN_OPTION_LIMITS.warmup.default, 'warmup');
   const iters = boundedInteger(filter.iters ?? RUN_OPTION_LIMITS.iters.default, 'iters');
   const timeoutMs = boundedInteger(filter.timeoutMs ?? RUN_OPTION_LIMITS.timeoutMs.default, 'timeoutMs');
-  const randomSeed = (filter.randomSeed ?? defaults.seedFactory?.() ?? '').trim();
-  if (!randomSeed) {
-    throw new RunOptionValidationError('seed', 'Enter a non-empty replay seed.', 'options-fs');
-  }
   const exhaustiveMedia = filter.exhaustiveMedia === true;
   const browser = filter.browser ?? defaults.browser;
   if (!BROWSER_VALUES.has(browser)) {
@@ -159,10 +142,8 @@ export function freezeRunConfiguration(
     iters,
     timeoutMs,
     reuseData: filter.reuseData ?? filter.reuseSuccessful ?? true,
-    randomizeOrder: filter.randomizeOrder ?? true,
-    randomSeed,
     exhaustiveMedia,
-    mediaMode: exhaustiveMedia ? 'exhaustive' : 'seeded-single',
+    mediaMode: exhaustiveMedia ? 'exhaustive' : 'canonical-single',
   });
 }
 

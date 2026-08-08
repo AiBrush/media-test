@@ -230,7 +230,7 @@ P0 first, then P1, then P2, grouped stably by area. This table is the index; ful
 | REQ-UI-14 | Reserve Resume for validated checkpoint | App/UI | P1 | UI-08 |
 | REQ-UI-15 | Unify manual & launcher export envelope | App/UI | P1 | UI-08, REP-09 |
 | REQ-UI-16 | Disable /__save by default; loopback dev server | App/UI | P1 | — |
-| REQ-UI-17 | Expose seed entry/replay + selected input variant/SHA | App/UI | P2 | UI-08 |
+| REQ-UI-17 | Expose canonical selected input variant/SHA | App/UI | P2 | UI-08 |
 | REQ-UI-18 | Cross-port cache origin + import provenance | App/UI | P2 | UI-09 |
 | REQ-UI-19 | Render all matrix rows on one scrollable page | App/UI | P2 | — |
 | REQ-UI-20 | One CLI/UI option schema; fix headed/headless copy | App/UI | P2 | — |
@@ -1031,14 +1031,14 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 - **Acceptance:** A size or SHA-256 mismatch prevents those bytes reaching every engine and produces one corpus issue; with no verified candidate, no draw/engine is invoked and affected cells are NA_ASSET/`eligible=0`; mutation tests for truncated bytes and same-path replacement fail before the first adapter call.
 - **Source:** docs/subsystems/media-selection.md — Target design #1 / gap "Catalog validation and integrity are permissive"
 
-### REQ-SEL-03 — Order-independent versioned scoring with a durable digest replay key
+### REQ-SEL-03 — Order-independent canonical selection with a durable digest replay key
 - **Priority:** P0
 - **Depends on:** REQ-SEL-01
-- **Current:** Selection hashes `runSeed|scenarioId` and indexes catalog order via mulberry32; neither the RNG/policy version nor the eligible-pool digest is recorded (`src/core/media-selection.ts:397-413`, `src/core/scenario.ts:338-349`).
-- **Problem:** Reordering/inserting files remaps a seed, and the same textual seed can mean different bytes across corpus revisions, so a seed alone is not a stable sample identity.
-- **Change:** Replace index selection with a specified cryptographic hash-to-integer keyed score over `selectionPolicyVersion|seed|scenarioId|fullCandidateDigest` (highest-random-weight, canonical tie-break); record seed, algorithm id/version, selected full path + full SHA-256, eligible-pool digest, and candidate count; make full path + full SHA-256 the durable replay key that works even if the catalog changes, and reject a pool-digest mismatch on seed replay unless explicitly opted in.
-- **Acceptance:** Same policy/seed/scenario/pool-digest selects the same full digest in every supported browser; reordering never changes the pick; adding/removing a candidate changes a prior pick only when set-scoring selects the changed member; a recorded failing digest replays as an explicit input; a golden vector exists per `selectionPolicyVersion`.
-- **Source:** docs/subsystems/media-selection.md — Target design #2 / gap "Fixed seed does not identify a stable sample by itself"
+- **Current:** Selection chooses the lexicographically smallest stable candidate identity and records the algorithm id/version, selected full path + SHA-256, eligible-pool digest, and candidate count.
+- **Problem:** Catalog enumeration order and run-local state must never remap a scenario to different bytes and invalidate an otherwise compatible cache entry.
+- **Change:** Keep canonical candidate identity as the sole single-file decision input; make full path + full SHA-256 the durable explicit replay key and reject a pool-digest mismatch unless explicit replay is requested.
+- **Acceptance:** The same scenario and pool select the same full digest in every supported browser and after page reload; reordering never changes the pick; a recorded failing digest replays explicitly after catalog drift.
+- **Source:** docs/subsystems/media-selection.md — Target design #2 / gap "Canonical selection identity"
 
 ### REQ-SEL-04 — Typed oracle-evidence plan with declared sufficient sets
 - **Priority:** P0
@@ -1049,13 +1049,13 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 - **Acceptance:** No result status depends on free-form oracle-detail text; every candidate report lists required/applied/unavailable/sufficient survivor oracles; a required-missing + weak-pass case becomes NA_ASSET; a no-sufficient-evidence file stays in the denominator rather than being removed to improve coverage.
 - **Source:** docs/subsystems/media-selection.md — Target design #3 / gap "Survivor-oracle routing is implicit and brittle"
 
-### REQ-SEL-05 — Define the sampling unit as unique verified content
+### REQ-SEL-05 — Define each eligible candidate as unique verified content
 - **Priority:** P1
 - **Depends on:** REQ-SEL-01
-- **Current:** Every file entry occupies one array slot with no duplicate-content detection or stratification, and baked gets one slot regardless of corpus size (`src/core/media-selection.ts:375-410`).
-- **Problem:** Duplicate downloads or a provider with many near-identical files receive extra probability and baked coverage decays as reals are appended, biasing the sample.
-- **Change:** Define the sampling unit as unique verified content (a repeated digest in one scenario is one unit, not extra probability mass); disclose per-candidate selection probabilities; introduce any strata/weights only as versioned manifest fields applied identically for every engine.
-- **Acceptance:** Duplicate-content fixtures do not change selection probability and are rejected rather than double-weighted; a deterministic seed sweep meets a predeclared uniformity test; reports enumerate the eligible pool and any weights used.
+- **Current:** Duplicate content digests are rejected before candidate selection.
+- **Problem:** Duplicate downloads must not create distinct candidate identities or change the canonical choice.
+- **Change:** Define each eligible candidate as unique verified content; introduce future strata or weights only as versioned manifest fields applied identically for every engine.
+- **Acceptance:** Duplicate-content fixtures are rejected; reports enumerate the eligible pool; canonical selection remains independent of row order.
 - **Source:** docs/subsystems/media-selection.md — Target design #2 / gap "Sampling probability can be accidentally weighted"
 
 ### REQ-SEL-06 — Make derived-CENC candidate eligibility fail-closed and digest-bound
@@ -1072,17 +1072,17 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 - **Depends on:** REQ-SEL-02
 - **Current:** Real cache tags truncate SHA to 12 hex, baked tags omit content identity, the corpus checksum is a 32-bit FNV digest, and a cache hit restores only the scenario id while retaining the stored run's old selection/environment (`src/core/media-selection.ts:438-454`, `src/core/runner.ts:1981-1998`).
 - **Problem:** Baked byte changes evade identity, collisions are needlessly plausible, pool-only drift reuses stale counts, and reports describe the prior run envelope.
-- **Change:** Replace the 12-hex/filename tags and FNV checksum with full-SHA-256 canonical identities, recording distinct `eligiblePoolDigest` and `executedInputDigest` (including the verified baked digest); build a reusable observation key from engine/version, runtime config, scenario-contract and oracle/evidence-contract fingerprints, executed input digests, and benchmark config; re-envelope every cache hit with the current run's seed, pool digest, candidate count, corpus state, and timestamps.
-- **Acceptance:** Changing baked or real bytes changes the cache key and both digests; a SHA-256 prefix collision or same-filename/different-bytes cannot hit the same entry; reordering an unchanged exhaustive set keeps the set cache key but adding/removing/changing a member invalidates it; changing the oracle/scenario contract invalidates the observation; reusing identical bytes under a new seed stamps the new envelope while tracing to the original observation.
+- **Change:** Replace the 12-hex/filename tags and FNV checksum with full-SHA-256 canonical identities, recording distinct `eligiblePoolDigest` and `executedInputDigest` (including the verified baked digest); build a reusable observation key from engine/version, runtime config, scenario-contract and oracle/evidence-contract fingerprints, executed input digests, and benchmark config; re-envelope every cache hit with the current pool digest, candidate count, corpus state, and timestamps.
+- **Acceptance:** Changing baked or real bytes changes the cache key and both digests; a SHA-256 prefix collision or same-filename/different-bytes cannot hit the same entry; reordering an unchanged exhaustive set keeps the set cache key but adding/removing/changing a member invalidates it; changing the oracle/scenario contract invalidates the observation; reusing identical bytes traces to the original observation.
 - **Source:** docs/subsystems/media-selection.md — Target design #5 / gap "Cache and corpus identity are too weak and can retain stale provenance"
 
 ### REQ-SEL-08 — Add selection-policy property tests and an end-to-end acceptance suite
 - **Priority:** P2
 - **Depends on:** REQ-SEL-01
-- **Current:** The unit script covers deterministic single selection, shape/duration gates, baked-only policies, id/URL, CENC rewrite, cache tags, checksum order-independence, seek exclusion, and fallback, but imports neither `candidatesForRun` nor runner/report integration (`scripts/test-media-selection.mjs:15-21`).
+- **Current:** The unit script covers deterministic canonical selection, exhaustive enumeration, shape/duration gates, baked-only policies, id/URL, CENC rewrite, cache tags, checksum order-independence, seek exclusion, and fallback; Bun tests cover runner/cache/report integration.
 - **Problem:** The new manifest, sampling, evidence, partial-coverage, and cache behaviors have no test coverage across the real integration path.
-- **Change:** Keep focused example tests and add property tests over row permutations, candidate add/remove, duplicate content, malformed fields, empty pools, and seed sweeps; cover `candidatesForRun`, `runMatrix` integration, cache hits, and report serialization; persist counterexample identities and add a fixed golden vector per `selectionPolicyVersion`.
-- **Acceptance:** CI exercises seeded-single and exhaustive modes through report JSON and proves the acceptance matrix for PASS/DIFF/FAIL/NA, denominators, failing identities, cache behavior, and manifest drift.
+- **Change:** Keep focused example tests and property tests over row permutations, candidate add/remove, duplicate content, malformed fields, and empty pools; cover `candidatesForRun`, `runMatrix` integration, cache hits, and report serialization.
+- **Acceptance:** CI exercises canonical-single and exhaustive modes through report JSON and proves the acceptance matrix for PASS/FAIL/NA, denominators, failing identities, cache behavior, and manifest drift.
 - **Source:** docs/subsystems/media-selection.md — Target design #6 / gap "Current tests stop before exhaustive integration"
 
 ## Golden baking & fixtures
@@ -1418,9 +1418,9 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 ### REQ-UI-08 — Build, surface, and export an immutable run manifest
 - **Priority:** P1
 - **Depends on:** REQ-UI-05
-- **Current:** Per-result `env` and `selection` fields exist but only in JSON, and manual export omits filter/seed/completion/registration provenance (`src/core/scenario.ts:269-329`, `src/app/main.ts:393-405`).
+- **Current:** Per-result `env` and `selection` fields exist but only in JSON, and manual export omits filter/completion/registration provenance (`src/core/scenario.ts:269-329`, `src/app/main.ts:393-405`).
 - **Problem:** A run cannot be uniformly replayed or audited from the UI, and partial/empty payloads resemble complete runs.
-- **Change:** Build a visible and exported immutable manifest (schema/status-model version, run id, start/end time, completion state, suite/build revision, engine instance ids/configs, browser/build+operator tag, user agent, GPU, capability snapshot, scenario/oracle-definition digest, filters, warmup/iterations, execution-order digest, seed, media mode, corpus checksum, selected files+hashes, cache policy/hits, registration failures) and surface those fields in the UI rather than leaving them only in JSON.
+- **Change:** Build a visible and exported immutable manifest (schema/status-model version, run id, start/end time, completion state, suite/build revision, engine instance ids/configs, browser/build+operator tag, user agent, GPU, capability snapshot, scenario/oracle-definition digest, filters, warmup/iterations, execution-order digest, media mode, corpus checksum, selected files+hashes, cache policy/hits, registration failures) and surface those fields in the UI rather than leaving them only in JSON.
 - **Acceptance:** The manifest is visible and exported with all listed fields; current per-result `env`/`selection` values are surfaced in the UI.
 - **Source:** docs/subsystems/app-ui.md — Target "Reproducibility and cache contract"
 
@@ -1481,7 +1481,7 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 ### REQ-UI-15 — Unify manual and launcher export into one canonical versioned envelope
 - **Priority:** P1
 - **Depends on:** REQ-UI-08, REQ-REP-09
-- **Current:** Manual export omits the active filter, run-level seed, Playwright version, completion/partial state, registration report, and report artifacts, and the launcher adds only some (`src/app/main.ts:393-405`, `scripts/launch.mjs:277-305`).
+- **Current:** Manual export omits the active filter, Playwright version, completion/partial state, registration report, and report artifacts, and the launcher adds only some (`src/app/main.ts:393-405`, `scripts/launch.mjs:277-305`).
 - **Problem:** An empty/partial payload can resemble a complete run and the two export paths are not uniformly validatable.
 - **Change:** Have manual and launcher exports share one canonical versioned envelope (immutable run manifest, registration report, environment/support, results, cache-hit provenance, completion/partial reason, content digest) and offer raw results JSON plus the structured report JSON and Markdown, each labelled by schema and purpose.
 - **Acceptance:** The same run downloaded manually and saved by Playwright validate against the same schema and differ only in explicitly optional launcher provenance; raw/report-JSON/Markdown share cell count, status/coverage facts, run id, corpus checksum, and completion state; a complete run cannot carry a stale `partialReason` or suite error.
@@ -1496,20 +1496,20 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 - **Acceptance:** Security tests reject disabled, unauthenticated, traversal, sibling-prefix, cross-origin, non-JSON, and oversized requests while the explicit local happy path writes only the allowlisted results file and normal fixture Range/isolated WASM requests still succeed.
 - **Source:** docs/subsystems/app-ui.md — Target "Export and server boundary" / gap 16
 
-### REQ-UI-17 — Expose seed entry/replay and the selected input variant, count, and SHA-256
+### REQ-UI-17 — Expose the canonical selected input variant, count, and SHA-256
 - **Priority:** P2
 - **Depends on:** REQ-UI-08
-- **Current:** Manual runs expose no seed field (a time+`Math.random()` seed is generated) and there is no operator-facing display of the selected input variant (`src/app/main.ts:310-323`).
-- **Problem:** Runs are not reproducible from the UI and the chosen media is invisible until raw JSON is inspected.
-- **Change:** Let manual users enter, copy, and replay a seed, and after selection show the selected input variant(s), candidate count, and SHA-256 (keeping media catalog-controlled by media-selection, not an untracked local-file path).
-- **Acceptance:** Warmup/iteration/browser tag/seed/reuse/exhaustive/filter values round-trip through a visible run-configuration summary and the export manifest; the UI shows the selected variant, candidate count, and SHA-256 after selection.
+- **Current:** Selection is canonical and there is no operator-facing display of the selected input variant.
+- **Problem:** The chosen media is invisible until raw JSON is inspected.
+- **Change:** After selection show the selected input variant(s), candidate count, and SHA-256 while keeping media catalog-controlled.
+- **Acceptance:** Warmup/iteration/browser tag/reuse/exhaustive/filter values round-trip through a visible run-configuration summary and export manifest; the UI shows the selected variant, candidate count, and SHA-256.
 - **Source:** docs/subsystems/app-ui.md — Target "Run configuration and state model"
 
 ### REQ-UI-18 — Make cross-port cache origin and import provenance explicit
 - **Priority:** P2
 - **Depends on:** REQ-UI-09
-- **Current:** The server port commonly changes, IndexedDB is origin-scoped, and the launcher reseeds current-origin storage from result files with no page validation epoch (`scripts/run.sh:104-136`, `scripts/launch.mjs:340-423`).
-- **Problem:** Operators are misled that a persistent browser profile shares IndexedDB across ports, and seeded rows follow inconsistent epoch policy.
+- **Current:** The server port can change and IndexedDB is origin-scoped; cross-port reuse requires explicit validated import.
+- **Problem:** Operators can be misled that a persistent browser profile shares IndexedDB across ports.
 - **Change:** Make origin and import provenance explicit, use one validated import schema, never promise cross-port persistence, and show origin, storage availability/estimate, entry count, invalidated count, last error, and export/clear controls.
 - **Acceptance:** Running on two ports with the same profile shows no native rows in the second origin until an explicit validated import, after which every status follows the same epoch policy.
 - **Source:** docs/subsystems/app-ui.md — Target "Reproducibility and cache contract" / gap 7
@@ -1526,9 +1526,9 @@ not restated; each engine keeps its framework-specific API detail and fixtures.
 ### REQ-UI-20 — Give the CLI and UI one option schema and fix inert --headed/headless copy
 - **Priority:** P2
 - **Depends on:** none
-- **Current:** Playwright is always headed, `--headed` is inert, serve copy says "headlessly," and only `launch.mjs` accepts seed/exhaustive flags (`scripts/launch.mjs:69-74`, `scripts/run.sh:57-76`, `scripts/serve.sh:65-67`).
-- **Problem:** `run.sh` cannot forward seed/exhaustive and the headed/headless copy contradicts the implementation.
-- **Change:** Establish one option schema and generated help across UI, `run.sh`, and `launch.mjs` for seed, exhaustive mode, reuse/fresh policy, filters, timing, timeout, and browser choice with one meaning; implement or remove `--headed`; and use one accurate term for browser mode.
+- **Current:** Playwright uses a visible browser and the canonical option schema covers exhaustive mode and reuse/fresh policy.
+- **Problem:** Help and accepted options must remain consistent across entry points.
+- **Change:** Keep one generated option schema across UI, `run.sh`, and `launch.mjs` for exhaustive mode, reuse/fresh policy, filters, timing, timeout, and browser choice.
 - **Acceptance:** CLI conformance tests prove every documented option is accepted and forwarded exactly once, and help output contains no inert or contradictory headed/headless claim.
 - **Source:** docs/subsystems/app-ui.md — Target "Export and server boundary" / gap 14
 

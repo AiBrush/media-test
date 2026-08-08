@@ -11,7 +11,6 @@ import {
   assessRobustnessVariantEligibility,
   buildCandidateEvidencePlan,
   buildSelectionManifest,
-  candidateScore,
   candidatesForRun,
   computeCorpusChecksum,
   computeEligiblePoolsDigest,
@@ -460,7 +459,7 @@ describe('REQ-SEL-02 exact byte identity before engine use', () => {
     });
     const pool = manifest.pools[0]!;
     expect(pool.eligible).toBe(0);
-    expect(selectCandidateFromPool(pool, { seed: 'must-not-draw' })).toMatchObject({
+    expect(selectCandidateFromPool(pool)).toMatchObject({
       state: 'EMPTY',
       eligible: 0,
       issue: { reasonCode: 'CORPUS_NO_VERIFIED_CANDIDATE', status: 'NA_ASSET' },
@@ -511,51 +510,52 @@ describe('REQ-SEL-02 exact byte identity before engine use', () => {
   });
 });
 
-describe('REQ-SEL-03/05 order-independent HRW scoring, replay, and unique-content fairness', () => {
+describe('REQ-SEL-03/05 order-independent canonical selection, replay, and unique-content identity', () => {
   const files = [sourceFile('01.mp4', 'one'), sourceFile('02.mp4', 'two'), sourceFile('03.mp4', 'three')];
 
-  test('policy has a fixed golden vector and selection is invariant under every file permutation', () => {
+  test('hashing has fixed golden vectors and selection is invariant under every file permutation', () => {
     expect(sha256Hex(new Uint8Array())).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
     expect(sha256Hex(bytes('abc'))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-    const digest = files[0]!.sha256;
-    expect(candidateScore('golden-seed', 'probe/selection', digest)).toBe(
-      '424114bfc523c3af50e7b558fe339938bf23fe376a893fe3916b9cfa6b0e8d92',
-    );
     const picks = new Set<string>();
     for (const order of permutations(files)) {
       const pool = poolFor(order);
-      const decision = selectCandidateFromPool(pool, { seed: 'permutation-seed' });
+      const decision = selectCandidateFromPool(pool);
       expect(decision.state).toBe('SELECTED');
-      if (decision.state === 'SELECTED') picks.add(decision.candidate.contentDigest);
-    }
-    expect(picks.size).toBe(1);
-  });
-
-  test('adding/removing candidates changes a pick only when HRW set membership requires it', () => {
-    const base = poolFor(files.slice(0, 2));
-    const added = poolFor(files);
-    for (let i = 0; i < 500; i++) {
-      const seed = `minimal-churn-${i}`;
-      const before = selectCandidateFromPool(base, { seed });
-      const after = selectCandidateFromPool(added, { seed });
-      if (before.state !== 'SELECTED' || after.state !== 'SELECTED') throw new Error('unexpected empty pool');
-      if (after.candidate.contentDigest !== files[2]!.sha256) {
-        expect(after.candidate.contentDigest).toBe(before.candidate.contentDigest);
+      if (decision.state === 'SELECTED') {
+        picks.add(decision.candidate.candidateIdentity);
+        expect(decision.replay).toBe('canonical');
       }
     }
+    expect([...picks]).toEqual([
+      [...poolFor(files).candidates]
+        .sort((left, right) => left.candidateIdentity.localeCompare(right.candidateIdentity))[0]!
+        .candidateIdentity,
+    ]);
   });
 
-  test('seed replay rejects pool drift; recorded full candidate replays explicitly after drift', () => {
+  test('adding/removing candidates follows the canonical candidate-identity minimum', () => {
+    const base = poolFor(files.slice(0, 2));
+    const added = poolFor(files);
+    const before = selectCandidateFromPool(base);
+    const after = selectCandidateFromPool(added);
+    if (before.state !== 'SELECTED' || after.state !== 'SELECTED') throw new Error('unexpected empty pool');
+    expect(before.candidate.candidateIdentity).toBe(
+      [...base.candidates].sort((a, b) => a.candidateIdentity.localeCompare(b.candidateIdentity))[0]!.candidateIdentity,
+    );
+    expect(after.candidate.candidateIdentity).toBe(
+      [...added.candidates].sort((a, b) => a.candidateIdentity.localeCompare(b.candidateIdentity))[0]!.candidateIdentity,
+    );
+  });
+
+  test('canonical replay rejects pool drift; recorded full candidate replays explicitly after drift', () => {
     const original = poolFor(files.slice(0, 2));
-    const selected = selectCandidateFromPool(original, { seed: 'failing-seed' });
+    const selected = selectCandidateFromPool(original);
     if (selected.state !== 'SELECTED') throw new Error('selection missing');
     const changed = poolFor(files);
     expect(selectCandidateFromPool(changed, {
-      seed: 'failing-seed',
       expectedPoolDigest: original.eligiblePoolDigest,
     })).toMatchObject({ state: 'POOL_MISMATCH', reasonCode: 'SELECTION_POOL_DIGEST_MISMATCH' });
     const replay = selectCandidateFromPool(changed, {
-      seed: 'different-seed-is-irrelevant-to-explicit-input',
       expectedPoolDigest: original.eligiblePoolDigest,
       replayCandidate: selected.candidate,
     });
@@ -563,17 +563,10 @@ describe('REQ-SEL-03/05 order-independent HRW scoring, replay, and unique-conten
     if (replay.state === 'SELECTED') expect(replay.candidate.candidateIdentity).toBe(selected.candidate.candidateIdentity);
   });
 
-  test('uniform seed sweep stays inside the predeclared 10% band and discloses equal weights', () => {
+  test('canonical selection discloses the complete equally weighted eligible pool', () => {
     const pool = poolFor(files);
-    const counts = new Map(pool.candidates.map((candidate) => [candidate.candidateIdentity, 0]));
-    const draws = 8_000;
-    for (let i = 0; i < draws; i++) {
-      const decision = selectCandidateFromPool(pool, { seed: `uniform-${i}` });
-      if (decision.state !== 'SELECTED') throw new Error('selection missing');
-      counts.set(decision.candidate.candidateIdentity, counts.get(decision.candidate.candidateIdentity)! + 1);
-    }
-    const expected = draws / pool.candidates.length;
-    for (const count of counts.values()) expect(Math.abs(count - expected) / expected).toBeLessThan(0.10);
+    const decision = selectCandidateFromPool(pool);
+    expect(decision).toMatchObject({ state: 'SELECTED', replay: 'canonical', candidateCount: pool.candidates.length });
     expect(pool.candidates.every((candidate) =>
       candidate.probability.numerator === 1 &&
       candidate.probability.denominator === pool.candidates.length &&
@@ -863,7 +856,7 @@ describe('REQ-SEL-07 full-digest pool/execution/cache contracts', () => {
     expect(exhaustiveSelectionCacheTag(selections)).not.toBe(exhaustiveSelectionCacheTag(selections.slice(1)));
   });
 
-  test('scenario/oracle contracts invalidate observation keys; new seed re-envelopes one observation', () => {
+  test('scenario/oracle contracts invalidate observation keys; current run re-envelopes one observation', () => {
     const base = {
       engine: { id: 'engine', version: '1', runtimeConfig: { mode: 'worker' } },
       browser: { family: 'chromium', version: '1' },
@@ -878,7 +871,6 @@ describe('REQ-SEL-07 full-digest pool/execution/cache contracts', () => {
     const reused = reEnvelopeObservation(
       { status: 'PASS', immutableSemanticResult: true },
       {
-        seed: 'new-seed',
         eligiblePoolDigest: sha256Hex('pool'),
         executedInputDigest: base.executedInputDigest,
         candidateCount: 3,
@@ -887,7 +879,7 @@ describe('REQ-SEL-07 full-digest pool/execution/cache contracts', () => {
       },
       { observationKey: key, runId: 'original-run', createdAtIso: '2026-07-15T12:00:00.000Z' },
     );
-    expect(reused.envelope.seed).toBe('new-seed');
+    expect(reused.envelope.eligiblePoolDigest).toBe(sha256Hex('pool'));
     expect(reused.reusedFrom.observationKey).toBe(key);
   });
 
@@ -905,8 +897,8 @@ describe('REQ-SEL-07 full-digest pool/execution/cache contracts', () => {
     expect(poolA.eligiblePoolDigest).not.toBe(poolB.eligiblePoolDigest);
     expect(poolA.candidates[0]?.contentDigest).not.toBe(poolB.candidates[0]?.contentDigest);
     const sources = new Map([['probe/selection', row([], { class: 'SYNTHETIC' })]]);
-    const selA = selectForRun([scenario()], 'seed', sources, { bakedManifest: bakedManifest([{ id: 'baked.mp4', contents: 'baked-v1' }]) }).get('probe/selection')!;
-    const selB = selectForRun([scenario()], 'seed', sources, { bakedManifest: bakedManifest([{ id: 'baked.mp4', contents: 'baked-v2' }]) }).get('probe/selection')!;
+    const selA = selectForRun([scenario()], sources, { bakedManifest: bakedManifest([{ id: 'baked.mp4', contents: 'baked-v1' }]) }).get('probe/selection')!;
+    const selB = selectForRun([scenario()], sources, { bakedManifest: bakedManifest([{ id: 'baked.mp4', contents: 'baked-v2' }]) }).get('probe/selection')!;
     expect(selA.executedInputDigest).not.toBe(selB.executedInputDigest);
     expect(selectionCacheTag(selA)).not.toBe(selectionCacheTag(selB));
     expect(computeCorpusChecksum([selA])).not.toBe(computeCorpusChecksum([selB]));
@@ -979,5 +971,5 @@ describe('REQ-SEL-08 property/e2e selection surface and FEAT-76 robustness vecto
   });
 });
 
-expect(SELECTION_POLICY_VERSION).toBe('hrw-sha256@1');
-expect(SELECTION_ALGORITHM_ID).toBe('sha256-max-score-utf8-v1');
+expect(SELECTION_POLICY_VERSION).toBe('canonical-candidate@1');
+expect(SELECTION_ALGORITHM_ID).toBe('candidate-identity-lexicographic-min-v1');

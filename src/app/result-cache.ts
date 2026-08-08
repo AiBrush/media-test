@@ -12,10 +12,11 @@ import type {
 } from './run-artifact.ts';
 
 const DB_NAME = 'media-browser-test-results';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = 'results';
-export const CACHE_VALIDATION_EPOCH = '2026-07-16-results-v2-fingerprint-v3-preflight-config';
-export const CACHE_EXPORT_SCHEMA = 'media-browser-test/browser-cache-export@2' as const;
+const LOOKUP_INDEX = 'by-lookup-key';
+export const CACHE_VALIDATION_EPOCH = '2026-08-03-results-v2-fingerprint-v5-canonical-selection';
+export const CACHE_EXPORT_SCHEMA = 'media-browser-test/browser-cache-export@3' as const;
 
 const STATUS_TTL_MS: Partial<Record<ScenarioResult['status'], number>> = {
   ERROR: 15 * 60 * 1_000,
@@ -43,6 +44,8 @@ export interface CacheExportBundle {
   generatedAtIso: string;
   sourceOrigin: string;
   validationEpoch: string;
+  storedEntryCount: number;
+  excludedIncompatibleEntryCount: number;
   entries: CachedResultRow[];
   contentHash: string;
 }
@@ -136,6 +139,9 @@ function hasExecutionFingerprint(result: ScenarioResult): boolean {
 
 function invalidationReason(row: StoredResultRow, nowMs: number): string | undefined {
   if (row.validationEpoch !== CACHE_VALIDATION_EPOCH) return 'validation epoch changed';
+  if (row.result.exhaustive?.some((entry) => entry.status === 'SKIPPED')) {
+    return 'exhaustive observation stopped before every input completed';
+  }
   if (!hasExecutionFingerprint(row.result)) return 'missing full execution-manifest fingerprint';
   const createdMs = Date.parse(row.createdAtIso);
   if (!Number.isFinite(createdMs)) return 'invalid creation timestamp';
@@ -149,7 +155,12 @@ function openDb(): Promise<IDBDatabase> {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE, { keyPath: 'key' });
+      const store = db.objectStoreNames.contains(STORE)
+        ? req.transaction!.objectStore(STORE)
+        : db.createObjectStore(STORE, { keyPath: 'key' });
+      if (!store.indexNames.contains(LOOKUP_INDEX)) {
+        store.createIndex(LOOKUP_INDEX, 'lookupKey', { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error('failed to open result cache'));
@@ -211,9 +222,9 @@ export function createResultCache(options: ResultCacheOptions = {}): ResultCache
     async get(engineId, scenarioId, browser) {
       try {
         const wanted = lookupKey(engineId, scenarioId, browser);
-        const rows = await readAllRows(await db());
+        const rows = await readRowsByLookupKey(await db(), wanted);
         const valid = rows
-          .filter((row) => row.lookupKey === wanted && invalidationReason(row, now().getTime()) === undefined)
+          .filter((row) => invalidationReason(row, now().getTime()) === undefined)
           .sort((a, b) => b.updatedAtIso.localeCompare(a.updatedAtIso));
         const row = valid[0];
         if (!row) return undefined;
@@ -358,7 +369,12 @@ export function createResultCache(options: ResultCacheOptions = {}): ResultCache
       });
     },
     async exportBundle() {
-      const entries = await api.list();
+      const storedEntries = await api.list();
+      // A cache epoch is also the persistence-schema boundary. Older rows remain visible so the
+      // operator can decide whether to clear them, but they must never be migrated into a current
+      // validated bundle. In particular, removed selection fields such as runSeed are rejected by
+      // results@2 rather than silently rewritten.
+      const entries = storedEntries.filter((entry) => entry.validationEpoch === CACHE_VALIDATION_EPOCH);
       const generatedAtIso = now().toISOString();
       // IndexedDB keeps the live runner shape so reuse does not depend on a persistence adapter.
       // The explicit cross-origin bundle is a trust boundary, though, and import deliberately
@@ -382,6 +398,8 @@ export function createResultCache(options: ResultCacheOptions = {}): ResultCache
         generatedAtIso,
         sourceOrigin: origin,
         validationEpoch: CACHE_VALIDATION_EPOCH,
+        storedEntryCount: storedEntries.length,
+        excludedIncompatibleEntryCount: storedEntries.length - entries.length,
         entries: persistedEntries,
       };
       return deepFreeze({ ...substantive, contentHash: canonicalContentHash(substantive) });
@@ -523,6 +541,14 @@ export function validateCacheExportBundle(value: unknown): CacheExportBundle {
     throw new Error('cache import validationEpoch is missing');
   }
   if (!Array.isArray(record.entries)) throw new Error('cache import entries must be an array');
+  for (const field of ['storedEntryCount', 'excludedIncompatibleEntryCount'] as const) {
+    if (!Number.isInteger(record[field]) || (record[field] as number) < 0) {
+      throw new Error(`cache import ${field} must be a non-negative integer`);
+    }
+  }
+  if ((record.storedEntryCount as number) !== record.entries.length + (record.excludedIncompatibleEntryCount as number)) {
+    throw new Error('cache import entry counts are inconsistent');
+  }
   if (typeof record.contentHash !== 'string') throw new Error('cache import contentHash is missing');
   const substantive = { ...record };
   delete substantive.contentHash;
@@ -631,6 +657,18 @@ async function readAllRows(database: IDBDatabase): Promise<StoredResultRow[]> {
     req.onerror = () => reject(req.error ?? new Error('failed to list result cache'));
     tx.oncomplete = () => resolve(rows);
     tx.onerror = () => reject(tx.error ?? new Error('failed to list result cache'));
+  });
+}
+
+async function readRowsByLookupKey(
+  database: IDBDatabase,
+  wanted: string,
+): Promise<StoredResultRow[]> {
+  return await new Promise((resolve, reject) => {
+    const tx = database.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).index(LOOKUP_INDEX).getAll(wanted);
+    req.onsuccess = () => resolve(req.result as StoredResultRow[]);
+    req.onerror = () => reject(req.error ?? new Error('failed to read result-cache lookup index'));
   });
 }
 

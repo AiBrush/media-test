@@ -236,8 +236,6 @@ export interface ScenarioSelection {
   candidateIdentity?: string;
   selectionPolicyVersion?: typeof SELECTION_POLICY_VERSION;
   selectionAlgorithmId?: typeof SELECTION_ALGORITHM_ID;
-  score?: string;
-  probability?: SelectionProbability;
   evidencePlan?: CandidateOracleEvidencePlan;
   rejections?: readonly CandidateRejection[];
   catalogState?: 'ready' | 'fallback';
@@ -905,7 +903,6 @@ export function evaluateCandidateEvidence(
 }
 
 export interface CandidateSelectionRequest {
-  seed: string;
   expectedPoolDigest?: string;
   allowPoolDrift?: boolean;
   /** Durable explicit replay. The full recorded candidate snapshot remains usable after catalog drift. */
@@ -918,7 +915,7 @@ export interface CandidateReplayKey {
   inputs: readonly ContentIdentity[];
 }
 
-/** Durable replay identity persisted with a failure; it is independent of seed and live pool order. */
+/** Durable replay identity persisted with a failure; it is independent of live pool order. */
 export function candidateReplayKey(candidate: SelectionCandidateManifest): CandidateReplayKey {
   return deepFreeze({
     scenarioId: candidate.scenarioId,
@@ -931,11 +928,9 @@ export type CandidateSelectionDecision =
   | {
       state: 'SELECTED';
       candidate: SelectionCandidateManifest;
-      score: string;
-      seed: string;
       eligiblePoolDigest: string;
       candidateCount: number;
-      replay: 'seed' | 'explicit';
+      replay: 'canonical' | 'explicit';
     }
   | {
       state: 'EMPTY';
@@ -950,10 +945,10 @@ export type CandidateSelectionDecision =
       reasonCode: 'SELECTION_POOL_DIGEST_MISMATCH';
     };
 
-/** Order-independent highest-random-weight selection using SHA-256 integer comparison. */
+/** Pick the canonical candidate independently of catalog enumeration order. */
 export function selectCandidateFromPool(
   pool: ScenarioCandidatePool,
-  request: CandidateSelectionRequest,
+  request: CandidateSelectionRequest = {},
 ): CandidateSelectionDecision {
   if (
     request.expectedPoolDigest &&
@@ -973,8 +968,6 @@ export function selectCandidateFromPool(
     return deepFreeze({
       state: 'SELECTED',
       candidate: request.replayCandidate,
-      score: candidateScore(request.seed, pool.scenarioId, request.replayCandidate.contentDigest),
-      seed: request.seed,
       eligiblePoolDigest: pool.eligiblePoolDigest,
       candidateCount: pool.candidates.length,
       replay: 'explicit',
@@ -988,32 +981,16 @@ export function selectCandidateFromPool(
       issue: rejection(pool.scenarioId, undefined, 'CORPUS_NO_VERIFIED_CANDIDATE', 'candidate pool is empty'),
     });
   }
-  let selected = pool.candidates[0]!;
-  let selectedScore = candidateScore(request.seed, pool.scenarioId, selected.contentDigest);
-  for (let index = 1; index < pool.candidates.length; index++) {
-    const candidate = pool.candidates[index]!;
-    const score = candidateScore(request.seed, pool.scenarioId, candidate.contentDigest);
-    if (score > selectedScore || (score === selectedScore && candidate.candidateIdentity < selected.candidateIdentity)) {
-      selected = candidate;
-      selectedScore = score;
-    }
-  }
+  const selected = pool.candidates.reduce((current, candidate) =>
+    candidate.candidateIdentity < current.candidateIdentity ? candidate : current,
+  );
   return deepFreeze({
     state: 'SELECTED',
     candidate: selected,
-    score: selectedScore,
-    seed: request.seed,
     eligiblePoolDigest: pool.eligiblePoolDigest,
     candidateCount: pool.candidates.length,
-    replay: 'seed',
+    replay: 'canonical',
   });
-}
-
-export function candidateScore(seed: string, scenarioId: string, fullCandidateDigest: string): string {
-  if (!LOWER_SHA256.test(fullCandidateDigest)) {
-    throw new SelectionPolicyError('CANDIDATE_DIGEST_INVALID', 'HRW scoring requires a full lowercase SHA-256');
-  }
-  return sha256Hex(`${SELECTION_POLICY_VERSION}\u0000${seed}\u0000${scenarioId}\u0000${fullCandidateDigest}`);
 }
 
 export function computeEligiblePoolDigest(
@@ -1047,10 +1024,9 @@ export interface SelectOptions {
   replayCandidates?: ReadonlyMap<string, SelectionCandidateManifest> | Readonly<Record<string, SelectionCandidateManifest>>;
 }
 
-/** Existing runner surface, now backed by order-independent full-digest scoring. */
+/** Select the stable canonical input for each scenario. */
 export function selectForRun(
   scenarios: Scenario[],
-  runSeed: string,
   sources: ReadonlyMap<string, ScenarioSourceRow>,
   options: SelectOptions = {},
 ): Map<string, ScenarioSelection> {
@@ -1058,7 +1034,6 @@ export function selectForRun(
   for (const scenario of scenarios) {
     const pool = compatibilityPool(scenario, sources, options);
     const decision = selectCandidateFromPool(pool, {
-      seed: runSeed,
       expectedPoolDigest: valueFor(options.expectedPoolDigests, scenario.id),
       allowPoolDrift: options.allowPoolDrift,
       replayCandidate: valueFor(options.replayCandidates, scenario.id),
@@ -1067,7 +1042,7 @@ export function selectForRun(
       throw new SelectionPolicyError(decision.reasonCode, `expected ${decision.expectedPoolDigest}, got ${decision.actualPoolDigest}`);
     }
     if (decision.state === 'EMPTY') continue;
-    out.set(scenario.id, makeSelection(scenario, decision.candidate, pool, decision.score, sources));
+    out.set(scenario.id, makeSelection(scenario, decision.candidate, pool, sources));
   }
   return out;
 }
@@ -1081,7 +1056,7 @@ export function candidatesForRun(
   const out = new Map<string, ScenarioSelection[]>();
   for (const scenario of scenarios) {
     const pool = compatibilityPool(scenario, sources, options);
-    out.set(scenario.id, pool.candidates.map((candidate) => makeSelection(scenario, candidate, pool, undefined, sources)));
+    out.set(scenario.id, pool.candidates.map((candidate) => makeSelection(scenario, candidate, pool, sources)));
   }
   return out;
 }
@@ -1171,7 +1146,6 @@ function makeSelection(
   scenario: Scenario,
   candidate: SelectionCandidateManifest,
   pool: ScenarioCandidatePool,
-  score: string | undefined,
   sources: ReadonlyMap<string, ScenarioSourceRow>,
 ): ScenarioSelection {
   const isBaked = candidate.kind === 'baked';
@@ -1216,8 +1190,6 @@ function makeSelection(
     candidateIdentity: candidate.candidateIdentity,
     selectionPolicyVersion: SELECTION_POLICY_VERSION,
     selectionAlgorithmId: SELECTION_ALGORITHM_ID,
-    ...(score ? { score } : {}),
-    probability: candidate.probability,
     evidencePlan: candidate.evidencePlan,
     rejections: pool.rejections,
     ...(sources instanceof LoadedScenarioSources

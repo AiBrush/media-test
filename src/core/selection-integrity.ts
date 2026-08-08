@@ -9,8 +9,8 @@ import { Sha256, sha256Hex } from './seeded-rng.ts';
 
 export const CATALOG_SCHEMA_VERSION = 'media-candidate-catalog@1' as const;
 export const BAKED_CORPUS_SCHEMA_VERSION = 'baked-corpus@1' as const;
-export const SELECTION_POLICY_VERSION = 'hrw-sha256@1' as const;
-export const SELECTION_ALGORITHM_ID = 'sha256-max-score-utf8-v1' as const;
+export const SELECTION_POLICY_VERSION = 'canonical-candidate@1' as const;
+export const SELECTION_ALGORITHM_ID = 'candidate-identity-lexicographic-min-v1' as const;
 export const SELECTION_MANIFEST_SCHEMA_VERSION = 'media-selection-manifest@1' as const;
 
 export type SourceClass = 'REAL' | 'SYNTHETIC' | 'STREAMING' | 'DERIVED';
@@ -785,7 +785,6 @@ export function computeObservationKey(input: ObservationKeyInput): string {
 }
 
 export interface SelectionRunEnvelope {
-  seed: string;
   eligiblePoolDigest: string;
   executedInputDigest: string;
   candidateCount: number;

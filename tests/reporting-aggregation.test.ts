@@ -515,7 +515,6 @@ function completeContext(
       corpusChecksum: 'corpus',
       selectedFileSetHash: 'files-hash',
       mutationHash: 'no-mutation',
-      rotationSeed: 'seed',
       runSelectionHash: 'selection-hash',
       primaryMetric: metric,
       primaryUnit: unit,

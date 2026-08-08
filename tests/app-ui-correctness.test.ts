@@ -5,7 +5,6 @@ import { join, relative, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import {
-  DEFAULT_LAUNCHER_RANDOM_SEED,
   RUN_OPTION_DEFINITIONS,
   RUN_OPTION_LIMITS,
   RunOptionValidationError,
@@ -18,6 +17,7 @@ import {
   finalizeRunManifest,
   strictResultsEnvelope,
   validateCanonicalRunArtifact,
+  validateRunManifest,
   withLauncherProvenance,
 } from '../src/app/run-artifact.ts';
 import type { CacheManifestSnapshot, RunCompletionState } from '../src/app/run-artifact.ts';
@@ -179,7 +179,7 @@ describe('REQ-UI-04/05/08/15/17: frozen configuration and canonical artifacts', 
     const frozen = freezeRunConfiguration({
       browser: 'chromium', engineIds: engines, scenarioIds: scenarios, featureIds: ['probe'],
       operations: ['probe'], pillar: 'functional', warmup: 0, iters: 50, timeoutMs: 1_000,
-      reuseData: false, randomizeOrder: true, randomSeed: 'replay-me', exhaustiveMedia: true,
+      reuseData: false, exhaustiveMedia: true,
     }, {
       browser: 'chromium', engineIds: [], featureIds: [], scenarioIds: [], operations: [],
     });
@@ -192,11 +192,11 @@ describe('REQ-UI-04/05/08/15/17: frozen configuration and canonical artifacts', 
     expect(Object.isFrozen(frozen)).toBe(true);
     expect(Object.isFrozen(frozen.engineIds)).toBe(true);
     expect(() => freezeRunConfiguration({
-      browser: 'chromium', engineIds: [], scenarioIds: ['probe/example'], randomSeed: 'seed',
+      browser: 'chromium', engineIds: [], scenarioIds: ['probe/example'],
     }, { browser: 'chromium', engineIds: [], featureIds: [], scenarioIds: [] }))
       .toThrow(RunOptionValidationError);
     expect(() => freezeRunConfiguration({
-      browser: 'chromium', engineIds: ['engine'], scenarioIds: ['probe/example'], warmup: 21, randomSeed: 'seed',
+      browser: 'chromium', engineIds: ['engine'], scenarioIds: ['probe/example'], warmup: 21,
     }, { browser: 'chromium', engineIds: [], featureIds: [], scenarioIds: [] }))
       .toThrow(/Warmup must be an integer from 0 to 20/);
   });
@@ -213,6 +213,10 @@ describe('REQ-UI-04/05/08/15/17: frozen configuration and canonical artifacts', 
     });
     expect(parsed.runId).toBe(artifact.runId);
     expect(strict.results).toHaveLength(1);
+    expect(() => validateRunManifest({
+      ...artifact.manifest,
+      configuration: { ...artifact.manifest.configuration, randomSeed: 'removed-field' },
+    })).toThrow(/unknown field 'randomSeed'/);
     expect(JSON.stringify(artifact).match(/"results":/g)).toHaveLength(1);
     expect((artifact as unknown as Record<string, unknown>).resultsEnvelope).toBeUndefined();
 
@@ -452,12 +456,24 @@ describe('REQ-UI-09/18: cache validation and non-fatal failure evidence', () => 
       generatedAtIso: '2026-07-16T12:00:00.000Z',
       sourceOrigin: 'http://127.0.0.1:5173',
       validationEpoch: CACHE_VALIDATION_EPOCH,
+      storedEntryCount: 0,
+      excludedIncompatibleEntryCount: 0,
       entries: [],
     };
     const bundle = { ...substantive, contentHash: canonicalContentHash(substantive) };
     expect(validateCacheExportBundle(bundle)).toEqual(bundle);
     expect(() => validateCacheExportBundle({ ...bundle, sourceOrigin: 'http://127.0.0.1:5174' }))
       .toThrow(/contentHash mismatch/);
+    expect(() => validateCacheExportBundle({
+      ...bundle,
+      schema: 'media-browser-test/browser-cache-export@2',
+    })).toThrow(/browser-cache-export@3/);
+
+    const inconsistent = { ...substantive, storedEntryCount: 1 };
+    expect(() => validateCacheExportBundle({
+      ...inconsistent,
+      contentHash: canonicalContentHash(inconsistent),
+    })).toThrow(/entry counts are inconsistent/);
   });
 
   test('an IndexedDB open failure is announced in a total cache snapshot', async () => {
@@ -486,6 +502,8 @@ describe('REQ-UI-09/18: cache validation and non-fatal failure evidence', () => 
         generatedAtIso: '2026-07-16T12:00:00.000Z',
         sourceOrigin: 'http://127.0.0.1:5174',
         validationEpoch: 'old-validation-epoch',
+        storedEntryCount: 0,
+        excludedIncompatibleEntryCount: 0,
         entries: [],
       };
       await expect(cache!.importBundle({
@@ -694,7 +712,9 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(html).toMatch(/<progress id="run-progress"[^>]*min="0"[^>]*max="1"/);
     expect(html).toMatch(/<progress id="file-progress"[^>]*min="0"[^>]*max="1"/);
     expect(html).toContain('id="live-status" role="status" aria-live="polite"');
-    expect(html).toMatch(/id="randomize-order" type="checkbox" \/>/);
+    expect(html).not.toContain('id="randomize-order"');
+    expect(html).not.toContain('id="random-seed"');
+    expect(html).not.toContain('Replay seed');
     expect(html).toMatch(/id="exhaustive-media" type="checkbox" checked \/>/);
     expect(html).not.toContain('Run configuration &amp; provenance');
     expect(html).not.toContain('id="run-config-section"');
@@ -719,9 +739,7 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(wrapper).toContain('visible window');
     expect(server).toContain('loopback by default');
     expect(RUN_OPTION_LIMITS.timeoutMs.default).toBe(86_400_000);
-    expect(DEFAULT_LAUNCHER_RANDOM_SEED).toBe('media-test-launcher-default');
-    expect(launcher).toContain(`Default replay seed when omitted: ${DEFAULT_LAUNCHER_RANDOM_SEED}`);
-    expect(wrapper).toContain(`Default replay seed when omitted: ${DEFAULT_LAUNCHER_RANDOM_SEED}`);
+    expect(`${launcher}\n${wrapper}`).not.toMatch(/replay seed|random-seed/i);
     expect(wrapper).toContain('Default run deadline: 86400000 ms (24 hours).');
     expect(wrapper).toContain('reuse the last cache-origin port');
   });
@@ -737,7 +755,7 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
         '--no-serve', '--base-url', 'http://127.0.0.1:5173',
         '--browser', 'chromium', '--engine', 'engine', '--feature', 'probe',
         '--operation', 'probe', '--scenario', 'probe/example', '--pillar', 'functional',
-        '--warmup', '0', '--iters', '2', '--timeout-ms', '1000', '--random-seed', 'seed-1',
+        '--warmup', '0', '--iters', '2', '--timeout-ms', '1000',
         '--exhaustive', '--no-reuse',
       ], {
         cwd: ROOT,
@@ -770,7 +788,7 @@ function frozenConfiguration(): FrozenRunConfiguration {
   return freezeRunConfiguration({
     browser: 'chromium', engineIds: ['engine'], featureIds: ['probe'], scenarioIds: ['probe/example'],
     operations: ['probe'], pillar: 'functional', warmup: 0, iters: 1, timeoutMs: 1_000,
-    reuseData: true, randomizeOrder: true, randomSeed: 'artifact-seed', exhaustiveMedia: false,
+    reuseData: true, exhaustiveMedia: false,
   }, { browser: 'chromium', engineIds: [], featureIds: [], scenarioIds: [] });
 }
 
@@ -820,8 +838,6 @@ function artifactFromRows(
     iters: 1,
     timeoutMs: 1_000,
     reuseData: true,
-    randomizeOrder: false,
-    randomSeed: 'terminal-evidence-seed',
     exhaustiveMedia: false,
   }, { browser: 'chromium', engineIds: [], featureIds: [], scenarioIds: [] });
   const scenario = {
