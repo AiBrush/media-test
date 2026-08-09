@@ -30,21 +30,54 @@
 
 import { LADDER, mp4H264In, perfCase, T_FAST, T_HUGE, T_LARGE } from './_shared.ts';
 import type { Requires, Scenario } from '../../core/scenario.ts';
+import type { CandidateInputEnvelope } from '../../core/scenario.ts';
+import {
+  PROBE_SCALE_BUDGETS,
+  type ProbeBudgetContract,
+} from '../../features/probe/index.ts';
+import {
+  HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
+  MEDIUM_1080P_30S_CANDIDATE_ENVELOPE,
+  TINY_640X360_2S_CANDIDATE_ENVELOPE,
+  UHD_3840X2160_10S_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
 
 interface Rung {
   key: string;
+  revision: number;
   asset: string;
   timeoutMs: number;
+  candidateEnvelope: CandidateInputEnvelope;
 }
 
 // Ordered small→large. Runtime manifest/golden evidence is the sole availability authority.
 const RUNGS: Rung[] = [
-  { key: 'tiny', asset: LADDER.tiny, timeoutMs: T_FAST },
-  { key: 'medium', asset: LADDER.medium, timeoutMs: T_FAST },
-  { key: 'large4k', asset: LADDER.large4k, timeoutMs: T_LARGE },
-  { key: 'large', asset: LADDER.large, timeoutMs: T_LARGE },
-  { key: 'huge', asset: LADDER.huge, timeoutMs: T_HUGE },
-  { key: 'massive', asset: LADDER.massive, timeoutMs: T_HUGE },
+  {
+    key: 'tiny', revision: 2, asset: LADDER.tiny, timeoutMs: T_FAST,
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
+  },
+  {
+    key: 'medium', revision: 2, asset: LADDER.medium, timeoutMs: T_FAST,
+    candidateEnvelope: MEDIUM_1080P_30S_CANDIDATE_ENVELOPE,
+  },
+  {
+    key: 'large4k', revision: 2, asset: LADDER.large4k, timeoutMs: T_LARGE,
+    candidateEnvelope: UHD_3840X2160_10S_CANDIDATE_ENVELOPE,
+  },
+  {
+    key: 'large', revision: 2, asset: LADDER.large, timeoutMs: T_LARGE,
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  },
+  {
+    key: 'huge', revision: 2, asset: LADDER.huge, timeoutMs: T_HUGE,
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  },
+  {
+    key: 'massive', revision: 2, asset: LADDER.massive, timeoutMs: T_HUGE,
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
+  },
 ];
 
 function availabilityNote(r: Rung): string {
@@ -56,16 +89,38 @@ function h264AacRequiresForRung(r: Rung, op: Requires['operations'][number]): Re
   return { operations: [op], containersIn: ['mov'], videoCodecs: ['h264'], audioCodecs: ['aac'] };
 }
 
+const EXTRACT_PROBE_BUDGET_BY_RUNG: Readonly<Record<string, ProbeBudgetContract>> = Object.freeze({
+  large: PROBE_SCALE_BUDGETS.large,
+  huge: PROBE_SCALE_BUDGETS.huge,
+  massive: PROBE_SCALE_BUDGETS.massive,
+});
+
 // extract-metadata across the ladder → ops/sec (per-call overhead at small sizes, real cost at large).
 const extractLadder: Scenario[] = RUNGS.map((r) =>
   perfCase({
     id: `performance/size-ladder-extract-metadata-${r.key}`,
+    revision: r.revision,
     op: 'probe',
     input: r.asset,
+    candidateEnvelope: r.candidateEnvelope,
     requires: h264AacRequiresForRung(r, 'probe'),
     oracles: ['golden-metadata'],
-    metrics: ['opsPerSec', 'wall'],
+    metrics: EXTRACT_PROBE_BUDGET_BY_RUNG[r.key] === undefined
+      ? ['opsPerSec', 'wall']
+      : ['opsPerSec', 'wall', 'peakMemory'],
     primary: 'opsPerSec',
+    ...(EXTRACT_PROBE_BUDGET_BY_RUNG[r.key] === undefined
+      ? {}
+      : {
+          options: {
+            robustness: {
+              probe: {
+                schema: 'media-test/probe-scenario-contract@1',
+                probeBudget: EXTRACT_PROBE_BUDGET_BY_RUNG[r.key],
+              },
+            },
+          },
+        }),
     timeoutMs: r.timeoutMs,
     notes:
       `§5.3 size axis (${r.key}): extract-metadata on ${r.asset}, rank by ops/sec. Gated by ` +
@@ -77,8 +132,10 @@ const extractLadder: Scenario[] = RUNGS.map((r) =>
 const iterateLadder: Scenario[] = RUNGS.map((r) =>
   perfCase({
     id: `performance/size-ladder-iterate-packets-${r.key}`,
+    revision: r.revision,
     op: 'demux',
     input: r.asset,
+    candidateEnvelope: r.candidateEnvelope,
     requires: h264AacRequiresForRung(r, 'demux'),
     oracles: ['golden-packets'],
     metrics: ['packetsPerSec', 'throughputRealtime', 'wall'],
@@ -98,8 +155,10 @@ const MEMORY_RUNGS = RUNGS.filter((r) => r.key === 'large4k' || r.key === 'large
 const memoryPressure: Scenario[] = MEMORY_RUNGS.map((r) =>
   perfCase({
     id: `performance/size-ladder-demux-peak-memory-${r.key}`,
+    revision: r.revision,
     op: 'demux',
     input: r.asset,
+    candidateEnvelope: r.candidateEnvelope,
     requires: h264AacRequiresForRung(r, 'demux'),
     oracles: ['golden-packets'],
     metrics: ['peakMemory', 'packetsPerSec', 'wall'],

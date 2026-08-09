@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  validateDemuxResult,
   validateEncodedTrack,
   validateEncodedTracks,
   type MediaInput,
@@ -8,6 +9,7 @@ import {
 import {
   AibrushMediaEngine,
   aibrushMuxRepresentationFields,
+  createAibrushCountingSource,
   enrichAibrushProbeMetadata,
   enrichAibrushProbeMetadataFromTrackFacts,
   normalizedAibrushCodecFields,
@@ -16,12 +18,94 @@ import {
 } from '../src/engines/aibrush-media/adapter.ts';
 import {
   buildAibrushDemuxResult,
+  createAibrushDemuxResultBuilder,
   normalizeAibrushTrack,
   representationForAibrushTrack,
   withObservedCadence,
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('releases counted range copies after the framework consumes them', async () => {
+    const body = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]);
+    const blob = new Blob([body]);
+    const reads: number[] = [];
+    let wholeBufferReads = 0;
+    const source = await createAibrushCountingSource({
+      id: 'counted.mp4',
+      url: 'blob:http://127.0.0.1:5151/counted.mp4',
+      mime: 'video/mp4',
+      sizeBytes: body.byteLength,
+      mutated: false,
+      arrayBuffer: () => {
+        wholeBufferReads++;
+        throw new Error('counting source must not materialize the whole input');
+      },
+      blob: () => Promise.resolve(blob),
+    }, (bytes) => reads.push(bytes));
+
+    const window = await source.range(2, 6);
+    expect(window).toEqual(new Uint8Array([2, 3, 4, 5]));
+    expect(reads).toEqual([4]);
+    expect(wholeBufferReads).toBe(0);
+    source.releaseRange?.(window);
+    expect(window.byteLength).toBe(0);
+    expect(body).toEqual(new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));
+    source.releaseRange?.(window);
+  });
+
+  test('normalizes large producer batches without retaining a decoder config per packet', () => {
+    const description = new Uint8Array([1, 100, 0, 40, 0xff, 0xe1]);
+    const track = {
+      id: 7,
+      mediaType: 'video' as const,
+      codec: 'avc1.640028',
+      config: { codec: 'avc1.640028', codedWidth: 1_920, codedHeight: 1_080, description },
+    };
+    const metadata: NormalizedMetadata = {
+      container: 'mp4',
+      durationSec: 10,
+      tracks: [normalizeAibrushTrack(track)],
+    };
+    const builder = createAibrushDemuxResultBuilder(metadata, [track]);
+    const firstBatch = Array.from({ length: 257 }, (_, index) => ({
+      trackIndex: 0,
+      size: 1,
+      ptsUs: index * 1_000,
+      dtsUs: index * 1_000,
+      durationUs: 1_000,
+      keyframe: index === 0,
+    }));
+    builder.addPackets(firstBatch);
+    firstBatch[0]!.ptsUs = -1;
+    for (let start = firstBatch.length; start < 10_000; start += 257) {
+      builder.addPackets(Array.from({ length: Math.min(257, 10_000 - start) }, (_, offset) => {
+        const index = start + offset;
+        return {
+          trackIndex: 0,
+          size: 1,
+          ptsUs: index * 1_000,
+          dtsUs: index * 1_000,
+          durationUs: 1_000,
+          keyframe: false,
+        };
+      }));
+    }
+
+    const result = builder.finish();
+    const configured = result.packets.filter((packet) => packet.decoderConfig !== undefined);
+    expect(result.packets).toHaveLength(10_000);
+    expect(result.packets[0]?.ptsUs).toBe(0);
+    expect(result.packets[0]).not.toBe(firstBatch[0]);
+    expect(configured).toHaveLength(1);
+    expect(configured[0]?.decoderConfig).toEqual(description);
+    expect(configured[0]?.decoderConfig?.buffer).not.toBe(description.buffer);
+    expect(result.representations?.[0]?.description).toEqual(description);
+    expect(result.representations?.[0]?.description?.buffer).not.toBe(
+      configured[0]?.decoderConfig?.buffer,
+    );
+    expect(() => validateDemuxResult('aibrush-media@dev', result)).not.toThrow();
+  });
+
   test('represents an auxiliary track with no codec token as explicit unknown evidence', () => {
     expect(normalizedAibrushCodecFields('')).toEqual({ codec: 'unknown' });
     expect(normalizedAibrushCodecFields(' avc1.640028 ')).toEqual({

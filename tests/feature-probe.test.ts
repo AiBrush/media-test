@@ -3,6 +3,16 @@ import { existsSync, readFileSync } from 'node:fs';
 
 import type { NormalizedTrack } from '../src/core/engine.ts';
 import {
+  buildSelectionManifest,
+  findScenarioPool,
+  parseBakedCorpusManifest,
+  parseScenarioSourceCatalog,
+} from '../src/core/media-selection.ts';
+import {
+  scenarioDefinitionProjection,
+  validateScenarioDefinitionV2,
+} from '../src/core/scenario.ts';
+import {
   HLS_PLAYLIST_ONLY_PROBE_SCHEMA,
   HLS_PROTECTED_SEGMENT_PROBE_SCHEMA,
   PROBE_COVERAGE_DECISIONS,
@@ -54,6 +64,118 @@ function observation(overrides: Partial<ProbeMetadataObservation> = {}): ProbeMe
     ...overrides,
   };
 }
+
+const PROBE_CANDIDATE_ENVELOPE_CASES = [
+  {
+    id: 'probe/micro_h264_1frame', input: 'micro_h264_1frame.mp4',
+    envelope: {
+      minWidth: 320, maxWidth: 320, minHeight: 240, maxHeight: 240,
+      minDurationSec: 0.9, maxDurationSec: 1.1,
+    },
+    eligibleReal: [], mismatchedReal: [], duplicateReal: [],
+  },
+  {
+    id: 'probe/micro_audio_short', input: 'micro_audio_short.m4a',
+    envelope: { minDurationSec: 0, maxDurationSec: 0.25 },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+  {
+    id: 'probe/tiny_h264_360p_2s', input: 'tiny_h264_360p_2s.mp4',
+    envelope: {
+      minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+      minDurationSec: 1.8, maxDurationSec: 2.2,
+    },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+  {
+    id: 'probe/tiny_vp9_360p_2s', input: 'tiny_vp9_360p_2s.webm',
+    envelope: {
+      minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+      minDurationSec: 1.8, maxDurationSec: 2.2,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'], duplicateReal: [],
+  },
+  {
+    id: 'probe/large_h264_1080p_120s', input: 'large_h264_1080p_120s.mp4',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 108, maxDurationSec: 132,
+    },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+  {
+    id: 'probe/large_vp9_1080p_120s', input: 'large_vp9_1080p_120s.webm',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 108, maxDurationSec: 132,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'], duplicateReal: [],
+  },
+  {
+    id: 'probe/huge_h264_1080p_600s', input: 'huge_h264_1080p_600s.mov',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 540, maxDurationSec: 660,
+    },
+    eligibleReal: ['01.mov'], mismatchedReal: ['02.mov', '03.mov'], duplicateReal: [],
+  },
+  {
+    id: 'probe/huge_vp9_1080p_240s', input: 'huge_vp9_1080p_240s.webm',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 216, maxDurationSec: 264,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'], duplicateReal: [],
+  },
+  {
+    id: 'probe/big_buck_bunny_1080p_h264', input: 'big_buck_bunny_1080p_h264.mov',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 540, maxDurationSec: 660,
+    },
+    eligibleReal: [], mismatchedReal: ['02.mov', '03.mov'], duplicateReal: ['01.mov'],
+  },
+  {
+    id: 'probe/massive_h264_1080p_2h', input: 'massive_h264_1080p_2h.mp4',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 6480, maxDurationSec: 7920,
+    },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+  {
+    id: 'probe/massive_vp9_1080p_2h', input: 'massive_vp9_1080p_2h.webm',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 6480, maxDurationSec: 7920,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'], duplicateReal: [],
+  },
+  {
+    id: 'probe/perf-extract-metadata-large', input: 'large_h264_1080p_120s.mp4',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 108, maxDurationSec: 132,
+    },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+  {
+    id: 'probe/perf-extract-metadata-huge', input: 'huge_h264_1080p_600s.mov',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 540, maxDurationSec: 660,
+    },
+    eligibleReal: ['01.mov'], mismatchedReal: ['02.mov', '03.mov'], duplicateReal: [],
+  },
+  {
+    id: 'probe/perf-extract-metadata-massive', input: 'massive_h264_1080p_2h.mp4',
+    envelope: {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 6480, maxDurationSec: 7920,
+    },
+    eligibleReal: [], mismatchedReal: ['01.mp4', '02.mp4', '03.mp4'], duplicateReal: [],
+  },
+] as const;
 
 function verdictOf(value: ReturnType<typeof assessDeclaredMetadataFields>): string {
   return value.state === 'VERDICT' ? value.verdict : value.state;
@@ -346,6 +468,65 @@ describe('REQ-FEAT-38 bounded scale probing', () => {
     ]) {
       expect(scenario(id).options?.metadataTrackTypes).toEqual(['video', 'audio']);
       expect(scenario(id).notes).toContain('tmcd');
+    }
+  });
+
+  test('all scale and throughput rows publish versioned, schema-valid candidate envelopes', () => {
+    const expectedIds = PROBE_CANDIDATE_ENVELOPE_CASES.map((entry) => entry.id).sort();
+    expect(probeScenarios
+      .filter((entry) => entry.candidateEnvelope !== undefined)
+      .map((entry) => entry.id)
+      .sort()).toEqual(expectedIds);
+
+    for (const expected of PROBE_CANDIDATE_ENVELOPE_CASES) {
+      const item = scenario(expected.id);
+      expect(item.revision, expected.id).toBe(2);
+      expect(item.input, expected.id).toBe(expected.input);
+      expect(item.candidateEnvelope, expected.id).toEqual(expected.envelope);
+      expect(Object.isFrozen(item.candidateEnvelope), expected.id).toBeTrue();
+      expect(validateScenarioDefinitionV2(scenarioDefinitionProjection(item)), expected.id).toEqual([]);
+    }
+  });
+
+  test('production selection retains baked and matching MOV inputs while excluding wrong workloads', () => {
+    const catalogResult = parseScenarioSourceCatalog(
+      textAt('fixtures/media/scenarios/_sources.ndjson'),
+    );
+    if (catalogResult.state !== 'VALID') {
+      throw new Error(catalogResult.issues.map((issue) => issue.detail).join('; '));
+    }
+    const bakedResult = parseBakedCorpusManifest(jsonAt('fixtures/manifest.json'));
+    if (bakedResult.state !== 'VALID') {
+      throw new Error(bakedResult.issues.map((issue) => issue.detail).join('; '));
+    }
+    const manifest = buildSelectionManifest({
+      scenarios: PROBE_CANDIDATE_ENVELOPE_CASES.map((entry) => scenario(entry.id)),
+      catalog: catalogResult.catalog,
+      bakedManifest: bakedResult.manifest,
+    });
+
+    for (const expected of PROBE_CANDIDATE_ENVELOPE_CASES) {
+      const pool = findScenarioPool(manifest, expected.id);
+      if (!pool) throw new Error(`missing candidate pool '${expected.id}'`);
+
+      expect(pool.candidates
+        .filter((candidate) => candidate.kind === 'baked')
+        .map((candidate) => candidate.selectedFile), expected.id).toEqual([expected.input]);
+      expect(pool.candidates
+        .filter((candidate) => candidate.kind === 'real')
+        .map((candidate) => candidate.selectedFile)
+        .sort(), expected.id).toEqual([...expected.eligibleReal].sort());
+      expect(pool.rejections
+        .filter((rejection) => rejection.reasonCode === 'CANDIDATE_INPUT_CONTRACT_MISMATCH')
+        .map((rejection) => rejection.selectedFile)
+        .sort(), expected.id).toEqual([...expected.mismatchedReal].sort());
+      expect(pool.rejections
+        .filter((rejection) => rejection.reasonCode === 'CANDIDATE_DUPLICATE_CONTENT')
+        .map((rejection) => rejection.selectedFile)
+        .sort(), expected.id).toEqual([...expected.duplicateReal].sort());
+      expect(pool.rejections.length, expected.id).toBe(
+        expected.mismatchedReal.length + expected.duplicateReal.length,
+      );
     }
   });
 });

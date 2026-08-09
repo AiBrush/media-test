@@ -20,7 +20,7 @@ export const GOLDEN_ARTIFACT_SCHEMA = 'media-test/golden-artifact@1' as const;
 export const GOLDEN_PROVENANCE_SCHEMA = 'media-test/golden-provenance@1' as const;
 export const GOLDEN_SCHEMA_MAJOR = 1 as const;
 
-export type GoldenArtifactKind = 'metadata' | 'packets' | 'frames' | 'ssim' | 'keys' | 'segments' | 'availability';
+export type GoldenArtifactKind = 'metadata' | 'packets' | 'frames' | 'ssim' | 'alpha' | 'keys' | 'segments' | 'availability';
 
 export interface DigestSubject {
   sha256: string;
@@ -427,7 +427,7 @@ function parseVersion(value: unknown): { major: number; minor: number; patch: nu
 }
 
 function isKind(value: unknown): value is GoldenArtifactKind {
-  return value === 'metadata' || value === 'packets' || value === 'frames' || value === 'ssim' || value === 'keys' || value === 'segments' || value === 'availability';
+  return value === 'metadata' || value === 'packets' || value === 'frames' || value === 'ssim' || value === 'alpha' || value === 'keys' || value === 'segments' || value === 'availability';
 }
 
 function isAvailability(value: unknown): boolean {

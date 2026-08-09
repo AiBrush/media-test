@@ -124,6 +124,8 @@ function pushUnique(list: string[], value: string): void {
 export interface MuxCase {
   /** stable id suffix (namespaced under mux/) */
   id: string;
+  /** Increment when selection semantics or the executable contract changes. */
+  revision?: number;
   /** source asset(s) the runner demuxes to obtain EncodedTracks (must exist in fixtures/manifest.json) */
   input: string | string[];
   /** source container(s) — for negotiation */
@@ -142,6 +144,8 @@ export interface MuxCase {
   primaryMetric?: MetricId;
   /** Per-case oracle tolerances, e.g. cross-source mux duration rounding. */
   tolerances?: Scenario['tolerances'];
+  /** Exact workload facts every exhaustive source candidate must satisfy. */
+  candidateEnvelope?: Scenario['candidateEnvelope'];
   /**
    * Override the default oracle set. Every ordinary row defaults to neutral semantic re-import plus
    * property-invariant:probe-duration; output-mode rows add their structural layout oracle.
@@ -173,6 +177,7 @@ export function buildMux(c: MuxCase): Scenario {
   const features = muxFeatures(c);
   return defineScenario({
     id: `mux/${c.id}`,
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'mux',
     input: c.input,
     options: muxOptions(c),
@@ -189,6 +194,7 @@ export function buildMux(c: MuxCase): Scenario {
     metrics: [...metrics],
     ...(c.primaryMetric ? { primaryMetric: c.primaryMetric } : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
@@ -202,6 +208,8 @@ export function buildMuxAll(cases: MuxCase[]): Scenario[] {
 
 export interface MuxPropertyCase {
   id: string;
+  /** Increment when selection semantics or the executable contract changes. */
+  revision?: number;
   /** the invariant token the property-invariant oracle interprets (DECODE_MUX | PROBE_DUR) */
   invariant: string;
   input: string | string[];
@@ -214,6 +222,8 @@ export interface MuxPropertyCase {
   /** default: semantic reference-reimport + the requested property invariant */
   oracles?: OracleId[];
   tolerances?: Scenario['tolerances'];
+  /** Exact workload facts every exhaustive source candidate must satisfy. */
+  candidateEnvelope?: Scenario['candidateEnvelope'];
   timeoutMs?: number;
   notes?: string;
 }
@@ -236,6 +246,7 @@ export function buildMuxProperty(c: MuxPropertyCase): Scenario {
   }
   return defineScenario({
     id: `mux/${c.id}`,
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'mux',
     input: c.input,
     options: { container: c.to, invariant: c.invariant, ...(c.extraOptions ?? {}) },
@@ -250,6 +261,7 @@ export function buildMuxProperty(c: MuxPropertyCase): Scenario {
     oracles,
     metrics: ['wall', 'peakMemory', 'longtasks'],
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });

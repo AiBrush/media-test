@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   AdapterContractError,
   BrowserNotSupportedError,
+  CANONICAL_READ_VIDEO_CODECS,
+  CANONICAL_VIDEO_CODECS,
   createBrowserNotSupportedError,
   createMalformedInputError,
   createNotApplicableError,
@@ -184,6 +186,71 @@ describe('REQ-ADP-04: normalized carrier validation', () => {
       () => validateNormalizedMetadata(ENGINE_ID, falseCanonicalTimecode),
       'metadata.tracks[0].codecCanonical',
     );
+  });
+
+  test('accepts MJPEG as truthful read-side metadata and demux packet evidence', () => {
+    expect(CANONICAL_READ_VIDEO_CODECS).toContain('mjpeg');
+    expect(CANONICAL_VIDEO_CODECS).not.toContain('mjpeg');
+
+    const metadata: NormalizedMetadata = {
+      container: 'mkv',
+      durationSec: 1,
+      tracks: [
+        { type: 'video', codec: 'h264', width: 1280, height: 696 },
+        { type: 'audio', codec: 'aac', sampleRate: 44_100, channels: 2 },
+        { type: 'other', codec: 'unknown' },
+        {
+          type: 'video',
+          codec: 'mjpeg',
+          canonicalCodec: 'mjpeg',
+          codecCanonical: 'mjpeg',
+          nativeCodecTag: 'V_MJPEG',
+          width: 480,
+          height: 360,
+        },
+      ],
+    };
+    const demux: DemuxResult = {
+      metadata,
+      packets: [{
+        trackIndex: 3,
+        size: 4,
+        ptsUs: 0,
+        dtsUs: 0,
+        keyframe: true,
+        trackType: 'video',
+        codec: 'mjpeg',
+        framing: 'raw',
+      }],
+      packetOrdering: 'decode',
+      representations: [{
+        trackIndex: 3,
+        packetOrdering: 'decode',
+        framing: 'raw',
+        accessUnitGrouping: 'one-frame-per-chunk',
+        parameterSetLocation: 'not-applicable',
+        nativeCodecTag: 'V_MJPEG',
+      }],
+    };
+
+    expect(validateAdapterResult(ENGINE_ID, 'probe', metadata)).toBe(metadata);
+    expect(validateAdapterResult(ENGINE_ID, 'demux', demux)).toBe(demux);
+  });
+
+  test('keeps MJPEG outside encoded-track and declared capability vocabularies', () => {
+    const encoded = encodedTrackFixture('h264', 'annexb');
+    encoded.codec = 'mjpeg';
+    expectContractPath(
+      () => validateEncodedTracks(ENGINE_ID, { tracks: [encoded] }),
+      'encodedTracks.tracks[0].codec',
+    );
+
+    for (const field of ['videoCodecs', 'videoCodecsIn', 'videoCodecsOut'] as const) {
+      const capabilities = emptyCaps();
+      capabilities[field] = ['mjpeg'];
+      const engine = { id: ENGINE_ID, capabilities: () => capabilities } as MediaEngine;
+      expectContractPath(() => validateCapabilitySet(engine, capabilities), `capabilities.${field}[0]`);
+    }
   });
 
   const invalidMetadataRows: Array<{ name: string; mutate(value: NormalizedMetadata): void; path: string }> = [

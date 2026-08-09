@@ -109,14 +109,13 @@ const WRITE_CASES: TagWriteCase[] = [
 ];
 
 // ── Tag edit must NOT corrupt media — explicit, standalone metamorphic statements ─────────────────
-// (Distinct from the write cases above: these assert the no-corruption invariant as the PRIMARY
-// property on a plain remux, so even an engine that does NOT declare metadata:write — but whose remux
-// preserves the stream — is exercised, and the invariant reads as a first-class deepEdge item.)
+// Distinct from the write cases above, these make no-corruption the PRIMARY property while retaining
+// an explicit tag payload, metadata:write capability gate, and independent neutral re-import.
 
 const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
   {
     id: 'tagedit_no_corrupt_video_mp4_mkv',
-    revision: 2,
+    revision: 3,
     invariant: DECODE_REMUX,
     input: 'h264_1080p_30s.mp4',
     from: 'mp4',
@@ -131,6 +130,7 @@ const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
       carrier: 'mkv',
       requested: METADATA_UNICODE_TAGS,
     }),
+    oracles: ['reference-reimport', 'property-invariant'],
     notes:
       'Tag edit must not corrupt VIDEO: a tag-only rewrite (modeled as a lossless remux) must leave the ' +
       'coded samples untouched — decode(remux(x))==decode(x) (pixels bit-exact). Catches an engine that ' +
@@ -138,15 +138,24 @@ const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
   },
   {
     id: 'tagedit_no_corrupt_audio_flac',
+    revision: 2,
     invariant: PROBE_DUR,
     input: 'flac_seektable.flac',
     from: 'flac',
     to: 'flac',
     audioCodecs: ['flac'],
+    features: ['metadata:write'],
+    tags: METADATA_UNICODE_TAGS,
+    metadataTagContract: defineMetadataTagContract({
+      mode: 'write-reprobe',
+      carrier: 'flac',
+      requested: METADATA_UNICODE_TAGS,
+    }),
+    oracles: ['reference-reimport', 'property-invariant'],
     notes:
-      'Tag edit must not corrupt AUDIO: a FLAC tag rewrite must preserve the audio stream — ' +
-      'probe(remux(x)).dur≈probe(x).dur (duration unchanged; the honest no-PCM-oracle proxy for "audio ' +
-      'samples bit-identical").',
+      'Tag edit must not corrupt AUDIO: write the explicit Unicode subset to FLAC VORBIS_COMMENT, ' +
+      'then require neutral tag readback from a structurally valid re-import while preserving the ' +
+      'audio duration. The duration invariant is the honest no-PCM-oracle proxy for sample identity.',
   },
 ];
 
@@ -157,7 +166,7 @@ const NO_CORRUPT_PROPERTY: MetaPropertyCase[] = [
 const CROSS_CONTAINER_PROPERTY: MetaPropertyCase[] = [
   {
     id: 'meta_consistent_mp4_to_mkv',
-    revision: 2,
+    revision: 3,
     invariant: PROBE_DUR,
     input: 'h264_1080p_30s.mp4',
     from: 'mp4',
@@ -172,6 +181,7 @@ const CROSS_CONTAINER_PROPERTY: MetaPropertyCase[] = [
       carrier: 'mkv',
       requested: METADATA_UNICODE_TAGS,
     }),
+    oracles: ['reference-reimport', 'property-invariant'],
     tolerances: { durationToleranceSec: 0.1 },
     notes:
       'Cross-container metadata consistency (A.16): the same content re-wrapped MP4->MKV must yield a ' +

@@ -244,6 +244,127 @@ describe('REQ-DSL-01: validated immutable ScenarioDefinitionV2', () => {
     expect(Object.isFrozen((stored.options as { invariant: object }).invariant)).toBe(true);
   });
 
+  test('candidate envelopes are canonical input-selection contracts with ordered finite bounds', () => {
+    const authored = {
+      minWidth: 1920,
+      maxWidth: 1920,
+      minHeight: 1080,
+      maxHeight: 1080,
+      minDurationSec: 108,
+      maxDurationSec: 132,
+    };
+    const bounded = defineScenario({
+      ...baseSpec('probe/candidate-envelope'),
+      candidateEnvelope: authored,
+    });
+    authored.maxDurationSec = 999;
+
+    expect(bounded.candidateEnvelope).toEqual({
+      minWidth: 1920,
+      maxWidth: 1920,
+      minHeight: 1080,
+      maxHeight: 1080,
+      minDurationSec: 108,
+      maxDurationSec: 132,
+    });
+    expect(scenarioDefinitionProjection(bounded).candidateEnvelope).toEqual(bounded.candidateEnvelope);
+    expect(Object.isFrozen(bounded.candidateEnvelope)).toBe(true);
+
+    const invalid = cloneDefinition();
+    invalid.candidateEnvelope = { minWidth: 1919.5, minDurationSec: 133, maxDurationSec: 132 };
+    expect(validateScenarioDefinitionV2(invalid)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: 'candidateEnvelope.minWidth',
+        code: 'CANDIDATE_ENVELOPE_DIMENSION',
+      }),
+      expect.objectContaining({
+        path: 'candidateEnvelope.minDurationSec',
+        code: 'CANDIDATE_ENVELOPE_RANGE',
+      }),
+    ]));
+  });
+
+  test('quality-constrained ABR rungs validate as an atomic hard-rate and SSIM contract', () => {
+    const scenario = defineScenario({
+      id: 'transcode/dsl-quality-abr',
+      op: 'transcode',
+      input: 'h264_1080p_30s.mp4',
+      options: {
+        container: 'mp4',
+        video: { codec: 'h264' },
+        variants: [{
+          width: 640,
+          height: 360,
+          bitrate: 800_000,
+          maxAverageBitrate: 1_040_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.95 },
+        }],
+      },
+      requires: {
+        operations: ['transcode'],
+        containersIn: ['mp4'],
+        containersOut: ['mp4'],
+        videoCodecs: ['h264'],
+        features: ['quality-constrained-rate'],
+      },
+      oracles: ['fanout-renditions'],
+      metrics: [],
+    });
+    const valid = structuredClone(scenarioDefinitionProjection(scenario));
+    expect(validateScenarioDefinitionV2(valid)).toEqual([]);
+
+    const rung = () => (structuredClone(valid.options.variants) as Array<Record<string, unknown>>)[0]!;
+    const invalidCases: Array<{
+      path: string;
+      code: string;
+      mutate: (definition: ScenarioDefinitionV2) => void;
+    }> = [
+      {
+        path: 'options.variants[0]',
+        code: 'TRANSCODE_QUALITY_TUPLE_ATOMIC',
+        mutate: (definition) => { delete (definition.options.variants as Array<Record<string, unknown>>)[0]!.quality; },
+      },
+      {
+        path: 'options.variants[0].quality.samples',
+        code: 'TRANSCODE_QUALITY_SAMPLES',
+        mutate: (definition) => {
+          ((definition.options.variants as Array<Record<string, unknown>>)[0]!.quality as Record<string, unknown>).samples = 0;
+        },
+      },
+      {
+        path: 'options.variants[0].maxAverageBitrate',
+        code: 'TRANSCODE_QUALITY_MAXIMUM_BELOW_PREFERRED',
+        mutate: (definition) => {
+          (definition.options.variants as Array<Record<string, unknown>>)[0]!.maxAverageBitrate = 799_999;
+        },
+      },
+      {
+        path: 'options.variants[0].width',
+        code: 'ABR_RUNG_DIMENSION_REQUIRED',
+        mutate: (definition) => { delete (definition.options.variants as Array<Record<string, unknown>>)[0]!.width; },
+      },
+      {
+        path: 'options.variants[0].bogus',
+        code: 'ABR_RUNG_OPTION',
+        mutate: (definition) => { (definition.options.variants as Array<Record<string, unknown>>)[0]!.bogus = true; },
+      },
+      {
+        path: 'options.video.codec',
+        code: 'ABR_LADDER_CODEC',
+        mutate: (definition) => { (definition.options.video as Record<string, unknown>).codec = 'vp9'; },
+      },
+    ];
+
+    expect(rung()).toMatchObject({ width: 640, bitrate: 800_000 });
+    for (const fixture of invalidCases) {
+      const invalid = structuredClone(valid);
+      fixture.mutate(invalid);
+      expect(validateScenarioDefinitionV2(invalid), fixture.code).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: fixture.path, code: fixture.code }),
+      ]));
+    }
+  });
+
   test('declarative mutation handlers resolve only after validation', () => {
     registerScenarioMutationHandler(MUTATION_HANDLER, (bytes, parameters) =>
       bytes.slice(0, Number(parameters.keepBytes)));

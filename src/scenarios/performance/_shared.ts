@@ -47,7 +47,14 @@
  */
 
 import type { TranscodeOptions } from '../../core/engine.ts';
-import type { MetricId, OracleId, OracleTolerances, Requires, Scenario } from '../../core/scenario.ts';
+import type {
+  CandidateInputEnvelope,
+  MetricId,
+  OracleId,
+  OracleTolerances,
+  Requires,
+  Scenario,
+} from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
 // ── Big-read + size-ladder asset ids (canonical; must match manifest + golden filenames) ──────────
@@ -112,8 +119,10 @@ export const CONVERT_TOLERANCES: OracleTolerances = { ssimMin: 0.97, psnrMinDb: 
 
 export interface PerfCaseSpec {
   id: string;
+  revision?: number;
   op: Scenario['op'];
   input: string | string[];
+  candidateEnvelope?: CandidateInputEnvelope;
   requires: Requires;
   oracles: OracleId[];
   /** metrics list; `primary` is prepended if absent and is set as the case's primaryMetric. */
@@ -130,8 +139,10 @@ export function perfCase(s: PerfCaseSpec): Scenario {
   const metrics = s.metrics.includes(s.primary) ? s.metrics : [s.primary, ...s.metrics];
   return defineScenario({
     id: s.id,
+    ...(s.revision !== undefined ? { revision: s.revision } : {}),
     op: s.op,
     input: s.input,
+    ...(s.candidateEnvelope !== undefined ? { candidateEnvelope: s.candidateEnvelope } : {}),
     ...(s.options ? { options: s.options } : {}),
     requires: s.requires,
     oracles: s.oracles,

@@ -2,6 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 import type { MediaBytes, MediaInput } from '../src/core/engine.ts';
+import {
+  buildSelectionManifest,
+  parseBakedCorpusManifest,
+  parseScenarioSourceCatalog,
+} from '../src/core/media-selection.ts';
 import type { OracleOutcome } from '../src/core/scenario.ts';
 import {
   REMUX_ROUND_TRIP_LEG_ROLE,
@@ -642,6 +647,78 @@ describe('REQ-FEAT-10 safe partial remux classifications', () => {
 });
 
 describe('REQ-FEAT-11 manifest-derived size-ladder availability', () => {
+  test('all four size rows publish revisioned exact workload envelopes', () => {
+    const expected = new Map<string, object>([
+      ['remux/large_h264_1080p_120s_mp4_to_mkv', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 108, maxDurationSec: 132,
+      }],
+      ['remux/large_vp9_1080p_120s_webm_to_mkv', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 108, maxDurationSec: 132,
+      }],
+      ['remux/huge_h264_1080p_600s_mov_to_mp4', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 540, maxDurationSec: 660,
+      }],
+      ['remux/massive_h264_1080p_2h_mp4_to_mkv', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 6480, maxDurationSec: 7920,
+      }],
+    ]);
+    const sizeRows = remuxScenarios.filter((scenario) => expected.has(scenario.id));
+
+    expect(sizeRows).toHaveLength(expected.size);
+    for (const scenario of sizeRows) {
+      expect(scenario.revision, scenario.id).toBe(2);
+      expect(scenario.candidateEnvelope, scenario.id).toEqual(expected.get(scenario.id));
+      expect(Object.isFrozen(scenario.candidateEnvelope), scenario.id).toBe(true);
+    }
+  });
+
+  test('size envelopes close the current catalog to the exact 167-member remux pool', () => {
+    const catalog = parseScenarioSourceCatalog(textAt('fixtures/media/scenarios/_sources.ndjson'));
+    const baked = parseBakedCorpusManifest(JSON.parse(textAt('fixtures/manifest.json')));
+    if (catalog.state !== 'VALID' || baked.state !== 'VALID') {
+      throw new Error('expected valid committed selection catalogs');
+    }
+    const selection = buildSelectionManifest({
+      scenarios: remuxScenarios,
+      catalog: catalog.catalog,
+      bakedManifest: baked.manifest,
+    });
+    expect(selection.pools).toHaveLength(49);
+    expect(selection.pools.reduce((total, pool) => total + pool.candidates.length, 0)).toBe(167);
+
+    const expected = new Map<string, { admitted: string[]; rejected: string[] }>([
+      ['remux/large_h264_1080p_120s_mp4_to_mkv', {
+        admitted: ['large_h264_1080p_120s.mp4'],
+        rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['remux/large_vp9_1080p_120s_webm_to_mkv', {
+        admitted: ['large_vp9_1080p_120s.webm'],
+        rejected: ['01.webm', '02.webm', '03.webm'],
+      }],
+      ['remux/huge_h264_1080p_600s_mov_to_mp4', {
+        admitted: ['01.mov', 'huge_h264_1080p_600s.mov'],
+        rejected: ['02.mov', '03.mov'],
+      }],
+      ['remux/massive_h264_1080p_2h_mp4_to_mkv', {
+        admitted: ['massive_h264_1080p_2h.mp4'],
+        rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+    ]);
+    for (const [scenarioId, exact] of expected) {
+      const pool = selection.pools.find((candidate) => candidate.scenarioId === scenarioId);
+      expect(pool?.candidates.map((candidate) => candidate.selectedFile), scenarioId).toEqual(exact.admitted);
+      expect(pool?.rejections.map((rejection) => rejection.selectedFile), scenarioId).toEqual(exact.rejected);
+      expect(
+        pool?.rejections.every((rejection) => rejection.reasonCode === 'CANDIDATE_INPUT_CONTRACT_MISMATCH'),
+        scenarioId,
+      ).toBe(true);
+    }
+  });
+
   test('every one of the 49 remux rows resolves to a concrete manifest identity', () => {
     const source = manifest();
     expect(remuxScenarios).toHaveLength(49);

@@ -471,6 +471,15 @@ export interface SelectedDecodeTrackEvidence {
 export interface DecodeOptions {
   maxFrames?: number;
   track?: DecodeTrackSelector;
+  /**
+   * Exact source-timeline presentation timestamps requested by evidence producers. `originUs` maps
+   * those timestamps onto a zero-based HTMLMediaElement timeline without relabeling observed pixels.
+   * Engines without a media-element route may retain their ordinary bounded-prefix behavior.
+   */
+  exactPresentationTimes?: {
+    readonly originUs: number;
+    readonly timestampsUs: readonly number[];
+  };
   /** Called at the normalized frame-sink delivery boundary with an absolute monotonic timestamp. */
   onFirstFrame?: (atMs: number) => void;
 }
@@ -479,6 +488,16 @@ export interface FrameSink {
   frames: FrameDigest[];
   /** raw pixels for SSIM/PSNR oracles; may be absent if the engine only produced digests */
   getPixels?(i: number): Promise<ImageData>;
+  /**
+   * Decoder-observed colour metadata for each retained frame. This stays separate from RGBA pixels:
+   * requesting RGBA converts them to sRGB, so those bytes can no longer prove that an input was PQ/BT.2020.
+   */
+  decodedColorSpaces?: Array<{
+    primaries?: string | null;
+    transfer?: string | null;
+    matrix?: string | null;
+    fullRange?: boolean | null;
+  }>;
   /** Required whenever DecodeOptions.track requested a concrete track. */
   selectedTrack?: SelectedDecodeTrackEvidence;
   telemetry?: OperationFinalCounters;
@@ -540,7 +559,16 @@ export interface TranscodeVideoOptions {
   width?: number;
   height?: number;
   fps?: number;
+  /** Preferred whole-program elementary-stream average bitrate. */
   bitrate?: number;
+  /** Hard whole-program elementary-stream average bitrate ceiling. */
+  maxAverageBitrate?: number;
+  /** Versioned objective-quality floor evaluated by the selected engine before publishing output. */
+  quality?: {
+    metric: 'ssim-luma-v1';
+    minimumMean: number;
+    samples?: number;
+  };
   rotate?: number;
 }
 
@@ -551,12 +579,22 @@ export interface TranscodeAudioOptions {
   bitrate?: number;
 }
 
+/** Authored identity and switching timeline for a multi-rendition transcode request. */
+export interface TranscodeRenditionSetOptions {
+  id: string;
+  renditionIds: string[];
+  switchPointsUs: number[];
+  segmentMode: 'random-access' | 'segments';
+}
+
 export interface TranscodeOptions {
   container: string;
   video?: TranscodeVideoOptions;
   audio?: TranscodeAudioOptions;
   /** fan-out / ABR ladder: one input → N renditions */
   variants?: TranscodeVideoOptions[];
+  /** Explicit semantic association for `variants`; adapters return this as candidate-authored evidence. */
+  renditionSet?: TranscodeRenditionSetOptions;
 }
 
 /** Encoded, demuxed tracks fed back into a muxer (mux()). Opaque chunk bytes + minimal framing. */
@@ -633,6 +671,8 @@ export const CHECKED_SUPPORT_SNAPSHOT_PROTOCOL = 'media-browser-test/checked-sup
 export const NOT_APPLICABLE_ERROR_KIND = 'media-browser-test/not-applicable@1' as const;
 export const BROWSER_NOT_SUPPORTED_ERROR_KIND = 'media-browser-test/browser-not-supported@1' as const;
 export const MALFORMED_INPUT_ERROR_KIND = 'media-browser-test/malformed-input@1' as const;
+export const OPERATION_CONSTRAINT_UNSATISFIED_ERROR_KIND =
+  'media-browser-test/operation-constraint-unsatisfied@1' as const;
 
 /** Public scenario operations plus the oracle-only composition call that still needs tuple support. */
 export type ConcreteRequestOperation = Operation | 'concat';
@@ -712,6 +752,49 @@ export interface MalformedInputErrorInit {
   reason: string;
   inputId?: string;
   cause?: unknown;
+}
+
+/** One bounded encoder candidate observed before a hard output constraint was declared unsatisfied. */
+export interface ConstraintAttemptEvidence {
+  readonly attempt: number;
+  readonly targetBytes: number;
+  readonly actualBytes: number;
+  readonly averageBitrate: number;
+  readonly qualityMean?: number;
+  readonly qualitySamples?: number;
+}
+
+/** Exact hard-rate/objective-quality contract and all bounded attempts made against it. */
+export interface OperationConstraintEvidence {
+  readonly constraint: 'h264-quality-rate';
+  readonly preferredAverageBitrate: number;
+  readonly maxAverageBitrate: number;
+  readonly minimumQualityMean: number;
+  readonly metric: 'ssim-luma-v1';
+  readonly attempts: readonly ConstraintAttemptEvidence[];
+}
+
+export interface OperationConstraintUnsatisfiedErrorInit {
+  reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED';
+  operation: 'transcode';
+  engineId: string;
+  reason: string;
+  evidence: OperationConstraintEvidence;
+  cause?: unknown;
+}
+
+/** Realm-safe semantic failure: execution happened, but no bounded candidate met every hard constraint. */
+export interface SerializedOperationConstraintUnsatisfiedError {
+  readonly kind: typeof OPERATION_CONSTRAINT_UNSATISFIED_ERROR_KIND;
+  readonly name: 'OperationConstraintUnsatisfiedError';
+  readonly message: string;
+  readonly reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED';
+  readonly operation: 'transcode';
+  readonly engineId: string;
+  readonly reason: string;
+  readonly evidence: OperationConstraintEvidence;
+  readonly cause?: SerializableValue;
+  readonly stack?: string;
 }
 
 /**
@@ -836,6 +919,37 @@ export class MalformedInputError implements SerializedMalformedInputError {
   }
 }
 
+/**
+ * Error-shaped plain object so the semantic FAIL channel and its bounded evidence survive Worker and
+ * cross-realm transport. It is deliberately separate from both applicability and harness failures.
+ */
+export class OperationConstraintUnsatisfiedError implements SerializedOperationConstraintUnsatisfiedError {
+  readonly kind = OPERATION_CONSTRAINT_UNSATISFIED_ERROR_KIND;
+  readonly name = 'OperationConstraintUnsatisfiedError' as const;
+  readonly message: string;
+  readonly reasonCode = 'TRANSCODE_CONSTRAINT_UNSATISFIED' as const;
+  readonly operation = 'transcode' as const;
+  readonly engineId: string;
+  readonly reason: string;
+  readonly evidence: OperationConstraintEvidence;
+  readonly cause?: SerializableValue;
+  readonly stack?: string;
+
+  constructor(init: OperationConstraintUnsatisfiedErrorInit) {
+    this.engineId = requireNonEmpty(init.engineId, 'engineId');
+    this.reason = requireNonEmpty(init.reason, 'reason');
+    this.message = this.reason;
+    this.evidence = cloneConstraintEvidence(init.evidence);
+    if (init.cause !== undefined) this.cause = serializeCause(init.cause);
+    const stack = new Error(this.reason).stack;
+    if (stack) this.stack = stack.replace(/^Error:/, `${this.name}:`);
+  }
+
+  toJSON(): SerializedOperationConstraintUnsatisfiedError {
+    return serializeOperationConstraintUnsatisfiedError(this);
+  }
+}
+
 /** Structural, realm-independent guard for direct, cloned, or Worker-posted errors. */
 export function isNotApplicableError(value: unknown): value is SerializedNotApplicableError {
   if (!isRecord(value)) return false;
@@ -888,6 +1002,24 @@ export function isMalformedInputError(value: unknown): value is SerializedMalfor
   );
 }
 
+/** Structural, realm-independent guard for a bounded hard-constraint semantic failure. */
+export function isOperationConstraintUnsatisfiedError(
+  value: unknown,
+): value is SerializedOperationConstraintUnsatisfiedError {
+  if (!isRecord(value)) return false;
+  return (
+    value.kind === OPERATION_CONSTRAINT_UNSATISFIED_ERROR_KIND &&
+    value.name === 'OperationConstraintUnsatisfiedError' &&
+    value.reasonCode === 'TRANSCODE_CONSTRAINT_UNSATISFIED' &&
+    value.operation === 'transcode' &&
+    typeof value.engineId === 'string' &&
+    value.engineId.length > 0 &&
+    typeof value.reason === 'string' &&
+    value.reason.length > 0 &&
+    isOperationConstraintEvidence(value.evidence)
+  );
+}
+
 /** Explicit wire representation for hosts that serialize thrown values themselves. */
 export function serializeNotApplicableError(value: SerializedNotApplicableError): SerializedNotApplicableError {
   return {
@@ -937,6 +1069,23 @@ export function serializeMalformedInputError(
     stage: value.stage,
     reason: value.reason,
     ...(value.inputId !== undefined ? { inputId: value.inputId } : {}),
+    ...(value.cause !== undefined ? { cause: cloneSerializable(value.cause) } : {}),
+    ...(value.stack !== undefined ? { stack: value.stack } : {}),
+  };
+}
+
+export function serializeOperationConstraintUnsatisfiedError(
+  value: SerializedOperationConstraintUnsatisfiedError,
+): SerializedOperationConstraintUnsatisfiedError {
+  return {
+    kind: OPERATION_CONSTRAINT_UNSATISFIED_ERROR_KIND,
+    name: 'OperationConstraintUnsatisfiedError',
+    message: value.message,
+    reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED',
+    operation: 'transcode',
+    engineId: value.engineId,
+    reason: value.reason,
+    evidence: cloneConstraintEvidence(value.evidence),
     ...(value.cause !== undefined ? { cause: cloneSerializable(value.cause) } : {}),
     ...(value.stack !== undefined ? { stack: value.stack } : {}),
   };
@@ -997,6 +1146,22 @@ export function createMalformedInputError(
     reasonCode,
     reason,
     ...(inputId !== undefined ? { inputId } : {}),
+    ...(cause !== undefined ? { cause } : {}),
+  });
+}
+
+export function createOperationConstraintUnsatisfiedError(
+  engineId: string,
+  reason: string,
+  evidence: OperationConstraintEvidence,
+  cause?: unknown,
+): OperationConstraintUnsatisfiedError {
+  return new OperationConstraintUnsatisfiedError({
+    engineId,
+    operation: 'transcode',
+    reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED',
+    reason,
+    evidence,
     ...(cause !== undefined ? { cause } : {}),
   });
 }
@@ -1142,6 +1307,68 @@ function requireNonEmpty(value: string, field: string): string {
   const normalized = value.trim();
   if (!normalized) throw new TypeError(`${field} must be a non-empty string`);
   return normalized;
+}
+
+export function isOperationConstraintEvidence(value: unknown): value is OperationConstraintEvidence {
+  if (!isRecord(value)) return false;
+  if (
+    value.constraint !== 'h264-quality-rate' ||
+    value.metric !== 'ssim-luma-v1' ||
+    !positiveSafeInteger(value.preferredAverageBitrate) ||
+    !positiveSafeInteger(value.maxAverageBitrate) ||
+    value.maxAverageBitrate < value.preferredAverageBitrate ||
+    !unitInterval(value.minimumQualityMean) ||
+    !Array.isArray(value.attempts) ||
+    value.attempts.length === 0
+  ) return false;
+  return value.attempts.every((attempt) => {
+    if (!isRecord(attempt)) return false;
+    return (
+      positiveSafeInteger(attempt.attempt) &&
+      nonNegativeSafeInteger(attempt.targetBytes) &&
+      nonNegativeSafeInteger(attempt.actualBytes) &&
+      positiveFinite(attempt.averageBitrate) &&
+      (attempt.qualityMean === undefined || unitInterval(attempt.qualityMean)) &&
+      (attempt.qualitySamples === undefined || positiveSafeInteger(attempt.qualitySamples))
+    );
+  });
+}
+
+function cloneConstraintEvidence(value: OperationConstraintEvidence): OperationConstraintEvidence {
+  if (!isOperationConstraintEvidence(value)) {
+    throw new TypeError('evidence must be a valid H.264 quality/rate constraint attempt record');
+  }
+  return {
+    constraint: 'h264-quality-rate',
+    preferredAverageBitrate: value.preferredAverageBitrate,
+    maxAverageBitrate: value.maxAverageBitrate,
+    minimumQualityMean: value.minimumQualityMean,
+    metric: 'ssim-luma-v1',
+    attempts: value.attempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      targetBytes: attempt.targetBytes,
+      actualBytes: attempt.actualBytes,
+      averageBitrate: attempt.averageBitrate,
+      ...(attempt.qualityMean !== undefined ? { qualityMean: attempt.qualityMean } : {}),
+      ...(attempt.qualitySamples !== undefined ? { qualitySamples: attempt.qualitySamples } : {}),
+    })),
+  };
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function nonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function positiveFinite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
+function unitInterval(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
 }
 
 function cloneTupleSummary(tuple: ApplicabilityTupleSummary): ApplicabilityTupleSummary {
@@ -1338,6 +1565,10 @@ export type CanonicalContainer = (typeof CANONICAL_CONTAINERS)[number];
 export const CANONICAL_VIDEO_CODECS = ['h264', 'hevc', 'vp8', 'vp9', 'av1'] as const;
 export type CanonicalVideoCodec = (typeof CANONICAL_VIDEO_CODECS)[number];
 
+/** Canonical video identities that adapters may report from read-side metadata/demux results. */
+export const CANONICAL_READ_VIDEO_CODECS = [...CANONICAL_VIDEO_CODECS, 'mjpeg'] as const;
+export type CanonicalReadVideoCodec = (typeof CANONICAL_READ_VIDEO_CODECS)[number];
+
 export const CANONICAL_AUDIO_CODECS = [
   'aac',
   'opus',
@@ -1351,6 +1582,10 @@ export const CANONICAL_AUDIO_CODECS = [
   'pcm-s24be',
 ] as const;
 export type CanonicalAudioCodec = (typeof CANONICAL_AUDIO_CODECS)[number];
+
+/** Canonical codec identities permitted in read-side metadata and demux packet evidence. */
+export const CANONICAL_READ_CODECS = [...CANONICAL_READ_VIDEO_CODECS, ...CANONICAL_AUDIO_CODECS] as const;
+export type CanonicalReadCodec = (typeof CANONICAL_READ_CODECS)[number];
 
 // ── Runtime adapter-boundary validation ──────────────────────────────────────────────────────────────────────
 
@@ -1521,7 +1756,7 @@ export function validateNormalizedTrack(engineId: string, value: unknown, path =
   if (record.trackId !== undefined) requireNonEmptyString(engineId, `${path}.trackId`, record.trackId);
   for (const key of ['canonicalCodec', 'codecCanonical'] as const) {
     if (record[key] === undefined) continue;
-    if (type === 'video') requireCanonicalVideoCodec(engineId, `${path}.${key}`, record[key]);
+    if (type === 'video') requireCanonicalReadVideoCodec(engineId, `${path}.${key}`, record[key]);
     else if (type === 'audio') requireCanonicalAudioCodec(engineId, `${path}.${key}`, record[key]);
     else contractFail(engineId, `${path}.${key}`, 'must be omitted for subtitle and other tracks');
   }
@@ -1912,7 +2147,7 @@ export function validatePacketInfo(
   if (record.trackType !== undefined && !isTrackType(record.trackType)) {
     contractFail(engineId, `${path}.trackType`, 'must be a canonical track type');
   }
-  if (record.codec !== undefined) requireCanonicalCodec(engineId, `${path}.codec`, record.codec);
+  if (record.codec !== undefined) requireCanonicalResultCodec(engineId, `${path}.codec`, record.codec);
   if (record.payload !== undefined) {
     const payload = requireOwnedBytes(engineId, `${path}.payload`, record.payload, buffers, true);
     if (payload.byteLength !== record.size) {
@@ -2418,11 +2653,37 @@ function requireCanonicalCodec(
   return value as CanonicalVideoCodec | CanonicalAudioCodec;
 }
 
+function requireCanonicalResultCodec(
+  engineId: string,
+  path: string,
+  value: unknown,
+): CanonicalReadCodec {
+  if (typeof value !== 'string' || !(CANONICAL_READ_CODECS as readonly string[]).includes(value)) {
+    contractFail(engineId, path, `must be a canonical result codec token (${CANONICAL_READ_CODECS.join(', ')})`);
+  }
+  return value as CanonicalReadCodec;
+}
+
 function requireCanonicalVideoCodec(engineId: string, path: string, value: unknown): CanonicalVideoCodec {
   if (typeof value !== 'string' || !(CANONICAL_VIDEO_CODECS as readonly string[]).includes(value)) {
     contractFail(engineId, path, `must be a canonical video codec token (${CANONICAL_VIDEO_CODECS.join(', ')})`);
   }
   return value as CanonicalVideoCodec;
+}
+
+function requireCanonicalReadVideoCodec(
+  engineId: string,
+  path: string,
+  value: unknown,
+): CanonicalReadVideoCodec {
+  if (typeof value !== 'string' || !(CANONICAL_READ_VIDEO_CODECS as readonly string[]).includes(value)) {
+    contractFail(
+      engineId,
+      path,
+      `must be a canonical read-side video codec token (${CANONICAL_READ_VIDEO_CODECS.join(', ')})`,
+    );
+  }
+  return value as CanonicalReadVideoCodec;
 }
 
 function requireCanonicalAudioCodec(engineId: string, path: string, value: unknown): CanonicalAudioCodec {
@@ -2444,7 +2705,7 @@ function requireTrackCodec(
   value: unknown,
   type: TrackType,
 ): string {
-  if (type === 'video') return requireCanonicalVideoCodec(engineId, path, value);
+  if (type === 'video') return requireCanonicalReadVideoCodec(engineId, path, value);
   if (type === 'audio') return requireCanonicalAudioCodec(engineId, path, value);
   // Subtitle/data/timecode vocabularies are container-specific. Preserve their bounded native
   // token rather than misclassifying it as one of the benchmark's audio/video codec families.

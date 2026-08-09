@@ -476,4 +476,45 @@ describe('REQ-FEAT-06 demux coverage fixtures are committed', () => {
       ]);
     }
   });
+
+  test('all size rows publish revisioned exact workload envelopes', () => {
+    const expected = new Map<string, object>([
+      ['demux/size_micro_micro_h264_1frame', {
+        minWidth: 320, maxWidth: 320, minHeight: 240, maxHeight: 240,
+        minDurationSec: 0.9, maxDurationSec: 1.1,
+      }],
+      ['demux/size_micro_micro_audio_short', { minDurationSec: 0, maxDurationSec: 0.25 }],
+      ['demux/size_tiny_tiny_h264_360p_2s', {
+        minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+        minDurationSec: 1.8, maxDurationSec: 2.2,
+      }],
+      ['demux/size_tiny_tiny_vp9_360p_2s', {
+        minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+        minDurationSec: 1.8, maxDurationSec: 2.2,
+      }],
+      ['demux/size_large_large_h264_1080p_120s', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 108, maxDurationSec: 132,
+      }],
+      ['demux/size_large_large_vp9_1080p_120s', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 108, maxDurationSec: 132,
+      }],
+      ['demux/size_huge_huge_h264_1080p_600s', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 540, maxDurationSec: 660,
+      }],
+      ['demux/size_massive_massive_h264_1080p_2h', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 6480, maxDurationSec: 7920,
+      }],
+    ]);
+
+    const sizeRows = demuxScenarios.filter((scenario) => scenario.id.startsWith('demux/size_'));
+    expect(sizeRows).toHaveLength(expected.size);
+    for (const scenario of sizeRows) {
+      expect(scenario.revision).toBe(2);
+      expect(scenario.candidateEnvelope).toEqual(expected.get(scenario.id));
+    }
+  });
 });

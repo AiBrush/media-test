@@ -21,6 +21,11 @@
  */
 
 import type { Scenario } from '../../core/scenario.ts';
+import {
+  HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
 import { buildRemux, type RemuxCase } from './_shared.ts';
 
 const SIZE_LADDER_TIMEOUT_MS = 120_000; // 2 min: bounds a GB-scale lazy-read remux hang.
@@ -31,6 +36,8 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   // large (~100 MB) H.264 MP4 -> MKV: sustained throughput + peak memory for the MP4/H.264 family.
   {
     asset: 'large_h264_1080p_120s.mp4',
+    revision: 2,
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],
@@ -43,6 +50,8 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   // large (~100 MB) VP9 WebM -> MKV: crosses the size axis with the WebM/VP9 family.
   {
     asset: 'large_vp9_1080p_120s.webm',
+    revision: 2,
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     from: 'webm',
     to: 'mkv',
     videoCodecs: ['vp9'],
@@ -53,6 +62,8 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   // huge (~500-700 MB) self-contained big-read .mov -> MP4: the deterministic big-read remux.
   {
     asset: 'huge_h264_1080p_600s.mov',
+    revision: 2,
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     from: 'mov',
     to: 'mp4',
     videoCodecs: ['h264'],
@@ -65,6 +76,8 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   // massive (~1-1.4 GB, 2h) low-bitrate H.264 MP4 -> MKV: lazy-read / OOM-resistance / many-samples.
   {
     asset: 'massive_h264_1080p_2h.mp4',
+    revision: 2,
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
     from: 'mp4',
     to: 'mkv',
     videoCodecs: ['h264'],

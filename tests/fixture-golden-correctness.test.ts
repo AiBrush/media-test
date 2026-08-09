@@ -121,6 +121,25 @@ describe('REQ-FIX-01/05/10 shared raw+canonical metadata normalization', () => {
     expect(scenarioFramePlaceholderForGolden('same.mp4', source, frameProbe).frames).toEqual(expected);
     expect(expected.map((entry: { ptsUs: number }) => entry.ptsUs)).toEqual([0, 33_367, 66_733]);
   });
+
+  test('source PTS stays authoritative when best-effort decoding collapses distinct occurrences', () => {
+    const ptsUs = [
+      0, 16_666, 33_332, 49_998, 66_664, 83_330,
+      99_996, 116_662, 133_327, 149_994, 166_660, 183_326,
+    ];
+    const frameProbe = {
+      frames: ptsUs.map((pts, index) => ({
+        stream_index: 0,
+        pts_time: (pts / 1_000_000).toFixed(6),
+        best_effort_timestamp_time: index >= 10 ? '0.216658' : (pts / 1_000_000).toFixed(6),
+        key_frame: 0,
+      })),
+    };
+    const selected = selectPresentationFramePlaceholders(frameProbe);
+    expect(selected).toHaveLength(12);
+    expect(selected.map((entry: { ptsUs: number }) => entry.ptsUs)).toEqual(ptsUs);
+    expect(new Set(selected.map((entry: { ptsUs: number }) => entry.ptsUs)).size).toBe(12);
+  });
 });
 
 describe('REQ-FIX-02 semantic packets versus representation fingerprints', () => {
@@ -537,7 +556,7 @@ function packetProbe(tag: string, sizes: number[]): any {
   };
 }
 
-function validEnvelope(kind: 'metadata' | 'packets' | 'frames' | 'ssim' | 'keys' | 'segments' | 'availability', payload: unknown, availability = { state: 'ready' }): any {
+function validEnvelope(kind: 'metadata' | 'packets' | 'frames' | 'ssim' | 'alpha' | 'keys' | 'segments' | 'availability', payload: unknown, availability = { state: 'ready' }): any {
   const sourceMedia = { sha256: digest(TEST_MEDIA_BYTES), sizeBytes: TEST_MEDIA_BYTES.byteLength };
   const provenance = createGoldenProvenance({
     artifactKind: kind, assetId: 'a.mp4', sourceMedia, recipe: 'test#fixture',

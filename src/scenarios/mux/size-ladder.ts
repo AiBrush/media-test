@@ -31,6 +31,10 @@
 
 import type { Scenario } from '../../core/scenario.ts';
 import { MUX_SPARSE_CO64_ACCEPTANCE_CASE } from '../../features/mux/index.ts';
+import {
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  TINY_640X360_2S_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
 import { buildMux, type MuxCase } from './_shared.ts';
 
 const SIZE_LADDER_TIMEOUT_MS = 120_000; // 2 min: bounds a large/long mux index-rewrite hang.
@@ -61,11 +65,13 @@ const SIZE_LADDER_CASES: MuxCase[] = [
   },
   {
     id: 'size_tiny_360p_to_mp4',
+    revision: 2,
     input: 'tiny_h264_360p_2s.mp4',
     containersIn: ['mp4'],
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
     notes: 'SIZE LADDER (tiny ~100 KB): 2 s 360p H.264+AAC → mp4. Tiny-rung mux latency / small sample table.',
   },
@@ -73,11 +79,13 @@ const SIZE_LADDER_CASES: MuxCase[] = [
   // ── LARGE / LONG rung: 64-bit (co64) offset crossover + dense mkv cues + many-thousand samples ──
   {
     id: 'size_large_1080p_to_mp4',
+    revision: 2,
     input: 'large_h264_1080p_120s.mp4',
     containersIn: ['mp4'],
     to: 'mp4',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     primaryMetric: 'throughputRealtime',
     tolerances: { durationToleranceSec: 0.125 },
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,
@@ -87,11 +95,13 @@ const SIZE_LADDER_CASES: MuxCase[] = [
   },
   {
     id: 'size_large_1080p_to_mkv',
+    revision: 2,
     input: 'large_h264_1080p_120s.mp4',
     containersIn: ['mp4'],
     to: 'mkv',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     primaryMetric: 'throughputRealtime',
     tolerances: { durationToleranceSec: 0.125 },
     timeoutMs: SIZE_LADDER_TIMEOUT_MS,

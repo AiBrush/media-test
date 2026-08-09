@@ -39,6 +39,7 @@ import {
 } from './_shared.ts';
 import type { Scenario } from '../../core/scenario.ts';
 import type { TranscodeOptions } from '../../core/engine.ts';
+import { MEDIUM_1080P_30S_CANDIDATE_ENVELOPE } from '../_candidate-envelopes.ts';
 
 // decode fps — decode a bounded prefix; rank by decodeFps; gate by decoded-frames-bitexact.
 const DECODE_MAX_FRAMES = 12; // matches the baked golden prefix and avoids retaining huge RGBA buffers.
@@ -70,8 +71,10 @@ const T_ENCODE_FPS = 120_000;
 
 const encodeFps: Scenario = perfCase({
   id: 'performance/encode-fps',
+  revision: 2,
   op: 'transcode',
   input: BIG_READ_GOLDEN,
+  candidateEnvelope: MEDIUM_1080P_30S_CANDIDATE_ENVELOPE,
   options: ENCODE_SOURCE_RES,
   requires: {
     operations: ['transcode'],

@@ -4,6 +4,22 @@ import { readFileSync } from 'node:fs';
 import type { FrameDigest, SeekResult } from '../src/core/engine.ts';
 import type { BenchSummary } from '../src/core/scenario.ts';
 import {
+  buildSelectionManifest,
+  findScenarioPool,
+  parseBakedCorpusManifest,
+  parseScenarioSourceCatalog,
+} from '../src/core/media-selection.ts';
+import {
+  scenarioDefinitionProjection,
+  validateScenarioDefinitionV2,
+} from '../src/core/scenario.ts';
+import {
+  leadingPresentationFramePrefix,
+  presentationDecodeWindows,
+  presentationSampleTimesUs,
+  seekToPresentedVideoFrame,
+} from '../src/engines/platform/decode.ts';
+import {
   ALPHA_DIGEST_ALGORITHM,
   ALPHA_EVIDENCE_SCHEMA,
   DECODE_PROVENANCE_CATALOG,
@@ -35,11 +51,128 @@ import {
   type SelectedDecodeTrackEvidence,
 } from '../src/features/decode-seek/index.ts';
 import { decodeSeekScenarios } from '../src/scenarios/decode-seek/index.ts';
-import { leadingPresentationFramePrefix } from '../src/engines/platform/decode.ts';
+
+type PresentedFrameCallback = (
+  now: number,
+  metadata: { readonly mediaTime?: number },
+) => void;
+
+class FakeVideoPresenter {
+  currentTime = 0;
+  readonly cancelledCallbacks: number[] = [];
+  readonly #listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  readonly #frameCallbacks = new Map<number, PresentedFrameCallback>();
+  #nextCallback = 1;
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    const listeners = this.#listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.#listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  requestVideoFrameCallback(callback: PresentedFrameCallback): number {
+    const handle = this.#nextCallback++;
+    this.#frameCallbacks.set(handle, callback);
+    return handle;
+  }
+
+  cancelVideoFrameCallback(handle: number): void {
+    this.cancelledCallbacks.push(handle);
+    this.#frameCallbacks.delete(handle);
+  }
+
+  dispatch(type: 'seeked' | 'error'): void {
+    for (const listener of [...(this.#listeners.get(type) ?? [])]) {
+      if (typeof listener === 'function') listener(new Event(type));
+      else listener.handleEvent(new Event(type));
+    }
+  }
+
+  present(mediaTime: number): void {
+    const callback = this.#frameCallbacks.entries().next().value as
+      | [number, PresentedFrameCallback]
+      | undefined;
+    if (callback === undefined) throw new Error('no pending video-frame callback');
+    this.#frameCallbacks.delete(callback[0]);
+    callback[1](0, { mediaTime });
+  }
+
+  get pendingFrameCallbacks(): number {
+    return this.#frameCallbacks.size;
+  }
+}
 
 function jsonAt(path: string): unknown {
   return JSON.parse(readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')) as unknown;
 }
+
+function textAt(path: string): string {
+  return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+}
+
+function scenario(id: string) {
+  return decodeSeekScenarios.find((entry) => entry.id === id)!;
+}
+
+const DECODE_CANDIDATE_ENVELOPE_CASES = [
+  {
+    id: 'decode-seek/decode_h264_4k', input: 'h264_4k_10s.mp4',
+    envelope: { minWidth: 3_840, maxWidth: 3_840, minHeight: 2_160, maxHeight: 2_160 },
+    eligibleReal: ['01.mp4', '02.mp4', '03.mp4'], mismatchedReal: [],
+  },
+  {
+    id: 'decode-seek/decode_size_micro_h264_1frame', input: 'micro_h264_1frame.mp4',
+    envelope: {
+      minWidth: 320, maxWidth: 320, minHeight: 240, maxHeight: 240,
+      minDurationSec: 0.9, maxDurationSec: 1.1,
+    },
+    eligibleReal: [], mismatchedReal: [],
+  },
+  {
+    id: 'decode-seek/decode_size_tiny_h264_360p', input: 'tiny_h264_360p_2s.mp4',
+    envelope: {
+      minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+      minDurationSec: 1.8, maxDurationSec: 2.2,
+    },
+    eligibleReal: ['03.mp4'], mismatchedReal: ['01.mp4', '02.mp4'],
+  },
+  {
+    id: 'decode-seek/decode_size_tiny_vp9_360p', input: 'tiny_vp9_360p_2s.webm',
+    envelope: {
+      minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+      minDurationSec: 1.8, maxDurationSec: 2.2,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'],
+  },
+  {
+    id: 'decode-seek/decode_size_large_h264_120s', input: 'large_h264_1080p_120s.mp4',
+    envelope: {
+      minWidth: 1_920, maxWidth: 1_920, minHeight: 1_080, maxHeight: 1_080,
+      minDurationSec: 108, maxDurationSec: 132,
+    },
+    eligibleReal: ['01.mp4'], mismatchedReal: ['02.mp4', '03.mp4'],
+  },
+  {
+    id: 'decode-seek/decode_size_large_vp9_120s', input: 'large_vp9_1080p_120s.webm',
+    envelope: {
+      minWidth: 1_920, maxWidth: 1_920, minHeight: 1_080, maxHeight: 1_080,
+      minDurationSec: 108, maxDurationSec: 132,
+    },
+    eligibleReal: [], mismatchedReal: ['01.webm', '02.webm', '03.webm'],
+  },
+  {
+    id: 'decode-seek/decode_size_huge_h264_600s', input: 'huge_h264_1080p_600s.mov',
+    envelope: {
+      minWidth: 1_920, maxWidth: 1_920, minHeight: 1_080, maxHeight: 1_080,
+      minDurationSec: 540, maxDurationSec: 660,
+    },
+    eligibleReal: ['02.mov'], mismatchedReal: ['01.mov', '03.mov'],
+  },
+] as const;
 
 function digest(seed: string): string {
   return seed.repeat(64).slice(0, 64);
@@ -74,6 +207,108 @@ describe('REQ-FEAT-40 bounded platform decode presentation prefix', () => {
       0, 33_333, 66_667, 100_000, 133_333, 166_667,
       233_333, 266_667, 333_333, 366_667, 433_333, 466_667,
     ]);
+  });
+
+  test('uniform sampling derives a whole-program window from demux PTS without container duration', () => {
+    const headerlessTimeline = Array.from({ length: 50 }, (_, index) => ({ ptsUs: 80_000 + index * 40_000 }));
+    expect(presentationSampleTimesUs(headerlessTimeline, { maxFrames: 4, sampling: 'uniform' })).toEqual([
+      0,
+      500_000,
+      1_000_000,
+      1_500_000,
+    ]);
+  });
+
+  test('paired explicit instants are bounded, sanitized and relative to the first video PTS', () => {
+    const timeline = [{ ptsUs: 2_000_000 }, { ptsUs: 2_040_000 }, { ptsUs: 2_080_000 }];
+    expect(presentationSampleTimesUs(timeline, {
+      maxFrames: 3,
+      sampling: 'uniform',
+      sampleTimesSec: [0.08, Number.NaN, -1, 0, 0.04, 9],
+    })).toEqual([0, 40_000, 80_000]);
+  });
+
+  test('sparse-keyframe whole-program samples share one decode instead of replaying the prefix', () => {
+    const samples = Array.from({ length: 3_600 }, (_, index) => ({
+      ptsUs: index * 33_333,
+      keyframe: index === 0,
+    }));
+    const times = presentationSampleTimesUs(samples, { maxFrames: 8, sampling: 'uniform' });
+    const windows = presentationDecodeWindows(samples, times);
+    expect(windows).toHaveLength(1);
+    expect(windows[0]).toMatchObject({ startIndex: 0 });
+    expect(windows[0]!.targetPtsUs).toHaveLength(8);
+    expect(windows[0]!.endIndex).toBeLessThanOrEqual(samples.length);
+  });
+});
+
+describe('platform video-element presentation barriers', () => {
+  test('a no-op zero seek resolves from fresh exact compositor evidence and returns its media time', async () => {
+    const video = new FakeVideoPresenter();
+    const seek = seekToPresentedVideoFrame(
+      video as unknown as HTMLVideoElement,
+      0,
+      1_000,
+      0.001,
+    );
+
+    video.present(0.0004);
+    await expect(seek).resolves.toBe(0.0004);
+    expect(video.pendingFrameCallbacks).toBe(0);
+  });
+
+  test('re-arms after a stale compositor callback and proves the exact authored anchor', async () => {
+    const video = new FakeVideoPresenter();
+    let settled = false;
+    const seek = seekToPresentedVideoFrame(
+      video as unknown as HTMLVideoElement,
+      0.8,
+      1_000,
+      0.001,
+    ).then(() => {
+      settled = true;
+    });
+
+    // A callback may race ahead of `seeked`; mediaTime, not callback order, identifies its surface.
+    video.present(0.6);
+    video.dispatch('seeked');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(video.pendingFrameCallbacks).toBe(1);
+
+    video.present(0.8);
+    await seek;
+    expect(settled).toBe(true);
+  });
+
+  test('requires rVFC evidence for exact anchors but retains seeked fallback otherwise', async () => {
+    const withoutRvfc = {
+      currentTime: 0,
+      addEventListener(type: string, listener: EventListener): void {
+        if (type === 'seeked') queueMicrotask(() => listener(new Event(type)));
+      },
+      removeEventListener(): void {},
+    } as unknown as HTMLVideoElement;
+
+    await expect(
+      seekToPresentedVideoFrame(withoutRvfc, 0.8, 1_000, 0.001),
+    ).rejects.toThrow('requires requestVideoFrameCallback mediaTime evidence');
+    await expect(seekToPresentedVideoFrame(withoutRvfc, 0.8, 1_000)).resolves.toBeUndefined();
+  });
+
+  test('cancels an armed presentation callback when the media element errors', async () => {
+    const video = new FakeVideoPresenter();
+    const seek = seekToPresentedVideoFrame(
+      video as unknown as HTMLVideoElement,
+      0.8,
+      1_000,
+      0.001,
+    );
+    video.dispatch('error');
+
+    await expect(seek).rejects.toThrow('<video> error during seek');
+    expect(video.cancelledCallbacks).toEqual([1]);
+    expect(video.pendingFrameCallbacks).toBe(0);
   });
 });
 
@@ -471,5 +706,58 @@ describe('REQ-FEAT-51 ImageDecoder applicability is separate', () => {
     })).toMatchObject({
       state: 'UNAVAILABLE', status: 'NA_BROWSER', reasonCode: 'IMAGE_DECODER_TYPE_UNSUPPORTED',
     });
+  });
+});
+
+describe('decode workload candidate envelopes', () => {
+  test('the exact seven size/geometry rows publish revisioned, schema-valid envelopes', () => {
+    expect(decodeSeekScenarios
+      .filter((entry) => entry.candidateEnvelope !== undefined)
+      .map((entry) => entry.id)
+      .sort()).toEqual(DECODE_CANDIDATE_ENVELOPE_CASES.map((entry) => entry.id).sort());
+
+    for (const expected of DECODE_CANDIDATE_ENVELOPE_CASES) {
+      const item = scenario(expected.id);
+      expect(item.revision, expected.id).toBe(2);
+      expect(item.input, expected.id).toBe(expected.input);
+      expect(item.candidateEnvelope, expected.id).toEqual(expected.envelope);
+      expect(Object.isFrozen(item.candidateEnvelope), expected.id).toBeTrue();
+      expect(validateScenarioDefinitionV2(scenarioDefinitionProjection(item)), expected.id).toEqual([]);
+    }
+  });
+
+  test('production selection retains only real assets inside the authored workload geometry', () => {
+    const catalogResult = parseScenarioSourceCatalog(
+      textAt('fixtures/media/scenarios/_sources.ndjson'),
+    );
+    if (catalogResult.state !== 'VALID') {
+      throw new Error(catalogResult.issues.map((issue) => issue.detail).join('; '));
+    }
+    const bakedResult = parseBakedCorpusManifest(jsonAt('fixtures/manifest.json'));
+    if (bakedResult.state !== 'VALID') {
+      throw new Error(bakedResult.issues.map((issue) => issue.detail).join('; '));
+    }
+    const manifest = buildSelectionManifest({
+      scenarios: DECODE_CANDIDATE_ENVELOPE_CASES.map((entry) => scenario(entry.id)),
+      catalog: catalogResult.catalog,
+      bakedManifest: bakedResult.manifest,
+    });
+
+    for (const expected of DECODE_CANDIDATE_ENVELOPE_CASES) {
+      const pool = findScenarioPool(manifest, expected.id);
+      if (!pool) throw new Error(`missing candidate pool '${expected.id}'`);
+      expect(pool.candidates
+        .filter((candidate) => candidate.kind === 'baked')
+        .map((candidate) => candidate.selectedFile), expected.id).toEqual([expected.input]);
+      expect(pool.candidates
+        .filter((candidate) => candidate.kind === 'real')
+        .map((candidate) => candidate.selectedFile)
+        .sort(), expected.id).toEqual([...expected.eligibleReal].sort());
+      expect(pool.rejections
+        .filter((rejection) => rejection.reasonCode === 'CANDIDATE_INPUT_CONTRACT_MISMATCH')
+        .map((rejection) => rejection.selectedFile)
+        .sort(), expected.id).toEqual([...expected.mismatchedReal].sort());
+      expect(pool.rejections.length, expected.id).toBe(expected.mismatchedReal.length);
+    }
   });
 });

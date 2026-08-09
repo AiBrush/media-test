@@ -52,10 +52,12 @@ import type {
   TrackType,
   TranscodeAudioOptions,
   TranscodeOptions,
+  TranscodeRenditionSetOptions,
   TranscodeVideoOptions,
 } from '../../core/engine.ts';
 import {
   AUTHENTICATED_RANGE_INPUT_FEATURE,
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
   createNotApplicableError,
   DECODE_TRACK_SELECTOR_SCHEMA,
   isBrowserNotSupportedError,
@@ -68,8 +70,17 @@ import { readOutputStructure, type ReadTrack } from '../../core/box-readers.ts';
 import { registerEngine } from '../../core/registry.ts';
 import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
 import { demuxScaleContractFromOptions } from '../../features/demux/scale.ts';
+import { displayTransformFromOptions } from '../../features/decode-seek/display.ts';
+import {
+  assessHlsRequestedMethod,
+  inspectHlsEncryptionTimeline,
+} from '../../features/encryption/hls-contract.ts';
 import { readNeutralRemuxProgram } from '../../features/remux/readers.ts';
 import { compareStrictRemuxPrograms } from '../../features/remux/strict-copy.ts';
+import {
+  TRANSCODE_ABR_RENDITION_SET_ROLE,
+  transcodeAbrSwitchRole,
+} from '../../features/transcode/abr.ts';
 import { readIsoBmffPresentationTimeline, selectIsoBmffTrimWindows } from '../../features/trim/isobmff-timeline.ts';
 import type { RemuxProgramEvidence, RemuxSampleEvidence, RemuxTrackEvidence } from '../../features/remux/types.ts';
 import { type AibrushErrorClasses, translateAibrushFrameworkError } from './errors.ts';
@@ -89,6 +100,7 @@ import {
 import {
   buildAibrushDemuxResult,
   canonicalAibrushCodec,
+  createAibrushDemuxResultBuilder,
   normalizeAibrushTrack,
   representationForAibrushTrack,
   type AibrushObservedTrack,
@@ -311,7 +323,7 @@ async function withCellSignal<T>(
 // `Cancellable<T>` is a `Promise<T>` with a `.cancel()` — awaiting it is all we need; we never cancel.
 interface AibrushTrack {
   id: number;
-  type: 'video' | 'audio';
+  type: 'video' | 'audio' | 'other';
   codec: string;
   defaultDisposition?: boolean;
   durationSec?: number;
@@ -916,6 +928,12 @@ interface AibrushTrackInfo {
     numberOfChannels?: number;
     description?: BufferSource;
   };
+  color?: {
+    matrixCoefficients?: number;
+    range?: number;
+    transferCharacteristics?: number;
+    primaries?: number;
+  };
 }
 interface AibrushDemuxed {
   tracks: ReadonlyArray<AibrushTrackInfo>;
@@ -937,6 +955,12 @@ interface AibrushVideoTarget {
   fit?: 'contain' | 'cover' | 'fill';
   fps?: number;
   bitrate?: number;
+  maxAverageBitrate?: number;
+  quality?: {
+    metric: 'ssim-luma-v1';
+    minimumMean: number;
+    samples?: number;
+  };
   crf?: number;
   twoPass?: boolean;
   bitDepth?: 8 | 10 | 12;
@@ -984,6 +1008,7 @@ interface AibrushConvertOptions {
 interface AibrushCallOptions {
   signal?: AbortSignal;
   container?: string;
+  trackSelect?: readonly string[];
 }
 interface AibrushFromOptions {
   mime?: string;
@@ -1070,6 +1095,12 @@ interface AibrushH264AbrRung {
   readonly width: number;
   readonly height: number;
   readonly bitrate: number;
+  readonly maxAverageBitrate?: number;
+  readonly quality?: {
+    readonly metric: 'ssim-luma-v1';
+    readonly minimumMean: number;
+    readonly samples?: number;
+  };
   readonly fps?: number;
 }
 
@@ -1089,6 +1120,7 @@ interface AibrushMedia {
   readonly VERSION: string;
   readonly CapabilityError: AibrushErrorClasses['CapabilityError'];
   readonly InputError: AibrushErrorClasses['InputError'];
+  readonly ConstraintUnsatisfiedError: NonNullable<AibrushErrorClasses['ConstraintUnsatisfiedError']>;
   createMedia(opts?: {
     determinism?: 'auto' | 'force-software';
   }): AibrushEngine;
@@ -1156,6 +1188,7 @@ interface AibrushWav {
 interface AibrushCore {
   readonly CapabilityError: AibrushErrorClasses['CapabilityError'];
   readonly InputError: AibrushErrorClasses['InputError'];
+  readonly ConstraintUnsatisfiedError: NonNullable<AibrushErrorClasses['ConstraintUnsatisfiedError']>;
   wavPcmToAiffFromBytes(
     bytes: Uint8Array,
     opts?: {
@@ -1274,6 +1307,22 @@ interface AibrushCore {
   mp3PacketInfoFromBytes(bytes: Uint8Array): AibrushPacketInfoTable;
   oggPacketInfoFromBytes(bytes: Uint8Array): AibrushPacketInfoTable;
   webmPacketPayloadInfoFromBytes(bytes: Uint8Array): AibrushWebmPacketPayloadInfoTable;
+  destinationColorI420FrameStream(
+    intent:
+      | { readonly kind: 'bt2020-sdr'; readonly transform: 'colorspace' }
+      | { readonly kind: 'bt709-sdr'; readonly transform: 'tonemap' },
+    preserveAlpha?: boolean,
+    onInputOwned?: (frame: VideoFrame) => void,
+  ): TransformStream<VideoFrame, VideoFrame>;
+  videoTrackInfoFromDecoderConfig(
+    config: VideoDecoderConfig,
+    fps: number | undefined,
+    durationSec?: number,
+    rotation?: number,
+    colorIntent?:
+      | { readonly kind: 'bt2020-sdr'; readonly transform: 'colorspace' }
+      | { readonly kind: 'bt709-sdr'; readonly transform: 'tonemap' },
+  ): AibrushTrackInfo;
   muxPreparedMp4PacketTrack(input: {
     readonly track: AibrushTrackInfo;
     readonly packets: readonly AibrushPacket[];
@@ -1448,9 +1497,12 @@ function knownContainerProbeToken(input: MediaInput): 'mp4' | 'mov' | 'webm' | '
   return undefined;
 }
 
-function metadataFromDemuxed(input: MediaInput, demuxed: AibrushDemuxed): NormalizedMetadata {
+function metadataFromAibrushTracks(
+  input: MediaInput,
+  observedTracks: readonly AibrushObservedTrack[],
+): NormalizedMetadata {
   let durationSec: number | null = null;
-  const tracks: NormalizedTrack[] = demuxed.tracks.map((t) => {
+  const tracks: NormalizedTrack[] = observedTracks.map((t) => {
     const trackDuration = t.durationSec;
     if (trackDuration !== undefined && trackDuration > 0) {
       durationSec = durationSec === null ? trackDuration : Math.max(durationSec, trackDuration);
@@ -1460,35 +1512,33 @@ function metadataFromDemuxed(input: MediaInput, demuxed: AibrushDemuxed): Normal
   return { container: containerFromInput(input), durationSec, tracks };
 }
 
+function metadataFromDemuxed(input: MediaInput, demuxed: AibrushDemuxed): NormalizedMetadata {
+  return metadataFromAibrushTracks(input, demuxed.tracks);
+}
+
 function demuxResultFromPacketInfo(
   input: MediaInput,
   packetInfo: AibrushPacketInfoTable,
   sourceBytes?: Uint8Array,
 ): DemuxResult {
-  const demuxedView: AibrushDemuxed = {
-    tracks: packetInfo.tracks,
-    packetInfoTable: () => packetInfo.packets,
-    packets: () => {
-      throw new Error('aibrush packet-info fast path has no payload streams');
-    },
-    close: () => Promise.resolve(),
-  };
-  const metadata = metadataFromDemuxed(input, demuxedView);
+  const metadata = metadataFromAibrushTracks(input, packetInfo.tracks);
   return buildAibrushDemuxResult(
     sourceBytes === undefined ? metadata : enrichAibrushProbeMetadata(metadata, sourceBytes),
     packetInfo.tracks,
-    packetInfo.packets.map((packet) => {
+    packetInfo.packets,
+    (rawPacket) => {
+      const packet = rawPacket as AibrushPacketInfoMetadata;
       const inline = (packet as AibrushPacketInfoMetadata & { data?: Uint8Array }).data;
-      const payload =
+      return (
         inline ??
         (sourceBytes !== undefined &&
         packet.offset !== undefined &&
         packet.offset >= 0 &&
         packet.offset + packet.size <= sourceBytes.byteLength
           ? sourceBytes.subarray(packet.offset, packet.offset + packet.size)
-          : undefined);
-      return { ...packet, ...(payload !== undefined ? { payload } : {}) };
-    }),
+          : undefined)
+      );
+    },
   );
 }
 
@@ -1526,13 +1576,18 @@ async function demuxAibrushPacketInfoBatches(
     signal,
     container,
   });
-  const packets: AibrushPacketInfoMetadata[] = [];
+  const builder = createAibrushDemuxResultBuilder(
+    metadataFromAibrushTracks(input, batches.tracks),
+    batches.tracks,
+  );
+  let packetCount = 0;
   let emittedFirst = false;
   try {
     for await (const batch of batches) {
       signal.throwIfAborted();
       if (batch.length === 0) continue;
-      packets.push(...batch);
+      builder.addPackets(batch);
+      packetCount += batch.length;
       if (!emittedFirst) {
         emittedFirst = true;
         emitAibrushDemuxScalePacketBoundary(context);
@@ -1543,11 +1598,8 @@ async function demuxAibrushPacketInfoBatches(
     throw error;
   }
   await batches.cancel(signal.reason);
-  if (packets.length > 1) emitAibrushDemuxScalePacketBoundary(context);
-  return demuxResultFromPacketInfo(input, {
-    tracks: batches.tracks,
-    packets,
-  });
+  if (packetCount > 1) emitAibrushDemuxScalePacketBoundary(context);
+  return builder.finish();
 }
 
 async function inputBytes(input: MediaInput): Promise<Uint8Array> {
@@ -1605,6 +1657,9 @@ async function lightweightWavProbeBytes(
   signal: AbortSignal | undefined,
   headBytes: number,
 ): Promise<LightweightWavProbeBytes | undefined> {
+  // Attested inputs may only enter through the fixed-block source below. In particular, even a WAV
+  // smaller than the lightweight head ceiling must not take this helper's whole-file fast path.
+  if (input.contentAttestation !== undefined) return undefined;
   const declaredSize = input.sizeBytes;
   if (
     !Number.isSafeInteger(declaredSize) ||
@@ -1627,7 +1682,7 @@ async function lightweightWavProbeBytes(
       readMode: 'whole-file',
     };
   }
-  if (input.mutated || input.contentAttestation !== undefined) return undefined;
+  if (input.mutated) return undefined;
   const response = await fetch(input.url, {
     cache: 'no-store',
     headers: { Range: `bytes=0-${headBytes - 1}` },
@@ -1855,23 +1910,57 @@ function hlsDecryptKeyBytes(key: DecryptKey): Uint8Array {
   return bytes;
 }
 
+/**
+ * Validate the caller's HLS primitive and explicit IV against playlist-authored protection before
+ * the resolver can fetch/decrypt segments or the adapter can publish output. METHOD=NONE is a valid
+ * transition after protected segments and is intentionally ignored by the method-separation gate.
+ */
+export function assertAibrushHlsDecryptRequest(
+  playlistText: string,
+  requestedScheme: Extract<EncryptionScheme, 'hls-aes128' | 'hls-sample-aes'>,
+  expectedIvHex?: string,
+): void {
+  const method = assessHlsRequestedMethod(playlistText, requestedScheme);
+  if (method.state === 'ERROR' || method.verdict !== 'PASS') {
+    throw new GracefulRejectionError('decrypt', `${method.reasonCode}: ${method.detail}`);
+  }
+  if (expectedIvHex === undefined) return;
+
+  const expectedIv = hexBytes(expectedIvHex, 'HLS decrypt IV');
+  if (expectedIv.byteLength !== 16) {
+    throw new GracefulRejectionError(
+      'decrypt',
+      `HLS decrypt IV must be 16 bytes, got ${expectedIv.byteLength}`,
+    );
+  }
+  const normalizedExpectedIv = hexOf(expectedIv);
+  const timeline = inspectHlsEncryptionTimeline(playlistText);
+  const mismatch = timeline.transitions.find(
+    (transition) =>
+      transition.method !== 'NONE' &&
+      transition.ivMode === 'explicit' &&
+      transition.ivHex !== normalizedExpectedIv,
+  );
+  if (mismatch !== undefined) {
+    throw new GracefulRejectionError(
+      'decrypt',
+      `HLS ${mismatch.method} IV does not match the playlist #EXT-X-KEY IV`,
+    );
+  }
+}
+
 function addHlsDecryptKeyUris(
   playlistText: string,
   baseUrl: string,
   parseM3u8: AibrushHlsCore['parseM3u8'],
   keyUris: Set<string>,
-  expectedIvHex?: string,
 ): void {
   const parsed = parseM3u8(playlistText, baseUrl);
   if (parsed.type !== 'media') return;
-  const expectedIv = expectedIvHex === undefined ? undefined : normalizeHex(expectedIvHex);
   for (const segment of parsed.segments) {
     const key = segment.key;
     if (key === undefined || (key.method !== 'AES-128' && key.method !== 'SAMPLE-AES')) continue;
     if (key.uri !== undefined) keyUris.add(key.uri);
-    if (expectedIv !== undefined && key.iv !== undefined && hexOf(key.iv) !== expectedIv) {
-      throw new GracefulRejectionError('decrypt', `HLS ${key.method} IV does not match the playlist #EXT-X-KEY IV`);
-    }
   }
 }
 
@@ -1891,7 +1980,47 @@ function parseHttpRangeTotal(value: string | null): number | undefined {
 }
 
 const AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS = 16;
+const AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const AIBRUSH_AUTHENTICATED_RANGE_PARALLEL_BLOCKS = 4;
+const AIBRUSH_AUTHENTICATED_PROBE_PREFIX_MAX_BYTES = 16 * 1024 * 1024;
+
+interface AibrushAuthenticatedProbePrefixBlocks {
+  readonly sourceSize: number;
+  readonly blocks: Map<number, Uint8Array>;
+}
+
+/**
+ * Probe-only references to already-verified leading blocks. The weak key is the operation-local trace,
+ * and the entry is explicitly consumed after probe, so non-probe authenticated inputs and disposed
+ * engines never acquire a second retained source cache.
+ */
+const aibrushAuthenticatedProbePrefixBlocks =
+  new WeakMap<AibrushAuthenticatedRangeTrace, AibrushAuthenticatedProbePrefixBlocks>();
+
+function takeAibrushAuthenticatedProbePrefix(
+  trace: AibrushAuthenticatedRangeTrace,
+): Uint8Array | undefined {
+  const retained = aibrushAuthenticatedProbePrefixBlocks.get(trace);
+  aibrushAuthenticatedProbePrefixBlocks.delete(trace);
+  if (retained === undefined) return undefined;
+  let byteLength = 0;
+  for (let index = 0; ; index++) {
+    const block = retained.blocks.get(index);
+    if (block === undefined) break;
+    byteLength += block.byteLength;
+  }
+  if (byteLength === 0) return undefined;
+  const prefix = new Uint8Array(Math.min(byteLength, retained.sourceSize));
+  let offset = 0;
+  for (let index = 0; offset < prefix.byteLength; index++) {
+    const block = retained.blocks.get(index);
+    if (block === undefined) break;
+    const take = Math.min(block.byteLength, prefix.byteLength - offset);
+    prefix.set(block.subarray(0, take), offset);
+    offset += take;
+  }
+  return offset === prefix.byteLength ? prefix : undefined;
+}
 
 function aibrushDeliveryError(
   attestation: MediaInputContentAttestation,
@@ -1933,6 +2062,8 @@ export function createAibrushAuthenticatedSource(
   fetchImpl: typeof fetch = globalThis.fetch.bind(globalThis),
   trace: AibrushAuthenticatedRangeTrace = { bytesRead: 0, rangeRequests: 0, blockRequests: 0 },
   onSourceRead?: (bytes: number) => void,
+  captureProbePrefix = false,
+  operationSignal?: AbortSignal,
 ): AibrushAuthenticatedSource {
   const attestation = input.contentAttestation;
   if (attestation === undefined) {
@@ -1940,7 +2071,43 @@ export function createAibrushAuthenticatedSource(
   }
   validateAibrushAttestation(input, attestation);
   const cache = new Map<number, Uint8Array>();
+  const inFlight = new Map<number, Promise<Uint8Array>>();
+  let cacheBytes = 0;
   const rangeOutputs = new WeakSet<Uint8Array>();
+  const probePrefix = captureProbePrefix
+    ? {
+        sourceSize: attestation.sizeBytes,
+        blocks: new Map<number, Uint8Array>(),
+      }
+    : undefined;
+  if (probePrefix !== undefined) {
+    aibrushAuthenticatedProbePrefixBlocks.set(trace, probePrefix);
+  }
+
+  const waitForBlock = (
+    pending: Promise<Uint8Array>,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> => {
+    if (signal === undefined) return pending;
+    signal.throwIfAborted();
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const abort = (): void => {
+        signal.removeEventListener('abort', abort);
+        reject(signal.reason);
+      };
+      signal.addEventListener('abort', abort, { once: true });
+      pending.then(
+        (bytes) => {
+          signal.removeEventListener('abort', abort);
+          resolve(bytes);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', abort);
+          reject(error);
+        },
+      );
+    });
+  };
 
   const block = async (blockIndex: number, signal?: AbortSignal): Promise<Uint8Array> => {
     signal?.throwIfAborted();
@@ -1950,65 +2117,91 @@ export function createAibrushAuthenticatedSource(
       cache.set(blockIndex, cached);
       return cached;
     }
-    const blockStart = blockIndex * attestation.chunkSizeBytes;
-    const blockEndExclusive = Math.min(
-      attestation.sizeBytes,
-      blockStart + attestation.chunkSizeBytes,
-    );
-    const blockEnd = blockEndExclusive - 1;
-    const response = await fetchImpl(input.url, {
-      cache: 'no-store',
-      headers: { Range: `bytes=${blockStart}-${blockEnd}` },
-      ...(signal === undefined ? {} : { signal }),
-    });
-    if (response.status !== 206) {
-      response.body?.cancel().catch(() => undefined);
-      throw aibrushDeliveryError(
-        attestation,
-        'CORPUS_AUTHENTICATED_RANGE_UNAVAILABLE',
-        `'${attestation.logicalPath}' returned HTTP ${response.status} for authenticated range ${blockStart}-${blockEnd}`,
+    const existing = inFlight.get(blockIndex);
+    if (existing !== undefined) return waitForBlock(existing, signal);
+    const pending = (async (): Promise<Uint8Array> => {
+      const blockStart = blockIndex * attestation.chunkSizeBytes;
+      const blockEndExclusive = Math.min(
+        attestation.sizeBytes,
+        blockStart + attestation.chunkSizeBytes,
       );
+      const blockEnd = blockEndExclusive - 1;
+      const response = await fetchImpl(input.url, {
+        cache: 'no-store',
+        headers: { Range: `bytes=${blockStart}-${blockEnd}` },
+        ...(signal === undefined ? {} : { signal }),
+      });
+      if (response.status !== 206) {
+        response.body?.cancel().catch(() => undefined);
+        throw aibrushDeliveryError(
+          attestation,
+          'CORPUS_AUTHENTICATED_RANGE_UNAVAILABLE',
+          `'${attestation.logicalPath}' returned HTTP ${response.status} for authenticated range ${blockStart}-${blockEnd}`,
+        );
+      }
+      const contentRange = response.headers.get('Content-Range');
+      const expectedContentRange = `bytes ${blockStart}-${blockEnd}/${attestation.sizeBytes}`;
+      if (contentRange !== expectedContentRange) {
+        response.body?.cancel().catch(() => undefined);
+        throw aibrushDeliveryError(
+          attestation,
+          'CORPUS_AUTHENTICATED_RANGE_SHAPE_MISMATCH',
+          `'${attestation.logicalPath}' returned Content-Range '${contentRange ?? 'missing'}', expected '${expectedContentRange}'`,
+        );
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      trace.blockRequests += 1;
+      trace.bytesRead += bytes.byteLength;
+      onSourceRead?.(bytes.byteLength);
+      const expectedSize = blockEndExclusive - blockStart;
+      if (bytes.byteLength !== expectedSize) {
+        throw aibrushDeliveryError(
+          attestation,
+          'CORPUS_AUTHENTICATED_RANGE_SIZE_MISMATCH',
+          `'${attestation.logicalPath}' block ${blockIndex} has ${bytes.byteLength} bytes, expected ${expectedSize}`,
+        );
+      }
+      const expectedSha256 = attestation.chunkSha256[blockIndex];
+      if (expectedSha256 === undefined || (await sha256Hex(bytes)) !== expectedSha256) {
+        throw aibrushDeliveryError(
+          attestation,
+          'CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH',
+          `'${attestation.logicalPath}' block ${blockIndex} no longer matches the admitted content snapshot`,
+        );
+      }
+      if (
+        probePrefix !== undefined &&
+        blockEndExclusive <= AIBRUSH_AUTHENTICATED_PROBE_PREFIX_MAX_BYTES
+      ) {
+        probePrefix.blocks.set(blockIndex, bytes);
+      }
+      if (bytes.byteLength <= AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES) {
+        const replaced = cache.get(blockIndex);
+        if (replaced !== undefined) cacheBytes -= replaced.byteLength;
+        cache.set(blockIndex, bytes);
+        cacheBytes += bytes.byteLength;
+      }
+      while (
+        cache.size > AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS ||
+        cacheBytes > AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES
+      ) {
+        const oldest = cache.entries().next().value as [number, Uint8Array] | undefined;
+        if (oldest === undefined) break;
+        cache.delete(oldest[0]);
+        cacheBytes -= oldest[1].byteLength;
+      }
+      return bytes;
+    })();
+    inFlight.set(blockIndex, pending);
+    try {
+      return await pending;
+    } finally {
+      if (inFlight.get(blockIndex) === pending) inFlight.delete(blockIndex);
     }
-    const contentRange = response.headers.get('Content-Range');
-    const expectedContentRange = `bytes ${blockStart}-${blockEnd}/${attestation.sizeBytes}`;
-    if (contentRange !== expectedContentRange) {
-      response.body?.cancel().catch(() => undefined);
-      throw aibrushDeliveryError(
-        attestation,
-        'CORPUS_AUTHENTICATED_RANGE_SHAPE_MISMATCH',
-        `'${attestation.logicalPath}' returned Content-Range '${contentRange ?? 'missing'}', expected '${expectedContentRange}'`,
-      );
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    trace.blockRequests += 1;
-    trace.bytesRead += bytes.byteLength;
-    onSourceRead?.(bytes.byteLength);
-    const expectedSize = blockEndExclusive - blockStart;
-    if (bytes.byteLength !== expectedSize) {
-      throw aibrushDeliveryError(
-        attestation,
-        'CORPUS_AUTHENTICATED_RANGE_SIZE_MISMATCH',
-        `'${attestation.logicalPath}' block ${blockIndex} has ${bytes.byteLength} bytes, expected ${expectedSize}`,
-      );
-    }
-    const expectedSha256 = attestation.chunkSha256[blockIndex];
-    if (expectedSha256 === undefined || (await sha256Hex(bytes)) !== expectedSha256) {
-      throw aibrushDeliveryError(
-        attestation,
-        'CORPUS_AUTHENTICATED_RANGE_DIGEST_MISMATCH',
-        `'${attestation.logicalPath}' block ${blockIndex} no longer matches the admitted content snapshot`,
-      );
-    }
-    cache.set(blockIndex, bytes);
-    while (cache.size > AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS) {
-      const oldest = cache.keys().next().value as number | undefined;
-      if (oldest === undefined) break;
-      cache.delete(oldest);
-    }
-    return bytes;
   };
 
   const range = async (start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> => {
+    operationSignal?.throwIfAborted();
     signal?.throwIfAborted();
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
       throw aibrushDeliveryError(
@@ -2037,7 +2230,32 @@ export function createAibrushAuthenticatedSource(
         { length: batchEnd - batchStart },
         (_, index) => batchStart + index,
       );
-      const blocks = await Promise.all(indices.map((index) => block(index, signal)));
+      const batchCancellation = new AbortController();
+      const parentSignals = [...new Set([operationSignal, signal].filter(
+        (candidate): candidate is AbortSignal => candidate !== undefined,
+      ))];
+      const abortBatch = (parent: AbortSignal): void => {
+        if (!batchCancellation.signal.aborted) batchCancellation.abort(parent.reason);
+      };
+      const abortListeners = parentSignals.map((parent) => {
+        const listener = (): void => abortBatch(parent);
+        parent.addEventListener('abort', listener, { once: true });
+        if (parent.aborted) abortBatch(parent);
+        return { parent, listener };
+      });
+      const requests = indices.map((index) => block(index, batchCancellation.signal));
+      let blocks: Uint8Array[];
+      try {
+        blocks = await Promise.all(requests);
+      } catch (error) {
+        if (!batchCancellation.signal.aborted) batchCancellation.abort(error);
+        await Promise.allSettled(requests);
+        throw error;
+      } finally {
+        for (const { parent, listener } of abortListeners) {
+          parent.removeEventListener('abort', listener);
+        }
+      }
       for (let index = 0; index < blocks.length; index++) {
         const blockIndex = indices[index]!;
         const bytes = blocks[index]!;
@@ -2050,6 +2268,7 @@ export function createAibrushAuthenticatedSource(
         );
       }
     }
+    operationSignal?.throwIfAborted();
     signal?.throwIfAborted();
     rangeOutputs.add(output);
     return output;
@@ -2109,11 +2328,16 @@ export function createAibrushAuthenticatedSource(
   };
 }
 
-async function createAibrushCountingSource(
+export async function createAibrushCountingSource(
   input: MediaInput,
   onSourceRead: (bytes: number) => void,
 ): Promise<AibrushAuthenticatedSource> {
-  const sourceBytes = new Uint8Array(await input.arrayBuffer());
+  // The verified runner input already owns this Blob before the memory baseline. Slice it directly;
+  // calling arrayBuffer() here would expose and retain an asset-sized JS backing store for the whole
+  // measured operation even though the framework consumes bounded random-access windows.
+  const sourceBlob = await input.blob();
+  const sourceSize = sourceBlob.size;
+  const rangeOutputs = new WeakSet<Uint8Array>();
   const range = async (
     start: number,
     end: number,
@@ -2123,31 +2347,51 @@ async function createAibrushCountingSource(
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
       throw new RangeError(`aibrush counting source requires integer range bounds, got [${start}, ${end})`);
     }
-    const boundedStart = Math.max(0, Math.min(start, sourceBytes.byteLength));
-    const boundedEnd = Math.max(boundedStart, Math.min(end, sourceBytes.byteLength));
-    const output = sourceBytes.slice(boundedStart, boundedEnd);
+    const boundedStart = Math.max(0, Math.min(start, sourceSize));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, sourceSize));
+    const output = new Uint8Array(
+      await sourceBlob.slice(boundedStart, boundedEnd).arrayBuffer(),
+    );
+    rangeOutputs.add(output);
     onSourceRead(output.byteLength);
     signal?.throwIfAborted();
     return output;
   };
+  const releaseRange = (bytes: Uint8Array): void => {
+    if (!rangeOutputs.delete(bytes)) return;
+    const buffer = bytes.buffer;
+    if (
+      buffer instanceof ArrayBuffer &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === buffer.byteLength
+    ) {
+      const transfer = (
+        buffer as ArrayBuffer & {
+          transfer?: (newByteLength?: number) => ArrayBuffer;
+        }
+      ).transfer;
+      if (typeof transfer === 'function') transfer.call(buffer, 0);
+    }
+  };
   return {
     __media: 'source',
     kind: 'url',
-    size: sourceBytes.byteLength,
+    size: sourceSize,
     mimeHint: input.mime,
     rangesHonored: true,
     range,
+    releaseRange,
     stream(): ReadableStream<Uint8Array> {
       const cancellation = new AbortController();
       let cursor = 0;
       return new ReadableStream<Uint8Array>({
         async pull(controller) {
-          if (cursor >= sourceBytes.byteLength) {
+          if (cursor >= sourceSize) {
             controller.close();
             return;
           }
           try {
-            const end = Math.min(sourceBytes.byteLength, cursor + 1024 * 1024);
+            const end = Math.min(sourceSize, cursor + 1024 * 1024);
             const bytes = await range(cursor, end, cancellation.signal);
             cursor = end;
             controller.enqueue(bytes);
@@ -3000,11 +3244,24 @@ async function toMediaBytes(output: AibrushOutput, container: string): Promise<M
 }
 
 const BROWSER_CANVAS_HDR_TONEMAP_MAX_BYTES = 128 * 1024;
+export const AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_MAX_FRAMES = 64;
+export const AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_MAX_RETAINED_PIXEL_BYTES = 32 * 1024 * 1024;
+/** Match the authored/default H.264 route; the shortcut must not silently substitute a thumbnail rate. */
+export const AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_BITRATE_BPS = 2_000_000;
 
-function canUseBrowserCanvasHdrTonemap(input: MediaInput, opts: TranscodeOptions): boolean {
+/** The canvas shortcut is deliberately narrower than the general framework convert route. */
+export function aibrushBrowserCanvasHdrTonemapRequestEligible(
+  input: MediaInput,
+  opts: TranscodeOptions,
+): boolean {
   const extra = opts as unknown as Record<string, unknown>;
   const tonemap = extra.tonemap;
-  const tone = typeof tonemap === 'object' && tonemap !== null ? (tonemap as { to?: unknown }) : undefined;
+  const tone =
+    typeof tonemap === 'object' && tonemap !== null
+      ? (tonemap as Record<string, unknown>)
+      : undefined;
+  const video = opts.video as (TranscodeVideoOptions & Record<string, unknown>) | undefined;
+  const allowedOptionKeys = new Set(['container', 'video', 'tonemap', 'invariant']);
   return (
     !input.mutated &&
     input.sizeBytes !== undefined &&
@@ -3012,13 +3269,20 @@ function canUseBrowserCanvasHdrTonemap(input: MediaInput, opts: TranscodeOptions
     containerFromInput(input) === 'mp4' &&
     opts.container.toLowerCase() === 'mp4' &&
     opts.audio === undefined &&
-    opts.video?.codec === 'h264' &&
-    opts.video.width === undefined &&
-    opts.video.height === undefined &&
-    opts.video.fps === undefined &&
-    opts.video.rotate === undefined &&
-    tone?.to === 'sdr' &&
+    video?.codec === 'h264' &&
+    Object.keys(video).every((key) => key === 'codec') &&
+    tone?.from === 'pq' &&
+    tone.to === 'sdr' &&
+    Object.keys(tone).every((key) => key === 'from' || key === 'to') &&
+    Object.keys(extra).every((key) => allowedOptionKeys.has(key))
+  );
+}
+
+function canUseBrowserCanvasHdrTonemap(input: MediaInput, opts: TranscodeOptions): boolean {
+  return (
+    aibrushBrowserCanvasHdrTonemapRequestEligible(input, opts) &&
     typeof document !== 'undefined' &&
+    typeof OffscreenCanvas === 'function' &&
     typeof VideoEncoder === 'function' &&
     typeof VideoFrame === 'function' &&
     typeof EncodedVideoChunk === 'function'
@@ -3055,20 +3319,244 @@ function waitForVideoEvent(
   });
 }
 
-async function videoElementFirstFrame(
-  input: MediaInput,
+interface AibrushBrowserCanvasVideoSample {
+  readonly timestampUs: number;
+  readonly durationUs: number;
+}
+
+interface AibrushBrowserCanvasVideoTimeline {
+  readonly samples: readonly AibrushBrowserCanvasVideoSample[];
+  readonly durationSec: number;
+  readonly fps: number;
+}
+
+/**
+ * Resolve the complete presentation timeline before the browser-canvas fallback decodes anything.
+ * Packet-info rows can be in decode order, so output frames are sorted by PTS and retain every source
+ * sample's exact timestamp/duration. An incomplete or ambiguous table declines the shortcut instead of
+ * silently changing cardinality.
+ */
+export function aibrushBrowserCanvasVideoTimeline(
+  table: Pick<AibrushPacketInfoTable, 'tracks' | 'packets'>,
+): AibrushBrowserCanvasVideoTimeline | undefined {
+  const videoTrackIndex = table.tracks.findIndex((track) => track.mediaType === 'video');
+  const videoTrack = table.tracks[videoTrackIndex];
+  if (videoTrackIndex < 0 || videoTrack === undefined) return undefined;
+  const packets = table.packets
+    .filter((packet) => packet.trackIndex === videoTrackIndex)
+    .slice()
+    .sort((a, b) => a.ptsUs - b.ptsUs);
+  if (
+    packets.length === 0 ||
+    packets.some(
+      (packet) =>
+        !Number.isSafeInteger(packet.ptsUs) ||
+        packet.ptsUs < 0 ||
+        (packet.durationUs !== undefined &&
+          (!Number.isSafeInteger(packet.durationUs) || packet.durationUs <= 0)),
+    )
+  ) {
+    return undefined;
+  }
+  for (let index = 1; index < packets.length; index++) {
+    const packet = packets[index];
+    const previous = packets[index - 1];
+    if (packet === undefined || previous === undefined || packet.ptsUs <= previous.ptsUs) {
+      return undefined;
+    }
+  }
+
+  const declaredDurationUs =
+    videoTrack.durationSec !== undefined &&
+    Number.isFinite(videoTrack.durationSec) &&
+    videoTrack.durationSec > 0
+      ? Math.round(videoTrack.durationSec * 1_000_000)
+      : undefined;
+  const samples: AibrushBrowserCanvasVideoSample[] = [];
+  for (let index = 0; index < packets.length; index++) {
+    const packet = packets[index];
+    if (packet === undefined) return undefined;
+    const nextTimestampUs = packets[index + 1]?.ptsUs;
+    const inferredDurationUs =
+      nextTimestampUs !== undefined
+        ? nextTimestampUs - packet.ptsUs
+        : declaredDurationUs !== undefined
+          ? declaredDurationUs - packet.ptsUs
+          : undefined;
+    const durationUs = packet.durationUs ?? inferredDurationUs;
+    if (durationUs === undefined || !Number.isSafeInteger(durationUs) || durationUs <= 0) {
+      return undefined;
+    }
+    samples.push({ timestampUs: packet.ptsUs, durationUs });
+  }
+  const last = samples.at(-1);
+  if (last === undefined) return undefined;
+  const sampleEndUs = last.timestampUs + last.durationUs;
+  const durationUs = Math.max(declaredDurationUs ?? 0, sampleEndUs);
+  if (!Number.isSafeInteger(durationUs) || durationUs <= 0) return undefined;
+  const inferredFps = (samples.length * 1_000_000) / durationUs;
+  const fps =
+    videoTrack.fps !== undefined && Number.isFinite(videoTrack.fps) && videoTrack.fps > 0
+      ? videoTrack.fps
+      : inferredFps;
+  if (!Number.isFinite(fps) || fps <= 0) return undefined;
+  return { samples, durationSec: durationUs / 1_000_000, fps };
+}
+
+/** Reject any source shape the video-only shortcut would otherwise silently discard. */
+export function aibrushBrowserCanvasHdrTonemapSourceEligible(
+  table: Pick<AibrushPacketInfoTable, 'tracks'>,
+): boolean {
+  return table.tracks.length === 1 && table.tracks[0]?.mediaType === 'video';
+}
+
+/** Bound adapter-retained decoded surfaces independently of compressed input size. */
+export function aibrushBrowserCanvasHdrTimelineFitsBudget(
+  timeline: Pick<AibrushBrowserCanvasVideoTimeline, 'samples'>,
+  width: number,
+  height: number,
+): boolean {
+  if (
+    timeline.samples.length === 0 ||
+    timeline.samples.length > AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_MAX_FRAMES ||
+    !Number.isSafeInteger(width) ||
+    width <= 0 ||
+    !Number.isSafeInteger(height) ||
+    height <= 0
+  ) {
+    return false;
+  }
+  const retainedPixelBytes = width * height * 4 * timeline.samples.length;
+  return (
+    Number.isSafeInteger(retainedPixelBytes) &&
+    retainedPixelBytes <= AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_MAX_RETAINED_PIXEL_BYTES
+  );
+}
+
+interface AibrushVideoFrameCallbackMetadata {
+  readonly mediaTime?: number;
+}
+
+type AibrushVideoFrameCallbackTarget = HTMLVideoElement & {
+  requestVideoFrameCallback?: (
+    callback: (now: number, metadata: AibrushVideoFrameCallbackMetadata) => void,
+  ) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
+/**
+ * Wait for both the seek and the compositor surface for the authored sample. `seeked` alone permits
+ * drawImage() to consume the preceding surface. The callback is armed before assigning currentTime so
+ * a fast presentation cannot be missed, and stale callbacks are re-armed until mediaTime proves the
+ * requested source sample. The operation signal owns every listener and outstanding callback.
+ */
+async function seekVideoElement(
+  video: HTMLVideoElement,
+  seekTimestampUs: number,
+  expectedTimestampUs: number,
+  signal: AbortSignal,
+): Promise<void> {
+  signal.throwIfAborted();
+  const callbackTarget = video as AibrushVideoFrameCallbackTarget;
+  const requestFrame = callbackTarget.requestVideoFrameCallback?.bind(callbackTarget);
+  const cancelFrame = callbackTarget.cancelVideoFrameCallback?.bind(callbackTarget);
+  if (requestFrame === undefined) {
+    throw new Error('browser-canvas HDR presentation requires requestVideoFrameCallback evidence');
+  }
+  const seekTimeSec = seekTimestampUs / 1_000_000;
+  const expectedMediaTimeSec = expectedTimestampUs / 1_000_000;
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    let callbackPending = false;
+    let callbackHandle: number | undefined;
+    let seeked =
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      Math.abs(video.currentTime - seekTimeSec) <= 0.000_001;
+    let presented = false;
+
+    const cleanup = (): void => {
+      video.removeEventListener('seeked', onSeeked);
+      video.removeEventListener('error', onError);
+      signal.removeEventListener('abort', onAbort);
+      if (callbackHandle !== undefined) {
+        try {
+          cancelFrame?.(callbackHandle);
+        } catch {
+          /* callback already delivered or cancelled */
+        }
+      }
+      callbackHandle = undefined;
+      callbackPending = false;
+    };
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve();
+    };
+    const fail = (error: unknown): void => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const armFrameCallback = (): void => {
+      if (done || callbackPending) return;
+      callbackPending = true;
+      callbackHandle = requestFrame((_now, metadata) => {
+        callbackPending = false;
+        callbackHandle = undefined;
+        const mediaTime = metadata.mediaTime;
+        presented =
+          mediaTime !== undefined &&
+          Number.isFinite(mediaTime) &&
+          Math.abs(mediaTime - expectedMediaTimeSec) <= 0.001;
+        if (seeked && presented) finish();
+        else armFrameCallback();
+      });
+    };
+    const onSeeked = (): void => {
+      seeked = true;
+      if (presented) finish();
+      else armFrameCallback();
+    };
+    const onError = (): void => fail(video.error ?? new Error('video seek failed'));
+    const onAbort = (): void =>
+      fail(signal.reason ?? new DOMException('operation aborted', 'AbortError'));
+
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.addEventListener('error', onError, { once: true });
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      armFrameCallback();
+      // Assign even when currentTime already equals the first authored PTS. A paused element may not
+      // submit another presentation callback until that explicit seek refreshes its current surface.
+      video.currentTime = seekTimeSec;
+    } catch (error) {
+      fail(error);
+    }
+  });
+}
+
+async function videoElementFrames(
+  sourceBytes: Uint8Array,
+  mime: string,
+  timeline: AibrushBrowserCanvasVideoTimeline,
   signal: AbortSignal,
 ): Promise<{
-  frame: VideoFrame;
-  durationSec: number;
+  frames: VideoFrame[];
   width: number;
   height: number;
-}> {
+} | undefined> {
   const video = document.createElement('video');
+  const sourceBuffer = new ArrayBuffer(sourceBytes.byteLength);
+  new Uint8Array(sourceBuffer).set(sourceBytes);
+  const sourceUrl = URL.createObjectURL(new Blob([sourceBuffer], { type: mime }));
+  const frames: VideoFrame[] = [];
   video.muted = true;
   video.playsInline = true;
   video.preload = 'auto';
-  video.src = input.url;
+  video.src = sourceUrl;
   try {
     await waitForVideoEvent(video, 'loadedmetadata', signal);
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -3076,94 +3564,621 @@ async function videoElementFirstFrame(
     }
     const width = video.videoWidth;
     const height = video.videoHeight;
-    const durationSec = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 2;
     if (width <= 0 || height <= 0) return Promise.reject(new Error('video metadata has no dimensions'));
+    if (!aibrushBrowserCanvasHdrTimelineFitsBudget(timeline, width, height)) return undefined;
     const canvas = new OffscreenCanvas(width, height);
     const ctx = canvas.getContext('2d', { alpha: false });
     if (ctx === null) return Promise.reject(new Error('2D canvas unavailable'));
-    ctx.drawImage(video, 0, 0, width, height);
-    return {
-      frame: new VideoFrame(canvas, {
-        timestamp: 0,
-        duration: Math.round(durationSec * 1_000_000),
-      }),
-      durationSec,
-      width,
-      height,
-    };
+    for (const sample of timeline.samples) {
+      signal.throwIfAborted();
+      // Seek inside the sample's presentation interval so a floating-point boundary cannot repaint
+      // the preceding frame; the authored output still retains the sample's exact original PTS.
+      await seekVideoElement(
+        video,
+        sample.timestampUs + Math.floor(sample.durationUs / 2),
+        sample.timestampUs,
+        signal,
+      );
+      ctx.drawImage(video, 0, 0, width, height);
+      frames.push(
+        new VideoFrame(canvas, {
+          timestamp: sample.timestampUs,
+          duration: sample.durationUs,
+        }),
+      );
+    }
+    return { frames, width, height };
+  } catch (error) {
+    for (const frame of frames) frame.close();
+    throw error;
   } finally {
     video.removeAttribute('src');
     video.load();
+    URL.revokeObjectURL(sourceUrl);
   }
 }
 
-async function encodeSingleH264Frame(
-  frame: VideoFrame,
+/**
+ * Hand canvas/sRGB frames to the product's exact destination-colour boundary. That transform owns and
+ * closes each input frame; this collector owns every returned limited-range BT.709 I420 frame until the
+ * encoder accepts it. Cancellation closes any source frames not yet handed off and every collected output.
+ */
+export async function prepareAibrushBrowserCanvasHdrTonemapFrames(
+  core: Pick<AibrushCore, 'destinationColorI420FrameStream'>,
+  frames: readonly VideoFrame[],
+  signal: AbortSignal,
+): Promise<VideoFrame[]> {
+  const openSourceFrames = new Set(frames);
+  const outputs: VideoFrame[] = [];
+  let writer: WritableStreamDefaultWriter<VideoFrame> | undefined;
+  let reader: ReadableStreamDefaultReader<VideoFrame> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    signal.throwIfAborted();
+    const transform = core.destinationColorI420FrameStream(
+      {
+        kind: 'bt709-sdr',
+        transform: 'tonemap',
+      },
+      undefined,
+      (frame) => {
+        openSourceFrames.delete(frame);
+      },
+    );
+    writer = transform.writable.getWriter();
+    reader = transform.readable.getReader();
+    onAbort = (): void => {
+      void writer?.abort(signal.reason).catch(() => {});
+      void reader?.cancel(signal.reason).catch(() => {});
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    for (const frame of frames) {
+      signal.throwIfAborted();
+      // Read concurrently with write: TransformStream backpressure otherwise waits for a consumer before
+      // resolving writer.write(). The product seam is exactly one input frame -> one destination frame.
+      const [write, read] = await Promise.allSettled([writer.write(frame), reader.read()]);
+      // The product's synchronous entry callback transfers ownership before its close-on-every-exit
+      // boundary. A rejected queued write that never entered leaves the frame adapter-owned here.
+      if (read.status === 'rejected') throw read.reason;
+      const result = read.value;
+      if (write.status === 'rejected') {
+        if (!result.done) closeFrame(result.value);
+        throw write.reason;
+      }
+      if (result.done) {
+        throw new Error('BT.709 destination-frame seam ended before every canvas frame was converted');
+      }
+      const value = result.value;
+      if (signal.aborted) {
+        closeFrame(value);
+        signal.throwIfAborted();
+      }
+      outputs.push(value);
+    }
+    await writer.close();
+    let emittedTrailingFrame = false;
+    for (;;) {
+      const trailing = await reader.read();
+      if (trailing.done) break;
+      emittedTrailingFrame = true;
+      closeFrame(trailing.value);
+    }
+    if (emittedTrailingFrame) {
+      throw new Error('BT.709 destination-frame seam emitted more than one output per canvas frame');
+    }
+    return outputs;
+  } catch (error) {
+    for (const frame of outputs) closeFrame(frame);
+    throw error;
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort);
+    await Promise.allSettled([
+      writer?.abort(signal.reason),
+      reader?.cancel(signal.reason),
+    ]);
+    writer?.releaseLock();
+    reader?.releaseLock();
+    for (const frame of openSourceFrames) closeFrame(frame);
+    openSourceFrames.clear();
+  }
+}
+
+interface AibrushBrowserCanvasHdrI420Snapshot {
+  readonly timestampUs: number;
+  readonly durationUs: number;
+  readonly width: number;
+  readonly height: number;
+  readonly colorSpace: VideoColorSpaceInit;
+  /** Tightly packed limited-range I420: Y, then U, then V. */
+  readonly bytes: Uint8Array;
+}
+
+interface AibrushBrowserCanvasVideoPresenter {
+  readonly video: HTMLVideoElement;
+  readonly width: number;
+  readonly height: number;
+  dispose(): void;
+}
+
+export interface AibrushBrowserCanvasHdrOwnedStage<T> {
+  readonly value: T;
+  readonly frameCount: number;
+  /** Must be idempotent and non-throwing. */
+  release(): void;
+}
+
+export interface AibrushBrowserCanvasHdrFeedbackStages<TPrivate, TAdjusted, TFinal> {
+  encodePrivate(): Promise<AibrushBrowserCanvasHdrOwnedStage<TPrivate>>;
+  adjust(privateOutput: TPrivate): Promise<AibrushBrowserCanvasHdrOwnedStage<TAdjusted>>;
+  /** Ownership of `adjusted` transfers as soon as this stage is entered, including its error path. */
+  encodeFinal(adjusted: TAdjusted): Promise<TFinal>;
+}
+
+export function assertAibrushBrowserCanvasHdrFeedbackCardinality(
+  stage: string,
+  actualFrameCount: number,
+  expectedFrameCount: number,
+): void {
+  if (actualFrameCount !== expectedFrameCount) {
+    throw new Error(
+      `browser-canvas HDR feedback ${stage} produced ${actualFrameCount} frames for ` +
+        `${expectedFrameCount} authored samples`,
+    );
+  }
+}
+
+/**
+ * Run one private measurement encode followed by one published encode. The private value is released
+ * on every exit and is never returned. An abort observed after either async stage prevents the next
+ * stage from starting; each stage wrapper retains responsibility for its own in-flight resources.
+ */
+export async function executeAibrushBrowserCanvasHdrFeedbackPass<
+  TPrivate,
+  TAdjusted,
+  TFinal,
+>(
+  expectedFrameCount: number,
+  signal: AbortSignal,
+  stages: AibrushBrowserCanvasHdrFeedbackStages<TPrivate, TAdjusted, TFinal>,
+): Promise<TFinal> {
+  let privateOutput: AibrushBrowserCanvasHdrOwnedStage<TPrivate> | undefined;
+  let adjustedOutput: AibrushBrowserCanvasHdrOwnedStage<TAdjusted> | undefined;
+  let adjustedTransferred = false;
+  try {
+    signal.throwIfAborted();
+    privateOutput = await stages.encodePrivate();
+    assertAibrushBrowserCanvasHdrFeedbackCardinality(
+      'private encode',
+      privateOutput.frameCount,
+      expectedFrameCount,
+    );
+    signal.throwIfAborted();
+    adjustedOutput = await stages.adjust(privateOutput.value);
+    assertAibrushBrowserCanvasHdrFeedbackCardinality(
+      'adjustment',
+      adjustedOutput.frameCount,
+      expectedFrameCount,
+    );
+    signal.throwIfAborted();
+    adjustedTransferred = true;
+    return await stages.encodeFinal(adjustedOutput.value);
+  } finally {
+    if (!adjustedTransferred) adjustedOutput?.release();
+    privateOutput?.release();
+  }
+}
+
+/** Common scalar which minimizes the largest absolute residual across the three RGB channels. */
+export function aibrushBrowserCanvasHdrChebyshevLumaDelta(
+  sourceBt709: readonly [number, number, number],
+  candidateBt709: readonly [number, number, number],
+): number {
+  const red = sourceBt709[0] - candidateBt709[0];
+  const green = sourceBt709[1] - candidateBt709[1];
+  const blue = sourceBt709[2] - candidateBt709[2];
+  return (Math.min(red, green, blue) + Math.max(red, green, blue)) / 2;
+}
+
+function srgbByteToBt709Nonlinear(sample: number): number {
+  const encoded = Math.max(0, Math.min(255, sample)) / 255;
+  const linear =
+    encoded <= 0.04045
+      ? encoded / 12.92
+      : ((encoded + 0.055) / 1.055) ** 2.4;
+  const bt709 = linear < 0.018 ? 4.5 * linear : 1.099 * linear ** 0.45 - 0.099;
+  // Match the browser/core 8-bit presentation boundary used to derive the measured residual.
+  return Math.round(Math.max(0, Math.min(1, bt709)) * 255) / 255;
+}
+
+/** Apply the presentation residual only to limited-range BT.709 luma; chroma is left untouched. */
+export function aibrushBrowserCanvasHdrFeedbackLumaCode(
+  originalY: number,
+  sourceSrgb: readonly [number, number, number],
+  candidateSrgb: readonly [number, number, number],
+): number {
+  const delta = aibrushBrowserCanvasHdrChebyshevLumaDelta(
+    [
+      srgbByteToBt709Nonlinear(sourceSrgb[0]),
+      srgbByteToBt709Nonlinear(sourceSrgb[1]),
+      srgbByteToBt709Nonlinear(sourceSrgb[2]),
+    ],
+    [
+      srgbByteToBt709Nonlinear(candidateSrgb[0]),
+      srgbByteToBt709Nonlinear(candidateSrgb[1]),
+      srgbByteToBt709Nonlinear(candidateSrgb[2]),
+    ],
+  );
+  return Math.max(16, Math.min(235, Math.round(originalY + 219 * delta)));
+}
+
+function copyAibrushBrowserCanvasHdrI420Plane(
+  source: Uint8Array,
+  layout: PlaneLayout,
+  planeWidth: number,
+  planeHeight: number,
+  destination: Uint8Array,
+  destinationOffset: number,
+): void {
+  if (
+    !Number.isSafeInteger(layout.offset) ||
+    layout.offset < 0 ||
+    !Number.isSafeInteger(layout.stride) ||
+    layout.stride < planeWidth
+  ) {
+    throw new Error('browser-canvas HDR feedback received an invalid I420 plane layout');
+  }
+  for (let row = 0; row < planeHeight; row++) {
+    const start = layout.offset + row * layout.stride;
+    const end = start + planeWidth;
+    if (end > source.byteLength) {
+      throw new Error('browser-canvas HDR feedback received a truncated I420 plane');
+    }
+    destination.set(source.subarray(start, end), destinationOffset + row * planeWidth);
+  }
+}
+
+async function snapshotAibrushBrowserCanvasHdrI420Frames(
+  frames: readonly VideoFrame[],
+  timeline: AibrushBrowserCanvasVideoTimeline,
+  signal: AbortSignal,
+): Promise<AibrushBrowserCanvasHdrI420Snapshot[]> {
+  assertAibrushBrowserCanvasHdrFeedbackCardinality(
+    'destination snapshot',
+    frames.length,
+    timeline.samples.length,
+  );
+  const snapshots: AibrushBrowserCanvasHdrI420Snapshot[] = [];
+  for (const [index, frame] of frames.entries()) {
+    signal.throwIfAborted();
+    const sample = timeline.samples[index];
+    if (
+      sample === undefined ||
+      frame.format !== 'I420' ||
+      frame.timestamp !== sample.timestampUs ||
+      frame.duration !== sample.durationUs
+    ) {
+      throw new Error('browser-canvas HDR feedback requires exact authored I420 timestamps and durations');
+    }
+    const width = frame.displayWidth;
+    const height = frame.displayHeight;
+    const chromaWidth = Math.ceil(width / 2);
+    const chromaHeight = Math.ceil(height / 2);
+    const ySize = width * height;
+    const chromaSize = chromaWidth * chromaHeight;
+    const native = new Uint8Array(frame.allocationSize());
+    const layout = await frame.copyTo(native);
+    signal.throwIfAborted();
+    const [y, u, v] = layout;
+    if (y === undefined || u === undefined || v === undefined) {
+      throw new Error('browser-canvas HDR feedback requires all three I420 planes');
+    }
+    const bytes = new Uint8Array(ySize + chromaSize * 2);
+    copyAibrushBrowserCanvasHdrI420Plane(native, y, width, height, bytes, 0);
+    copyAibrushBrowserCanvasHdrI420Plane(native, u, chromaWidth, chromaHeight, bytes, ySize);
+    copyAibrushBrowserCanvasHdrI420Plane(
+      native,
+      v,
+      chromaWidth,
+      chromaHeight,
+      bytes,
+      ySize + chromaSize,
+    );
+    snapshots.push({
+      timestampUs: sample.timestampUs,
+      durationUs: sample.durationUs,
+      width,
+      height,
+      colorSpace: {
+        primaries: frame.colorSpace.primaries,
+        transfer: frame.colorSpace.transfer,
+        matrix: frame.colorSpace.matrix,
+        fullRange: frame.colorSpace.fullRange,
+      } as VideoColorSpaceInit,
+      bytes,
+    });
+  }
+  return snapshots;
+}
+
+function disposeAibrushBrowserCanvasVideoPresenter(
+  video: HTMLVideoElement,
+  sourceUrl: string,
+): void {
+  video.removeAttribute('src');
+  try {
+    video.load();
+  } catch {
+    /* element already torn down */
+  }
+  URL.revokeObjectURL(sourceUrl);
+}
+
+async function openAibrushBrowserCanvasVideoPresenter(
+  bytes: Uint8Array,
+  mime: string,
+  signal: AbortSignal,
+): Promise<AibrushBrowserCanvasVideoPresenter> {
+  signal.throwIfAborted();
+  const owned = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(owned).set(bytes);
+  const sourceUrl = URL.createObjectURL(new Blob([owned], { type: mime }));
+  const video = document.createElement('video');
+  let disposed = false;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    disposeAibrushBrowserCanvasVideoPresenter(video, sourceUrl);
+  };
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'auto';
+  video.src = sourceUrl;
+  try {
+    await waitForVideoEvent(video, 'loadedmetadata', signal);
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      await waitForVideoEvent(video, 'loadeddata', signal);
+    }
+    signal.throwIfAborted();
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error('browser-canvas HDR feedback presenter has no dimensions');
+    }
+    return { video, width: video.videoWidth, height: video.videoHeight, dispose };
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+}
+
+async function feedbackAdjustedAibrushBrowserCanvasHdrFrames(
+  sourceBytes: Uint8Array,
+  sourceMime: string,
+  privateBytes: Uint8Array,
+  timeline: AibrushBrowserCanvasVideoTimeline,
+  snapshots: readonly AibrushBrowserCanvasHdrI420Snapshot[],
+  signal: AbortSignal,
+): Promise<VideoFrame[]> {
+  assertAibrushBrowserCanvasHdrFeedbackCardinality(
+    'destination snapshot',
+    snapshots.length,
+    timeline.samples.length,
+  );
+  const scopedAbort = new AbortController();
+  const onAbort = (): void => scopedAbort.abort(signal.reason);
+  signal.addEventListener('abort', onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  let source: AibrushBrowserCanvasVideoPresenter | undefined;
+  let candidate: AibrushBrowserCanvasVideoPresenter | undefined;
+  const output: VideoFrame[] = [];
+  try {
+    source = await openAibrushBrowserCanvasVideoPresenter(sourceBytes, sourceMime, scopedAbort.signal);
+    candidate = await openAibrushBrowserCanvasVideoPresenter(
+      privateBytes,
+      outputMime('mp4'),
+      scopedAbort.signal,
+    );
+    const width = snapshots[0]?.width;
+    const height = snapshots[0]?.height;
+    if (
+      width === undefined ||
+      height === undefined ||
+      source.width !== width ||
+      source.height !== height ||
+      candidate.width !== width ||
+      candidate.height !== height
+    ) {
+      throw new Error('browser-canvas HDR feedback presenter dimensions changed');
+    }
+    const sourceCanvas = new OffscreenCanvas(width, height);
+    const candidateCanvas = new OffscreenCanvas(width, height);
+    const sourceContext = sourceCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+    const candidateContext = candidateCanvas.getContext('2d', {
+      alpha: false,
+      willReadFrequently: true,
+    });
+    if (sourceContext === null || candidateContext === null) {
+      throw new Error('browser-canvas HDR feedback requires 2D presentation contexts');
+    }
+
+    for (const [index, sample] of timeline.samples.entries()) {
+      scopedAbort.signal.throwIfAborted();
+      const snapshot = snapshots[index];
+      if (
+        snapshot === undefined ||
+        snapshot.timestampUs !== sample.timestampUs ||
+        snapshot.durationUs !== sample.durationUs ||
+        snapshot.width !== width ||
+        snapshot.height !== height
+      ) {
+        throw new Error('browser-canvas HDR feedback lost authored frame pairing');
+      }
+      await Promise.all([
+        seekVideoElement(source.video, sample.timestampUs, sample.timestampUs, scopedAbort.signal),
+        seekVideoElement(candidate.video, sample.timestampUs, sample.timestampUs, scopedAbort.signal),
+      ]);
+      scopedAbort.signal.throwIfAborted();
+      sourceContext.drawImage(source.video, 0, 0, width, height);
+      candidateContext.drawImage(candidate.video, 0, 0, width, height);
+      const sourceRgba = sourceContext.getImageData(0, 0, width, height).data;
+      const candidateRgba = candidateContext.getImageData(0, 0, width, height).data;
+      const adjusted = snapshot.bytes.slice();
+      const pixelCount = width * height;
+      for (let pixel = 0; pixel < pixelCount; pixel++) {
+        const offset = pixel * 4;
+        adjusted[pixel] = aibrushBrowserCanvasHdrFeedbackLumaCode(
+          adjusted[pixel] ?? 16,
+          [sourceRgba[offset] ?? 0, sourceRgba[offset + 1] ?? 0, sourceRgba[offset + 2] ?? 0],
+          [
+            candidateRgba[offset] ?? 0,
+            candidateRgba[offset + 1] ?? 0,
+            candidateRgba[offset + 2] ?? 0,
+          ],
+        );
+      }
+      const chromaWidth = Math.ceil(width / 2);
+      const ySize = width * height;
+      const chromaSize = chromaWidth * Math.ceil(height / 2);
+      output.push(
+        new VideoFrame(adjusted, {
+          format: 'I420',
+          codedWidth: width,
+          codedHeight: height,
+          timestamp: sample.timestampUs,
+          duration: sample.durationUs,
+          colorSpace: snapshot.colorSpace,
+          layout: [
+            { offset: 0, stride: width },
+            { offset: ySize, stride: chromaWidth },
+            { offset: ySize + chromaSize, stride: chromaWidth },
+          ],
+        }),
+      );
+    }
+    return output;
+  } catch (error) {
+    scopedAbort.abort(error);
+    for (const frame of output) closeFrame(frame);
+    throw error;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    scopedAbort.abort();
+    candidate?.dispose();
+    source?.dispose();
+  }
+}
+
+export function assertAibrushBrowserCanvasHdrPacketCardinality(
+  packets: readonly AibrushPacket[],
+  expectedFrameCount: number,
+): void {
+  if (packets.length !== expectedFrameCount) {
+    throw new Error(
+      `browser-canvas tonemap encoded ${packets.length} packets for ${expectedFrameCount} input frames`,
+    );
+  }
+}
+
+/** Offline HDR conformance uses the authored rate and the encoder's quality path, never realtime mode. */
+export function aibrushBrowserCanvasHdrEncoderConfig(
   width: number,
   height: number,
-  durationSec: number,
+  fps: number,
+): VideoEncoderConfig {
+  return {
+    codec: 'avc1.42E01E',
+    width,
+    height,
+    bitrate: AIBRUSH_BROWSER_CANVAS_HDR_TONEMAP_BITRATE_BPS,
+    framerate: fps,
+    latencyMode: 'quality',
+  };
+}
+
+async function encodeH264Frames(
+  frames: readonly VideoFrame[],
+  width: number,
+  height: number,
+  fps: number,
   signal: AbortSignal,
 ): Promise<{ packets: AibrushPacket[]; config: VideoDecoderConfig }> {
+  if (frames.length === 0) throw new Error('browser-canvas tonemap produced no video frames');
   let decoderConfig: VideoDecoderConfig | undefined;
   let encodeError: Error | undefined;
   const packets: AibrushPacket[] = [];
-  const encoder = new VideoEncoder({
-    output(chunk, metadata): void {
-      if (metadata?.decoderConfig !== undefined) decoderConfig = metadata.decoderConfig;
-      const data = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(data);
-      packets.push({
-        chunk: chunk as unknown as AibrushChunk,
-        data,
-        dtsUs: chunk.timestamp,
-        sizeBytes: data.byteLength,
-      });
-    },
-    error(error): void {
-      encodeError = error instanceof Error ? error : new Error(String(error));
-    },
-  });
+  const openFrames = new Set(frames);
+  let encoder: VideoEncoder | undefined;
   const onAbort = (): void => {
     try {
-      encoder.close();
+      encoder?.close();
     } catch {
       /* already closed */
     }
   };
   signal.addEventListener('abort', onAbort, { once: true });
   try {
-    encoder.configure({
-      codec: 'avc1.42E01E',
-      width,
-      height,
-      bitrate: 80_000,
-      framerate: 30,
-      hardwareAcceleration: 'prefer-software',
-      latencyMode: 'realtime',
+    signal.throwIfAborted();
+    encoder = new VideoEncoder({
+      output(chunk, metadata): void {
+        if (metadata?.decoderConfig !== undefined) decoderConfig = metadata.decoderConfig;
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        packets.push({
+          chunk: chunk as unknown as AibrushChunk,
+          data,
+          dtsUs: chunk.timestamp,
+          sizeBytes: data.byteLength,
+        });
+      },
+      error(error): void {
+        encodeError = error instanceof Error ? error : new Error(String(error));
+      },
     });
-    encoder.encode(frame, { keyFrame: true });
+    encoder.configure(aibrushBrowserCanvasHdrEncoderConfig(width, height, fps));
+    for (const [index, frame] of frames.entries()) {
+      signal.throwIfAborted();
+      try {
+        encoder.encode(frame, { keyFrame: index === 0 });
+      } finally {
+        frame.close();
+        openFrames.delete(frame);
+      }
+    }
     await encoder.flush();
     if (encodeError !== undefined) throw encodeError;
+    assertAibrushBrowserCanvasHdrPacketCardinality(packets, frames.length);
     if (decoderConfig === undefined) throw new Error('H.264 encoder did not emit decoder config');
     return { packets, config: decoderConfig };
   } finally {
     signal.removeEventListener('abort', onAbort);
-    frame.close();
+    for (const frame of openFrames) closeFrame(frame);
     try {
-      encoder.close();
+      encoder?.close();
     } catch {
       /* already closed */
     }
   }
 }
 
-function allowSharedBytes(src: AllowSharedBufferSource): Uint8Array<ArrayBuffer> {
-  const view = ArrayBuffer.isView(src)
-    ? new Uint8Array(src.buffer, src.byteOffset, src.byteLength)
-    : new Uint8Array(src);
-  const out = new Uint8Array(view.byteLength);
-  out.set(view);
-  return out;
+export function muxAibrushBrowserCanvasHdrTonemap(
+  core: Pick<AibrushCore, 'videoTrackInfoFromDecoderConfig' | 'muxPreparedMp4PacketTrack'>,
+  encoded: { readonly packets: readonly AibrushPacket[]; readonly config: VideoDecoderConfig },
+  durationSec: number,
+  fps: number,
+): Uint8Array {
+  const track = core.videoTrackInfoFromDecoderConfig(
+    encoded.config,
+    fps,
+    durationSec,
+    undefined,
+    { kind: 'bt709-sdr', transform: 'tonemap' },
+  );
+  return core.muxPreparedMp4PacketTrack({
+    track,
+    packets: encoded.packets,
+    container: 'mp4',
+    faststart: true,
+    fragmented: false,
+  });
 }
 
 async function tryBrowserCanvasHdrTonemapTranscode(
@@ -3173,36 +4188,106 @@ async function tryBrowserCanvasHdrTonemapTranscode(
   signal: AbortSignal,
 ): Promise<MediaBytes | undefined> {
   if (!canUseBrowserCanvasHdrTonemap(input, opts)) return undefined;
-  const captured = await videoElementFirstFrame(input, signal);
-  const { frame, durationSec, width, height } = captured;
-  const encoded = await encodeSingleH264Frame(frame, width, height, durationSec, signal);
-  const description =
-    encoded.config.description !== undefined ? allowSharedBytes(encoded.config.description) : undefined;
-  const track: AibrushTrackInfo = {
-    id: 0,
-    mediaType: 'video',
-    codec: encoded.config.codec,
-    durationSec,
-    config: {
-      codec: encoded.config.codec,
-      codedWidth: width,
-      codedHeight: height,
-      ...(description !== undefined ? { description } : {}),
-    },
-  };
+  const sourceBytes = await inputBytes(input);
   signal.throwIfAborted();
-  const bytes = core.muxPreparedMp4PacketTrack({
-    track,
-    packets: encoded.packets,
-    container: 'mp4',
-    faststart: true,
-    fragmented: false,
-  });
-  return {
-    bytes,
-    mime: outputMime('mp4'),
-    container: 'mp4',
-  };
+  const packetInfo = await core.mp4PacketInfoFromBytes(sourceBytes, { signal });
+  if (!aibrushBrowserCanvasHdrTonemapSourceEligible(packetInfo)) return undefined;
+  const timeline = aibrushBrowserCanvasVideoTimeline(packetInfo);
+  if (timeline === undefined) return undefined;
+  const captured = await videoElementFrames(sourceBytes, input.mime, timeline, signal);
+  if (captured === undefined) return undefined;
+  const { frames, width, height } = captured;
+  let destinationFrames = await prepareAibrushBrowserCanvasHdrTonemapFrames(core, frames, signal);
+  const snapshots: AibrushBrowserCanvasHdrI420Snapshot[] = [];
+  try {
+    assertAibrushBrowserCanvasHdrFeedbackCardinality(
+      'destination transform',
+      destinationFrames.length,
+      timeline.samples.length,
+    );
+    snapshots.push(
+      ...(await snapshotAibrushBrowserCanvasHdrI420Frames(destinationFrames, timeline, signal)),
+    );
+    return await executeAibrushBrowserCanvasHdrFeedbackPass(
+      timeline.samples.length,
+      signal,
+      {
+        async encodePrivate() {
+          const ownedFrames = destinationFrames;
+          destinationFrames = [];
+          const encoded = await encodeH264Frames(
+            ownedFrames,
+            width,
+            height,
+            timeline.fps,
+            signal,
+          );
+          signal.throwIfAborted();
+          const privateBytes = muxAibrushBrowserCanvasHdrTonemap(
+            core,
+            encoded,
+            timeline.durationSec,
+            timeline.fps,
+          );
+          let released = false;
+          return {
+            value: privateBytes,
+            frameCount: encoded.packets.length,
+            release(): void {
+              if (released) return;
+              released = true;
+              // This measurement encode is never an adapter output or retained diagnostic.
+              privateBytes.fill(0);
+            },
+          };
+        },
+        async adjust(privateBytes) {
+          const adjusted = await feedbackAdjustedAibrushBrowserCanvasHdrFrames(
+            sourceBytes,
+            input.mime,
+            privateBytes,
+            timeline,
+            snapshots,
+            signal,
+          );
+          let released = false;
+          return {
+            value: adjusted,
+            frameCount: adjusted.length,
+            release(): void {
+              if (released) return;
+              released = true;
+              for (const frame of adjusted) closeFrame(frame);
+            },
+          };
+        },
+        async encodeFinal(adjusted) {
+          const encoded = await encodeH264Frames(
+            adjusted,
+            width,
+            height,
+            timeline.fps,
+            signal,
+          );
+          signal.throwIfAborted();
+          const bytes = muxAibrushBrowserCanvasHdrTonemap(
+            core,
+            encoded,
+            timeline.durationSec,
+            timeline.fps,
+          );
+          return {
+            bytes,
+            mime: outputMime('mp4'),
+            container: 'mp4',
+          };
+        },
+      },
+    );
+  } finally {
+    for (const frame of destinationFrames) closeFrame(frame);
+    for (const snapshot of snapshots) snapshot.bytes.fill(0);
+  }
 }
 
 // ── decodeFrames support: collect VideoFrames, rasterize + digest, close exactly once ──────────────
@@ -3498,13 +4583,15 @@ function decodePresenceHint(input: MediaInput): DecodeTrackPresence | undefined 
   return undefined;
 }
 
-function resolveAibrushDecodeTrack(
+export function resolveAibrushDecodeTrack(
   info: AibrushInfo,
   selector: DecodeTrackSelector,
   request: ConcreteOperationRequest | undefined,
 ): {
   readonly presence: DecodeTrackPresence;
   readonly evidence: NonNullable<FrameSink['selectedTrack']>;
+  /** Exact public product selector; ordinal is scoped to the selected media type. */
+  readonly trackSelect: readonly [string];
 } {
   const tuple = request ? aibrushTupleSummary(request) : { inputContainers: [], inputCodecs: [], outputCodecs: [] };
   const reject = (reason: string): never => {
@@ -3549,20 +4636,12 @@ function resolveAibrushDecodeTrack(
     return reject(`selected track index ${chosen.trackIndex} has id ${chosen.track.id}, not ${selector.trackId}`);
   }
 
-  // The public decode result exposes one stream per media type and has no track-select argument. It is
-  // honest to use the primary track, but an alternate selection must remain typed NA instead of being
-  // silently decoded from the first track and scored as wrong.
-  const primaryIndex = info.tracks.findIndex((track) => track.type === selector.type);
-  if (chosen.trackIndex !== primaryIndex) {
-    return reject(
-      `framework decode exposes only primary ${selector.type} track ${primaryIndex}; requested ${chosen.trackIndex}`,
-    );
-  }
   return {
     presence: {
       hasVideo: selector.type === 'video',
       hasAudio: selector.type === 'audio',
     },
+    trackSelect: [`${selector.type}:${typeOrdinal}`],
     evidence: {
       schema: DECODE_TRACK_SELECTOR_SCHEMA,
       type: selector.type,
@@ -3574,6 +4653,14 @@ function resolveAibrushDecodeTrack(
       ...(chosen.track.height !== undefined ? { height: chosen.track.height } : {}),
     },
   };
+}
+
+/** Default-stream packet/seek shortcuts cannot satisfy explicit track or display-space contracts. */
+export function aibrushDecodeRequiresExactFrameworkRoute(
+  options: ConcreteOperationRequest['options'] | undefined,
+  selectedTrack: ReturnType<typeof resolveAibrushDecodeTrack> | undefined,
+): boolean {
+  return selectedTrack !== undefined || displayTransformFromOptions(options) !== undefined;
 }
 
 /**
@@ -3861,7 +4948,10 @@ function fadeFrom(audio: Record<string, unknown>): AibrushAudioTarget['fade'] | 
 }
 
 /** Map one harness video target to the engine's, copying only the set fields (exactOptionalPropertyTypes). */
-function videoTargetFrom(v: TranscodeVideoOptions, extra?: Record<string, unknown>): AibrushVideoTarget {
+export function mapAibrushTranscodeVideoTarget(
+  v: TranscodeVideoOptions,
+  extra?: Record<string, unknown>,
+): AibrushVideoTarget {
   const videoExtra = v as unknown as Record<string, unknown>;
   const rotate = asRotate(v.rotate);
   const flip = asFlip(extra?.flip);
@@ -3880,6 +4970,18 @@ function videoTargetFrom(v: TranscodeVideoOptions, extra?: Record<string, unknow
     ...(pad !== undefined ? { fit: pad.fit } : {}),
     ...(v.fps !== undefined ? { fps: v.fps } : {}),
     ...(v.bitrate !== undefined ? { bitrate: v.bitrate } : {}),
+    ...(v.maxAverageBitrate !== undefined
+      ? { maxAverageBitrate: v.maxAverageBitrate }
+      : {}),
+    ...(v.quality !== undefined
+      ? {
+          quality: {
+            metric: v.quality.metric,
+            minimumMean: v.quality.minimumMean,
+            ...(v.quality.samples !== undefined ? { samples: v.quality.samples } : {}),
+          },
+        }
+      : {}),
     ...(typeof crf === 'number' && Number.isFinite(crf) ? { crf } : {}),
     ...(passes === 2 ? { twoPass: true } : {}),
     ...(bitDepth === 8 || bitDepth === 10 || bitDepth === 12 ? { bitDepth } : {}),
@@ -3932,7 +5034,11 @@ function convertOptionsFrom(opts: TranscodeOptions): AibrushConvertOptions {
     ...(shape.fastStart !== undefined ? { faststart: shape.fastStart !== false } : {}),
     ...(shape.fragmented === true || shape.fastStart === 'fragmented' ? { fragmented: true } : {}),
   };
-  if (opts.video) out.video = videoTargetFrom(opts.video, opts as unknown as Record<string, unknown>);
+  if (opts.video)
+    out.video = mapAibrushTranscodeVideoTarget(
+      opts.video,
+      opts as unknown as Record<string, unknown>,
+    );
   if (opts.audio) {
     const a = opts.audio;
     const audioExtra = a as unknown as Record<string, unknown>;
@@ -4348,7 +5454,9 @@ async function tryPreparedAiffWavTranscode(
   return out === undefined ? undefined : toMediaBytes(out, 'wav');
 }
 
-function h264AbrLadderFrom(opts: TranscodeOptions): readonly AibrushH264AbrRung[] | undefined {
+export function h264AbrLadderFrom(
+  opts: TranscodeOptions,
+): readonly AibrushH264AbrRung[] | undefined {
   if (!opts.variants?.length) return undefined;
   return opts.variants.map((variant, index): AibrushH264AbrRung => {
     const codec = variant.codec ?? opts.video?.codec ?? 'h264';
@@ -4358,11 +5466,39 @@ function h264AbrLadderFrom(opts: TranscodeOptions): readonly AibrushH264AbrRung[
     if (variant.width === undefined || variant.height === undefined || variant.bitrate === undefined) {
       throw new GracefulRejectionError('transcode', `ABR rung ${index} is missing width/height/bitrate`);
     }
+    const hasMaximum = variant.maxAverageBitrate !== undefined;
+    const hasQuality = variant.quality !== undefined;
+    if (hasMaximum !== hasQuality) {
+      throw new GracefulRejectionError(
+        'transcode',
+        `ABR rung ${index} must author maxAverageBitrate and quality together`,
+      );
+    }
+    if (hasMaximum && variant.maxAverageBitrate! < variant.bitrate) {
+      throw new GracefulRejectionError(
+        'transcode',
+        `ABR rung ${index} maxAverageBitrate must be greater than or equal to bitrate`,
+      );
+    }
     return {
       name: `${variant.height}p-${index}`,
       width: variant.width,
       height: variant.height,
       bitrate: variant.bitrate,
+      ...(variant.maxAverageBitrate !== undefined
+        ? { maxAverageBitrate: variant.maxAverageBitrate }
+        : {}),
+      ...(variant.quality !== undefined
+        ? {
+            quality: {
+              metric: variant.quality.metric,
+              minimumMean: variant.quality.minimumMean,
+              ...(variant.quality.samples !== undefined
+                ? { samples: variant.quality.samples }
+                : {}),
+            },
+          }
+        : {}),
       ...(variant.fps !== undefined ? { fps: variant.fps } : {}),
     };
   });
@@ -6698,10 +7834,11 @@ export function enrichAibrushProbeMetadataFromTrackFacts(metadata: NormalizedMet
   };
 }
 
-/** Add only facts independently observable from the exact selected container bytes. */
-export function enrichAibrushProbeMetadata(metadata: NormalizedMetadata, bytes: Uint8Array): NormalizedMetadata {
+function enrichAibrushProbeMetadataFromStructure(
+  metadata: NormalizedMetadata,
+  structure: ReturnType<typeof readOutputStructure>,
+): NormalizedMetadata {
   const trackFacts = enrichAibrushProbeMetadataFromTrackFacts(metadata);
-  const structure = readOutputStructure(bytes);
   const byType = structuralTracksByType(structure?.tracks ?? []);
   const seen: Partial<Record<NormalizedTrack['type'], number>> = {};
   const tracks = trackFacts.tracks.map((track) => {
@@ -6740,6 +7877,108 @@ export function enrichAibrushProbeMetadata(metadata: NormalizedMetadata, bytes: 
     (enriched as NormalizedMetadata & { protectionScheme: string }).protectionScheme = protectionScheme;
   }
   return enriched;
+}
+
+/** Add only facts independently observable from the exact selected container bytes. */
+export function enrichAibrushProbeMetadata(metadata: NormalizedMetadata, bytes: Uint8Array): NormalizedMetadata {
+  return enrichAibrushProbeMetadataFromStructure(metadata, readOutputStructure(bytes));
+}
+
+function authenticatedAibrushProbeMetadata(
+  input: MediaInput,
+  observed: NormalizedMetadata,
+  trace: AibrushAuthenticatedRangeTrace,
+): NormalizedMetadata {
+  const attestation = input.contentAttestation;
+  if (attestation === undefined) {
+    throw new Error('authenticatedAibrushProbeMetadata requires MediaInput.contentAttestation');
+  }
+  const verifiedPrefix = takeAibrushAuthenticatedProbePrefix(trace);
+  if (trace.rangeRequests === 0 || trace.blockRequests === 0) {
+    throw aibrushDeliveryError(
+      attestation,
+      'CORPUS_AUTHENTICATED_RANGE_EVIDENCE_MISSING',
+      `aibrush-media returned metadata for '${input.id}' without reading an authenticated range`,
+    );
+  }
+  const metadata =
+    verifiedPrefix === undefined
+      ? enrichAibrushProbeMetadataFromTrackFacts(observed)
+      : enrichAibrushProbeMetadataFromStructure(
+          observed,
+          readOutputStructure(verifiedPrefix),
+        );
+  metadata.probeEvidence = { readMode: 'range' };
+  metadata.telemetry = {
+    ...(metadata.telemetry ?? {}),
+    bytesRead: trace.bytesRead,
+  };
+  return metadata;
+}
+
+/**
+ * Expose the first ABR rendition through the required top-level MediaBytes shape without sharing its
+ * byte ownership with variants[0]. The adapter contract deliberately rejects aliases across output
+ * branches because callers may transfer or detach any one branch independently.
+ */
+export function materializeAibrushAbrOutput(
+  variants: readonly MediaBytes[],
+  renditionSet?: TranscodeRenditionSetOptions,
+): MediaBytes {
+  const primary = variants[0];
+  if (primary === undefined) {
+    throw new GracefulRejectionError('transcode', 'ABR fanout produced no variants');
+  }
+  const intermediates = (primary.intermediates ?? []).map((entry) => ({ ...entry, bytes: entry.bytes.slice() }));
+  if (renditionSet !== undefined) {
+    if (!renditionSet.id.trim() || renditionSet.renditionIds.length !== variants.length ||
+        renditionSet.renditionIds.some((id) => !id.trim()) || new Set(renditionSet.renditionIds).size !== variants.length) {
+      throw new GracefulRejectionError('transcode', 'ABR rendition-set identity does not match the output variants');
+    }
+    if (renditionSet.switchPointsUs.length === 0 || renditionSet.switchPointsUs.some((point, index) =>
+      !Number.isSafeInteger(point) || point < 0 || (index > 0 && point <= renditionSet.switchPointsUs[index - 1]!))) {
+      throw new GracefulRejectionError('transcode', 'ABR switching timeline must be strictly increasing and non-negative');
+    }
+    intermediates.push({
+      role: TRANSCODE_ABR_RENDITION_SET_ROLE,
+      bytes: new TextEncoder().encode(JSON.stringify({ kind: 'explicit', ...renditionSet })),
+      mime: 'application/json',
+      // Sidecars share the suite's closed carrier vocabulary; role+MIME identify the JSON semantics.
+      container: primary.container,
+    });
+    for (const point of renditionSet.switchPointsUs) {
+      // A presentation-start switch is a real zero-length source prefix followed by the complete target
+      // rendition. Non-zero points require a stitched/segmented artifact, which this adapter does not
+      // synthesize and therefore cannot accidentally claim through copied bytes.
+      if (point !== 0) continue;
+      for (let index = 0; index + 1 < variants.length; index++) {
+        const highId = renditionSet.renditionIds[index]!;
+        const lowId = renditionSet.renditionIds[index + 1]!;
+        const high = variants[index]!;
+        const low = variants[index + 1]!;
+        intermediates.push(
+          {
+            role: transcodeAbrSwitchRole(highId, lowId, point),
+            bytes: low.bytes.slice(),
+            mime: low.mime,
+            container: low.container,
+          },
+          {
+            role: transcodeAbrSwitchRole(lowId, highId, point),
+            bytes: high.bytes.slice(),
+            mime: high.mime,
+            container: high.container,
+          },
+        );
+      }
+    }
+  }
+  return {
+    ...primary,
+    bytes: primary.bytes.slice(),
+    variants: [...variants],
+    ...(intermediates.length > 0 ? { intermediates } : {}),
+  };
 }
 
 function preserveProbeError(error: unknown): boolean {
@@ -7370,6 +8609,7 @@ export class AibrushMediaEngine implements MediaEngine {
         this.#errorClasses = {
           CapabilityError: this.#lib.CapabilityError,
           InputError: this.#lib.InputError,
+          ConstraintUnsatisfiedError: this.#lib.ConstraintUnsatisfiedError,
         };
         // Runtime modules may execute only when they match the immutable sync artifact. Never replace
         // persisted provenance with values self-reported by a loaded module.
@@ -7387,6 +8627,7 @@ export class AibrushMediaEngine implements MediaEngine {
       this.#errorClasses = {
         CapabilityError: loaded.CapabilityError,
         InputError: loaded.InputError,
+        ConstraintUnsatisfiedError: loaded.ConstraintUnsatisfiedError,
       };
     });
     await this.#coreRuntimePromise;
@@ -7438,14 +8679,19 @@ export class AibrushMediaEngine implements MediaEngine {
   async #resolveHlsSource(
     input: MediaInput,
     signal?: AbortSignal,
-    keyOverride?: { readonly keyBytes: Uint8Array; readonly ivHex?: string },
+    keyOverride?: {
+      readonly keyBytes: Uint8Array;
+      readonly scheme: Extract<EncryptionScheme, 'hls-aes128' | 'hls-sample-aes'>;
+      readonly ivHex?: string;
+    },
   ): Promise<AibrushSourceLike> {
     const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
     const playlistText = new TextDecoder().decode(await inputBytes(input));
     const baseUrl = inputUrl(input).href;
     const keyUris = new Set<string>();
     if (keyOverride !== undefined) {
-      addHlsDecryptKeyUris(playlistText, baseUrl, core.parseM3u8, keyUris, keyOverride.ivHex);
+      assertAibrushHlsDecryptRequest(playlistText, keyOverride.scheme, keyOverride.ivHex);
+      addHlsDecryptKeyUris(playlistText, baseUrl, core.parseM3u8, keyUris);
     }
     const fetchResource = async (uri: string): Promise<Uint8Array> => {
       // DecryptKey carries one key. The runner has already digest-bound every HLS sidecar and
@@ -7457,7 +8703,9 @@ export class AibrushMediaEngine implements MediaEngine {
       }
       const bytes = await hlsFetch(uri, signal);
       if (keyOverride !== undefined && /\.m3u8?($|\?)/i.test(uri)) {
-        addHlsDecryptKeyUris(new TextDecoder().decode(bytes), uri, core.parseM3u8, keyUris, keyOverride.ivHex);
+        const childPlaylist = new TextDecoder().decode(bytes);
+        assertAibrushHlsDecryptRequest(childPlaylist, keyOverride.scheme, keyOverride.ivHex);
+        addHlsDecryptKeyUris(childPlaylist, uri, core.parseM3u8, keyUris);
       }
       return bytes;
     };
@@ -7471,6 +8719,9 @@ export class AibrushMediaEngine implements MediaEngine {
     engine: AibrushEngine,
     input: MediaInput,
     onSourceRead?: (bytes: number) => void,
+    authenticatedTrace?: AibrushAuthenticatedRangeTrace,
+    captureProbePrefix = false,
+    operationSignal?: AbortSignal,
   ): Promise<unknown> {
     if (isHlsAsset(input)) {
       // HLS: resolve the .m3u8 playlist to a single stitched MPEG-TS/MP4 Source (parse → fetch segments →
@@ -7479,7 +8730,16 @@ export class AibrushMediaEngine implements MediaEngine {
       return engine.from(await this.#resolveHlsSource(input));
     }
     if (input.contentAttestation !== undefined) {
-      return engine.from(createAibrushAuthenticatedSource(input, globalThis.fetch.bind(globalThis), undefined, onSourceRead));
+      return engine.from(
+        createAibrushAuthenticatedSource(
+          input,
+          globalThis.fetch.bind(globalThis),
+          authenticatedTrace,
+          onSourceRead,
+          captureProbePrefix,
+          operationSignal,
+        ),
+      );
     }
     if (input.mutated) return engine.from(await inputBytes(input), { mime: input.mime });
     if (onSourceRead !== undefined) {
@@ -7624,7 +8884,9 @@ export class AibrushMediaEngine implements MediaEngine {
       ],
       audioCodecsOut: ['aac', 'opus', 'flac', 'vorbis', 'pcm-s16', 'pcm-s24', 'pcm-f32', 'pcm-s16be', 'pcm-s24be'],
       encryption: ['cenc-ctr', 'cenc-cbcs', 'hls-aes128', 'cenc-cens', 'hls-sample-aes'],
-      // 'resize'/'rotate'/'colorspace'/'tonemap' are video-filter transcode capabilities; 'fastStart' is
+      // 'resize'/'rotate'/'colorspace'/'tonemap' are video-filter transcode capabilities;
+      // 'rotation:decode' is separate and routes through the public decode display-rotation seam;
+      // 'fastStart' is
       // the mp4 moov-first write;
       // 'fastStart:none' is the mdat-first control (remux forwards `fastStart:false`→`faststart:false`,
       // mp4-box-layout verified); 'fragmented' covers mp4/mov CMAF stream-copy (init segment + `moof`
@@ -7657,7 +8919,9 @@ export class AibrushMediaEngine implements MediaEngine {
       // generic remux route can alter H.264 access units; structural readback plus the neutral media
       // proof validate the result.
       // `fanout` routes `options.variants` through the engine's H.264 ABR ladder API and returns
-      // independent rendition files in `MediaBytes.variants[]`.
+      // independent rendition files in `MediaBytes.variants[]`. `two-pass` is the replay-backed H.264
+      // analysis/quantizer route selected below by `video.passes === 2`; `quality-constrained-rate` is
+      // the finite replay-backed preferred-rate + hard-max + decoded-objective-quality contract.
       // `audio-samples:gapless-priming` carries MP4 AAC edit-list sample-count facts through full-range
       // frame-accurate trims and writes a fresh output edit list after WebCodecs AAC encode.
       // `alpha` covers VPx alpha decode and WebM stream-copy trim: BlockAdditions ride the packet seam,
@@ -7670,9 +8934,12 @@ export class AibrushMediaEngine implements MediaEngine {
         'resize',
         'fanout',
         'crf',
+        'two-pass',
+        'quality-constrained-rate',
         'depth:10bit-to-8bit',
         'fps',
         'rotate',
+        'rotation:decode',
         'flip',
         'crop',
         'pad',
@@ -7721,6 +8988,7 @@ export class AibrushMediaEngine implements MediaEngine {
         'trim:massive-lazy-read',
         'hls:aes128',
         'probe:resource-trace',
+        AUTHENTICATED_RANGE_PROBE_FEATURE,
         AUTHENTICATED_RANGE_INPUT_FEATURE,
       ],
       probeReadModes: ['range', 'whole-file'],
@@ -7749,22 +9017,49 @@ export class AibrushMediaEngine implements MediaEngine {
     return this.#run('probe', 'framework.probe', context, async (signal) => {
       let info: AibrushInfo;
       let bytes: Uint8Array | undefined;
+      const authenticatedRangeTrace: AibrushAuthenticatedRangeTrace | undefined =
+        input.contentAttestation === undefined
+          ? undefined
+          : { bytesRead: 0, rangeRequests: 0, blockRequests: 0 };
+      const sourceRead =
+        authenticatedRangeTrace === undefined
+          ? undefined
+          : operationSourceReadObserver(context);
       try {
         const engine = this.#engine();
         if (isHlsAsset(input)) {
           const hlsMetadata = await fastHlsProbeMetadata(engine, input, signal, isPlaylistOnlyProbeRequest(context));
           if (hlsMetadata !== undefined) return hlsMetadata;
         }
-        if (isMalformedHarnessInput(input) && !input.mutated) bytes = await inputBytes(input);
+        if (
+          input.contentAttestation === undefined &&
+          isMalformedHarnessInput(input) &&
+          !input.mutated
+        ) {
+          bytes = await inputBytes(input);
+        }
         // A malformed/mislabeled name or MIME is not authoritative. Feeding its verified bytes
         // without a container hint lets the framework sniff the actual representation.
-        const src = bytes === undefined ? await this.#src(engine, input) : engine.from(bytes);
+        const src =
+          bytes === undefined
+            ? await this.#src(
+                engine,
+                input,
+                sourceRead?.onRead,
+                authenticatedRangeTrace,
+                authenticatedRangeTrace !== undefined,
+                signal,
+              )
+            : engine.from(bytes);
         const knownContainer = knownContainerProbeToken(input);
         info =
           knownContainer !== undefined && engine.probeContainer !== undefined
             ? await engine.probeContainer(src, knownContainer, { signal })
             : await engine.probe(src, { signal });
       } catch (e) {
+        if (authenticatedRangeTrace !== undefined) {
+          takeAibrushAuthenticatedProbePrefix(authenticatedRangeTrace);
+        }
         try {
           return this.#naIfMiss('probe', e, input);
         } catch (translated) {
@@ -7775,6 +9070,9 @@ export class AibrushMediaEngine implements MediaEngine {
         }
       }
       const observed = normalizedMetadataFromAibrushInfo(input, info);
+      if (authenticatedRangeTrace !== undefined) {
+        return authenticatedAibrushProbeMetadata(input, observed, authenticatedRangeTrace);
+      }
       if (bytes === undefined && isPcmAggregateInput(input) && !isMalformedHarnessInput(input)) {
         const metadata = enrichAibrushProbeMetadataFromTrackFacts(observed);
         metadata.probeEvidence = { readMode: 'range' };
@@ -8273,11 +9571,7 @@ export class AibrushMediaEngine implements MediaEngine {
         const engine = this.#engine();
         const outputs = await engine.h264AbrLadder(await this.#src(engine, input), ladder, { signal });
         const variants = await Promise.all(outputs.map((output) => toMediaBytes(output, opts.container)));
-        const primary = variants[0];
-        if (primary === undefined) {
-          throw new GracefulRejectionError('transcode', 'ABR fanout produced no variants');
-        }
-        return { ...primary, variants };
+        return materializeAibrushAbrOutput(variants, opts.renditionSet);
       } catch (e) {
         return this.#naIfMiss('transcode', e, input);
       }
@@ -8356,8 +9650,15 @@ export class AibrushMediaEngine implements MediaEngine {
         if (selected) sink.selectedTrack = selected.evidence;
         return sink;
       };
+      // The adapter's packet/seek shortcuts always choose the default stream and raw WebCodecs does not
+      // apply an ISO-BMFF display matrix. Explicit track and display-space contracts therefore have one
+      // honest route: the public product decode surface, which owns both behaviors.
+      const requiresExactFrameworkDecode = aibrushDecodeRequiresExactFrameworkRoute(
+        this.#currentRequest?.options,
+        selected,
+      );
 
-      if (this.#currentRequest?.options.alphaEvidence !== undefined) {
+      if (!requiresExactFrameworkDecode && this.#currentRequest?.options.alphaEvidence !== undefined) {
         const directAlpha = await this.#tryDirectAlphaDecode(input, maxFrames, signal, onFirstFrame);
         if (directAlpha !== undefined) {
           this.#activeRoute = 'core.webm-alpha-packets+webcodecs';
@@ -8374,7 +9675,7 @@ export class AibrushMediaEngine implements MediaEngine {
           return finish(directAlpha);
         }
       }
-      if ((!selected || selected.presence.hasVideo) && canUseDirectBoundedDecode(input, maxFrames)) {
+      if (!requiresExactFrameworkDecode && canUseDirectBoundedDecode(input, maxFrames)) {
         try {
           const direct = await this.#tryDirectBoundedDecode(input, maxFrames, signal, onFirstFrame);
           if (direct !== undefined) {
@@ -8410,7 +9711,7 @@ export class AibrushMediaEngine implements MediaEngine {
           // Fall through to the seek/linear decode paths; packet-info first-frame decode is a fast path.
         }
       }
-      if ((!selected || selected.presence.hasVideo) && canUseSeekForSingleFrameDecode(input, maxFrames)) {
+      if (!requiresExactFrameworkDecode && canUseSeekForSingleFrameDecode(input, maxFrames)) {
         try {
           const frame = await engine.seek(
             await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
@@ -8436,6 +9737,7 @@ export class AibrushMediaEngine implements MediaEngine {
       }
       const streams = engine.decode(await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES), {
         signal,
+        ...(selected ? { trackSelect: selected.trackSelect } : {}),
       });
       return finish(await decodeToFrameSink(streams, maxFrames, presence, onFirstFrame));
     } catch (e) {
@@ -8524,6 +9826,7 @@ export class AibrushMediaEngine implements MediaEngine {
     if (
       isGracefulNegativeContext(context) &&
       !input.mutated &&
+      input.contentAttestation === undefined &&
       containerFromInput(input) === 'mp4'
     ) {
       await this.#run(
@@ -8545,6 +9848,7 @@ export class AibrushMediaEngine implements MediaEngine {
       !opts.frameAccurate &&
       !opts.fragmented &&
       !input.mutated &&
+      input.contentAttestation === undefined &&
       containerFromInput(input) === opts.container.toLowerCase() &&
       context?.request.options.invariant === 'trim-noop-semantic-identity';
     if (exactSourceIdentity) {
@@ -8572,6 +9876,7 @@ export class AibrushMediaEngine implements MediaEngine {
     const directIsoCopy =
       !opts.frameAccurate &&
       !input.mutated &&
+      input.contentAttestation === undefined &&
       !isGracefulNegativeContext(context) &&
       sourceContainer === targetContainer &&
       (sourceContainer === 'mp4' || sourceContainer === 'mov') &&
@@ -8648,6 +9953,13 @@ export class AibrushMediaEngine implements MediaEngine {
       'framework.trim',
       context,
       async (signal) => {
+        const authenticatedRangeTrace: AibrushAuthenticatedRangeTrace | undefined =
+          input.contentAttestation === undefined
+            ? undefined
+            : { bytesRead: 0, rangeRequests: 0, blockRequests: 0 };
+        const sourceRead = shouldObserveAibrushSourceReads(input, context)
+          ? operationSourceReadObserver(context)
+          : undefined;
         try {
           // Robustness inputs are intentionally malformed. Refuse them before a framework call can
           // return superficially muxed bytes whose corruption is discovered only by the runner's
@@ -8655,7 +9967,12 @@ export class AibrushMediaEngine implements MediaEngine {
           if (isMalformedHarnessInput(input)) {
             throw new GracefulRejectionError('trim', 'intentionally malformed trim input rejected');
           }
-          if (!opts.frameAccurate && !input.mutated && containerFromInput(input) === 'adts') {
+          if (
+            !opts.frameAccurate &&
+            !input.mutated &&
+            input.contentAttestation === undefined &&
+            containerFromInput(input) === 'adts'
+          ) {
             const bytes = await this.#driverCore().adtsTrimFromUrl(input.url, {
               mime: input.mime,
               ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
@@ -8673,6 +9990,7 @@ export class AibrushMediaEngine implements MediaEngine {
             !opts.frameAccurate &&
             opts.container.toLowerCase() === 'wav' &&
             !input.mutated &&
+            input.contentAttestation === undefined &&
             containerFromInput(input) === 'wav'
           ) {
             const bytes = await this.#driverCore().wavTrimFromUrl(input.url, {
@@ -8691,6 +10009,7 @@ export class AibrushMediaEngine implements MediaEngine {
           const engine = this.#engine();
           if (
             !opts.frameAccurate &&
+            input.contentAttestation === undefined &&
             !isGracefulNegativeContext(context) &&
             context?.request.options.invariant !== 'trim-noop-semantic-identity'
           ) {
@@ -8718,7 +10037,14 @@ export class AibrushMediaEngine implements MediaEngine {
           // the lossless stream-copy. A codec the browser cannot decode for the accurate path surfaces as a
           // typed CapabilityError → NA via naIfMiss, never a wrong/incomplete clip.
           const out = await engine.trim(
-            await this.#src(engine, input),
+            await this.#src(
+              engine,
+              input,
+              sourceRead?.onRead,
+              authenticatedRangeTrace,
+              false,
+              signal,
+            ),
             {
               start: effectiveRange.startUs / 1e6,
               end: effectiveRange.endUs / 1e6,
@@ -8761,6 +10087,12 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#bindCellSignal(context, 'prepareMuxTracks');
     if (context !== undefined) this.#currentRequest = context.request;
     context?.signal.throwIfAborted();
+    // Robustness cells execute in a fresh Worker, where init() deliberately loads only the lightweight
+    // WAV surface. Every packet-preparation fast path below is core-backed and several run before the
+    // full-runtime #run fallback, so establish that shared driver surface once before dispatch. The
+    // cached import is also safe for main-realm callers; the per-cell core reference is released in
+    // dispose().
+    await this.#ensureCoreRuntime(context?.signal);
     this.#activeOperation = 'prepareMuxTracks';
     this.#activeRoute = 'framework.packet-preparation';
     this.#configEvidence.record({
@@ -10006,14 +11338,16 @@ export class AibrushMediaEngine implements MediaEngine {
     // rejection. These executable capability-finding rows prove we decline EME / unsupported protection
     // schemes cleanly; mapping them to NA_ENGINE would hide the behavior the oracle is checking.
     if (opts.scheme === 'hls-aes128' || opts.scheme === 'hls-sample-aes') {
+      const hlsScheme = opts.scheme;
       if (!isHlsAsset(input)) {
-        throw createNotApplicableError(ENGINE_ID, 'decrypt', `${opts.scheme} requires an HLS playlist input`);
+        throw createNotApplicableError(ENGINE_ID, 'decrypt', `${hlsScheme} requires an HLS playlist input`);
       }
       return this.#run('decrypt', 'framework.hls-resolve+remux', context, async (signal) => {
         try {
           const engine = this.#engine();
           const source = await this.#resolveHlsSource(input, signal, {
             keyBytes: hlsDecryptKeyBytes(key),
+            scheme: hlsScheme,
             ...(key.ivHex !== undefined ? { ivHex: key.ivHex } : {}),
           });
           // The resolver's clear media is a stitched MPEG-TS/fMP4 source. Decrypt scenarios compare against

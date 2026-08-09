@@ -199,10 +199,18 @@ function avcCodecString(avcC: Uint8Array): string {
   return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
 }
 
+/** Reverse all 32 compatibility bits, as required by the RFC 6381 HEVC codec-string grammar. */
+function reverseBits32(value: number): number {
+  let reversed = 0;
+  for (let bit = 0; bit < 32; bit++) reversed = (reversed << 1) | ((value >>> bit) & 1);
+  return reversed >>> 0;
+}
+
 /**
- * Build a best-effort HEVC codec string from hvcC. Full hvcC parsing is involved; we extract the
- * fields WebCodecs cares about (general_profile_idc, compat flags, general_level_idc) for the codec
- * string. The `description` (the whole hvcC) is what the decoder actually configures from.
+ * Build an exact HEVC codec string from hvcC. A supplied HEVCDecoderConfigurationRecord carries the
+ * VPS/SPS/PPS out of band, so the WebCodecs configuration uses the hvc1 semantic. Compatibility flags
+ * are bit-reversed for RFC 6381 and the actual non-trailing-zero constraint bytes are retained; a raw
+ * mask such as `60000000` or an invented `.B0` makes otherwise supported browser configs fail parsing.
  */
 function hevcCodecString(hvcC: Uint8Array): string {
   // hvcC layout: [0]=ver,[1]=general_profile_space(2)|tier(1)|profile_idc(5),
@@ -211,13 +219,18 @@ function hevcCodecString(hvcC: Uint8Array): string {
   const profileSpace = (b1 >> 6) & 0x03;
   const tierFlag = (b1 >> 5) & 0x01;
   const profileIdc = b1 & 0x1f;
-  const compat = be32(hvcC, 2) >>> 0;
+  const compat = reverseBits32(be32(hvcC, 2) >>> 0);
   const levelIdc = hvcC[12] ?? 93;
   const space = profileSpace === 0 ? '' : String.fromCharCode(64 + profileSpace); // 1->'A'
   const tier = tierFlag === 0 ? 'L' : 'H';
-  // Reverse-bit compat as a hex string per RFC; common content is 6 (0x60000000 -> "6").
-  const compatHex = compat.toString(16);
-  return `hev1.${space}${profileIdc}.${compatHex}.${tier}${levelIdc}.B0`;
+  const compatHex = compat.toString(16).toUpperCase();
+  let codec = `hvc1.${space}${profileIdc}.${compatHex}.${tier}${levelIdc}`;
+  let lastConstraintByte = 5;
+  while (lastConstraintByte >= 0 && (hvcC[6 + lastConstraintByte] ?? 0) === 0) lastConstraintByte--;
+  for (let index = 0; index <= lastConstraintByte; index++) {
+    codec += `.${(hvcC[6 + index] ?? 0).toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return codec;
 }
 
 /** Parse the stsd sample entry to obtain codec token, dims, and codec-private description box. */
@@ -569,7 +582,7 @@ interface EditListTiming {
 }
 
 /** Read unit-rate, non-empty edit segments. Empty leading edits do not contribute program frames. */
-function parseEditListTiming(buf: Uint8Array, trak: Box): EditListTiming | undefined {
+function parseEditListTimingRaw(buf: Uint8Array, trak: Box): EditListTiming | undefined {
   const edts = findBox(buf, trak.bodyStart, trak.bodyEnd, 'edts');
   const elst = edts ? findBox(buf, edts.bodyStart, edts.bodyEnd, 'elst') : undefined;
   if (!elst || elst.bodyEnd - elst.bodyStart < 8) return undefined;
@@ -596,8 +609,14 @@ function parseEditListTiming(buf: Uint8Array, trak: Box): EditListTiming | undef
     }
     cursor += entryBytes;
   }
-  if (mediaStartTicks === undefined || presentationTicks <= 0) return undefined;
+  if (mediaStartTicks === undefined) return undefined;
   return { presentationTicks, mediaStartTicks };
+}
+
+/** Gapless evidence additionally requires a positive movie-presentation span. */
+function parseEditListTiming(buf: Uint8Array, trak: Box): EditListTiming | undefined {
+  const timing = parseEditListTimingRaw(buf, trak);
+  return timing && timing.presentationTicks > 0 ? timing : undefined;
 }
 
 function parseTkhdTrackId(buf: Uint8Array, tkhd: Box): number | null {
@@ -838,6 +857,7 @@ function buildSamplesFromFragments(
   moov: Box,
   trackId: number,
   timescale: number,
+  presentationOriginTicks: number,
 ): Mp4Sample[] {
   const defaults = parseTrexDefaults(bytes, moov);
   const samples: Mp4Sample[] = [];
@@ -925,8 +945,8 @@ function buildSamplesFromFragments(
           const toUs = (ticks: number): number => Math.round((ticks * 1_000_000) / timescale);
           samples.push({
             data: bytes.subarray(dataOffset, dataOffset + sizeBytes).slice(),
-            dtsUs: toUs(decodeTicks),
-            ptsUs: toUs(decodeTicks + compositionOffsetTicks),
+            dtsUs: toUs(decodeTicks - presentationOriginTicks),
+            ptsUs: toUs(decodeTicks + compositionOffsetTicks - presentationOriginTicks),
             durationUs: toUs(durationTicks),
             keyframe: fragmentSampleIsSync(sampleFlags),
           });
@@ -1084,13 +1104,22 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       const sampleDesc = parseStsd(bytes, stsd);
       const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
       const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
+      const fragmentPresentationOriginTicks = parseEditListTimingRaw(bytes, trak)?.mediaStartTicks ?? 0;
       let samples: Mp4Sample[] = [];
       try {
         samples = buildSamplesFromStbl(bytes, stbl, timescale);
       } catch (error) {
         if (!findBox(bytes, 0, bytes.length, 'moof')) throw error;
       }
-      if (trackId !== null) samples.push(...buildSamplesFromFragments(bytes, moov, trackId, timescale));
+      if (trackId !== null) {
+        samples.push(...buildSamplesFromFragments(
+          bytes,
+          moov,
+          trackId,
+          timescale,
+          fragmentPresentationOriginTicks,
+        ));
+      }
       if (samples.length === 0) throw new UnsupportedMp4Error('video track contains no addressable samples');
       const config: Mp4VideoConfig = {
         codec: sampleDesc.token,
@@ -1117,7 +1146,16 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       }
       const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
       const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
-      if (trackId !== null) samples.push(...buildSamplesFromFragments(bytes, moov, trackId, timescale));
+      const fragmentPresentationOriginTicks = parseEditListTimingRaw(bytes, trak)?.mediaStartTicks ?? 0;
+      if (trackId !== null) {
+        samples.push(...buildSamplesFromFragments(
+          bytes,
+          moov,
+          trackId,
+          timescale,
+          fragmentPresentationOriginTicks,
+        ));
+      }
       if (samples.length === 0) continue;
       const config: Mp4AudioConfig = {
         codec: audioDesc.token,

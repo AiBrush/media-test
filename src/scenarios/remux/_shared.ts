@@ -34,7 +34,7 @@
  *    from the re-wrapped stream) rather than just structural re-import.
  */
 
-import type { OracleId, Scenario } from '../../core/scenario.ts';
+import type { CandidateInputEnvelope, OracleId, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 
 /** Metrics every bytes-producing remux case reports (perf is secondary to correctness here). */
@@ -58,6 +58,10 @@ export interface RemuxCase {
   videoCodecsIn?: string[];
   audioCodecs?: string[];
   features?: string[];
+  /** Explicit identity revision for workload-contract changes. */
+  revision?: number;
+  /** Bounds rotating candidates to the authored workload rather than filename resemblance. */
+  candidateEnvelope?: CandidateInputEnvelope;
   /**
    * Override the default oracle set. Defaults:
    *   - every case: reference-reimport. It confirms the output is parseable and preserves media track
@@ -86,8 +90,10 @@ function defaultOracles(c: RemuxCase): OracleId[] {
 export function buildRemux(c: RemuxCase): Scenario {
   return defineScenario({
     id: remuxId(c),
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'remux',
     input: c.asset,
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     options: { container: c.to },
     requires: {
       operations: ['remux'],

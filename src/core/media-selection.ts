@@ -9,7 +9,7 @@
  * exposing the same full-digest/pool/evidence identities for the integration owner to consume.
  */
 
-import type { OracleId, OracleOutcome, Scenario } from './scenario.ts';
+import type { CandidateInputEnvelope, OracleId, OracleOutcome, Scenario } from './scenario.ts';
 import { reduceOracleOutcomes } from './scenario.ts';
 import {
   BAKED_CORPUS_SCHEMA_VERSION,
@@ -456,7 +456,7 @@ function buildScenarioPool(
     ...candidate,
     probability: { numerator: 1, denominator: sortedBases.length, weight: 1 } as const,
   }));
-  const eligiblePoolDigest = computeEligiblePoolDigest(scenario.id, candidates);
+  const eligiblePoolDigest = computeEligiblePoolDigest(scenario.id, candidates, scenario.candidateEnvelope);
   return deepFreeze({
     scenarioId: scenario.id,
     eligiblePoolDigest,
@@ -582,6 +582,12 @@ function rotationPolicyReason(
       detail: 'the decoded-frame benchmark is calibrated to the baked input and its committed RGBA prefix',
     };
   }
+  if (FIXTURE_BOUND_INPUT_SEMANTIC_SCENARIOS.has(scenario.id)) {
+    return {
+      reasonCode: 'SOURCE_SEMANTICS_FIXTURE_BOUND',
+      detail: 'the authored input semantics are carried by the baked fixture and are not declared by the catalog row',
+    };
+  }
   if (AUDIO_DSP_FIXED_INPUT_SCENARIOS.has(scenario.id)) {
     return {
       reasonCode: 'AUDIO_DSP_INPUT_SEMANTICS_FIXTURE_BOUND',
@@ -595,6 +601,23 @@ function rotationPolicyReason(
   // assessRobustnessVariantEligibility below, which requires an exact same-contract declaration.
   return undefined;
 }
+
+const FIXTURE_BOUND_INPUT_SEMANTIC_SCENARIOS = new Set([
+  // The effect contract requires an authored 90-degree display matrix. The source catalog currently
+  // describes only codec/container geometry, so shape-compatible MP4s cannot substitute for this
+  // pre-rotated fixture without first gaining independently probed orientation evidence.
+  'transcode/h264_rotate_normalize',
+
+  // These metadata contracts depend on malformed tag regions, a display matrix, or authored track
+  // attribution. The catalog currently declares only container/codec shape, so its otherwise-valid
+  // files cannot stand in for the property-bearing baked fixtures until that evidence is published.
+  'metadata/neg_garbled_id3_mp3_probe',
+  'metadata/neg_garbled_ilst_mp4_probe',
+  'metadata/read_h264_multitrack',
+  'metadata/rotation_survives_mp4_mkv',
+  'metadata/tracks_attribution_multitrack',
+  'metadata/tracks_packet_attribution_multitrack',
+]);
 
 const AUDIO_DSP_FIXED_INPUT_SCENARIOS = new Set([
   'audio-dsp/resample_48k_to_16k',
@@ -621,7 +644,12 @@ export function assessCandidateEligibility(
   if (row.class === 'DERIVED') {
     const derived = assessDerivedCencEligibility(scenario, file);
     if (!derived.eligible) return derived;
-    const derivedShapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario))
+    const derivedShapeReason = shapeGateReason(
+      file,
+      row.requires,
+      scenario.candidateEnvelope,
+      requiredMinDurationSec(scenario),
+    )
       ?? fixedDurationContractReason(scenario, file);
     return derivedShapeReason
       ? {
@@ -630,7 +658,12 @@ export function assessCandidateEligibility(
         }
       : derived;
   }
-  const shapeReason = shapeGateReason(file, row.requires, requiredMinDurationSec(scenario))
+  const shapeReason = shapeGateReason(
+    file,
+    row.requires,
+    scenario.candidateEnvelope,
+    requiredMinDurationSec(scenario),
+  )
     ?? fixedDurationContractReason(scenario, file);
   if (shapeReason) {
     return {
@@ -996,11 +1029,13 @@ export function selectCandidateFromPool(
 export function computeEligiblePoolDigest(
   scenarioId: string,
   candidates: readonly Pick<SelectionCandidateManifest, 'candidateIdentity' | 'contentDigest' | 'probability'>[],
+  candidateEnvelope?: CandidateInputEnvelope,
 ): string {
   return canonicalSha256({
     schema: 'eligible-pool@1',
     selectionPolicyVersion: SELECTION_POLICY_VERSION,
     scenarioId,
+    ...(candidateEnvelope ? { candidateEnvelope } : {}),
     candidates: [...candidates]
       .map((candidate) => ({
         candidateIdentity: candidate.candidateIdentity,
@@ -1135,7 +1170,7 @@ function compatibilityPool(
   }));
   return deepFreeze({
     scenarioId: scenario.id,
-    eligiblePoolDigest: computeEligiblePoolDigest(scenario.id, candidates),
+    eligiblePoolDigest: computeEligiblePoolDigest(scenario.id, candidates, scenario.candidateEnvelope),
     candidates,
     rejections: rejections.sort(compareRejections),
     eligible: candidates.length,
@@ -1302,7 +1337,8 @@ export class SelectionPolicyError extends Error {
 function shapeGateReason(
   file: SourceFileRecord,
   requires: ScenarioSourceRow['requires'],
-  minDurationSec: number,
+  scenarioEnvelope: CandidateInputEnvelope | undefined,
+  operationMinDurationSec: number,
 ): string | undefined {
   if (file.container.toLowerCase() !== requires.container.toLowerCase()) {
     return `container '${file.container}' != required '${requires.container}'`;
@@ -1321,13 +1357,64 @@ function shapeGateReason(
       return `encryption scheme '${file.keys?.scheme ?? 'none'}' not in [${requires.encryption.join(', ')}]`;
     }
   }
-  if (minDurationSec > 0) {
+  const scenarioEnvelopeReason = sourceEnvelopeGateReason(file, scenarioEnvelope);
+  if (scenarioEnvelopeReason) return `scenario candidate envelope: ${scenarioEnvelopeReason}`;
+  const catalogEnvelopeReason = sourceEnvelopeGateReason(file, requires);
+  if (catalogEnvelopeReason) return `catalog candidate envelope: ${catalogEnvelopeReason}`;
+  if (operationMinDurationSec > 0) {
     const duration = typeof file.durationSec === 'number' && Number.isFinite(file.durationSec)
       ? file.durationSec
       : undefined;
-    if (duration === undefined || duration < minDurationSec + 0.02) {
-      return `duration ${duration ?? 'unknown'}s too short for ${minDurationSec.toFixed(3)}s target`;
+    if (duration === undefined || duration < operationMinDurationSec + 0.02) {
+      return `duration ${duration ?? 'unknown'}s too short for ${operationMinDurationSec.toFixed(3)}s target`;
     }
+  }
+  return undefined;
+}
+
+function sourceEnvelopeGateReason(
+  file: SourceFileRecord,
+  envelope: CandidateInputEnvelope | undefined,
+): string | undefined {
+  if (!envelope) return undefined;
+  return boundedSourceValueReason(
+    'width',
+    file.width,
+    envelope.minWidth,
+    envelope.maxWidth,
+    'px',
+  ) ?? boundedSourceValueReason(
+    'height',
+    file.height,
+    envelope.minHeight,
+    envelope.maxHeight,
+    'px',
+  ) ?? boundedSourceValueReason(
+    'duration',
+    file.durationSec,
+    envelope.minDurationSec,
+    envelope.maxDurationSec,
+    's',
+  );
+}
+
+function boundedSourceValueReason(
+  field: 'width' | 'height' | 'duration',
+  raw: number | null | undefined,
+  min: number | undefined,
+  max: number | undefined,
+  unit: 'px' | 's',
+): string | undefined {
+  if (min === undefined && max === undefined) return undefined;
+  const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+  const required = min !== undefined && max !== undefined
+    ? `inclusive range [${min}, ${max}]${unit}`
+    : min !== undefined
+      ? `minimum ${min}${unit}`
+      : `maximum ${max}${unit}`;
+  if (value === undefined) return `${field} is unknown; required ${required}`;
+  if ((min !== undefined && value < min) || (max !== undefined && value > max)) {
+    return `${field} ${value}${unit} is outside required ${required}`;
   }
   return undefined;
 }

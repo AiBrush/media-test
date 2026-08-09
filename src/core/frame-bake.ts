@@ -20,8 +20,8 @@
  *   - We never invent a digest, and we never reorder/relabel the golden frame list: the golden's
  *     `index` / `ptsUs` / `keyframe` are authoritative (the oracle matches by index, then golden pts);
  *     we only OVERWRITE the `sha256` field, in golden order, with the engine's decoded-frame digests in
- *     presentation order. (decodeFrames returns frames sorted by pts and re-indexed 0..N-1; we pair
- *     golden[i] ↔ decoded[i].)
+ *     presentation order. Pairing is timestamp-keyed and one-to-one; array position can never relabel
+ *     pixels from a different presentation instant.
  *   - Image negatives (jpeg/png/webp) are decoded via ImageDecoder/createImageBitmap (a still is not a
  *     <video> nor an MP4/WebM the inline demux understands); their single frame is digested the same way.
  *
@@ -46,12 +46,19 @@
  *   - WebCodecs / ImageDecoder references: research/dossiers/platform.md (per the platform adapter header).
  */
 
-import type { FrameDigest, FrameSink, MediaEngine, MediaInput } from './engine.ts';
+import type { DecodeOptions, FrameDigest, FrameSink, MediaEngine, MediaInput } from './engine.ts';
 import { getEngine } from './registry.ts';
 import { digestFrame } from './oracles.ts';
 import { canonicalizeJson, canonicalJsonSha256 } from './canonical-json.ts';
 import { sha256Hex } from './seeded-rng.ts';
 import { pairFramesByTimestamp } from './golden-frame-evidence.ts';
+import {
+  ALPHA_DIGEST_ALGORITHM,
+  ALPHA_EVIDENCE_SCHEMA,
+  alphaFrameEvidence,
+  type AlphaEvidenceArtifact,
+  type AlphaFrameEvidence,
+} from '../features/decode-seek/alpha.ts';
 
 // ── The golden frame-json shape we read (placeholder) and write (filled) ────────────────────────
 
@@ -99,6 +106,8 @@ export interface FrameBakeRuntimeProvenance {
     locale: string;
     timezone: string;
   };
+  /** Complete locked publication perimeter supplied by the filesystem orchestrator. */
+  toolPerimeter: Record<string, unknown>;
   decoderConfiguration: Record<string, unknown>;
   startedAtIso: string;
   finishedAtIso?: string;
@@ -143,6 +152,19 @@ export interface GoldenSsimDoc {
   sigs: number[][];
 }
 
+/** Exact timestamp-keyed alpha evidence, independently source-bound and browser-qualified. */
+export interface GoldenAlphaDoc {
+  schema: 'media-test/golden-artifact@1';
+  schemaVersion: '1.0.0';
+  artifactKind: 'alpha';
+  assetId: string;
+  sourceMedia: FrameBakeSourceIdentity;
+  pixelNormalizationVersion: typeof PIXEL_NORMALIZATION_VERSION;
+  availability: { state: 'ready' };
+  provenance: Record<string, unknown>;
+  payload: AlphaEvidenceArtifact;
+}
+
 // ── Tunables ────────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -170,11 +192,10 @@ const FRAME_BAKE_DECODE_MIN_FRAMES = 64;
  * HONESTY GATE (§0.1/§0.6). golden[i] is filled ONLY from the decoded frame whose PTS equals
  * golden[i].ptsUs (± this). A genuine decode reproduces the container timestamps to within timebase
  * rounding (single-digit µs: WebCodecs VideoFrame.timestamp vs ffprobe round(pts_time*1e6)). When the
- * platform CANNOT inline-demux a container (e.g. FRAGMENTED MP4 → moof/mdat) it falls back to
- * <video>-element sampling, which returns frames SPREAD ACROSS THE CLIP (0, D/N, 2D/N, …) — NOT the
- * first-N presentation frames the golden lists. Those land many ms off every listed PTS, so they FAIL
- * the match, keep sha256:null, and the golden stays pending ⇒ NA (runner.ts decodeFrameGoldenGap) — never
- * a golden with the right PTS LABELS but WRONG PIXELS that FAILs every faithful decoder (the SSIM≈0.5 bug).
+ * platform routes through an HTMLVideoElement, frame-bake supplies every listed source PTS and its
+ * non-zero origin. The presenter seeks the corresponding zero-based media times, proves each surface
+ * with requestVideoFrameCallback, and retains the original source PTS labels. Any route that ignores
+ * those anchors still lands outside this tolerance and stays pending rather than relabeling wrong pixels.
  * 1 ms « the smallest genuine inter-frame gap in the corpus (240 fps → 4167 µs), so it can never
  * cross-match an adjacent frame, yet » container-timebase rounding, and « any real sparse-fallback skip.
  */
@@ -201,6 +222,7 @@ export interface FrameBakeAssetResult {
   /** the golden filename relative to fixtures/golden, e.g. 'av1_720p_5s.webm.frames.json' */
   framesFile: string;
   ssimFile: string;
+  alphaFile: string;
   status: FrameBakeStatus;
   /** count of golden frames listed vs how many this pass actually digested */
   listedFrames: number;
@@ -211,6 +233,8 @@ export interface FrameBakeAssetResult {
   framesDoc?: GoldenFramesDoc;
   /** the luma-signature side-file to WRITE BACK (present iff ≥1 frame filled). */
   ssimDoc?: GoldenSsimDoc;
+  /** exact alpha-plane side-file, emitted only when explicitly requested and the bake is complete. */
+  alphaDoc?: GoldenAlphaDoc;
 }
 
 export interface FrameBakeReport {
@@ -440,13 +464,16 @@ export async function bakeAssetFrames(
   engine: MediaEngine,
   force = false,
   runtimeProvenance?: FrameBakeRuntimeProvenance,
+  includeAlphaEvidence = false,
 ): Promise<FrameBakeAssetResult> {
   const framesFile = `${assetId}.frames.json`;
   const ssimFile = `${assetId}.ssim.json`;
+  const alphaFile = `${assetId}.alpha.json`;
   const base: Omit<FrameBakeAssetResult, 'status' | 'note'> = {
     assetId,
     framesFile,
     ssimFile,
+    alphaFile,
     listedFrames: 0,
     filledFrames: 0,
   };
@@ -463,7 +490,7 @@ export async function bakeAssetFrames(
   // Already baked? (a real, non-null sha256 present on every listed frame and not flagged pending).
   const alreadyFilled =
     placeholder.pending === false && listed.every((f) => typeof f.sha256 === 'string' && f.sha256.length > 0);
-  if (alreadyFilled && !force) {
+  if (alreadyFilled && !force && !includeAlphaEvidence) {
     return { ...base, status: 'skipped', note: 'frames golden already filled (non-pending, all sha256 present)' };
   }
 
@@ -509,7 +536,13 @@ export async function bakeAssetFrames(
   // Decode → an ordered list of decoded frames (with pixels for the luma signature).
   let decoded: DecodedFrameEvidence[];
   try {
-    decoded = await decodeAssetFrames(assetId, engine, input, Math.max(listed.length, FRAME_BAKE_DECODE_MIN_FRAMES));
+    decoded = await decodeAssetFrames(
+      assetId,
+      engine,
+      input,
+      Math.max(listed.length, FRAME_BAKE_DECODE_MIN_FRAMES),
+      exactPresentationTimesForFrameBake(listed),
+    );
   } catch (err) {
     return {
       ...base,
@@ -605,6 +638,33 @@ export async function bakeAssetFrames(
       })()
     : undefined;
 
+  // Alpha is an explicit, strict artifact request. Never infer eligibility from the observed output:
+  // if a decoder regression flattens alpha to opaque, publishing that exact output makes the oracle
+  // fail rather than silently turning the candidate into NA_ASSET. Like SSIM, partial evidence is never
+  // published because it could make an incomplete timeline look authoritative.
+  const alphaDoc: GoldenAlphaDoc | undefined = complete && includeAlphaEvidence
+    ? (() => {
+        const alphaPayload: AlphaEvidenceArtifact = jsonSafe({
+          schema: ALPHA_EVIDENCE_SCHEMA,
+          assetId,
+          sourceSha256: sourceIdentity.sha256,
+          algorithm: ALPHA_DIGEST_ALGORITHM,
+          frames: materialized.alphaFrames,
+        });
+        return {
+          schema: 'media-test/golden-artifact@1',
+          schemaVersion: '1.0.0',
+          artifactKind: 'alpha',
+          assetId,
+          sourceMedia: sourceIdentity,
+          pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+          availability: { state: 'ready' as const },
+          provenance: browserGoldenProvenance('alpha', assetId, sourceIdentity, alphaPayload, runtime, stamp.iso),
+          payload: alphaPayload,
+        };
+      })()
+    : undefined;
+
   return {
     ...base,
     status: complete ? 'filled' : 'partial',
@@ -613,6 +673,7 @@ export async function bakeAssetFrames(
       : `digested ${filledCount}/${listed.length} listed frame(s); golden kept pending (honest, no fabrication)`,
     framesDoc,
     ...(ssimDoc ? { ssimDoc } : {}),
+    ...(alphaDoc ? { alphaDoc } : {}),
   };
 }
 
@@ -626,6 +687,7 @@ export interface DecodedFrameEvidence {
 interface FrameMaterializationResult {
   frames: GoldenFrameEntry[];
   sigs: number[][];
+  alphaFrames: AlphaFrameEvidence[];
   filledCount: number;
   matches: Array<{ expectedPtsUs: number; observedPtsUs: number }>;
 }
@@ -644,6 +706,7 @@ export function materializeFrameEvidence(
   const decodedByExpected = new Map(pairing.pairs.map((pair) => [pair.referenceIndex, decoded[pair.candidateIndex]!]));
   const frames: GoldenFrameEntry[] = [];
   const sigs: number[][] = [];
+  const alphaFrames: AlphaFrameEvidence[] = [];
   const matches: Array<{ expectedPtsUs: number; observedPtsUs: number }> = [];
   let filledCount = 0;
   for (let expectedIndex = 0; expectedIndex < listed.length; expectedIndex++) {
@@ -686,10 +749,16 @@ export function materializeFrameEvidence(
       pixelProvenance,
     });
     sigs.push(downsampleLuma(observed.image, LUMA_SIG_SIDE));
+    alphaFrames.push(alphaFrameEvidence(
+      expected.ptsUs,
+      observed.image.width,
+      observed.image.height,
+      observed.image.data,
+    ));
     matches.push({ expectedPtsUs: expected.ptsUs, observedPtsUs: observed.digest.ptsUs });
     filledCount++;
   }
-  return { frames, sigs, filledCount, matches };
+  return { frames, sigs, alphaFrames, filledCount, matches };
 }
 
 /**
@@ -703,13 +772,14 @@ async function decodeAssetFrames(
   engine: MediaEngine,
   input: MediaInput,
   count: number,
+  exactPresentationTimes: NonNullable<DecodeOptions['exactPresentationTimes']>,
 ): Promise<DecodedFrameEvidence[]> {
   if (isImageAsset(assetId)) {
     const one = await decodeImageToFrame(input);
     return one ? [one] : [];
   }
 
-  const sink: FrameSink = await engine.decodeFrames(input, { maxFrames: count });
+  const sink: FrameSink = await engine.decodeFrames(input, { maxFrames: count, exactPresentationTimes });
   const frames = Array.isArray(sink.frames) ? sink.frames : [];
   const out: DecodedFrameEvidence[] = [];
   const getPixels = typeof sink.getPixels === 'function' ? sink.getPixels.bind(sink) : undefined;
@@ -730,6 +800,29 @@ async function decodeAssetFrames(
   return out;
 }
 
+/**
+ * Build the exact source-timeline request carried into platform media-element fallbacks. Frame
+ * placeholders list a leading presentation sequence, so the first listed PTS is its timeline origin;
+ * retaining that non-zero origin keeps relative HTML media seeks and absolute golden matching honest.
+ */
+export function exactPresentationTimesForFrameBake(
+  listed: readonly Pick<GoldenFrameEntry, 'ptsUs'>[],
+): NonNullable<DecodeOptions['exactPresentationTimes']> {
+  if (listed.length === 0) throw new Error('frame-bake exact presentation request requires listed frames');
+  const timestampsUs = listed.map((frame) => frame.ptsUs);
+  let previousPtsUs: number | undefined;
+  for (const ptsUs of timestampsUs) {
+    if (!Number.isSafeInteger(ptsUs)) {
+      throw new Error('frame-bake listed presentation timestamps must be safe integer microseconds');
+    }
+    if (previousPtsUs !== undefined && ptsUs <= previousPtsUs) {
+      throw new Error('frame-bake listed presentation timestamps must be strictly increasing and unique');
+    }
+    previousPtsUs = ptsUs;
+  }
+  return { originUs: timestampsUs[0]!, timestampsUs };
+}
+
 // ── Top-level pass (decode every pending asset, return the write-back map) ───────────────────────
 
 export interface FrameBakeOptions {
@@ -737,6 +830,8 @@ export interface FrameBakeOptions {
   assetIds?: string[];
   /** regenerate even when the existing frames golden is already filled. */
   force?: boolean;
+  /** Emit exact timestamp-keyed alpha evidence for every explicitly selected asset. */
+  includeAlphaEvidence?: boolean;
   /** progress callback (done, total, current asset id). */
   onProgress?: (done: number, total: number, assetId: string) => void;
   /** Exact browser executable/build and host perimeter supplied by the filesystem orchestrator. */
@@ -762,12 +857,19 @@ export async function runFrameBake(opts: FrameBakeOptions = {}): Promise<FrameBa
       opts.onProgress?.(i, ids.length, id);
       let result: FrameBakeAssetResult;
       try {
-        result = await bakeAssetFrames(id, engine, opts.force === true, opts.provenance);
+        result = await bakeAssetFrames(
+          id,
+          engine,
+          opts.force === true,
+          opts.provenance,
+          opts.includeAlphaEvidence === true,
+        );
       } catch (err) {
         result = {
           assetId: id,
           framesFile: `${id}.frames.json`,
           ssimFile: `${id}.ssim.json`,
+          alphaFile: `${id}.alpha.json`,
           status: 'failed',
           listedFrames: 0,
           filledFrames: 0,
@@ -781,6 +883,9 @@ export async function runFrameBake(opts: FrameBakeOptions = {}): Promise<FrameBa
         writes[result.framesFile] = JSON.stringify(result.framesDoc, null, 2) + '\n';
         if (result.ssimDoc && result.ssimDoc.sigs.length > 0) {
           writes[result.ssimFile] = JSON.stringify(result.ssimDoc, null, 2) + '\n';
+        }
+        if (result.alphaDoc && result.alphaDoc.payload.frames.length > 0) {
+          writes[result.alphaFile] = JSON.stringify(result.alphaDoc, null, 2) + '\n';
         }
       }
     }
@@ -977,6 +1082,14 @@ function defaultRuntimeProvenance(startedAtIso: string): FrameBakeRuntimeProvena
   return {
     browser: { family: 'unknown', version: 'unknown', executable: null, userAgent },
     platform: { os, arch, locale, timezone },
+    // A browser-only/manual run can still write compatibility evidence, but this deliberately does
+    // not impersonate the locked filesystem publication perimeter. Active-generation import rejects
+    // it until scripts/frame-bake.mjs supplies the complete toolchain record.
+    toolPerimeter: {
+      schemaVersion: 'browser-only-unpublishable@1',
+      browser: { family: 'unknown', version: 'unknown', executable: null, userAgent },
+      platform: { os, arch, locale, timezone },
+    },
     decoderConfiguration: {
       engine: PLATFORM_ENGINE_ID,
       framePixelAccess: 'FrameSink.getPixels',
@@ -991,11 +1104,11 @@ function jsonSafe<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function browserGoldenProvenance(
-  artifactKind: 'frames' | 'ssim',
+export function browserGoldenProvenance(
+  artifactKind: 'frames' | 'ssim' | 'alpha',
   assetId: string,
   sourceMedia: FrameBakeSourceIdentity,
-  payload: Record<string, unknown>,
+  payload: unknown,
   runtime: FrameBakeRuntimeProvenance,
   finishedAtIso: string,
 ): Record<string, unknown> {
@@ -1005,6 +1118,9 @@ function browserGoldenProvenance(
     sourceSha256: sourceMedia.sha256,
     sourceSizeBytes: sourceMedia.sizeBytes,
     pixelNormalizationVersion: PIXEL_NORMALIZATION_VERSION,
+    browser: runtime.browser,
+    browserPlatform: runtime.platform,
+    decoderConfiguration: runtime.decoderConfiguration,
   };
   const canonicalPayload = canonicalizeJson(payload);
   return {
@@ -1021,11 +1137,7 @@ function browserGoldenProvenance(
     },
     runDetails: {
       baker: 'media-test/frame-bake@1',
-      perimeter: {
-        browser: runtime.browser,
-        platform: runtime.platform,
-        decoderConfiguration: runtime.decoderConfiguration,
-      },
+      perimeter: runtime.toolPerimeter,
       startedAtIso: runtime.startedAtIso,
       finishedAtIso: runtime.finishedAtIso ?? finishedAtIso,
       timeMode: 'browser-qualified-wall-clock',

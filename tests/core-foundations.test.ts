@@ -380,6 +380,23 @@ describe('REQ-CORE-04: typed golden and neutral-reader evidence', () => {
     expect(planned).toEqual(['meta', 'packets']);
   });
 
+  test('a strict alpha oracle requests both frame timing and first-class alpha evidence', () => {
+    const planned = goldenKindsForScenario(defineScenario({
+      id: 'decode-seek/alpha-plan',
+      op: 'decodeFrames',
+      input: 'asset.webm',
+      options: {
+        maxFrames: 1,
+        alphaEvidence: { schema: 'media-test/alpha-plane-evidence@1', assetId: 'asset.webm' },
+      },
+      requires: { operations: ['decodeFrames'], features: ['alpha'] },
+      oracles: ['alpha-plane'],
+      metrics: [],
+    }));
+
+    expect(planned).toEqual(['meta', 'frames', 'alpha']);
+  });
+
   test('an oracle accessing evidence omitted by its plan is a harness ERROR, not NA_ASSET', async () => {
     await withMockFetch((url) => Response.json(validGoldenForUrl(url)), async () => {
       const planned = await loadGolden('asset', { requestedKinds: [] });
@@ -391,6 +408,62 @@ describe('REQ-CORE-04: typed golden and neutral-reader evidence', () => {
         state: 'ERROR',
         reasonCode: 'GOLDEN_EVIDENCE_NOT_REQUESTED',
       });
+    });
+  });
+
+  test('strict alpha routing uses GoldenStore availability and rejects payload source drift', async () => {
+    const scenario = defineScenario({
+      id: 'decode-seek/alpha-routing',
+      op: 'decodeFrames',
+      input: 'source.mp4',
+      options: {
+        maxFrames: 1,
+        alphaEvidence: { schema: 'media-test/alpha-plane-evidence@1', assetId: 'source.mp4' },
+      },
+      requires: { operations: ['decodeFrames'], features: ['alpha'] },
+      oracles: ['alpha-plane'],
+      metrics: [],
+    });
+    const missing = emptyGoldenStore();
+    const context = {
+      scenario,
+      input: mediaInput(),
+      golden: missing,
+      decodeWithPlatform: async () => ({ frames: [] }),
+      playbackSmoke: async () => false,
+    } as OracleContext;
+    expect(await runOracle('alpha-plane', context)).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_ASSET',
+      reasonCode: 'GOLDEN_NOT_LOADED',
+    });
+
+    const drifted = emptyGoldenStore();
+    drifted.alpha = {
+      schema: 'media-test/alpha-plane-evidence@1',
+      assetId: 'source.mp4',
+      sourceSha256: '00'.repeat(32),
+      algorithm: 'sha256-tight-alpha-u8',
+      frames: [{
+        ptsUs: 0,
+        width: 1,
+        height: 1,
+        alphaSha256: '11'.repeat(32),
+        nonOpaquePixels: 1,
+        minAlpha: 0,
+        maxAlpha: 0,
+      }],
+    };
+    drifted.evidence.alpha = {
+      state: 'OK',
+      value: drifted.alpha,
+      url: '/source.mp4.alpha.json',
+      raw: drifted.alpha,
+    };
+    expect(await runOracle('alpha-plane', { ...context, golden: drifted })).toMatchObject({
+      state: 'UNAVAILABLE',
+      status: 'NA_ASSET',
+      reasonCode: 'ALPHA_EVIDENCE_SOURCE_MISMATCH',
     });
   });
 
@@ -417,11 +490,12 @@ describe('REQ-CORE-04: typed golden and neutral-reader evidence', () => {
     });
     await withMockFetch((url) => Response.json(validGoldenForUrl(url)), async () => {
       const golden = await loadGolden('asset');
-      expect(Object.values(golden.evidence).map((entry) => entry.state)).toEqual(['OK', 'OK', 'OK', 'OK']);
+      expect(Object.values(golden.evidence).map((entry) => entry.state)).toEqual(['OK', 'OK', 'OK', 'OK', 'OK']);
       expect(golden.meta?.container).toBe('mp4');
       expect(golden.packets).toHaveLength(1);
       expect(golden.frames).toHaveLength(1);
       expect(golden.ssimRef).toEqual([[0.25, 0.75]]);
+      expect(golden.alpha).toMatchObject({ schema: 'media-test/alpha-plane-evidence@1', assetId: 'asset' });
     });
   });
 
@@ -613,6 +687,23 @@ function validGoldenForUrl(url: string): unknown {
     return [{ trackIndex: 0, size: 12, ptsUs: 0, dtsUs: 0, keyframe: true }];
   }
   if (url.includes('.frames.json')) return [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }];
+  if (url.includes('.alpha.json')) {
+    return {
+      schema: 'media-test/alpha-plane-evidence@1',
+      assetId: 'asset',
+      sourceSha256: 'cd'.repeat(32),
+      algorithm: 'sha256-tight-alpha-u8',
+      frames: [{
+        ptsUs: 0,
+        width: 1,
+        height: 1,
+        alphaSha256: 'ef'.repeat(32),
+        nonOpaquePixels: 1,
+        minAlpha: 0,
+        maxAlpha: 0,
+      }],
+    };
+  }
   return [[0.25, 0.75]];
 }
 

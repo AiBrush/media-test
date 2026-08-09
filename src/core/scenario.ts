@@ -108,6 +108,7 @@ export type OracleId =
   | 'reference-reimport' // re-import engine output with the reference engine; compare packet tables
   | 'playback-smoke' // <video> can play the output
   | 'ssim-psnr' // decode output → SSIM+PSNR vs reference frames (lossy ops)
+  | 'average-bitrate' // elementary video sample payload bytes / presentation span vs authored target
   | 'mp4-box-layout' // MP4/MOV top-level box order/fragment structure for output-shape rows
   | 'webm-live-layout' // WebM/MKV live/append-only layout: unknown-size Segment, no SeekHead/Duration
   | 'fanout-renditions' // multi-rendition transcode output: count, dimensions, playback, and SSIM
@@ -180,6 +181,16 @@ export interface ScenarioInputDefinition {
   role?: string;
 }
 
+/** Engine-independent metadata envelope that every rotatable catalog candidate must satisfy. */
+export interface CandidateInputEnvelope {
+  minWidth?: number;
+  maxWidth?: number;
+  minHeight?: number;
+  maxHeight?: number;
+  minDurationSec?: number;
+  maxDurationSec?: number;
+}
+
 export interface ScenarioMutationSpec {
   mutationId: string;
   parameters: JsonObject;
@@ -199,6 +210,7 @@ export interface ScenarioDefinitionV2 {
   order: number;
   op: Operation;
   inputs: ScenarioInputDefinition[];
+  candidateEnvelope?: CandidateInputEnvelope;
   options: JsonObject;
   requires: NormalizedRequires;
   oracles: OracleId[];
@@ -224,6 +236,8 @@ export interface ScenarioSpec {
   input: string | string[];
   /** V2 JSON-only input declaration. Legacy callers may continue to supply `input`. */
   inputs?: ScenarioInputDefinition[];
+  /** Candidate-selection metadata contract; deliberately separate from engine capability `requires`. */
+  candidateEnvelope?: CandidateInputEnvelope;
   /** operation options forwarded to the engine method (container/transcode/trim/decrypt args) */
   options?: TranscodeOptions | { container?: string } | Record<string, unknown>;
   requires: Requires;
@@ -379,6 +393,7 @@ export function validateScenarioDefinitionV2(
   }
 
   validateInputs(source.inputs, scenarioId, context, add);
+  validateCandidateEnvelope(source.candidateEnvelope, add);
   validateOptions(source.op, source.options, add);
   validateRequires(source.requires, source.op, add);
   validateIdArray(source.oracles, 'oracles', ORACLE_IDS, true, add);
@@ -390,6 +405,18 @@ export function validateScenarioDefinitionV2(
     add('timeoutMs', 'SCENARIO_TIMEOUT', 'must be a finite number greater than zero');
   }
   if (typeof source.notes !== 'string') add('notes', 'SCENARIO_NOTES', 'must be a string');
+
+  const authoredRenditionSet = isPlainRecord(source.options) && isPlainRecord(source.options.renditionSet)
+    ? source.options.renditionSet
+    : undefined;
+  if (authoredRenditionSet && Array.isArray(source.renditionIds) &&
+      !sameJson(authoredRenditionSet.renditionIds, source.renditionIds)) {
+    add(
+      'options.renditionSet.renditionIds',
+      'RENDITION_SET_IDS_MISMATCH',
+      'must exactly match the scenario renditionIds order',
+    );
+  }
 
   const prefix = typeof source.id === 'string' ? familyFromId(source.id) : '';
   if (typeof source.family === 'string' && prefix && source.family !== prefix) {
@@ -449,6 +476,7 @@ export function scenarioDefinitionProjection(
     order: definition.order,
     op: definition.op,
     inputs: definition.inputs,
+    ...(definition.candidateEnvelope ? { candidateEnvelope: definition.candidateEnvelope } : {}),
     options: definition.options ?? {},
     requires: definition.requires,
     oracles: definition.oracles,
@@ -519,6 +547,9 @@ function normalizeScenarioDefinition(
     order: spec.order ?? 0,
     op: spec.op,
     inputs: cloneDefinitionValue(rawInputs),
+    ...(spec.candidateEnvelope
+      ? { candidateEnvelope: cloneDefinitionValue(spec.candidateEnvelope) }
+      : {}),
     options,
     requires: normalizeRequires(spec.requires, spec.op),
     oracles: cloneDefinitionValue(spec.oracles),
@@ -640,6 +671,44 @@ function validateInputs(
   }
 }
 
+function validateCandidateEnvelope(value: unknown, add: AddDiagnostic): void {
+  if (value === undefined) return;
+  if (!isPlainRecord(value)) {
+    add('candidateEnvelope', 'CANDIDATE_ENVELOPE_TYPE', 'must be a plain JSON object');
+    return;
+  }
+  rejectUnknownKeys(value, CANDIDATE_ENVELOPE_KEYS, 'candidateEnvelope', add);
+  for (const key of ['minWidth', 'maxWidth', 'minHeight', 'maxHeight'] as const) {
+    const bound = value[key];
+    if (bound !== undefined && (!Number.isSafeInteger(bound) || (bound as number) <= 0)) {
+      add(`candidateEnvelope.${key}`, 'CANDIDATE_ENVELOPE_DIMENSION', 'must be a positive safe integer');
+    }
+  }
+  for (const key of ['minDurationSec', 'maxDurationSec'] as const) {
+    const bound = value[key];
+    if (bound !== undefined && (typeof bound !== 'number' || !Number.isFinite(bound) || bound < 0)) {
+      add(`candidateEnvelope.${key}`, 'CANDIDATE_ENVELOPE_DURATION', 'must be finite and non-negative');
+    }
+  }
+  validateCandidateEnvelopeRange(value, 'minWidth', 'maxWidth', add);
+  validateCandidateEnvelopeRange(value, 'minHeight', 'maxHeight', add);
+  validateCandidateEnvelopeRange(value, 'minDurationSec', 'maxDurationSec', add);
+}
+
+function validateCandidateEnvelopeRange(
+  value: Record<string, unknown>,
+  minKey: keyof CandidateInputEnvelope,
+  maxKey: keyof CandidateInputEnvelope,
+  add: AddDiagnostic,
+): void {
+  const min = value[minKey];
+  const max = value[maxKey];
+  if (typeof min === 'number' && Number.isFinite(min) &&
+      typeof max === 'number' && Number.isFinite(max) && min > max) {
+    add(`candidateEnvelope.${minKey}`, 'CANDIDATE_ENVELOPE_RANGE', `must not exceed ${maxKey}`);
+  }
+}
+
 function validateOptions(operation: unknown, value: unknown, add: AddDiagnostic): void {
   if (!isPlainRecord(value)) {
     add('options', 'SCENARIO_OPTIONS', 'must be a plain JSON object');
@@ -658,9 +727,171 @@ function validateOptions(operation: unknown, value: unknown, add: AddDiagnostic)
   if (operation === 'seek' && !Number.isFinite(value.tUs)) {
     add('options.tUs', 'SEEK_TARGET', 'must be a finite timestamp');
   }
+  if (operation === 'transcode') {
+    if (value.video !== undefined) {
+      validateTranscodeVideoOptions(value.video, 'options.video', false, add);
+    }
+    if (value.variants !== undefined) {
+      if (
+        isPlainRecord(value.video) &&
+        value.video.codec !== undefined &&
+        value.video.codec !== 'h264'
+      ) {
+        add(
+          'options.video.codec',
+          'ABR_LADDER_CODEC',
+          "the H.264 ABR operation requires top-level video codec 'h264'",
+        );
+      }
+      if (!Array.isArray(value.variants) || value.variants.length === 0) {
+        add('options.variants', 'ABR_VARIANTS', 'must be a non-empty array of video rungs');
+      } else {
+        for (const [index, variant] of value.variants.entries()) {
+          validateTranscodeVideoOptions(variant, `options.variants[${index}]`, true, add);
+        }
+      }
+    }
+  }
+  if (operation === 'transcode' && value.renditionSet !== undefined) {
+    if (!isPlainRecord(value.renditionSet)) {
+      add('options.renditionSet', 'RENDITION_SET_TYPE', 'must be a plain JSON object');
+    } else {
+      const renditionSet = value.renditionSet;
+      rejectUnknownKeys(renditionSet, RENDITION_SET_KEYS, 'options.renditionSet', add);
+      if (typeof renditionSet.id !== 'string' || renditionSet.id.trim().length === 0) {
+        add('options.renditionSet.id', 'RENDITION_SET_ID', 'must be a non-empty string');
+      }
+      validateIdArray(renditionSet.renditionIds, 'options.renditionSet.renditionIds', undefined, false, add);
+      if (!Array.isArray(renditionSet.switchPointsUs) || renditionSet.switchPointsUs.length === 0) {
+        add('options.renditionSet.switchPointsUs', 'RENDITION_SET_SWITCH_POINTS', 'must be a non-empty array');
+      } else {
+        for (const [index, point] of renditionSet.switchPointsUs.entries()) {
+          if (!Number.isSafeInteger(point) || (point as number) < 0 ||
+              (index > 0 && (point as number) <= (renditionSet.switchPointsUs[index - 1] as number))) {
+            add(
+              `options.renditionSet.switchPointsUs[${index}]`,
+              'RENDITION_SET_SWITCH_POINT',
+              'must be a strictly increasing non-negative safe integer timeline',
+            );
+          }
+        }
+      }
+      if (renditionSet.segmentMode !== 'random-access' && renditionSet.segmentMode !== 'segments') {
+        add('options.renditionSet.segmentMode', 'RENDITION_SET_SEGMENT_MODE', "must be 'random-access' or 'segments'");
+      }
+    }
+  }
   if (operation === 'decrypt') {
     if (typeof value.scheme !== 'string') add('options.scheme', 'DECRYPT_SCHEME', 'must be a scheme string');
     if (!isPlainRecord(value.key)) add('options.key', 'DECRYPT_KEY', 'must be a key descriptor object');
+  }
+}
+
+function validateTranscodeVideoOptions(
+  value: unknown,
+  path: string,
+  abrRung: boolean,
+  add: AddDiagnostic,
+): void {
+  if (!isPlainRecord(value)) {
+    add(path, abrRung ? 'ABR_RUNG_TYPE' : 'TRANSCODE_VIDEO_TYPE', 'must be a plain JSON object');
+    return;
+  }
+  rejectUnknownKeys(
+    value,
+    abrRung ? ABR_VIDEO_OPTION_KEYS : TRANSCODE_VIDEO_OPTION_KEYS,
+    path,
+    add,
+    abrRung ? 'ABR_RUNG_OPTION' : 'TRANSCODE_VIDEO_OPTION',
+  );
+  if (value.codec !== undefined && (typeof value.codec !== 'string' || value.codec.trim().length === 0)) {
+    add(`${path}.codec`, 'TRANSCODE_VIDEO_CODEC', 'must be a non-empty codec string');
+  }
+  if (abrRung && value.codec !== undefined && value.codec !== 'h264') {
+    add(`${path}.codec`, 'ABR_RUNG_CODEC', "the H.264 ABR operation requires codec 'h264'");
+  }
+
+  const hasMaximum = value.maxAverageBitrate !== undefined;
+  const hasQuality = value.quality !== undefined;
+  const constrained = hasMaximum || hasQuality;
+  for (const key of ['width', 'height'] as const) {
+    const dimension = value[key];
+    if (abrRung && dimension === undefined) {
+      add(`${path}.${key}`, 'ABR_RUNG_DIMENSION_REQUIRED', 'is required for every ABR rung');
+    } else if (
+      dimension !== undefined &&
+      (!Number.isSafeInteger(dimension) || ((abrRung || constrained) && (dimension as number) <= 0))
+    ) {
+      add(`${path}.${key}`, 'TRANSCODE_VIDEO_DIMENSION', 'must be a positive safe integer');
+    }
+  }
+  if (
+    value.fps !== undefined &&
+    (typeof value.fps !== 'number' || !Number.isFinite(value.fps) || value.fps <= 0)
+  ) {
+    add(`${path}.fps`, 'TRANSCODE_VIDEO_FPS', 'must be finite and positive');
+  }
+
+  if (abrRung && value.bitrate === undefined) {
+    add(`${path}.bitrate`, 'ABR_RUNG_BITRATE_REQUIRED', 'is required for every ABR rung');
+  }
+  if (
+    value.bitrate !== undefined &&
+    (!Number.isSafeInteger(value.bitrate) || (value.bitrate as number) <= 0)
+  ) {
+    add(`${path}.bitrate`, 'TRANSCODE_VIDEO_BITRATE', 'must be a positive safe integer');
+  }
+  if (hasMaximum && (!Number.isSafeInteger(value.maxAverageBitrate) || (value.maxAverageBitrate as number) <= 0)) {
+    add(`${path}.maxAverageBitrate`, 'TRANSCODE_VIDEO_MAXIMUM_BITRATE', 'must be a positive safe integer');
+  }
+  if (hasMaximum !== hasQuality) {
+    add(
+      path,
+      'TRANSCODE_QUALITY_TUPLE_ATOMIC',
+      'maxAverageBitrate and quality must be authored together with bitrate',
+    );
+  }
+  if ((hasMaximum || hasQuality) && value.bitrate === undefined) {
+    add(`${path}.bitrate`, 'TRANSCODE_QUALITY_BITRATE_REQUIRED', 'is required by the quality/rate tuple');
+  }
+  if (
+    typeof value.bitrate === 'number' &&
+    Number.isFinite(value.bitrate) &&
+    typeof value.maxAverageBitrate === 'number' &&
+    Number.isFinite(value.maxAverageBitrate) &&
+    value.maxAverageBitrate < value.bitrate
+  ) {
+    add(
+      `${path}.maxAverageBitrate`,
+      'TRANSCODE_QUALITY_MAXIMUM_BELOW_PREFERRED',
+      'must be greater than or equal to bitrate',
+    );
+  }
+  if (hasQuality) validateTranscodeQuality(value.quality, `${path}.quality`, add);
+}
+
+function validateTranscodeQuality(value: unknown, path: string, add: AddDiagnostic): void {
+  if (!isPlainRecord(value)) {
+    add(path, 'TRANSCODE_QUALITY_TYPE', 'must be a plain JSON object');
+    return;
+  }
+  rejectUnknownKeys(value, TRANSCODE_QUALITY_KEYS, path, add, 'TRANSCODE_QUALITY_OPTION');
+  if (value.metric !== 'ssim-luma-v1') {
+    add(`${path}.metric`, 'TRANSCODE_QUALITY_METRIC', "must equal 'ssim-luma-v1'");
+  }
+  if (
+    typeof value.minimumMean !== 'number' ||
+    !Number.isFinite(value.minimumMean) ||
+    value.minimumMean < 0 ||
+    value.minimumMean > 1
+  ) {
+    add(`${path}.minimumMean`, 'TRANSCODE_QUALITY_MEAN', 'must be finite and in [0, 1]');
+  }
+  if (
+    value.samples !== undefined &&
+    (!Number.isSafeInteger(value.samples) || (value.samples as number) < 1 || (value.samples as number) > 256)
+  ) {
+    add(`${path}.samples`, 'TRANSCODE_QUALITY_SAMPLES', 'must be a safe integer in [1, 256]');
   }
 }
 
@@ -1068,7 +1299,7 @@ const OPERATION_IDS = new Set<Operation>([
 ]);
 const ORACLE_IDS = new Set<OracleId>([
   'golden-metadata', 'golden-packets', 'decoded-frames-bitexact', 'decoded-audio-pcm',
-  'reference-reimport', 'playback-smoke', 'ssim-psnr', 'mp4-box-layout', 'webm-live-layout',
+  'reference-reimport', 'playback-smoke', 'ssim-psnr', 'average-bitrate', 'mp4-box-layout', 'webm-live-layout',
   'fanout-renditions', 'alpha-plane', 'seek-accuracy', 'trim-boundaries', 'decrypt-bitexact',
   'graceful-failure', 'property-invariant',
 ]);
@@ -1097,7 +1328,7 @@ const FEATURES = new Set([
   'mux:browser-decode-equality', 'mux:hevc-browser-decode-equality', 'mux:roundtrip-compare', 'mux:sparse-co64',
   'mux:vfr-timestamps', 'packets:dts', 'pad', 'remux:av1-opus-in-mp4', 'remux:av1-opus-in-webm',
   'remux:compose', 'remux:flac-in-ogg', 'remux:mp3-in-mp4', 'remux:vp9-opus-in-mp4', 'resample',
-  'resize', 'rotate', 'rotation:decode', 'streaming:decode-equality', 'target:writes', 'tonemap',
+  'quality-constrained-rate', 'resize', 'rotate', 'rotation:decode', 'streaming:decode-equality', 'target:writes', 'tonemap',
   'trim:compose', 'trim:flac-no-seektable-frame-scan', 'trim:flac-seektable-copy',
   'trim:frame-accurate', 'trim:frame-accurate-hevc', 'trim:massive-lazy-read', 'two-pass', 'upmix',
   'webcrypto:cenc-ctr-clear-output',
@@ -1110,11 +1341,14 @@ const RECIPE_SOURCES = new Set<WebCodecsConfigRecipe['source']>([
 ]);
 
 const ROOT_DEFINITION_KEYS = new Set([
-  'schemaVersion', 'id', 'revision', 'family', 'order', 'op', 'inputs', 'options', 'requires',
+  'schemaVersion', 'id', 'revision', 'family', 'order', 'op', 'inputs', 'candidateEnvelope', 'options', 'requires',
   'oracles', 'metrics', 'primaryMetric', 'tolerances', 'timeoutMs', 'notes', 'mutation',
   'inputVariantIds', 'renditionIds',
 ]);
 const INPUT_KEYS = new Set(['assetId', 'variantId', 'role']);
+const CANDIDATE_ENVELOPE_KEYS = new Set<keyof CandidateInputEnvelope>([
+  'minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'minDurationSec', 'maxDurationSec',
+]);
 const MUTATION_KEYS = new Set(['mutationId', 'parameters']);
 const TOLERANCE_KEYS = new Set<keyof OracleTolerances>([
   'ssimMin', 'psnrMinDb', 'durationToleranceSec', 'fpsTolerance', 'seekToleranceUs',
@@ -1130,6 +1364,15 @@ const COMBINATION_KEYS = new Set([
   'browserConfigRecipes',
 ]);
 const RECIPE_KEYS = new Set(['role', 'source', 'trackIndex']);
+const RENDITION_SET_KEYS = new Set(['id', 'renditionIds', 'switchPointsUs', 'segmentMode']);
+const TRANSCODE_VIDEO_OPTION_KEYS = new Set([
+  'codec', 'width', 'height', 'fps', 'bitrate', 'maxAverageBitrate', 'quality', 'rotate', 'crf',
+  'passes', 'bitDepth',
+]);
+const ABR_VIDEO_OPTION_KEYS = new Set([
+  'codec', 'width', 'height', 'fps', 'bitrate', 'maxAverageBitrate', 'quality',
+]);
+const TRANSCODE_QUALITY_KEYS = new Set(['metric', 'minimumMean', 'samples']);
 const REQUIREMENT_VOCABULARIES = [
   ['operations', OPERATION_IDS], ['containersIn', CONTAINERS], ['containersOut', CONTAINERS],
   ['videoCodecs', VIDEO_CODECS], ['audioCodecs', AUDIO_CODECS], ['videoCodecsIn', VIDEO_CODECS],
@@ -1146,7 +1389,7 @@ const OPTION_KEYS: Record<Operation, ReadonlySet<string>> = {
   probe: new Set(['gracefulAllowOutput', 'invariant', 'metadataTrackTypes', 'property', 'robustness']),
   demux: new Set(['gracefulAllowOutput', 'invariant', 'robustness']),
   remux: new Set(['appendOnly', 'container', 'durationUs', 'fastStart', 'fragmented', 'gracefulAllowOutput', 'invariant', 'maximumPacketCount', 'robustness', 'roundTrip', 'tags', 'target', 'targetUs', 'writeChunkBytes']),
-  transcode: new Set(['alpha', 'audio', 'colorspace', 'container', 'crop', 'fastStart', 'flip', 'gracefulAllowOutput', 'invariant', 'pad', 'robustness', 'tonemap', 'variants', 'video']),
+  transcode: new Set(['alpha', 'audio', 'colorspace', 'container', 'crop', 'fastStart', 'flip', 'gracefulAllowOutput', 'invariant', 'pad', 'renditionSet', 'robustness', 'tonemap', 'variants', 'video']),
   decodeFrames: new Set([
     'alphaEvidence', 'decodeProvenance', 'decodeTrackSelector', 'displayEvidence',
     'gracefulAllowOutput', 'imageDecoder', 'invariant', 'maxFrames', 'robustness', 'selectTrackType',
@@ -1162,7 +1405,7 @@ const ORACLES_BY_OPERATION: Record<Operation, ReadonlySet<OracleId>> = {
   probe: new Set(['golden-metadata', 'graceful-failure', 'property-invariant']),
   demux: new Set(['golden-metadata', 'golden-packets', 'graceful-failure', 'property-invariant']),
   remux: new Set(['graceful-failure', 'mp4-box-layout', 'playback-smoke', 'property-invariant', 'reference-reimport', 'webm-live-layout']),
-  transcode: new Set(['alpha-plane', 'fanout-renditions', 'graceful-failure', 'playback-smoke', 'property-invariant', 'ssim-psnr']),
+  transcode: new Set(['alpha-plane', 'average-bitrate', 'fanout-renditions', 'graceful-failure', 'playback-smoke', 'property-invariant', 'ssim-psnr']),
   decodeFrames: new Set(['alpha-plane', 'decoded-audio-pcm', 'decoded-frames-bitexact', 'graceful-failure', 'property-invariant', 'ssim-psnr']),
   seek: new Set(['graceful-failure', 'property-invariant', 'seek-accuracy']),
   trim: new Set(['graceful-failure', 'playback-smoke', 'property-invariant', 'reference-reimport', 'trim-boundaries']),

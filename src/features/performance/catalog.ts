@@ -30,7 +30,7 @@ const questions: PerformanceQuestion[] = [
   q('performance/convert-peak-memory', 'What user-agent-specific peak and baseline delta occurs during the 320×180 conversion window?', 'ua-memory-window-convert-v1'),
   q('performance/convert-longtasks', 'How many in-window milliseconds of observed main-thread long tasks occur during conversion?', 'longtask-window-convert-v1'),
   q('performance/metamorphic-transcode-idempotent-source-res', 'How many actual output frames per second retain visual identity at source resolution?', 'adaptive-metamorphic-source-res-v1'),
-  q('performance/metamorphic-probe-duration-cross-container', 'How quickly is source presentation duration preserved across MP4-to-WebM remux?', 'adaptive-metamorphic-duration-v1'),
+  q('performance/metamorphic-probe-duration-cross-container', 'How quickly is source presentation duration preserved across MP4-to-Matroska remux?', 'adaptive-metamorphic-duration-v1'),
   q('performance/metamorphic-decode-remux', 'How quickly does MP4-to-Matroska remux preserve decode-equivalent presentation?', 'adaptive-metamorphic-decode-remux-v1'),
   q('performance/metamorphic-vfr-iterate-packets', 'How many observed irregular-timeline VFR packets per second are iterated?', 'adaptive-metamorphic-vfr-demux-v1'),
   q('performance/metamorphic-vfr-probe-duration', 'How many VFR presentation-duration probes per second complete without nominal-rate inference?', 'adaptive-metamorphic-vfr-probe-v1'),

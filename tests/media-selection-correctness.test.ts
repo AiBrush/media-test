@@ -2,6 +2,11 @@ import { describe, expect, test } from 'bun:test';
 
 import type { OracleOutcome, Scenario } from '../src/core/scenario.ts';
 import { Sha256, bytesToLowerHex } from '../src/core/seeded-rng.ts';
+import { demuxScenarios } from '../src/scenarios/demux/index.ts';
+import { decodeSeekScenarios } from '../src/scenarios/decode-seek/index.ts';
+import { metadataScenarios } from '../src/scenarios/metadata/index.ts';
+import { performanceScenarios } from '../src/scenarios/performance/index.ts';
+import { transcodeScenarios } from '../src/scenarios/transcode/index.ts';
 import {
   DECRYPT_METAMORPHIC_INVARIANT,
   ROBUSTNESS_VARIANT_SELECTION_CONTRACT,
@@ -153,6 +158,158 @@ test('decode-fps keeps its committed RGBA prefix bound to the baked input', () =
   expect(selections.get(fixed.id)?.map((selection) => selection.isBaked)).toEqual([true]);
 });
 
+test('VP9 alpha exhaustive selection retains the baked input and all three curated real sources', async () => {
+  const [catalogText, manifestJson] = await Promise.all([
+    Bun.file('fixtures/media/scenarios/_sources.ndjson').text(),
+    Bun.file('fixtures/manifest.json').json(),
+  ]);
+  const parsedCatalog = parseScenarioSourceCatalog(catalogText);
+  const parsedBaked = parseBakedCorpusManifest(manifestJson);
+  if (parsedCatalog.state !== 'VALID' || parsedBaked.state !== 'VALID') {
+    throw new Error('VP9 alpha selection fixtures must validate');
+  }
+  const selectedScenario = decodeSeekScenarios.find((entry) =>
+    entry.id === 'decode-seek/decode_vp9_alpha');
+  if (!selectedScenario) throw new Error('VP9 alpha decode scenario is missing');
+  const pool = findScenarioPool(buildSelectionManifest({
+    scenarios: [selectedScenario],
+    catalog: parsedCatalog.catalog,
+    bakedManifest: parsedBaked.manifest,
+  }), selectedScenario.id);
+  if (!pool) throw new Error('VP9 alpha candidate pool is missing');
+
+  expect(pool.candidates.map((candidate) => candidate.selectedFile).sort()).toEqual([
+    '01.webm',
+    '02.webm',
+    '03.webm',
+    'vp9_alpha.webm',
+  ]);
+  expect(pool.rejections).toEqual([]);
+});
+
+test('rotate-normalize rejects shape-compatible files that do not declare the authored display matrix', () => {
+  const fixed = scenario({
+    id: 'transcode/h264_rotate_normalize',
+    family: 'transcode',
+    op: 'transcode',
+    input: 'h264_rotated90.mp4',
+    options: {
+      container: 'mp4',
+      video: { codec: 'h264', rotate: 0 },
+      invariant: 'transcode-effect-aware',
+    },
+    requires: {
+      operations: ['transcode'],
+      containersIn: ['mp4'],
+      containersOut: ['mp4'],
+      videoCodecs: ['h264'],
+      audioCodecs: ['aac'],
+      features: ['rotate'],
+    },
+    oracles: ['ssim-psnr', 'playback-smoke', 'property-invariant'],
+  });
+  const real = sourceFile('01.mp4', 'shape-compatible but orientation-free bytes');
+  const sourceRow = row([real], { scenarioId: fixed.id });
+  const manifest = buildSelectionManifest({
+    scenarios: [fixed],
+    catalog: catalogFromRows([sourceRow]),
+    bakedManifest: bakedManifest([{ id: 'h264_rotated90.mp4', contents: 'authored rotated fixture' }]),
+  });
+  const pool = findScenarioPool(manifest, fixed.id)!;
+
+  expect(pool.candidates.map((candidate) => candidate.kind)).toEqual(['baked']);
+  expect(pool.rejections).toContainEqual(expect.objectContaining({
+    selectedFile: '01.mp4',
+    reasonCode: 'SOURCE_SEMANTICS_FIXTURE_BOUND',
+  }));
+});
+
+test('metadata fixture-semantic rows are baked-only while the family retains the exact 25-row/76-member pool', async () => {
+  const [catalogText, manifestJson] = await Promise.all([
+    Bun.file('fixtures/media/scenarios/_sources.ndjson').text(),
+    Bun.file('fixtures/manifest.json').json(),
+  ]);
+  const parsedCatalog = parseScenarioSourceCatalog(catalogText);
+  const parsedBaked = parseBakedCorpusManifest(manifestJson);
+  if (parsedCatalog.state !== 'VALID') {
+    throw new Error(parsedCatalog.issues.map((issue) => issue.detail).join('; '));
+  }
+  if (parsedBaked.state !== 'VALID') {
+    throw new Error(parsedBaked.issues.map((issue) => issue.detail).join('; '));
+  }
+
+  const fixtureBound = [
+    'metadata/neg_garbled_id3_mp3_probe',
+    'metadata/neg_garbled_ilst_mp4_probe',
+    'metadata/read_h264_multitrack',
+    'metadata/rotation_survives_mp4_mkv',
+    'metadata/tracks_attribution_multitrack',
+    'metadata/tracks_packet_attribution_multitrack',
+  ] as const;
+  const manifest = buildSelectionManifest({
+    scenarios: metadataScenarios,
+    catalog: parsedCatalog.catalog,
+    bakedManifest: parsedBaked.manifest,
+  });
+
+  expect(metadataScenarios).toHaveLength(25);
+  expect(manifest.pools).toHaveLength(25);
+  expect(manifest.pools.reduce((sum, pool) => sum + pool.candidates.length, 0)).toBe(76);
+  for (const id of fixtureBound) {
+    const pool = findScenarioPool(manifest, id);
+    expect(pool?.candidates.map((candidate) => candidate.kind), id).toEqual(['baked']);
+    expect(pool?.rejections, id).toHaveLength(3);
+    expect(pool?.rejections.every((rejection) =>
+      rejection.reasonCode === 'SOURCE_SEMANTICS_FIXTURE_BOUND'), id).toBe(true);
+  }
+});
+
+test('performance workload envelopes produce the exact revision-2 canonical pools', async () => {
+  const [catalogText, manifestJson] = await Promise.all([
+    Bun.file('fixtures/media/scenarios/_sources.ndjson').text(),
+    Bun.file('fixtures/manifest.json').json(),
+  ]);
+  const parsedCatalog = parseScenarioSourceCatalog(catalogText);
+  const parsedBaked = parseBakedCorpusManifest(manifestJson);
+  if (parsedCatalog.state !== 'VALID') {
+    throw new Error(parsedCatalog.issues.map((issue) => issue.detail).join('; '));
+  }
+  if (parsedBaked.state !== 'VALID') {
+    throw new Error(parsedBaked.issues.map((issue) => issue.detail).join('; '));
+  }
+  const manifest = buildSelectionManifest({
+    scenarios: performanceScenarios,
+    catalog: parsedCatalog.catalog,
+    bakedManifest: parsedBaked.manifest,
+  });
+
+  expect(manifest.pools).toHaveLength(33);
+  expect(manifest.pools.reduce((sum, pool) => sum + pool.candidates.length, 0)).toBe(78);
+  expect(manifest.pools.reduce((sum, pool) => sum + pool.rejections.length, 0)).toBe(54);
+  const poolCounts = manifest.pools.reduce<Record<number, number>>((counts, pool) => {
+    counts[pool.candidates.length] = (counts[pool.candidates.length] ?? 0) + 1;
+    return counts;
+  }, {});
+  expect(poolCounts).toEqual({ 1: 16, 2: 3, 4: 14 });
+
+  for (const id of [
+    'performance/encode-fps',
+    'performance/metamorphic-transcode-idempotent-source-res',
+  ]) {
+    const pool = findScenarioPool(manifest, id);
+    expect(pool?.candidates.map((candidate) => candidate.selectedFile), id)
+      .toEqual(['h264_1080p_30s.mp4']);
+    expect(pool?.rejections, id).toHaveLength(3);
+  }
+
+  for (const pool of manifest.pools.filter((entry) => entry.scenarioId.startsWith('performance/size-ladder-'))) {
+    const expectedCandidates = pool.scenarioId.endsWith('-huge') ? 2 : 1;
+    expect(pool.candidates, pool.scenarioId).toHaveLength(expectedCandidates);
+    expect(pool.rejections.every((rejection) =>
+      rejection.reasonCode === 'CANDIDATE_INPUT_CONTRACT_MISMATCH'), pool.scenarioId).toBe(true);
+  }
+});
+
 function catalogFromRows(rows: readonly ScenarioSourceRow[]): ValidatedScenarioSourceCatalog {
   const parsed = parseScenarioSourceCatalog(rows.map((entry) => JSON.stringify(entry)).join('\n'));
   if (parsed.state !== 'VALID') throw new Error(parsed.issues.map((issue) => issue.detail).join('; '));
@@ -221,6 +378,290 @@ test('full-range no-op selection admits only candidates with the authored full d
   if (!rejected.eligible) {
     expect(rejected.rejection).toMatchObject({ reasonCode: 'CANDIDATE_INPUT_CONTRACT_MISMATCH' });
     expect(rejected.rejection.detail).toContain('full-range no-op contract');
+  }
+});
+
+test('source envelopes admit arbitrary matching assets at inclusive boundaries and fail closed', () => {
+  const candidateEnvelope = {
+    minWidth: 1920,
+    maxWidth: 1920,
+    minHeight: 1080,
+    maxHeight: 1080,
+    minDurationSec: 108,
+    maxDurationSec: 132,
+  } as const;
+  const boundedScenario = scenario({
+    id: 'transcode/source-envelope-contract',
+    family: 'transcode',
+    op: 'transcode',
+    input: 'baked.webm',
+    candidateEnvelope,
+  });
+  const requires: ScenarioSourceRow['requires'] = {
+    container: 'webm',
+    video: true,
+    videoCodecs: ['vp9'],
+    audioCodecs: ['opus'],
+  };
+  const candidate = (name: string, overrides: Partial<SourceFileRecord> = {}) => sourceFile(name, name, {
+    container: 'webm',
+    videoCodecs: ['vp9'],
+    audioCodecs: ['opus'],
+    width: 1920,
+    height: 1080,
+    durationSec: 120,
+    ...overrides,
+  });
+  const eligibility = (file: SourceFileRecord) => assessCandidateEligibility(
+    boundedScenario,
+    row([file], { scenarioId: boundedScenario.id, requires }),
+    file,
+  );
+
+  for (const file of [
+    candidate('unrelated-lower-bound.webm', { durationSec: 108 }),
+    candidate('future-generic-source.webm'),
+    candidate('unrelated-upper-bound.webm', { durationSec: 132 }),
+  ]) {
+    expect(eligibility(file).eligible).toBe(true);
+  }
+
+  for (const [file, field] of [
+    [candidate('too-narrow.webm', { width: 1919 }), 'width'],
+    [candidate('too-wide.webm', { width: 1921 }), 'width'],
+    [candidate('too-short.webm', { durationSec: 107.999 }), 'duration'],
+    [candidate('too-long.webm', { durationSec: 132.001 }), 'duration'],
+    [candidate('unknown-height.webm', { height: null }), 'height'],
+    [candidate('unknown-duration.webm', { durationSec: null }), 'duration'],
+  ] as const) {
+    const result = eligibility(file);
+    expect(result.eligible).toBe(false);
+    if (!result.eligible) {
+      expect(result.rejection.reasonCode).toBe('CANDIDATE_INPUT_CONTRACT_MISMATCH');
+      expect(result.rejection.detail).toContain(field);
+    }
+  }
+
+  const catalogOnly = candidate('catalog-only-bound.webm', { durationSec: 107 });
+  const catalogResult = assessCandidateEligibility(
+    scenario({ id: 'transcode/catalog-envelope-contract', family: 'transcode', op: 'transcode' }),
+    row([catalogOnly], {
+      scenarioId: 'transcode/catalog-envelope-contract',
+      requires: { ...requires, minDurationSec: 108 },
+    }),
+    catalogOnly,
+  );
+  expect(catalogResult).toMatchObject({
+    eligible: false,
+    rejection: { reasonCode: 'CANDIDATE_INPUT_CONTRACT_MISMATCH' },
+  });
+
+  const matching = candidate('cache-envelope-match.webm');
+  const matchingRow = row([matching], { scenarioId: boundedScenario.id, requires });
+  const candidateCatalog = catalogFromRows([matchingRow]);
+  const candidateBaked = bakedManifest([{ id: 'baked.webm', contents: 'same baked bytes' }]);
+  const boundedPool = findScenarioPool(buildSelectionManifest({
+    scenarios: [boundedScenario], catalog: candidateCatalog, bakedManifest: candidateBaked,
+  }), boundedScenario.id)!;
+  const unboundedPool = findScenarioPool(buildSelectionManifest({
+    scenarios: [{ ...boundedScenario, candidateEnvelope: undefined }],
+    catalog: candidateCatalog,
+    bakedManifest: candidateBaked,
+  }), boundedScenario.id)!;
+  expect(boundedPool.candidates.map((entry) => entry.candidateIdentity)).toEqual(
+    unboundedPool.candidates.map((entry) => entry.candidateIdentity),
+  );
+  expect(boundedPool.eligiblePoolDigest).not.toBe(unboundedPool.eligiblePoolDigest);
+});
+
+test('tracked large-rung envelopes keep baked when regenerated catalog rows have no bounds', () => {
+  const exactLargeEnvelope = {
+    minWidth: 1920,
+    maxWidth: 1920,
+    minHeight: 1080,
+    maxHeight: 1080,
+    minDurationSec: 108,
+    maxDurationSec: 132,
+  };
+  const currentRungs: Array<{
+    scenarioId: string;
+    bakedId: string;
+    container: string;
+    videoCodec: string;
+    audioCodec: string;
+    files: Array<{ file: string; width: number; height: number; durationSec: number }>;
+  }> = [
+    {
+      scenarioId: 'transcode/ladder_large_h264_1080p_120s_resize_720p',
+      bakedId: 'large_h264_1080p_120s.mp4',
+      container: 'mp4',
+      videoCodec: 'h264',
+      audioCodec: 'aac',
+      files: [
+        { file: '01.mp4', width: 1280, height: 720, durationSec: 129.898333 },
+        { file: '02.mp4', width: 3840, height: 2160, durationSec: 23.53 },
+        { file: '03.mp4', width: 640, height: 360, durationSec: 180.693333 },
+      ],
+    },
+    {
+      scenarioId: 'transcode/ladder_large_vp9_1080p_120s_to_h264_720p',
+      bakedId: 'large_vp9_1080p_120s.webm',
+      container: 'webm',
+      videoCodec: 'vp9',
+      audioCodec: 'opus',
+      files: [
+        { file: '01.webm', width: 1280, height: 720, durationSec: 182.574 },
+        { file: '02.webm', width: 960, height: 720, durationSec: 610.248 },
+        { file: '03.webm', width: 640, height: 480, durationSec: 1697.261 },
+      ],
+    },
+  ];
+
+  for (const current of currentRungs) {
+    const selectedScenario = transcodeScenarios.find((entry) => entry.id === current.scenarioId);
+    if (!selectedScenario) throw new Error(`missing tracked scenario '${current.scenarioId}'`);
+    expect(selectedScenario).toMatchObject({ revision: 2, candidateEnvelope: exactLargeEnvelope });
+    const sourceRow = row(current.files.map((file) => sourceFile(file.file, `current ${file.file}`, {
+      container: current.container,
+      videoCodecs: [current.videoCodec],
+      audioCodecs: [current.audioCodec],
+      width: file.width,
+      height: file.height,
+      durationSec: file.durationSec,
+    })), {
+      scenarioId: current.scenarioId,
+      requires: {
+        container: current.container,
+        video: true,
+        videoCodecs: [current.videoCodec],
+        audioCodecs: [current.audioCodec],
+      },
+    });
+    const manifest = buildSelectionManifest({
+      scenarios: [selectedScenario],
+      catalog: catalogFromRows([sourceRow]),
+      bakedManifest: bakedManifest([{ id: current.bakedId, contents: `verified baked ${current.bakedId}` }]),
+    });
+    const pool = findScenarioPool(manifest, current.scenarioId);
+    if (!pool) throw new Error(`missing candidate pool '${current.scenarioId}'`);
+
+    expect(pool.candidates.map((candidate) => ({
+      kind: candidate.kind,
+      selectedFile: candidate.selectedFile,
+    }))).toEqual([{ kind: 'baked', selectedFile: current.bakedId }]);
+    expect(pool.rejections.map((rejection) => ({
+      selectedFile: rejection.selectedFile,
+      reasonCode: rejection.reasonCode,
+    }))).toEqual(current.files.map((file) => ({
+      selectedFile: file.file,
+      reasonCode: 'CANDIDATE_INPUT_CONTRACT_MISMATCH',
+    })));
+  }
+});
+
+test('every tracked demux size row filters real candidates by its independent workload envelope', () => {
+  const cases = [
+    {
+      scenarioId: 'demux/size_micro_micro_h264_1frame', bakedId: 'micro_h264_1frame.mp4',
+      container: 'mp4', videoCodec: 'h264', audioCodec: undefined,
+      width: 320, height: 240, durationSec: 1,
+    },
+    {
+      scenarioId: 'demux/size_micro_micro_audio_short', bakedId: 'micro_audio_short.m4a',
+      container: 'mp4', videoCodec: undefined, audioCodec: 'aac',
+      width: undefined, height: undefined, durationSec: 0.125,
+    },
+    {
+      scenarioId: 'demux/size_tiny_tiny_h264_360p_2s', bakedId: 'tiny_h264_360p_2s.mp4',
+      container: 'mp4', videoCodec: 'h264', audioCodec: 'aac',
+      width: 640, height: 360, durationSec: 2,
+    },
+    {
+      scenarioId: 'demux/size_tiny_tiny_vp9_360p_2s', bakedId: 'tiny_vp9_360p_2s.webm',
+      container: 'webm', videoCodec: 'vp9', audioCodec: 'opus',
+      width: 640, height: 360, durationSec: 2,
+    },
+    {
+      scenarioId: 'demux/size_large_large_h264_1080p_120s', bakedId: 'large_h264_1080p_120s.mp4',
+      container: 'mp4', videoCodec: 'h264', audioCodec: 'aac',
+      width: 1920, height: 1080, durationSec: 120,
+    },
+    {
+      scenarioId: 'demux/size_large_large_vp9_1080p_120s', bakedId: 'large_vp9_1080p_120s.webm',
+      container: 'webm', videoCodec: 'vp9', audioCodec: 'opus',
+      width: 1920, height: 1080, durationSec: 120,
+    },
+    {
+      scenarioId: 'demux/size_huge_huge_h264_1080p_600s', bakedId: 'huge_h264_1080p_600s.mov',
+      container: 'mov', videoCodec: 'h264', audioCodec: 'aac',
+      width: 1920, height: 1080, durationSec: 600,
+    },
+    {
+      scenarioId: 'demux/size_massive_massive_h264_1080p_2h', bakedId: 'massive_h264_1080p_2h.mp4',
+      container: 'mp4', videoCodec: 'h264', audioCodec: 'aac',
+      width: 1920, height: 1080, durationSec: 7200,
+    },
+  ] as const;
+
+  for (const current of cases) {
+    const selectedScenario = demuxScenarios.find((entry) => entry.id === current.scenarioId);
+    if (!selectedScenario) throw new Error(`missing tracked scenario '${current.scenarioId}'`);
+    const exact = sourceFile(`exact-${current.bakedId}`, `exact ${current.bakedId}`, {
+      container: current.container,
+      videoCodecs: current.videoCodec ? [current.videoCodec] : [],
+      audioCodecs: current.audioCodec ? [current.audioCodec] : [],
+      ...(current.width !== undefined ? { width: current.width } : {}),
+      ...(current.height !== undefined ? { height: current.height } : {}),
+      durationSec: current.durationSec,
+    });
+    const wrongDuration = sourceFile(`wrong-duration-${current.bakedId}`, `wrong ${current.bakedId}`, {
+      container: current.container,
+      videoCodecs: current.videoCodec ? [current.videoCodec] : [],
+      audioCodecs: current.audioCodec ? [current.audioCodec] : [],
+      ...(current.width !== undefined ? { width: current.width } : {}),
+      ...(current.height !== undefined ? { height: current.height } : {}),
+      durationSec: (selectedScenario.candidateEnvelope?.maxDurationSec ?? current.durationSec) + 0.001,
+    });
+    const files = current.width === undefined
+      ? [exact, wrongDuration]
+      : [
+          exact,
+          wrongDuration,
+          sourceFile(`wrong-width-${current.bakedId}`, `wrong width ${current.bakedId}`, {
+            container: current.container,
+            videoCodecs: current.videoCodec ? [current.videoCodec] : [],
+            audioCodecs: current.audioCodec ? [current.audioCodec] : [],
+            width: current.width + 1,
+            height: current.height,
+            durationSec: current.durationSec,
+          }),
+        ];
+    const sourceRow = row(files, {
+      scenarioId: current.scenarioId,
+      requires: {
+        container: current.container,
+        video: current.videoCodec !== undefined,
+        videoCodecs: current.videoCodec ? [current.videoCodec] : [],
+        audioCodecs: current.audioCodec ? [current.audioCodec] : [],
+      },
+    });
+    const manifest = buildSelectionManifest({
+      scenarios: [selectedScenario],
+      catalog: catalogFromRows([sourceRow]),
+      bakedManifest: bakedManifest([{
+        id: current.bakedId,
+        contents: `verified baked ${current.bakedId}`,
+      }]),
+    });
+    const pool = findScenarioPool(manifest, current.scenarioId);
+    if (!pool) throw new Error(`missing candidate pool '${current.scenarioId}'`);
+
+    expect(pool.candidates.map((candidate) => candidate.selectedFile).sort()).toEqual(
+      [current.bakedId, exact.file].sort(),
+    );
+    expect(pool.rejections.map((rejection) => rejection.reasonCode)).toEqual(
+      Array(files.length - 1).fill('CANDIDATE_INPUT_CONTRACT_MISMATCH'),
+    );
   }
 });
 
@@ -339,6 +780,44 @@ describe('REQ-SEL-01 canonical validated candidate manifest', () => {
       'CATALOG_SHA256_INVALID',
       'CATALOG_SIZE_INVALID',
       'CATALOG_UNKNOWN_FIELD',
+    ]));
+  });
+
+  test('source-envelope requirements are validated as ordered finite ranges', () => {
+    const valid = row([sourceFile('01.mp4', 'one')], {
+      requires: {
+        container: 'mp4',
+        video: true,
+        videoCodecs: ['h264'],
+        audioCodecs: ['aac'],
+        minWidth: 1920,
+        maxWidth: 1920,
+        minHeight: 1080,
+        maxHeight: 1080,
+        minDurationSec: 108,
+        maxDurationSec: 132,
+      },
+    });
+    const parsedValid = parseScenarioSourceCatalog(JSON.stringify(valid));
+    expect(parsedValid.state).toBe('VALID');
+    if (parsedValid.state === 'VALID') {
+      expect(parsedValid.catalog.rows[0]?.requires).toMatchObject(valid.requires);
+    }
+
+    const invalid = {
+      ...valid,
+      requires: {
+        ...valid.requires,
+        minWidth: 1919.5,
+        minDurationSec: 133,
+        maxDurationSec: 132,
+      },
+    };
+    const parsedInvalid = parseScenarioSourceCatalog(JSON.stringify(invalid));
+    expect(parsedInvalid.state).toBe('INVALID');
+    expect(parsedInvalid.issues.map((issue) => issue.reasonCode)).toEqual(expect.arrayContaining([
+      'CATALOG_REQUIREMENT_BOUND_INVALID',
+      'CATALOG_REQUIREMENT_RANGE_INVALID',
     ]));
   });
 

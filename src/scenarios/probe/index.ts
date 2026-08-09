@@ -27,7 +27,13 @@
  * src/features/probe/coverage.ts; no missing-asset scenario is registered as fake coverage.
  */
 
-import type { MetricId, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
+import type {
+  CandidateInputEnvelope,
+  MetricId,
+  OracleId,
+  OracleTolerances,
+  Scenario,
+} from '../../core/scenario.ts';
 import type { EncryptionScheme } from '../../core/engine.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import {
@@ -39,14 +45,67 @@ import {
   type ProbeBudgetContract,
   type ProbeMetadataFieldPolicy,
 } from '../../features/probe/index.ts';
+import { LARGE_1080P_120S_CANDIDATE_ENVELOPE } from '../_candidate-envelopes.ts';
+
+const MICRO_320X240_1S_CANDIDATE_ENVELOPE = {
+  minWidth: 320,
+  maxWidth: 320,
+  minHeight: 240,
+  maxHeight: 240,
+  minDurationSec: 0.9,
+  maxDurationSec: 1.1,
+} satisfies CandidateInputEnvelope;
+
+const MICRO_AUDIO_CANDIDATE_ENVELOPE = {
+  minDurationSec: 0,
+  maxDurationSec: 0.25,
+} satisfies CandidateInputEnvelope;
+
+const TINY_640X360_2S_CANDIDATE_ENVELOPE = {
+  minWidth: 640,
+  maxWidth: 640,
+  minHeight: 360,
+  maxHeight: 360,
+  minDurationSec: 1.8,
+  maxDurationSec: 2.2,
+} satisfies CandidateInputEnvelope;
+
+const HUGE_1080P_10MIN_CANDIDATE_ENVELOPE = {
+  minWidth: 1920,
+  maxWidth: 1920,
+  minHeight: 1080,
+  maxHeight: 1080,
+  minDurationSec: 540,
+  maxDurationSec: 660,
+} satisfies CandidateInputEnvelope;
+
+const HUGE_1080P_4MIN_CANDIDATE_ENVELOPE = {
+  minWidth: 1920,
+  maxWidth: 1920,
+  minHeight: 1080,
+  maxHeight: 1080,
+  minDurationSec: 216,
+  maxDurationSec: 264,
+} satisfies CandidateInputEnvelope;
+
+const MASSIVE_1080P_2H_CANDIDATE_ENVELOPE = {
+  minWidth: 1920,
+  maxWidth: 1920,
+  minHeight: 1080,
+  maxHeight: 1080,
+  minDurationSec: 6480,
+  maxDurationSec: 7920,
+} satisfies CandidateInputEnvelope;
 
 // ── (A) per-container golden-metadata probes ─────────────────────────────────────────────────────
 
 /** One probe scenario per asset. `containersIn` + codec hints make NA-negotiation honest. */
 interface ProbeCase {
   id?: string;
+  revision?: number;
   asset: string;
   container: string;
+  candidateEnvelope?: CandidateInputEnvelope;
   videoCodecs?: string[];
   videoCodecsIn?: string[];
   audioCodecs?: string[];
@@ -379,28 +438,36 @@ const PROBE_CASES: ProbeCase[] = [
   // ── (B) SIZE ladder (§5.3 first-class axis). Each bucket gets a functional, golden-gated probe. ──
   {
     // MICRO video (~1 KB, single keyframe). VIDEO-ONLY → golden has exactly 1 track (count gated).
+    revision: 2,
     asset: 'micro_h264_1frame.mp4',
     container: 'mp4',
+    candidateEnvelope: MICRO_320X240_1S_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     notes: 'micro bucket (~1 KB): smallest valid MP4, one keyframe, video-only. Init-overhead-dominated probe.',
   },
   {
     // MICRO audio (~1-2 KB). Few AAC frames; audio-only.
+    revision: 2,
     asset: 'micro_audio_short.m4a',
     container: 'mp4',
+    candidateEnvelope: MICRO_AUDIO_CANDIDATE_ENVELOPE,
     audioCodecs: ['aac'],
     notes: 'micro bucket audio (~1-2 KB): few AAC frames; init-overhead-dominated probe latency.',
   },
   {
+    revision: 2,
     asset: 'tiny_h264_360p_2s.mp4',
     container: 'mp4',
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes: 'tiny bucket (~100 KB) 360p MP4 — size-ladder representative for the MP4/H.264 family.',
   },
   {
+    revision: 2,
     asset: 'tiny_vp9_360p_2s.webm',
     container: 'webm',
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
     notes: 'tiny bucket (~100 KB) 360p WebM — pairs with tiny_h264 so the tiny rung covers both families.',
@@ -408,15 +475,19 @@ const PROBE_CASES: ProbeCase[] = [
   {
     // LARGE 1080p MP4 (~100 MB). Golden present only after a non-skip-longform bake; until then this
     // probe reports a clean FAIL ("no golden meta") rather than a fabricated pass — honest by §15.
+    revision: 2,
     asset: 'large_h264_1080p_120s.mp4',
     container: 'mp4',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes: 'large bucket (~100 MB) 1080p H.264 MP4. Probe must read the moov cheaply at scale (faststart).',
   },
   {
+    revision: 2,
     asset: 'large_vp9_1080p_120s.webm',
     container: 'webm',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
     notes: 'large bucket (~100 MB) 1080p VP9 WebM — pairs with large_h264 so the large rung crosses families.',
@@ -424,8 +495,10 @@ const PROBE_CASES: ProbeCase[] = [
   {
     // HUGE self-contained big-read .mov (~500-700 MB). Deterministic, network-free; golden after a
     // full (non-skip-longform) bake.
+    revision: 2,
     asset: 'huge_h264_1080p_600s.mov',
     container: 'mov',
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { metadataTrackTypes: ['video', 'audio'] },
@@ -435,8 +508,10 @@ const PROBE_CASES: ProbeCase[] = [
       'tmcd data tracks, which are outside the normalized probe media-track contract.',
   },
   {
+    revision: 2,
     asset: 'huge_vp9_1080p_240s.webm',
     container: 'webm',
+    candidateEnvelope: HUGE_1080P_4MIN_CANDIDATE_ENVELOPE,
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
     notes: 'huge bucket VP9/WebM twin. Keeps the huge rung cross-family instead of H.264-only.',
@@ -444,8 +519,10 @@ const PROBE_CASES: ProbeCase[] = [
   {
     // HUGE big-read PARITY twin (the real Big Buck Bunny 1080p H.264 .mov Mediabunny benchmarks).
     // 'provided' (drop-in / pin-then-fetch): NA(asset-missing) until present, then golden-gated.
+    revision: 2,
     asset: 'big_buck_bunny_1080p_h264.mov',
     container: 'mov',
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { metadataTrackTypes: ['video', 'audio'] },
@@ -456,8 +533,10 @@ const PROBE_CASES: ProbeCase[] = [
   },
   {
     // MASSIVE 2h low-bitrate 1080p (~1-1.4 GB, ~216k frames). Many-sample sample-table parse; lazy read.
+    revision: 2,
     asset: 'massive_h264_1080p_2h.mp4',
     container: 'mp4',
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes:
@@ -465,8 +544,10 @@ const PROBE_CASES: ProbeCase[] = [
       'WITHOUT walking the many-thousand-sample table (lazy/partial read, no OOM). Golden after full bake.',
   },
   {
+    revision: 2,
     asset: 'massive_vp9_1080p_2h.webm',
     container: 'webm',
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
     videoCodecs: ['vp9'],
     audioCodecs: ['opus'],
     notes: 'massive bucket VP9/WebM twin. Exercises long-form lazy probe behavior outside ISOBMFF.',
@@ -476,8 +557,10 @@ const PROBE_CASES: ProbeCase[] = [
 const goldenProbeScenarios: Scenario[] = PROBE_CASES.map((c) =>
   defineScenario({
     id: `probe/${c.id ?? c.asset.replace(/\.[^.]+$/, '')}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'probe',
     input: c.asset,
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     requires: {
       operations: ['probe'],
       containersIn: [c.container],
@@ -541,8 +624,10 @@ const hlsAes128PlaylistOnlyProbe: Scenario = defineScenario({
  */
 interface PerfProbeCase {
   id: string;
+  revision: number;
   asset: string;
   container: string;
+  candidateEnvelope: CandidateInputEnvelope;
   videoCodecs?: string[];
   audioCodecs?: string[];
   options?: Record<string, unknown>;
@@ -552,8 +637,10 @@ interface PerfProbeCase {
 const PERF_PROBE_CASES: PerfProbeCase[] = [
   {
     id: 'perf-extract-metadata-large',
+    revision: 2,
     asset: 'large_h264_1080p_120s.mp4',
     container: 'mp4',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes:
@@ -562,8 +649,10 @@ const PERF_PROBE_CASES: PerfProbeCase[] = [
   },
   {
     id: 'perf-extract-metadata-huge',
+    revision: 2,
     asset: 'huge_h264_1080p_600s.mov',
     container: 'mov',
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     options: { metadataTrackTypes: ['video', 'audio'] },
@@ -575,8 +664,10 @@ const PERF_PROBE_CASES: PerfProbeCase[] = [
   },
   {
     id: 'perf-extract-metadata-massive',
+    revision: 2,
     asset: 'massive_h264_1080p_2h.mp4',
     container: 'mp4',
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     notes:
@@ -591,8 +682,10 @@ const OPS_PER_SEC: MetricId = 'opsPerSec';
 const perfProbeScenarios: Scenario[] = PERF_PROBE_CASES.map((c) =>
   defineScenario({
     id: `probe/${c.id}`,
+    revision: c.revision,
     op: 'probe',
     input: c.asset,
+    candidateEnvelope: c.candidateEnvelope,
     requires: {
       operations: ['probe'],
       containersIn: [c.container],

@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { CapabilityError, InputError } from '@aibrush/media';
+import { CapabilityError, ConstraintUnsatisfiedError, InputError } from '@aibrush/media';
 import {
+  AUTHENTICATED_RANGE_PROBE_FEATURE,
   CONCRETE_OPERATION_PROTOCOL,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
   isMalformedInputError,
   isNotApplicableError,
+  isOperationConstraintUnsatisfiedError,
   validateCapabilitySet,
   type ConcreteOperationRequest,
   type MediaInput,
@@ -12,20 +14,28 @@ import {
   type OperationContext,
   type OperationTelemetry,
   type TranscodeAudioOptions,
+  type TranscodeVideoOptions,
 } from '../src/core/engine.ts';
 import {
   AibrushMediaEngine,
+  aibrushDecodeRequiresExactFrameworkRoute,
   aibrushDirectDecodeFitsFrameBudget,
+  mapAibrushTranscodeVideoTarget,
+  resolveAibrushDecodeTrack,
   selectAibrushCopyTrimSampleIndices,
 } from '../src/engines/aibrush-media/adapter.ts';
 import { classifyAibrushFrameworkError, translateAibrushFrameworkError } from '../src/engines/aibrush-media/errors.ts';
 import { sha256Hex } from '../src/engines/platform/digest.ts';
-import { decideAibrushSupport } from '../src/engines/aibrush-media/support.ts';
+import {
+  AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES,
+  decideAibrushSupport,
+} from '../src/engines/aibrush-media/support.ts';
 import {
   buildAibrushDemuxResult,
   normalizeAibrushTrack,
 } from '../src/engines/aibrush-media/representation.ts';
 import { decodeNativePcm } from '../src/features/audio-dsp/index.ts';
+import { defineDisplayTransform } from '../src/features/decode-seek/display.ts';
 import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
 import { inspectTrimAudioContainer } from '../src/features/trim/audio.ts';
 import { assessFragmentedTrimOutput } from '../src/features/trim/fragmented.ts';
@@ -46,6 +56,19 @@ const AUDIO: NormalizedTrack = {
   sampleRate: 48_000,
   channels: 2,
 };
+const VP8_VIDEO: NormalizedTrack = {
+  type: 'video',
+  codec: 'vp8',
+  width: 1_280,
+  height: 720,
+  fps: 30,
+};
+const VORBIS_AUDIO: NormalizedTrack = {
+  type: 'audio',
+  codec: 'vorbis',
+  sampleRate: 48_000,
+  channels: 2,
+};
 
 describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
   test('the declared still-image inputs are valid shared capability tokens', () => {
@@ -53,12 +76,160 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     const capabilities = validateCapabilitySet(engine);
     expect(capabilities.containersIn).toEqual(expect.arrayContaining(['jpeg', 'png', 'webp']));
     expect(capabilities.probeReadModes).toEqual(['range', 'whole-file']);
+    expect(capabilities.features).toContain(AUTHENTICATED_RANGE_PROBE_FEATURE);
+    expect(capabilities.features).toContain('two-pass');
+    expect(capabilities.features).toContain('quality-constrained-rate');
   });
 
-  test('does not claim display-matrix-applied decode without an explicit rotation path', () => {
+  test('admits exact JPEG, PNG, and WebP probe representations without requiring ImageDecoder', () => {
+    for (const [scenarioId, container, codec] of [
+      ['robustness/image_jpeg_probe', 'jpeg', 'mjpeg'],
+      ['robustness/image_png_probe', 'png', 'png'],
+      ['robustness/image_webp_probe', 'webp', 'webp'],
+    ] as const) {
+      expect(
+        decideAibrushSupport(
+          request('probe', container, [{ type: 'video', codec, width: 640, height: 480 }], {
+            scenarioId,
+          }),
+        ),
+        scenarioId,
+      ).toEqual({ supported: true });
+    }
+  });
+
+  test('keeps ImageDecoder absence as browser applicability for still-image decode only', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'ImageDecoder');
+    try {
+      Reflect.deleteProperty(globalThis, 'ImageDecoder');
+      for (const [container, codec] of [
+        ['jpeg', 'mjpeg'],
+        ['png', 'png'],
+        ['webp', 'webp'],
+      ] as const) {
+        expect(
+          decideAibrushSupport(
+            request('decodeFrames', container, [{ type: 'video', codec, width: 640, height: 480 }]),
+          ),
+          container,
+        ).toMatchObject({
+          supported: false,
+          status: 'NA_BROWSER',
+          reasonCode: 'AIBRUSH_IMAGE_DECODER_UNAVAILABLE',
+        });
+      }
+      Object.defineProperty(globalThis, 'ImageDecoder', {
+        configurable: true,
+        writable: true,
+        value: function ImageDecoder() {},
+      });
+      for (const [container, codec] of [
+        ['jpeg', 'mjpeg'],
+        ['png', 'png'],
+        ['webp', 'webp'],
+      ] as const) {
+        expect(
+          decideAibrushSupport(
+            request('decodeFrames', container, [{ type: 'video', codec, width: 640, height: 480 }]),
+          ),
+          container,
+        ).toEqual({ supported: true });
+      }
+    } finally {
+      restoreGlobal('ImageDecoder', descriptor);
+    }
+  });
+
+  test('assesses each FLAC SEEKTABLE-equivalence input independently at remux preflight', () => {
+    const flacTrack: NormalizedTrack = {
+      type: 'audio', codec: 'flac', sampleRate: 48_000, channels: 2,
+    };
+    const property = request('remux', 'flac', [flacTrack], {
+      scenarioId: 'robustness/prop_flac_seek_seektable_equiv',
+      outputContainer: 'flac',
+      options: { invariant: 'flac-seek-lands-identical-with-without-seektable' },
+    });
+    property.inputs = [
+      { ...property.inputs[0]!, id: 'flac_seektable.flac', tracks: [{ ...flacTrack }] },
+      { ...property.inputs[0]!, id: 'flac_noseektable.flac', tracks: [{ ...flacTrack }] },
+    ];
+
+    expect(decideAibrushSupport(property)).toEqual({ supported: true });
+
+    expect(decideAibrushSupport({
+      ...property,
+      scenarioId: 'remux/two-flac-sources',
+      options: {},
+    })).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_CONTAINER_CODEC_ILLEGAL',
+    });
+
+    expect(decideAibrushSupport({
+      ...property,
+      inputs: [
+        property.inputs[0]!,
+        { ...property.inputs[1]!, tracks: [{ ...flacTrack }, { ...flacTrack }] },
+      ],
+    })).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_CONTAINER_CODEC_ILLEGAL',
+    });
+  });
+
+  test('declares display-matrix decode separately from authored rotation transforms', () => {
     const capabilities = validateCapabilitySet(new AibrushMediaEngine());
-    expect(capabilities.features).not.toContain('rotation:decode');
+    expect(capabilities.features).toContain('rotation:decode');
     expect(capabilities.features).toContain('rotate');
+  });
+
+  test('routes a typed display-space contract around every default-track decode shortcut', () => {
+    expect(aibrushDecodeRequiresExactFrameworkRoute({}, undefined)).toBe(false);
+    expect(aibrushDecodeRequiresExactFrameworkRoute({
+      displayEvidence: defineDisplayTransform({
+        codedWidth: 1_280,
+        codedHeight: 720,
+        displayWidth: 720,
+        displayHeight: 1_280,
+        rotationDegrees: 90,
+        flipX: false,
+        flipY: false,
+      }),
+    }, undefined)).toBe(true);
+  });
+
+  test('maps the authored two-pass request to the framework replay-backed option', () => {
+    const twoPass = {
+      codec: 'h264',
+      bitrate: 2_000_000,
+      passes: 2,
+    } as TranscodeVideoOptions & { passes: number };
+    const onePass = { ...twoPass, passes: 1 };
+
+    expect(mapAibrushTranscodeVideoTarget(twoPass)).toMatchObject({
+      codec: 'h264',
+      bitrate: 2_000_000,
+      twoPass: true,
+    });
+    expect(mapAibrushTranscodeVideoTarget(onePass)).not.toHaveProperty('twoPass');
+  });
+
+  test('maps the authored preferred/max-rate objective-quality tuple without redefining bitrate', () => {
+    expect(
+      mapAibrushTranscodeVideoTarget({
+        codec: 'h264',
+        bitrate: 2_000_000,
+        maxAverageBitrate: 2_600_000,
+        quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+      }),
+    ).toEqual({
+      codec: 'h264',
+      bitrate: 2_000_000,
+      maxAverageBitrate: 2_600_000,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+    });
   });
 
   test('bounds adaptive reuse and cross-process memory sampling', () => {
@@ -71,6 +242,108 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         sampleTimeoutMs: 30_000,
       },
     });
+  });
+
+  test('rejects oversized finite remux publication before content execution without fixture routing', () => {
+    const massiveFixtureBytes = 1_144_401_376;
+    const oversized = request('remux', 'mp4', [VIDEO, AUDIO], {
+      scenarioId: 'remux/arbitrary_large_input',
+      inputId: 'arbitrary.mp4',
+      inputSizeBytes: massiveFixtureBytes,
+      outputContainer: 'mkv',
+    });
+
+    expect(decideAibrushSupport(oversized)).toEqual({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_FINITE_REMUX_OUTPUT_SIZE_UNSUPPORTED',
+      reason:
+        `finite remux publication for ${massiveFixtureBytes} declared ` +
+        `source bytes exceeds the verified ${AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES}-byte ` +
+        'complete-payload retention ceiling',
+      preContent: true,
+    });
+  });
+
+  test('keeps smaller finite remux rows and explicit append-only publication admitted', () => {
+    expect(
+      decideAibrushSupport(
+        request('remux', 'mp4', [VIDEO, AUDIO], {
+          inputSizeBytes: 843_645_455,
+          outputContainer: 'mkv',
+        }),
+      ),
+    ).toMatchObject({ supported: true });
+
+    expect(
+      decideAibrushSupport(
+        request('remux', 'mp4', [VIDEO, AUDIO], {
+          inputSizeBytes: AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES + 1,
+          outputContainer: 'mkv',
+          options: { appendOnly: true },
+        }),
+      ),
+    ).toMatchObject({ supported: true });
+  });
+
+  test('checks mux container legality after canonical selected-audio resolution', () => {
+    expect(
+      decideAibrushSupport(
+        request('mux', 'webm', [VP8_VIDEO, VORBIS_AUDIO], {
+          scenarioId: 'mux/vorbis_to_ogg',
+          outputContainer: 'ogg',
+          options: { trackSelect: ['audio:0'] },
+        }),
+      ),
+    ).toEqual({ supported: true });
+
+    const sourceQualified: ConcreteOperationRequest = {
+      ...request('mux', 'mp4', [VIDEO, AUDIO], {
+        scenarioId: 'mux/source_qualified_vorbis_to_ogg',
+        outputContainer: 'ogg',
+        options: { trackSelect: ['audio:0@1'] },
+      }),
+      inputs: [
+        {
+          id: 'video-source.mp4', mime: 'video/mp4', container: 'mp4', sizeBytes: 1_024,
+          mutated: false, sourceEvidence: 'RESOLVED', tracks: [VIDEO, AUDIO],
+        },
+        {
+          id: 'vorbis-source.webm', mime: 'video/webm', container: 'webm', sizeBytes: 1_024,
+          mutated: false, sourceEvidence: 'RESOLVED', tracks: [VP8_VIDEO, VORBIS_AUDIO],
+        },
+      ],
+    };
+    expect(decideAibrushSupport(sourceQualified)).toEqual({ supported: true });
+  });
+
+  test('still rejects an illegal video track when mux trackSelect selects it', () => {
+    for (const trackSelect of [['video:0'], ['video:0@1']]) {
+      const base = request('mux', 'webm', [VP8_VIDEO, VORBIS_AUDIO], {
+        outputContainer: 'ogg',
+        options: { trackSelect },
+      });
+      const selectedIllegal: ConcreteOperationRequest = trackSelect[0]?.includes('@1')
+        ? {
+            ...base,
+            inputs: [
+              {
+                id: 'audio-source.ogg', mime: 'audio/ogg', container: 'ogg', sizeBytes: 1_024,
+                mutated: false, sourceEvidence: 'RESOLVED', tracks: [VORBIS_AUDIO],
+              },
+              {
+                id: 'video-source.webm', mime: 'video/webm', container: 'webm', sizeBytes: 1_024,
+                mutated: false, sourceEvidence: 'RESOLVED', tracks: [VP8_VIDEO, VORBIS_AUDIO],
+              },
+            ],
+          }
+        : base;
+      expect(decideAibrushSupport(selectedIllegal)).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_CONTAINER_CODEC_ILLEGAL',
+      });
+    }
   });
 
   test('bounds direct ISO-BMFF decode by decoded RGBA storage rather than a fixture-sized frame cap', () => {
@@ -515,6 +788,109 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     });
   });
 
+  test('expands a bare AVC sample-entry tag to the concrete product decoder profile and level', () => {
+    const bareAvcTrack = {
+      type: 'video',
+      codec: 'h264',
+      nativeCodecTag: 'avc1',
+      profile: 'High',
+      level: 31,
+      width: 1_280,
+      height: 720,
+    } as NormalizedTrack & { readonly profile: string; readonly level: number };
+    const decision = decideAibrushSupport(
+      request('decodeFrames', 'mp4', [bareAvcTrack]),
+    );
+
+    expect(decision).toEqual({
+      supported: true,
+      browserConfigs: [
+        {
+          role: 'video-decoder',
+          trackIndex: 0,
+          config: {
+            codec: 'avc1.64001F',
+            codedWidth: 1_280,
+            codedHeight: 720,
+          },
+        },
+      ],
+    });
+  });
+
+  test('probes only the exact selected decode track, so an unsupported default track cannot veto it', () => {
+    const unsupportedDefault: NormalizedTrack = {
+      ...VIDEO,
+      codec: 'hevc',
+      nativeCodecTag: 'hvc1.1.6.L93.B0',
+      trackId: 'default-hevc',
+    };
+    const selected: NormalizedTrack = {
+      ...VIDEO,
+      width: 1_280,
+      height: 720,
+      trackId: 'alternate-h264',
+    };
+    const decision = decideAibrushSupport(
+      request('decodeFrames', 'mp4', [unsupportedDefault, selected], {
+        options: {
+          decodeTrackSelector: {
+            schema: 'media-test/decode-track-selector@1',
+            type: 'video',
+            trackIndex: 1,
+            typeOrdinal: 1,
+            trackId: 'alternate-h264',
+          },
+        },
+      }),
+    );
+    expect(decision).toEqual({
+      supported: true,
+      browserConfigs: [
+        {
+          role: 'video-decoder',
+          trackIndex: 1,
+          config: {
+            codec: 'avc1.640028',
+            codedWidth: 1_280,
+            codedHeight: 720,
+          },
+        },
+      ],
+    });
+  });
+
+  test('maps a non-default selected video to the exact public product trackSelect ordinal', () => {
+    const operationRequest = request('decodeFrames', 'mp4', [VIDEO, VIDEO], {
+      options: { invariant: 'decode-track-selection' },
+    });
+    const resolved = resolveAibrushDecodeTrack(
+      {
+        container: 'mp4',
+        durationSec: 1,
+        tracks: [
+          { id: 7, type: 'video', codec: 'h264', defaultDisposition: true, width: 1_280, height: 720 },
+          { id: 11, type: 'video', codec: 'h264', defaultDisposition: false, width: 1_280, height: 720 },
+          { id: 19, type: 'audio', codec: 'aac' },
+        ],
+      },
+      {
+        schema: 'media-test/decode-track-selector@1',
+        type: 'video',
+        trackIndex: 1,
+        typeOrdinal: 1,
+        trackId: '11',
+      },
+      operationRequest,
+    );
+
+    expect(resolved.trackSelect).toEqual(['video:1']);
+    expect(resolved.presence).toEqual({ hasVideo: true, hasAudio: false });
+    expect(resolved.evidence).toMatchObject({
+      type: 'video', trackIndex: 1, typeOrdinal: 1, trackId: '11', codec: 'h264',
+    });
+  });
+
   test('never launders an intentionally mutated input into unsupported applicability', () => {
     const malformed = request('remux', 'jpeg', [], {
       outputContainer: 'unknown',
@@ -616,10 +992,56 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     expect(result.representations?.map((representation) => representation.trackIndex)).toEqual([0]);
   });
 
-  test('still rejects subtitle and unsupported media demux tracks', () => {
+  test('admits read-side MJPEG beside media and auxiliary tracks without claiming an MJPEG encoder', () => {
+    expect(
+      decideAibrushSupport(
+        request('demux', 'mkv', [
+          VIDEO,
+          AUDIO,
+          { type: 'other', codec: 'attachment' },
+          { type: 'video', codec: 'mjpeg', width: 480, height: 360 },
+        ]),
+      ),
+    ).toEqual({ supported: true });
+
+    expect(
+      decideAibrushSupport(
+        request('transcode', 'mkv', [VIDEO, AUDIO], {
+          outputContainer: 'mkv',
+          videoCodec: 'mjpeg',
+        }),
+      ),
+    ).toMatchObject({
+      supported: false,
+      reasonCode: 'AIBRUSH_VIDEO_ENCODER_UNAVAILABLE',
+    });
+  });
+
+  test('preserves exact-track remux legality NAs for an MKV carrying auxiliary MJPEG', () => {
+    const tracks: NormalizedTrack[] = [
+      VIDEO,
+      AUDIO,
+      { type: 'other', codec: '' },
+      { type: 'video', codec: 'mjpeg', width: 480, height: 360, fps: 90_000 },
+    ];
+    for (const container of ['mov', 'mp4', 'ts']) {
+      expect(
+        decideAibrushSupport(
+          request('remux', 'mkv', tracks, { outputContainer: container }),
+        ),
+        container,
+      ).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_CONTAINER_CODEC_ILLEGAL',
+      });
+    }
+  });
+
+  test('still rejects subtitle and unknown media demux tracks', () => {
     for (const track of [
       { type: 'subtitle' as const, codec: 'subrip' },
-      { type: 'video' as const, codec: 'mjpeg', width: 480, height: 360 },
+      { type: 'video' as const, codec: 'theora', width: 480, height: 360 },
     ]) {
       expect(decideAibrushSupport(request('demux', 'mkv', [VIDEO, AUDIO, track]))).toMatchObject({
         supported: false,
@@ -664,6 +1086,36 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     });
   });
 
+  test('keeps decoder probes but omits the unreachable sub-two-pixel encoder probe for a graceful boundary', () => {
+    const boundary = request('transcode', 'mp4', [VIDEO, AUDIO], {
+      outputContainer: 'mp4',
+      videoCodec: 'h264',
+      outputWidth: 1,
+      outputHeight: 1,
+      transforms: { resize: { width: 1, height: 1 } },
+    });
+    boundary.options = { ...boundary.options, gracefulAllowOutput: true };
+
+    const decision = decideAibrushSupport(boundary);
+    expect(decision).toMatchObject({ supported: true });
+    if (!decision.supported) throw new Error('expected the graceful boundary tuple to be supported');
+    expect(decision.browserConfigs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'video-decoder' }),
+    ]));
+    expect(decision.browserConfigs?.some((entry) => entry.role === 'video-encoder')).toBe(false);
+
+    const ordinary = decideAibrushSupport({
+      ...boundary,
+      options: { ...boundary.options, gracefulAllowOutput: false },
+    });
+    expect(ordinary).toMatchObject({
+      supported: true,
+      browserConfigs: expect.arrayContaining([
+        expect.objectContaining({ role: 'video-encoder' }),
+      ]),
+    });
+  });
+
   test('probes a dimension-valid H.264 level for 1080p output', () => {
     expect(
       decideAibrushSupport(
@@ -690,49 +1142,130 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
     });
   });
 
-  test('declares measured audio-content writer and decoder boundaries without hiding working codecs', () => {
-    const audioRows: Array<[string, string, string, string]> = [
-      ['wav', 'mp4', 'aac', 'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED'],
-      ['wav', 'ogg', 'opus', 'AIBRUSH_OGG_OPUS_OUTPUT_UNSUPPORTED'],
-      ['flac', 'webm', 'opus', 'AIBRUSH_WEBM_OPUS_PRESENTATION_UNSUPPORTED'],
-    ];
-    for (const [inputContainer, outputContainer, audioCodec, reasonCode] of audioRows) {
-      expect(
-        decideAibrushSupport(
-          request(
-            'transcode',
-            inputContainer,
-            [
-              {
-                type: 'audio',
-                codec: inputContainer === 'wav' ? 'pcm-s16' : inputContainer,
-                sampleRate: 48_000,
-                channels: 1,
-              },
-            ],
+  test('probes every ABR quality rung with its exact quantizer encoder configuration', () => {
+    const variants = [
+      [1_920, 1_080, 5_000_000, 6_500_000],
+      [1_280, 720, 2_800_000, 3_640_000],
+      [854, 480, 1_400_000, 1_820_000],
+      [640, 360, 800_000, 1_040_000],
+    ].map(([width, height, bitrate, maxAverageBitrate]) => ({
+      width,
+      height,
+      bitrate,
+      maxAverageBitrate,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+    }));
+    const decision = decideAibrushSupport(
+      request('transcode', 'mp4', [VIDEO, AUDIO], {
+        outputContainer: 'mp4',
+        videoCodec: 'h264',
+        options: { video: { codec: 'h264' }, variants },
+      }),
+    );
+    expect(decision).toMatchObject({ supported: true });
+    if (!decision.supported) throw new Error('expected ABR support');
+    expect(decision.browserConfigs?.filter((entry) => entry.role === 'video-encoder')).toEqual([
+      {
+        role: 'video-encoder',
+        config: {
+          codec: 'avc1.640028', width: 1_920, height: 1_080, latencyMode: 'quality',
+          bitrateMode: 'quantizer', framerate: 30,
+        },
+      },
+      {
+        role: 'video-encoder',
+        config: {
+          codec: 'avc1.64001F', width: 1_280, height: 720, latencyMode: 'quality',
+          bitrateMode: 'quantizer', framerate: 30,
+        },
+      },
+      {
+        role: 'video-encoder',
+        config: {
+          codec: 'avc1.64001F', width: 854, height: 480, latencyMode: 'quality',
+          bitrateMode: 'quantizer', framerate: 30,
+        },
+      },
+      {
+        role: 'video-encoder',
+        config: {
+          codec: 'avc1.64001E', width: 640, height: 360, latencyMode: 'quality',
+          bitrateMode: 'quantizer', framerate: 30,
+        },
+      },
+    ]);
+  });
+
+  test('applies the fixed 48 kHz Opus boundary to implicit preservation and explicit resampling', () => {
+    const outputContainers = ['ogg', 'webm', 'mp4', 'mov', 'mkv'] as const;
+    for (const outputContainer of outputContainers) {
+      const concrete = (sourceSampleRate: number, outputSampleRate?: number) =>
+        request(
+          'transcode',
+          'wav',
+          [
             {
-              outputContainer,
-              audioCodec,
-              options: { invariant: 'transcode-audio-content' },
+              type: 'audio',
+              codec: 'pcm-s16',
+              sampleRate: sourceSampleRate,
+              channels: 1,
             },
-          ),
-        ),
-      ).toMatchObject({ supported: false, status: 'NA_ENGINE', reasonCode });
+          ],
+          {
+            outputContainer,
+            audioCodec: 'opus',
+            ...(outputSampleRate !== undefined ? { outputSampleRate } : {}),
+            options: {
+              invariant: 'transcode-audio-content',
+              audio: {
+                codec: 'opus',
+                ...(outputSampleRate !== undefined ? { sampleRate: outputSampleRate } : {}),
+              },
+            },
+            ...(outputSampleRate !== undefined
+              ? { transforms: { audio: { sampleRate: outputSampleRate } } }
+              : {}),
+          },
+        );
+
+      expect(decideAibrushSupport(concrete(48_000))).toMatchObject({ supported: true });
+      expect(decideAibrushSupport(concrete(44_100))).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_OPUS_FIXED_RATE_CONTRACT_UNSUPPORTED',
+      });
+      expect(decideAibrushSupport(concrete(44_100, 48_000))).toMatchObject({ supported: true });
+      expect(decideAibrushSupport(concrete(48_000, 44_100))).toMatchObject({
+        supported: false,
+        status: 'NA_ENGINE',
+        reasonCode: 'AIBRUSH_OPUS_FIXED_RATE_CONTRACT_UNSUPPORTED',
+      });
     }
+  });
+
+  test('declares measured audio-content writer and decoder boundaries without hiding working codecs', () => {
+
+    expect(
+      decideAibrushSupport(
+        request(
+          'transcode',
+          'wav',
+          [{ type: 'audio', codec: 'pcm-s16', sampleRate: 48_000, channels: 1 }],
+          {
+            outputContainer: 'mp4',
+            audioCodec: 'aac',
+            options: { invariant: 'transcode-audio-content' },
+          },
+        ),
+      ),
+    ).toMatchObject({ supported: true });
 
     expect(
       decideAibrushSupport(
         request(
           'transcode',
           'aac',
-          [
-            {
-              type: 'audio',
-              codec: 'aac',
-              sampleRate: 48_000,
-              channels: 2,
-            },
-          ],
+          [{ type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 }],
           {
             scenarioId: 'transcode/aac_to_pcm_wav_extract',
             outputContainer: 'wav',
@@ -741,10 +1274,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
           },
         ),
       ),
-    ).toMatchObject({
-      supported: false,
-      reasonCode: 'AIBRUSH_AAC_PCM_EQUIVALENCE_UNSUPPORTED',
-    });
+    ).toMatchObject({ supported: true });
 
     expect(
       decideAibrushSupport(
@@ -1875,8 +2405,27 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
             options: { alpha: 'keep', invariant: 'transcode-effect-aware' },
           }),
         ),
-      ).toEqual({ supported: true });
+      ).toMatchObject({ supported: true });
     }
+
+    const opaqueLetterbox = request('transcode', 'webm', [{ type: 'video', codec: 'vp9' }], {
+      scenarioId: 'transcode/h264_pad_letterbox_4x3_to_16x9',
+      inputId: 'vp9_alpha.webm',
+      outputContainer: 'mp4',
+      videoCodec: 'h264',
+      options: {
+        video: { codec: 'h264', width: 1_280, height: 720 },
+        pad: { width: 1_280, height: 720, color: 'black' },
+        invariant: 'transcode-effect-aware',
+      },
+    });
+    expect(decideAibrushSupport(opaqueLetterbox)).toMatchObject({
+      supported: false,
+      status: 'NA_ENGINE',
+      reasonCode: 'AIBRUSH_H264_ALPHA_PRESERVATION_UNSUPPORTED',
+    });
+    opaqueLetterbox.inputs[0]!.id = 'opaque-vp9.webm';
+    expect(decideAibrushSupport(opaqueLetterbox)).toMatchObject({ supported: true });
 
     const exactRoundtrip = request('transcode', 'mp4', [VIDEO, AUDIO], {
       scenarioId: 'transcode/roundtrip_leg1_h264_to_vp9',
@@ -1885,10 +2434,7 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       videoCodec: 'vp9',
       audioCodec: 'opus',
     });
-    expect(decideAibrushSupport(exactRoundtrip)).toMatchObject({
-      supported: false,
-      reasonCode: 'AIBRUSH_H264_VP9_ROUNDTRIP_QUALITY_BOUND',
-    });
+    expect(decideAibrushSupport(exactRoundtrip)).toMatchObject({ supported: true });
     exactRoundtrip.inputs[0]!.id = 'scenarios/transcode/roundtrip_leg1_h264_to_vp9/02.mp4';
     expect(decideAibrushSupport(exactRoundtrip)).toMatchObject({
       supported: true,
@@ -1908,82 +2454,24 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       reasonCode: string;
     }> = [
       {
-        scenarioId: 'transcode/bframe_reorder_h264_to_vp9',
-        inputId: 'scenarios/transcode/bframe_reorder_h264_to_vp9/03.mp4',
-        inputContainer: 'mp4',
-        tracks: [VIDEO, AUDIO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        audioCodec: 'opus',
-        reasonCode: 'AIBRUSH_BFRAME_VP9_PORTRAIT_QUALITY_BOUND',
-      },
-      {
-        scenarioId: 'transcode/h264_to_vp9_webm',
-        inputId: 'scenarios/transcode/h264_to_vp9_webm/02.mp4',
-        inputContainer: 'mp4',
-        tracks: [VIDEO, AUDIO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        audioCodec: 'opus',
-        reasonCode: 'AIBRUSH_H264_VP9_QUALITY_BOUND',
-      },
-      {
-        scenarioId: 'transcode/h264_to_vp9_webm',
-        inputId: 'scenarios/transcode/h264_to_vp9_webm/03.mp4',
-        inputContainer: 'mp4',
-        tracks: [VIDEO, AUDIO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        audioCodec: 'opus',
-        reasonCode: 'AIBRUSH_H264_VP9_QUALITY_BOUND',
-      },
-      {
-        scenarioId: 'transcode/vp9_to_av1_webm',
-        inputId: 'scenarios/transcode/vp9_to_av1_webm/02.webm',
-        inputContainer: 'webm',
-        tracks: [
-          { type: 'video', codec: 'vp9' },
-          { type: 'audio', codec: 'opus' },
-        ],
-        outputContainer: 'webm',
-        videoCodec: 'av1',
-        reasonCode: 'AIBRUSH_VP9_AV1_QUALITY_BOUND',
-      },
-      {
-        scenarioId: 'transcode/h264_to_av1_mp4',
-        inputId: 'scenarios/transcode/h264_to_av1_mp4/03.mp4',
+        scenarioId: 'transcode/h264_two_pass_bitrate',
+        inputId: 'scenarios/transcode/h264_two_pass_bitrate/02.mp4',
         inputContainer: 'mp4',
         tracks: [VIDEO, AUDIO],
         outputContainer: 'mp4',
-        videoCodec: 'av1',
-        reasonCode: 'AIBRUSH_H264_AV1_PORTRAIT_QUALITY_BOUND',
+        videoCodec: 'h264',
+        options: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
+        reasonCode: 'AIBRUSH_H264_TWO_PASS_QUALITY_BOUND',
       },
       {
-        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
-        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/01.mp4',
+        scenarioId: 'transcode/h264_two_pass_bitrate',
+        inputId: 'scenarios/transcode/h264_two_pass_bitrate/03.mp4',
         inputContainer: 'mp4',
-        tracks: [VIDEO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
-      },
-      {
-        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
-        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/02.mp4',
-        inputContainer: 'mp4',
-        tracks: [VIDEO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
-      },
-      {
-        scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
-        inputId: 'scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/03.mp4',
-        inputContainer: 'mp4',
-        tracks: [VIDEO],
-        outputContainer: 'webm',
-        videoCodec: 'vp9',
-        reasonCode: 'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
+        tracks: [VIDEO, AUDIO],
+        outputContainer: 'mp4',
+        videoCodec: 'h264',
+        options: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
+        reasonCode: 'AIBRUSH_H264_TWO_PASS_QUALITY_BOUND',
       },
       {
         scenarioId: 'transcode/vp9_to_vp8_webm',
@@ -2011,16 +2499,6 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
         audioCodec: 'vorbis',
         reasonCode: 'AIBRUSH_VP9_VP8_QUALITY_BOUND',
       },
-      {
-        scenarioId: 'transcode/wav_to_vorbis_ogg',
-        inputId: 'scenarios/transcode/wav_to_vorbis_ogg/03.wav',
-        inputContainer: 'wav',
-        tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels: 2 }],
-        outputContainer: 'ogg',
-        audioCodec: 'vorbis',
-        options: { invariant: 'transcode-audio-content' },
-        reasonCode: 'AIBRUSH_VORBIS_OGG_CONTINUATION_UNSUPPORTED',
-      },
     ];
 
     for (const row of rows) {
@@ -2041,10 +2519,131 @@ describe('REQ-ENG-32: aibrush-media concrete tuple applicability', () => {
       expect(decideAibrushSupport(concrete), `${row.scenarioId} neighbor`).toMatchObject({ supported: true });
     }
   });
+
+  test('admits the repaired implicit VP9 and AV1 quality variants', () => {
+    const rows = [
+      {
+        scenarioId: 'transcode/bframe_reorder_h264_to_vp9',
+        inputId: 'scenarios/transcode/bframe_reorder_h264_to_vp9/03.mp4',
+        outputContainer: 'webm',
+        videoCodec: 'vp9',
+        audioCodec: 'opus',
+      },
+      ...['02.mp4', '03.mp4'].map((file) => ({
+        scenarioId: 'transcode/h264_to_vp9_webm',
+        inputId: `scenarios/transcode/h264_to_vp9_webm/${file}`,
+        outputContainer: 'webm',
+        videoCodec: 'vp9',
+        audioCodec: 'opus',
+      })),
+      {
+        scenarioId: 'transcode/h264_to_av1_mp4',
+        inputId: 'scenarios/transcode/h264_to_av1_mp4/03.mp4',
+        outputContainer: 'mp4',
+        videoCodec: 'av1',
+        audioCodec: undefined,
+      },
+    ] as const;
+
+    for (const row of rows) {
+      expect(
+        decideAibrushSupport(
+          request('transcode', 'mp4', [VIDEO, AUDIO], {
+            scenarioId: row.scenarioId,
+            inputId: row.inputId,
+            outputContainer: row.outputContainer,
+            videoCodec: row.videoCodec,
+            ...(row.audioCodec !== undefined ? { audioCodec: row.audioCodec } : {}),
+          }),
+        ),
+        row.inputId,
+      ).toMatchObject({ supported: true });
+    }
+  });
+
+  test('admits the repaired 44.1 kHz stereo Vorbis candidate', () => {
+    const concrete = request(
+      'transcode',
+      'wav',
+      [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels: 2 }],
+      {
+        scenarioId: 'transcode/wav_to_vorbis_ogg',
+        inputId: 'scenarios/transcode/wav_to_vorbis_ogg/03.wav',
+        outputContainer: 'ogg',
+        audioCodec: 'vorbis',
+        options: { invariant: 'transcode-audio-content' },
+      },
+    );
+
+    expect(decideAibrushSupport(concrete)).toEqual({ supported: true });
+  });
+
+  test('admits the presentation-complete VP9 resize variants', () => {
+    for (const file of ['01.mp4', '02.mp4', '03.mp4']) {
+      const decision = decideAibrushSupport(
+        request('transcode', 'mp4', [VIDEO], {
+          scenarioId: 'transcode/video_only_h264_resize_360p_to_vp9_webm',
+          inputId: `scenarios/transcode/video_only_h264_resize_360p_to_vp9_webm/${file}`,
+          outputContainer: 'webm',
+          videoCodec: 'vp9',
+          outputWidth: 640,
+          outputHeight: 360,
+          transforms: { resize: { width: 640, height: 360 } },
+          options: { video: { codec: 'vp9', width: 640, height: 360, bitrate: 4_000_000 } },
+        }),
+      );
+      expect(decision, file).toMatchObject({
+        supported: true,
+        browserConfigs: expect.arrayContaining([
+          expect.objectContaining({
+            role: 'video-encoder',
+            config: expect.objectContaining({ codec: 'vp09.00.10.08', width: 640, height: 360 }),
+          }),
+        ]),
+      });
+    }
+  });
+
+  test('admits the repaired exact VP9 to AV1 candidate', () => {
+    const decision = decideAibrushSupport(
+      request(
+        'transcode',
+        'webm',
+        [
+          {
+            type: 'video',
+            codec: 'vp9',
+            nativeCodecTag: 'vp09.00.10.08',
+            width: 1_920,
+            height: 1_080,
+            fps: 30,
+          },
+          { type: 'audio', codec: 'opus', nativeCodecTag: 'opus', sampleRate: 48_000, channels: 2 },
+        ],
+        {
+          scenarioId: 'transcode/vp9_to_av1_webm',
+          inputId: 'scenarios/transcode/vp9_to_av1_webm/02.webm',
+          outputContainer: 'webm',
+          videoCodec: 'av1',
+          options: { video: { codec: 'av1' } },
+        },
+      ),
+    );
+
+    expect(decision).toMatchObject({
+      supported: true,
+      browserConfigs: expect.arrayContaining([
+        expect.objectContaining({
+          role: 'video-encoder',
+          config: expect.objectContaining({ codec: 'av01.0.04M.08', width: 1_920, height: 1_080 }),
+        }),
+      ]),
+    });
+  });
 });
 
 describe('REQ-ENG-32: exact framework error taxonomy', () => {
-  const classes = { CapabilityError, InputError };
+  const classes = { CapabilityError, ConstraintUnsatisfiedError, InputError };
 
   test('uses the exact CapabilityError class/code and ignores diagnostic prose', () => {
     const error = new CapabilityError('completely rewritten diagnostic');
@@ -2123,6 +2722,66 @@ describe('REQ-ENG-32: exact framework error taxonomy', () => {
       ),
     ).toBe(error);
   });
+
+  test('translates the exact bounded constraint class into a semantic failure with attempt evidence', () => {
+    const evidence = {
+      constraint: 'h264-quality-rate',
+      preferredAverageBitrate: 2_000_000,
+      maxAverageBitrate: 2_600_000,
+      minimumQualityMean: 0.95,
+      metric: 'ssim-luma-v1',
+      attempts: [{
+        attempt: 1,
+        targetBytes: 250_000,
+        actualBytes: 240_000,
+        averageBitrate: 1_920_000,
+        qualityMean: 0.92,
+        qualitySamples: 8,
+      }],
+    } as const;
+    const frameworkError = new ConstraintUnsatisfiedError('no bounded candidate met both constraints', evidence);
+    expect(classifyAibrushFrameworkError(frameworkError, classes)).toEqual({
+      kind: 'constraint',
+      code: 'constraint-unsatisfied',
+      reason: 'no bounded candidate met both constraints',
+      evidence,
+    });
+
+    const translated = captureThrown(() =>
+      translateAibrushFrameworkError(
+        'transcode',
+        frameworkError,
+        classes,
+        undefined,
+        undefined,
+        () => false,
+        (_op, reason) => new Error(reason),
+      ),
+    );
+    expect(isOperationConstraintUnsatisfiedError(translated)).toBe(true);
+    expect(translated).toMatchObject({
+      reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED',
+      operation: 'transcode',
+      evidence,
+    });
+    expect(isOperationConstraintUnsatisfiedError(structuredClone(translated))).toBe(true);
+  });
+
+  test('does not trust a foreign constraint-unsatisfied lookalike', () => {
+    const foreign = Object.assign(new Error('no bounded candidate'), {
+      name: 'ConstraintUnsatisfiedError',
+      code: 'constraint-unsatisfied',
+      detail: {
+        constraint: 'h264-quality-rate',
+        preferredAverageBitrate: 2_000_000,
+        maxAverageBitrate: 2_600_000,
+        minimumQualityMean: 0.95,
+        metric: 'ssim-luma-v1',
+        attempts: [],
+      },
+    });
+    expect(classifyAibrushFrameworkError(foreign, classes).kind).toBe('fault');
+  });
 });
 
 function request(
@@ -2137,8 +2796,10 @@ function request(
     mutated?: boolean;
     scenarioId?: string;
     inputId?: string;
+    inputSizeBytes?: number;
     outputWidth?: number;
     outputHeight?: number;
+    outputSampleRate?: number;
     transforms?: ConcreteOperationRequest['transforms'];
   } = {},
 ): ConcreteOperationRequest {
@@ -2157,7 +2818,7 @@ function request(
         mutated: overrides.mutated ?? false,
         sourceEvidence: 'RESOLVED',
         tracks,
-        sizeBytes: 1_024,
+        sizeBytes: overrides.inputSizeBytes ?? 1_024,
       },
     ],
     ...(overrides.outputContainer !== undefined
@@ -2168,6 +2829,9 @@ function request(
             ...(overrides.audioCodec !== undefined ? { audioCodec: overrides.audioCodec } : {}),
             ...(overrides.outputWidth !== undefined ? { width: overrides.outputWidth } : {}),
             ...(overrides.outputHeight !== undefined ? { height: overrides.outputHeight } : {}),
+            ...(overrides.outputSampleRate !== undefined
+              ? { sampleRate: overrides.outputSampleRate }
+              : {}),
           },
         }
       : {}),
@@ -2304,7 +2968,7 @@ function restoreGlobal(name: string, descriptor: PropertyDescriptor | undefined)
 }
 
 describe('performance evidence boundaries', () => {
-  test('quality, remux, and massive packet limits are exact pre-content decisions', () => {
+  test('quality and massive packet limits are exact pre-content decisions', () => {
     const quality = request('transcode', 'mp4', [VIDEO, AUDIO], {
       scenarioId: 'performance/convert-longtasks',
       inputId: 'scenarios/performance/convert-longtasks/03.mp4',
@@ -2330,12 +2994,53 @@ describe('performance evidence boundaries', () => {
       preContent: true,
     });
 
-    quality.scenarioId = 'performance/encode-fps';
-    quality.inputs[0]!.id = 'scenarios/performance/encode-fps/03.mp4';
-    expect(decideAibrushSupport(quality)).toMatchObject({
-      supported: false,
-      reasonCode: 'AIBRUSH_PERFORMANCE_ENCODE_QUALITY_BOUND',
-      preContent: true,
-    });
+  });
+
+  test('source-resolution performance rows probe the exact runtime 1920x1080 VP9 tuple', () => {
+    for (const scenarioId of [
+      'performance/encode-fps',
+      'performance/metamorphic-transcode-idempotent-source-res',
+    ]) {
+      const sourceResolution = request('transcode', 'mp4', [VIDEO, AUDIO], {
+        scenarioId,
+        inputId: 'h264_1080p_30s.mp4',
+        outputContainer: 'webm',
+        videoCodec: 'vp9',
+        audioCodec: 'opus',
+        outputWidth: 1_920,
+        outputHeight: 1_080,
+        options: {
+          container: 'webm',
+          video: { codec: 'vp9', width: 1_920, height: 1_080 },
+          audio: { codec: 'opus' },
+        },
+        transforms: { resize: { width: 1_920, height: 1_080 } },
+      });
+
+      expect(decideAibrushSupport(sourceResolution), scenarioId).toEqual({
+        supported: true,
+        browserConfigs: [
+          {
+            role: 'video-decoder',
+            trackIndex: 0,
+            config: {
+              codec: 'avc1.640028',
+              codedWidth: 1_920,
+              codedHeight: 1_080,
+            },
+          },
+          {
+            role: 'video-encoder',
+            config: {
+              codec: 'vp09.00.10.08',
+              width: 1_920,
+              height: 1_080,
+              bitrate: 2_000_000,
+              framerate: 30,
+            },
+          },
+        ],
+      });
+    }
   });
 });

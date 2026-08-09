@@ -1091,7 +1091,7 @@ const STATUSES = new Set<ResultStatus>([
 ]);
 const ORACLES = new Set<OracleId>([
   'golden-metadata', 'golden-packets', 'decoded-frames-bitexact', 'decoded-audio-pcm',
-  'reference-reimport', 'playback-smoke', 'ssim-psnr', 'mp4-box-layout', 'webm-live-layout',
+  'reference-reimport', 'playback-smoke', 'ssim-psnr', 'average-bitrate', 'mp4-box-layout', 'webm-live-layout',
   'fanout-renditions', 'alpha-plane', 'seek-accuracy', 'trim-boundaries', 'decrypt-bitexact',
   'graceful-failure', 'property-invariant',
 ]);

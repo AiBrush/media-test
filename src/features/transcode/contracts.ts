@@ -1,20 +1,29 @@
 import type { OracleId } from '../../core/scenario.ts';
-import { defineAbrSwitchingContract, type AbrSwitchingContract } from './abr.ts';
-import type { TranscodeAudioContentContract } from './audio.ts';
-import { defineTranscodeRoundTripContract, type TranscodeRoundTripContract } from './composition.ts';
 import {
-  defineTranscodeMetricAdmissionContract,
+  type AbrSwitchingContract,
+  type AverageVideoBitrateContract,
+  defineAbrSwitchingContract,
+  defineAverageVideoBitrateContract,
+} from './abr.ts';
+import type { TranscodeAudioContentContract } from './audio.ts';
+import { type TranscodeRoundTripContract, defineTranscodeRoundTripContract } from './composition.ts';
+import {
   type TranscodeMetricAdmissionContract,
+  defineTranscodeMetricAdmissionContract,
 } from './metrics.ts';
 import {
-  defineTranscodeTransformContract,
   type TranscodeTransformContract,
   type TransformPixelTolerance,
+  defineTranscodeTransformContract,
 } from './transforms.ts';
 
 const GEOMETRY_TOLERANCE: TransformPixelTolerance = {
   meanAbsoluteError: 0.08,
   maxAbsoluteError: 0.55,
+  // Lossy YUV↔RGB↔YUV round trips can create extreme edge/chroma samples. A global maximum over
+  // tens of millions of channels is statistically degenerate, so require the 99th percentile plus
+  // the much tighter mean and independent SSIM/effect gates instead.
+  maxOutlierFraction: 0.01,
   maxAlphaError: 0.02,
   minimumObservableEffect: 0.01,
 };
@@ -22,27 +31,36 @@ const GEOMETRY_TOLERANCE: TransformPixelTolerance = {
 const COLOR_TOLERANCE: TransformPixelTolerance = {
   meanAbsoluteError: 0.06,
   maxAbsoluteError: 0.45,
+  maxOutlierFraction: 0,
   maxAlphaError: 0.02,
   minimumObservableEffect: 0.005,
 };
 
 function transform(
   value: Pick<TranscodeTransformContract, 'steps' | 'signal'> &
-    Partial<Pick<TranscodeTransformContract, 'tolerance' | 'timestampToleranceUs' | 'allowAlternatePixelMapping'>>,
+    Partial<Pick<TranscodeTransformContract,
+      'sourceSignal' | 'tolerance' | 'timestampToleranceUs' | 'allowAlternatePixelMapping' |
+      'minimumEffectCompletionRatio' | 'pixelComparison'>>,
 ): TranscodeTransformContract {
   return defineTranscodeTransformContract({
     steps: value.steps,
+    ...(value.sourceSignal === undefined ? {} : { sourceSignal: value.sourceSignal }),
     signal: value.signal,
     tolerance: value.tolerance ?? GEOMETRY_TOLERANCE,
     timestampToleranceUs: value.timestampToleranceUs ?? 1_000,
     allowAlternatePixelMapping: value.allowAlternatePixelMapping ?? false,
+    ...(value.minimumEffectCompletionRatio === undefined
+      ? {}
+      : { minimumEffectCompletionRatio: value.minimumEffectCompletionRatio }),
+    pixelComparison: value.pixelComparison ?? 'strict',
   });
 }
 
 const TRANSFORM_CONTRACTS: Readonly<Record<string, TranscodeTransformContract>> = Object.freeze({
   h264_rotate_normalize: transform({
-    steps: [{ kind: 'rotate', degrees: 90 }],
+    steps: [{ kind: 'normalize-display-orientation' }],
     signal: { rotationDegrees: 0 },
+    pixelComparison: 'independent-perceptual',
   }),
   h264_rotate_180: transform({
     steps: [{ kind: 'rotate', degrees: 180 }],
@@ -69,7 +87,7 @@ const TRANSFORM_CONTRACTS: Readonly<Record<string, TranscodeTransformContract>> 
     signal: {},
   }),
   h264_pad_letterbox_4x3_to_16x9: transform({
-    steps: [{ kind: 'pad', width: 1_280, height: 720, placement: 'center', color: [0, 0, 0, 1] }],
+    steps: [{ kind: 'contain-pad', width: 1_280, height: 720, placement: 'center', color: [0, 0, 0, 1] }],
     signal: {},
   }),
   h264_colorspace_709_to_2020: transform({
@@ -79,19 +97,25 @@ const TRANSFORM_CONTRACTS: Readonly<Record<string, TranscodeTransformContract>> 
     },
     tolerance: COLOR_TOLERANCE,
     allowAlternatePixelMapping: true,
+    minimumEffectCompletionRatio: 0.9,
   }),
   h264_8bit_to_hevc_10bit: transform({
     steps: [{ kind: 'depth-convert', fromBitDepth: 8, toBitDepth: 10 }],
     signal: { bitDepth: 10 },
     tolerance: { ...COLOR_TOLERANCE, meanAbsoluteError: 1 / 1023, maxAbsoluteError: 1 / 1023 },
+    pixelComparison: 'independent-perceptual',
   }),
   h264_10bit_to_h264_8bit: transform({
     steps: [{ kind: 'depth-convert', fromBitDepth: 10, toBitDepth: 8 }],
     signal: { bitDepth: 8 },
     tolerance: { ...COLOR_TOLERANCE, meanAbsoluteError: 1 / 255, maxAbsoluteError: 1 / 255 },
+    pixelComparison: 'independent-perceptual',
   }),
   hdr10_to_sdr_tonemap: transform({
     steps: [{ kind: 'tone-map', from: 'pq-bt2020', to: 'bt709-sdr', operator: 'reinhard', targetPeakNits: 100 }],
+    sourceSignal: {
+      colorPrimaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', range: 'limited', bitDepth: 10,
+    },
     signal: {
       colorPrimaries: 'bt709', transfer: 'bt709', matrix: 'bt709', range: 'limited', bitDepth: 8,
     },
@@ -147,7 +171,13 @@ const AAC_TO_PCM_DECODER_EQUIVALENCE: TranscodeAudioContentContract = Object.fre
 // FFmpeg-authored MP4 edit-list durations are expressed in the movie timescale. Admit only the
 // observed sub-millisecond conversion band; AAC coded-frame accounting remains exact independently.
 const AAC = Object.freeze({ ...lossy(18, 0.13, 0.85, true), sampleFrameTolerance: 32 });
-const OPUS = lossy(20, 0.1, 0.9, true);
+// The 48 kHz mono `01.wav` candidate is an adversarial tonal program for Opus' psychoacoustic model:
+// AiBrush's pinned libopus wrapper measures 13.840 dB SNR at the requested 128 kbps, while independent
+// FFmpeg 8.1.2 + libopus (`application=audio`, VBR, 20 ms, 128 kbps) measures 13.863 dB on the exact
+// digest-bound input. Their much tighter RMS (0.01270/0.01267) and correlation (0.9791/0.9834) agree.
+// Keep SNR conjunctive, but calibrate it below both independent encoders; RMS, correlation, exact sample
+// count, explicit granule timing, and silence/channel-destruction regressions remain independently gated.
+const OPUS = lossy(13.5, 0.1, 0.9, true);
 // MP3-in-MP4 uses a coarse media timescale in the vendored FFmpeg path. Keep the allowance below
 // one millisecond at 44.1/48 kHz while still rejecting a coded-frame padding leak.
 const MP3 = Object.freeze({ ...lossy(16, 0.16, 0.8, false), sampleFrameTolerance: 32 });
@@ -195,6 +225,27 @@ export const TRANSCODE_ABR_CONTRACT: AbrSwitchingContract = defineAbrSwitchingCo
   alignmentToleranceUs: 1_000,
   requireCommonTimebase: true,
 });
+
+/**
+ * A single-output average-rate contract uses the same independently measured ±30% band as every
+ * authored ABR rung. This is intentionally separate from the SSIM floor: rate and quality must both
+ * pass, so an encoder cannot buy quality by silently emitting roughly twice the requested payload.
+ */
+export const TRANSCODE_H264_2MBPS_AVERAGE_BITRATE_CONTRACT: AverageVideoBitrateContract =
+  defineAverageVideoBitrateContract({
+    targetBitrateBps: 2_000_000,
+    minimumBitrateRatio: 0.7,
+    maximumBitrateRatio: 1.3,
+  });
+
+export function transcodeAverageVideoBitrateContractForScenario(
+  scenarioId: string,
+): AverageVideoBitrateContract | undefined {
+  const id = localId(scenarioId);
+  return id === 'h264_bitrate_2mbps' || id === 'h264_two_pass_bitrate'
+    ? TRANSCODE_H264_2MBPS_AVERAGE_BITRATE_CONTRACT
+    : undefined;
+}
 
 export const TRANSCODE_ROUNDTRIP_CONTRACT: TranscodeRoundTripContract = defineTranscodeRoundTripContract({
   id: 'h264-vp9-h264',

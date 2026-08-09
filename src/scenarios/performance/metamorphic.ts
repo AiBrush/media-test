@@ -12,7 +12,7 @@
  *      reference-source fallback today; gates on real golden frames once the frame-bake commits them.)
  *
  *   2. probe-duration-cross-container (§A.16 'probe(x).dur consistent across containers'):
- *      op=remux MP4 → WebM with options.invariant='probe-duration'. The op produces ctx.output, then
+ *      op=remux MP4 → Matroska with options.invariant='probe-duration'. The op produces ctx.output, then
  *      property-invariant re-probes the remuxed output via the REFERENCE engine and asserts its
  *      duration ≈ golden duration (the property-invariant 'probe-duration' branch — which needs an
  *      OUTPUT to probe, so it CANNOT run on a bare probe op; remux is the correct carrier). golden meta
@@ -39,6 +39,7 @@
 import { VFR_ASSET, mp4H264In, perfCase, T_FAST } from './_shared.ts';
 import type { Scenario } from '../../core/scenario.ts';
 import type { TranscodeOptions } from '../../core/engine.ts';
+import { MEDIUM_1080P_30S_CANDIDATE_ENVELOPE } from '../_candidate-envelopes.ts';
 
 // 1) transcode idempotent at source resolution (1:1 geometry no-op) — tight SSIM floor.
 const SOURCE_RES_CONVERT: TranscodeOptions = {
@@ -49,8 +50,10 @@ const SOURCE_RES_CONVERT: TranscodeOptions = {
 
 const transcodeIdempotent: Scenario = perfCase({
   id: 'performance/metamorphic-transcode-idempotent-source-res',
+  revision: 2,
   op: 'transcode',
   input: 'h264_1080p_30s.mp4',
+  candidateEnvelope: MEDIUM_1080P_30S_CANDIDATE_ENVELOPE,
   options: SOURCE_RES_CONVERT,
   requires: {
     operations: ['transcode'],
@@ -77,13 +80,14 @@ const transcodeIdempotent: Scenario = perfCase({
 // 2) probe-duration consistent across containers — remux carries the invariant (probe needs output).
 const probeDurationCrossContainer: Scenario = perfCase({
   id: 'performance/metamorphic-probe-duration-cross-container',
+  revision: 2,
   op: 'remux',
   input: 'h264_1080p_30s.mp4',
-  options: { container: 'webm', invariant: 'probe-duration' },
+  options: { container: 'mkv', invariant: 'probe-duration' },
   requires: {
     operations: ['remux'],
     containersIn: ['mp4'],
-    containersOut: ['webm'],
+    containersOut: ['mkv'],
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
   },
@@ -92,7 +96,7 @@ const probeDurationCrossContainer: Scenario = perfCase({
   primary: 'throughputRealtime',
   timeoutMs: T_FAST,
   notes:
-    `§A.16 probe-duration across containers: remux h264_1080p_30s.mp4 → WebM, then property-invariant ` +
+    `§A.16 probe-duration across containers: remux h264_1080p_30s.mp4 → Matroska, then property-invariant ` +
     `re-probes the output and asserts duration ≈ golden. Rank source-presentation seconds / wall-second.`,
 });
 

@@ -191,6 +191,39 @@ describe('REQ-FEAT-77: structured disposition and survivor contracts', () => {
 });
 
 describe('REQ-FEAT-78: production Worker isolation and resource evidence', () => {
+  test('aibrush demux→mux packet roundtrip bootstraps core in a Worker and disposes exactly once', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/tiny_h264_360p_2s.mp4').arrayBuffer(),
+    );
+    const sha256 = new Bun.CryptoHasher('sha256').update(bytes).digest('hex');
+    type Response =
+      | { state: 'RESULT'; result: { status: string; oracleOutcomes: unknown[] }; disposeCalls: number }
+      | { state: 'ERROR'; message: string };
+    const response = await runTerminableWorker<
+      { bytes: Uint8Array; sha256: string },
+      Response
+    >(
+      () => new Worker(
+        new URL('./engine-aibrush-media-robustness.worker.ts', import.meta.url),
+        { type: 'module' },
+      ),
+      { bytes, sha256 },
+      { timeoutMs: 30_000 },
+    );
+
+    expect(response.state).toBe('RESULT');
+    if (response.state !== 'RESULT') throw new Error(response.message);
+    expect(response.result.status).toBe('PASS');
+    expect(response.result.oracleOutcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        state: 'VERDICT',
+        verdict: 'PASS',
+        oracle: 'property-invariant',
+      }),
+    ]));
+    expect(response.disposeCalls).toBe(1);
+  }, 30_000);
+
   test('the real robustness worker measures and enforces its memory ceiling', async () => {
     const scenario = robustnessScenarios.find((entry) => entry.id === 'robustness/edge_video_only_micro_probe');
     expect(scenario).toBeDefined();

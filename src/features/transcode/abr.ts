@@ -11,6 +11,7 @@ import {
 export const TRANSCODE_ABR_SCHEMA = 'media-test/transcode-abr@1' as const;
 export const TRANSCODE_ABR_RENDITION_SET_ROLE = 'transcode-abr-rendition-set' as const;
 export const TRANSCODE_ABR_SWITCH_ROLE_PREFIX = 'transcode-abr-switch:' as const;
+export const TRANSCODE_AVERAGE_VIDEO_BITRATE_SCHEMA = 'media-test/transcode-average-video-bitrate@1' as const;
 
 /** Stable intermediate role for a neutrally decodable, actually stitched adjacent-rung switch. */
 export function transcodeAbrSwitchRole(fromId: string, toId: string, switchPointUs: number): string {
@@ -32,6 +33,8 @@ export interface AbrRenditionEvidence {
   readonly width: number;
   readonly height: number;
   readonly bitrateBps: number;
+  /** Sum of elementary video sample payload bytes; excludes audio and container overhead. */
+  readonly videoSamplePayloadBytes: number;
   readonly durationUs: number;
   readonly timebase: Readonly<{ numerator: number; denominator: number }>;
   readonly samples: readonly AbrSampleInterval[];
@@ -39,6 +42,25 @@ export interface AbrRenditionEvidence {
   readonly validity: TranscodeDecision;
   readonly quality: TranscodeDecision;
 }
+
+export interface AverageVideoBitrateContract {
+  readonly schema: typeof TRANSCODE_AVERAGE_VIDEO_BITRATE_SCHEMA;
+  readonly targetBitrateBps: number;
+  readonly minimumBitrateRatio: number;
+  readonly maximumBitrateRatio: number;
+}
+
+export interface AverageVideoBitrateEvidence {
+  /** Sum of elementary video sample payload bytes; never the whole output file size. */
+  readonly videoSamplePayloadBytes: number;
+  /** max(video PTS + duration) - min(video PTS), in microseconds. */
+  readonly presentationSpanUs: number;
+  readonly sampleCount: number;
+}
+
+export type AverageVideoBitrateEvidenceResult =
+  | Readonly<{ state: 'OK'; value: AverageVideoBitrateEvidence }>
+  | Readonly<{ state: 'BLOCKED'; decision: TranscodeDecision }>;
 
 export type AbrRenditionEvidenceResult =
   | Readonly<{ state: 'OK'; value: AbrRenditionEvidence }>
@@ -107,6 +129,86 @@ export function defineAbrSwitchingContract(
     throw new TypeError('ABR tolerances must be finite and non-negative');
   }
   return deepFreeze({ schema: TRANSCODE_ABR_SCHEMA, ...value });
+}
+
+export function defineAverageVideoBitrateContract(
+  value: Omit<AverageVideoBitrateContract, 'schema'>,
+): AverageVideoBitrateContract {
+  if (!Number.isFinite(value.targetBitrateBps) || value.targetBitrateBps <= 0 ||
+      !Number.isFinite(value.minimumBitrateRatio) || value.minimumBitrateRatio <= 0 ||
+      !Number.isFinite(value.maximumBitrateRatio) ||
+      value.maximumBitrateRatio < value.minimumBitrateRatio) {
+    throw new TypeError('average-video-bitrate contract requires a positive target and ordered positive ratio band');
+  }
+  return deepFreeze({ schema: TRANSCODE_AVERAGE_VIDEO_BITRATE_SCHEMA, ...value });
+}
+
+/**
+ * Reuse the ABR collector's neutral MP4/sample-table path for a single output. The returned
+ * evidence is deliberately limited to elementary video payload bytes and presentation span so a
+ * consumer cannot accidentally substitute whole-file size or a track's declared bitrate field.
+ */
+export function collectAverageVideoBitrateEvidence(
+  output: MediaBytes,
+): AverageVideoBitrateEvidenceResult {
+  const notScored = transcodeVerdict(
+    'PASS',
+    'TRANSCODE_AVERAGE_VIDEO_BITRATE_COLLECTION_ONLY',
+    'single-output collection does not score validity or quality',
+  );
+  const collected = collectAbrRenditionEvidence('single-output', output, notScored, notScored);
+  if (collected.state === 'BLOCKED') return collected;
+  return {
+    state: 'OK',
+    value: Object.freeze({
+      videoSamplePayloadBytes: collected.value.videoSamplePayloadBytes,
+      presentationSpanUs: collected.value.durationUs,
+      sampleCount: collected.value.samples.length,
+    }),
+  };
+}
+
+/** Score the independently observed average video rate against an authored target band. */
+export function evaluateAverageVideoBitrate(
+  contract: AverageVideoBitrateContract,
+  evidence: AverageVideoBitrateEvidence,
+): TranscodeDecision {
+  if (!Number.isSafeInteger(evidence.videoSamplePayloadBytes) || evidence.videoSamplePayloadBytes <= 0 ||
+      !Number.isSafeInteger(evidence.presentationSpanUs) || evidence.presentationSpanUs <= 0 ||
+      !Number.isSafeInteger(evidence.sampleCount) || evidence.sampleCount <= 0) {
+    return transcodeError(
+      'TRANSCODE_AVERAGE_VIDEO_BITRATE_EVIDENCE_INVALID',
+      'average-video-bitrate evidence requires positive integer payload bytes, presentation span, and sample count',
+    );
+  }
+  const bitrateBps = evidence.videoSamplePayloadBytes * 8 * 1_000_000 / evidence.presentationSpanUs;
+  const ratio = bitrateBps / contract.targetBitrateBps;
+  const measurements = {
+    videoSamplePayloadBytes: evidence.videoSamplePayloadBytes,
+    videoPresentationSpanUs: evidence.presentationSpanUs,
+    videoSampleCount: evidence.sampleCount,
+    videoAverageBitrateBps: bitrateBps,
+    videoTargetBitrateBps: contract.targetBitrateBps,
+    videoBitrateRatio: ratio,
+    videoMinimumBitrateBps: contract.targetBitrateBps * contract.minimumBitrateRatio,
+    videoMaximumBitrateBps: contract.targetBitrateBps * contract.maximumBitrateRatio,
+  };
+  if (ratio < contract.minimumBitrateRatio || ratio > contract.maximumBitrateRatio) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_AVERAGE_VIDEO_BITRATE_BAND_MISMATCH',
+      `measured elementary video rate ${Math.round(bitrateBps)}bps is ${ratio.toFixed(3)}x requested; ` +
+        `allowed ${contract.minimumBitrateRatio}..${contract.maximumBitrateRatio}`,
+      measurements,
+    );
+  }
+  return transcodeVerdict(
+    'PASS',
+    'TRANSCODE_AVERAGE_VIDEO_BITRATE_MATCH',
+    `measured elementary video rate ${Math.round(bitrateBps)}bps is ${ratio.toFixed(3)}x requested, ` +
+      `inside ${contract.minimumBitrateRatio}..${contract.maximumBitrateRatio}`,
+    measurements,
+  );
 }
 
 /** Collect authored sample/keyframe/bitrate facts without using a scored engine. */
@@ -499,6 +601,7 @@ function collected(
     value: Object.freeze({
       id, codec, width, height,
       bitrateBps: videoBytes * 8 * 1_000_000 / durationUs,
+      videoSamplePayloadBytes: videoBytes,
       durationUs,
       timebase: Object.freeze({ numerator: 1, denominator: timescale }),
       samples: Object.freeze(samples.map((sample) => Object.freeze({ ...sample }))),

@@ -789,6 +789,7 @@ function logicalPathAssetId(logicalPath: unknown, artifactKind?: string): string
     packets: '.packets.json',
     frames: '.frames.json',
     ssim: '.ssim.json',
+    alpha: '.alpha.json',
     keys: '.keys.json',
     segments: '.segments.json',
   };

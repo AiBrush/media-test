@@ -23,6 +23,7 @@
 
 import type {
   BrowserName,
+  DecodeOptions,
   DemuxResult,
   FrameDigest,
   FrameSink,
@@ -75,6 +76,7 @@ import {
   displayTransformFromOptions,
   parseAlphaEvidenceArtifact,
   seekSequenceContractFromOptions,
+  type AlphaEvidenceArtifact,
   type DecodeSeekVerdict,
   type SeekSequenceObservation,
 } from '../features/decode-seek/index.ts';
@@ -171,15 +173,22 @@ import {
   TRANSCODE_ABR_RENDITION_SET_ROLE,
   TRANSCODE_AUDIO_CONTENT_INVARIANT,
   TRANSCODE_EFFECT_INVARIANT,
+  TRANSCODE_OMITTED_AAC_PRESERVATION_INVARIANT,
   collectAbrRenditionEvidence,
+  collectAverageVideoBitrateEvidence,
   decodedAacPcmFromMp4,
   decodedPcmFromContainer,
+  endpointInclusiveQualitySamplePts,
+  evaluateAverageVideoBitrate,
   evaluateAbrSwitchability,
+  evaluateOmittedAacPreservation,
   evaluateTranscodeRuntimeInvariant,
   readTranscodeAudioStructure,
   readTranscodeTransformSignal,
   transcodeAbrSwitchRole,
+  transcodeAverageVideoBitrateContractForScenario,
   transcodeError,
+  ssimLumaV1QualityContractFromOptions,
   transcodeTransformContractForScenario,
   transcodeUnavailable,
   transcodeVerdict,
@@ -190,6 +199,7 @@ import {
   type DecodedAudioSignal,
   type TranscodeDecision,
   type TranscodePixelFrame,
+  type TransformSignalEvidence,
 } from '../features/transcode/index.ts';
 
 /** No-engine structural read of an engine's OWN output bytes (box-readers.ts). */
@@ -198,7 +208,7 @@ type OutputTrack = OutputStructure['tracks'][number];
 
 // ── Golden store ──────────────────────────────────────────────────────────────────────────────
 
-export type GoldenKind = 'meta' | 'packets' | 'frames' | 'ssim';
+export type GoldenKind = 'meta' | 'packets' | 'frames' | 'ssim' | 'alpha';
 export type GoldenEvidenceState =
   | 'OK'
   | 'NOT_REQUESTED'
@@ -228,6 +238,7 @@ export interface GoldenEvidenceMap {
   packets: GoldenEvidence<PacketInfo[]>;
   frames: GoldenEvidence<FrameDigest[]>;
   ssim: GoldenEvidence<number[][]>;
+  alpha: GoldenEvidence<AlphaEvidenceArtifact>;
 }
 
 export interface GoldenStore {
@@ -235,6 +246,7 @@ export interface GoldenStore {
   packets?: PacketInfo[];
   frames?: FrameDigest[]; // golden decoded-frame digests
   ssimRef?: number[][]; // downsampled luma signatures per reference frame (for ssim-psnr)
+  alpha?: AlphaEvidenceArtifact; // exact timestamp-keyed alpha planes
   raw?: Record<string, unknown>;
   evidence: GoldenEvidenceMap;
 }
@@ -260,14 +272,14 @@ export async function loadGolden(
   const options = typeof baseUrlOrOptions === 'string' ? { baseUrl: baseUrlOrOptions } : baseUrlOrOptions;
   const base = (options.baseUrl ?? 'fixtures/golden').replace(/\/+$/, '');
   const url = (kind: string) => `${base}/${assetId}.${kind}.json`;
-  const requestedKinds = new Set<GoldenKind>(options.requestedKinds ?? ['meta', 'packets', 'frames', 'ssim']);
+  const requestedKinds = new Set<GoldenKind>(options.requestedKinds ?? ['meta', 'packets', 'frames', 'ssim', 'alpha']);
   const notRequested = <T>(kind: GoldenKind): GoldenEvidence<T> => ({
     state: 'NOT_REQUESTED',
     reasonCode: 'GOLDEN_EVIDENCE_NOT_REQUESTED',
     url: url(kind),
   });
 
-  const [meta, packets, frames, ssim] = await Promise.all([
+  const [meta, packets, frames, ssim, alpha] = await Promise.all([
     requestedKinds.has('meta')
       ? loadGoldenEvidence(url('meta'), options.expectedDigests?.meta, parseGoldenMetadata, options.evidenceProvider, 'metadata')
       : Promise.resolve(notRequested<NormalizedMetadata>('meta')),
@@ -280,9 +292,12 @@ export async function loadGolden(
     requestedKinds.has('ssim')
       ? loadGoldenEvidence(url('ssim'), options.expectedDigests?.ssim, parseGoldenSsim, options.evidenceProvider, 'ssim')
       : Promise.resolve(notRequested<number[][]>('ssim')),
+    requestedKinds.has('alpha')
+      ? loadGoldenEvidence(url('alpha'), options.expectedDigests?.alpha, parseGoldenAlpha, options.evidenceProvider, 'alpha')
+      : Promise.resolve(notRequested<AlphaEvidenceArtifact>('alpha')),
   ]);
 
-  const evidence: GoldenEvidenceMap = { meta, packets, frames, ssim };
+  const evidence: GoldenEvidenceMap = { meta, packets, frames, ssim, alpha };
   const store: GoldenStore = { evidence };
   const raw: Record<string, unknown> = {};
 
@@ -302,6 +317,10 @@ export async function loadGolden(
     store.ssimRef = ssim.value;
     raw.ssim = ssim.raw;
   }
+  if (alpha.state === 'OK') {
+    store.alpha = alpha.value;
+    raw.alpha = alpha.raw;
+  }
 
   if (Object.keys(raw).length) store.raw = raw;
   return store;
@@ -319,6 +338,7 @@ export function emptyGoldenStore(baseUrl = 'fixtures/golden'): GoldenStore {
       packets: missing('packets'),
       frames: missing('frames'),
       ssim: missing('ssim'),
+      alpha: missing('alpha'),
     },
   };
 }
@@ -328,7 +348,7 @@ async function loadGoldenEvidence<T>(
   expectedSha256: string | undefined,
   parse: (value: unknown) => T | undefined,
   provider?: GoldenEvidenceProvider,
-  strictKind?: 'metadata' | 'packets' | 'frames' | 'ssim',
+  strictKind?: 'metadata' | 'packets' | 'frames' | 'ssim' | 'alpha',
 ): Promise<GoldenEvidence<T>> {
   if (provider && strictKind) {
     const indexed = await provider.load(strictKind, parse);
@@ -509,6 +529,12 @@ function parseGoldenSsim(value: unknown): number[][] | undefined {
   const parsed = parseSsimRef(value);
   if (!parsed || parsed.some((row) => row.some((item) => !Number.isFinite(item)))) return undefined;
   return parsed;
+}
+
+/** Strict providers pass the canonical payload; the compatibility mirror may contain either form. */
+function parseGoldenAlpha(value: unknown): AlphaEvidenceArtifact | undefined {
+  if (isObject(value) && value.schema === 'media-test/golden-artifact@1') value = value.payload;
+  return parseAlphaEvidenceArtifact(value);
 }
 
 /** Accept either a bare value or a single-key wrapper object ({ packets: [...] } etc.). */
@@ -718,6 +744,9 @@ export interface OracleContext {
       sampling?: 'prefix' | 'uniform';
       durationHintSec?: number;
       sampleTimesSec?: readonly number[];
+      exactPresentationTimes?: NonNullable<DecodeOptions['exactPresentationTimes']>;
+      /** Force the browser presenter/canvas color-management path instead of RGB copyTo(). */
+      presentationColorManaged?: boolean;
     },
   ) => Promise<FrameSink>;
   /** injected by runner: <video> playback smoke test → resolves true if it plays a few frames */
@@ -737,6 +766,7 @@ const ORACLE_IDS = new Set<OracleId>([
   'reference-reimport',
   'playback-smoke',
   'ssim-psnr',
+  'average-bitrate',
   'mp4-box-layout',
   'webm-live-layout',
   'fanout-renditions',
@@ -966,6 +996,8 @@ export async function runOracle(
         return await playbackSmoke(ctx);
       case 'ssim-psnr':
         return await ssimPsnr(ctx, t);
+      case 'average-bitrate':
+        return averageBitrate(ctx);
       case 'mp4-box-layout':
         return mp4BoxLayout(ctx);
       case 'webm-live-layout':
@@ -1012,7 +1044,9 @@ function mp4BoxLayout(ctx: OracleContext): OracleOutcome {
   const oracle: OracleId = 'mp4-box-layout';
   const out = ctx.output;
   if (!out) return fail(oracle, 'no ctx.output to inspect');
-  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const options: Record<string, unknown> = isObject(ctx.scenario.options)
+    ? ctx.scenario.options as Record<string, unknown>
+    : {};
   const outputContainer = normStr(readStringOption(options, ['container']) ?? out.container);
   if (outputContainer !== 'mp4' && outputContainer !== 'mov') {
     return fail(oracle, `output container '${outputContainer || out.container}' is not an ISOBMFF layout target`);
@@ -1133,7 +1167,9 @@ function webmLiveLayout(ctx: OracleContext): OracleOutcome {
   const out = ctx.output;
   if (!out) return fail(oracle, 'no ctx.output to inspect');
 
-  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const options: Record<string, unknown> = isObject(ctx.scenario.options)
+    ? ctx.scenario.options as Record<string, unknown>
+    : {};
   const outputContainer = normStr(readStringOption(options, ['container']) ?? out.container);
   if (outputContainer !== 'webm' && outputContainer !== 'mkv') {
     return fail(oracle, `output container '${outputContainer || out.container}' is not a WebM/Matroska layout target`);
@@ -1958,7 +1994,7 @@ function normalizeContradictedGoldenCadence(
   metadata: NormalizedMetadata,
   packets: readonly PacketInfo[] | undefined,
 ): { metadata: NormalizedMetadata; representationDifferences: string[] } {
-  if (!packets || packets.length < 2) return { metadata, representationDifferences: [] };
+  if (!packets || packets.length === 0) return { metadata, representationDifferences: [] };
   const tracks = metadata.tracks.map((track) => ({ ...track }));
   const representationDifferences: string[] = [];
   for (let trackIndex = 0; trackIndex < tracks.length; trackIndex++) {
@@ -1969,7 +2005,32 @@ function normalizeContradictedGoldenCadence(
     const timeline = packets
       .filter((packet) => packet.trackIndex === trackIndex && Number.isFinite(packet.ptsUs))
       .sort((a, b) => a.ptsUs - b.ptsUs);
-    if (timeline.length < 2) continue;
+    if (timeline.length === 0) continue;
+    if (timeline.length === 1) {
+      // A singleton video presentation has no inter-frame cadence. Containers commonly expose their
+      // media timebase as a nominal rate for attached/poster pictures (for example 90 kHz), while a
+      // demuxer can only report the effective one-presentation program rate. The exact packet table
+      // plus evidenced program duration are authoritative here; this is not a tolerance for a
+      // multi-picture stream, which continues through the interval-based branch below.
+      const programDurationSec = presentationDuration(metadata).value;
+      if (!(programDurationSec != null && Number.isFinite(programDurationSec) && programDurationSec > 0)) continue;
+      const observedIntervalUs = programDurationSec * 1_000_000;
+      const observed = 1 / programDurationSec;
+      if (Math.abs(declared - observed) / Math.min(declared, observed) <= 0.05) continue;
+      track.fps = observed;
+      track.fpsProvenance = {
+        source: 'observed',
+        cadence: 'CFR',
+        sampleCount: 1,
+        observedIntervalUs,
+        envelope: { minFps: observed, maxFps: observed },
+      };
+      representationDifferences.push(
+        `golden video[${trackIndex}] nominal cadence ${declared}fps contradicted by one exact ` +
+          `presentation over the ${programDurationSec.toFixed(6)}s program span; singleton packet cadence is authoritative`,
+      );
+      continue;
+    }
     const startUs = timeline[0]!.ptsUs;
     const endUs = timeline.reduce(
       (end, packet) => Math.max(end, packet.ptsUs + Math.max(0, packet.durationUs ?? 0)),
@@ -4469,6 +4530,10 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
   }
 
   const evidence: AbrRenditionEvidence[] = [];
+  const scenarioOptions: unknown = ctx.scenario.options;
+  const authoredVariants = isObject(scenarioOptions) && Array.isArray(scenarioOptions.variants)
+    ? scenarioOptions.variants
+    : [];
   for (let index = 0; index < variants.length; index++) {
     const variant = variants[index]!;
     const id = renditionIds[index]!;
@@ -4485,7 +4550,11 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
     const validity = played
       ? transcodeVerdict('PASS', 'TRANSCODE_ABR_RENDITION_PLAYABLE', `rendition '${id}' played in the required browser`)
       : transcodeVerdict('FAIL', 'TRANSCODE_ABR_RENDITION_UNPLAYABLE', `rendition '${id}' playback did not advance`);
-    const quality = oracleOutcomeToTranscodeDecision(await ssimPsnr({ ...ctx, output: variant }, t));
+    const authoredVariant = authoredVariants[index];
+    const qualityContext = isObject(authoredVariant)
+      ? abrRenditionOracleContext(ctx, variant, authoredVariant)
+      : { ...ctx, output: variant };
+    const quality = oracleOutcomeToTranscodeDecision(await ssimPsnr(qualityContext, t));
     const collected = collectAbrRenditionEvidence(id, variant, validity, quality);
     if (collected.state === 'BLOCKED') return transcodeDecisionOutcome(oracle, collected.decision);
     evidence.push(collected.value);
@@ -4503,6 +4572,37 @@ async function fanoutRenditions(ctx: OracleContext, t: Required<OracleTolerances
     oracle,
     evaluateAbrSwitchability(TRANSCODE_ABR_CONTRACT, description, evidence, switches),
   );
+}
+
+/**
+ * Score each rendition against the contract authored on that exact variant. Fanout options keep the
+ * per-rung hard-rate/quality tuple under `variants[]`; presenting only the top-level `video` object to
+ * `ssimPsnr` would silently select the generic prefix/uniform sampler instead of the endpoint-inclusive
+ * `ssim-luma-v1` contract. Codec inheritance mirrors the adapter (codec only; every other authority is
+ * per-rung and must be explicit).
+ */
+function abrRenditionOracleContext(
+  ctx: OracleContext,
+  output: MediaBytes,
+  authoredVariant: Record<string, unknown>,
+): OracleContext {
+  const options = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
+  const topLevelVideo = readObjectOption(options, 'video');
+  const inheritedCodec =
+    typeof authoredVariant.codec !== 'string' && typeof topLevelVideo?.codec === 'string'
+      ? { codec: topLevelVideo.codec }
+      : {};
+  return {
+    ...ctx,
+    scenario: {
+      ...ctx.scenario,
+      options: {
+        ...options,
+        video: { ...inheritedCodec, ...authoredVariant },
+      },
+    },
+    output,
+  };
 }
 
 type AbrDescriptionRead =
@@ -4657,6 +4757,31 @@ function upperFirst(value: string): string {
   return value ? value[0]!.toUpperCase() + value.slice(1) : value;
 }
 
+// ── average-bitrate ──────────────────────────────────────────────────────────────────────────
+
+function averageBitrate(ctx: OracleContext): OracleOutcome {
+  const oracle: OracleId = 'average-bitrate';
+  const contract = transcodeAverageVideoBitrateContractForScenario(ctx.scenario.id);
+  if (!contract) {
+    return transcodeDecisionOutcome(oracle, transcodeError(
+      'TRANSCODE_AVERAGE_VIDEO_BITRATE_CONTRACT_NOT_REGISTERED',
+      `scenario '${ctx.scenario.id}' selected average-bitrate without an authored rate contract`,
+    ));
+  }
+  if (!ctx.output) {
+    return transcodeDecisionOutcome(oracle, transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_AVERAGE_VIDEO_BITRATE_OUTPUT_MISSING',
+      'average-bitrate transcode produced no output bytes',
+    ));
+  }
+  const evidence = collectAverageVideoBitrateEvidence(ctx.output);
+  if (evidence.state === 'BLOCKED') {
+    return transcodeDecisionOutcome(oracle, evidence.decision);
+  }
+  return transcodeDecisionOutcome(oracle, evaluateAverageVideoBitrate(contract, evidence.value));
+}
+
 // ── ssim-psnr ────────────────────────────────────────────────────────────────────────────────
 
 const REFERENCE_BROWSER_UNAVAILABLE_CODES = new Set([
@@ -4779,13 +4904,17 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   const transcodeOptions: Record<string, unknown> = isObject(ctx.scenario.options)
     ? ctx.scenario.options
     : {};
-  const uniformSampling = transcodeOptions.fastStart === 'fragmented' || transcodeOptions.fragmented === true;
+  const fragmentedSampling = transcodeOptions.fastStart === 'fragmented' || transcodeOptions.fragmented === true;
   // Committed frame goldens are deliberately prefix samples. A uniformly sampled fragmented output
   // spans the whole presentation window, so pairing it to that prefix is a domain mismatch. Use the
   // uniformly decoded immutable source as the reference for this case, even when a prefix golden is
   // available.
-  const haveGolden = !useReferenceSource && !uniformSampling &&
+  const haveGolden = !useReferenceSource && !fragmentedSampling &&
     ((!!want && want.length > 0) || (!!refSigs && refSigs.length > 0));
+  // A source-reference comparison must sample the same presentation instants from both files. This
+  // is especially important when a source display matrix selects the media-element presenter while
+  // the normalized candidate selects raw WebCodecs; prefix-vs-uniform evidence is incomparable.
+  const uniformReferenceSampling = !haveGolden;
 
   // When there is NO committed golden (a resize/transcode case, or golden pending the in-browser
   // frame-bake), §5.2 says validate against REFERENCE frames, not golden: decode the SOURCE in-browser
@@ -4795,6 +4924,15 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   const maxFrames = haveGolden
     ? Math.max(want?.length ?? 0, refSigs?.length ?? 0) || undefined
     : REFERENCE_SAMPLE;
+  const displayContract = displayTransformFromOptions(ctx.scenario.options);
+
+  // Source-reference evidence is source-anchored: sample the immutable input across its real demux
+  // timeline, then request those exact relative instants from the candidate. Decoding the two files
+  // independently first makes headerless/live-style sources look like short prefixes and can pair
+  // different moments when container duration metadata differs.
+  if (!haveGolden && !displayContract && ctx.output && !ctx.frames) {
+    return ssimVsReferenceSource(oracle, ctx, t);
+  }
 
   // Source the CANDIDATE frame sequence:
   //   • decodeFrames → ctx.frames, the engine's own decoded pixels/digests.
@@ -4816,7 +4954,7 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     try {
       sink = await ctx.decodeWithPlatform(ctx.output, {
         maxFrames,
-        ...(uniformSampling ? {
+        ...(uniformReferenceSampling ? {
           sampling: 'uniform' as const,
           ...(durationHintSec !== undefined ? { durationHintSec } : {}),
         } : {}),
@@ -4856,16 +4994,19 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     ? decodedCandidateFrames.slice(0, want.length)
     : decodedCandidateFrames;
 
-  const displayContract = displayTransformFromOptions(ctx.scenario.options);
   if (displayContract) {
     let reference: FrameSink;
     try {
       const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+      const exactPresentationTimes = displayReferencePresentationTimes(ctx, want, candFrames.length);
       reference = await ctx.decodeWithPlatform({
         bytes: sourceBytes,
         mime: ctx.input.mime,
         container: resolveContainer(undefined, ctx.input.id),
-      }, { maxFrames: candFrames.length });
+      }, {
+        maxFrames: exactPresentationTimes?.timestampsUs.length ?? candFrames.length,
+        ...(exactPresentationTimes !== undefined ? { exactPresentationTimes } : {}),
+      });
     } catch (error) {
       return classifyReferenceDecodeFailure(oracle, 'source', error);
     }
@@ -5032,6 +5173,51 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     : fail(oracle, detail, finiteOnly(measurements));
 }
 
+/**
+ * Select exact immutable-source instants for display-space reference presentation. Committed frame
+ * timestamps are authoritative when present; metadata's observed leading timeline keeps the live
+ * reference independent while a frame sidecar is pending. Candidate timestamps never define the
+ * source origin, so a shifted candidate cannot make its own relabeled timeline pass.
+ */
+function displayReferencePresentationTimes(
+  ctx: OracleContext,
+  committedFrames: readonly FrameDigest[] | undefined,
+  candidateCount: number,
+): NonNullable<DecodeOptions['exactPresentationTimes']> | undefined {
+  const metadataTimeline = ctx.golden.meta?.tracks
+    .find((track) => track.type === 'video')
+    ?.frameTimestampsUs;
+  const authoredMaxFrames = readNumberOption(ctx.scenario.options, ['maxFrames']);
+  const metadataCount = metadataTimeline === undefined
+    ? 0
+    : Math.min(
+        metadataTimeline.length,
+        authoredMaxFrames === undefined
+          ? candidateCount
+          : Math.max(0, Math.floor(authoredMaxFrames)),
+      );
+  const timestampsUs = committedFrames?.length
+    ? committedFrames.map((frame) => frame.ptsUs)
+    : metadataTimeline?.slice(0, metadataCount) ?? [];
+  if (timestampsUs.length === 0) return undefined;
+
+  const metadataOriginUs = metadataTimeline?.[0];
+  const originUs = Number.isSafeInteger(metadataOriginUs) ? metadataOriginUs! : timestampsUs[0]!;
+  if (!Number.isSafeInteger(originUs)) return undefined;
+  let previousPtsUs: number | undefined;
+  for (const ptsUs of timestampsUs) {
+    if (
+      !Number.isSafeInteger(ptsUs) ||
+      ptsUs < originUs ||
+      (previousPtsUs !== undefined && ptsUs <= previousPtsUs)
+    ) {
+      return undefined;
+    }
+    previousPtsUs = ptsUs;
+  }
+  return { originUs, timestampsUs };
+}
+
 function decodeSeekOracleOutcome(oracle: OracleId, decision: DecodeSeekVerdict): OracleOutcome {
   return {
     state: 'VERDICT',
@@ -5054,12 +5240,9 @@ async function ssimVsReferenceSource(
   oracle: OracleId,
   ctx: OracleContext,
   t: Required<OracleTolerances>,
-  candSink: FrameSink,
-  candCount: number,
+  candidateSink?: FrameSink,
+  candidateCount?: number,
 ): Promise<OracleOutcome> {
-  if (typeof candSink.getPixels !== 'function') {
-    return fail(oracle, 'candidate decode exposes no pixels (getPixels) — cannot compute SSIM/PSNR');
-  }
   if (!ctx.input) return fail(oracle, 'no source input available to derive reference frames');
 
   let srcBytes: MediaBytes;
@@ -5071,24 +5254,39 @@ async function ssimVsReferenceSource(
     return fail(oracle, `could not read source bytes for reference decode: ${errMsg(err)}`);
   }
 
-  const sample = Math.min(candCount, 8);
+  const videoOptions = readObjectOption(ctx.scenario.options, 'video');
+  const qualityOptions = videoOptions ? readObjectOption(videoOptions, 'quality') : undefined;
+  const namesSsimLumaV1 = qualityOptions?.metric === 'ssim-luma-v1';
+  const qualityContract = ssimLumaV1QualityContractFromOptions(ctx.scenario.options);
+  if (namesSsimLumaV1 && !qualityContract) {
+    return oracleError(
+      oracle,
+      'TRANSCODE_SSIM_LUMA_V1_CONTRACT_INVALID',
+      'authored ssim-luma-v1 options do not contain a valid minimumMean and bounded sample count',
+    );
+  }
+  if (qualityContract) {
+    if (!ctx.output) return fail(oracle, 'ssim-luma-v1 quality contract has no candidate output bytes');
+    return ssimAtAuthoredQualityAnchors(oracle, ctx, srcBytes, qualityContract);
+  }
+
+  const sample = Math.min(candidateCount ?? 8, 8);
   let srcSink: FrameSink | null | undefined;
+  let durationHintSec: number | undefined;
   try {
-    const options: Record<string, unknown> = isObject(ctx.scenario.options)
-      ? ctx.scenario.options
-      : {};
-    const uniformSampling = options.fastStart === 'fragmented' || options.fragmented === true;
     const goldenDurationSec = ctx.golden.meta?.durationSec;
-    const durationHintSec = typeof goldenDurationSec === 'number' &&
+    durationHintSec = typeof goldenDurationSec === 'number' &&
         Number.isFinite(goldenDurationSec) && goldenDurationSec > 0
       ? goldenDurationSec
       : undefined;
+    const candidateTimesSec = candidateSink
+      ? normalizedFrameTimesSec(candidateSink.frames, sample)
+      : [];
     srcSink = await ctx.decodeWithPlatform(srcBytes, {
       maxFrames: sample,
-      ...(uniformSampling ? {
-        sampling: 'uniform' as const,
-        ...(durationHintSec !== undefined ? { durationHintSec } : {}),
-      } : {}),
+      sampling: 'uniform' as const,
+      ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+      ...(candidateTimesSec.length > 0 ? { sampleTimesSec: candidateTimesSec } : {}),
     });
   } catch (err) {
     return classifyReferenceDecodeFailure(oracle, 'source', err, srcBytes);
@@ -5098,6 +5296,43 @@ async function ssimVsReferenceSource(
       oracle,
       'REFERENCE_SOURCE_PIXELS_UNAVAILABLE',
       'reference source decode returned no pixel-bearing sink',
+    );
+  }
+
+  if (!candidateSink) {
+    if (!ctx.output) return fail(oracle, 'no candidate output available for paired reference sampling');
+    const sourceTimesSec = normalizedFrameTimesSec(srcSink.frames, sample);
+    if (sourceTimesSec.length === 0) {
+      return oracleError(
+        oracle,
+        'REFERENCE_SOURCE_TIMING_UNAVAILABLE',
+        'reference source decode returned no finite presentation timestamps',
+      );
+    }
+    try {
+      candidateSink = await ctx.decodeWithPlatform(ctx.output, {
+        maxFrames: sourceTimesSec.length,
+        sampling: 'uniform',
+        sampleTimesSec: sourceTimesSec,
+        ...(durationHintSec !== undefined ? { durationHintSec } : {}),
+      });
+    } catch (err) {
+      return classifyReferenceDecodeFailure(oracle, 'candidate', err, ctx.output);
+    }
+    candidateCount = Array.isArray(candidateSink.frames) ? candidateSink.frames.length : 0;
+  }
+  if (typeof candidateSink.getPixels !== 'function') {
+    return fail(oracle, 'candidate decode exposes no pixels (getPixels) — cannot compute SSIM/PSNR');
+  }
+  const candSink = candidateSink;
+  const candidatePixels = candidateSink.getPixels;
+  const candCount = candidateCount ?? (Array.isArray(candSink.frames) ? candSink.frames.length : 0);
+  if (candCount === 0) {
+    return classifyReferenceDecodeFailure(
+      oracle,
+      'candidate',
+      { reasonCode: 'REFERENCE_DECODE_EMPTY_AMBIGUOUS' },
+      ctx.output,
     );
   }
   const srcCount = Array.isArray(srcSink.frames) ? srcSink.frames.length : 0;
@@ -5134,7 +5369,7 @@ async function ssimVsReferenceSource(
     let candPx: ImageData | null | undefined;
     let srcPx: ImageData | null | undefined;
     try {
-      candPx = await candSink.getPixels(pair.candidateIndex);
+      candPx = await candidatePixels(pair.candidateIndex);
       srcPx = await srcSink.getPixels(pair.referenceIndex);
     } catch {
       continue;
@@ -5187,6 +5422,216 @@ async function ssimVsReferenceSource(
   return ssimOk ? pass(oracle, detail, measurements) : fail(oracle, detail, measurements);
 }
 
+/**
+ * Acceptance-side recomputation of the public quality objective. The neutral source sample table
+ * supplies every real PTS; both files are then decoded only at the independently selected exact
+ * anchors. This intentionally does not use the generic half-open uniform sweep above.
+ */
+async function ssimAtAuthoredQualityAnchors(
+  oracle: OracleId,
+  ctx: OracleContext,
+  source: MediaBytes,
+  contract: { readonly minimumMean: number; readonly samples: number },
+): Promise<OracleOutcome> {
+  if (!ctx.output) return fail(oracle, 'ssim-luma-v1 quality contract has no candidate output bytes');
+  const sourceRead = readNeutralRemuxProgram(source.bytes, source.container);
+  if (sourceRead.state !== 'OK') {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_TIMELINE_UNAVAILABLE',
+      `neutral source reader returned ${sourceRead.state} [${sourceRead.reasonCode}]`,
+    );
+  }
+  const videoTracks = sourceRead.value.tracks.filter((track) => track.type === 'video');
+  if (videoTracks.length !== 1 || videoTracks[0]!.samples.length === 0) {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_TRACK_SHAPE_INVALID',
+      `quality source requires exactly one non-empty video track; observed ${videoTracks.length}`,
+    );
+  }
+  const rawPts = videoTracks[0]!.samples.map((sample) => sample.ptsUs);
+  if (rawPts.some((ptsUs) => !Number.isSafeInteger(ptsUs))) {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_PTS_INCOMPLETE',
+      'quality source sample table lacks complete safe-integer presentation timestamps',
+    );
+  }
+  const originUs = Math.min(...rawPts as number[]);
+  const relativePts = (rawPts as number[]).map((ptsUs) => ptsUs - originUs);
+  const candidateRead = readNeutralRemuxProgram(ctx.output.bytes, ctx.output.container);
+  if (candidateRead.state !== 'OK') {
+    return fail(
+      oracle,
+      `candidate quality timeline is ${candidateRead.state.toLowerCase()} ` +
+        `[${candidateRead.reasonCode}]`,
+    );
+  }
+  const candidateVideoTracks = candidateRead.value.tracks.filter((track) => track.type === 'video');
+  const candidateRawPts = candidateVideoTracks[0]?.samples.map((sample) => sample.ptsUs) ?? [];
+  if (
+    candidateVideoTracks.length !== 1 ||
+    candidateRawPts.length === 0 ||
+    candidateRawPts.some((ptsUs) => !Number.isSafeInteger(ptsUs))
+  ) {
+    return fail(oracle, 'candidate quality output lacks one complete timestamped video track');
+  }
+  const candidateOriginUs = Math.min(...candidateRawPts as number[]);
+  let anchorsUs: readonly number[];
+  try {
+    anchorsUs = endpointInclusiveQualitySamplePts(relativePts, contract.samples);
+  } catch (error) {
+    return oracleError(
+      oracle,
+      'TRANSCODE_SSIM_LUMA_V1_SAMPLER_ERROR',
+      `independent quality sampler rejected authored timing evidence: ${errMsg(error)}`,
+    );
+  }
+  if (anchorsUs.length === 0) {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_PTS_EMPTY',
+      'quality source contains no unique real presentation timestamp',
+    );
+  }
+  const sampleTimesSec = anchorsUs.map((ptsUs) => ptsUs / 1_000_000);
+
+  let sourceSink: FrameSink;
+  try {
+    sourceSink = await ctx.decodeWithPlatform(source, {
+      maxFrames: anchorsUs.length,
+      sampleTimesSec,
+    });
+  } catch (error) {
+    return classifyReferenceDecodeFailure(oracle, 'source', error, source);
+  }
+  let candidateSink: FrameSink;
+  try {
+    candidateSink = await ctx.decodeWithPlatform(ctx.output, {
+      maxFrames: anchorsUs.length,
+      sampleTimesSec,
+    });
+  } catch (error) {
+    return classifyReferenceDecodeFailure(oracle, 'candidate', error, ctx.output);
+  }
+  if (typeof sourceSink.getPixels !== 'function') {
+    return oracleError(
+      oracle,
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_PIXELS_UNAVAILABLE',
+      'neutral source decoder returned no pixel-bearing quality evidence',
+    );
+  }
+  if (typeof candidateSink.getPixels !== 'function') {
+    return fail(oracle, 'candidate decoder returned no pixel-bearing ssim-luma-v1 evidence');
+  }
+
+  const observedSourcePts = normalizedSinkPts(sourceSink.frames, originUs);
+  const observedCandidatePts = normalizedSinkPts(candidateSink.frames, candidateOriginUs);
+  if (!numberArraysEqual(observedSourcePts, anchorsUs)) {
+    return oracleError(
+      oracle,
+      'TRANSCODE_SSIM_LUMA_V1_SOURCE_ANCHOR_MISMATCH',
+      `neutral source decoder returned [${observedSourcePts.join(', ')}], expected exact real PTS ` +
+        `[${anchorsUs.join(', ')}]`,
+    );
+  }
+  if (!numberArraysEqual(observedCandidatePts, anchorsUs)) {
+    return fail(
+      oracle,
+      `candidate does not cover the authored quality anchors: returned ` +
+        `[${observedCandidatePts.join(', ')}], expected [${anchorsUs.join(', ')}]`,
+      {
+        requestedSamples: anchorsUs.length,
+        pairs: Math.min(observedSourcePts.length, observedCandidatePts.length),
+        presentationCoverage: observedCandidatePts.length / anchorsUs.length,
+      },
+    );
+  }
+
+  const sourcePixels = sourceSink.getPixels.bind(sourceSink);
+  const candidatePixels = candidateSink.getPixels.bind(candidateSink);
+  let ssimSum = 0;
+  let ssimMin = 1;
+  let psnrSum = 0;
+  let psnrCount = 0;
+  for (let index = 0; index < anchorsUs.length; index++) {
+    let sourceImage: ImageData;
+    let candidateImage: ImageData;
+    try {
+      [sourceImage, candidateImage] = await Promise.all([
+        sourcePixels(index),
+        candidatePixels(index),
+      ]);
+    } catch (error) {
+      return fail(oracle, `quality pixels are unavailable at anchor ${anchorsUs[index]}us: ${errMsg(error)}`);
+    }
+    const prepared = prepareReferenceImage(
+      ctx,
+      sourceImage,
+      candidateImage.width,
+      candidateImage.height,
+    ).image;
+    if (!prepared) return fail(oracle, `could not prepare source pixels at anchor ${anchorsUs[index]}us`);
+    const score = ssim(candidateImage, prepared);
+    if (!Number.isFinite(score)) return fail(oracle, `SSIM is non-finite at anchor ${anchorsUs[index]}us`);
+    ssimSum += score;
+    ssimMin = Math.min(ssimMin, score);
+    const psnr = psnrDb(candidateImage, prepared);
+    if (Number.isFinite(psnr)) {
+      psnrSum += psnr;
+      psnrCount++;
+    }
+  }
+
+  const mean = ssimSum / anchorsUs.length;
+  const psnrMean = psnrCount > 0 ? psnrSum / psnrCount : 0;
+  const measurements = finiteOnly({
+    requestedSamples: contract.samples,
+    pairs: anchorsUs.length,
+    ssimMean: mean,
+    ssimMin,
+    psnrDb: psnrMean,
+    presentationCoverage: 1,
+    meanTimestampResidualUs: 0,
+    maxTimestampResidualUs: 0,
+    qualityFirstAnchorPtsUs: anchorsUs[0]!,
+    qualityLastAnchorPtsUs: anchorsUs[anchorsUs.length - 1]!,
+  });
+  const passed = mean >= contract.minimumMean;
+  const detail =
+    `ssim-luma-v1 endpoint-inclusive real-PTS anchors: mean ${mean.toFixed(4)} ` +
+    `(min ${ssimMin.toFixed(4)}), PSNR mean ${psnrMean.toFixed(1)} dB (advisory) over ` +
+    `${anchorsUs.length} exact sample(s); gate mean SSIM≥${contract.minimumMean}`;
+  return passed ? pass(oracle, detail, measurements) : fail(oracle, detail, measurements);
+}
+
+function normalizedSinkPts(frames: readonly FrameDigest[], originUs: number): number[] {
+  if (frames.length === 0 || frames.some((frame) => !Number.isSafeInteger(frame.ptsUs))) return [];
+  return frames.map((frame) => frame.ptsUs - originUs);
+}
+
+function numberArraysEqual(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function normalizedFrameTimesSec(frames: readonly FrameDigest[], maxFrames: number): number[] {
+  const pts = frames
+    .map((frame) => frame.ptsUs)
+    .filter((ptsUs) => Number.isFinite(ptsUs))
+    .sort((a, b) => a - b);
+  if (pts.length === 0) return [];
+  const originUs = pts[0]!;
+  return pts
+    .filter((ptsUs, index) => index === 0 || ptsUs !== pts[index - 1])
+    .slice(0, Math.max(0, Math.floor(maxFrames)))
+    .map((ptsUs) => Math.max(0, ptsUs - originUs) / 1_000_000);
+}
+
 function prepareReferenceImage(
   ctx: OracleContext,
   img: ImageData,
@@ -5215,6 +5660,16 @@ function prepareReferenceImage(
     if (ref) steps.push(`flipped ${flip}`);
   }
 
+  const video = readObjectOption(options, 'video');
+  const requestedRotation = video ? readNumberOption(video, ['rotate']) : undefined;
+  const rotation = requestedRotation === undefined
+    ? 0
+    : ((Math.round(requestedRotation) % 360) + 360) % 360;
+  if (ref && (rotation === 90 || rotation === 180 || rotation === 270)) {
+    ref = rotateImageData(ref, rotation);
+    if (ref) steps.push(`rotated ${rotation}° clockwise`);
+  }
+
   const pad = readObjectOption(options, 'pad');
   if (ref && pad) {
     const width = readNumberOption(pad, ['width']) ?? targetW;
@@ -5235,7 +5690,12 @@ function prepareReferenceImage(
 function usesTransformReference(ctx: OracleContext): boolean {
   if (ctx.scenario.op !== 'transcode') return false;
   const options: Record<string, unknown> = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
-  return isObject(options.crop) || isObject(options.pad) || typeof options.flip === 'string';
+  const video = isObject(options.video) ? options.video : undefined;
+  const rotate = typeof video?.rotate === 'number'
+    ? ((Math.round(video.rotate) % 360) + 360) % 360
+    : 0;
+  return isObject(options.crop) || isObject(options.pad) || typeof options.flip === 'string' ||
+    rotate === 90 || rotate === 180 || rotate === 270;
 }
 
 function usesAlphaVisualReference(ctx: OracleContext): boolean {
@@ -5309,6 +5769,27 @@ function flipImageData(img: ImageData | null, mode: string): ImageData | null {
   }
 }
 
+function rotateImageData(img: ImageData | null, degrees: 90 | 180 | 270): ImageData | null {
+  if (!img || typeof OffscreenCanvas !== 'function') return null;
+  try {
+    const src = new OffscreenCanvas(img.width, img.height);
+    const sctx = src.getContext('2d');
+    if (!sctx) return null;
+    sctx.putImageData(img, 0, 0);
+    const width = degrees === 180 ? img.width : img.height;
+    const height = degrees === 180 ? img.height : img.width;
+    const dst = new OffscreenCanvas(width, height);
+    const dctx = dst.getContext('2d');
+    if (!dctx) return null;
+    dctx.translate(width / 2, height / 2);
+    dctx.rotate((degrees * Math.PI) / 180);
+    dctx.drawImage(src, -img.width / 2, -img.height / 2);
+    return dctx.getImageData(0, 0, width, height);
+  } catch {
+    return null;
+  }
+}
+
 function padContainImageData(img: ImageData | null, w: number, h: number, color: string): ImageData | null {
   if (!img || typeof OffscreenCanvas !== 'function') return null;
   const targetW = Math.max(1, Math.round(w));
@@ -5356,41 +5837,16 @@ async function alphaPlane(ctx: OracleContext): Promise<OracleOutcome> {
     ? ctx.scenario.options as Record<string, unknown>
     : undefined;
   if (isObject(options?.alphaEvidence)) {
-    let response: Response;
-    const artifactUrl = `fixtures/golden/${ctx.input.id}.alpha.json`;
-    try {
-      response = await fetch(artifactUrl, { cache: 'no-store' });
-    } catch {
-      return unavailable(
+    const artifact = ctx.golden.alpha;
+    if (!artifact) {
+      return missingGoldenOutcome(
+        ctx.golden,
+        'alpha',
         oracle,
-        'NA_ASSET',
-        'ALPHA_EVIDENCE_FETCH_FAILED',
-        `could not fetch timestamp-keyed alpha evidence '${artifactUrl}'`,
+        `timestamp-keyed alpha evidence is unavailable for '${ctx.input.id}'`,
       );
     }
-    if (response.status === 404) {
-      return unavailable(
-        oracle,
-        'NA_ASSET',
-        'ALPHA_EVIDENCE_NOT_FOUND',
-        `timestamp-keyed alpha evidence is absent for '${ctx.input.id}'`,
-      );
-    }
-    if (!response.ok) {
-      return oracleError(
-        oracle,
-        'ALPHA_EVIDENCE_HTTP_ERROR',
-        `alpha evidence request failed (${response.status} ${response.statusText})`,
-      );
-    }
-    let raw: unknown;
-    try {
-      raw = await response.json();
-    } catch {
-      return oracleError(oracle, 'ALPHA_EVIDENCE_JSON_INVALID', 'alpha evidence is not valid JSON');
-    }
-    const artifact = parseAlphaEvidenceArtifact(raw);
-    if (!artifact || artifact.assetId !== ctx.input.id) {
+    if (artifact.assetId !== ctx.input.id) {
       return oracleError(
         oracle,
         'ALPHA_EVIDENCE_SCHEMA_INVALID',
@@ -6806,9 +7262,11 @@ function anchoredRemuxSampleTimesSec(
  * Prefer the deterministic inline WebCodecs prefix when both wrappers expose the same decode-order
  * video essence. HTMLMediaElement seeking is still required for transformed/fragmented or genuinely
  * different presentation domains, but it can return a stale compositor frame immediately after a
- * `seeked` event. Exact payload/configuration parity makes sequential decode the stronger oracle.
+ * `seeked` event. A wrapper-wide PTS epoch shift is presentation-neutral, so timestamps are compared
+ * relative to each program's first decode-order PTS. Exact payload/configuration parity makes
+ * sequential decode the stronger oracle.
  */
-function remuxProgramsShareDecodePrefix(
+export function remuxProgramsShareDecodePrefix(
   source: RemuxProgramEvidence,
   output: RemuxProgramEvidence,
   maxFrames: number,
@@ -6832,13 +7290,18 @@ function remuxProgramsShareDecodePrefix(
     Math.max(1, Math.floor(maxFrames)) + 16,
   );
   if (compared === 0) return false;
+  const sourcePtsOriginUs = sourceVideo.samples[0]?.ptsUs;
+  const outputPtsOriginUs = outputVideo.samples[0]?.ptsUs;
+  if (sourcePtsOriginUs === undefined || outputPtsOriginUs === undefined) return false;
   for (let index = 0; index < compared; index++) {
     const left = sourceVideo.samples[index]!;
     const right = outputVideo.samples[index]!;
     if (
       left.ptsUs === undefined ||
       right.ptsUs === undefined ||
-      Math.abs(left.ptsUs - right.ptsUs) > 1_000 ||
+      Math.abs(
+        (left.ptsUs - sourcePtsOriginUs) - (right.ptsUs - outputPtsOriginUs),
+      ) > 1_000 ||
       left.keyframe !== right.keyframe ||
       !remuxBytesEqual(left.payload, right.payload)
     ) {
@@ -6966,6 +7429,10 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
 
   if (which === TRANSCODE_AUDIO_CONTENT_INVARIANT) {
     return transcodeAudioContentInvariant(ctx);
+  }
+
+  if (which === TRANSCODE_OMITTED_AAC_PRESERVATION_INVARIANT) {
+    return transcodeOmittedAacPreservationInvariant(ctx);
   }
 
   if (which === TRIM_AUDIO_CONTENT_INVARIANT) {
@@ -7114,18 +7581,15 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
   }
 
   if (which.includes('decode') || which.includes('remux')) {
-    // decode(remux(x)) == decode(x): prefer committed source-decode digests, but remux properties
-    // remain executable when that optional cache is pending by decoding the verified source and
-    // candidate through the same independent browser path.
+    // decode(remux(x)) == decode(x): compare both verified byte streams in this browser invocation.
+    // Hardware/WebCodecs raster hashes can vary on isolated frames across processes, while the
+    // independent reference-reimport layer still proves exact coded-unit preservation.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const golden = await frameComparisonGolden(ctx);
-    // Metadata remux rows state the literal metamorphic property decode(remux(x))==decode(x).
-    // Compare both verified byte streams in this browser invocation even when an offline frame
-    // cache exists: hardware/WebCodecs raster hashes can vary on isolated frames across processes,
-    // while the independent reference-reimport layer still proves exact coded-unit preservation.
-    const preferLiveMetadataReference =
-      ctx.scenario.op === 'remux' && ctx.scenario.family === 'metadata';
-    let want = preferLiveMetadataReference ? undefined : golden.frames;
+    const preferLiveRemuxReference = ctx.scenario.op === 'remux';
+    const preferSequentialMetadataReference =
+      preferLiveRemuxReference && ctx.scenario.family === 'metadata';
+    let want = preferLiveRemuxReference ? undefined : golden.frames;
     let liveReferenceDecodeOptions:
       | {
           maxFrames: number;
@@ -7177,7 +7641,9 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
       // and an inline-demuxable Matroska output). Force both sides onto one presentation-time domain
       // for transformed media. Plain metadata remuxes instead use sequential WebCodecs prefixes:
       // repeated HTMLMediaElement seeks can land on an adjacent frame at a rounded wrapper boundary.
-      liveReferenceDecodeOptions = (preferLiveMetadataReference && !hasDisplayTransform) || stableInlinePrefix
+      const useSequentialLiveReference =
+        (preferSequentialMetadataReference && !hasDisplayTransform) || stableInlinePrefix;
+      liveReferenceDecodeOptions = useSequentialLiveReference
         ? {
             maxFrames: sampleTimesSec.length || 60,
             sampling: 'prefix',
@@ -9403,6 +9869,49 @@ function minPacketPtsDelta(pkts: PacketInfo[], ptsUs: number): number | undefine
   return Number.isFinite(best) ? best : undefined;
 }
 
+async function transcodeOmittedAacPreservationInvariant(
+  ctx: OracleContext,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'property-invariant';
+  if (!ctx.output) {
+    return transcodeDecisionOutcome(oracle, transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_OMITTED_AAC_OUTPUT_MISSING',
+      'omitted-audio transcode produced no candidate bytes',
+    ));
+  }
+  let sourceBytes: Uint8Array;
+  try {
+    sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+  } catch (error) {
+    return transcodeDecisionOutcome(oracle, transcodeError(
+      'TRANSCODE_OMITTED_AAC_SOURCE_READ_ERROR',
+      `digest-verified source bytes could not be materialized: ${errMsg(error)}`,
+    ));
+  }
+  const sourceContainer = resolveContainer(ctx.golden.meta?.container, ctx.input.id);
+  const sourceRead = readNeutralRemuxProgram(sourceBytes, sourceContainer);
+  if (sourceRead.state !== 'OK') {
+    return transcodeDecisionOutcome(oracle, transcodeUnavailable(
+      'NA_ASSET',
+      'TRANSCODE_OMITTED_AAC_SOURCE_STRUCTURE_UNAVAILABLE',
+      `neutral source reader returned ${sourceRead.state} [${sourceRead.reasonCode}]`,
+    ));
+  }
+  const candidateRead = readNeutralRemuxProgram(ctx.output.bytes, ctx.output.container);
+  if (candidateRead.state !== 'OK') {
+    return transcodeDecisionOutcome(oracle, transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_OMITTED_AAC_CANDIDATE_STRUCTURE_INVALID',
+      `neutral candidate reader returned ${candidateRead.state} [${candidateRead.reasonCode}]`,
+    ));
+  }
+  return transcodeDecisionOutcome(
+    oracle,
+    evaluateOmittedAacPreservation(sourceRead.value, candidateRead.value),
+  );
+}
+
 async function transcodeEffectInvariant(ctx: OracleContext): Promise<OracleOutcome> {
   const oracle: OracleId = 'property-invariant';
   const output = ctx.output;
@@ -9457,14 +9966,55 @@ async function transcodeEffectInvariant(ctx: OracleContext): Promise<OracleOutco
     return transcodeDecisionOutcome(oracle, transcodeUnavailable(
       'NA_ASSET', 'TRANSCODE_TRANSFORM_SOURCE_SIGNALING_UNAVAILABLE', detail));
   }
+  if (contract.sourceSignal !== undefined) {
+    const transitionDecision = validateSignalChangingTranscodeShape(ctx, source, output);
+    if (transitionDecision !== undefined) return transcodeDecisionOutcome(oracle, transitionDecision);
+  }
 
   let sourceSink: FrameSink;
+  let sourceSignalSink: FrameSink | undefined;
   let candidateSink: FrameSink;
   try {
-    [sourceSink, candidateSink] = await Promise.all([
-      ctx.decodeWithPlatform(source, { maxFrames: 8 }),
-      ctx.decodeWithPlatform(output, { maxFrames: 8 }),
-    ]);
+    if (contract.sourceSignal !== undefined) {
+      const durationHintSec = ctx.golden.meta?.durationSec;
+      // The presentation-managed HTMLVideoElement path intentionally exposes normalized canvas RGBA,
+      // not the decoder's coded colour metadata. Collect the immutable source's VideoFrame colourSpace
+      // independently through the raw neutral decoder, then use the presenter only for pixel evidence.
+      sourceSignalSink = await ctx.decodeWithPlatform(source, {
+        maxFrames: 8,
+        sampling: 'uniform',
+        ...(typeof durationHintSec === 'number' && Number.isFinite(durationHintSec) && durationHintSec > 0
+          ? { durationHintSec }
+          : {}),
+      });
+      const authoredSourceTimesSec = normalizedFrameTimesSec(sourceSignalSink.frames, 8);
+      if (authoredSourceTimesSec.length === 0) {
+        return oracleError(
+          oracle,
+          'TRANSCODE_TRANSFORM_SOURCE_TIMING_UNAVAILABLE',
+          'neutral raw source decode returned no finite presentation anchors',
+        );
+      }
+      sourceSink = await ctx.decodeWithPlatform(source, {
+        maxFrames: authoredSourceTimesSec.length,
+        sampleTimesSec: authoredSourceTimesSec,
+        presentationColorManaged: true,
+        ...(typeof durationHintSec === 'number' && Number.isFinite(durationHintSec) && durationHintSec > 0
+          ? { durationHintSec }
+          : {}),
+      });
+      const sourceTimesSec = normalizedFrameTimesSec(sourceSink.frames, 8);
+      candidateSink = await ctx.decodeWithPlatform(output, {
+        maxFrames: sourceTimesSec.length,
+        presentationColorManaged: true,
+        sampleTimesSec: sourceTimesSec,
+      });
+    } else {
+      [sourceSink, candidateSink] = await Promise.all([
+        ctx.decodeWithPlatform(source, { maxFrames: 8 }),
+        ctx.decodeWithPlatform(output, { maxFrames: 8 }),
+      ]);
+    }
   } catch (error) {
     const role = sourceSignal.state === 'OK' ? 'candidate' : 'source';
     return classifyReferenceDecodeFailure(oracle, role, error, role === 'candidate' ? output : source);
@@ -9496,8 +10046,100 @@ async function transcodeEffectInvariant(ctx: OracleContext): Promise<OracleOutco
     scenarioId: ctx.scenario.id,
     sourceFrames,
     candidateFrames,
+    sourceSignal: mergeDecodedSourceColorSignal(
+      sourceSignal.state === 'OK' ? sourceSignal.value : {},
+      sourceSignalSink ?? sourceSink,
+    ),
     signal: candidateSignal.value,
   }));
+}
+
+function validateSignalChangingTranscodeShape(
+  ctx: OracleContext,
+  source: MediaBytes,
+  output: MediaBytes,
+): TranscodeDecision | undefined {
+  const sourceRead = readNeutralRemuxProgram(source.bytes, source.container);
+  if (sourceRead.state !== 'OK') {
+    return transcodeUnavailable(
+      'NA_ASSET',
+      'TRANSCODE_TRANSFORM_SOURCE_STRUCTURE_UNAVAILABLE',
+      `neutral source reader returned ${sourceRead.state} [${sourceRead.reasonCode}]`,
+    );
+  }
+  const candidateRead = readNeutralRemuxProgram(output.bytes, output.container);
+  if (candidateRead.state !== 'OK') {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_OUTPUT_STRUCTURE_INVALID',
+      `neutral candidate reader returned ${candidateRead.state} [${candidateRead.reasonCode}]`,
+    );
+  }
+  const sourceVideos = sourceRead.value.tracks.filter((track) => track.type === 'video');
+  const candidateVideos = candidateRead.value.tracks.filter((track) => track.type === 'video');
+  if (sourceVideos.length !== 1 || candidateVideos.length !== 1 || candidateRead.value.tracks.length !== 1) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_TRACK_SHAPE_MISMATCH',
+      `signal-changing transcode requires one source video and one video-only output; observed ` +
+        `${sourceVideos.length} source video(s), ${candidateVideos.length} candidate video(s), ` +
+        `${candidateRead.value.tracks.length} total candidate track(s)`,
+    );
+  }
+  const options = (isObject(ctx.scenario.options) ? ctx.scenario.options : {}) as Record<string, unknown>;
+  const videoOptions = isObject(options.video) ? options.video : {};
+  const requestedCodec = typeof videoOptions.codec === 'string' ? videoOptions.codec : undefined;
+  const requestedContainer = typeof options.container === 'string' ? options.container : undefined;
+  if (requestedContainer !== undefined && !sameContainerFamily(candidateRead.value.container, requestedContainer)) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_OUTPUT_CONTAINER_MISMATCH',
+      `candidate container=${candidateRead.value.container}; requested ${requestedContainer}`,
+    );
+  }
+  if (requestedCodec !== undefined && codecsConflict(candidateVideos[0]!.codec, requestedCodec)) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_OUTPUT_CODEC_MISMATCH',
+      `candidate codec=${candidateVideos[0]!.codec}; requested ${requestedCodec}`,
+    );
+  }
+  const authoredSource = ctx.golden.meta?.tracks.find((track) => track.type === 'video')?.codec;
+  if (authoredSource !== undefined && codecsConflict(sourceVideos[0]!.codec, authoredSource)) {
+    return transcodeUnavailable(
+      'NA_ASSET',
+      'TRANSCODE_TRANSFORM_SOURCE_CODEC_MISMATCH',
+      `source codec=${sourceVideos[0]!.codec}; authored ${authoredSource}`,
+    );
+  }
+  return undefined;
+}
+
+function mergeDecodedSourceColorSignal(
+  structural: TransformSignalEvidence,
+  sink: FrameSink,
+): TransformSignalEvidence {
+  const decoded = sink.decodedColorSpaces ?? [];
+  const common = <Key extends keyof NonNullable<FrameSink['decodedColorSpaces']>[number]>(key: Key) => {
+    const values = decoded.map((entry) => entry[key]);
+    const first = values[0];
+    return first !== undefined && first !== null && values.every((value) => value === first)
+      ? first
+      : undefined;
+  };
+  const primaries = common('primaries');
+  const transfer = common('transfer');
+  const matrix = common('matrix');
+  const fullRange = common('fullRange');
+  const canonicalTransfer = transfer === 'smpte2084' ? 'pq' : transfer;
+  const canonicalMatrix = matrix === 'bt2020nc' ? 'bt2020-ncl' : matrix;
+  return {
+    ...structural,
+    ...(typeof primaries === 'string' ? { colorPrimaries: primaries } : {}),
+    ...(typeof canonicalTransfer === 'string' ? { transfer: canonicalTransfer } : {}),
+    ...(typeof canonicalMatrix === 'string' ? { matrix: canonicalMatrix } : {}),
+    ...(typeof fullRange === 'boolean' ? { range: fullRange ? 'full' : 'limited' } : {}),
+  };
 }
 
 async function transcodePixelFramesFromSink(

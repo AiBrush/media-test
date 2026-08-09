@@ -28,7 +28,17 @@ export const SCENARIO_DEFINITION_V2_SCHEMA = {
         },
       },
     },
-    options: { type: 'object' },
+    candidateEnvelope: { $ref: '#/$defs/candidateEnvelope' },
+    options: {
+      type: 'object',
+      properties: {
+        video: { $ref: '#/$defs/transcodeVideoOptions' },
+        variants: {
+          type: 'array', minItems: 1,
+          items: { $ref: '#/$defs/abrVideoOptions' },
+        },
+      },
+    },
     requires: { $ref: '#/$defs/requires' },
     oracles: { type: 'array', minItems: 1, uniqueItems: true, items: { $ref: '#/$defs/oracle' } },
     metrics: { type: 'array', uniqueItems: true, items: { $ref: '#/$defs/metric' } },
@@ -58,8 +68,63 @@ export const SCENARIO_DEFINITION_V2_SCHEMA = {
   $defs: {
     family: { enum: ['probe', 'demux', 'remux', 'transcode', 'decode-seek', 'trim', 'mux', 'encryption', 'metadata', 'streaming-output', 'audio-dsp', 'robustness', 'performance'] },
     operation: { enum: ['probe', 'demux', 'remux', 'transcode', 'decodeFrames', 'seek', 'trim', 'mux', 'decrypt'] },
-    oracle: { enum: ['golden-metadata', 'golden-packets', 'decoded-frames-bitexact', 'decoded-audio-pcm', 'reference-reimport', 'playback-smoke', 'ssim-psnr', 'mp4-box-layout', 'webm-live-layout', 'fanout-renditions', 'alpha-plane', 'seek-accuracy', 'trim-boundaries', 'decrypt-bitexact', 'graceful-failure', 'property-invariant'] },
+    oracle: { enum: ['golden-metadata', 'golden-packets', 'decoded-frames-bitexact', 'decoded-audio-pcm', 'reference-reimport', 'playback-smoke', 'ssim-psnr', 'average-bitrate', 'mp4-box-layout', 'webm-live-layout', 'fanout-renditions', 'alpha-plane', 'seek-accuracy', 'trim-boundaries', 'decrypt-bitexact', 'graceful-failure', 'property-invariant'] },
     metric: { enum: ['wall', 'throughputRealtime', 'peakMemory', 'sourceReads', 'targetWrites', 'bytesOut', 'longtasks', 'decodeFps', 'encodeFps', 'opsPerSec', 'packetsPerSec', 'framesPerSec', 'sampleFramesPerSec', 'seekMs', 'timeToFirstByte', 'timeToFirstFrame', 'loadInit', 'bundleSize'] },
+    candidateEnvelope: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        minWidth: { type: 'integer', minimum: 1 },
+        maxWidth: { type: 'integer', minimum: 1 },
+        minHeight: { type: 'integer', minimum: 1 },
+        maxHeight: { type: 'integer', minimum: 1 },
+        minDurationSec: { type: 'number', minimum: 0 },
+        maxDurationSec: { type: 'number', minimum: 0 },
+      },
+    },
+    qualityConstraint: {
+      type: 'object', additionalProperties: false, required: ['metric', 'minimumMean'],
+      properties: {
+        metric: { const: 'ssim-luma-v1' },
+        minimumMean: { type: 'number', minimum: 0, maximum: 1 },
+        samples: { type: 'integer', minimum: 1, maximum: 256 },
+      },
+    },
+    transcodeVideoOptions: {
+      type: 'object',
+      properties: {
+        codec: { type: 'string', minLength: 1 },
+        width: { type: 'integer' },
+        height: { type: 'integer' },
+        fps: { type: 'number', exclusiveMinimum: 0 },
+        bitrate: { type: 'integer', minimum: 1 },
+        maxAverageBitrate: { type: 'integer', minimum: 1 },
+        quality: { $ref: '#/$defs/qualityConstraint' },
+        rotate: { type: 'number' },
+        crf: { type: 'number' },
+        passes: { type: 'number' },
+        bitDepth: { type: 'integer' },
+      },
+      dependentRequired: {
+        maxAverageBitrate: ['bitrate', 'quality'],
+        quality: ['bitrate', 'maxAverageBitrate'],
+      },
+    },
+    abrVideoOptions: {
+      type: 'object', additionalProperties: false, required: ['width', 'height', 'bitrate'],
+      properties: {
+        codec: { const: 'h264' },
+        width: { type: 'integer', minimum: 1 },
+        height: { type: 'integer', minimum: 1 },
+        fps: { type: 'number', exclusiveMinimum: 0 },
+        bitrate: { type: 'integer', minimum: 1 },
+        maxAverageBitrate: { type: 'integer', minimum: 1 },
+        quality: { $ref: '#/$defs/qualityConstraint' },
+      },
+      dependentRequired: {
+        maxAverageBitrate: ['bitrate', 'quality'],
+        quality: ['bitrate', 'maxAverageBitrate'],
+      },
+    },
     stringTokens: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
     tokens: {
       type: 'object', additionalProperties: false, required: ['operations'],

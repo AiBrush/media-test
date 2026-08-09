@@ -7,12 +7,17 @@
  * returned { goldenFilename: jsonText } map under fixtures/golden/.
  */
 
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { collectToolPerimeter } from '../fixtures/lib/golden-contract.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
+const TOOLCHAIN_LOCK_PATH = join(ROOT, 'fixtures/toolchain.lock.json');
+const TOOLCHAIN_LOCK = JSON.parse(readFileSync(TOOLCHAIN_LOCK_PATH, 'utf8'));
+const FIXTURE_SOURCE_DATE_EPOCH = process.env.SOURCE_DATE_EPOCH ?? TOOLCHAIN_LOCK.sourceDateEpoch;
 
 /**
  * Enumerate the nested scenario frame PLACEHOLDERS on disk (fixtures/golden/scenarios/ ** /*.frames.json)
@@ -52,6 +57,7 @@ const opts = {
   outDir: 'fixtures/golden',
   timeoutMs: 10 * 60 * 1000,
   force: false,
+  alpha: false,
   scenarioFrames: false,
   headless: false,
 };
@@ -80,6 +86,9 @@ for (let i = 0; i < argv.length; i++) {
     case '--force':
       opts.force = true;
       break;
+    case '--alpha':
+      opts.alpha = true;
+      break;
     case '--scenario-frames':
       opts.scenarioFrames = true;
       break;
@@ -93,6 +102,7 @@ for (let i = 0; i < argv.length; i++) {
           '  [--asset <assetId>[,<assetId>]]  explicit flat/nested asset id(s) to bake\n' +
           '  [--scenario-frames]              bake EVERY nested fixtures/golden/scenarios/**/*.frames.json placeholder\n' +
           '  [--headless]                     run the browser headless (default: headed, for the human flow)\n' +
+          '  [--alpha]                        emit exact timestamp-keyed alpha-plane evidence\n' +
           '  [--force]                        refill goldens already marked filled',
       );
       process.exit(0);
@@ -179,6 +189,9 @@ try {
   if (bootError) throw new Error(`suite boot failed: ${bootError}`);
 
   const browserVersion = browser.version();
+  const playwrightVersion = JSON.parse(
+    readFileSync(join(ROOT, 'node_modules/playwright/package.json'), 'utf8'),
+  ).version;
   const browserRealm = await page.evaluate(() => ({
     userAgent: navigator.userAgent,
     locale: navigator.language,
@@ -191,6 +204,27 @@ try {
         }
       : null,
   }));
+  const toolPerimeter = collectToolPerimeter({
+    playwright: {
+      state: 'present',
+      executable: 'playwright',
+      versionOutput: String(playwrightVersion),
+    },
+    browser: {
+      state: 'present',
+      executable: browserCfg.executablePath ?? `playwright:${browserCfg.type}`,
+      versionOutput: browserVersion,
+    },
+  });
+  toolPerimeter.declaredLock = {
+    sha256: createHash('sha256').update(readFileSync(TOOLCHAIN_LOCK_PATH)).digest('hex'),
+    sourceDateEpoch: TOOLCHAIN_LOCK.sourceDateEpoch,
+    locale: TOOLCHAIN_LOCK.locale,
+    timezone: TOOLCHAIN_LOCK.timezone,
+    required: TOOLCHAIN_LOCK.required,
+    optional: TOOLCHAIN_LOCK.optional,
+  };
+  toolPerimeter.environment.SOURCE_DATE_EPOCH = String(FIXTURE_SOURCE_DATE_EPOCH);
   const provenance = {
     browser: {
       family: opts.browser,
@@ -204,6 +238,7 @@ try {
       locale: browserRealm.locale || process.env.LANG || 'und',
       timezone: browserRealm.timezone || process.env.TZ || 'not-exposed',
     },
+    toolPerimeter,
     decoderConfiguration: {
       engine: 'platform',
       framePixelAccess: 'FrameSink.getPixels',
@@ -216,8 +251,14 @@ try {
 
   const start = Date.now();
   const reportPromise = page.evaluate(
-    ({ assetIds, force, provenance }) => window.__FRAME_BAKE__.run({ assetIds, force, provenance }),
-    { assetIds: opts.assetIds, force: opts.force, provenance },
+    ({ assetIds, force, includeAlphaEvidence, provenance }) =>
+      window.__FRAME_BAKE__.run({ assetIds, force, includeAlphaEvidence, provenance }),
+    {
+      assetIds: opts.assetIds,
+      force: opts.force,
+      includeAlphaEvidence: opts.alpha,
+      provenance,
+    },
   );
   let settled = false;
   const progress = (async () => {
@@ -270,6 +311,7 @@ try {
   // FAIL instead of the NA a pending frames golden intends (runner.ts decodeFrameGoldenGap needs BOTH
   // frames AND ssim absent). Remove it so an unfaithful-decode asset resolves to an honest NA_ASSET.
   let prunedSsim = 0;
+  let prunedAlpha = 0;
   for (const asset of report.assets ?? []) {
     // Prune ONLY for an asset we ATTEMPTED but could not fully bake (partial/failed): its frames golden
     // is pending, so any co-located ssim.json is stale and must go. NEVER prune 'filled' (freshly
@@ -280,11 +322,19 @@ try {
       rmSync(ssimPath, { force: true });
       prunedSsim++;
     }
+    if (!opts.alpha || !asset.alphaFile) continue;
+    const alphaPath = resolve(outDir, asset.alphaFile);
+    if ((alphaPath === outDir || alphaPath.startsWith(outDir + sep)) && existsSync(alphaPath)) {
+      rmSync(alphaPath, { force: true });
+      prunedAlpha++;
+    }
   }
 
   console.log(
     `[frame-bake] summary filled:${report.summary.filled} partial:${report.summary.partial} ` +
-      `failed:${report.summary.failed} skipped:${report.summary.skipped}; wrote ${written} file(s), pruned ${prunedSsim} stale ssim`,
+      `failed:${report.summary.failed} skipped:${report.summary.skipped}; wrote ${written} file(s), ` +
+      `pruned ${prunedSsim} stale ssim` +
+      (opts.alpha ? `, pruned ${prunedAlpha} stale alpha` : ''),
   );
   for (const asset of report.assets) {
     console.log(`[frame-bake] ${asset.assetId}: ${asset.status} (${asset.filledFrames}/${asset.listedFrames}) ${asset.note}`);

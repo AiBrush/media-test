@@ -4,7 +4,13 @@ import { readFileSync } from 'node:fs';
 import { isNotApplicableError } from '../src/core/engine.ts';
 import type { CapabilitySet, EncodedTracks, MediaEngine } from '../src/core/engine.ts';
 import type { CodecSupport } from '../src/core/feature-detect.ts';
-import type { ResolvedInput, VerifiedContent } from '../src/core/media-selection.ts';
+import {
+  buildSelectionManifest,
+  parseBakedCorpusManifest,
+  parseScenarioSourceCatalog,
+  type ResolvedInput,
+  type VerifiedContent,
+} from '../src/core/media-selection.ts';
 import { runOne } from '../src/core/runner.ts';
 import type { DisplayFrameEvidence } from '../src/features/decode-seek/index.ts';
 import {
@@ -59,6 +65,10 @@ import { muxScenarios } from '../src/scenarios/mux/index.ts';
 
 function bytesAt(path: string): Uint8Array {
   return new Uint8Array(readFileSync(new URL(`../${path}`, import.meta.url)));
+}
+
+function textAt(path: string): string {
+  return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 }
 
 function jsonAt<T>(path: string): T {
@@ -169,6 +179,93 @@ describe('REQ-FEAT-13 shared selector grammar and semantic multi-source identity
       const selectors = (scenario.options as Record<string, unknown>).trackSelect;
       expect(Array.isArray(selectors), scenario.id).toBe(true);
       for (const selector of selectors as string[]) expect(selector, scenario.id).toMatch(/^(video|audio):\d+@\d+$/);
+    }
+  });
+});
+
+describe('REQ-FEAT-20 revisioned mux workload selection', () => {
+  test('the seven edge and size rows publish exact frozen workload envelopes', () => {
+    const fullHd10s = {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 9, maxDurationSec: 11,
+    };
+    const hd10s = {
+      minWidth: 1280, maxWidth: 1280, minHeight: 720, maxHeight: 720,
+      minDurationSec: 9, maxDurationSec: 11,
+    };
+    const large1080p = {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 108, maxDurationSec: 132,
+    };
+    const tiny360p = {
+      minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+      minDurationSec: 1.8, maxDurationSec: 2.2,
+    };
+    const expected = new Map<string, object>([
+      ['mux/edge_bframes_decode_mux_mp4', fullHd10s],
+      ['mux/edge_bframes_decode_mux_mkv', fullHd10s],
+      ['mux/edge_rotation_decode_mux_mov', hd10s],
+      ['mux/edge_rotation_decode_mux_mkv', hd10s],
+      ['mux/size_large_1080p_to_mp4', large1080p],
+      ['mux/size_large_1080p_to_mkv', large1080p],
+      ['mux/size_tiny_360p_to_mp4', tiny360p],
+    ]);
+    const rows = muxScenarios.filter((scenario) => expected.has(scenario.id));
+
+    expect(rows).toHaveLength(expected.size);
+    for (const scenario of rows) {
+      expect(scenario.revision, scenario.id).toBe(2);
+      expect(scenario.candidateEnvelope, scenario.id).toEqual(expected.get(scenario.id));
+      expect(Object.isFrozen(scenario.candidateEnvelope), scenario.id).toBe(true);
+    }
+  });
+
+  test('workload envelopes close the current catalog to the exact 155-member mux pool', () => {
+    const catalog = parseScenarioSourceCatalog(textAt('fixtures/media/scenarios/_sources.ndjson'));
+    const baked = parseBakedCorpusManifest(JSON.parse(textAt('fixtures/manifest.json')));
+    if (catalog.state !== 'VALID' || baked.state !== 'VALID') {
+      throw new Error('expected valid committed selection catalogs');
+    }
+    const selection = buildSelectionManifest({
+      scenarios: muxScenarios,
+      catalog: catalog.catalog,
+      bakedManifest: baked.manifest,
+    });
+    expect(selection.pools).toHaveLength(53);
+    expect(selection.pools.reduce((total, pool) => total + pool.candidates.length, 0)).toBe(155);
+    expect(selection.pools.reduce((total, pool) => total + pool.rejections.length, 0)).toBe(33);
+
+    const expected = new Map<string, { admitted: string[]; rejected: string[] }>([
+      ['mux/edge_bframes_decode_mux_mp4', {
+        admitted: ['h264_bframes_1080p.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/edge_bframes_decode_mux_mkv', {
+        admitted: ['h264_bframes_1080p.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/edge_rotation_decode_mux_mov', {
+        admitted: ['h264_rotated90.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/edge_rotation_decode_mux_mkv', {
+        admitted: ['h264_rotated90.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/size_large_1080p_to_mp4', {
+        admitted: ['large_h264_1080p_120s.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/size_large_1080p_to_mkv', {
+        admitted: ['large_h264_1080p_120s.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+      ['mux/size_tiny_360p_to_mp4', {
+        admitted: ['tiny_h264_360p_2s.mp4'], rejected: ['01.mp4', '02.mp4', '03.mp4'],
+      }],
+    ]);
+    for (const [scenarioId, exact] of expected) {
+      const pool = selection.pools.find((candidate) => candidate.scenarioId === scenarioId);
+      expect(pool?.candidates.map((candidate) => candidate.selectedFile), scenarioId).toEqual(exact.admitted);
+      expect(pool?.rejections.map((rejection) => rejection.selectedFile), scenarioId).toEqual(exact.rejected);
+      expect(
+        pool?.rejections.every((rejection) => rejection.reasonCode === 'CANDIDATE_INPUT_CONTRACT_MISMATCH'),
+        scenarioId,
+      ).toBe(true);
     }
   });
 });

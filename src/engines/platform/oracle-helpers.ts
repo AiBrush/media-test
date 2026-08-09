@@ -12,8 +12,12 @@
  */
 
 import type { FrameSink, MediaBytes } from '../../core/engine.ts';
-import { decodeWithVideoElement, decodeWithWebCodecs } from './decode.ts';
-import type { DecodeInput } from './decode.ts';
+import {
+  decodeWithVideoElement,
+  decodeWithWebCodecs,
+  exactPresentationAnchorsForVideoElement,
+} from './decode.ts';
+import type { DecodeInput, PlatformDecodeOptions } from './decode.ts';
 import {
   demuxMp4Video,
   hasMp4DisplayMatrixTransform,
@@ -129,15 +133,32 @@ function demuxToDecodeInput(bytes: Uint8Array, container?: string): DecodeInput 
  */
 export async function decodeBytesToFrames(
   input: MediaBytes | Uint8Array,
-  opts?: {
-    maxFrames?: number;
-    sampling?: 'prefix' | 'uniform';
-    durationHintSec?: number;
-    sampleTimesSec?: readonly number[];
+  opts?: PlatformDecodeOptions & {
+    presentationColorManaged?: boolean;
   },
 ): Promise<FrameSink> {
   const bytes = toBytes(input);
   const container = input instanceof Uint8Array ? undefined : input.container;
+  const exactAnchors = exactPresentationAnchorsForVideoElement(opts);
+  const sampleTimesSec = exactAnchors?.map((anchor) => anchor.mediaTimeSec) ?? opts?.sampleTimesSec;
+  const sampleTimestampsUs = exactAnchors?.map((anchor) => anchor.ptsUs);
+
+  // HDR tone-map conformance is a presentation-space invariant. Both immutable source and candidate
+  // must cross the same standards rendering primitive: VideoFrame.copyTo(RGBA) and drawImage() can use
+  // different legal HDR-to-SDR mappings even though both expose sRGB pixels. The product remains a black
+  // box; this route only makes the neutral reference use the browser presenter on both sides.
+  if (opts?.presentationColorManaged === true) {
+    if (!hasDom()) {
+      throw new Error('presentation-color-managed decode requires a DOM video presenter');
+    }
+    const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
+    return decodeWithVideoElement(blob, {
+      maxFrames: Math.min(opts.maxFrames ?? 8, 32),
+      ...(opts.durationHintSec !== undefined ? { durationHintSec: opts.durationHintSec } : {}),
+      ...(sampleTimesSec !== undefined ? { sampleTimesSec } : {}),
+      ...(sampleTimestampsUs !== undefined ? { sampleTimestampsUs } : {}),
+    });
+  }
 
   // Raw WebCodecs decodes coded pixels and does not apply an ISO BMFF track matrix. Route any
   // non-identity MP4/MOV transform through the browser presenter so source and candidate evidence
@@ -148,33 +169,22 @@ export async function decodeBytesToFrames(
       maxFrames?: number;
       durationHintSec?: number;
       sampleTimesSec?: readonly number[];
+      sampleTimestampsUs?: readonly number[];
     } = {};
     // Media-element evidence retains RGBA pixels. Bound display-matrix sampling so a caller's raw
     // WebCodecs cap (often thousands of frames) cannot request tens of gigabytes of retained pixels.
     displayOpts.maxFrames = Math.min(opts?.maxFrames ?? 8, 32);
     if (opts?.durationHintSec !== undefined) displayOpts.durationHintSec = opts.durationHintSec;
-    if (opts?.sampleTimesSec !== undefined) displayOpts.sampleTimesSec = opts.sampleTimesSec;
+    if (sampleTimesSec !== undefined) displayOpts.sampleTimesSec = sampleTimesSec;
+    if (sampleTimestampsUs !== undefined) displayOpts.sampleTimestampsUs = sampleTimestampsUs;
     return decodeWithVideoElement(blob, displayOpts);
   }
 
-  // Keep source and candidate sampling domains identical for comparisons involving formats that
-  // require the media-element path (notably fragmented MP4). Inline WebCodecs returns a prefix,
-  // whereas the media element samples uniformly across presentation time.
-  if (opts?.sampling === 'uniform' && hasDom()) {
-    const blob = new Blob([bytes.slice().buffer], { type: mimeFor(input) });
-    const fallbackOpts: {
-      maxFrames?: number;
-      durationHintSec?: number;
-      sampleTimesSec?: readonly number[];
-    } = {};
-    if (opts.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
-    if (opts.durationHintSec !== undefined) fallbackOpts.durationHintSec = opts.durationHintSec;
-    if (opts.sampleTimesSec !== undefined) fallbackOpts.sampleTimesSec = opts.sampleTimesSec;
-    return decodeWithVideoElement(blob, fallbackOpts);
-  }
-
   // demuxToDecodeInput only throws on a non-Unsupported parse error (a bug); a recognized-but-
-  // unparseable container returns null. Guard it so any unexpected throw still routes to <video>.
+  // unparseable container returns null. Uniform requests stay on this path when possible: the
+  // bounded keyframe-window sampler can use real cluster/sample timestamps even when an HTML media
+  // element cannot seek the source or infer its duration. Guard unexpected throws so a genuinely
+  // unsupported container can still route to <video>.
   let decodeInput: DecodeInput | null = null;
   let demuxThrew: unknown;
   try {
@@ -210,10 +220,12 @@ export async function decodeBytesToFrames(
     maxFrames?: number;
     durationHintSec?: number;
     sampleTimesSec?: readonly number[];
+    sampleTimestampsUs?: readonly number[];
   } = {};
   if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
   if (opts?.durationHintSec !== undefined) fallbackOpts.durationHintSec = opts.durationHintSec;
-  if (opts?.sampleTimesSec !== undefined) fallbackOpts.sampleTimesSec = opts.sampleTimesSec;
+  if (sampleTimesSec !== undefined) fallbackOpts.sampleTimesSec = sampleTimesSec;
+  if (sampleTimestampsUs !== undefined) fallbackOpts.sampleTimestampsUs = sampleTimestampsUs;
   return decodeWithVideoElement(blob, fallbackOpts);
 }
 

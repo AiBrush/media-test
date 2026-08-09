@@ -3,6 +3,8 @@ export * from './audio.ts';
 export * from './composition.ts';
 export * from './contracts.ts';
 export * from './metrics.ts';
+export * from './omitted-aac.ts';
+export * from './quality.ts';
 export * from './runtime.ts';
 export * from './transforms.ts';
 export * from './types.ts';

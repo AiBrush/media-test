@@ -56,13 +56,26 @@
  * ────────────────────────────────────────────────────────────────────────────────────────────────
  */
 
-import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
+import type {
+  CandidateInputEnvelope,
+  OracleId,
+  OracleTolerances,
+  Scenario,
+} from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import {
   TRIM_AUDIO_CONTENT_INVARIANT,
   TRIM_FEATURE_PROPERTIES_INVARIANT,
   TRIM_NOOP_IDENTITY_INVARIANT,
 } from '../../features/trim/index.ts';
+import {
+  FULL_HD_10S_CANDIDATE_ENVELOPE,
+  HD_1280X720_10S_CANDIDATE_ENVELOPE,
+  HD_1280X720_4S_CANDIDATE_ENVELOPE,
+  HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
 
 // ── Default metric sets ─────────────────────────────────────────────────────────────────────────
 
@@ -88,6 +101,8 @@ const TRIM_LADDER_METRICS = [
 
 interface TrimCase {
   id: string;
+  revision?: number;
+  candidateEnvelope?: CandidateInputEnvelope;
   asset: string;
   /** source container token (== output container; trim keeps the wrapper) */
   container: string;
@@ -493,6 +508,8 @@ const TRIM_CASES: TrimCase[] = [
   // / deepEdgeToAdd open-GOP). Tight ±1-frame tolerance — boundary must be reconstructed, not greened.
   {
     id: 'h264_open_gop_frame_accurate',
+    revision: 2,
+    candidateEnvelope: FULL_HD_10S_CANDIDATE_ENVELOPE,
     asset: 'h264_bframes_1080p.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -510,6 +527,8 @@ const TRIM_CASES: TrimCase[] = [
   // (dossier missingCases #12). Declares 'rotate' so only rotation-aware engines contest it.
   {
     id: 'h264_rotated_keyframe_aligned',
+    revision: 2,
+    candidateEnvelope: HD_1280X720_10S_CANDIDATE_ENVELOPE,
     asset: 'h264_rotated90.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -528,6 +547,8 @@ const TRIM_CASES: TrimCase[] = [
   // cut (dossier missingCases #13).
   {
     id: 'h264_multitrack_keyframe_aligned',
+    revision: 2,
+    candidateEnvelope: HD_1280X720_10S_CANDIDATE_ENVELOPE,
     asset: 'h264_multitrack.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -546,6 +567,8 @@ const TRIM_CASES: TrimCase[] = [
   // request through trimContractForScenario; progressive output fails structural evidence.
   {
     id: 'fmp4_fragment_boundary_copy',
+    revision: 2,
+    candidateEnvelope: HD_1280X720_4S_CANDIDATE_ENVELOPE,
     asset: 'fragmented_cmaf.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -611,6 +634,8 @@ const TRIM_CASES: TrimCase[] = [
 const LADDER_CASES: TrimCase[] = [
   {
     id: 'large_h264_copy_lazyread',
+    revision: 2,
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     asset: 'large_h264_1080p_120s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -629,6 +654,8 @@ const LADDER_CASES: TrimCase[] = [
   },
   {
     id: 'large_h264_frame_accurate_throughput',
+    revision: 2,
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     asset: 'large_h264_1080p_120s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -647,6 +674,8 @@ const LADDER_CASES: TrimCase[] = [
   },
   {
     id: 'huge_h264_mov_copy_peakmem',
+    revision: 2,
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     asset: 'huge_h264_1080p_600s.mov',
     container: 'mov',
     videoCodec: 'h264',
@@ -664,6 +693,8 @@ const LADDER_CASES: TrimCase[] = [
   },
   {
     id: 'massive_h264_copy_sustained',
+    revision: 2,
+    candidateEnvelope: MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
     asset: 'massive_h264_1080p_2h.mp4',
     container: 'mp4',
     videoCodec: 'h264',
@@ -698,8 +729,10 @@ function buildTrim(c: TrimCase): Scenario {
   ];
   return defineScenario({
     id: `trim/${c.id}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'trim',
     input: c.asset,
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     options: {
       container: c.container,
       frameAccurate: c.frameAccurate,

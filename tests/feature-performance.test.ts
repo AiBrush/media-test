@@ -25,6 +25,10 @@ import type {
 import { RemotionWebcodecsEngine } from '../src/engines/remotion-webcodecs/adapter.ts';
 import { performanceScenarios, performanceAggregateScenarioIds } from '../src/scenarios/performance/index.ts';
 import {
+  PROBE_SCALE_BUDGETS,
+  probeBudgetFromOptions,
+} from '../src/features/probe/index.ts';
+import {
   PERFORMANCE_QUESTIONS,
   aggregatePerformanceQuestionIds,
   available,
@@ -793,6 +797,85 @@ describe('REQ-FEAT-74: data-driven scale availability and de-duplicated question
     }
     expect(performanceScenarios.map((scenario) => scenario.notes).join('\n'))
       .not.toMatch(/un[- ]?baked|not (?:yet )?baked|golden[- ]absent/i);
+  });
+
+  test('long-form metadata performance rows require attested bounded reads and memory evidence', () => {
+    for (const scale of ['large', 'huge', 'massive'] as const) {
+      const item = performanceScenarios.find(
+        (scenario) => scenario.id === `performance/size-ladder-extract-metadata-${scale}`,
+      );
+      expect(item).toBeDefined();
+      expect(probeBudgetFromOptions(item?.options)).toEqual(PROBE_SCALE_BUDGETS[scale]);
+      expect(item?.metrics).toContain('peakMemory');
+    }
+    for (const scale of ['tiny', 'medium', 'large4k'] as const) {
+      const item = performanceScenarios.find(
+        (scenario) => scenario.id === `performance/size-ladder-extract-metadata-${scale}`,
+      );
+      expect(item).toBeDefined();
+      expect(probeBudgetFromOptions(item?.options)).toBeUndefined();
+    }
+  });
+
+  test('source-resolution and all 15 ladder rows publish revisioned exact workload envelopes', () => {
+    const medium = {
+      minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+      minDurationSec: 27, maxDurationSec: 33,
+    };
+    for (const id of [
+      'performance/encode-fps',
+      'performance/metamorphic-transcode-idempotent-source-res',
+    ]) {
+      const scenario = performanceScenarios.find((entry) => entry.id === id);
+      expect(scenario, id).toMatchObject({ revision: 2, candidateEnvelope: medium });
+      expect(Object.isFrozen(scenario?.candidateEnvelope), id).toBe(true);
+    }
+
+    const envelopeByRung = new Map<string, object>([
+      ['tiny', {
+        minWidth: 640, maxWidth: 640, minHeight: 360, maxHeight: 360,
+        minDurationSec: 1.8, maxDurationSec: 2.2,
+      }],
+      ['medium', medium],
+      ['large4k', {
+        minWidth: 3840, maxWidth: 3840, minHeight: 2160, maxHeight: 2160,
+        minDurationSec: 9, maxDurationSec: 11,
+      }],
+      ['large', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 108, maxDurationSec: 132,
+      }],
+      ['huge', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 540, maxDurationSec: 660,
+      }],
+      ['massive', {
+        minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080,
+        minDurationSec: 6480, maxDurationSec: 7920,
+      }],
+    ]);
+    const ladder = performanceScenarios.filter((scenario) =>
+      scenario.id.startsWith('performance/size-ladder-'));
+    expect(ladder).toHaveLength(15);
+    for (const scenario of ladder) {
+      const rung = /-(tiny|medium|large4k|large|huge|massive)$/.exec(scenario.id)?.[1];
+      expect(rung, scenario.id).toBeDefined();
+      expect(scenario.revision, scenario.id).toBe(2);
+      expect(scenario.candidateEnvelope, scenario.id).toEqual(envelopeByRung.get(rung!));
+      expect(Object.isFrozen(scenario.candidateEnvelope), scenario.id).toBe(true);
+    }
+  });
+
+  test('probe-duration remux uses a legal Matroska target', () => {
+    const scenario = performanceScenarios.find((entry) =>
+      entry.id === 'performance/metamorphic-probe-duration-cross-container');
+    expect(scenario).toMatchObject({
+      revision: 2,
+      options: { container: 'mkv', invariant: 'probe-duration' },
+      requires: { containersIn: ['mp4'], containersOut: ['mkv'], videoCodecs: ['h264'] },
+    });
+    expect(PERFORMANCE_QUESTIONS.find((entry) => entry.scenarioId === scenario?.id)?.question)
+      .toContain('MP4-to-Matroska');
   });
 
   test('availability follows manifest identity and typed reader state, not a baked boolean', () => {

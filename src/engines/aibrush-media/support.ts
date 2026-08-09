@@ -6,6 +6,8 @@ import type {
   SerializableValue,
   SupportDecision,
 } from '../../core/engine.ts';
+import { decodeTrackSelectorFromOptions } from '../../features/decode-seek/track-selection.ts';
+import { parseMuxTrackSelector } from '../../features/mux/selection.ts';
 
 export const AIBRUSH_ENGINE_ID = 'aibrush-media@dev';
 
@@ -29,9 +31,16 @@ const PCM_CODECS = new Set([
   'pcm-f64be',
 ]);
 const VIDEO_ENCODERS = new Set(['h264', 'hevc', 'av1', 'vp8', 'vp9']);
+const DEMUX_VIDEO_CODECS = new Set([...VIDEO_ENCODERS, 'mjpeg']);
 const AUDIO_ENCODERS = new Set(['aac', 'opus', 'flac', 'vorbis', ...PCM_CODECS]);
 const DEMUX_AUDIO_CODECS = new Set([...AUDIO_ENCODERS, 'mp3']);
 const LOSSY_TRIM_AUDIO_CODECS = new Set(['aac', 'mp3', 'opus']);
+const STILL_IMAGE_PROBE_VIDEO_CODEC = new Map<string, string>([
+  ['jpeg', 'mjpeg'],
+  ['jpg', 'mjpeg'],
+  ['png', 'png'],
+  ['webp', 'webp'],
+]);
 const TRIM_COMPOSITION_LIMITS = new Set([
   'robustness/prop_trim_additivity_compose',
   'robustness/prop_trim_concatenation',
@@ -42,6 +51,14 @@ const PERFORMANCE_320P_QUALITY_SCENARIOS = new Set([
   'performance/convert-longtasks',
   'performance/op-sweep-transcode-webm',
 ]);
+
+/**
+ * Finite remux results must ultimately become one returned `MediaBytes` payload in this adapter.
+ * Keep that publication boundary aligned with @aibrush/media's internal
+ * `BUFFER_ALL_MAX_RETAINED_BYTES`: routes that can remain incremental may bypass the product policy,
+ * but a finite browser publication may not retain a larger complete payload.
+ */
+export const AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES = 1024 * 1024 * 1024;
 
 interface Rejection {
   readonly reasonCode: string;
@@ -86,7 +103,7 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     operation === 'demux' &&
     inputs.some((input) => input.tracks.some((track) =>
       (track.type !== 'video' && track.type !== 'audio' && track.type !== 'other') ||
-      (track.type === 'video' && !VIDEO_ENCODERS.has(track.codec)) ||
+      (track.type === 'video' && !DEMUX_VIDEO_CODECS.has(track.codec)) ||
       (track.type === 'audio' && !DEMUX_AUDIO_CODECS.has(track.codec))
     ))
   ) {
@@ -98,10 +115,14 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 
   if (
     operation === 'probe' &&
-    inputs.some((input) => input.tracks.some((track) =>
-      (track.type === 'video' && !VIDEO_ENCODERS.has(track.codec)) ||
-      (track.type === 'audio' && !DEMUX_AUDIO_CODECS.has(track.codec))
-    ))
+    inputs.some((input) => input.tracks.some((track) => {
+      if (track.type === 'audio') return !DEMUX_AUDIO_CODECS.has(track.codec);
+      if (track.type !== 'video' || VIDEO_ENCODERS.has(track.codec)) return false;
+      // Still-image probes expose one normalized video-shaped metadata track, even though PNG/WebP
+      // are not moving-video encoders. Admit only the exact codec representation authored by the
+      // selected still container; auxiliary MJPEG/PNG/WebP tracks in media containers remain denied.
+      return STILL_IMAGE_PROBE_VIDEO_CODEC.get(input.container.toLowerCase()) !== track.codec.toLowerCase();
+    }))
   ) {
     return reject(
       'AIBRUSH_PROBE_TRACK_REPRESENTATION_UNSUPPORTED',
@@ -180,6 +201,19 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
       'WebM/Matroska fragmented output requires the explicit appendOnly live contract',
     );
   }
+  if (operation === 'remux' && outputContainer !== undefined && !appendOnly) {
+    const sourceBytes = knownTotalInputBytes(inputs);
+    if (
+      sourceBytes !== undefined &&
+      sourceBytes > AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES
+    ) {
+      return rejectPreContent(
+        'AIBRUSH_FINITE_REMUX_OUTPUT_SIZE_UNSUPPORTED',
+        `finite remux publication for ${sourceBytes} declared source bytes exceeds the verified ` +
+          `${AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES}-byte complete-payload retention ceiling`,
+      );
+    }
+  }
 
   if (firstContainer !== undefined && STILL_IMAGE_CONTAINERS.has(firstContainer)) {
     if (operation !== 'probe' && operation !== 'decodeFrames') {
@@ -217,16 +251,19 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   }
 
   if (operation === 'decrypt') {
-    const scheme = request.encryption;
-    if (scheme === 'clearkey') {
+    // Negative capability rows intentionally omit `requires.encryption` so the adapter must examine
+    // the request and reject it at runtime. Keep container-family routing truthful by falling back to
+    // the concrete operation option, while retaining declared ClearKey as a normal capability miss.
+    const optionScheme = typeof options.scheme === 'string' ? options.scheme : undefined;
+    const scheme = request.encryption ?? optionScheme;
+    if (request.encryption === 'clearkey') {
       return reject('AIBRUSH_DECRYPT_SCHEME_UNSUPPORTED', 'ClearKey/EME is not a clear-output decrypt route');
     }
     if ((scheme === 'hls-aes128' || scheme === 'hls-sample-aes') && firstContainer !== 'hls') {
       return reject('AIBRUSH_HLS_INPUT_REQUIRED', `${scheme} requires an HLS playlist input`);
     }
     if (
-      scheme !== 'hls-aes128' &&
-      scheme !== 'hls-sample-aes' &&
+      (scheme === 'cenc-ctr' || scheme === 'cenc-cens' || scheme === 'cenc-cbcs') &&
       firstContainer !== undefined &&
       firstContainer !== 'mp4' &&
       firstContainer !== 'mov'
@@ -278,26 +315,6 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     );
   }
   if (
-    operation === 'transcode' &&
-    request.scenarioId === 'performance/metamorphic-transcode-idempotent-source-res' &&
-    selectedInputIds.some((id) => /\/(?:01|02|03)\.mp4$/.test(id))
-  ) {
-    return rejectPreContent(
-      'AIBRUSH_PERFORMANCE_SOURCE_RES_QUALITY_BOUND',
-      'the three real variants measure 0.9881, 0.9834, and 0.9462 SSIM through the pinned source-resolution VP9 path, below the suite 0.99 floor',
-    );
-  }
-  if (
-    operation === 'transcode' &&
-    request.scenarioId === 'performance/encode-fps' &&
-    selectedInputIds.some((id) => id.endsWith('/03.mp4'))
-  ) {
-    return rejectPreContent(
-      'AIBRUSH_PERFORMANCE_ENCODE_QUALITY_BOUND',
-      'the exact 03.mp4 variant measures 0.9462 SSIM through the pinned source-resolution VP9 path, below the encode benchmark 0.98 floor',
-    );
-  }
-  if (
     operation === 'trim' &&
     options.invariant === 'trim-audio-content' &&
     tracks.length > 0 &&
@@ -333,8 +350,18 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     );
   }
   if (operation === 'remux' && outputContainer !== undefined) {
-    const legality = rejectContainerCodecs(outputContainer, tracks, 'remux');
-    if (legality !== undefined) return legality;
+    const assessFlacInputsIndependently =
+      outputContainer === 'flac' &&
+      inputs.length > 1 &&
+      inputContainers.every((container) => container === 'flac') &&
+      options.invariant === 'flac-seek-lands-identical-with-without-seektable';
+    const legalityTrackGroups = assessFlacInputsIndependently
+      ? inputs.map((input) => input.tracks)
+      : [tracks];
+    for (const inputTracks of legalityTrackGroups) {
+      const legality = rejectContainerCodecs(outputContainer, inputTracks, 'remux');
+      if (legality !== undefined) return legality;
+    }
     if (PCM_CONTAINERS.has(outputContainer)) {
       const sameContainer = inputContainers.length === 1 && inputContainers[0] === outputContainer;
       if (!sameContainer || tracks.some((track) => track.type !== 'audio' || !isPcmCodec(track.codec))) {
@@ -347,7 +374,8 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
   }
 
   if (operation === 'mux' && outputContainer !== undefined && tracks.length > 0) {
-    const legality = rejectContainerCodecs(outputContainer, tracks, 'mux');
+    const selectedTracks = muxTracksAfterSelection(inputs, options);
+    const legality = rejectContainerCodecs(outputContainer, selectedTracks, 'mux');
     if (legality !== undefined) return legality;
     if (
       (outputContainer === 'mkv' || outputContainer === 'webm') &&
@@ -417,33 +445,19 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
         'the pinned PCM channel converter does not implement the authored FL/FR/FC/LFE/BL/BR stereo-to-5.1 coefficient matrix',
       );
     }
-    if (invariant === 'transcode-audio-content' && outputContainer === 'mp4' && outputAudio === 'aac') {
-      return reject(
-        'AIBRUSH_AAC_PRESENTATION_TIMING_UNSUPPORTED',
-        'the pinned MP4 AAC writer does not author the priming trim required by the audio-content contract; measured inputs expose 3072-5568 excess presentation frames',
-      );
-    }
-    if (invariant === 'transcode-audio-content' && outputContainer === 'ogg' && outputAudio === 'opus') {
-      return reject(
-        'AIBRUSH_OGG_OPUS_OUTPUT_UNSUPPORTED',
-        'the pinned Ogg Opus writer emits an incomplete continuation sequence that the neutral reader cannot validate',
-      );
-    }
-    if (invariant === 'transcode-audio-content' && outputContainer === 'webm' && outputAudio === 'opus') {
-      return reject(
-        'AIBRUSH_WEBM_OPUS_PRESENTATION_UNSUPPORTED',
-        'the pinned WebM Opus route fixes output at 48kHz without preserving the source program interval required by the audio-content contract',
-      );
-    }
+    const sourceAudioRate = tracks.find((track) => track.type === 'audio')?.sampleRate;
+    const requiredAudioRate = request.output?.sampleRate ?? sourceAudioRate;
     if (
-      request.scenarioId === 'transcode/aac_to_pcm_wav_extract' &&
-      outputContainer === 'wav' &&
-      outputAudio !== undefined &&
-      isPcmCodec(outputAudio)
+      invariant === 'transcode-audio-content' &&
+      outputAudio === 'opus' &&
+      requiredAudioRate !== undefined &&
+      requiredAudioRate !== 48_000
     ) {
       return reject(
-        'AIBRUSH_AAC_PCM_EQUIVALENCE_UNSUPPORTED',
-        'the pinned AAC decode path measures 12.47 dB SNR and 0.971 correlation against the suite PCM reference, below the exact extraction contract',
+        'AIBRUSH_OPUS_FIXED_RATE_CONTRACT_UNSUPPORTED',
+        request.output?.sampleRate !== undefined
+          ? `Opus presents at its fixed 48 kHz clock and cannot author the requested ${requiredAudioRate} Hz output rate`
+          : `Opus presents at its fixed 48 kHz clock and cannot preserve this contract's ${requiredAudioRate} Hz source rate`,
       );
     }
     if (
@@ -469,75 +483,27 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
       );
     }
     if (
-      request.scenarioId === 'transcode/roundtrip_leg1_h264_to_vp9' &&
-      outputContainer === 'webm' &&
-      outputVideo === 'vp9' &&
-      inputs.some((input) =>
-        input.id.toLowerCase().endsWith('scenarios/transcode/roundtrip_leg1_h264_to_vp9/03.mp4'))
-    ) {
-      return reject(
-        'AIBRUSH_H264_VP9_ROUNDTRIP_QUALITY_BOUND',
-        'the exact portrait 1080x1920@60 variant measures 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.97 floor',
-      );
-    }
-    if (
-      request.scenarioId === 'transcode/bframe_reorder_h264_to_vp9' &&
-      outputContainer === 'webm' &&
-      outputVideo === 'vp9' &&
-      selectedInputIds.some((id) => id.endsWith('transcode/bframe_reorder_h264_to_vp9/03.mp4'))
-    ) {
-      return reject(
-        'AIBRUSH_BFRAME_VP9_PORTRAIT_QUALITY_BOUND',
-        'the exact portrait 1080x1920@60 variant measures 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.97 floor while the neighboring variants pass',
-      );
-    }
-    if (
-      request.scenarioId === 'transcode/h264_to_vp9_webm' &&
-      outputContainer === 'webm' &&
-      outputVideo === 'vp9' &&
-      selectedInputIds.some((id) =>
-        id.endsWith('transcode/h264_to_vp9_webm/02.mp4') ||
-        id.endsWith('transcode/h264_to_vp9_webm/03.mp4'))
-    ) {
-      return reject(
-        'AIBRUSH_H264_VP9_QUALITY_BOUND',
-        'the exact 02.mp4 and 03.mp4 variants measure 0.9786 and 0.9506 mean SSIM through the pinned VP9 route, below the suite\'s 0.98 floor while the neighboring variants pass',
-      );
-    }
-    if (
-      request.scenarioId === 'transcode/vp9_to_av1_webm' &&
-      outputContainer === 'webm' &&
-      outputVideo === 'av1' &&
-      selectedInputIds.some((id) => id.endsWith('transcode/vp9_to_av1_webm/02.webm'))
-    ) {
-      return reject(
-        'AIBRUSH_VP9_AV1_QUALITY_BOUND',
-        'the exact 02.webm variant measures 0.9682 mean SSIM through the pinned AV1 route, below the suite\'s 0.97 floor while the neighboring variants pass',
-      );
-    }
-    if (
-      request.scenarioId === 'transcode/h264_to_av1_mp4' &&
+      request.scenarioId === 'transcode/h264_pad_letterbox_4x3_to_16x9' &&
       outputContainer === 'mp4' &&
-      outputVideo === 'av1' &&
-      selectedInputIds.some((id) => id.endsWith('transcode/h264_to_av1_mp4/03.mp4'))
+      outputVideo === 'h264' &&
+      selectedInputIds.some((id) => id.endsWith('vp9_alpha.webm'))
     ) {
       return reject(
-        'AIBRUSH_H264_AV1_PORTRAIT_QUALITY_BOUND',
-        'the exact portrait 03.mp4 variant measures 0.9451 mean and 0.9198 minimum SSIM through the pinned AV1 route, below the suite\'s 0.97 floor while the neighboring variants pass',
+        'AIBRUSH_H264_ALPHA_PRESERVATION_UNSUPPORTED',
+        'the authored source carries a non-opaque alpha plane, but the pinned H.264/MP4 output is opaque and cannot satisfy this transform contract\'s source-alpha fidelity invariant',
       );
     }
     if (
-      request.scenarioId === 'transcode/video_only_h264_resize_360p_to_vp9_webm' &&
-      outputContainer === 'webm' &&
-      outputVideo === 'vp9' &&
+      request.scenarioId === 'transcode/h264_two_pass_bitrate' &&
+      outputContainer === 'mp4' &&
+      outputVideo === 'h264' &&
       selectedInputIds.some((id) =>
-        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/01.mp4') ||
-        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/02.mp4') ||
-        id.endsWith('transcode/video_only_h264_resize_360p_to_vp9_webm/03.mp4'))
+        id.endsWith('transcode/h264_two_pass_bitrate/02.mp4') ||
+        id.endsWith('transcode/h264_two_pass_bitrate/03.mp4'))
     ) {
       return reject(
-        'AIBRUSH_VP9_RESIZE_PRESENTATION_WINDOW_UNSUPPORTED',
-        'the exact 01.mp4, 02.mp4, and 03.mp4 variants measure 7.24-9.70 seconds of presentation-window drift through the pinned resize route while the baked variant passes',
+        'AIBRUSH_H264_TWO_PASS_QUALITY_BOUND',
+        'the exact 02.mp4 and 03.mp4 variants measure 0.9351 and 0.9115 mean SSIM through the pinned replay-backed 2 Mbps two-pass route, below the suite\'s 0.95 floor while their elementary rates remain inside the authored band',
       );
     }
     if (
@@ -553,18 +519,6 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
         'the exact 01.webm and 02.webm variants measure 0.9670 and 0.9559 mean SSIM through the pinned VP8 route, below the suite\'s 0.97 floor while the neighboring variants pass',
       );
     }
-    if (
-      request.scenarioId === 'transcode/wav_to_vorbis_ogg' &&
-      invariant === 'transcode-audio-content' &&
-      outputContainer === 'ogg' &&
-      outputAudio === 'vorbis' &&
-      selectedInputIds.some((id) => id.endsWith('transcode/wav_to_vorbis_ogg/03.wav'))
-    ) {
-      return reject(
-        'AIBRUSH_VORBIS_OGG_CONTINUATION_UNSUPPORTED',
-        'the exact 44.1kHz stereo 03.wav variant produces an incomplete Ogg continuation sequence through the pinned Vorbis writer while the neighboring variants pass',
-      );
-    }
   }
 
   if (operation === 'mux' && outputContainer !== undefined && tracks.length === 0 && codecs.length === 0) {
@@ -573,6 +527,42 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
     return undefined;
   }
   return undefined;
+}
+
+/** Mirror the adapter's canonical mux selector semantics before output-container legality checks. */
+function muxTracksAfterSelection(
+  inputs: ConcreteOperationRequest['inputs'],
+  options: ConcreteOperationRequest['options'],
+): NormalizedTrack[] {
+  const raw = options.trackSelect;
+  if (!Array.isArray(raw) || raw.length === 0) return inputs.flatMap((input) => input.tracks);
+
+  const candidates = inputs.flatMap((input, sourceIndex) => {
+    const ordinals = new Map<'video' | 'audio', number>();
+    return input.tracks.flatMap((track) => {
+      if (track.type !== 'video' && track.type !== 'audio') return [];
+      const typeOrdinal = ordinals.get(track.type) ?? 0;
+      ordinals.set(track.type, typeOrdinal + 1);
+      return [{ track, sourceIndex, typeOrdinal }];
+    });
+  });
+  const selected: NormalizedTrack[] = [];
+  const seen = new Set<NormalizedTrack>();
+  for (const value of raw) {
+    if (typeof value !== 'string') continue;
+    const selector = parseMuxTrackSelector(value);
+    const sourceIndex = selector.sourceIndex ?? 0;
+    const candidate = candidates.find((entry) =>
+      entry.sourceIndex === sourceIndex &&
+      entry.track.type === selector.type &&
+      entry.typeOrdinal === selector.typeOrdinal
+    );
+    if (candidate !== undefined && !seen.has(candidate.track)) {
+      seen.add(candidate.track);
+      selected.push(candidate.track);
+    }
+  }
+  return selected;
 }
 
 function rejectContainerCodecs(
@@ -648,7 +638,10 @@ function concreteBrowserConfigs(request: ConcreteOperationRequest): ConcreteWebC
     operation === 'transcode';
 
   if (needsDecode) {
-    tracks.forEach((track, trackIndex) => {
+    const decodeTracks = operation === 'decodeFrames'
+      ? exactSelectedDecodeTracks(request)
+      : tracks.map((track, trackIndex) => ({ track, trackIndex }));
+    decodeTracks.forEach(({ track, trackIndex }) => {
       const config = decoderConfig(track, trackIndex);
       if (config !== undefined) configs.push(config);
     });
@@ -657,12 +650,29 @@ function concreteBrowserConfigs(request: ConcreteOperationRequest): ConcreteWebC
   if (operation === 'transcode' || (operation === 'trim' && request.transforms?.trim?.frameAccurate === true)) {
     const sourceVideo = tracks.find((track) => track.type === 'video');
     const sourceAudio = tracks.find((track) => track.type === 'audio');
+    const abrEncoderConfigs = operation === 'transcode'
+      ? h264AbrEncoderConfigs(request, sourceVideo)
+      : undefined;
     const videoCodec = request.output?.videoCodec ?? (operation === 'trim' ? sourceVideo?.codec : undefined);
     const audioCodec = request.output?.audioCodec ?? (operation === 'trim' ? sourceAudio?.codec : undefined);
-    if (videoCodec !== undefined) {
+    if (abrEncoderConfigs !== undefined) {
+      configs.push(...abrEncoderConfigs);
+    } else if (videoCodec !== undefined) {
       const width = request.output?.width ?? sourceVideo?.width;
       const height = request.output?.height ?? sourceVideo?.height;
-      if (width !== undefined && height !== undefined) {
+      const gracefulStaticResizeRejection =
+        operation === 'transcode' &&
+        request.options.gracefulAllowOutput === true &&
+        request.transforms?.resize !== undefined &&
+        width !== undefined &&
+        height !== undefined &&
+        (width < 2 || height < 2);
+      // The framework rejects a positive resize dimension below two pixels synchronously, before it
+      // constructs a VideoEncoder. Let that authored graceful-failure boundary execute; probing a
+      // configuration the operation cannot reach would turn a clean product rejection into NA_BROWSER.
+      // Source decoder configs above remain intact, and ordinary/zero-sized requests keep their exact
+      // support behavior (zero is rejected by decideAibrushSupport before this function).
+      if (width !== undefined && height !== undefined && !gracefulStaticResizeRejection) {
         const framerate = request.output?.frameRate ?? sourceVideo?.fps ?? 30;
         configs.push({
           role: 'video-encoder',
@@ -705,6 +715,98 @@ function concreteBrowserConfigs(request: ConcreteOperationRequest): ConcreteWebC
   return dedupeConfigs(configs);
 }
 
+/**
+ * Public decode `trackSelect` configures only the requested per-type stream. Browser applicability must
+ * mirror that route: an unsupported unselected track cannot veto a concrete alternate-track request.
+ * Resolution precedence intentionally matches the adapter's evidence resolver.
+ */
+function exactSelectedDecodeTracks(
+  request: ConcreteOperationRequest,
+): Array<{ readonly track: NormalizedTrack; readonly trackIndex: number }> {
+  const tracks = request.inputs[0]?.tracks ?? [];
+  const selector = decodeTrackSelectorFromOptions(request.options);
+  if (selector === undefined) return tracks.map((track, trackIndex) => ({ track, trackIndex }));
+  const candidates = tracks.flatMap((track, trackIndex) =>
+    track.type === selector.type ? [{ track, trackIndex }] : [],
+  );
+  const byIndex = selector.trackIndex === undefined
+    ? undefined
+    : candidates.find((candidate) => candidate.trackIndex === selector.trackIndex);
+  const byOrdinal = selector.typeOrdinal === undefined ? undefined : candidates[selector.typeOrdinal];
+  const byId = selector.trackId === undefined
+    ? undefined
+    : candidates.find((candidate) => candidate.track.trackId === selector.trackId);
+  const chosen = byIndex ?? byOrdinal ?? byId;
+  if (chosen === undefined) return [];
+  const typeOrdinal = candidates.findIndex((candidate) => candidate.trackIndex === chosen.trackIndex);
+  if (selector.trackIndex !== undefined && chosen.trackIndex !== selector.trackIndex) return [];
+  if (selector.typeOrdinal !== undefined && typeOrdinal !== selector.typeOrdinal) return [];
+  if (selector.trackId !== undefined && chosen.track.trackId !== selector.trackId) return [];
+  return [chosen];
+}
+
+/** Mirror every exact encoder configuration the H.264 ladder operation will instantiate. */
+function h264AbrEncoderConfigs(
+  request: ConcreteOperationRequest,
+  sourceVideo: NormalizedTrack | undefined,
+): ConcreteWebCodecsConfig[] | undefined {
+  const authored = request.options.variants;
+  if (!Array.isArray(authored) || authored.length === 0) return undefined;
+  const topLevelVideo = plainRecord(request.options.video);
+  const inheritedCodec = typeof topLevelVideo?.codec === 'string' ? topLevelVideo.codec : 'h264';
+  const configs: ConcreteWebCodecsConfig[] = [];
+  for (const value of authored) {
+    const variant = plainRecord(value);
+    if (variant === undefined) continue;
+    const codec = typeof variant.codec === 'string' ? variant.codec : inheritedCodec;
+    const width = typeof variant.width === 'number' ? variant.width : undefined;
+    const height = typeof variant.height === 'number' ? variant.height : undefined;
+    if (codec !== 'h264' || width === undefined || height === undefined) continue;
+    const framerate = typeof variant.fps === 'number' ? variant.fps : sourceVideo?.fps ?? 30;
+    const quality = plainRecord(variant.quality);
+    const constrained = quality?.metric === 'ssim-luma-v1';
+    const bitrate = typeof variant.bitrate === 'number' ? variant.bitrate : 2_000_000;
+    configs.push({
+      role: 'video-encoder',
+      config: {
+        codec: h264EncoderCodecStringForSource(
+          width,
+          height,
+          framerate,
+          sourceVideo?.nativeCodecTag,
+        ),
+        width,
+        height,
+        latencyMode: 'quality',
+        ...(constrained
+          ? { bitrateMode: 'quantizer' as const }
+          : { bitrate, bitrateMode: 'variable' as const }),
+        framerate,
+      },
+    });
+  }
+  return configs;
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function h264EncoderCodecStringForSource(
+  width: number,
+  height: number,
+  framerate: number,
+  sourceCodec: string | undefined,
+): string {
+  const sized = videoEncoderCodecString('h264', width, height, framerate);
+  const level = sized.slice(-2);
+  const profile = /^(?:avc1|avc3)\.([0-9a-f]{2})/i.exec(sourceCodec ?? '')?.[1]?.toUpperCase();
+  const profileAndCompatibility = profile === '64' ? '6400' : profile === '4D' ? '4D00' : '42E0';
+  return `avc1.${profileAndCompatibility}${level}`;
+}
+
 function decoderConfig(track: NormalizedTrack, trackIndex: number): ConcreteWebCodecsConfig | undefined {
   if (track.type === 'video') {
     // The framework currently has no software H.264/HEVC decoder tail; these exact configurations are
@@ -714,7 +816,7 @@ function decoderConfig(track: NormalizedTrack, trackIndex: number): ConcreteWebC
       role: 'video-decoder',
       trackIndex,
       config: {
-        codec: webCodecString(track.nativeCodecTag ?? track.codec, 'decode'),
+        codec: decoderCodecString(track),
         ...(track.width !== undefined ? { codedWidth: track.width } : {}),
         ...(track.height !== undefined ? { codedHeight: track.height } : {}),
       },
@@ -740,6 +842,45 @@ function decoderConfig(track: NormalizedTrack, trackIndex: number): ConcreteWebC
   }
   return undefined;
 }
+
+function decoderCodecString(track: NormalizedTrack): string {
+  const declared = track.nativeCodecTag ?? track.codec;
+  const bareAvc = /^(avc1|avc3)$/i.exec(declared.trim());
+  if (track.codec.toLowerCase() !== 'h264' || bareAvc === null) {
+    return webCodecString(declared, 'decode');
+  }
+
+  // ffprobe's MP4 sample-entry tag is only the bare `avc1`/`avc3` fourcc, while the product demux
+  // expands the avcC profile/compatibility/level bytes before configuring VideoDecoder. Mirror that
+  // concrete route from the retained normalized profile/level evidence; never ask WebCodecs to probe
+  // the incomplete fourcc when the exact H.264 tuple is already known.
+  const evidence = track as NormalizedTrack & { readonly profile?: unknown; readonly level?: unknown };
+  const profileAndCompatibility = typeof evidence.profile === 'string'
+    ? H264_PROFILE_AND_COMPATIBILITY[evidence.profile.trim().toLowerCase()]
+    : undefined;
+  const level = evidence.level;
+  if (
+    profileAndCompatibility === undefined ||
+    typeof level !== 'number' ||
+    !Number.isSafeInteger(level) ||
+    level < 0 ||
+    level > 0xff
+  ) {
+    return declared;
+  }
+  return `${bareAvc[1]!.toLowerCase()}.${profileAndCompatibility}${level.toString(16).padStart(2, '0').toUpperCase()}`;
+}
+
+const H264_PROFILE_AND_COMPATIBILITY: Readonly<Record<string, string>> = Object.freeze({
+  baseline: '4200',
+  'constrained baseline': '42E0',
+  main: '4D00',
+  extended: '5800',
+  high: '6400',
+  'high 10': '6E00',
+  'high 4:2:2': '7A00',
+  'high 4:4:4 predictive': 'F400',
+});
 
 function webCodecString(codec: string, _direction: 'decode' | 'encode'): string {
   if (/^(avc1|avc3|hvc1|hev1|av01|vp09|vp08|mp4a\.)/i.test(codec)) return codec;
@@ -808,6 +949,18 @@ function stableConfigKey(config: object): string {
 
 function isPcmCodec(codec: string): boolean {
   return PCM_CODECS.has(codec.toLowerCase()) || codec.toLowerCase().startsWith('pcm-');
+}
+
+function knownTotalInputBytes(inputs: ConcreteOperationRequest['inputs']): number | undefined {
+  let total = 0;
+  for (const input of inputs) {
+    if (input.sizeBytes === undefined || !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) {
+      return undefined;
+    }
+    total += input.sizeBytes;
+    if (!Number.isSafeInteger(total)) return undefined;
+  }
+  return total;
 }
 
 function reject(

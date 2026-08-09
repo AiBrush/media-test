@@ -34,7 +34,7 @@
  * strict across independent decoders.
  */
 
-import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
+import type { CandidateInputEnvelope, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
 import {
   ALPHA_EVIDENCE_SCHEMA,
@@ -43,11 +43,19 @@ import {
   defineDisplayTransform,
   imageDecoderContract,
 } from '../../features/decode-seek/index.ts';
+import {
+  HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  MICRO_320X240_1S_CANDIDATE_ENVELOPE,
+  TINY_640X360_2S_CANDIDATE_ENVELOPE,
+  UHD_3840X2160_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
 
 // ── Frame-accurate decode ─────────────────────────────────────────────────────────────────────
 
 interface DecodeCase {
   id: string;
+  revision?: number;
   asset: string;
   container: string;
   videoCodec?: string;
@@ -56,6 +64,7 @@ interface DecodeCase {
   features?: string[];
   /** size-ladder bucket this decode point measures (for the decode-fps-vs-size curve) */
   sizeBucket?: string;
+  candidateEnvelope?: CandidateInputEnvelope;
   tolerances?: OracleTolerances;
   notes?: string;
 }
@@ -193,11 +202,13 @@ const DECODE_CASES: DecodeCase[] = [
   // ── size axis (A.14 / 8.2 / 5.3): the winner at 4K can differ from 1080p/720p ──
   {
     id: 'decode_h264_4k',
+    revision: 2,
     asset: 'h264_4k_10s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 30,
     sizeBucket: 'large',
+    candidateEnvelope: UHD_3840X2160_CANDIDATE_ENVELOPE,
     notes:
       '4K (3840×2160) H.264 decode — size axis per §5.3. May NA(browser) where a 4K-level decode ' +
       'session is unavailable. Distinct decode-fps-vs-size point from the 1080p/720p rungs.',
@@ -206,10 +217,11 @@ const DECODE_CASES: DecodeCase[] = [
   // ── display-matrix rotation as a DECODE case (A.16 "rotated (matrix not w/h swap)") ──
   {
     id: 'decode_rotated_display_matrix',
+    revision: 2,
     asset: 'h264_rotated90.mp4',
     container: 'mp4',
     videoCodec: 'h264',
-    features: ['rotate'],
+    features: ['rotation:decode'],
     maxFrames: 30,
     sizeBucket: 'small',
     notes:
@@ -320,6 +332,7 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
   const isAlpha = c.id.includes('alpha');
   return defineScenario({
     id: `decode-seek/${c.id}`,
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'decodeFrames',
     input: c.asset,
     options: {
@@ -366,6 +379,7 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
       : isAlpha ? DECODE_ALPHA_ORACLES : DECODE_ORACLES,
     metrics: [...DECODE_METRICS],
     primaryMetric: 'decodeFps',
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });
@@ -381,11 +395,13 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
 
 interface SizeLadderCase {
   id: string;
+  revision: number;
   asset: string;
   container: string;
   videoCodec: string;
   maxFrames: number;
   sizeBucket: string;
+  candidateEnvelope: CandidateInputEnvelope;
   tolerances?: OracleTolerances;
   /** the long/huge rungs are gated behind a slow bake; flag so notes are explicit */
   heavyBake?: boolean;
@@ -395,11 +411,13 @@ interface SizeLadderCase {
 const SIZE_LADDER_CASES: SizeLadderCase[] = [
   {
     id: 'decode_size_micro_h264_1frame',
+    revision: 2,
     asset: 'micro_h264_1frame.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 1,
     sizeBucket: 'micro',
+    candidateEnvelope: MICRO_320X240_1S_CANDIDATE_ENVELOPE,
     tolerances: { ssimMin: 0.96 },
     notes:
       'Single-frame micro clip: decode latency / per-call overhead floor of the size curve. Uses a ' +
@@ -407,20 +425,24 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'decode_size_tiny_h264_360p',
+    revision: 2,
     asset: 'tiny_h264_360p_2s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 30,
     sizeBucket: 'tiny',
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
     notes: 'Tiny 360p H.264: low end of the decode-fps-vs-size curve.',
   },
   {
     id: 'decode_size_tiny_vp9_360p',
+    revision: 2,
     asset: 'tiny_vp9_360p_2s.webm',
     container: 'webm',
     videoCodec: 'vp9',
     maxFrames: 30,
     sizeBucket: 'tiny',
+    candidateEnvelope: TINY_640X360_2S_CANDIDATE_ENVELOPE,
     tolerances: { ssimMin: 0.96 },
     notes:
       'Tiny 360p VP9: crosses the size axis with the WebM/VP9 format axis. Uses a slightly looser ' +
@@ -428,11 +450,13 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'decode_size_large_h264_120s',
+    revision: 2,
     asset: 'large_h264_1080p_120s.mp4',
     container: 'mp4',
     videoCodec: 'h264',
     maxFrames: 60,
     sizeBucket: 'large',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     heavyBake: true,
     notes:
       'Large (~100 MB, 120 s) 1080p H.264: sustained-decode rung. Decode fps measured over the ' +
@@ -440,11 +464,13 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'decode_size_large_vp9_120s',
+    revision: 2,
     asset: 'large_vp9_1080p_120s.webm',
     container: 'webm',
     videoCodec: 'vp9',
     maxFrames: 60,
     sizeBucket: 'large',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     heavyBake: true,
     notes:
       'Large (~100 MB, 120 s) 1080p VP9: the WebM/VP9 large rung so the size axis crosses the format ' +
@@ -452,11 +478,13 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'decode_size_huge_h264_600s',
+    revision: 2,
     asset: 'huge_h264_1080p_600s.mov',
     container: 'mov',
     videoCodec: 'h264',
     maxFrames: 60,
     sizeBucket: 'huge',
+    candidateEnvelope: HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
     heavyBake: true,
     notes:
       'Huge (~500–700 MB, 600 s) 1080p H.264 .mov: top of the decode size curve — lazy/partial read + ' +
@@ -467,6 +495,7 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
 const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
   defineScenario({
     id: `decode-seek/${c.id}`,
+    revision: c.revision,
     op: 'decodeFrames',
     input: c.asset,
     options: {
@@ -481,6 +510,7 @@ const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
     oracles: DECODE_ORACLES,
     metrics: [...DECODE_METRICS],
     primaryMetric: 'decodeFps',
+    candidateEnvelope: c.candidateEnvelope,
     ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   }),

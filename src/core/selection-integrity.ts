@@ -4,7 +4,7 @@
  * adapter construction, then pass only `VERIFIED` bytes across the engine boundary.
  */
 
-import type { OracleId } from './scenario.ts';
+import type { CandidateInputEnvelope, OracleId } from './scenario.ts';
 import { Sha256, sha256Hex } from './seeded-rng.ts';
 
 export const CATALOG_SCHEMA_VERSION = 'media-candidate-catalog@1' as const;
@@ -97,15 +97,17 @@ export interface SourceFileRecord {
   contract?: CandidateContractDeclaration;
 }
 
+export interface ScenarioSourceRequirements extends CandidateInputEnvelope {
+  container: string;
+  video: boolean;
+  videoCodecs: string[];
+  audioCodecs: string[];
+  encryption?: string[] | null;
+}
+
 export interface ScenarioSourceRow {
   scenarioId: string;
-  requires: {
-    container: string;
-    video: boolean;
-    videoCodecs: string[];
-    audioCodecs: string[];
-    encryption?: string[] | null;
-  };
+  requires: ScenarioSourceRequirements;
   class: SourceClass;
   files: SourceFileRecord[];
   reason?: string;
@@ -161,7 +163,19 @@ export type BakedManifestValidationResult =
 
 const SOURCE_CLASSES = new Set<SourceClass>(['REAL', 'SYNTHETIC', 'STREAMING', 'DERIVED']);
 const SOURCE_ROW_KEYS = new Set(['scenarioId', 'requires', 'class', 'files', 'reason', 'note']);
-const REQUIRES_KEYS = new Set(['container', 'video', 'videoCodecs', 'audioCodecs', 'encryption']);
+const REQUIRES_KEYS = new Set([
+  'container',
+  'video',
+  'videoCodecs',
+  'audioCodecs',
+  'encryption',
+  'minWidth',
+  'maxWidth',
+  'minHeight',
+  'maxHeight',
+  'minDurationSec',
+  'maxDurationSec',
+]);
 const SOURCE_FILE_KEYS = new Set([
   'file',
   'container',
@@ -225,6 +239,7 @@ const ORACLE_IDS = new Set<OracleId>([
   'reference-reimport',
   'playback-smoke',
   'ssim-psnr',
+  'average-bitrate',
   'mp4-box-layout',
   'webm-live-layout',
   'fanout-renditions',
@@ -872,6 +887,28 @@ function validateRequires(
   const encryption = raw.encryption === undefined || raw.encryption === null
     ? raw.encryption
     : normalizedTokenArray(raw.encryption, `${context}.requires.encryption`, issues, { line, scenarioId });
+  const location = { line, scenarioId };
+  const minWidth = optionalSourceRequirementBound(raw.minWidth, `${context}.requires.minWidth`, 'dimension', issues, location);
+  const maxWidth = optionalSourceRequirementBound(raw.maxWidth, `${context}.requires.maxWidth`, 'dimension', issues, location);
+  const minHeight = optionalSourceRequirementBound(raw.minHeight, `${context}.requires.minHeight`, 'dimension', issues, location);
+  const maxHeight = optionalSourceRequirementBound(raw.maxHeight, `${context}.requires.maxHeight`, 'dimension', issues, location);
+  const minDurationSec = optionalSourceRequirementBound(
+    raw.minDurationSec,
+    `${context}.requires.minDurationSec`,
+    'duration',
+    issues,
+    location,
+  );
+  const maxDurationSec = optionalSourceRequirementBound(
+    raw.maxDurationSec,
+    `${context}.requires.maxDurationSec`,
+    'duration',
+    issues,
+    location,
+  );
+  validateSourceRequirementRange(minWidth, maxWidth, 'width', `${context}.requires`, issues, location);
+  validateSourceRequirementRange(minHeight, maxHeight, 'height', `${context}.requires`, issues, location);
+  validateSourceRequirementRange(minDurationSec, maxDurationSec, 'durationSec', `${context}.requires`, issues, location);
   if (!container || typeof video !== 'boolean' || !videoCodecs || !audioCodecs) return undefined;
   if (video && videoCodecs.length === 0) {
     issues.push(issue('CATALOG_VIDEO_CODEC_REQUIRED', `${context}.requires.video=true needs a video codec`, { line, scenarioId }));
@@ -882,6 +919,12 @@ function validateRequires(
     videoCodecs,
     audioCodecs,
     ...(encryption !== undefined ? { encryption } : {}),
+    ...(minWidth !== undefined ? { minWidth } : {}),
+    ...(maxWidth !== undefined ? { maxWidth } : {}),
+    ...(minHeight !== undefined ? { minHeight } : {}),
+    ...(maxHeight !== undefined ? { maxHeight } : {}),
+    ...(minDurationSec !== undefined ? { minDurationSec } : {}),
+    ...(maxDurationSec !== undefined ? { maxDurationSec } : {}),
   };
 }
 
@@ -1451,6 +1494,45 @@ function optionalSafeSize(
     return undefined;
   }
   return raw;
+}
+
+function optionalSourceRequirementBound(
+  raw: unknown,
+  context: string,
+  kind: 'dimension' | 'duration',
+  issues: CatalogIssue[],
+  location: Partial<CatalogIssue>,
+): number | undefined {
+  if (raw === undefined) return undefined;
+  const valid = typeof raw === 'number'
+    && Number.isFinite(raw)
+    && (kind === 'dimension' ? Number.isSafeInteger(raw) && raw > 0 : raw >= 0);
+  if (!valid) {
+    issues.push(issue(
+      'CATALOG_REQUIREMENT_BOUND_INVALID',
+      `${context} must be ${kind === 'dimension' ? 'a positive safe integer' : 'finite and nonnegative'}`,
+      location,
+    ));
+    return undefined;
+  }
+  return raw;
+}
+
+function validateSourceRequirementRange(
+  min: number | undefined,
+  max: number | undefined,
+  field: 'width' | 'height' | 'durationSec',
+  context: string,
+  issues: CatalogIssue[],
+  location: Partial<CatalogIssue>,
+): void {
+  if (min !== undefined && max !== undefined && min > max) {
+    issues.push(issue(
+      'CATALOG_REQUIREMENT_RANGE_INVALID',
+      `${context}.min${field[0]!.toUpperCase()}${field.slice(1)} must not exceed max${field[0]!.toUpperCase()}${field.slice(1)}`,
+      location,
+    ));
+  }
 }
 
 function stringArray(raw: unknown, context: string, issues: CatalogIssue[]): string[] {

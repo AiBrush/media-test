@@ -52,6 +52,7 @@ import type {
   OperationContext,
   OperationPhase,
   SeekResult,
+  SerializedOperationConstraintUnsatisfiedError,
 } from './engine.ts';
 import {
   AUTHENTICATED_RANGE_INPUT_FEATURE,
@@ -67,6 +68,7 @@ import {
   isBrowserNotSupportedError,
   isMalformedInputError,
   isNotApplicableError,
+  isOperationConstraintUnsatisfiedError,
   validateAdapterResult,
   validateCapabilitySet,
   validateEncodedTracks,
@@ -225,6 +227,7 @@ import {
   assessDecodeTrackSelection,
   decodeScenarioProvenanceFromOptions,
   decodeTrackSelectorFromOptions,
+  displayTransformFromOptions,
   executeSeekSequence,
   imageDecoderContractFromOptions,
   materializeDecodeResultProvenance,
@@ -889,6 +892,7 @@ function createRunFixtureIntegrityRuntime(): ActiveFixtureRuntime {
 }
 
 const GOLDEN_KIND_ORDER: readonly GoldenKind[] = ['meta', 'packets', 'frames', 'ssim'];
+const GOLDEN_LOAD_KIND_ORDER: readonly GoldenKind[] = [...GOLDEN_KIND_ORDER, 'alpha'];
 const goldenLoadCacheByRuntime = new WeakMap<ActiveFixtureRuntime, Map<string, Promise<GoldenStore>>>();
 
 /**
@@ -912,9 +916,12 @@ export function goldenKindsForScenario(scenario: Scenario): readonly GoldenKind[
         kinds.add('packets');
         break;
       case 'decoded-frames-bitexact':
-      case 'alpha-plane':
       case 'decrypt-bitexact':
         kinds.add('frames');
+        break;
+      case 'alpha-plane':
+        kinds.add('frames');
+        kinds.add('alpha');
         break;
       case 'ssim-psnr':
       case 'fanout-renditions':
@@ -937,13 +944,14 @@ export function goldenKindsForScenario(scenario: Scenario): readonly GoldenKind[
       case 'golden-metadata':
       case 'decoded-audio-pcm':
       case 'playback-smoke':
+      case 'average-bitrate':
       case 'mp4-box-layout':
       case 'webm-live-layout':
       case 'graceful-failure':
         break;
     }
   }
-  return GOLDEN_KIND_ORDER.filter((kind) => kinds.has(kind));
+  return GOLDEN_LOAD_KIND_ORDER.filter((kind) => kinds.has(kind));
 }
 
 function loadGoldenForRun(
@@ -970,7 +978,9 @@ function loadGoldenForRun(
     cache = new Map();
     goldenLoadCacheByRuntime.set(runtime, cache);
   }
-  const plan = requestedKinds ? GOLDEN_KIND_ORDER.filter((kind) => requestedKinds.includes(kind)) : GOLDEN_KIND_ORDER;
+  const plan = requestedKinds
+    ? GOLDEN_LOAD_KIND_ORDER.filter((kind) => requestedKinds.includes(kind))
+    : GOLDEN_LOAD_KIND_ORDER;
   const cacheKey = `${assetId}\u0000${plan.join(',')}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
@@ -1267,7 +1277,19 @@ function buildAttestedStreamMediaInput(
   };
 }
 
-const LARGE_AUTHENTICATED_RANGE_INPUT_MIN_BYTES = 256 * 1024 * 1024;
+/**
+ * Immutable inputs above an operation's bounded eager-preparation ceiling are admitted only through
+ * the digest-bound URL source. This is an operation/size policy, deliberately independent of asset
+ * ids and containers: adding or rotating a corpus file cannot silently change its delivery mode.
+ *
+ * Trim's 128 MiB boundary matches the adapter's strict prepared-copy ceiling. Remux and demux keep
+ * their established 256 MiB ceiling because their bounded byte-table paths are independently sized.
+ */
+const AUTHENTICATED_RANGE_INPUT_MIN_BYTES_BY_OPERATION: Readonly<Partial<Record<Operation, number>>> = {
+  trim: 128 * 1024 * 1024,
+  remux: 256 * 1024 * 1024,
+  demux: 256 * 1024 * 1024,
+};
 
 function commonAuthenticatedStreamTransportEligible(
   scenario: Scenario,
@@ -1294,10 +1316,11 @@ function authenticatedStreamTransportFeature(
     return AUTHENTICATED_RANGE_PROBE_FEATURE;
   }
   const sizeBytes = resolvedInputs[0]?.sizeBytes;
+  const minimumBytes = AUTHENTICATED_RANGE_INPUT_MIN_BYTES_BY_OPERATION[scenario.op];
   if (
-    (scenario.op === 'remux' || scenario.op === 'demux') &&
+    minimumBytes !== undefined &&
     Number.isSafeInteger(sizeBytes) &&
-    Number(sizeBytes) > LARGE_AUTHENTICATED_RANGE_INPUT_MIN_BYTES
+    Number(sizeBytes) > minimumBytes
   ) {
     return AUTHENTICATED_RANGE_INPUT_FEATURE;
   }
@@ -4170,12 +4193,18 @@ function mediaSecFromContext(
   return undefined;
 }
 
-function decodeFrameGoldenGap(
+export function decodeFrameGoldenGap(
   scenario: Scenario,
   golden: GoldenStore,
 ): { status: 'NA_ASSET' | 'ERROR'; reason: string } | null {
   if (scenario.op !== 'decodeFrames') return null;
   if (!scenario.oracles.some((oracle) => oracle === 'ssim-psnr' || oracle === 'decoded-frames-bitexact')) {
+    return null;
+  }
+  // Display-space decode has an independent source reference: ssimPsnr decodes the verified input with
+  // the neutral platform engine and compares real presented dimensions/pixels. Requiring an ordinary
+  // coded-frame sidecar before that live reference can run turns a sufficient oracle into stale NA_ASSET.
+  if (scenario.oracles.includes('ssim-psnr') && displayTransformFromOptions(scenario.options) !== undefined) {
     return null;
   }
   const hasFrames = (golden.frames?.length ?? 0) > 0;
@@ -5738,6 +5767,10 @@ export async function runOne(
       if (err instanceof RunCancelledError) {
         return finalize('SKIPPED', [], `[RUN_CANCELLED] ${err.message}`);
       }
+      if (isOperationConstraintUnsatisfiedError(err)) {
+        const outcome = operationConstraintUnsatisfiedOutcome(scenario, err);
+        return finalize('FAIL', [outcome], `[${outcome.reasonCode}] ${outcome.detail}`);
+      }
       if (isNotApplicableError(err)) {
         return finalize('NA_ENGINE', [], errMessage(err));
       }
@@ -5915,13 +5948,48 @@ export async function runOne(
       );
     } catch (err) {
       if (isNotApplicableError(err)) {
-        return finalize('NA_ENGINE', oracleOutcomes, applicabilityReason(err));
+        // Correctness and candidate sufficiency were established before measurement began. A
+        // repeated operation may still expose a benchmark-only resource/configuration boundary;
+        // that makes the optional measurement unavailable, not the supported functional tuple
+        // inapplicable. Relabelling this row NA_ENGINE would also contradict the retained PASS
+        // oracles/candidate evidence and make the artifact fail its own result schema.
+        return finalize(
+          correctnessStatus,
+          oracleOutcomes,
+          undefined,
+          undefined,
+          {
+            state: 'UNAVAILABLE',
+            reasonCode: 'BENCH_NOT_APPLICABLE',
+            detail: applicabilityReason(err),
+          },
+        );
       }
       if (isBrowserNotSupportedError(err)) {
-        return finalize('NA_BROWSER', oracleOutcomes, browserApplicabilityReason(err));
+        return finalize(
+          correctnessStatus,
+          oracleOutcomes,
+          undefined,
+          undefined,
+          {
+            state: 'UNAVAILABLE',
+            reasonCode: 'BENCH_BROWSER_UNSUPPORTED',
+            detail: browserApplicabilityReason(err),
+          },
+        );
       }
       if (isCorpusDeliveryIntegrityError(err)) {
-        return finalize('NA_ASSET', oracleOutcomes, `[${err.reasonCode}] ${err.detail}`);
+        return finalize(
+          correctnessStatus,
+          oracleOutcomes,
+          undefined,
+          undefined,
+          {
+            state: 'UNAVAILABLE',
+            reasonCode: 'BENCH_ASSET_UNAVAILABLE',
+            detail: `[${err.reasonCode}] ${err.detail}`,
+          },
+        );
       }
       if (err instanceof TimeoutError) {
         return finalize(
@@ -6013,6 +6081,10 @@ export async function runOne(
       { state: 'AVAILABLE', metrics: Object.keys(benchResult ?? {}) as MetricId[] },
     );
   } catch (err) {
+    if (isOperationConstraintUnsatisfiedError(err)) {
+      const outcome = operationConstraintUnsatisfiedOutcome(scenario, err);
+      return finalize('FAIL', [outcome], `[${outcome.reasonCode}] ${outcome.detail}`);
+    }
     if (isNotApplicableError(err)) {
       return finalize('NA_ENGINE', [], applicabilityReason(err));
     }
@@ -8634,6 +8706,43 @@ function errMessage(err: unknown): string {
   } catch {
     return iJsonString(String(err));
   }
+}
+
+function operationConstraintUnsatisfiedOutcome(
+  scenario: Scenario,
+  error: SerializedOperationConstraintUnsatisfiedError,
+): OracleOutcome {
+  const attempts = error.evidence.attempts.map((attempt) => ({
+    attempt: attempt.attempt,
+    targetBytes: attempt.targetBytes,
+    actualBytes: attempt.actualBytes,
+    averageBitrate: attempt.averageBitrate,
+    ...(attempt.qualityMean !== undefined ? { qualityMean: attempt.qualityMean } : {}),
+    ...(attempt.qualitySamples !== undefined ? { qualitySamples: attempt.qualitySamples } : {}),
+  }));
+  const detail = `${error.engineId}.${error.operation}: ${iJsonString(error.reason)} ` +
+    `(${attempts.length} bounded candidate${attempts.length === 1 ? '' : 's'} attempted)`;
+  return {
+    state: 'VERDICT',
+    oracle: scenario.oracles.includes('fanout-renditions')
+      ? 'fanout-renditions'
+      : scenario.oracles[0] ?? 'property-invariant',
+    verdict: 'FAIL',
+    reasonCode: error.reasonCode,
+    detail,
+    measurements: { constraintAttempts: attempts.length },
+    evidence: {
+      schema: 'media-test/operation-constraint-unsatisfied@1',
+      engineId: error.engineId,
+      operation: error.operation,
+      constraint: error.evidence.constraint,
+      preferredAverageBitrate: error.evidence.preferredAverageBitrate,
+      maxAverageBitrate: error.evidence.maxAverageBitrate,
+      minimumQualityMean: error.evidence.minimumQualityMean,
+      metric: error.evidence.metric,
+      attempts,
+    },
+  };
 }
 
 /** External runtimes may surface ill-formed UTF-16; result strings must remain valid I-JSON. */

@@ -216,16 +216,33 @@ describe('REQ-FEAT-41 semantic tag read/write by neutral re-probe', () => {
   });
 
   test('all write/no-tag/cross-container scenarios carry executable neutral contracts', () => {
-    for (const id of [
+    const tagRewriteIds = [
       'metadata/write_mp4_tags', 'metadata/write_mkv_tags', 'metadata/write_mp3_id3',
       'metadata/write_flac_vorbiscomment', 'metadata/write_ogg_vorbiscomment',
-      'metadata/meta_consistent_mp4_to_mkv', 'metadata/read_no_tags_wav',
-      'metadata/read_no_tags_recorder_webm',
-    ]) {
+      'metadata/tagedit_no_corrupt_video_mp4_mkv',
+      'metadata/tagedit_no_corrupt_audio_flac',
+      'metadata/meta_consistent_mp4_to_mkv',
+    ] as const;
+    for (const id of [
+      ...tagRewriteIds,
+      'metadata/read_no_tags_wav', 'metadata/read_no_tags_recorder_webm',
+    ] as const) {
       expect(metadataTagContractFromOptions(scenario(id).options), id).toBeDefined();
+    }
+    for (const id of tagRewriteIds) {
+      expect(scenario(id).oracles, id).toContain('reference-reimport');
     }
     expect(metadataTagContractFromOptions(scenario('metadata/write_mp4_tags').options)?.requested?.title)
       .toBe(METADATA_UNICODE_TAGS.title);
+    const audioRewrite = scenario('metadata/tagedit_no_corrupt_audio_flac');
+    expect(audioRewrite.revision).toBe(2);
+    expect(audioRewrite.requires.features).toContain('metadata:write');
+    expect((audioRewrite.options as { tags?: Record<string, string> }).tags).toEqual(METADATA_UNICODE_TAGS);
+    expect(metadataTagContractFromOptions(audioRewrite.options)).toMatchObject({
+      mode: 'write-reprobe', carrier: 'flac', requested: METADATA_UNICODE_TAGS,
+    });
+    expect(scenario('metadata/tagedit_no_corrupt_video_mp4_mkv').revision).toBe(3);
+    expect(scenario('metadata/meta_consistent_mp4_to_mkv').revision).toBe(3);
   });
 
   test('conflicting aliases fail instead of silently selecting one', () => {

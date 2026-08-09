@@ -459,7 +459,7 @@ describe('REQ-FIX-06 attributable envelope publication', () => {
       [
         'unqualified time mode',
         (document) => { document.provenance.runDetails.timeMode = 'wall-clock'; },
-        "provenance timeMode must be 'source-date-epoch'",
+        "provenance timeMode must be 'source-date-epoch' when browserQualified is false",
       ],
       [
         'untyped browser qualification',

@@ -435,14 +435,14 @@ describe('REQ-ENG-13: ffmpeg tuple capability', () => {
       options: { video: { codec: 'h264' }, audio: { codec: 'aac' } },
     }), RUNTIME)).toEqual({ supported: true });
 
-    expect(reason(request('transcode', 'mp4', [
+    expect(decideFfmpegSupport(request('transcode', 'mp4', [
       { ...video('h264'), width: 1080, height: 1920, fps: 60, bitrate: 5_723_914 },
       { ...audio('aac'), bitrate: 189_393 },
     ], {
       id: 'scenarios/transcode/h264_bitrate_2mbps/03.mp4',
       output: { container: 'mp4', videoCodec: 'h264' },
       options: { video: { codec: 'h264', bitrate: 2_000_000 } },
-    }))).toBe('FFMPEG_H264_2MBPS_QUALITY_BOUND');
+    }), RUNTIME)).toEqual({ supported: true });
     expect(decideFfmpegSupport(request('transcode', 'mp4', [
       { ...video('h264'), width: 960, height: 540, fps: 30, bitrate: 1_639_712 },
       { ...audio('aac'), bitrate: 253_374 },

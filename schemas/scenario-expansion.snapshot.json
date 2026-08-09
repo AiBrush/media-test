@@ -21,8 +21,8 @@
     },
     {
       "id": "probe/big_buck_bunny_1080p_h264",
-      "revision": 1,
-      "definitionHash": "e865c20708cd2ecf907717dac92eb409019fb2d7daa45ca859eb232add104fc3",
+      "revision": 2,
+      "definitionHash": "164bd1540cffa84c8b61bf820ccceee49f4bc474aa3667c43a62c8a39d889308",
       "inputVariantIds": [
         "baked"
       ],
@@ -210,8 +210,8 @@
     },
     {
       "id": "probe/huge_h264_1080p_600s",
-      "revision": 1,
-      "definitionHash": "4a890340cbd1da73c779e4ffc54e1f194daebc86f8d3d762d3c38703dd6180f1",
+      "revision": 2,
+      "definitionHash": "a5d8574e6ef1fe959a9d4b3aa691542b2fe7fc841431f3b0b3651b5cc9aa4f28",
       "inputVariantIds": [
         "baked"
       ],
@@ -219,8 +219,8 @@
     },
     {
       "id": "probe/huge_vp9_1080p_240s",
-      "revision": 1,
-      "definitionHash": "3d80fd8cf01eb8384133cea01976127be6b96f8b48cf6730e1cc4c7efbd9ef72",
+      "revision": 2,
+      "definitionHash": "27db6bdfebd4ee90d76f6fc2b3f246125774906dfdb0e29d6828c86ade7fa4af",
       "inputVariantIds": [
         "baked"
       ],
@@ -228,8 +228,8 @@
     },
     {
       "id": "probe/large_h264_1080p_120s",
-      "revision": 1,
-      "definitionHash": "fd12c88885708a7d5e3f57ac3997fa6d1161c130eb37e265e74bcf0813ed0e45",
+      "revision": 2,
+      "definitionHash": "13556a9afe34f0a0a99afbe811e5f4a8622945fa58cb59c40a028f773850aff3",
       "inputVariantIds": [
         "baked"
       ],
@@ -237,8 +237,8 @@
     },
     {
       "id": "probe/large_vp9_1080p_120s",
-      "revision": 1,
-      "definitionHash": "1b7eb7feb86edcbf43a446bd7ef00fde00970277793acf8584242c98e221f23c",
+      "revision": 2,
+      "definitionHash": "da0a8a7946211e01e0d2c866b23be3076dfe1f0a49064332b235b11483719e19",
       "inputVariantIds": [
         "baked"
       ],
@@ -255,8 +255,8 @@
     },
     {
       "id": "probe/massive_h264_1080p_2h",
-      "revision": 1,
-      "definitionHash": "ed7dbcdab0744df0dbe6f5f7c01fd2188be6780f1e7768dd89e12b9c76c36fb9",
+      "revision": 2,
+      "definitionHash": "96c070e31b18aee27d9ab6f8fed7e7994b8f143acbbebf87b49658bf9c7cf91f",
       "inputVariantIds": [
         "baked"
       ],
@@ -264,8 +264,8 @@
     },
     {
       "id": "probe/massive_vp9_1080p_2h",
-      "revision": 1,
-      "definitionHash": "a8e57014e440d6fc7204faf12d8d7417bc6b73330504ed9a5e570ec8861872cd",
+      "revision": 2,
+      "definitionHash": "1cba38fc00d40be645c7e8da2853abbf4884342ce128d6f1093abef850ac1e0b",
       "inputVariantIds": [
         "baked"
       ],
@@ -291,8 +291,8 @@
     },
     {
       "id": "probe/micro_audio_short",
-      "revision": 1,
-      "definitionHash": "7502fd9ef580161a5cb94b2133badbb9fae8a2c3c7497db65ef54b943a04d61b",
+      "revision": 2,
+      "definitionHash": "dd04405a2e9685e51792c2f314beb802086b66cbca0d64faa58dc06b87f66086",
       "inputVariantIds": [
         "baked"
       ],
@@ -300,8 +300,8 @@
     },
     {
       "id": "probe/micro_h264_1frame",
-      "revision": 1,
-      "definitionHash": "1bac6779f4a2dfbb01642c677e3f086239c4b028605dd5a4f6f3f59a3785d015",
+      "revision": 2,
+      "definitionHash": "e5a7a897184d89eb70ef4edf6d5c0c207084d3b59438a773b913c9d0e1a5bd1e",
       "inputVariantIds": [
         "baked"
       ],
@@ -363,8 +363,8 @@
     },
     {
       "id": "probe/perf-extract-metadata-huge",
-      "revision": 1,
-      "definitionHash": "f7f827606e2c43701d2af49250f3f2bd1bb350511e850e9350a525a99d320c92",
+      "revision": 2,
+      "definitionHash": "c19c50af5335b26259001f9c67ad3cce42c48afeec6ab87fb05b2cc93f50ca47",
       "inputVariantIds": [
         "baked"
       ],
@@ -372,8 +372,8 @@
     },
     {
       "id": "probe/perf-extract-metadata-large",
-      "revision": 1,
-      "definitionHash": "e404b4980eb1bef9b7e97789542dd19de308cc27cf4d4a459583c4e8e4a44f43",
+      "revision": 2,
+      "definitionHash": "d39fc99a0c7520a4d7bb91e0ae8e07b230ef22b12ed32b695846937c1411b129",
       "inputVariantIds": [
         "baked"
       ],
@@ -381,8 +381,8 @@
     },
     {
       "id": "probe/perf-extract-metadata-massive",
-      "revision": 1,
-      "definitionHash": "07ade34d5edf11796640671bb30d0a61f831eeff836bf7bee742eef055215dc2",
+      "revision": 2,
+      "definitionHash": "556bff4dd3381f384a6a555699483f4fca39e7d88b9b6cd794027bc9fbaac179",
       "inputVariantIds": [
         "baked"
       ],
@@ -426,8 +426,8 @@
     },
     {
       "id": "probe/tiny_h264_360p_2s",
-      "revision": 1,
-      "definitionHash": "fad170a4064e5a66f588b05d4b864c08edd0ea9a67b225624a256abb949d54ed",
+      "revision": 2,
+      "definitionHash": "cc3d5dcd218f907b0539168d3fdaee2801fd2dbd1eba5189b885928f099675e9",
       "inputVariantIds": [
         "baked"
       ],
@@ -435,8 +435,8 @@
     },
     {
       "id": "probe/tiny_vp9_360p_2s",
-      "revision": 1,
-      "definitionHash": "3d5c05be32ec1fd0fd016c50912f74e2aa9635e6562ba8a39f7d7ffacbe25973",
+      "revision": 2,
+      "definitionHash": "456e5c6721ac1881a1c7078eec53e6555ba6e519c4e1c0862f1d543a7afce2e1",
       "inputVariantIds": [
         "baked"
       ],
@@ -850,8 +850,8 @@
     },
     {
       "id": "demux/size_huge_huge_h264_1080p_600s",
-      "revision": 1,
-      "definitionHash": "609f13c48451709ff3979d183bcd4c49ab033769297fad743ac6469368be4101",
+      "revision": 2,
+      "definitionHash": "9522dfd7f6fbea95b80c8e8281418cb6a8cbcfe93f2f360282d9e05a00f26b17",
       "inputVariantIds": [
         "baked"
       ],
@@ -859,8 +859,8 @@
     },
     {
       "id": "demux/size_large_large_h264_1080p_120s",
-      "revision": 1,
-      "definitionHash": "e34eb9bd6c967ff70c3cf4afa1374b2fbaa0ea6cbdaa9fb8ca6d62bf19bd2f6f",
+      "revision": 2,
+      "definitionHash": "ca17f131fb3a84f0c19d7ef0cf99a30475a1687ea3da7dd0224aee348412cc25",
       "inputVariantIds": [
         "baked"
       ],
@@ -868,8 +868,8 @@
     },
     {
       "id": "demux/size_large_large_vp9_1080p_120s",
-      "revision": 1,
-      "definitionHash": "4bcb1b239225d6ce3e29ac63b91d4949a35b6f6d19c011806a5d935061935da5",
+      "revision": 2,
+      "definitionHash": "91687f5724968e50ec4a535bc382a3b9cc279afed683149648ea7bb72991d162",
       "inputVariantIds": [
         "baked"
       ],
@@ -877,8 +877,8 @@
     },
     {
       "id": "demux/size_massive_massive_h264_1080p_2h",
-      "revision": 1,
-      "definitionHash": "1faec0838c678ea3303bc212592833cae16300c272094bd1f644148456356a0f",
+      "revision": 2,
+      "definitionHash": "12b291c649db3a35fcfaf544ff40fcc94c67cc756ccfdfc8abdaee5144aa39d1",
       "inputVariantIds": [
         "baked"
       ],
@@ -886,8 +886,8 @@
     },
     {
       "id": "demux/size_micro_micro_audio_short",
-      "revision": 1,
-      "definitionHash": "f2f74073891a34e4197b7122d51b624559b2a67adc28e4bc8e855e129c95bdf9",
+      "revision": 2,
+      "definitionHash": "9f34a0e75204380e164449c90c2f3ec2f02c6cfea51d1d7c0dd8c32883de9500",
       "inputVariantIds": [
         "baked"
       ],
@@ -895,8 +895,8 @@
     },
     {
       "id": "demux/size_micro_micro_h264_1frame",
-      "revision": 1,
-      "definitionHash": "5da3c37e1f078172b5e5c46a84e2a6e38066aa456aef9e1b15bbcbc45b0909bb",
+      "revision": 2,
+      "definitionHash": "86aa66139d4937c8e846e0d28587525e9e68ade4d9982e7e6e28bf7c7a75b822",
       "inputVariantIds": [
         "baked"
       ],
@@ -904,8 +904,8 @@
     },
     {
       "id": "demux/size_tiny_tiny_h264_360p_2s",
-      "revision": 1,
-      "definitionHash": "dbf11b1b4e7d5eb3378759818bd4f145185d587a321810761ff1f7bbbbb42a7d",
+      "revision": 2,
+      "definitionHash": "b2509c3538be0370eb72a02f85d0a7574506d64adac928cab9b5f282a796a2d8",
       "inputVariantIds": [
         "baked"
       ],
@@ -913,8 +913,8 @@
     },
     {
       "id": "demux/size_tiny_tiny_vp9_360p_2s",
-      "revision": 1,
-      "definitionHash": "0246a65f999c628b9f9dee4979612f497b703e3c10e7710311df4d107aecb506",
+      "revision": 2,
+      "definitionHash": "948fe98948d679c847117c0ef1497b91b090f6435f794936524ab75fb4ac6684",
       "inputVariantIds": [
         "baked"
       ],
@@ -1201,8 +1201,8 @@
     },
     {
       "id": "remux/huge_h264_1080p_600s_mov_to_mp4",
-      "revision": 1,
-      "definitionHash": "e5136b618aab2d603917ede886df88cd834d3d4a7833b146a4a864edf6f525df",
+      "revision": 2,
+      "definitionHash": "2eeec55c732df5c126167916a4a07e5ec5cfea4ea78baa450b4cf3e7a07aeee0",
       "inputVariantIds": [
         "baked"
       ],
@@ -1210,8 +1210,8 @@
     },
     {
       "id": "remux/large_h264_1080p_120s_mp4_to_mkv",
-      "revision": 1,
-      "definitionHash": "1bce2403298ca5d83df804a823a518340153c3372d10292e54b94d0c064f49b3",
+      "revision": 2,
+      "definitionHash": "aae3f7384589f5628b639db36e1b06bcdcb9ad61e91a9c49a2cfb4bbaf0e3252",
       "inputVariantIds": [
         "baked"
       ],
@@ -1219,8 +1219,8 @@
     },
     {
       "id": "remux/large_vp9_1080p_120s_webm_to_mkv",
-      "revision": 1,
-      "definitionHash": "28a62cdc4dd555caba9ba14175212149a2ce26525888aee07320419046ee4854",
+      "revision": 2,
+      "definitionHash": "5d60d3aeedce6c2c214ad492dc1a76a9461cba61031297a98e95d81cb79aea57",
       "inputVariantIds": [
         "baked"
       ],
@@ -1228,8 +1228,8 @@
     },
     {
       "id": "remux/massive_h264_1080p_2h_mp4_to_mkv",
-      "revision": 1,
-      "definitionHash": "9cda2745bd062dced8b2db58cdf7a56940e9d459ac29bb5c39656dfb1b78fed5",
+      "revision": 2,
+      "definitionHash": "dd1e632f89872806b3e5123358ea6092c1587889b84ab03da34a709228d99af8",
       "inputVariantIds": [
         "baked"
       ],
@@ -1534,8 +1534,8 @@
     },
     {
       "id": "transcode/fanout_h264_abr_ladder",
-      "revision": 1,
-      "definitionHash": "2d01c6a9e6d4901f420087674fc0a31fe6dcb84c99d14ae59b41f4c3aa8fd1dd",
+      "revision": 3,
+      "definitionHash": "3f921be9e8000de81c6f5b272745e9cadb4bd5325dc2c697e989b8ad87f62e01",
       "inputVariantIds": [
         "baked"
       ],
@@ -1602,8 +1602,8 @@
     },
     {
       "id": "transcode/h264_bitrate_2mbps",
-      "revision": 1,
-      "definitionHash": "693d46321546e294b08cf484a8fba77c16e1f1775c8ba6db9cff4f10ba780b93",
+      "revision": 4,
+      "definitionHash": "21134265e47ed54c51bd6b9de6b8eeb754f82997e4d233974e7d70ab3a60e131",
       "inputVariantIds": [
         "baked"
       ],
@@ -1710,8 +1710,8 @@
     },
     {
       "id": "transcode/h264_rotate_180",
-      "revision": 1,
-      "definitionHash": "4b6917f3e85892b727cb044c6c8118085a373656b8f259b1de25794da332b0cf",
+      "revision": 2,
+      "definitionHash": "c8d9d548016fc5427c0357ab90ec0af14d92a1d48c34cd9d16e28dee2d8557e4",
       "inputVariantIds": [
         "baked"
       ],
@@ -1719,8 +1719,8 @@
     },
     {
       "id": "transcode/h264_rotate_270_dimswap",
-      "revision": 1,
-      "definitionHash": "a9701c3e4dfac0d659483eca0585b9f334d9d8ab4a232c7b3541b82bc37a73f4",
+      "revision": 2,
+      "definitionHash": "5e4f0aa3255eca9ba28b165dc03f802acc89a5df6cbc51fb9310864afba9af5a",
       "inputVariantIds": [
         "baked"
       ],
@@ -1728,8 +1728,8 @@
     },
     {
       "id": "transcode/h264_rotate_90_dimswap",
-      "revision": 1,
-      "definitionHash": "0d8ae3fc91634daa9ac781b2d38d8ddca8f26533411a43bf4966ace737ffde09",
+      "revision": 2,
+      "definitionHash": "8640f9bd4524f349c22b4b9d48d8b68d23998dc5f323a1c2f9931802030e0138",
       "inputVariantIds": [
         "baked"
       ],
@@ -1818,8 +1818,8 @@
     },
     {
       "id": "transcode/h264_two_pass_bitrate",
-      "revision": 1,
-      "definitionHash": "49d1e594e8bae57c15d74f1f467eca961ccc3c5a77e658e309336282f07ca39d",
+      "revision": 2,
+      "definitionHash": "248d6a79410fe14650c610a5f3d8f6f6616388c3ebafd173d67b40b9872dd08e",
       "inputVariantIds": [
         "baked"
       ],
@@ -1881,8 +1881,8 @@
     },
     {
       "id": "transcode/ladder_large_h264_1080p_120s_resize_720p",
-      "revision": 1,
-      "definitionHash": "dc0a8cf4e55bf55ad9a3980f408be88d8422ce0d512a6b5f3096c740807e6a8d",
+      "revision": 2,
+      "definitionHash": "82674f85a9542ac52ee59841702760a67af8e555e7ba95f5539996dfa348b8d5",
       "inputVariantIds": [
         "baked"
       ],
@@ -1890,8 +1890,8 @@
     },
     {
       "id": "transcode/ladder_large_vp9_1080p_120s_to_h264_720p",
-      "revision": 1,
-      "definitionHash": "5c88d6cfd41376524429f1e5d79469460725f1ef54d19cda32459ad24ec3d11d",
+      "revision": 2,
+      "definitionHash": "9281edcb717fd20f73bb6ba459aabfe6796c9686af9e4280aacafca16747a31c",
       "inputVariantIds": [
         "baked"
       ],
@@ -2232,8 +2232,8 @@
     },
     {
       "id": "decode-seek/decode_h264_4k",
-      "revision": 1,
-      "definitionHash": "1d189a1430d7fd495b77afa53568ee5c4c0a5169da7d05034e3d700572bb06de",
+      "revision": 2,
+      "definitionHash": "84531ff93f21d22fd205d5f86b5f2c233fdb5097f5bd898f512d7e31ddce14c8",
       "inputVariantIds": [
         "baked"
       ],
@@ -2322,8 +2322,8 @@
     },
     {
       "id": "decode-seek/decode_rotated_display_matrix",
-      "revision": 1,
-      "definitionHash": "c35a77795364e593fc217d00e64b6732f5bb96568f657da64368bf4c5590b92e",
+      "revision": 2,
+      "definitionHash": "0aab75710c1a0ea96dfdbc4eff1ff7bf83e4e06005a16dc354de086be41ccbfc",
       "inputVariantIds": [
         "baked"
       ],
@@ -2331,8 +2331,8 @@
     },
     {
       "id": "decode-seek/decode_size_huge_h264_600s",
-      "revision": 1,
-      "definitionHash": "4384d13019b22d0e635ea7388ef79541c9e89e5be127561fb5686d3f7b64ffff",
+      "revision": 2,
+      "definitionHash": "24b2f370969d91d6080a8d4ac5afe08320076f15dbf5909346b1ba00bc1c8920",
       "inputVariantIds": [
         "baked"
       ],
@@ -2340,8 +2340,8 @@
     },
     {
       "id": "decode-seek/decode_size_large_h264_120s",
-      "revision": 1,
-      "definitionHash": "736ee976f251640b224c5b8644fc661ffad0dd1cf065299befb8d943b924ef65",
+      "revision": 2,
+      "definitionHash": "de98205fae3c9d364aab343bdd02985cca57c352e0c2191747c8323dd7a8c490",
       "inputVariantIds": [
         "baked"
       ],
@@ -2349,8 +2349,8 @@
     },
     {
       "id": "decode-seek/decode_size_large_vp9_120s",
-      "revision": 1,
-      "definitionHash": "711b873242e7aef05d64de81a841cafca61430735ca6106f66d56d69cab96537",
+      "revision": 2,
+      "definitionHash": "a3b50c5de2c227e1958fb243366112c2b9446866a631412f5c9462488534be04",
       "inputVariantIds": [
         "baked"
       ],
@@ -2358,8 +2358,8 @@
     },
     {
       "id": "decode-seek/decode_size_micro_h264_1frame",
-      "revision": 1,
-      "definitionHash": "fc93964bf0ffcdee2a796a522d064588737acb0734ef804cfd53bf92c971928d",
+      "revision": 2,
+      "definitionHash": "99ec19f492eaea5addabf720b7678698cc821959a237055d986ff724adc79a74",
       "inputVariantIds": [
         "baked"
       ],
@@ -2367,8 +2367,8 @@
     },
     {
       "id": "decode-seek/decode_size_tiny_h264_360p",
-      "revision": 1,
-      "definitionHash": "6d613c8974adfe39e7b237c7da09e4472dfaa2a57033e7a4bc85fb79aa4f5537",
+      "revision": 2,
+      "definitionHash": "299181d82c1dd2633d06de6b20d48fd2003f46350de77976d6f5002b56d5afe2",
       "inputVariantIds": [
         "baked"
       ],
@@ -2376,8 +2376,8 @@
     },
     {
       "id": "decode-seek/decode_size_tiny_vp9_360p",
-      "revision": 1,
-      "definitionHash": "66e9f5879f864fd491f137b05d6babd3b62216374bf3c6f383f207e53caccddd",
+      "revision": 2,
+      "definitionHash": "5af0d9a961f94bf18dd8839dced631c23d78bca787b52ab2c80066dc5162a991",
       "inputVariantIds": [
         "baked"
       ],
@@ -2673,8 +2673,8 @@
     },
     {
       "id": "trim/fmp4_fragment_boundary_copy",
-      "revision": 1,
-      "definitionHash": "66f04f53a6ccea88eec7f63a5f609554938b0e748108f8cc60608800cca48f72",
+      "revision": 2,
+      "definitionHash": "b3c9e8bcfe383391cf28ed26bc68d257fb4d0c4649347357711b8049dab2259e",
       "inputVariantIds": [
         "baked"
       ],
@@ -2727,8 +2727,8 @@
     },
     {
       "id": "trim/h264_multitrack_keyframe_aligned",
-      "revision": 1,
-      "definitionHash": "6b80b17a7925b376a8567289b46474f47803c2a70de232bb111f494ba2351ab6",
+      "revision": 2,
+      "definitionHash": "1dd7ebd7dcc235686dc4e0919dadfc1415ae28597398ee1a27ef8cf853c31b99",
       "inputVariantIds": [
         "baked"
       ],
@@ -2745,8 +2745,8 @@
     },
     {
       "id": "trim/h264_open_gop_frame_accurate",
-      "revision": 1,
-      "definitionHash": "4f1f7b1eb16e546d809663f69570b515069d0c751b8e514da563185469497c63",
+      "revision": 2,
+      "definitionHash": "95a71a5e43fba358bc9eb04532575e7244c8fb4c1cf7e0a6df95e233af18e8ba",
       "inputVariantIds": [
         "baked"
       ],
@@ -2754,8 +2754,8 @@
     },
     {
       "id": "trim/h264_rotated_keyframe_aligned",
-      "revision": 1,
-      "definitionHash": "b205e8e334ea6d000d8b2a17fa2ec36138507f96cfeb410423dc87b55451717b",
+      "revision": 2,
+      "definitionHash": "3d6c3d3ef4b49915e6b8e4fba6667a193aebc24d83fce7c93863dcd83bef50e0",
       "inputVariantIds": [
         "baked"
       ],
@@ -2826,8 +2826,8 @@
     },
     {
       "id": "trim/huge_h264_mov_copy_peakmem",
-      "revision": 1,
-      "definitionHash": "4d9daeba4e98c4a0ac2d5c7437c0ac31369962cc7910fd26e6e38041eff3ce11",
+      "revision": 2,
+      "definitionHash": "31a292e984034868fabfbb84af0f260a2f05b048fc4c069e44023107f88345fc",
       "inputVariantIds": [
         "baked"
       ],
@@ -2835,8 +2835,8 @@
     },
     {
       "id": "trim/large_h264_copy_lazyread",
-      "revision": 1,
-      "definitionHash": "88ec630dc615ea3db91e5a2dead914c0dc0e0a4f09e5f924fb9c02ee3024f448",
+      "revision": 2,
+      "definitionHash": "0817c1381821e9af60c1882ac45a9431df2ff6d51b7b0553dae43c61f0f63ed5",
       "inputVariantIds": [
         "baked"
       ],
@@ -2844,8 +2844,8 @@
     },
     {
       "id": "trim/large_h264_frame_accurate_throughput",
-      "revision": 1,
-      "definitionHash": "cab5c2e2d38eabcba21a7e4489cf74af130a6e7c8a5ddb55724ffeed9d223140",
+      "revision": 2,
+      "definitionHash": "d77dbfda3be5f6f90b27ed5184aa5566b4fdb3baf87056c960de943a23ddac52",
       "inputVariantIds": [
         "baked"
       ],
@@ -2853,8 +2853,8 @@
     },
     {
       "id": "trim/massive_h264_copy_sustained",
-      "revision": 1,
-      "definitionHash": "1342281987c7d7acd7d2dd2c51dd73339dcc653900075fe4d0f6d8d89347b426",
+      "revision": 2,
+      "definitionHash": "5bd4e60996049e0e56bc810f627cda9a84300e1ce6b58493337c0ff5423836c1",
       "inputVariantIds": [
         "baked"
       ],
@@ -3024,8 +3024,8 @@
     },
     {
       "id": "mux/edge_bframes_decode_mux_mkv",
-      "revision": 1,
-      "definitionHash": "c83551517728ee65c0e51a8e8ce7cbac9208e3f41cbcd89511c3b263ee55ace4",
+      "revision": 2,
+      "definitionHash": "78abaf62815eb07aa94d186986855dc36a78a0007aa7c35356f7f3b3f6fee41f",
       "inputVariantIds": [
         "baked"
       ],
@@ -3033,8 +3033,8 @@
     },
     {
       "id": "mux/edge_bframes_decode_mux_mp4",
-      "revision": 1,
-      "definitionHash": "5996536fa9042e05a872ac37ae21eeb4eee4f09766716ffaf7034c35f512798a",
+      "revision": 2,
+      "definitionHash": "e774a01d9f16914f9e5f0bd4de801d7b0090518d545568920c9776e698c26bd6",
       "inputVariantIds": [
         "baked"
       ],
@@ -3069,8 +3069,8 @@
     },
     {
       "id": "mux/edge_rotation_decode_mux_mkv",
-      "revision": 1,
-      "definitionHash": "237a1d9c48500ae840e3fb17341e36559040a879989533ea019d1dbd73eb70db",
+      "revision": 2,
+      "definitionHash": "6e522e2e75a0a49b93a9e0e22b15e84c059cac7de976d429f0acb2313ab97934",
       "inputVariantIds": [
         "baked"
       ],
@@ -3078,8 +3078,8 @@
     },
     {
       "id": "mux/edge_rotation_decode_mux_mov",
-      "revision": 1,
-      "definitionHash": "6878ea2f4bbdf0dd3f3ac9c1ca95f0398c11a18499c3076ef35c5fbffe6f6e37",
+      "revision": 2,
+      "definitionHash": "1653e27d03928578e065fba64d8c7aa0b3825002f0a87b0a10d2834d1fb2365f",
       "inputVariantIds": [
         "baked"
       ],
@@ -3339,8 +3339,8 @@
     },
     {
       "id": "mux/size_large_1080p_to_mkv",
-      "revision": 1,
-      "definitionHash": "d710987c3e32f5add85c9d00bec46f0ad4e563afe69dc942f1ac100a87936c60",
+      "revision": 2,
+      "definitionHash": "4a4c12afc89e44ff262a9cca80bc40c50ef90fde7faf1418211968454a9e9850",
       "inputVariantIds": [
         "baked"
       ],
@@ -3348,8 +3348,8 @@
     },
     {
       "id": "mux/size_large_1080p_to_mp4",
-      "revision": 1,
-      "definitionHash": "97d58fd15a4ca5e67f3a5b9f4d2cda5ef8a3745e5c465df24e592042f62dff6f",
+      "revision": 2,
+      "definitionHash": "46e1a0aa8c0cb3e1829e7a9f7e64fefd05605fde4e49ddc610cad3f39bdc0315",
       "inputVariantIds": [
         "baked"
       ],
@@ -3393,8 +3393,8 @@
     },
     {
       "id": "mux/size_tiny_360p_to_mp4",
-      "revision": 1,
-      "definitionHash": "7598ebb2da2e400aa4ed2e6f17a37fa06a566805591d85ed5ea4ca2f3450f156",
+      "revision": 2,
+      "definitionHash": "aa4fa687efe9ca36efa36e226c02fd584d198b847ffe71428edc55103faf05d4",
       "inputVariantIds": [
         "baked"
       ],
@@ -3681,8 +3681,8 @@
     },
     {
       "id": "metadata/meta_consistent_mp4_to_mkv",
-      "revision": 2,
-      "definitionHash": "1de240a2c5dc26536a5ff3804070305e84095343b58f4125b088a3cd375be943",
+      "revision": 3,
+      "definitionHash": "9db9365f0be3a99f42f375b52a562f0d808ec27b9413521c4c751f009bea3426",
       "inputVariantIds": [
         "baked"
       ],
@@ -3825,8 +3825,8 @@
     },
     {
       "id": "metadata/tagedit_no_corrupt_audio_flac",
-      "revision": 1,
-      "definitionHash": "1d1f824e2b2518fb6fe07280155b21a94b156f2fd61b50455d7afdc0f9505204",
+      "revision": 2,
+      "definitionHash": "216b05eb2c73365bdd92c59862646ea162f706e1140d933d128042c889663309",
       "inputVariantIds": [
         "baked"
       ],
@@ -3834,8 +3834,8 @@
     },
     {
       "id": "metadata/tagedit_no_corrupt_video_mp4_mkv",
-      "revision": 2,
-      "definitionHash": "4c7bd45b52282add0562bf4f7753574a1e2b8a37ba343068977905291ef504c9",
+      "revision": 3,
+      "definitionHash": "41ad92ab154d435a5be265e23dde787f0c5c800c38a950ab78877dc17db6074b",
       "inputVariantIds": [
         "baked"
       ],
@@ -5085,8 +5085,8 @@
     },
     {
       "id": "performance/encode-fps",
-      "revision": 1,
-      "definitionHash": "9ccd97962242c4ac3a827cdcc9a7cb722a0d8e47296d49d27b81dbea3c6355cc",
+      "revision": 2,
+      "definitionHash": "ccc309c54cf2d54d2877ac73c9061de65f9cff95b9fc1e5d1b082f8620c91c58",
       "inputVariantIds": [
         "baked"
       ],
@@ -5121,8 +5121,8 @@
     },
     {
       "id": "performance/metamorphic-probe-duration-cross-container",
-      "revision": 1,
-      "definitionHash": "7e5ee59f4f0c4c05d108e5a43fcba466a957309756f5ec112681fe93713a4015",
+      "revision": 2,
+      "definitionHash": "4c5d9fd6d72197d694e23d4ac11724cd38a5daddb7484dd7711fb0d831b68c59",
       "inputVariantIds": [
         "baked"
       ],
@@ -5130,8 +5130,8 @@
     },
     {
       "id": "performance/metamorphic-transcode-idempotent-source-res",
-      "revision": 1,
-      "definitionHash": "e3c172a71e0bc313f6b26eb4c97a73d53a8ba0e1d937cd753f216f34338b683c",
+      "revision": 2,
+      "definitionHash": "74fb93d65f5f32888223fc63e6cb3d58b36a9fb956497a96ddd752c43971fb90",
       "inputVariantIds": [
         "baked"
       ],
@@ -5202,8 +5202,8 @@
     },
     {
       "id": "performance/size-ladder-demux-peak-memory-huge",
-      "revision": 1,
-      "definitionHash": "ea01126b31fa28e05c86b4a9ad27b12c589bf516e1b7f2ff4642be2bc3a527f4",
+      "revision": 2,
+      "definitionHash": "0a19235b72f884d9a7558f694d78d46a9ac14e30b7508f19c866d32661b093cc",
       "inputVariantIds": [
         "baked"
       ],
@@ -5211,8 +5211,8 @@
     },
     {
       "id": "performance/size-ladder-demux-peak-memory-large",
-      "revision": 1,
-      "definitionHash": "7535d3b6bd0db7f1a8055289ed64b3e5c548b0acc1285f859cbad0ec2734f746",
+      "revision": 2,
+      "definitionHash": "a71799e200bb4a7d941a6ea5f15857f1568dac9a67b444631b9b0900b2db0abb",
       "inputVariantIds": [
         "baked"
       ],
@@ -5220,8 +5220,8 @@
     },
     {
       "id": "performance/size-ladder-demux-peak-memory-large4k",
-      "revision": 1,
-      "definitionHash": "7ffe3e10cf8e8ce4802d51591ef70e9b9297fd5bd33330440ea036d372aacdb4",
+      "revision": 2,
+      "definitionHash": "825aaeb183b7317c0e1912d18a6abc6ee1c8a99e8243dce90f6afd81007a46d8",
       "inputVariantIds": [
         "baked"
       ],
@@ -5229,8 +5229,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-huge",
-      "revision": 1,
-      "definitionHash": "f38b001c711004a2049ba2c6fa3fdd7439d1b44cab2068b3fa6d88e76000bf1d",
+      "revision": 2,
+      "definitionHash": "a7c0ff77f79df7c0df9357c26ba3b215be862bc04e5c34b8857bfc8988ca83f7",
       "inputVariantIds": [
         "baked"
       ],
@@ -5238,8 +5238,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-large",
-      "revision": 1,
-      "definitionHash": "a3dab5c150ca6a512eaa9102fd966dbd4ed28b3d3fea6d7be8d29ac168f4e8f7",
+      "revision": 2,
+      "definitionHash": "756be50ee1ca525d807dc5631c3bf68662a9face5fbc169b6f03a8b8a7d8d4f6",
       "inputVariantIds": [
         "baked"
       ],
@@ -5247,8 +5247,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-large4k",
-      "revision": 1,
-      "definitionHash": "225e75d3322fd029eb4a50b5753c329d87cf1afb0903d22d989aa117ec50de70",
+      "revision": 2,
+      "definitionHash": "feffd46a6c982b484ba6abf3ef92ecb500da766e37548a8cfc2a01a3b14c381f",
       "inputVariantIds": [
         "baked"
       ],
@@ -5256,8 +5256,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-massive",
-      "revision": 1,
-      "definitionHash": "ca6a4ba7cf8df1adb8bfbcfe50df06f88fc4c79ec216400327e1fcd01da80d60",
+      "revision": 2,
+      "definitionHash": "ee7b79f57f9dac1419b278136322e39dd30451eac4429310e3835d28b467c227",
       "inputVariantIds": [
         "baked"
       ],
@@ -5265,8 +5265,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-medium",
-      "revision": 1,
-      "definitionHash": "fb6cb902901f8f79d51e3718730bc33c1c1f91e016ab9fb909eff6f39c0c3342",
+      "revision": 2,
+      "definitionHash": "1191da395393183ee24673613fe705dbd6fe69f6be2367c42c2cf5ade24004a1",
       "inputVariantIds": [
         "baked"
       ],
@@ -5274,8 +5274,8 @@
     },
     {
       "id": "performance/size-ladder-extract-metadata-tiny",
-      "revision": 1,
-      "definitionHash": "a534589738b0fbfc0a8ac9097244374bb59666c2e55a63ae033fb9e385aab10a",
+      "revision": 2,
+      "definitionHash": "fecacfe36d8257c854d18dea80eec5ddcdcadaf8f224ea9eb46e2eb99c17420e",
       "inputVariantIds": [
         "baked"
       ],
@@ -5283,8 +5283,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-huge",
-      "revision": 1,
-      "definitionHash": "b313895c6156d854dbf72a8b658ef580c544eee1cad7c14dbcae41e0afbbdffb",
+      "revision": 2,
+      "definitionHash": "9bd179030995f18a3bea7de6b396dda25bddd6aef1ebbb78e2f2a4e39ef7f735",
       "inputVariantIds": [
         "baked"
       ],
@@ -5292,8 +5292,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-large",
-      "revision": 1,
-      "definitionHash": "aabe0a25d5e204ef3c0045374dbc5ce9a34b65184fc3fd5afbd9c147a87fe43b",
+      "revision": 2,
+      "definitionHash": "a8b145889f983ad36a8183c4de35d1002e0de4062fc60ada9cfc87390e4c81ff",
       "inputVariantIds": [
         "baked"
       ],
@@ -5301,8 +5301,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-large4k",
-      "revision": 1,
-      "definitionHash": "97ecadb055180f2a75c1d080396758a096293d90a6c6ce7e2c9e47a9f831b1ea",
+      "revision": 2,
+      "definitionHash": "46f1bf94abc3eddda8945e515a81fbcb18b167fd0ce8a85d238d18c507366e7e",
       "inputVariantIds": [
         "baked"
       ],
@@ -5310,8 +5310,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-massive",
-      "revision": 1,
-      "definitionHash": "eaf6b7c6df0029f5ae940c949752f6e920ba18ef708449ea03a093f814f7fa12",
+      "revision": 2,
+      "definitionHash": "930e96a636d9029b16640c4d3ac9a69f9836cf7c63291a79040fc2770e44c837",
       "inputVariantIds": [
         "baked"
       ],
@@ -5319,8 +5319,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-medium",
-      "revision": 1,
-      "definitionHash": "a0e1f5a184a3d7eb9340b5888d1f6adf744f347f2e7769cab93cc4ca4fa93009",
+      "revision": 2,
+      "definitionHash": "f8998a73c84dc02bde2bf3ec26873ce7506c4d8348466e118141a2232be4810c",
       "inputVariantIds": [
         "baked"
       ],
@@ -5328,8 +5328,8 @@
     },
     {
       "id": "performance/size-ladder-iterate-packets-tiny",
-      "revision": 1,
-      "definitionHash": "e7482cfb5d955b5390dbdad32c572a14c7c6081622a0ada3304b16aab40f8c7b",
+      "revision": 2,
+      "definitionHash": "c1fec01e0aa05a149b22b8b99551d64862b391c0506b1e59b11bfa837bda5c75",
       "inputVariantIds": [
         "baked"
       ],

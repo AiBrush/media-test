@@ -30,6 +30,10 @@
 
 import type { Scenario } from '../../core/scenario.ts';
 import {
+  FULL_HD_10S_CANDIDATE_ENVELOPE,
+  HD_1280X720_10S_CANDIDATE_ENVELOPE,
+} from '../_candidate-envelopes.ts';
+import {
   buildMux,
   buildMuxProperty,
   DECODE_MUX,
@@ -41,6 +45,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
   // ── B-frame reorder must survive the mux: dts/pts spread → regenerated ctts / SimpleBlock lacing ──
   {
     id: 'edge_bframes_decode_mux_mp4',
+    revision: 2,
     invariant: DECODE_MUX,
     input: 'h264_bframes_1080p.mp4',
     containersIn: ['mp4'],
@@ -48,6 +53,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['mux:vfr-timestamps'],
+    candidateEnvelope: FULL_HD_10S_CANDIDATE_ENVELOPE,
     // mp4 target is faithful → add reference-reimport so dropped/duplicated samples also show up.
     oracles: ['property-invariant', 'reference-reimport'],
     notes:
@@ -57,6 +63,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
   },
   {
     id: 'edge_bframes_decode_mux_mkv',
+    revision: 2,
     invariant: DECODE_MUX,
     input: 'h264_bframes_1080p.mp4',
     containersIn: ['mp4'],
@@ -64,6 +71,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['mux:vfr-timestamps'],
+    candidateEnvelope: FULL_HD_10S_CANDIDATE_ENVELOPE,
     notes:
       'B-FRAME mux → mkv (§A.16): same coded samples re-laced as Matroska SimpleBlocks; the muxer must ' +
       'preserve the reorder via block timestamps. Full timeline + decode + neutral semantic re-import gate it.',
@@ -72,6 +80,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
   // ── Rotation / display matrix preservation through mux ──
   {
     id: 'edge_rotation_decode_mux_mov',
+    revision: 2,
     invariant: DECODE_MUX,
     input: 'h264_rotated90.mp4',
     containersIn: ['mp4'],
@@ -79,6 +88,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['rotate'],
+    candidateEnvelope: HD_1280X720_10S_CANDIDATE_ENVELOPE,
     oracles: ['property-invariant', 'reference-reimport'],
     notes:
       'ROTATION mux → mov (§A.16 rotated, matrix not w/h swap): the 90° display matrix must be authored ' +
@@ -87,6 +97,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
   },
   {
     id: 'edge_rotation_decode_mux_mkv',
+    revision: 2,
     invariant: DECODE_MUX,
     input: 'h264_rotated90.mp4',
     containersIn: ['mp4'],
@@ -94,6 +105,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['rotate'],
+    candidateEnvelope: HD_1280X720_10S_CANDIDATE_ENVELOPE,
     notes:
       'ROTATION mux → mkv (§A.16): rotation carried as a Matroska track ProjectionPoseRoll / display ' +
       'metadata; decode(mux(x))==decode(x) gates the observable rotation through the Matroska writer.',

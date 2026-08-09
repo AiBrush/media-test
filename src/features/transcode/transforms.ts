@@ -14,11 +14,12 @@ export type MatrixCoefficient = 'bt709' | 'bt2020-ncl' | 'rgb';
 export type ColorRange = 'limited' | 'full';
 
 export type TransformStep =
+  | Readonly<{ kind: 'normalize-display-orientation' }>
   | Readonly<{ kind: 'rotate'; degrees: 90 | 180 | 270 }>
   | Readonly<{ kind: 'flip'; axis: 'horizontal' | 'vertical' }>
   | Readonly<{ kind: 'crop'; x: number; y: number; width: number; height: number }>
   | Readonly<{
-      kind: 'pad';
+      kind: 'contain-pad';
       width: number;
       height: number;
       placement: 'center';
@@ -75,6 +76,8 @@ export interface TransformPixelTolerance {
   /** Normalized [0,1] RGBA error over every compared channel. */
   readonly meanAbsoluteError: number;
   readonly maxAbsoluteError: number;
+  /** Maximum fraction of channels allowed above maxAbsoluteError (a bounded lossy-codec tail). */
+  readonly maxOutlierFraction: number;
   readonly maxAlphaError: number;
   /** Minimum mean change required before a fixture can prove a non-identity effect. */
   readonly minimumObservableEffect: number;
@@ -83,11 +86,17 @@ export interface TransformPixelTolerance {
 export interface TranscodeTransformContract {
   readonly schema: typeof TRANSCODE_TRANSFORM_SCHEMA;
   readonly steps: readonly TransformStep[];
+  /** Independently observed input signal required before a signal-changing transform can be graded. */
+  readonly sourceSignal?: TransformSignalExpectation;
   readonly signal: TransformSignalExpectation;
   readonly tolerance: TransformPixelTolerance;
   readonly timestampToleranceUs: number;
   /** Color/tone-map implementations may legally differ while still proving a non-identity effect. */
   readonly allowAlternatePixelMapping: boolean;
+  /** Minimum completion on either the target-coordinate or decoded-sRGB endpoint axis. */
+  readonly minimumEffectCompletionRatio?: number;
+  /** Browser-normalized pixels delegate fidelity to the scenario's independent perceptual oracle. */
+  readonly pixelComparison: 'strict' | 'independent-perceptual';
 }
 
 export interface TranscodePixelFrame {
@@ -96,6 +105,7 @@ export interface TranscodePixelFrame {
   readonly width: number;
   readonly height: number;
   readonly bitDepth: number;
+  /** Tightly packed RGBA normalized to sRGB by the neutral WebCodecs readback boundary. */
   readonly data: Uint8Array | Uint8ClampedArray | Uint16Array;
 }
 
@@ -107,11 +117,20 @@ interface FloatPlane {
 }
 
 export function defineTranscodeTransformContract(
-  value: Omit<TranscodeTransformContract, 'schema'>,
+  value: Omit<TranscodeTransformContract, 'schema' | 'pixelComparison'> &
+    Partial<Pick<TranscodeTransformContract, 'pixelComparison'>>,
 ): TranscodeTransformContract {
   if (value.steps.length === 0) throw new TypeError('transcode transform contract requires at least one step');
   if (!Number.isFinite(value.timestampToleranceUs) || value.timestampToleranceUs < 0) {
     throw new TypeError('transform timestamp tolerance must be finite and non-negative');
+  }
+  if (
+    value.minimumEffectCompletionRatio !== undefined &&
+    (!Number.isFinite(value.minimumEffectCompletionRatio) ||
+      value.minimumEffectCompletionRatio < 0 ||
+      value.minimumEffectCompletionRatio > 1)
+  ) {
+    throw new TypeError('transform minimum effect completion ratio must be within [0,1]');
   }
   for (const [name, limit] of Object.entries(value.tolerance)) {
     if (!Number.isFinite(limit) || limit < 0 || limit > 1) {
@@ -119,8 +138,9 @@ export function defineTranscodeTransformContract(
     }
   }
   validateSignal(value.signal);
+  if (value.sourceSignal !== undefined) validateSignal(value.sourceSignal);
   for (const step of value.steps) validateStep(step);
-  return deepFreeze({ schema: TRANSCODE_TRANSFORM_SCHEMA, ...value });
+  return deepFreeze({ schema: TRANSCODE_TRANSFORM_SCHEMA, pixelComparison: 'strict', ...value });
 }
 
 /**
@@ -172,6 +192,11 @@ export function applyTranscodeTransform(
   let plane = toFloatPlane(source);
   for (const step of contract.steps) {
     switch (step.kind) {
+      case 'normalize-display-orientation':
+        // Oracle source pixels are decoded in display space, so the container matrix is already
+        // applied. Normalization preserves those displayed pixels while compareSignal proves that
+        // the candidate authored an identity output matrix.
+        break;
       case 'rotate':
         plane = rotate(plane, step.degrees);
         break;
@@ -181,14 +206,24 @@ export function applyTranscodeTransform(
       case 'crop':
         plane = crop(plane, step);
         break;
-      case 'pad':
-        plane = pad(plane, step);
+      case 'contain-pad':
+        plane = containPad(plane, step);
         break;
       case 'color-convert':
-        plane = convertPrimaries(plane, step.from, step.to);
+        // Neutral source pixels come from VideoFrame.copyTo(RGBA), whose target colorSpace defaults to
+        // sRGB. Build the authored reference from that actual representation, not from the source's former
+        // video-transfer coordinates. Candidate sRGB readback is mapped into the same target coordinates
+        // by comparisonPlane() below before any sample is graded.
+        plane = convertNormalizedSrgbToPrimaries(plane, step.to);
         break;
       case 'tone-map':
-        plane = toneMapPqToSdr(plane, step.targetPeakNits);
+        // Neutral HDR source and candidate pixels cross the same browser <video> -> canvas presenter.
+        // Those RGBA values are already normalized sRGB presentation values, not the source's former
+        // PQ/BT.2020 code values. Re-applying the PQ EOTF here would tone-map the browser-normalized
+        // presentation a second time. The pixel invariant at this seam is therefore presentation
+        // preservation; sourceSignal + candidate signal independently prove the actual
+        // PQ/BT.2020/10-bit -> SDR/BT.709/8-bit transition.
+        plane = normalizedSrgbToneMapPresentation(plane, step.targetPeakNits);
         break;
       case 'depth-convert':
         if (plane.bitDepth !== step.fromBitDepth) {
@@ -257,10 +292,36 @@ export function evaluateTranscodeTransform(
   let referenceSourceDelta = 0;
   let candidateSourceDelta = 0;
   let comparableSourceSamples = 0;
+  let maximumErrorOutliers = 0;
+  let semanticReferenceDelta = 0;
+  let semanticCandidateDelta = 0;
+  let semanticEndpointError = 0;
+  let semanticReferenceEnergy = 0;
+  let semanticCandidateEnergy = 0;
+  let semanticProjection = 0;
+  let semanticSamples = 0;
+  const channelAbsoluteError = [0, 0, 0, 0];
+  const channelSignedError = [0, 0, 0, 0];
+  const channelMaximumError = [0, 0, 0, 0];
+  const channelOutliers = [0, 0, 0, 0];
+  const channelSamples = [0, 0, 0, 0];
+  const quadrantAbsoluteError = [0, 0, 0, 0];
+  const quadrantOutliers = [0, 0, 0, 0];
+  const quadrantSamples = [0, 0, 0, 0];
+  const frameAbsoluteError: number[] = [];
+  const frameOutliers: number[] = [];
+  const frameSamples: number[] = [];
+  let maximumTimestampDeltaUs = 0;
+  const colorTarget = colorTargetForContract(contract);
+  const hasColorConversion = colorTarget !== undefined;
 
   try {
-    for (const pair of pairs) {
+    for (const [pairIndex, pair] of pairs.entries()) {
       const expected = applyTranscodeTransform(pair.source, contract);
+      maximumTimestampDeltaUs = Math.max(
+        maximumTimestampDeltaUs,
+        Math.abs(pair.candidate.ptsUs - pair.source.ptsUs),
+      );
       if (pair.candidate.width !== expected.width || pair.candidate.height !== expected.height) {
         return transcodeVerdict(
           'FAIL',
@@ -277,13 +338,36 @@ export function evaluateTranscodeTransform(
           `candidate pixels are ${pair.candidate.bitDepth}-bit; expected ${expected.bitDepth}-bit`,
         );
       }
-      const got = toFloatPlane(pair.candidate);
+      const candidatePresentation = toFloatPlane(pair.candidate);
+      const got = colorTarget === undefined
+        ? candidatePresentation
+        : convertNormalizedSrgbToPrimaries(candidatePresentation, colorTarget);
       const want = toFloatPlane(expected);
       for (let index = 0; index < want.data.length; index++) {
-        const delta = Math.abs(got.data[index]! - want.data[index]!);
+        const signedDelta = got.data[index]! - want.data[index]!;
+        const delta = Math.abs(signedDelta);
+        const channel = index % 4;
+        const pixel = Math.floor(index / 4);
+        const x = pixel % want.width;
+        const y = Math.floor(pixel / want.width);
+        const quadrant = (y >= want.height / 2 ? 2 : 0) + (x >= want.width / 2 ? 1 : 0);
         absoluteError += delta;
         maximumError = Math.max(maximumError, delta);
         if (index % 4 === 3) alphaMaximumError = Math.max(alphaMaximumError, delta);
+        channelAbsoluteError[channel] = (channelAbsoluteError[channel] ?? 0) + delta;
+        channelSignedError[channel] = (channelSignedError[channel] ?? 0) + signedDelta;
+        channelMaximumError[channel] = Math.max(channelMaximumError[channel] ?? 0, delta);
+        channelSamples[channel] = (channelSamples[channel] ?? 0) + 1;
+        quadrantAbsoluteError[quadrant] = (quadrantAbsoluteError[quadrant] ?? 0) + delta;
+        quadrantSamples[quadrant] = (quadrantSamples[quadrant] ?? 0) + 1;
+        frameAbsoluteError[pairIndex] = (frameAbsoluteError[pairIndex] ?? 0) + delta;
+        frameSamples[pairIndex] = (frameSamples[pairIndex] ?? 0) + 1;
+        if (delta > contract.tolerance.maxAbsoluteError) {
+          maximumErrorOutliers++;
+          channelOutliers[channel] = (channelOutliers[channel] ?? 0) + 1;
+          quadrantOutliers[quadrant] = (quadrantOutliers[quadrant] ?? 0) + 1;
+          frameOutliers[pairIndex] = (frameOutliers[pairIndex] ?? 0) + 1;
+        }
         sampleCount++;
       }
       if (pair.source.width === expected.width && pair.source.height === expected.height) {
@@ -292,6 +376,21 @@ export function evaluateTranscodeTransform(
           referenceSourceDelta += Math.abs(want.data[index]! - original.data[index]!);
           candidateSourceDelta += Math.abs(got.data[index]! - original.data[index]!);
           comparableSourceSamples++;
+        }
+        if (colorTarget !== undefined) {
+          const signalOnlyRetag = rawColorRetagPresentation(original, colorTarget);
+          for (let index = 0; index < original.data.length; index++) {
+            if (index % 4 === 3) continue;
+            const axis = original.data[index]! - signalOnlyRetag.data[index]!;
+            const movement = candidatePresentation.data[index]! - signalOnlyRetag.data[index]!;
+            semanticReferenceDelta += Math.abs(axis);
+            semanticCandidateDelta += Math.abs(movement);
+            semanticEndpointError += Math.abs(candidatePresentation.data[index]! - original.data[index]!);
+            semanticReferenceEnergy += axis * axis;
+            semanticCandidateEnergy += movement * movement;
+            semanticProjection += movement * axis;
+            semanticSamples++;
+          }
         }
       }
     }
@@ -309,23 +408,103 @@ export function evaluateTranscodeTransform(
   const meanCandidateSourceDelta = comparableSourceSamples
     ? candidateSourceDelta / comparableSourceSamples
     : Number.POSITIVE_INFINITY;
+  const targetCoordinateClosenessRatio =
+    comparableSourceSamples > 0 && meanReferenceSourceDelta > 0
+      ? 1 - meanAbsoluteError / meanReferenceSourceDelta
+      : Number.POSITIVE_INFINITY;
+  const meanSemanticReferenceDelta = semanticSamples > 0
+    ? semanticReferenceDelta / semanticSamples
+    : Number.POSITIVE_INFINITY;
+  const meanSemanticCandidateDelta = semanticSamples > 0
+    ? semanticCandidateDelta / semanticSamples
+    : Number.POSITIVE_INFINITY;
+  const meanSemanticEndpointError = semanticSamples > 0
+    ? semanticEndpointError / semanticSamples
+    : Number.POSITIVE_INFINITY;
+  const effectCompletionRatio = hasColorConversion && semanticReferenceEnergy > 0
+    ? semanticProjection / semanticReferenceEnergy
+    : targetCoordinateClosenessRatio;
+  const effectDirectionCosine = hasColorConversion && semanticReferenceEnergy > 0 && semanticCandidateEnergy > 0
+    ? semanticProjection / Math.sqrt(semanticReferenceEnergy * semanticCandidateEnergy)
+    : Number.POSITIVE_INFINITY;
+  const channelNames = ['red', 'green', 'blue', 'alpha'] as const;
+  const quadrantNames = ['topLeft', 'topRight', 'bottomLeft', 'bottomRight'] as const;
+  const diagnosticMeasurements: Record<string, number> = { maximumTimestampDeltaUs };
+  for (const [channel, name] of channelNames.entries()) {
+    const count = channelSamples[channel] ?? 0;
+    diagnosticMeasurements[`${name}MeanAbsoluteError`] = count
+      ? (channelAbsoluteError[channel] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+    diagnosticMeasurements[`${name}MeanSignedError`] = count
+      ? (channelSignedError[channel] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+    diagnosticMeasurements[`${name}MaximumAbsoluteError`] = channelMaximumError[channel] ?? 0;
+    diagnosticMeasurements[`${name}OutlierFraction`] = count
+      ? (channelOutliers[channel] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+  }
+  for (const [quadrant, name] of quadrantNames.entries()) {
+    const count = quadrantSamples[quadrant] ?? 0;
+    diagnosticMeasurements[`${name}MeanAbsoluteError`] = count
+      ? (quadrantAbsoluteError[quadrant] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+    diagnosticMeasurements[`${name}OutlierFraction`] = count
+      ? (quadrantOutliers[quadrant] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+  }
+  for (let frame = 0; frame < frameSamples.length; frame++) {
+    const count = frameSamples[frame] ?? 0;
+    diagnosticMeasurements[`frame${frame}MeanAbsoluteError`] = count
+      ? (frameAbsoluteError[frame] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+    diagnosticMeasurements[`frame${frame}OutlierFraction`] = count
+      ? (frameOutliers[frame] ?? 0) / count
+      : Number.POSITIVE_INFINITY;
+  }
   const measurements = {
     sourceFrames: sourceFrames.length,
     candidateFrames: candidateFrames.length,
     matchedFrames: pairs.length,
     meanAbsoluteError,
     maximumAbsoluteError: maximumError,
+    maximumErrorOutliers,
+    maximumErrorOutlierFraction: sampleCount ? maximumErrorOutliers / sampleCount : Number.POSITIVE_INFINITY,
     maximumAlphaError: alphaMaximumError,
     meanReferenceSourceDelta,
     meanCandidateSourceDelta,
+    targetCoordinateClosenessRatio,
+    meanSemanticReferenceDelta,
+    meanSemanticCandidateDelta,
+    meanSemanticEndpointError,
+    effectCompletionRatio,
+    effectDirectionCosine,
+    ...diagnosticMeasurements,
   };
 
+  if (contract.pixelComparison === 'independent-perceptual') {
+    return transcodeVerdict(
+      'PASS',
+      'TRANSCODE_TRANSFORM_SIGNAL_AND_SHAPE_MATCH',
+      `${pairs.length} timestamp-paired frame(s) match the required dimensions, depth, timeline, and authored signaling; ` +
+        'pixel fidelity is gated independently by the required perceptual oracle',
+      measurements,
+    );
+  }
+
   const requiresVisibleEffect = contract.steps.some((step) =>
-    step.kind !== 'depth-convert' && step.kind !== 'preserve-alpha');
+    step.kind !== 'depth-convert' && step.kind !== 'preserve-alpha' &&
+    step.kind !== 'normalize-display-orientation' && step.kind !== 'tone-map');
+  const referenceEffectDelta = hasColorConversion ? meanSemanticReferenceDelta : meanReferenceSourceDelta;
+  const candidateEffectDelta = hasColorConversion ? meanSemanticCandidateDelta : meanCandidateSourceDelta;
+  // This midpoint only classifies candidates still nearest the independently synthesized no-op endpoint.
+  // The projection gate below separately proves progress toward the authored presentation endpoint.
+  const noOpEffectCeiling = hasColorConversion
+    ? Math.max(contract.tolerance.minimumObservableEffect, referenceEffectDelta * 0.5)
+    : contract.tolerance.minimumObservableEffect;
   if (
     requiresVisibleEffect &&
     comparableSourceSamples > 0 &&
-    meanReferenceSourceDelta < contract.tolerance.minimumObservableEffect
+    referenceEffectDelta < contract.tolerance.minimumObservableEffect
   ) {
     return transcodeUnavailable(
       'NA_ASSET',
@@ -337,8 +516,8 @@ export function evaluateTranscodeTransform(
   if (
     requiresVisibleEffect &&
     comparableSourceSamples > 0 &&
-    meanCandidateSourceDelta < contract.tolerance.minimumObservableEffect &&
-    meanReferenceSourceDelta >= contract.tolerance.minimumObservableEffect
+    candidateEffectDelta < noOpEffectCeiling &&
+    referenceEffectDelta >= contract.tolerance.minimumObservableEffect
   ) {
     return transcodeVerdict(
       'FAIL',
@@ -355,10 +534,46 @@ export function evaluateTranscodeTransform(
       measurements,
     );
   }
+  const completionThreshold = contract.minimumEffectCompletionRatio;
+  const targetCoordinateCompletion = completionThreshold !== undefined &&
+    targetCoordinateClosenessRatio >= completionThreshold;
+  const decodedSrgbCompletion = completionThreshold !== undefined &&
+    effectCompletionRatio >= completionThreshold;
   if (
-    meanAbsoluteError <= contract.tolerance.meanAbsoluteError &&
-    maximumError <= contract.tolerance.maxAbsoluteError
+    completionThreshold !== undefined &&
+    comparableSourceSamples > 0 &&
+    referenceEffectDelta >= contract.tolerance.minimumObservableEffect &&
+    !targetCoordinateCompletion &&
+    !decodedSrgbCompletion
   ) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_EFFECT_INCOMPLETE',
+      `candidate reaches ${(targetCoordinateClosenessRatio * 100).toFixed(2)}% target-coordinate closeness and ` +
+        `${(effectCompletionRatio * 100).toFixed(2)}% decoded-sRGB no-op→authored projection; ` +
+        `at least one axis must reach ${(completionThreshold * 100).toFixed(2)}%`,
+      measurements,
+    );
+  }
+  if (
+    hasColorConversion &&
+    semanticSamples > 0 &&
+    meanSemanticEndpointError > contract.tolerance.meanAbsoluteError
+  ) {
+    return transcodeVerdict(
+      'FAIL',
+      'TRANSCODE_TRANSFORM_SEMANTIC_RESIDUAL_EXCESSIVE',
+      `decoded-sRGB residual ${meanSemanticEndpointError.toFixed(6)} exceeds the independent ` +
+        `codec mean-error bound ${contract.tolerance.meanAbsoluteError}`,
+      measurements,
+    );
+  }
+  const maximumErrorOutlierFraction = sampleCount
+    ? maximumErrorOutliers / sampleCount
+    : Number.POSITIVE_INFINITY;
+  const tailWithinLimit = maximumError <= contract.tolerance.maxAbsoluteError ||
+    maximumErrorOutlierFraction <= contract.tolerance.maxOutlierFraction;
+  if (meanAbsoluteError <= contract.tolerance.meanAbsoluteError && tailWithinLimit) {
     return transcodeVerdict(
       'PASS',
       'TRANSCODE_TRANSFORM_EFFECT_MATCH',
@@ -370,7 +585,7 @@ export function evaluateTranscodeTransform(
   const legalAlternate =
     contract.allowAlternatePixelMapping &&
     comparableSourceSamples > 0 &&
-    meanCandidateSourceDelta >= contract.tolerance.minimumObservableEffect &&
+    candidateEffectDelta >= contract.tolerance.minimumObservableEffect &&
     meanAbsoluteError < meanReferenceSourceDelta &&
     meanAbsoluteError <= Math.max(contract.tolerance.meanAbsoluteError * 4, meanReferenceSourceDelta * 0.75);
   if (legalAlternate) {
@@ -384,10 +599,50 @@ export function evaluateTranscodeTransform(
   return transcodeVerdict(
     'FAIL',
     'TRANSCODE_TRANSFORM_PIXEL_MISMATCH',
-    `pixel error mean=${meanAbsoluteError.toFixed(6)}, max=${maximumError.toFixed(6)} exceeds ` +
-      `mean<=${contract.tolerance.meanAbsoluteError}, max<=${contract.tolerance.maxAbsoluteError}`,
+    `pixel error mean=${meanAbsoluteError.toFixed(6)}, max=${maximumError.toFixed(6)}, ` +
+      `outliers=${maximumErrorOutlierFraction.toFixed(6)} exceeds mean<=${contract.tolerance.meanAbsoluteError}, ` +
+      `max<=${contract.tolerance.maxAbsoluteError} for all but ${contract.tolerance.maxOutlierFraction} of channels`,
     measurements,
   );
+}
+
+/**
+ * Validate the immutable source signal for transforms whose normalized-RGBA pixel seam cannot retain it.
+ * A missing or wrong source is an asset-evidence gap, never permission to grade a signal-only relabel.
+ */
+export function evaluateTranscodeTransformSourceSignal(
+  actual: TransformSignalEvidence,
+  contract: TranscodeTransformContract,
+): TranscodeDecision | undefined {
+  const expected = contract.sourceSignal;
+  if (expected === undefined) return undefined;
+  const missing: string[] = [];
+  for (const [key, wanted] of Object.entries(expected)) {
+    if (wanted === undefined) continue;
+    const observed = actual[key as keyof TransformSignalEvidence];
+    if (observed === undefined || observed === null || observed === '') {
+      missing.push(key);
+      continue;
+    }
+    const equal = typeof wanted === 'string'
+      ? String(observed).trim().toLowerCase() === wanted
+      : observed === wanted;
+    if (!equal) {
+      return transcodeUnavailable(
+        'NA_ASSET',
+        'TRANSCODE_TRANSFORM_SOURCE_SIGNALING_MISMATCH',
+        `source ${key}=${String(observed)}; required ${String(wanted)}`,
+      );
+    }
+  }
+  if (missing.length > 0) {
+    return transcodeUnavailable(
+      'NA_ASSET',
+      'TRANSCODE_TRANSFORM_SOURCE_SIGNALING_UNAVAILABLE',
+      `independent source readers did not expose ${missing.join(', ')}`,
+    );
+  }
+  return undefined;
 }
 
 function compareSignal(
@@ -466,6 +721,18 @@ interface SignalIsoBox {
   readonly end: number;
 }
 
+interface H273ColorTuple {
+  readonly primaries: number;
+  readonly transfer: number;
+  readonly matrix: number;
+  readonly fullRange: boolean;
+}
+
+interface AvcSpsSignal {
+  readonly bitDepth: number;
+  readonly color: H273ColorTuple | undefined;
+}
+
 function readIsoBmffTransformSignal(
   bytes: Uint8Array,
   container: 'mp4' | 'mov',
@@ -515,9 +782,47 @@ function readIsoBmffTransformSignal(
     );
   }
   const children = signalIsoBoxes(bytes, childStart, sampleEntry.end);
-  const colr = children.find((box) => box.type === 'colr');
+  const colrBoxes = children.filter((box) => box.type === 'colr');
+  if (colrBoxes.length > 1 && (sampleEntry.type === 'avc1' || sampleEntry.type === 'avc3')) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_COLR_AMBIGUOUS',
+      'H.264 sample entry carries multiple colr declarations',
+    );
+  }
+  const colr = colrBoxes[0];
   if (colr) Object.assign(signal, readIsoColrSignal(bytes, colr));
-  const bitDepth = readIsoCodecBitDepth(bytes, sampleEntry.type, children);
+  let bitDepth: number | undefined;
+  if (sampleEntry.type === 'avc3') {
+    throw new TransformSignalReadError(
+      'UNSUPPORTED_STRUCTURE',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_INBAND_PARAMETER_SETS',
+      'avc3 may replace avcC parameter sets in-band, so elementary colour signaling cannot be proven',
+    );
+  }
+  if (sampleEntry.type === 'avc1') {
+    const avcCBoxes = children.filter((box) => box.type === 'avcC');
+    if (avcCBoxes.length === 0) {
+      throw new TransformSignalReadError(
+        'MALFORMED',
+        'TRANSCODE_TRANSFORM_SIGNAL_H264_AVCC_MISSING',
+        'avc1 sample entry has no AVCDecoderConfigurationRecord',
+      );
+    }
+    if (avcCBoxes.length > 1) {
+      throw new TransformSignalReadError(
+        'MALFORMED',
+        'TRANSCODE_TRANSFORM_SIGNAL_H264_AVCC_AMBIGUOUS',
+        'avc1 sample entry carries multiple AVCDecoderConfigurationRecords',
+      );
+    }
+    const avcC = avcCBoxes[0]!;
+    const spsSignals = readAvcSpsSignals(bytes.subarray(avcC.bodyStart, avcC.end));
+    bitDepth = uniqueAvcBitDepth(spsSignals);
+    reconcileAvc1ColorSignal(spsSignals, colr ? readIsoNclxTuple(bytes, colr) : undefined);
+  } else {
+    bitDepth = readIsoCodecBitDepth(bytes, sampleEntry.type, children);
+  }
   if (bitDepth !== undefined) Object.assign(signal, { bitDepth });
   return Object.freeze({ state: 'OK', value: Object.freeze(signal), reader: 'isobmff-video-signal' });
 }
@@ -587,6 +892,23 @@ function readIsoColrSignal(bytes: Uint8Array, box: SignalIsoBox): TransformSigna
   };
 }
 
+function readIsoNclxTuple(bytes: Uint8Array, box: SignalIsoBox): H273ColorTuple | undefined {
+  if (signalAscii(bytes, box.bodyStart, 4) !== 'nclx') return undefined;
+  if (box.bodyStart + 11 > box.end) {
+    throw new TransformSignalReadError(
+      'INCOMPLETE',
+      'TRANSCODE_TRANSFORM_SIGNAL_NCLX_TRUNCATED',
+      'H.264 nclx declaration is missing its range byte',
+    );
+  }
+  return {
+    primaries: signalU16(bytes, box.bodyStart + 4),
+    transfer: signalU16(bytes, box.bodyStart + 6),
+    matrix: signalU16(bytes, box.bodyStart + 8),
+    fullRange: (bytes[box.bodyStart + 10]! & 0x80) !== 0,
+  };
+}
+
 function readIsoCodecBitDepth(
   bytes: Uint8Array,
   sampleEntry: string,
@@ -641,6 +963,197 @@ function readAvcBitDepth(avcC: Uint8Array): number | undefined {
   return undefined;
 }
 
+function readAvcSpsSignals(avcC: Uint8Array): readonly AvcSpsSignal[] {
+  if (avcC.byteLength < 7 || avcC[0] !== 1) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_AVCC_INVALID',
+      'AVCDecoderConfigurationRecord is missing or invalid',
+    );
+  }
+  const spsCount = avcC[5]! & 0x1f;
+  if (spsCount === 0) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_MISSING',
+      'AVCDecoderConfigurationRecord contains no SPS',
+    );
+  }
+  const signals: AvcSpsSignal[] = [];
+  let offset = 6;
+  for (let index = 0; index < spsCount; index++) {
+    if (offset + 2 > avcC.byteLength) {
+      throw new TransformSignalReadError(
+        'INCOMPLETE',
+        'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_LENGTH_TRUNCATED',
+        `avcC SPS ${index} length is truncated`,
+      );
+    }
+    const length = signalU16(avcC, offset);
+    offset += 2;
+    if (length <= 1 || offset + length > avcC.byteLength) {
+      throw new TransformSignalReadError(
+        'INCOMPLETE',
+        'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_TRUNCATED',
+        `avcC SPS ${index} payload is truncated`,
+      );
+    }
+    signals.push(readAvcSpsSignal(avcC.subarray(offset, offset + length), index));
+    offset += length;
+  }
+  return signals;
+}
+
+function uniqueAvcBitDepth(signals: readonly AvcSpsSignal[]): number {
+  const depths = new Set(signals.map((signal) => signal.bitDepth));
+  if (depths.size !== 1) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_DEPTH_CONFLICT',
+      'avcC SPS entries disagree on coded bit depth',
+    );
+  }
+  return signals[0]!.bitDepth;
+}
+
+function reconcileAvc1ColorSignal(
+  signals: readonly AvcSpsSignal[],
+  nclx: H273ColorTuple | undefined,
+): void {
+  const colors = signals.map((signal) => signal.color);
+  const declared = colors.filter((color): color is H273ColorTuple => color !== undefined);
+  if (declared.length > 0 && declared.length !== colors.length) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_COLOR_AMBIGUOUS',
+      'only some avcC SPS entries carry a complete VUI colour declaration',
+    );
+  }
+  if (declared.length > 1 && declared.some((color) => !h273ColorTupleEqual(color, declared[0]!))) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_COLOR_CONFLICT',
+      'avcC SPS entries carry conflicting VUI colour declarations',
+    );
+  }
+  if (nclx === undefined) return;
+  if (declared.length === 0) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_COLOR_MISSING',
+      'nclx declares H.264 colour but no avcC SPS carries a complete VUI colour tuple',
+    );
+  }
+  if (!h273ColorTupleEqual(declared[0]!, nclx)) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_NCLX_SPS_CONFLICT',
+      'H.264 avcC SPS VUI colour tuple disagrees with the nclx declaration',
+    );
+  }
+}
+
+function h273ColorTupleEqual(left: H273ColorTuple, right: H273ColorTuple): boolean {
+  return left.primaries === right.primaries &&
+    left.transfer === right.transfer &&
+    left.matrix === right.matrix &&
+    left.fullRange === right.fullRange;
+}
+
+function readAvcSpsSignal(nal: Uint8Array, index: number): AvcSpsSignal {
+  if (nal.byteLength < 4 || (nal[0]! & 0x1f) !== 7) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_SPS_NAL_INVALID',
+      `avcC SPS ${index} is not an SPS NAL unit`,
+    );
+  }
+  const bits = new SignalBitReader(removeEmulationPrevention(nal.subarray(1)));
+  const profile = bits.readBits(8);
+  bits.skip(16);
+  bits.readUe();
+  let bitDepth = 8;
+  if (H264_HIGH_PROFILES.has(profile)) {
+    const chromaFormat = bits.readUe();
+    if (chromaFormat > 3) {
+      throw new TransformSignalReadError(
+        'MALFORMED',
+        'TRANSCODE_TRANSFORM_SIGNAL_H264_CHROMA_FORMAT_INVALID',
+        `H.264 SPS has invalid chroma_format_idc ${chromaFormat}`,
+      );
+    }
+    if (chromaFormat === 3) bits.skip(1);
+    bitDepth += bits.readUe();
+    bits.readUe();
+    bits.skip(1);
+    if (bits.readBits(1) === 1) {
+      const count = chromaFormat === 3 ? 12 : 8;
+      for (let scaling = 0; scaling < count; scaling++) {
+        if (bits.readBits(1) === 1) skipAvcScalingList(bits, scaling < 6 ? 16 : 64);
+      }
+    }
+  }
+  bits.readUe();
+  const picOrderCountType = bits.readUe();
+  if (picOrderCountType === 0) bits.readUe();
+  else if (picOrderCountType === 1) {
+    bits.skip(1);
+    bits.readSe();
+    bits.readSe();
+    const cycle = bits.readUe();
+    for (let item = 0; item < cycle; item++) bits.readSe();
+  } else if (picOrderCountType !== 2) {
+    throw new TransformSignalReadError(
+      'MALFORMED',
+      'TRANSCODE_TRANSFORM_SIGNAL_H264_POC_INVALID',
+      `H.264 SPS has invalid pic_order_cnt_type ${picOrderCountType}`,
+    );
+  }
+  bits.readUe();
+  bits.skip(1);
+  bits.readUe();
+  bits.readUe();
+  const frameMbsOnly = bits.readBits(1);
+  if (frameMbsOnly === 0) bits.skip(1);
+  bits.skip(1);
+  if (bits.readBits(1) === 1) {
+    bits.readUe();
+    bits.readUe();
+    bits.readUe();
+    bits.readUe();
+  }
+  if (bits.readBits(1) === 0) return { bitDepth, color: undefined };
+  if (bits.readBits(1) === 1) {
+    const aspectRatio = bits.readBits(8);
+    if (aspectRatio === 255) bits.skip(32);
+  }
+  if (bits.readBits(1) === 1) bits.skip(1);
+  if (bits.readBits(1) === 0) return { bitDepth, color: undefined };
+  bits.skip(3);
+  const fullRange = bits.readBits(1) === 1;
+  if (bits.readBits(1) === 0) return { bitDepth, color: undefined };
+  return {
+    bitDepth,
+    color: {
+      primaries: bits.readBits(8),
+      transfer: bits.readBits(8),
+      matrix: bits.readBits(8),
+      fullRange,
+    },
+  };
+}
+
+const H264_HIGH_PROFILES = new Set([44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244]);
+
+function skipAvcScalingList(bits: SignalBitReader, size: number): void {
+  let lastScale = 8;
+  let nextScale = 8;
+  for (let index = 0; index < size; index++) {
+    if (nextScale !== 0) nextScale = (lastScale + bits.readSe() + 256) % 256;
+    lastScale = nextScale === 0 ? lastScale : nextScale;
+  }
+}
+
 function readHevcBitDepth(hvcC: Uint8Array): number | undefined {
   // HEVCDecoderConfigurationRecord carries bit_depth_luma_minus8 directly in the low three bits of
   // byte 17. Reading that normative field is both stricter and less failure-prone than reparsing SPS.
@@ -687,6 +1200,11 @@ class SignalBitReader {
       }
     }
     return zeros === 0 ? 0 : 2 ** zeros - 1 + this.readBits(zeros);
+  }
+
+  readSe(): number {
+    const code = this.readUe();
+    return code % 2 === 1 ? (code + 1) / 2 : -(code / 2);
   }
 }
 
@@ -904,6 +1422,16 @@ function matchEffectFrames(
     frame.durationUs ?? (source[index + 1] ? source[index + 1]!.ptsUs - frame.ptsUs : 0))) || 1;
   const pairs: Array<{ source: TranscodePixelFrame; candidate: TranscodePixelFrame }> = [];
   for (const got of candidate) {
+    // Prefer an exact/request-anchor match before interval containment. With a positive tolerance,
+    // the preceding frame's half-open interval otherwise overlaps the next frame's exact PTS and
+    // systematically shifts every candidate after frame zero backward by one sample.
+    const nearest = source
+      .map((frame) => ({ frame, delta: Math.abs(frame.ptsUs - got.ptsUs) }))
+      .sort((a, b) => a.delta - b.delta || a.frame.ptsUs - b.frame.ptsUs)[0];
+    if (nearest && nearest.delta <= toleranceUs) {
+      pairs.push({ source: nearest.frame, candidate: got });
+      continue;
+    }
     const containing = source.find((frame, index) => {
       const duration = frame.durationUs ?? (source[index + 1]?.ptsUs ?? frame.ptsUs + fallbackDuration) - frame.ptsUs;
       return got.ptsUs >= frame.ptsUs - toleranceUs && got.ptsUs < frame.ptsUs + duration + toleranceUs;
@@ -912,9 +1440,6 @@ function matchEffectFrames(
       pairs.push({ source: containing, candidate: got });
       continue;
     }
-    const nearest = source
-      .map((frame) => ({ frame, delta: Math.abs(frame.ptsUs - got.ptsUs) }))
-      .sort((a, b) => a.delta - b.delta || a.frame.ptsUs - b.frame.ptsUs)[0];
     if (nearest && nearest.delta <= Math.max(toleranceUs, fallbackDuration / 2)) {
       pairs.push({ source: nearest.frame, candidate: got });
     }
@@ -1022,32 +1547,62 @@ function crop(source: FloatPlane, step: Extract<TransformStep, { kind: 'crop' }>
   return { ...source, width: step.width, height: step.height, data };
 }
 
-function pad(source: FloatPlane, step: Extract<TransformStep, { kind: 'pad' }>): FloatPlane {
+function containPad(source: FloatPlane, step: Extract<TransformStep, { kind: 'contain-pad' }>): FloatPlane {
   if (!Number.isSafeInteger(step.width) || !Number.isSafeInteger(step.height) ||
-      step.width < source.width || step.height < source.height) {
-    throw new TypeError('pad target must contain the complete source plane');
+      step.width <= 0 || step.height <= 0) {
+    throw new TypeError('contain-pad target dimensions must be positive integers');
   }
   if (step.color.some((channel) => !Number.isFinite(channel) || channel < 0 || channel > 1)) {
-    throw new TypeError('pad color channels must be normalized');
+    throw new TypeError('contain-pad color channels must be normalized');
   }
   const data = new Float64Array(step.width * step.height * 4);
   for (let offset = 0; offset < data.length; offset += 4) data.set(step.color, offset);
-  const left = Math.floor((step.width - source.width) / 2);
-  const top = Math.floor((step.height - source.height) / 2);
-  for (let y = 0; y < source.height; y++) {
-    for (let x = 0; x < source.width; x++) {
-      copyPixel(source.data, (y * source.width + x) * 4, data, ((top + y) * step.width + left + x) * 4);
+
+  const scale = Math.min(step.width / source.width, step.height / source.height);
+  const drawWidth = source.width * scale;
+  const drawHeight = source.height * scale;
+  const left = (step.width - drawWidth) / 2;
+  const top = (step.height - drawHeight) / 2;
+  for (let y = 0; y < step.height; y++) {
+    const centerY = y + 0.5;
+    if (centerY < top || centerY >= top + drawHeight) continue;
+    const sourceY = (centerY - top) / scale - 0.5;
+    const y0 = Math.max(0, Math.min(source.height - 1, Math.floor(sourceY)));
+    const y1 = Math.max(0, Math.min(source.height - 1, y0 + 1));
+    const fy = Math.max(0, Math.min(1, sourceY - Math.floor(sourceY)));
+    for (let x = 0; x < step.width; x++) {
+      const centerX = x + 0.5;
+      if (centerX < left || centerX >= left + drawWidth) continue;
+      const sourceX = (centerX - left) / scale - 0.5;
+      const x0 = Math.max(0, Math.min(source.width - 1, Math.floor(sourceX)));
+      const x1 = Math.max(0, Math.min(source.width - 1, x0 + 1));
+      const fx = Math.max(0, Math.min(1, sourceX - Math.floor(sourceX)));
+      const targetOffset = (y * step.width + x) * 4;
+      const topLeft = (y0 * source.width + x0) * 4;
+      const topRight = (y0 * source.width + x1) * 4;
+      const bottomLeft = (y1 * source.width + x0) * 4;
+      const bottomRight = (y1 * source.width + x1) * 4;
+      for (let channel = 0; channel < 4; channel++) {
+        const topSample = source.data[topLeft + channel]! * (1 - fx) + source.data[topRight + channel]! * fx;
+        const bottomSample = source.data[bottomLeft + channel]! * (1 - fx) + source.data[bottomRight + channel]! * fx;
+        data[targetOffset + channel] = topSample * (1 - fy) + bottomSample * fy;
+      }
     }
   }
   return { ...source, width: step.width, height: step.height, data };
 }
 
-function convertPrimaries(source: FloatPlane, from: ColorPrimaries, to: ColorPrimaries): FloatPlane {
-  if (from === to) return { ...source, data: source.data.slice() };
+/** Convert the neutral decoder's normalized sRGB pixels into authored video RGB coordinates. */
+function convertNormalizedSrgbToPrimaries(source: FloatPlane, to: ColorPrimaries): FloatPlane {
   const data = source.data.slice();
   for (let offset = 0; offset < data.length; offset += 4) {
-    const linear = [inverseBtOetf(data[offset]!), inverseBtOetf(data[offset + 1]!), inverseBtOetf(data[offset + 2]!)] as const;
-    const xyz = multiply3(RGB_TO_XYZ[from], linear);
+    const linear = [
+      inverseSrgbOetf(data[offset] ?? 0),
+      inverseSrgbOetf(data[offset + 1] ?? 0),
+      inverseSrgbOetf(data[offset + 2] ?? 0),
+    ] as const;
+    // sRGB and BT.709 share D65 primaries; only their transfer functions differ.
+    const xyz = multiply3(RGB_TO_XYZ.bt709, linear);
     const converted = multiply3(XYZ_TO_RGB[to], xyz);
     data[offset] = btOetf(converted[0]);
     data[offset + 1] = btOetf(converted[1]);
@@ -1056,19 +1611,40 @@ function convertPrimaries(source: FloatPlane, from: ColorPrimaries, to: ColorPri
   return { ...source, data };
 }
 
-function toneMapPqToSdr(source: FloatPlane, targetPeakNits: number): FloatPlane {
-  if (!Number.isFinite(targetPeakNits) || targetPeakNits <= 0) throw new TypeError('tone-map peak must be positive');
+function colorTargetForContract(contract: TranscodeTransformContract): ColorPrimaries | undefined {
+  let colorTarget: ColorPrimaries | undefined;
+  for (const step of contract.steps) {
+    if (step.kind === 'color-convert') colorTarget = step.to;
+  }
+  return colorTarget;
+}
+
+/**
+ * Independently synthesize the decoded-sRGB appearance of a signal-only retag. The input normalized-sRGB
+ * numbers are treated as target-coded BT.709/BT.2020 values without conversion, then decoded through the
+ * target transfer/primaries into the neutral reader's sRGB presentation space. This is the semantic 0%
+ * endpoint; the original normalized-sRGB source is the presentation-preserved 100% endpoint.
+ */
+function rawColorRetagPresentation(source: FloatPlane, target: ColorPrimaries): FloatPlane {
   const data = source.data.slice();
   for (let offset = 0; offset < data.length; offset += 4) {
-    const rgb2020Nits = [pqEotf(data[offset]!), pqEotf(data[offset + 1]!), pqEotf(data[offset + 2]!)] as const;
-    const xyzNits = multiply3(RGB_TO_XYZ.bt2020, rgb2020Nits);
-    const rgb709Nits = multiply3(XYZ_TO_RGB.bt709, xyzNits);
-    for (let channel = 0; channel < 3; channel++) {
-      const normalized = Math.max(0, rgb709Nits[channel]!) / targetPeakNits;
-      data[offset + channel] = btOetf(normalized / (1 + normalized));
-    }
+    const targetLinear = [
+      inverseBtOetf(data[offset] ?? 0),
+      inverseBtOetf(data[offset + 1] ?? 0),
+      inverseBtOetf(data[offset + 2] ?? 0),
+    ] as const;
+    const xyz = multiply3(RGB_TO_XYZ[target], targetLinear);
+    const displayLinear = multiply3(XYZ_TO_RGB.bt709, xyz);
+    data[offset] = srgbOetf(displayLinear[0]);
+    data[offset + 1] = srgbOetf(displayLinear[1]);
+    data[offset + 2] = srgbOetf(displayLinear[2]);
   }
-  return { ...source, bitDepth: 8, data };
+  return { ...source, data };
+}
+
+function normalizedSrgbToneMapPresentation(source: FloatPlane, targetPeakNits: number): FloatPlane {
+  if (!Number.isFinite(targetPeakNits) || targetPeakNits <= 0) throw new TypeError('tone-map peak must be positive');
+  return { ...source, bitDepth: 8, data: source.data.slice() };
 }
 
 function quantize(source: FloatPlane, bitDepth: number): FloatPlane {
@@ -1091,8 +1667,8 @@ function validateStep(step: TransformStep): void {
   if (step.kind === 'crop' && ![step.x, step.y, step.width, step.height].every(Number.isSafeInteger)) {
     throw new TypeError('crop contract values must be integers');
   }
-  if (step.kind === 'pad' && (!Number.isSafeInteger(step.width) || !Number.isSafeInteger(step.height))) {
-    throw new TypeError('pad contract dimensions must be integers');
+  if (step.kind === 'contain-pad' && (!Number.isSafeInteger(step.width) || !Number.isSafeInteger(step.height))) {
+    throw new TypeError('contain-pad contract dimensions must be integers');
   }
   if (step.kind === 'depth-convert' &&
       (![step.fromBitDepth, step.toBitDepth].every(Number.isSafeInteger) ||
@@ -1137,24 +1713,29 @@ function multiply3(matrix: Matrix3, vector: readonly [number, number, number]): 
   return matrix.map((row) => row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2]) as [number, number, number];
 }
 
-function inverseBtOetf(value: number): number {
-  const v = clamp01(value);
-  return v < 0.081 ? v / 4.5 : ((v + 0.099) / 1.099) ** (1 / 0.45);
-}
-
 function btOetf(value: number): number {
   const v = Math.max(0, value);
   return clamp01(v < 0.018 ? 4.5 * v : 1.099 * v ** 0.45 - 0.099);
 }
 
-function pqEotf(value: number): number {
-  const m1 = 2610 / 16384;
-  const m2 = 2523 / 32;
-  const c1 = 3424 / 4096;
-  const c2 = 2413 / 128;
-  const c3 = 2392 / 128;
-  const p = clamp01(value) ** (1 / m2);
-  return 10_000 * (Math.max(p - c1, 0) / (c2 - c3 * p)) ** (1 / m1);
+const BT_OETF_ALPHA = 1.09929682680944;
+const BT_OETF_BETA = 0.018053968510807;
+
+function inverseBtOetf(value: number): number {
+  const v = clamp01(value);
+  return v < 4.5 * BT_OETF_BETA
+    ? v / 4.5
+    : ((v + (BT_OETF_ALPHA - 1)) / BT_OETF_ALPHA) ** (1 / 0.45);
+}
+
+function srgbOetf(value: number): number {
+  const v = clamp01(value);
+  return v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055;
+}
+
+function inverseSrgbOetf(value: number): number {
+  const v = clamp01(value);
+  return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
 }
 
 function copyPixel(source: Float64Array, sourceOffset: number, target: Float64Array, targetOffset: number): void {

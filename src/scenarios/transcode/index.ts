@@ -12,8 +12,9 @@
  */
 
 import type { TranscodeOptions } from '../../core/engine.ts';
-import type { OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
+import type { CandidateInputEnvelope, OracleId, OracleTolerances, Scenario } from '../../core/scenario.ts';
 import { defineScenario } from '../../core/scenario.ts';
+import { LARGE_1080P_120S_CANDIDATE_ENVELOPE } from '../_candidate-envelopes.ts';
 
 /** SSIM is the gate. PSNR remains advisory until both decoded pixel planes are observable. */
 const TC_TOL: OracleTolerances = { ssimMin: 0.99 };
@@ -57,6 +58,8 @@ const withAudioContentInvariant = (opts: TranscodeOptions | TranscodeOpts): Tran
 
 interface VideoTranscodeCase {
   id: string;
+  /** Increment whenever this stable scenario id changes semantic options/oracles/tolerances. */
+  revision?: number;
   asset: string;
   fromContainer: string;
   fromVideo: string;
@@ -264,16 +267,32 @@ const VIDEO_CASES: VideoTranscodeCase[] = [
   // ── Bitrate target (quality knob) ──
   {
     id: 'h264_bitrate_2mbps',
+    revision: 4,
     asset: 'h264_1080p_30s.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
     fromAudio: 'aac',
     toContainer: 'mp4',
     toVideo: 'h264',
-    opts: { container: 'mp4', video: { codec: 'h264', bitrate: 2_000_000 } },
-    // Aggressive bitrate cut lowers fidelity; the exhaustive 1080x1920@60 candidate measures 0.932.
+    features: ['quality-constrained-rate'],
+    opts: {
+      container: 'mp4',
+      video: {
+        codec: 'h264',
+        bitrate: 2_000_000,
+        maxAverageBitrate: 2_600_000,
+        quality: { metric: 'ssim-luma-v1', minimumMean: 0.93, samples: 8 },
+      },
+    },
+    oraclesOverride: ['ssim-psnr', 'average-bitrate', 'property-invariant', 'playback-smoke'],
+    optsInvariant: 'transcode-preserve-omitted-aac',
+    // Aggressive bitrate cuts lower fidelity, so quality remains an independent mandatory gate.
     tolerances: { ssimMin: 0.93 },
-    notes: 'Re-encode at 2 Mbps; the 0.93 floor preserves a meaningful gate at intentionally low pixel-rate density.',
+    notes:
+      'Prefer 2 Mbps while allowing at most the independently authored 1.3× elementary-rate ceiling ' +
+      'only when needed to satisfy the explicit ssim-luma-v1 mean >= 0.93 constraint; independent ' +
+      'average-bitrate, endpoint-inclusive SSIM, byte-exact omitted-AAC preservation, and playback ' +
+      'oracles remain conjunctive.',
   },
 
   // ── Rotate (apply/normalize display rotation) ──
@@ -312,6 +331,7 @@ function buildVideoScenario(c: VideoTranscodeCase): Scenario {
       : c.opts;
   return defineScenario({
     id: `transcode/${c.id}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'transcode',
     input: c.asset,
     options,
@@ -441,22 +461,59 @@ const audioScenarios: Scenario[] = AUDIO_CASES.map((c) => {
  * ABR fan-out via TranscodeOptions.variants: the engine must surface every requested quality rung.
  * The fanout-renditions oracle validates every rendition independently and then validates the set's
  * authored bitrate bands, timebase/duration, random-access alignment, and decoded adjacent switches.
- * Requires the 'fanout' feature so engines without multi-rendition output negotiate NA.
+ * Requires both 'fanout' and 'quality-constrained-rate' so engines without either contract negotiate NA.
  */
 const ABR_OPTS: TranscodeOptions = {
   container: 'mp4',
   video: { codec: 'h264' },
   variants: [
-    { codec: 'h264', width: 1920, height: 1080, bitrate: 5_000_000 },
-    { codec: 'h264', width: 1280, height: 720, bitrate: 2_800_000 },
-    { codec: 'h264', width: 854, height: 480, bitrate: 1_400_000 },
-    { codec: 'h264', width: 640, height: 360, bitrate: 800_000 },
+    {
+      codec: 'h264',
+      width: 1920,
+      height: 1080,
+      bitrate: 5_000_000,
+      maxAverageBitrate: 6_500_000,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+    },
+    {
+      codec: 'h264',
+      width: 1280,
+      height: 720,
+      bitrate: 2_800_000,
+      maxAverageBitrate: 3_640_000,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+    },
+    {
+      codec: 'h264',
+      width: 854,
+      height: 480,
+      bitrate: 1_400_000,
+      maxAverageBitrate: 1_820_000,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+    },
+    {
+      codec: 'h264',
+      width: 640,
+      height: 360,
+      bitrate: 800_000,
+      maxAverageBitrate: 1_040_000,
+      quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+    },
   ],
+  renditionSet: {
+    id: 'h264-main-abr',
+    renditionIds: ['1080p', '720p', '480p', '360p'],
+    // The current non-fragmented ladder guarantees a shared random-access boundary at presentation
+    // start. Later switching points require an authored periodic-GOP/segment request and are not implied.
+    switchPointsUs: [0],
+    segmentMode: 'random-access',
+  },
 };
 
 const fanoutScenarios: Scenario[] = [
   defineScenario({
     id: 'transcode/fanout_h264_abr_ladder',
+    revision: 3,
     op: 'transcode',
     input: 'h264_1080p_30s.mp4',
     options: ABR_OPTS,
@@ -466,15 +523,16 @@ const fanoutScenarios: Scenario[] = [
       containersOut: ['mp4'],
       videoCodecs: ['h264'],
       audioCodecs: ['aac'],
-      features: ['fanout', 'resize'],
+      features: ['fanout', 'resize', 'quality-constrained-rate'],
     },
     oracles: ['fanout-renditions'],
     metrics: [...TC_METRICS],
     tolerances: { ssimMin: 0.95 },
     renditionIds: ['1080p', '720p', '480p', '360p'],
     notes:
-      'Explicit H.264 ABR set (1080/720/480/360): every rendition must satisfy validity, quality, ' +
-      'bitrate, common-timebase, aligned random-access, and cross-rendition switching contracts.',
+      'Explicit H.264 ABR set (1080/720/480/360): each authored preferred rate has an independent ' +
+      '1.3x hard ceiling and ssim-luma-v1 mean >= 0.95 objective; every rendition must also satisfy ' +
+      'validity, bitrate, common-timebase, aligned random-access, and cross-rendition switching contracts.',
   }),
 ];
 
@@ -645,13 +703,13 @@ const FPS_UP_CASES: VideoTranscodeCase[] = [
 
 // ── A.8 — rotate APPLY 90/180/270, incl. the dimension-swapping orientations (A.16 trap) ──────────
 //
-// The no-golden ssim-psnr reference path does NOT rotate the source (it only resizes), so a CORRECT
-// explicit rotation scores near-zero SSIM. These rows therefore gate on output metadata + duration;
-// rotate→0 normalize of the pre-rotated asset is already covered by h264_rotate_normalize with a
-// committed rotation-aware golden.
+// The source-reference SSIM path applies the requested quarter-turn in display space, independently
+// of the property oracle's typed transform implementation. Every rotation therefore has both a
+// perceptual gate and the authored signaling/dimension/effect gate.
 const ROTATE_CASES: VideoTranscodeCase[] = [
   {
     id: 'h264_rotate_180',
+    revision: 2,
     asset: 'h264_1080p_30s.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
@@ -660,14 +718,16 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 180 } },
-    oraclesOverride: ['property-invariant', 'playback-smoke'],
+    oraclesOverride: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     optsInvariant: 'transcode-effect-aware',
+    tolerances: { ssimMin: 0.95, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
       'Apply 180° rotation. The effect-aware oracle rotates source pixels and checks authored ' +
       'rotation signaling; playback/codec alone cannot satisfy the row.',
   },
   {
     id: 'h264_rotate_90_dimswap',
+    revision: 2,
     asset: 'h264_1080p_30s.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
@@ -676,14 +736,16 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 90 } },
-    oraclesOverride: ['property-invariant', 'playback-smoke'],
+    oraclesOverride: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     optsInvariant: 'transcode-effect-aware',
+    tolerances: { ssimMin: 0.95, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
       'Apply 90° rotation with W↔H swap. Timestamp-paired transformed pixels and authored rotation ' +
       'signaling are the gate; a dimension-only or playback-only implementation fails.',
   },
   {
     id: 'h264_rotate_270_dimswap',
+    revision: 2,
     asset: 'h264_rotated90.mp4',
     fromContainer: 'mp4',
     fromVideo: 'h264',
@@ -692,8 +754,9 @@ const ROTATE_CASES: VideoTranscodeCase[] = [
     toVideo: 'h264',
     features: ['rotate'],
     opts: { container: 'mp4', video: { codec: 'h264', rotate: 270 } },
-    oraclesOverride: ['property-invariant', 'playback-smoke'],
+    oraclesOverride: ['ssim-psnr', 'property-invariant', 'playback-smoke'],
     optsInvariant: 'transcode-effect-aware',
+    tolerances: { ssimMin: 0.95, durationToleranceSec: TC_REENCODE_DURATION_TOLERANCE_SEC },
     notes:
       'Apply 270° rotation to the pre-rotated asset. The effect-aware reference validates the ' +
       'compounded display pixels and normalized authored matrix independently of playback.',
@@ -712,6 +775,7 @@ const rotateScenarios: Scenario[] = ROTATE_CASES.map(buildVideoScenario);
 // is a real upright H.264 asset so the cell becomes live as soon as an engine declares support.
 interface TransformFeatureCase {
   id: string;
+  revision?: number;
   /** the descriptive, intentionally-undeclared capability token driving the honest NA */
   feature: string;
   /** option payload an engine WOULD receive once it supports the knob (forwarded as-is) */
@@ -800,8 +864,10 @@ const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
   },
   {
     id: 'h264_two_pass_bitrate',
+    revision: 2,
     feature: 'two-pass',
     extraOpts: { video: { codec: 'h264', bitrate: 2_000_000, passes: 2 } },
+    oracles: ['ssim-psnr', 'average-bitrate', 'playback-smoke'],
     tolerances: { ssimMin: 0.95 },
     timeoutMs: 300_000,
     notes:
@@ -813,6 +879,7 @@ const TRANSFORM_FEATURE_CASES: TransformFeatureCase[] = [
 const transformFeatureScenarios: Scenario[] = TRANSFORM_FEATURE_CASES.map((c) =>
   defineScenario({
     id: `transcode/${c.id}`,
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'transcode',
     input: c.asset ?? 'h264_1080p_30s.mp4',
     options: {
@@ -1150,7 +1217,9 @@ const audioEncodeScenarios: Scenario[] = AUDIO_ENCODE_CASES.map((c) => {
 // large-bucket (may be deferred in a --subset bake → SKIPPED, never a fake number).
 interface SizeLadderCase {
   id: string;
+  revision?: number;
   asset: string;
+  candidateEnvelope?: CandidateInputEnvelope;
   fromContainer: string;
   fromVideo: string;
   fromAudio: string;
@@ -1193,7 +1262,9 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'ladder_large_h264_1080p_120s_resize_720p',
+    revision: 2,
     asset: 'large_h264_1080p_120s.mp4',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     fromContainer: 'mp4',
     fromVideo: 'h264',
     fromAudio: 'aac',
@@ -1208,7 +1279,9 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
   },
   {
     id: 'ladder_large_vp9_1080p_120s_to_h264_720p',
+    revision: 2,
     asset: 'large_vp9_1080p_120s.webm',
+    candidateEnvelope: LARGE_1080P_120S_CANDIDATE_ENVELOPE,
     fromContainer: 'webm',
     fromVideo: 'vp9',
     fromAudio: 'opus',
@@ -1225,8 +1298,10 @@ const SIZE_LADDER_CASES: SizeLadderCase[] = [
 const sizeLadderScenarios: Scenario[] = SIZE_LADDER_CASES.map((c) =>
   defineScenario({
     id: `transcode/${c.id}`,
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'transcode',
     input: c.asset,
+    ...(c.candidateEnvelope ? { candidateEnvelope: c.candidateEnvelope } : {}),
     options: {
       container: c.toContainer,
       video: { codec: c.toVideo, width: c.width, height: c.height },

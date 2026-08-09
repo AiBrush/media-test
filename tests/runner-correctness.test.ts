@@ -14,6 +14,7 @@ import {
   AUTHENTICATED_RANGE_PROBE_FEATURE,
   createMalformedInputError,
   createNotApplicableError,
+  createOperationConstraintUnsatisfiedError,
 } from '../src/core/engine.ts';
 import {
   buildExecutionFingerprint,
@@ -23,6 +24,7 @@ import {
   ORACLE_MODEL_VERSION,
   aggregateExhaustive,
   buildExecutionOrder,
+  decodeFrameGoldenGap,
   reduceExhaustiveStatuses,
   runOne,
   runPixelBehaviorSelfTest,
@@ -32,6 +34,7 @@ import {
 import type { ExecutionFingerprintComponents, PixelBehaviorEvidence } from '../src/core/runner.ts';
 import { defineScenario } from '../src/core/scenario.ts';
 import type { OracleOutcome, Scenario, ScenarioResult } from '../src/core/scenario.ts';
+import { emptyGoldenStore } from '../src/core/oracles.ts';
 import {
   CorpusDeliveryIntegrityError,
   buildCandidateEvidencePlan,
@@ -53,6 +56,7 @@ import {
   reviewedForcedTimeoutCells,
 } from '../src/core/disabled-cells.ts';
 import { RemotionMediaParserEngine } from '../src/engines/remotion-media-parser/adapter.ts';
+import { defineDisplayTransform } from '../src/features/decode-seek/display.ts';
 
 const originalFetch = globalThis.fetch;
 const changedGlobals = new Map<string, PropertyDescriptor | undefined>();
@@ -157,6 +161,58 @@ function remuxScenario(id = 'remux/runner-test'): Scenario {
   });
 }
 
+function trimScenario(id = 'trim/runner-test'): Scenario {
+  return defineScenario({
+    id,
+    op: 'trim',
+    input: 'input.mp4',
+    requires: { operations: ['trim'], containersIn: ['mp4'], containersOut: ['mp4'] },
+    options: {
+      container: 'mp4',
+      frameAccurate: false,
+      range: { startUs: 0, endUs: 500_000 },
+    },
+    oracles: ['playback-smoke'],
+    metrics: [],
+  });
+}
+
+test('display-space decode can use its independent live reference without an ordinary frame sidecar', () => {
+  const ordinary = defineScenario({
+    id: 'decode-seek/runner-frame-golden-gate',
+    op: 'decodeFrames',
+    input: 'input.mp4',
+    requires: { operations: ['decodeFrames'], containersIn: ['mp4'], videoCodecs: ['h264'] },
+    options: { maxFrames: 1 },
+    oracles: ['ssim-psnr'],
+    metrics: [],
+  });
+  const display = defineScenario({
+    id: 'decode-seek/runner-live-display-reference',
+    op: 'decodeFrames',
+    input: 'input.mp4',
+    requires: { operations: ['decodeFrames'], containersIn: ['mp4'], videoCodecs: ['h264'] },
+    options: {
+      maxFrames: 1,
+      displayEvidence: defineDisplayTransform({
+        codedWidth: 1_280,
+        codedHeight: 720,
+        displayWidth: 720,
+        displayHeight: 1_280,
+        rotationDegrees: 90,
+        flipX: false,
+        flipY: false,
+      }),
+    },
+    oracles: ['ssim-psnr'],
+    metrics: [],
+  });
+  const missing = emptyGoldenStore();
+
+  expect(decodeFrameGoldenGap(ordinary, missing)).toMatchObject({ status: 'NA_ASSET' });
+  expect(decodeFrameGoldenGap(display, missing)).toBeNull();
+});
+
 function streamingScenario(target: 'buffer' | 'stream'): Scenario {
   return defineScenario({
     id: `streaming-output/runner-${target}-contract`,
@@ -240,6 +296,7 @@ function streamVerifiedProbeInput(): {
 }
 
 const LARGE_AUTHENTICATED_INPUT_BYTES = 256 * 1024 * 1024 + 1;
+const TRIM_AUTHENTICATED_INPUT_BYTES = 128 * 1024 * 1024 + 1;
 const largeInputSha256 = 'ab'.repeat(32);
 
 function streamVerifiedLargeInput(
@@ -670,6 +727,152 @@ describe('REQ-RUN-01/02/04 staged concrete applicability', () => {
     expect(failed.reason).toContain('encoder failed after configure');
   });
 
+  test('one unsupported exact ABR rung config makes the whole ladder NA_BROWSER before fanout', async () => {
+    const configs: ConcreteWebCodecsConfig[] = [
+      [1_920, 1_080, 'avc1.640028'],
+      [1_280, 720, 'avc1.64001F'],
+      [854, 480, 'avc1.64001F'],
+      [640, 360, 'avc1.64001E'],
+    ].map(([width, height, codec]) => ({
+      role: 'video-encoder' as const,
+      config: {
+        codec: String(codec),
+        width: Number(width),
+        height: Number(height),
+        framerate: 30,
+        latencyMode: 'quality' as const,
+        bitrateMode: 'quantizer' as const,
+      },
+    }));
+    const encoder = function MockVideoEncoder(): void {};
+    Object.defineProperty(encoder, 'isConfigSupported', {
+      configurable: true,
+      value: async (config: VideoEncoderConfig) => ({ supported: config.width !== 854 }),
+    });
+    setGlobal('VideoEncoder', encoder);
+    installCorpusFetch();
+    let operations = 0;
+    const engine = baseEngine('transcode', {
+      supports: async () => ({ supported: true, browserConfigs: configs }),
+      transcode: async () => {
+        operations += 1;
+        return bytes();
+      },
+    });
+    const scenario = defineScenario({
+      id: 'transcode/runner-exact-abr-configs',
+      op: 'transcode',
+      input: 'input.mp4',
+      requires: { operations: ['transcode'] },
+      options: {
+        container: 'mp4',
+        video: { codec: 'h264' },
+        variants: configs.map((entry, index) => {
+          const config = entry.config as VideoEncoderConfig;
+          return {
+            width: config.width,
+            height: config.height,
+            bitrate: 800_000 + index,
+            maxAverageBitrate: 1_040_000 + index,
+            quality: { metric: 'ssim-luma-v1' as const, minimumMean: 0.95, samples: 8 },
+          };
+        }),
+      },
+      oracles: ['fanout-renditions'],
+      metrics: [],
+    });
+
+    const result = await runOne(engine, scenario, browser, support, { pixelBehavior: pixelPass });
+    expect(result.status).toBe('NA_BROWSER');
+    expect(operations).toBe(0);
+    expect(result.support?.probes[2]).toMatchObject({
+      role: 'video-encoder',
+      state: 'UNSUPPORTED',
+      reasonCode: 'WEB_CODECS_CONFIG_UNSUPPORTED',
+    });
+    expect(result.support?.browserConfigs[2]).toMatchObject({
+      role: 'video-encoder',
+      config: expect.objectContaining({ width: 854, bitrateMode: 'quantizer' }),
+    });
+  });
+
+  test('bounded objective-quality exhaustion is semantic FAIL with attempts, never NA or ERROR', async () => {
+    installCorpusFetch();
+    const evidence = {
+      constraint: 'h264-quality-rate',
+      preferredAverageBitrate: 800_000,
+      maxAverageBitrate: 1_040_000,
+      minimumQualityMean: 0.95,
+      metric: 'ssim-luma-v1',
+      attempts: [
+        {
+          attempt: 1,
+          targetBytes: 100_000,
+          actualBytes: 98_000,
+          averageBitrate: 784_000,
+          qualityMean: 0.91,
+          qualitySamples: 8,
+        },
+        {
+          attempt: 2,
+          targetBytes: 130_000,
+          actualBytes: 128_000,
+          averageBitrate: 1_024_000,
+          qualityMean: 0.94,
+          qualitySamples: 8,
+        },
+      ],
+    } as const;
+    const engine = baseEngine('transcode', {
+      supports: async () => ({ supported: true }),
+      transcode: async () => {
+        throw createOperationConstraintUnsatisfiedError(
+          'runner-fake@1.0.0',
+          'no bounded H.264 candidate met both hard constraints',
+          evidence,
+        );
+      },
+    });
+    const scenario = defineScenario({
+      id: 'transcode/runner-quality-constraint-failure',
+      op: 'transcode',
+      input: 'input.mp4',
+      requires: { operations: ['transcode'] },
+      options: {
+        container: 'mp4',
+        video: { codec: 'h264' },
+        variants: [{
+          width: 640,
+          height: 360,
+          bitrate: 800_000,
+          maxAverageBitrate: 1_040_000,
+          quality: { metric: 'ssim-luma-v1', minimumMean: 0.95, samples: 8 },
+        }],
+      },
+      oracles: ['fanout-renditions'],
+      metrics: ['wall'],
+    });
+
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      pixelBehavior: pixelPass,
+    });
+    expect(result.status).toBe('FAIL');
+    expect(result.bench).toBeUndefined();
+    expect(result.oracleOutcomes).toEqual([expect.objectContaining({
+      state: 'VERDICT',
+      oracle: 'fanout-renditions',
+      verdict: 'FAIL',
+      reasonCode: 'TRANSCODE_CONSTRAINT_UNSATISFIED',
+      measurements: { constraintAttempts: 2 },
+      evidence: expect.objectContaining({
+        schema: 'media-test/operation-constraint-unsatisfied@1',
+        attempts: evidence.attempts,
+      }),
+    })]);
+    expect(JSON.parse(JSON.stringify(result.oracleOutcomes))).toEqual(result.oracleOutcomes);
+  });
+
   test('selected bytes are size+SHA verified before operation and URL readers see the verified body', async () => {
     installCorpusFetch();
     let operations = 0;
@@ -1086,6 +1289,51 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     expect(largeRemux.status).toBe('PASS');
     expect(observedLargeInput?.contentAttestation?.sha256).toBe(largeInputSha256);
 
+    let observedTrimInput: MediaInput | undefined;
+    const largeTrim = await runOne(baseEngine('trim', {
+      capabilities: () => ({
+        ...caps('trim'),
+        features: [...caps('trim').features, AUTHENTICATED_RANGE_INPUT_FEATURE],
+      }),
+      supports: async () => ({ supported: true }),
+      trim: async (input) => {
+        observedTrimInput = input;
+        expect(input.contentAttestation).toMatchObject({
+          sha256: largeInputSha256,
+          sizeBytes: TRIM_AUTHENTICATED_INPUT_BYTES,
+        });
+        await expect(input.arrayBuffer()).rejects.toThrow('ATTESTED_URL_WHOLE_FILE_FORBIDDEN');
+        return bytes();
+      },
+    }), trimScenario('trim/large-authenticated-range'), browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      ...streamVerifiedLargeInput(TRIM_AUTHENTICATED_INPUT_BYTES),
+    });
+    expect(largeTrim.status).toBe('PASS');
+    expect(observedTrimInput?.contentAttestation?.sha256).toBe(largeInputSha256);
+
+    let thresholdTrimCalls = 0;
+    const thresholdTrim = await runOne(baseEngine('trim', {
+      capabilities: () => ({
+        ...caps('trim'),
+        features: [...caps('trim').features, AUTHENTICATED_RANGE_INPUT_FEATURE],
+      }),
+      trim: async () => {
+        thresholdTrimCalls += 1;
+        return bytes();
+      },
+    }), trimScenario('trim/authenticated-range-exclusive-threshold'), browser, support, {
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      ...streamVerifiedLargeInput(128 * 1024 * 1024),
+    });
+    expect(thresholdTrim).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_FORBIDDEN'),
+    });
+    expect(thresholdTrimCalls).toBe(0);
+
     let unauthenticatedLargeCalls = 0;
     const unauthenticatedLarge = await runOne(baseEngine('remux', {
       capabilities: () => ({
@@ -1405,6 +1653,83 @@ describe('REQ-RUN-03 three-way performance admission', () => {
     expect(result.status).toBe('PASS');
     expect(result.bench).toBeUndefined();
     expect(result.measurement).toMatchObject({ state: 'UNAVAILABLE', reasonCode: 'BENCH_ERROR' });
+  });
+
+  test('a benchmark-only applicability boundary preserves the prior correctness PASS', async () => {
+    installCorpusFetch();
+    let calls = 0;
+    const engine = baseEngine('remux', {
+      supports: async () => ({ supported: true }),
+      remux: async () => {
+        calls += 1;
+        if (calls > 1) {
+          throw createNotApplicableError(
+            'runner-fake@1.0.0',
+            'remux',
+            'repeated measurement allocation is unavailable',
+            { inputContainers: ['mp4'], outputContainer: 'mp4' },
+            'FAKE_BENCH_RESOURCE_BOUNDARY',
+          );
+        }
+        return bytes();
+      },
+    });
+    const scenario = defineScenario({
+      ...remuxScenario('remux/runner-bench-not-applicable-after-correctness'),
+      metrics: ['wall'],
+    });
+    const sourceSha256 = 'ab'.repeat(32);
+    const evidencePlan: CandidateOracleEvidencePlan = {
+      schemaVersion: 'candidate-oracle-evidence@1',
+      sourceSha256,
+      requirements: [{
+        oracle: 'playback-smoke',
+        role: 'REQUIRED',
+        needs: [{ kind: 'BROWSER_CAPABILITY' }],
+      }],
+      requiredOracles: ['playback-smoke'],
+      sufficientOracleSets: [['playback-smoke']],
+      declaredAvailable: ['BROWSER_CAPABILITY'],
+      contractDigest: 'cd'.repeat(32),
+    };
+    const result = await runOne(engine, scenario, browser, support, {
+      pillar: 'performance',
+      benchOptions: { warmup: 0, iters: 1 },
+      pixelBehavior: pixelPass,
+      playbackSmoke: async () => true,
+      selectionEvidencePlan: evidencePlan,
+    });
+
+    expect(calls).toBe(2);
+    expect(result.status).toBe('PASS');
+    expect(result.candidateEvidence).toMatchObject({
+      status: 'PASS',
+      reasonCode: 'EVIDENCE_SUFFICIENT_PASS',
+      sufficient: true,
+    });
+    expect(result.bench).toBeUndefined();
+    expect(result.measurement).toEqual({
+      state: 'UNAVAILABLE',
+      reasonCode: 'BENCH_NOT_APPLICABLE',
+      detail: expect.stringContaining('FAKE_BENCH_RESOURCE_BOUNDARY'),
+    });
+
+    const inputVariantId = 'selected:input.mp4';
+    expect(validateScenarioResultV2({
+      ...result,
+      schemaVersion: 2,
+      scenarioRevision: scenario.revision,
+      definitionHash: scenario.definitionHash,
+      inputVariantId,
+      inputSha256: sourceSha256,
+      instance: {
+        scenarioId: scenario.id,
+        scenarioRevision: scenario.revision,
+        definitionHash: scenario.definitionHash,
+        inputVariantId,
+        inputSha256: sourceSha256,
+      },
+    })).toEqual([]);
   });
 
   test('run cancellation during measurement preserves completed candidate correctness and a writable row', async () => {

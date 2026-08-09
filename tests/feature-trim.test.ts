@@ -29,6 +29,14 @@ import {
   type TrimCompositionContract,
   type TrimSemanticPresentation,
 } from '../src/features/trim/index.ts';
+import {
+  FULL_HD_10S_CANDIDATE_ENVELOPE,
+  HD_1280X720_10S_CANDIDATE_ENVELOPE,
+  HD_1280X720_4S_CANDIDATE_ENVELOPE,
+  HUGE_1080P_10MIN_CANDIDATE_ENVELOPE,
+  LARGE_1080P_120S_CANDIDATE_ENVELOPE,
+  MASSIVE_1080P_2H_CANDIDATE_ENVELOPE,
+} from '../src/scenarios/_candidate-envelopes.ts';
 import { trimScenarios } from '../src/scenarios/trim/index.ts';
 
 const fixture = JSON.parse(readFileSync(
@@ -521,6 +529,29 @@ describe('REQ-FEAT-32 real fragmented trim scenario and structural evidence', ()
     expect(assessFragmentedTrimOutput(nonRebased, { requiredTrackTypes: ['video', 'audio'] })).toMatchObject({
       verdict: 'FAIL',
     });
+  });
+});
+
+describe('trim workload candidate envelopes', () => {
+  test('feature and size-ladder workloads are rev2 and keep only their authored geometry/duration rung', () => {
+    const expected = new Map([
+      ['trim/h264_rotated_keyframe_aligned', HD_1280X720_10S_CANDIDATE_ENVELOPE],
+      ['trim/h264_multitrack_keyframe_aligned', HD_1280X720_10S_CANDIDATE_ENVELOPE],
+      ['trim/fmp4_fragment_boundary_copy', HD_1280X720_4S_CANDIDATE_ENVELOPE],
+      ['trim/h264_open_gop_frame_accurate', FULL_HD_10S_CANDIDATE_ENVELOPE],
+      ['trim/large_h264_copy_lazyread', LARGE_1080P_120S_CANDIDATE_ENVELOPE],
+      ['trim/large_h264_frame_accurate_throughput', LARGE_1080P_120S_CANDIDATE_ENVELOPE],
+      ['trim/huge_h264_mov_copy_peakmem', HUGE_1080P_10MIN_CANDIDATE_ENVELOPE],
+      ['trim/massive_h264_copy_sustained', MASSIVE_1080P_2H_CANDIDATE_ENVELOPE],
+    ]);
+
+    for (const [id, candidateEnvelope] of expected) {
+      expect(trimScenarios.find((scenario) => scenario.id === id)).toMatchObject({
+        revision: 2,
+        candidateEnvelope,
+      });
+    }
+    expect(expected.size).toBe(8);
   });
 });
 

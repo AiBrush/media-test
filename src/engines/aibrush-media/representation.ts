@@ -37,6 +37,19 @@ export interface AibrushRawPacket {
   readonly payload?: Uint8Array;
 }
 
+export type AibrushPacketPayloadResolver = (
+  packet: AibrushRawPacket,
+) => Uint8Array | undefined;
+
+export interface AibrushDemuxResultBuilder {
+  /** Normalize one producer batch immediately so the caller can release its raw row objects. */
+  addPackets(
+    rawPackets: readonly AibrushRawPacket[],
+    payloadForPacket?: AibrushPacketPayloadResolver,
+  ): void;
+  finish(): DemuxResult;
+}
+
 export function canonicalAibrushCodec(codec: string): string {
   const normalized = codec.toLowerCase();
   if (normalized.startsWith('avc1') || normalized.startsWith('avc3')) return 'h264';
@@ -123,84 +136,128 @@ export function representationForAibrushTrack(
   };
 }
 
+/**
+ * Incrementally attach semantic packet evidence without retaining producer row objects. Track-level
+ * representation facts are computed once, and a fixed decoder configuration is attached only to the
+ * first packet of each track; the per-track `representations` entry remains the authoritative handoff.
+ */
+export function createAibrushDemuxResultBuilder(
+  metadata: NormalizedMetadata,
+  tracks: readonly AibrushObservedTrack[],
+): AibrushDemuxResultBuilder {
+  const packets: PacketInfo[] = [];
+  const tracksWithDts = new Set<number>();
+  const tracksWithDecoderConfig = new Set<number>();
+  const trackEvidence = tracks.map((track, trackIndex) => {
+    const nonMedia = track.nonMedia === true;
+    return {
+      trackType: (nonMedia ? 'other' : track.mediaType) as TrackType,
+      codec: nonMedia
+        ? undefined
+        : canonicalAibrushCodec(track.codec ?? track.config?.codec ?? 'unknown'),
+      representation: nonMedia
+        ? undefined
+        : representationForAibrushTrack(track, trackIndex, 'presentation'),
+      nalLengthSize: nonMedia ? undefined : nalLengthSize(track),
+    };
+  });
+  let finished = false;
+
+  return {
+    addPackets(rawPackets, payloadForPacket): void {
+      if (finished) throw new TypeError('cannot add packets after finishing the aibrush demux result');
+      for (const packet of rawPackets) {
+        if (packet.dtsUs !== undefined) tracksWithDts.add(packet.trackIndex);
+        const track = tracks[packet.trackIndex];
+        const evidence = trackEvidence[packet.trackIndex];
+        const candidatePayload = payloadForPacket?.(packet) ?? packet.payload;
+        const payload = candidatePayload?.byteLength === packet.size ? candidatePayload : undefined;
+        const decoderConfig =
+          evidence?.representation?.description !== undefined &&
+          !tracksWithDecoderConfig.has(packet.trackIndex)
+            ? evidence.representation.description.slice()
+            : undefined;
+        if (decoderConfig !== undefined) tracksWithDecoderConfig.add(packet.trackIndex);
+        packets.push({
+          trackIndex: packet.trackIndex,
+          size: packet.size,
+          ptsUs: packet.ptsUs,
+          ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
+          ...(packet.durationUs !== undefined ? { durationUs: packet.durationUs } : {}),
+          keyframe: packet.keyframe,
+          ...(evidence !== undefined ? { trackType: evidence.trackType } : {}),
+          ...(evidence?.codec !== undefined
+            ? { codec: evidence.codec }
+            : track === undefined && metadata.tracks[packet.trackIndex]?.codec !== undefined
+              ? { codec: metadata.tracks[packet.trackIndex]!.codec }
+              : {}),
+          ...(payload !== undefined
+            // The bytes are the authoritative evidence. Do not also publish a digest derived from
+            // the same buffer: an independent oracle must distrust and re-hash that self-assertion.
+            ? { payload: payload.slice() }
+            : {}),
+          ...(evidence?.representation !== undefined
+            ? { framing: evidence.representation.framing }
+            : {}),
+          ...(evidence?.nalLengthSize !== undefined
+            ? { nalLengthSize: evidence.nalLengthSize }
+            : {}),
+          ...(decoderConfig !== undefined ? { decoderConfig } : {}),
+          randomAccessKind: packet.keyframe ? 'sync-sample' : 'non-sync-sample',
+        });
+      }
+    },
+    finish(): DemuxResult {
+      if (finished) throw new TypeError('aibrush demux result builder is already finished');
+      finished = true;
+      const representations = trackEvidence.flatMap((evidence, trackIndex) => {
+        const representation = evidence.representation;
+        if (representation === undefined) return [];
+        const packetOrdering: DemuxTrackRepresentation['packetOrdering'] =
+          tracksWithDts.has(trackIndex) ? 'decode' : 'presentation';
+        return representation.packetOrdering === packetOrdering
+          ? [representation]
+          : [{ ...representation, packetOrdering }];
+      });
+      const packetOrdering =
+        representations.length === 0
+          ? undefined
+          : representations.every((representation) => representation.packetOrdering === 'decode')
+            ? 'decode'
+            : representations.every(
+                  (representation) => representation.packetOrdering === 'presentation',
+                )
+              ? 'presentation'
+              : undefined;
+      return {
+        metadata: withObservedCadence(metadata, packets),
+        packets,
+        ...(packetOrdering !== undefined ? { packetOrdering } : {}),
+        representations,
+      };
+    },
+  };
+}
+
 /** Attach semantic packet evidence without inventing a decode timestamp when the framework omitted it. */
 export function buildAibrushDemuxResult(
   metadata: NormalizedMetadata,
   tracks: readonly AibrushObservedTrack[],
   rawPackets: readonly AibrushRawPacket[],
+  payloadForPacket?: AibrushPacketPayloadResolver,
 ): DemuxResult {
-  const packets: PacketInfo[] = rawPackets.map((packet) => {
-    const payload = packet.payload?.byteLength === packet.size ? packet.payload : undefined;
-    const track = tracks[packet.trackIndex];
-    const codec =
-      track?.nonMedia === true
-        ? undefined
-        : track === undefined
-          ? metadata.tracks[packet.trackIndex]?.codec
-          : canonicalAibrushCodec(track.codec ?? track.config?.codec ?? 'unknown');
-    const representation = track === undefined
-      ? undefined
-      : track.nonMedia === true
-        ? undefined
-        : representationForAibrushTrack(
-            track,
-            packet.trackIndex,
-            packet.dtsUs === undefined ? 'presentation' : 'decode',
-          );
-    return {
-      trackIndex: packet.trackIndex,
-      size: packet.size,
-      ptsUs: packet.ptsUs,
-      ...(packet.dtsUs !== undefined ? { dtsUs: packet.dtsUs } : {}),
-      ...(packet.durationUs !== undefined ? { durationUs: packet.durationUs } : {}),
-      keyframe: packet.keyframe,
-      ...(track !== undefined
-        ? { trackType: (track.nonMedia === true ? 'other' : track.mediaType) as TrackType }
-        : {}),
-      ...(codec !== undefined ? { codec } : {}),
-      ...(payload !== undefined
-        // The bytes are the authoritative evidence. Do not also publish a digest derived from the
-        // same buffer: an independent oracle must distrust and re-hash that self-assertion anyway.
-        // Semantic goldens hash `payload` when required; scalar goldens can skip a redundant
-        // full-source digest pass while retaining the exact coded bytes for downstream consumers.
-        ? { payload: payload.slice() }
-        : {}),
-      ...(representation !== undefined ? { framing: representation.framing } : {}),
-      ...(track !== undefined && nalLengthSize(track) !== undefined ? { nalLengthSize: nalLengthSize(track) } : {}),
-      ...(representation?.description !== undefined ? { decoderConfig: representation.description.slice() } : {}),
-      randomAccessKind: packet.keyframe ? 'sync-sample' : 'non-sync-sample',
-    };
-  });
-  const metadataWithCadence = withObservedCadence(metadata, packets);
-  const representations = tracks.flatMap((track, trackIndex) => {
-    if (track.nonMedia === true) return [];
-    const hasDts = packets.some((packet) => packet.trackIndex === trackIndex && packet.dtsUs !== undefined);
-    return [representationForAibrushTrack(track, trackIndex, hasDts ? 'decode' : 'presentation')];
-  });
-  const packetOrdering =
-    representations.length === 0
-      ? undefined
-      : representations.every((representation) => representation.packetOrdering === 'decode')
-        ? 'decode'
-        : representations.every(
-              (representation) => representation.packetOrdering === 'presentation',
-            )
-          ? 'presentation'
-          : undefined;
-  return {
-    metadata: metadataWithCadence,
-    packets,
-    ...(packetOrdering !== undefined ? { packetOrdering } : {}),
-    representations,
-  };
+  const builder = createAibrushDemuxResultBuilder(metadata, tracks);
+  builder.addPackets(rawPackets, payloadForPacket);
+  return builder.finish();
 }
 
 export function withObservedCadence(metadata: NormalizedMetadata, packets: readonly PacketInfo[]): NormalizedMetadata {
   const tracks = metadata.tracks.map((track, trackIndex): NormalizedTrack => {
     if (track.type !== 'video') return { ...track };
-    const videoPackets = packets.filter((packet) => packet.trackIndex === trackIndex);
-    if (videoPackets.length === 0) return { ...track };
-    const ordered = [...videoPackets].sort((a, b) => a.ptsUs - b.ptsUs);
+    const ordered = packets
+      .filter((packet) => packet.trackIndex === trackIndex)
+      .sort((a, b) => a.ptsUs - b.ptsUs);
+    if (ordered.length === 0) return { ...track };
     if (ordered.length === 1) {
       const durationUs = ordered[0]!.durationUs;
       if (durationUs === undefined || durationUs <= 0) return { ...track };
@@ -275,7 +332,9 @@ function copyBytes(source: BufferSource): Uint8Array {
 function nalLengthSize(track: AibrushObservedTrack): number | undefined {
   const description = track.config?.description;
   if (description === undefined) return undefined;
-  const bytes = copyBytes(description);
+  const bytes = ArrayBuffer.isView(description)
+    ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+    : new Uint8Array(description);
   const codec = canonicalAibrushCodec(track.codec ?? track.config?.codec ?? 'unknown');
   if (codec === 'h264' && bytes.byteLength > 4) return (bytes[4]! & 0x03) + 1;
   if (codec === 'hevc' && bytes.byteLength > 21) return (bytes[21]! & 0x03) + 1;

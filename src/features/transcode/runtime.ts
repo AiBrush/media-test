@@ -25,6 +25,7 @@ import {
 } from './metrics.ts';
 import {
   evaluateTranscodeTransform,
+  evaluateTranscodeTransformSourceSignal,
   type TranscodePixelFrame,
   type TransformSignalEvidence,
 } from './transforms.ts';
@@ -132,6 +133,7 @@ export type TranscodeRuntimeInvariantRequest =
       scenarioId: string;
       sourceFrames: readonly TranscodePixelFrame[];
       candidateFrames: readonly TranscodePixelFrame[];
+      sourceSignal?: TransformSignalEvidence;
       signal: TransformSignalEvidence;
     }>
   | Readonly<{
@@ -159,6 +161,11 @@ export function evaluateTranscodeRuntimeInvariant(
           `scenario '${request.scenarioId}' selected ${request.invariant} without a transform contract`,
         );
       }
+      const sourceDecision = evaluateTranscodeTransformSourceSignal(
+        request.sourceSignal ?? {},
+        contract,
+      );
+      if (sourceDecision !== undefined) return sourceDecision;
       return evaluateTranscodeTransform(
         request.sourceFrames,
         request.candidateFrames,

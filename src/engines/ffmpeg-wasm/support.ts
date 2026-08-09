@@ -605,19 +605,6 @@ export function decideFfmpegSupport(
   if (
     request.operation === 'transcode' &&
     outputVideo === 'h264' &&
-    numberValue(videoOptions.bitrate) === 2_000_000 &&
-    request.inputs.some((input) =>
-      input.id.toLowerCase().endsWith('scenarios/transcode/h264_bitrate_2mbps/03.mp4'))
-  ) {
-    return reject(
-      'FFMPEG_H264_2MBPS_QUALITY_BOUND',
-      'the exact portrait 1080x1920@60 variant measures 0.7848 SSIM at 2Mbps in the vendored FFmpeg 5.1 x264 path, below the suite\'s 0.93 floor while the neighboring variants pass',
-    );
-  }
-
-  if (
-    request.operation === 'transcode' &&
-    outputVideo === 'h264' &&
     options.fastStart === 'fragmented' &&
     request.inputs.some((input) => {
       const id = input.id.toLowerCase();

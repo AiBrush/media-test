@@ -2,11 +2,14 @@ import type {
   ApplicabilityOperation,
   ConcreteOperationRequest,
   MediaInput,
+  OperationConstraintEvidence,
 } from '../../core/engine.ts';
 import {
+  createOperationConstraintUnsatisfiedError,
   createNotApplicableError,
   isBrowserNotSupportedError,
   isNotApplicableError,
+  isOperationConstraintEvidence,
 } from '../../core/engine.ts';
 import { AIBRUSH_ENGINE_ID, aibrushTupleSummary } from './support.ts';
 
@@ -14,11 +17,21 @@ import { AIBRUSH_ENGINE_ID, aibrushTupleSummary } from './support.ts';
 export interface AibrushErrorClasses {
   CapabilityError: abstract new (...args: never[]) => Error & { readonly code: 'capability-miss'; readonly detail?: unknown };
   InputError: abstract new (...args: never[]) => Error & { readonly code: 'unsupported-input'; readonly detail?: unknown };
+  ConstraintUnsatisfiedError?: abstract new (...args: never[]) => Error & {
+    readonly code: 'constraint-unsatisfied';
+    readonly detail: unknown;
+  };
 }
 
 export type AibrushFrameworkClassification =
   | { kind: 'capability'; code: 'capability-miss'; reason: string }
   | { kind: 'input'; code: 'unsupported-input'; reason: string }
+  | {
+      kind: 'constraint';
+      code: 'constraint-unsatisfied';
+      reason: string;
+      evidence: OperationConstraintEvidence;
+    }
   | { kind: 'fault'; code?: string; reason: string };
 
 /**
@@ -40,6 +53,14 @@ export function classifyAibrushFrameworkError(
       ? { kind: 'input', code: 'unsupported-input', reason }
       : { kind: 'fault', code: value.code, reason };
   }
+  if (
+    classes?.ConstraintUnsatisfiedError !== undefined &&
+    value instanceof classes.ConstraintUnsatisfiedError
+  ) {
+    return value.code === 'constraint-unsatisfied' && isOperationConstraintEvidence(value.detail)
+      ? { kind: 'constraint', code: 'constraint-unsatisfied', reason, evidence: value.detail }
+      : { kind: 'fault', code: value.code, reason };
+  }
   const code = exactCode(value);
   return code === undefined ? { kind: 'fault', reason } : { kind: 'fault', code, reason };
 }
@@ -55,6 +76,15 @@ export function translateAibrushFrameworkError(
 ): never {
   if (isNotApplicableError(value) || isBrowserNotSupportedError(value)) throw value;
   const classified = classifyAibrushFrameworkError(value, classes);
+  if (classified.kind === 'constraint') {
+    if (operation !== 'transcode') throw value;
+    throw createOperationConstraintUnsatisfiedError(
+      AIBRUSH_ENGINE_ID,
+      classified.reason,
+      classified.evidence,
+      value,
+    );
+  }
   if (classified.kind === 'capability') {
     if (malformed(input)) throw malformedError(operation, classified.reason);
     throw createNotApplicableError(

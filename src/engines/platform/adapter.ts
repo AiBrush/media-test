@@ -77,7 +77,12 @@ import type {
 import { createNotApplicableError, DECODE_TRACK_SELECTOR_SCHEMA } from '../../core/engine.ts';
 import { registerEngine } from '../../core/registry.ts';
 import { decodeBytesToFrames, playbackSmoke } from './oracle-helpers.ts';
-import { decodeWithVideoElement, decodeWithWebCodecs, grabFrameAt } from './decode.ts';
+import {
+  decodeWithVideoElement,
+  decodeWithWebCodecs,
+  exactPresentationAnchorsForVideoElement,
+  grabFrameAt,
+} from './decode.ts';
 import type { DecodeInput } from './decode.ts';
 import {
   demuxMp4Tracks,
@@ -516,10 +521,19 @@ export class PlatformEngine implements MediaEngine {
           'HTMLVideoElement display-matrix presentation cannot select an alternate video track',
         );
       }
-      const fallbackOpts: DecodeOptions & { selectedTrack?: FrameSink['selectedTrack'] } = {};
+      const fallbackOpts: DecodeOptions & {
+        selectedTrack?: FrameSink['selectedTrack'];
+        sampleTimesSec?: readonly number[];
+        sampleTimestampsUs?: readonly number[];
+      } = {};
       if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
       if (opts?.onFirstFrame) fallbackOpts.onFirstFrame = opts.onFirstFrame;
       if (decodeInput?.selectedTrack) fallbackOpts.selectedTrack = decodeInput.selectedTrack;
+      const exactAnchors = exactPresentationAnchorsForVideoElement(opts);
+      if (exactAnchors !== undefined) {
+        fallbackOpts.sampleTimesSec = exactAnchors.map((anchor) => anchor.mediaTimeSec);
+        fallbackOpts.sampleTimestampsUs = exactAnchors.map((anchor) => anchor.ptsUs);
+      }
       return decodeWithVideoElement(blob, fallbackOpts);
     }
 
@@ -546,9 +560,17 @@ export class PlatformEngine implements MediaEngine {
         'HTMLVideoElement fallback cannot prove the requested normalized track identity',
       );
     }
-    const fallbackOpts: DecodeOptions = {};
+    const fallbackOpts: DecodeOptions & {
+      sampleTimesSec?: readonly number[];
+      sampleTimestampsUs?: readonly number[];
+    } = {};
     if (opts?.maxFrames !== undefined) fallbackOpts.maxFrames = opts.maxFrames;
     if (opts?.onFirstFrame) fallbackOpts.onFirstFrame = opts.onFirstFrame;
+    const exactAnchors = exactPresentationAnchorsForVideoElement(opts);
+    if (exactAnchors !== undefined) {
+      fallbackOpts.sampleTimesSec = exactAnchors.map((anchor) => anchor.mediaTimeSec);
+      fallbackOpts.sampleTimestampsUs = exactAnchors.map((anchor) => anchor.ptsUs);
+    }
     return decodeWithVideoElement(blob, fallbackOpts);
   }
 

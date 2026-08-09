@@ -9,6 +9,7 @@ import type { OracleOutcome, Scenario } from '../src/core/scenario.ts';
 import {
   emptyGoldenStore,
   matchFramesByPresentationTime,
+  remuxProgramsShareDecodePrefix,
   runOracle,
   validateOracleOutcome,
   type GoldenStore,
@@ -20,6 +21,12 @@ import { sha256Hex as sha256HexSync } from '../src/core/canonical-json.ts';
 import { sha256Hex as rawSha256Hex } from '../src/core/media-selection.ts';
 import { defineProbeMetadataFieldPolicy } from '../src/features/probe/index.ts';
 import { defineDemuxScaleContract } from '../src/features/demux/index.ts';
+import type { RemuxProgramEvidence } from '../src/features/remux/types.ts';
+import {
+  assessDisplaySpaceEvidence,
+  defineDisplayTransform,
+  displayEvidenceFromFrameDigests,
+} from '../src/features/decode-seek/index.ts';
 
 test('neutral MP4 structure duration does not truncate a complete media timeline behind a short mvhd', async () => {
   const bytes = new Uint8Array(await Bun.file('fixtures/media/cenc_ctr_clear.mp4').arrayBuffer());
@@ -123,6 +130,59 @@ function verdict(outcome: OracleOutcome): string {
 }
 
 describe('REQ-ORAC-09 executable remux invariants', () => {
+  test('decode-prefix equivalence accepts wrapper epoch rebasing but rejects semantic drift', () => {
+    const payloads = [
+      new Uint8Array([0, 0, 0, 1, 0x65]),
+      new Uint8Array([0, 0, 0, 1, 0x41, 1]),
+      new Uint8Array([0, 0, 0, 1, 0x41, 2]),
+      new Uint8Array([0, 0, 0, 1, 0x41, 3]),
+    ];
+    const program = (
+      container: string,
+      ptsUs: readonly number[],
+      changedPayloadIndex?: number,
+    ): RemuxProgramEvidence => ({
+      schema: 'media-test/remux-program@1',
+      container,
+      byteLength: 1_024,
+      tracks: [{
+        id: 'video-1',
+        type: 'video',
+        codec: 'h264',
+        codecPrivate: new Uint8Array([1, 100, 0, 31]),
+        samples: ptsUs.map((pts, index) => {
+          const payload = payloads[index];
+          if (payload === undefined) throw new Error(`missing payload ${index}`);
+          return {
+            payload: changedPayloadIndex === index
+              ? new Uint8Array([0, 0, 0, 1, 0x41, 0xff])
+              : payload.slice(),
+            ptsUs: pts,
+            dtsUs: index * 16_683,
+            durationUs: 16_683,
+            keyframe: index === 0,
+            framing: 'length-prefixed',
+          };
+        }),
+      }],
+      representation: {},
+    });
+    const source = program('mp4', [33_367, 66_733, 50_050, 116_783]);
+    const rebasedMatroska = program('mkv', [0, 33_000, 17_000, 83_000]);
+
+    expect(remuxProgramsShareDecodePrefix(source, rebasedMatroska, 4)).toBe(true);
+    expect(remuxProgramsShareDecodePrefix(
+      source,
+      program('mkv', [0, 33_000, 19_000, 83_000]),
+      4,
+    )).toBe(false);
+    expect(remuxProgramsShareDecodePrefix(
+      source,
+      program('mkv', [0, 33_000, 17_000, 83_000], 2),
+      4,
+    )).toBe(false);
+  });
+
   test('two-leg reference re-import expects the return container', async () => {
     const bytes = new Uint8Array(await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer());
     const remuxInput: MediaInput = {
@@ -327,6 +387,44 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
     expect(decodeCalls).toEqual([
       { container: 'mp4', sampling: 'prefix' },
       { container: 'mkv', sampling: 'prefix' },
+    ]);
+  });
+
+  test('ordinary decode-remux bypasses a cached cross-process frame reference', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
+    const remuxInput: MediaInput = {
+      id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    const store = golden({ container: 'mp4', durationSec: 1, tracks: [] });
+    store.frames = [{ index: 0, ptsUs: 0, sha256: 'cd'.repeat(32) }];
+    store.evidence.frames = {
+      state: 'OK', value: store.frames, url: 'frames.json', raw: store.frames,
+    };
+    const remuxScenario = scenario('remux', 'property-invariant', {
+      container: 'mp4',
+      invariant: 'decode(remux(x))==decode(x)',
+    });
+    remuxScenario.family = 'decode-seek';
+    const decodeCalls: Array<{ container: string; sampling?: 'prefix' | 'uniform' }> = [];
+    const outcome = await runOracle('property-invariant', context({
+      scenario: remuxScenario,
+      input: remuxInput,
+      output: { bytes: source.slice(), mime: 'video/mp4', container: 'mp4' },
+      golden: store,
+      decodeWithPlatform: async (media, options) => {
+        decodeCalls.push({ container: media.container, sampling: options?.sampling });
+        return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
+      },
+    }));
+
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodeCalls).toEqual([
+      { container: 'mp4', sampling: 'prefix' },
+      { container: 'mp4', sampling: 'prefix' },
     ]);
   });
 
@@ -630,6 +728,43 @@ describe('REQ-ORAC-01 semantic golden metadata', () => {
       golden: golden(want, packets),
     }));
     expect(verdict(wrong)).toBe('FAIL');
+  });
+
+  test('single attached-picture packet normalizes a carrier timebase to its effective program cadence', async () => {
+    const durationSec = 5.549;
+    const want: NormalizedMetadata = {
+      container: 'mkv',
+      durationSec,
+      tracks: [video('mjpeg', { fps: 90_000 })],
+    };
+    const packets: PacketInfo[] = [{
+      trackIndex: 0,
+      size: 30_915,
+      ptsUs: 0,
+      keyframe: true,
+    }];
+    const observed: NormalizedMetadata = {
+      container: 'mkv',
+      durationSec,
+      tracks: [video('mjpeg', {
+        fps: undefined,
+        fpsProvenance: {
+          source: 'observed',
+          cadence: 'CFR',
+          sampleCount: 1,
+          observedIntervalUs: durationSec * 1_000_000,
+          envelope: { minFps: 1 / durationSec, maxFps: 1 / durationSec },
+        },
+      })],
+    };
+
+    const outcome = await runOracle('golden-metadata', context({
+      metadata: observed,
+      golden: golden(want, packets),
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(outcome.reasonCode).toBe('ORACLE_REPRESENTATION_DIFF');
+    expect(outcome.detail).toContain('singleton packet cadence is authoritative');
   });
 
   test('legacy rational/timestamp cadence fields remain backward-compatible', async () => {
@@ -971,18 +1106,150 @@ describe('REQ-ORAC-04 typed reference decode applicability', () => {
     expect(prefixOutcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
   });
 
+  test('display SSIM replaces duration-spread reference sampling with the exact source prefix', async () => {
+    const contract = defineDisplayTransform({
+      codedWidth: 1_280,
+      codedHeight: 720,
+      displayWidth: 720,
+      displayHeight: 1_280,
+      rotationDegrees: 90,
+      flipX: false,
+      flipY: false,
+    });
+    const timestampsUs = Array.from({ length: 12 }, (_, index) => Math.round(index * 1_000_000 / 30));
+    const sourceFrames: FrameDigest[] = timestampsUs.map((ptsUs, index) => ({
+      index,
+      ptsUs,
+      sha256: index.toString(16).padStart(2, '0').repeat(32),
+      width: 720,
+      height: 1_280,
+    }));
+    const durationSpreadFrames = sourceFrames.map((frame, index) => ({
+      ...frame,
+      ptsUs: Math.round(index * 10_000_000 / sourceFrames.length),
+    }));
+    expect(assessDisplaySpaceEvidence(
+      displayEvidenceFromFrameDigests(sourceFrames),
+      displayEvidenceFromFrameDigests(durationSpreadFrames),
+      contract,
+    )).toMatchObject({
+      verdict: 'FAIL',
+      reasonCode: 'DISPLAY_TIMESTAMP_COVERAGE_MISMATCH',
+      measurements: {
+        candidateFrames: 12,
+        referenceFrames: 12,
+        matchedFrames: 1,
+        unmatchedCandidateFrames: 11,
+        unmatchedReferenceFrames: 11,
+      },
+    });
+
+    const store = golden({
+      container: 'mp4',
+      durationSec: 10,
+      tracks: [{
+        type: 'video',
+        codec: 'h264',
+        width: 1_280,
+        height: 720,
+        frameTimestampsUs: timestampsUs,
+      }],
+    });
+    store.frames = sourceFrames;
+    let requestedExactTimes: unknown;
+    const outcome = await runOracle('ssim-psnr', context({
+      scenario: scenario('decodeFrames', 'ssim-psnr', {
+        maxFrames: 30,
+        displayEvidence: contract,
+      }),
+      golden: store,
+      frames: { frames: sourceFrames },
+      decodeWithPlatform: async (_media, options) => {
+        requestedExactTimes = options?.exactPresentationTimes;
+        const requested = options?.exactPresentationTimes?.timestampsUs ?? durationSpreadFrames.map((frame) => frame.ptsUs);
+        return {
+          frames: requested.map((ptsUs, index) => ({ ...sourceFrames[index]!, ptsUs })),
+        };
+      },
+    }));
+
+    expect(requestedExactTimes).toEqual({ originUs: 0, timestampsUs });
+    expect(outcome).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      reasonCode: 'DISPLAY_SPACE_EVIDENCE_MATCH',
+      measurements: { candidateFrames: 12, referenceFrames: 12, matchedFrames: 12 },
+    });
+  });
+
+  test('display reference keeps a non-zero immutable-source PTS origin', async () => {
+    const originUs = 2_000_000;
+    const timestampsUs = Array.from({ length: 3 }, (_, index) => originUs + index * 40_000);
+    const frames: FrameDigest[] = timestampsUs.map((ptsUs, index) => ({
+      index,
+      ptsUs,
+      sha256: `${index + 1}`.repeat(64),
+      width: 2,
+      height: 3,
+    }));
+    const contract = defineDisplayTransform({
+      codedWidth: 3,
+      codedHeight: 2,
+      displayWidth: 2,
+      displayHeight: 3,
+      rotationDegrees: 90,
+      flipX: false,
+      flipY: false,
+    });
+    const store = golden({
+      container: 'mp4',
+      durationSec: 1,
+      tracks: [{ type: 'video', codec: 'h264', frameTimestampsUs: timestampsUs }],
+    });
+    store.frames = frames;
+    let requestedOriginUs: number | undefined;
+    const outcome = await runOracle('ssim-psnr', context({
+      scenario: scenario('decodeFrames', 'ssim-psnr', { maxFrames: 3, displayEvidence: contract }),
+      golden: store,
+      frames: { frames },
+      decodeWithPlatform: async (_media, options) => {
+        requestedOriginUs = options?.exactPresentationTimes?.originUs;
+        return { frames: frames.map((frame) => ({ ...frame })) };
+      },
+    }));
+
+    expect(requestedOriginUs).toBe(originUs);
+    expect(outcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+  });
+
   test('valid browser-unsupported output is NA_BROWSER; truncated supported output is FAIL', async () => {
     const valid = box('moov');
+    let unsupportedDecodeCall = 0;
     const unsupported = await runOracle('ssim-psnr', context({
       scenario: scenario('transcode', 'ssim-psnr', { video: { codec: 'hevc' } }),
       output: { bytes: valid, mime: 'video/mp4', container: 'mp4' },
-      decodeWithPlatform: async () => { throw { reasonCode: 'WEB_CODECS_CONFIG_UNSUPPORTED', supported: false }; },
+      decodeWithPlatform: async () => {
+        if (unsupportedDecodeCall++ === 0) {
+          return {
+            frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }],
+            getPixels: async () => { throw new Error('not reached'); },
+          };
+        }
+        throw { reasonCode: 'WEB_CODECS_CONFIG_UNSUPPORTED', supported: false };
+      },
     }));
     const truncatedBytes = Uint8Array.from([0, 0, 0, 20, 0x6d, 0x6f, 0x6f, 0x76]);
+    let truncatedDecodeCall = 0;
     const truncated = await runOracle('ssim-psnr', context({
       scenario: scenario('transcode', 'ssim-psnr'),
       output: { bytes: truncatedBytes, mime: 'video/mp4', container: 'mp4' },
       decodeWithPlatform: async () => {
+        if (truncatedDecodeCall++ === 0) {
+          return {
+            frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }],
+            getPixels: async () => { throw new Error('not reached'); },
+          };
+        }
         throw { reasonCode: 'REFERENCE_DECODE_INVALID_BITSTREAM', configSupport: 'SUPPORTED', invalidBitstream: true };
       },
     }));
