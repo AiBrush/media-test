@@ -225,7 +225,8 @@ const DECODE_CASES: DecodeCase[] = [
     maxFrames: 30,
     sizeBucket: 'small',
     notes:
-      'Does the decoder apply the display matrix to OUTPUT PIXELS (content rotated 90°, dims swapped) ' +
+      'Does the decoder apply the display matrix to OUTPUT PIXELS (content rotated 270° clockwise, ' +
+      'dims swapped) ' +
       'rather than merely swapping width/height in metadata? Golden frames are the rotated, displayed ' +
       'pixels. This is the decode-side counterpart to the rotation remux edge in robustness.',
   },
@@ -355,7 +356,7 @@ const decodeScenarios: Scenario[] = DECODE_CASES.map((c) => {
               codedHeight: 720,
               displayWidth: 720,
               displayHeight: 1280,
-              rotationDegrees: 90,
+              rotationDegrees: 270,
               flipX: false,
               flipY: false,
             }),

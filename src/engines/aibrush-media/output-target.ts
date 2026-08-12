@@ -19,6 +19,9 @@ export interface AibrushStreamingRuntimeEvidence {
   readonly observerPolicy: string;
   readonly retainedOutputPolicy: string;
   readonly measurementContract: 'media-test/streaming-output-measurement@1';
+  readonly observedPacketCount?: number;
+  readonly reserveCompletion?: 'COMPLETED' | 'OVERFLOW_REJECTED' | 'FAILED';
+  readonly reserveOverflowReasonCode?: string;
 }
 
 export interface AibrushSinkTraceRecorderOptions {
@@ -41,12 +44,16 @@ export class AibrushSinkTraceRecorder {
   readonly #events: SinkTraceEvent[] = [];
   #lastAtMs = -Infinity;
   #acceptedEnd = 0;
+  #maximumEnd = 0;
+  #ranges: Array<{ start: number; end: number }> = [];
   #nativeWriteBytes = 0;
   #writeCount = 0;
   #maximumQueuedBytes = 0;
   #lastWriteAtMs: number | undefined;
   #hashHigh = FNV1A64_OFFSET_HIGH;
   #hashLow = FNV1A64_OFFSET_LOW;
+  #hashEnd = 0;
+  #incrementalHashValid = true;
   #prefix = new Uint8Array(0);
   #tail = new Uint8Array(0);
   #finalizeStarted = false;
@@ -92,24 +99,54 @@ export class AibrushSinkTraceRecorder {
     return this.#lastWriteAtMs;
   }
 
-  /** Observe one real non-empty native output write. Positions must stay append-only for supported modes. */
+  /** Bytes retained solely for independent prefix/tail validation (overlap counted once). */
+  get validationRetainedBytes(): number {
+    return this.#prefix.byteLength + this.#tail.byteLength;
+  }
+
+  /** Record a forward sparse region which a reserved-fast-start producer will patch before completion. */
+  reserve(position: number, length: number, maximumPacketCount: number): void {
+    if (!Number.isSafeInteger(position) || position < 0) throw new RangeError('aibrush reservation position is invalid');
+    if (!Number.isSafeInteger(length) || length < 1) throw new RangeError('aibrush reservation length is invalid');
+    if (!Number.isSafeInteger(maximumPacketCount) || maximumPacketCount < 1) {
+      throw new RangeError('aibrush reservation packet bound is invalid');
+    }
+    if (this.#finalizeStarted) throw new Error('aibrush sink reserved bytes after finalization began');
+    if (!this.enabled) return;
+    this.#events.push({
+      type: 'reservation',
+      sequence: this.#events.length,
+      atMs: this.#readNow(),
+      position,
+      length,
+      maximumPacketCount,
+    });
+  }
+
+  /** Observe one real non-empty native output write, including positioned patches and forward jumps. */
   write(chunk: Uint8Array, position: number): void {
     if (!(chunk instanceof Uint8Array)) throw new TypeError('aibrush sink write must be a Uint8Array');
     if (!Number.isSafeInteger(position) || position < 0) throw new RangeError('aibrush sink position is invalid');
-    if (position !== this.#acceptedEnd) {
-      throw new AibrushPositionedWriteUnsupportedError(position, this.#acceptedEnd);
-    }
     if (chunk.byteLength === 0) return;
     if (this.#finalizeStarted) throw new Error('aibrush sink wrote after finalization began');
+    const end = position + chunk.byteLength;
+    if (!Number.isSafeInteger(end)) throw new RangeError('aibrush sink write extent is invalid');
 
-    this.#acceptedEnd += chunk.byteLength;
+    this.#ranges = coalesceRanges([...this.#ranges, { start: position, end }]);
+    this.#acceptedEnd = coveredByteLength(this.#ranges);
+    this.#maximumEnd = Math.max(this.#maximumEnd, end);
     this.#nativeWriteBytes += chunk.byteLength;
     this.#writeCount++;
     // The callback itself is synchronous. One native chunk is being accepted at this event; there is no
     // adapter-side asynchronous queue or unawaited write promise.
     this.#maximumQueuedBytes = Math.max(this.#maximumQueuedBytes, chunk.byteLength);
     if (!this.enabled) return;
-    this.#consume(chunk);
+    if (this.#incrementalHashValid && position === this.#hashEnd) {
+      this.#consume(chunk);
+      this.#hashEnd = end;
+    } else {
+      this.#incrementalHashValid = false;
+    }
     const atMs = this.#readNow();
     this.#lastWriteAtMs = atMs;
     this.#events.push({
@@ -137,11 +174,32 @@ export class AibrushSinkTraceRecorder {
    * Close the trace after bytes are externally observable. `retainedOutputBytes` is the actual/peak
    * full-output retention of the surrounding adapter, not merely this observer's bounded windows.
    */
-  complete(target: 'buffer' | 'stream', retainedOutputBytes: number): SinkTrace | undefined {
+  complete(
+    target: 'buffer' | 'stream',
+    retainedOutputBytes: number,
+    finalBytes?: Uint8Array,
+  ): SinkTrace | undefined {
     if (!this.enabled) return undefined;
     if (!this.#finalizeStarted) this.beginFinalize();
     if (this.#finalized) throw new Error('aibrush sink trace already finalized');
     this.#finalized = true;
+    if (finalBytes !== undefined && finalBytes.byteLength !== this.#maximumEnd) {
+      throw new Error(
+        `aibrush finalized bytes have length ${finalBytes.byteLength}, expected positioned extent ${this.#maximumEnd}`,
+      );
+    }
+    if (finalBytes === undefined && !this.#incrementalHashValid) {
+      throw new Error('aibrush positioned sink trace completion requires finalized bytes');
+    }
+    const rollingHash = finalBytes === undefined
+      ? this.#hashHigh.toString(16).padStart(8, '0') + this.#hashLow.toString(16).padStart(8, '0')
+      : fnv1a64Hex(finalBytes);
+    const validationPrefix = finalBytes === undefined
+      ? this.#prefix.slice()
+      : finalBytes.slice(0, this.#prefixLimit);
+    const validationTail = finalBytes === undefined
+      ? this.#tail.slice()
+      : finalBytes.slice(Math.max(0, finalBytes.byteLength - this.#tailLimit));
     const atMs = this.#readNow();
     if (target === 'buffer') {
       this.#events.push({
@@ -162,12 +220,10 @@ export class AibrushSinkTraceRecorder {
       maximumOutstandingWritePromises: this.#writeCount > 0 ? 1 : 0,
       maximumQueuedBytes: this.#maximumQueuedBytes,
       retainedOutputBytes: nonNegativeInteger(retainedOutputBytes, 'retainedOutputBytes'),
-      rollingHash:
-        this.#hashHigh.toString(16).padStart(8, '0') +
-        this.#hashLow.toString(16).padStart(8, '0'),
+      rollingHash,
       rollingHashAlgorithm: 'fnv1a64' as const,
-      validationPrefix: this.#prefix.slice(),
-      validationTail: this.#tail.slice(),
+      validationPrefix,
+      validationTail,
     });
   }
 
@@ -202,29 +258,29 @@ export class AibrushSinkTraceRecorder {
   }
 }
 
-/** Typed local signal for a framework mode that unexpectedly needs positioned/patch writes. */
-export class AibrushPositionedWriteUnsupportedError extends Error {
-  readonly position: number;
-  readonly expectedPosition: number;
-
-  constructor(position: number, expectedPosition: number) {
-    super(`aibrush stream target write at position ${position}, expected ${expectedPosition} (append-only)`);
-    this.name = 'AibrushPositionedWriteUnsupportedError';
-    this.position = position;
-    this.expectedPosition = expectedPosition;
-  }
+export interface AibrushCallbackAccumulatorOptions extends AibrushSinkTraceRecorderOptions {
+  /** Per-track bound attached to the single inferred forward reservation in reserved fast-start mode. */
+  readonly maximumPacketCount?: number;
 }
 
-/** Contiguous callback target plus honest accounting for the later full-output concatenation. */
+/** Positioned callback target plus honest accounting for retained writes and final materialization. */
 export class AibrushCallbackAccumulator {
-  readonly #chunks: Uint8Array[] = [];
+  readonly #writes: Array<{ readonly bytes: Uint8Array; readonly position: number }> = [];
   readonly #recorder: AibrushSinkTraceRecorder;
-  #bytesWritten = 0;
+  readonly #maximumPacketCount: number | undefined;
+  #extent = 0;
+  #retainedWriteBytes = 0;
+  #reservationRecorded = false;
   #callbackWriteCount = 0;
   #peakRetainedBytes = 0;
 
-  constructor(options: AibrushSinkTraceRecorderOptions = {}) {
+  constructor(options: AibrushCallbackAccumulatorOptions = {}) {
+    if (options.maximumPacketCount !== undefined &&
+        (!Number.isSafeInteger(options.maximumPacketCount) || options.maximumPacketCount < 1)) {
+      throw new RangeError('maximumPacketCount must be a positive safe integer');
+    }
     this.#recorder = new AibrushSinkTraceRecorder(options);
+    this.#maximumPacketCount = options.maximumPacketCount;
   }
 
   get recorder(): AibrushSinkTraceRecorder {
@@ -232,38 +288,73 @@ export class AibrushCallbackAccumulator {
   }
 
   write(chunk: Uint8Array, position: number): void {
-    if (position !== this.#bytesWritten) {
-      throw new AibrushPositionedWriteUnsupportedError(position, this.#bytesWritten);
+    if (
+      this.#maximumPacketCount !== undefined &&
+      !this.#reservationRecorded &&
+      position > this.#extent
+    ) {
+      this.#recorder.reserve(this.#extent, position - this.#extent, this.#maximumPacketCount);
+      this.#reservationRecorded = true;
     }
     this.#recorder.write(chunk, position);
     if (chunk.byteLength === 0) return;
     const owned = chunk.slice();
-    this.#chunks.push(owned);
-    this.#bytesWritten += owned.byteLength;
+    const end = position + owned.byteLength;
+    this.#writes.push({ bytes: owned, position });
+    this.#extent = Math.max(this.#extent, end);
+    this.#retainedWriteBytes += owned.byteLength;
     this.#callbackWriteCount++;
-    this.#peakRetainedBytes = Math.max(this.#peakRetainedBytes, this.#bytesWritten);
+    this.#peakRetainedBytes = Math.max(this.#peakRetainedBytes, this.#retainedWriteBytes);
   }
 
   materialize(): Uint8Array {
-    const output = new Uint8Array(this.#bytesWritten);
-    // During concatenation both every callback-owned chunk and the full output allocation coexist.
-    this.#peakRetainedBytes = Math.max(this.#peakRetainedBytes, this.#bytesWritten + output.byteLength);
-    let offset = 0;
-    for (const chunk of this.#chunks) {
-      output.set(chunk, offset);
-      offset += chunk.byteLength;
+    const output = new Uint8Array(this.#extent);
+    // During reconstruction every callback-owned write and the final positioned extent coexist.
+    this.#peakRetainedBytes = Math.max(
+      this.#peakRetainedBytes,
+      this.#retainedWriteBytes + output.byteLength,
+    );
+    for (const write of this.#writes) {
+      output.set(write.bytes, write.position);
     }
-    this.#chunks.length = 0;
+    this.#writes.length = 0;
+    this.#retainedWriteBytes = 0;
     return output;
   }
 
   get evidence(): AibrushCallbackRetentionEvidence {
     return {
       callbackWriteCount: this.#callbackWriteCount,
-      bytesWritten: this.#bytesWritten,
+      bytesWritten: this.#extent,
       peakRetainedBytes: this.#peakRetainedBytes,
     };
   }
+}
+
+function coalesceRanges(
+  ranges: readonly { readonly start: number; readonly end: number }[],
+): Array<{ start: number; end: number }> {
+  const sorted = [...ranges].sort((left, right) => left.start - right.start || left.end - right.end);
+  const output: Array<{ start: number; end: number }> = [];
+  for (const range of sorted) {
+    const prior = output[output.length - 1];
+    if (prior !== undefined && range.start <= prior.end) prior.end = Math.max(prior.end, range.end);
+    else output.push({ start: range.start, end: range.end });
+  }
+  return output;
+}
+
+function coveredByteLength(ranges: readonly { readonly start: number; readonly end: number }[]): number {
+  return ranges.reduce((total, range) => total + range.end - range.start, 0);
+}
+
+function fnv1a64Hex(bytes: Uint8Array): string {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash.toString(16).padStart(16, '0');
 }
 
 function monotonicNow(): number {

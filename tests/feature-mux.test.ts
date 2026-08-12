@@ -43,6 +43,7 @@ import {
   readMuxOrientation,
   readNeutralMuxSource,
   readNeutralMuxTarget,
+  selectedMuxPresentationEndUs,
   validateMuxWriteTrace,
   type MuxCandidateTrackEvidence,
   type MuxDecision,
@@ -180,6 +181,22 @@ describe('REQ-FEAT-13 shared selector grammar and semantic multi-source identity
       expect(Array.isArray(selectors), scenario.id).toBe(true);
       for (const selector of selectors as string[]) expect(selector, scenario.id).toMatch(/^(video|audio):\d+@\d+$/);
     }
+  });
+
+  test('selected duration follows the selected track instead of a later unselected track', () => {
+    const source = readNeutralMuxSource(
+      bytesAt('fixtures/media/scenarios/mux/vorbis_to_ogg/02.webm'),
+      'webm',
+    );
+    expect(source.state).toBe('OK');
+    if (source.state !== 'OK') return;
+
+    const audioEndUs = selectedMuxPresentationEndUs([source.value], ['audio:0']);
+    const videoEndUs = selectedMuxPresentationEndUs([source.value], ['video:0']);
+    expect(audioEndUs).toBe(2_243_664_849_000);
+    expect((videoEndUs ?? 0) - (audioEndUs ?? 0)).toBeGreaterThan(150_000);
+    expect(() => selectedMuxPresentationEndUs([source.value], ['audio:0@1'])).toThrow(/missing source/);
+    expect(() => selectedMuxPresentationEndUs([source.value], ['audio:0', 'audio:0'])).toThrow(/duplicates/);
   });
 });
 
@@ -537,6 +554,17 @@ describe('REQ-FEAT-16 decisive neutral readers for every advertised mux target',
 });
 
 describe('REQ-FEAT-17 generic fragmented MP4 is not mislabeled CMAF', () => {
+  test('reserved fast-start carries its authored packet bound through mux scenario options', () => {
+    expect(muxOutputModeScenarios.find(
+      (scenario) => scenario.id === 'mux/mp4_faststart_reserve',
+    )?.options).toMatchObject({
+      container: 'mp4',
+      fastStart: 'reserve',
+      maximumPacketCount: 4_096,
+      target: 'stream',
+    });
+  });
+
   test('scenario/contract use a generic profile and a non-CMAF-branded fMP4 is never CMAF PASS', () => {
     expect(muxOutputModeScenarios.some((scenario) => scenario.id === 'mux/mp4_fragmented')).toBe(true);
     expect(muxOutputModeScenarios.some((scenario) => scenario.id.includes('cmaf'))).toBe(false);
@@ -710,7 +738,7 @@ describe('REQ-FEAT-19 rotation structure plus presentation under an explicit pol
       state: 'OK',
       value: {
         codedWidth: 1_280, codedHeight: 720, displayWidth: 720, displayHeight: 1_280,
-        rotationDegrees: 90, representation: 'isobmff-track-matrix',
+        rotationDegrees: 270, representation: 'isobmff-track-matrix',
       },
     });
     const policy = defineMuxRotationPolicy('preserve-or-bake');
@@ -735,13 +763,16 @@ describe('REQ-FEAT-19 rotation structure plus presentation under an explicit pol
 
   test('reads Matroska ProjectionPoseRoll and surfaces representation translation as a representation difference', () => {
     const source = readMuxOrientation(bytesAt('fixtures/media/h264_rotated90.mp4'), 'mp4');
-    const matroska = readMuxOrientation(orientedMatroska(), 'mkv');
+    const matroska = readMuxOrientation(orientedMatroska(90), 'mkv');
     expect(matroska).toMatchObject({
-      state: 'OK', value: { codedWidth: 1_280, codedHeight: 720, rotationDegrees: 90,
+      state: 'OK', value: { codedWidth: 1_280, codedHeight: 720, rotationDegrees: 270,
         representation: 'matroska-projection-roll' },
     });
     expect(assessMuxRotation(source, matroska, displayedFrames, displayedFrames)).toMatchObject({
       verdict: 'PASS', reasonCode: 'MUX_ROTATION_METADATA_REPRESENTATION_CHANGED',
+    });
+    expect(readMuxOrientation(orientedMatroska(-90), 'mkv')).toMatchObject({
+      state: 'OK', value: { rotationDegrees: 90, representation: 'matroska-projection-roll' },
     });
   });
 
@@ -817,12 +848,12 @@ function orientation(
   };
 }
 
-function orientedMatroska(): Uint8Array {
+function orientedMatroska(counterClockwiseRoll: number): Uint8Array {
   const uint = (value: number): Uint8Array => value > 0xff
     ? new Uint8Array([value >> 8, value & 0xff])
     : new Uint8Array([value]);
   const float = new Uint8Array(4);
-  new DataView(float.buffer).setFloat32(0, 90, false);
+  new DataView(float.buffer).setFloat32(0, counterClockwiseRoll, false);
   const video = ebml([0xe0], concatBytes(
     ebml([0xb0], uint(1_280)),
     ebml([0xba], uint(720)),

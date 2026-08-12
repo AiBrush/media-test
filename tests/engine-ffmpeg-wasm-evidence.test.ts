@@ -69,6 +69,7 @@ describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
           time_base: '1/90000',
           extradata: '00000000: 0164 001f ffe1 0019',
           tags: { language: 'eng' },
+          side_data_list: [{ side_data_type: 'Display Matrix', rotation: 90 }],
         },
         {
           index: 5,
@@ -91,6 +92,7 @@ describe('REQ-ENG-14/17: structured probe and representation evidence', () => {
     expect((parsed.metadata as unknown as Record<string, unknown>).presentationStartSec).toBe(-0.021333);
     expect(parsed.metadata.tracks[0]).toMatchObject({
       codec: 'h264', nativeCodecTag: 'avc1', fps: 30000 / 1001,
+      rotation: 270,
       fpsProvenance: {
         source: 'average', cadence: 'UNKNOWN', sampleCount: 300, observedIntervalUs: 10_010_000,
         rational: { numerator: 30000, denominator: 1001 },
@@ -398,7 +400,7 @@ describe('REQ-ENG-13/18: exact runtime-build parsers', () => {
     expect(parseTracksFromLog(log)).toEqual([
       {
         type: 'video', codec: 'h264', bitrate: null, language: null,
-        width: 640, height: 480, fps: 29.97, rotation: 90,
+        width: 640, height: 480, fps: 29.97, rotation: 270,
       },
       {
         type: 'audio', codec: 'pcm-s16', bitrate: 1_536_000, language: null,

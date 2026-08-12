@@ -75,14 +75,14 @@ describe('REQ-ENG-35: cell cancellation and exactly-once ownership', () => {
 });
 
 describe('REQ-ENG-36: factual route, write, retention, and provenance evidence', () => {
-  test('callback count matches callbacks and peak retention includes final concatenation', () => {
+  test('callback count and retention include sparse positioned reconstruction', () => {
     const target = new AibrushCallbackAccumulator();
     target.write(new Uint8Array([1, 2]), 0);
     target.write(new Uint8Array([3]), 2);
+    target.write(new Uint8Array([4]), 5);
     const bytes = target.materialize();
-    expect(bytes).toEqual(new Uint8Array([1, 2, 3]));
-    expect(target.evidence).toEqual({ callbackWriteCount: 2, bytesWritten: 3, peakRetainedBytes: 6 });
-    expect(() => target.write(new Uint8Array([4]), 99)).toThrow('expected 3');
+    expect(bytes).toEqual(new Uint8Array([1, 2, 3, 0, 0, 4]));
+    expect(target.evidence).toEqual({ callbackWriteCount: 3, bytesWritten: 6, peakRetainedBytes: 10 });
   });
 
   test('two public routes produce distinct immutable config evidence and buffer writes stay zero', () => {

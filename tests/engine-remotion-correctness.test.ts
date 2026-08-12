@@ -963,9 +963,15 @@ describe('probe container-evidence normalization', () => {
       await Bun.file('fixtures/media/scenarios/probe/h264_vfr/01.mp4').arrayBuffer(),
     );
     expect([...isoTrackHeaderEvidence(languageBytes)]).toMatchObject([
-      [1, { language: 'eng' }],
-      [2, { language: 'eng' }],
+      [1, { language: 'eng', defaultDisposition: true }],
+      [2, { language: 'eng', defaultDisposition: true }],
     ]);
+
+    const alternateBytes = new Uint8Array(
+      await Bun.file('fixtures/media/h264_multitrack.mp4').arrayBuffer(),
+    );
+    expect([...isoTrackHeaderEvidence(alternateBytes)].map(([, track]) => track.defaultDisposition))
+      .toEqual([true, true, false]);
 
     const fragmentedBytes = new Uint8Array(
       await Bun.file('fixtures/media/fragmented_cmaf.mp4').arrayBuffer(),
@@ -994,7 +1000,7 @@ describe('probe container-evidence normalization', () => {
       codec: 'vp9',
       width: 426,
       height: 240,
-      rotation: 90,
+      rotation: 270,
     });
 
     expect(normalizeRemotionParserTrack({

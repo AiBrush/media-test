@@ -8,6 +8,18 @@ import {
 } from '../src/core/engine.ts';
 import {
   AibrushMediaEngine,
+  aibrushConcatBoundaryEditSamples,
+  aibrushConcatBoundaryPacketsMatch,
+  aibrushConcatBoundarySamplesAreComplementary,
+  aibrushConcatCanCollapseBoundary,
+  aibrushConcatHasIsoAudioEditMetadata,
+  aibrushConcatIsIsoAacEditBoundary,
+  aibrushConcatMp4EditGaplessWindows,
+  aibrushConcatPresentationOffsetUs,
+  aibrushConcatSegmentPresentationDurationUs,
+  aibrushConcatTrackDecodeOffsetUs,
+  aibrushConcatTrackPresentationDurationUs,
+  aibrushConcatTracksCompatible,
   aibrushMuxRepresentationFields,
   createAibrushCountingSource,
   enrichAibrushProbeMetadata,
@@ -25,6 +37,312 @@ import {
 } from '../src/engines/aibrush-media/representation.ts';
 
 describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () => {
+  test('restores only a clamped leading AAC preroll packet at a concat seam', () => {
+    const common = {
+      timestampUs: 0,
+      durationUs: 21_333,
+      globalOffsetUs: 2_000_000,
+      priorPresentationEndUs: 1_990_000,
+      eligibleAacEditBoundary: true,
+    };
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        ...common,
+        mediaType: 'audio',
+        firstPacket: true,
+        eligibleAacEditBoundary: false,
+      }),
+    ).toBe(2_000_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        ...common,
+        mediaType: 'audio',
+        firstPacket: true,
+      }),
+    ).toBe(1_990_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        ...common,
+        mediaType: 'audio',
+        firstPacket: false,
+      }),
+    ).toBe(2_000_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        ...common,
+        mediaType: 'video',
+        firstPacket: true,
+      }),
+    ).toBe(2_000_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        ...common,
+        durationUs: 10_000,
+        mediaType: 'audio',
+        firstPacket: true,
+      }),
+    ).toBe(2_000_000);
+  });
+
+  test('separates a segment presentation boundary from each track decode tail', () => {
+    const nextPresentationOffsetUs = aibrushConcatSegmentPresentationDurationUs({
+      probedDurationUs: 3_008_000,
+      packetPresentationEndUs: 3_000_000,
+      packetCount: 231,
+    });
+    const audioDecodeOffsetUs = aibrushConcatTrackDecodeOffsetUs({
+      globalPresentationOffsetUs: nextPresentationOffsetUs,
+      priorDecodeEndUs: 3_008_000,
+      firstDecodeTimestampUs: 0,
+    });
+
+    expect(nextPresentationOffsetUs).toBe(3_000_000);
+    expect(audioDecodeOffsetUs).toBe(3_008_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        mediaType: 'audio',
+        timestampUs: 0,
+        durationUs: 21_333,
+        globalOffsetUs: nextPresentationOffsetUs,
+        priorPresentationEndUs: 2_992_000,
+        firstPacket: true,
+        eligibleAacEditBoundary: true,
+      }),
+    ).toBe(2_992_000);
+    expect(
+      aibrushConcatPresentationOffsetUs({
+        mediaType: 'audio',
+        timestampUs: 13_333,
+        durationUs: 21_333,
+        globalOffsetUs: nextPresentationOffsetUs,
+        priorPresentationEndUs: 2_992_000,
+        firstPacket: false,
+        eligibleAacEditBoundary: true,
+      }),
+    ).toBe(3_000_000);
+  });
+
+  test('keeps returning-track DTS contiguous and uses probe duration only for packetless segments', () => {
+    expect(
+      aibrushConcatTrackDecodeOffsetUs({
+        globalPresentationOffsetUs: 3_000_000,
+        priorDecodeEndUs: 1_008_000,
+        firstDecodeTimestampUs: 0,
+      }),
+    ).toBe(1_008_000);
+    expect(
+      aibrushConcatTrackDecodeOffsetUs({
+        globalPresentationOffsetUs: 3_000_000,
+        priorDecodeEndUs: undefined,
+        firstDecodeTimestampUs: 0,
+      }),
+    ).toBe(3_000_000);
+    expect(
+      aibrushConcatSegmentPresentationDurationUs({
+        probedDurationUs: 2_000_000,
+        packetPresentationEndUs: 0,
+        packetCount: 0,
+      }),
+    ).toBe(2_000_000);
+    expect(
+      aibrushConcatSegmentPresentationDurationUs({
+        probedDurationUs: 2_000_000,
+        packetPresentationEndUs: 1_750_000,
+        packetCount: 1,
+      }),
+    ).toBe(1_750_000);
+  });
+
+  test('deduplicates only an exact same-track terminal packet at the mapped edit boundary', () => {
+    const payload = new Uint8Array([0x21, 0x10, 0x56, 0xe5]);
+    const prior = {
+      payload,
+      presentationTimestampUs: 2_992_000,
+      durationUs: 21_333,
+      type: 'key',
+    };
+    const mappedRightFirstUs =
+      -8_000 +
+      aibrushConcatPresentationOffsetUs({
+        mediaType: 'audio',
+        timestampUs: -8_000,
+        durationUs: 21_333,
+        globalOffsetUs: 3_000_000,
+        priorPresentationEndUs: 3_000_000,
+        firstPacket: true,
+        eligibleAacEditBoundary: true,
+      });
+
+    expect(mappedRightFirstUs).toBe(2_992_000);
+    expect(
+      aibrushConcatBoundaryPacketsMatch({
+        prior,
+        current: { ...prior, payload: payload.slice() },
+      }),
+    ).toBe(true);
+    expect(
+      aibrushConcatBoundaryPacketsMatch({
+        prior,
+        current: { ...prior, payload: new Uint8Array([0x21, 0x10, 0x56, 0xe4]) },
+      }),
+    ).toBe(false);
+    expect(
+      aibrushConcatBoundaryPacketsMatch({
+        prior,
+        current: { ...prior, presentationTimestampUs: 3_013_333 },
+      }),
+    ).toBe(false);
+  });
+
+  test('composes adjacent MP4 edit windows while using their program span for the shared clock', () => {
+    expect(
+      aibrushConcatMp4EditGaplessWindows({
+        prior: {
+          basis: 'mp4-edit-list',
+          leadingSamples: 768,
+          trailingSamples: 640,
+          totalSamples: 144_000,
+        },
+        current: {
+          basis: 'mp4-edit-list',
+          leadingSamples: 384,
+          trailingSamples: 128,
+          totalSamples: 192_000,
+        },
+      }),
+    ).toEqual({
+      basis: 'mp4-edit-list',
+      leadingSamples: 768,
+      trailingSamples: 128,
+      totalSamples: 336_000,
+    });
+    expect(
+      aibrushConcatTrackPresentationDurationUs({
+        mediaType: 'audio',
+        packetPresentationEndUs: 3_013_333,
+        sampleRate: 48_000,
+        gaplessTotalSamples: 144_000,
+      }),
+    ).toBe(3_000_000);
+    expect(
+      aibrushConcatMp4EditGaplessWindows({
+        prior: { basis: 'mp4-edit-list', totalSamples: 144_000 },
+        current: { basis: 'ogg-opus-granule', totalSamples: 192_000 },
+      }),
+    ).toBeUndefined();
+  });
+
+  test('requires compatible consecutive ISO AAC edit evidence before collapsing a boundary AU', () => {
+    const description = new Uint8Array([0x12, 0x10]);
+    const priorTrack = {
+      id: 1,
+      mediaType: 'audio' as const,
+      codec: 'mp4a.40.2',
+      config: {
+        codec: 'mp4a.40.2',
+        sampleRate: 48_000,
+        numberOfChannels: 2,
+        description,
+      },
+      gapless: {
+        basis: 'mp4-edit-list' as const,
+        leadingSamples: 768,
+        trailingSamples: 640,
+        totalSamples: 144_000,
+      },
+    };
+    const currentTrack = {
+      ...priorTrack,
+      gapless: {
+        basis: 'mp4-edit-list' as const,
+        leadingSamples: 384,
+        trailingSamples: 128,
+        totalSamples: 192_000,
+      },
+    };
+    const eligibility = {
+      target: 'mp4',
+      consecutive: true,
+      prior: priorTrack,
+      current: currentTrack,
+    };
+    expect(aibrushConcatTracksCompatible(priorTrack, currentTrack)).toBe(true);
+    expect(aibrushConcatIsIsoAacEditBoundary(eligibility)).toBe(true);
+    expect(
+      aibrushConcatBoundaryEditSamples({
+        prior: priorTrack.gapless,
+        current: currentTrack.gapless,
+      }),
+    ).toBe(1024);
+    expect(
+      aibrushConcatBoundarySamplesAreComplementary({
+        prior: priorTrack.gapless,
+        current: currentTrack.gapless,
+        sampleRate: 48_000,
+        packetDurationUs: 21_333,
+      }),
+    ).toBe(true);
+
+    const packet = {
+      payload: new Uint8Array([0x21, 0x10, 0x56, 0xe5]),
+      presentationTimestampUs: 2_992_000,
+      durationUs: 21_333,
+      type: 'key',
+    };
+    const collapse = (eligibleIsoAacEditBoundary: boolean): boolean =>
+      aibrushConcatCanCollapseBoundary({
+        eligibleIsoAacEditBoundary,
+        priorGapless: priorTrack.gapless,
+        currentGapless: currentTrack.gapless,
+        sampleRate: 48_000,
+        prior: packet,
+        current: { ...packet, payload: packet.payload.slice() },
+      });
+    expect(collapse(true)).toBe(true);
+
+    const opusTrack = {
+      ...currentTrack,
+      codec: 'opus',
+      config: { ...currentTrack.config, codec: 'opus' },
+    };
+    expect(aibrushConcatIsIsoAacEditBoundary({ ...eligibility, current: opusTrack })).toBe(false);
+    expect(
+      aibrushConcatHasIsoAudioEditMetadata({
+        target: 'mp4',
+        prior: opusTrack,
+        current: opusTrack,
+      }),
+    ).toBe(true);
+    expect(aibrushConcatIsIsoAacEditBoundary({ ...eligibility, consecutive: false })).toBe(false);
+    expect(aibrushConcatIsIsoAacEditBoundary({ ...eligibility, target: 'webm' })).toBe(false);
+
+    const videoTrack = {
+      id: 1,
+      mediaType: 'video' as const,
+      codec: 'avc1.640028',
+      config: { codec: 'avc1.640028', codedWidth: 1920, codedHeight: 1080 },
+      gapless: priorTrack.gapless,
+    };
+    expect(
+      aibrushConcatIsIsoAacEditBoundary({
+        target: 'mp4',
+        consecutive: true,
+        prior: videoTrack,
+        current: videoTrack,
+      }),
+    ).toBe(false);
+    expect(collapse(false)).toBe(false);
+
+    const incompatibleTrack = {
+      ...currentTrack,
+      config: { ...currentTrack.config, numberOfChannels: 6 },
+    };
+    expect(aibrushConcatTracksCompatible(priorTrack, incompatibleTrack)).toBe(false);
+    expect(
+      aibrushConcatIsIsoAacEditBoundary({ ...eligibility, current: incompatibleTrack }),
+    ).toBe(false);
+  });
+
   test('releases counted range copies after the framework consumes them', async () => {
     const body = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]);
     const blob = new Blob([body]);
@@ -245,7 +563,7 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
       container: 'mp4', durationSec: 10,
       tracks: [{ type: 'video', codec: 'h264', rotation: 270 }, { type: 'audio', codec: 'aac' }],
     }, rotatedBytes);
-    expect(rotated.tracks[0]?.rotation).toBe(90);
+    expect(rotated.tracks[0]?.rotation).toBe(270);
 
     const pcm = enrichAibrushProbeMetadataFromTrackFacts({
       container: 'wav', durationSec: 1,
@@ -298,6 +616,19 @@ describe('REQ-ENG-33: aibrush-media representation-aware packet evidence', () =>
     expect(result.packets[0]).toMatchObject({ size: 310 });
     expect(result.packets[0]?.payload).toBeUndefined();
     expect(result.packets[0]?.payloadDigest).toBeUndefined();
+  });
+
+  test('retains an exact digest-only packet identity without materializing payload bytes', () => {
+    const track = { id: 1, mediaType: 'audio' as const, codec: 'aac' };
+    const payloadDigest = 'ab'.repeat(32);
+    const result = buildAibrushDemuxResult(
+      { container: 'mp4', durationSec: 1, tracks: [normalizeAibrushTrack(track)] },
+      [track],
+      [{ trackIndex: 0, size: 310, ptsUs: 0, keyframe: true, payloadDigest }],
+    );
+    expect(result.packets[0]).toMatchObject({ size: 310, payloadDigest });
+    expect(result.packets[0]?.payload).toBeUndefined();
+    expect(() => validateDemuxResult('aibrush-media@dev', result)).not.toThrow();
   });
 
   test('derives single-packet video cadence from an observed packet duration', () => {

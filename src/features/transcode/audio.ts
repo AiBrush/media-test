@@ -76,12 +76,15 @@ export interface DecodedAudioSignal {
   /** Whether the decoder exposed coded frames or already applied the authored presentation trim. */
   readonly timelineDomain: 'coded' | 'presentation';
   readonly timeline?: AudioTimelineEvidence;
+  /** Authored rate before an independent reference decoder resampled this signal. */
+  readonly resampledFromSampleRate?: number;
 }
 
 export interface LosslessAudioContract {
   readonly kind: 'lossless';
   readonly maximumAbsoluteError: number;
   readonly sampleFrameTolerance: number;
+  readonly resampledSampleFrameTolerance?: number;
   readonly requireExplicitTimeline: boolean;
   readonly channelTransform?: 'stereo-to-mono-average';
 }
@@ -92,6 +95,7 @@ export interface LossyAudioContract {
   readonly maximumRmsError: number;
   readonly minimumChannelCorrelation: number;
   readonly sampleFrameTolerance: number;
+  readonly resampledSampleFrameTolerance?: number;
   readonly requireExplicitTimeline: boolean;
   readonly channelTransform?: 'stereo-to-mono-average';
 }
@@ -108,6 +112,7 @@ export interface DecoderEquivalentAudioContract {
   readonly maximumAbsoluteError: number;
   readonly minimumChannelCorrelation: number;
   readonly sampleFrameTolerance: number;
+  readonly resampledSampleFrameTolerance?: number;
   readonly requireExplicitTimeline: boolean;
   readonly channelTransform?: 'stereo-to-mono-average';
 }
@@ -292,19 +297,28 @@ export function evaluateTranscodedAudioContent(
   const sourceFrames = sourceWindow.endFrame - sourceWindow.startFrame;
   const candidateFrames = candidateWindow.endFrame - candidateWindow.startFrame;
   const frameDelta = candidateFrames - sourceFrames;
+  const referenceSourceSampleRate = source.resampledFromSampleRate;
+  const sourceWasReferenceResampled = referenceSourceSampleRate !== undefined &&
+    referenceSourceSampleRate !== source.sampleRate;
+  const sampleFrameTolerance = sourceWasReferenceResampled
+    ? (contract.resampledSampleFrameTolerance ?? contract.sampleFrameTolerance)
+    : contract.sampleFrameTolerance;
   const measurements: Record<string, number> = {
     sourceSampleFrames: sourceFrames,
     candidateSampleFrames: candidateFrames,
     sampleFrameDelta: frameDelta,
     sampleRate: source.sampleRate,
     channels: expectedChannels,
+    ...(sourceWasReferenceResampled
+      ? { referenceSourceSampleRate }
+      : {}),
   };
-  if (Math.abs(frameDelta) > contract.sampleFrameTolerance) {
+  if (Math.abs(frameDelta) > sampleFrameTolerance) {
     return transcodeVerdict(
       'FAIL',
       frameDelta > 0 ? 'TRANSCODE_AUDIO_EXCESS_SAMPLES' : 'TRANSCODE_AUDIO_LOST_SAMPLES',
       `candidate program interval differs by ${frameDelta} sample frame(s); ` +
-        `declared tolerance is ${contract.sampleFrameTolerance}`,
+        `declared tolerance is ${sampleFrameTolerance}`,
       measurements,
     );
   }
@@ -965,6 +979,8 @@ function validateDecodedSignal(signal: DecodedAudioSignal, label: string): Trans
   if (!Number.isSafeInteger(signal.sampleRate) || signal.sampleRate <= 0 ||
       !Number.isSafeInteger(signal.channels) || signal.channels <= 0 ||
       !Number.isSafeInteger(signal.sampleFrames) || signal.sampleFrames < 0 ||
+      (signal.resampledFromSampleRate !== undefined &&
+        (!Number.isSafeInteger(signal.resampledFromSampleRate) || signal.resampledFromSampleRate <= 0)) ||
       signal.samples.length !== signal.sampleFrames * signal.channels) {
     return transcodeError(
       'TRANSCODE_AUDIO_DECODE_EVIDENCE_INVALID',

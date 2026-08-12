@@ -102,6 +102,8 @@ export interface OutputShape {
 export interface StreamCase {
   /** unique id suffix (namespaced under streaming-output/) */
   id: string;
+  /** Increment when the executable workload/evidence contract changes. */
+  revision?: number;
   /** source asset id (must exist in fixtures/manifest.json) */
   asset: string;
   /** source container token (canonical) */
@@ -203,6 +205,7 @@ export function buildStream(c: StreamCase): Scenario {
   const oracles = withWebmLiveLayoutOracle(withMp4LayoutOracle(c.oracles ?? DEFAULT_STREAM_ORACLES, c.shape), c.shape);
   return defineScenario({
     id: streamId(c),
+    ...(c.revision !== undefined ? { revision: c.revision } : {}),
     op: 'remux',
     input: c.asset,
     options: shapeOptions(c.shape),

@@ -286,7 +286,10 @@ function readMatroskaOrientation(
     const projection = videoFields.find((element) => element.id === 0x7670);
     const projectionFields = projection ? ebmlChildren(bytes, projection.bodyStart, projection.end) : [];
     const roll = projectionFields.find((element) => element.id === 0x7675);
-    const rotation = roll ? cardinalRotation(ebmlFloat(bytes, roll)) : 0;
+    // RFC 9559 ProjectionPoseRoll is counter-clockwise-positive, while the harness display contract is
+    // clockwise-positive (matching its ISO-BMFF matrix evidence). Negate before canonicalizing so a
+    // Matroska representation change does not reverse the authored presentation transform.
+    const rotation = roll ? cardinalRotation(-ebmlFloat(bytes, roll)) : 0;
     if (rotation === null) {
       return problem(
         'UNSUPPORTED_STRUCTURE',
@@ -371,11 +374,11 @@ function isoTrackRotation(bytes: Uint8Array, tkhd: IsoBox): 0 | 90 | 180 | 270 |
   const d = fixed16(bytes, offset + 16);
   const close = (actual: number, expected: number): boolean => Math.abs(actual - expected) <= 1 / 65536;
   if (close(a, 1) && close(b, 0) && close(c, 0) && close(d, 1)) return 0;
-  // ISO matrices transform coordinates counter-clockwise; expose the equivalent clockwise display
-  // rotation used by WebCodecs/ffprobe and by DisplayTransformContract.
-  if (close(a, 0) && close(b, 1) && close(c, -1) && close(d, 0)) return 270;
+  // The stored row `[a,b]` follows the suite's clockwise-positive display contract. FFmpeg's
+  // extracted `rotation` reports the inverse counter-clockwise angle, so it must not be copied here.
+  if (close(a, 0) && close(b, 1) && close(c, -1) && close(d, 0)) return 90;
   if (close(a, -1) && close(b, 0) && close(c, 0) && close(d, -1)) return 180;
-  if (close(a, 0) && close(b, -1) && close(c, 1) && close(d, 0)) return 90;
+  if (close(a, 0) && close(b, -1) && close(c, 1) && close(d, 0)) return 270;
   return null;
 }
 

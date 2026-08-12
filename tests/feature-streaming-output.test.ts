@@ -20,6 +20,7 @@ import {
   inspectMpegTs,
   probeFragmentedMp4Append,
   probeLiveWebmAppend,
+  recognizeStreamingScenarioContract,
   readTimeToFirstByteSample,
   streamingError,
   streamingOutputContractFromOptions,
@@ -437,6 +438,17 @@ describe('REQ-FEAT-89 equivalent-work isolation', () => {
     const massiveBuffer = streamingOutputContractFromOptions(byId.get('streaming-output/buffer_massive_h264_mp4')!.options);
     expect(massiveBuffer.representation).toBe(massiveStream.representation);
     expect(massiveBuffer.target).not.toBe(massiveStream.target);
+    for (const id of [
+      'streaming-output/stream_large_h264_mp4',
+      'streaming-output/stream_huge_h264_mov_to_mp4',
+      'streaming-output/stream_massive_h264_mp4',
+      'streaming-output/buffer_massive_h264_mp4',
+    ]) {
+      const recognition = recognizeStreamingScenarioContract(byId.get(id)!);
+      expect(recognition.matched).toBe(true);
+      if (!recognition.matched || recognition.state !== 'OK') continue;
+      expect(recognition.contract.requiresBrowserAppend).toBe(false);
+    }
   });
 });
 

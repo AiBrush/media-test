@@ -27,6 +27,7 @@ import {
   type StreamingCorrectnessResult,
   type StreamingDecision,
 } from './types.ts';
+import { readIsoBmffRangeProgram, type IsoBmffRangeSource } from '../remux/readers.ts';
 
 export const STREAMING_RUNTIME_EVIDENCE_SCHEMA = 'media-test/streaming-runtime-evidence@1' as const;
 export const STREAMING_RUNTIME_RESULT_SCHEMA = 'media-test/streaming-runtime-result@1' as const;
@@ -190,7 +191,12 @@ export function recognizeStreamingScenarioContract(scenario: unknown): Streaming
         cmaf: output.representation === 'fragmented-mp4' && lowerId.includes('cmaf'),
         requiresSinkTrace: true as const,
         requiresTimeToFirstByte: metrics.includes('timeToFirstByte'),
-        requiresBrowserAppend: output.representation === 'fragmented-mp4' || output.representation === 'live-webm',
+        // Full-output MSE append is covered by the ordinary rows. Scale rows isolate output retention
+        // and use the complete neutral range reader instead of asking SourceBuffer to retain hours of
+        // buffered media, which would make the browser probe itself the dominant memory consumer.
+        requiresBrowserAppend: !isScale && (
+          output.representation === 'fragmented-mp4' || output.representation === 'live-webm'
+        ),
         requiresResolvedRepresentation: isScale,
       }),
     });
@@ -498,7 +504,33 @@ async function assessContainerLayer(
       `output container ${output.container} != requested ${contract.output.container}`,
     ));
   } else if (contract.containerValidator === 'fragmented-mp4') {
-    checks.push(assessFragmentedMp4(output.bytes, { cmaf: contract.cmaf }));
+    if (output.artifact !== undefined) {
+      const read = await readIsoBmffRangeProgram(output.artifact, output.container);
+      checks.push(
+        read.state === 'OK' && read.value.representation.fragmented === true
+          ? streamingVerdict(
+              'PASS',
+              contract.cmaf ? 'CMAF_RANGE_FRAGMENT_STRUCTURE_VALID' : 'FMP4_RANGE_FRAGMENT_STRUCTURE_VALID',
+              `${read.value.tracks.length} range-read track(s), ` +
+                `${read.value.tracks.reduce((sum, track) => sum + track.samples.length, 0)} sample(s)`,
+              {
+                tracks: read.value.tracks.length,
+                samples: read.value.tracks.reduce((sum, track) => sum + track.samples.length, 0),
+              },
+            )
+          : streamingVerdict(
+              'FAIL',
+              read.state === 'OK'
+                ? 'FMP4_RANGE_REPRESENTATION_MISMATCH'
+                : read.reasonCode,
+              read.state === 'OK'
+                ? 'range-read ISO-BMFF output is not fragmented'
+                : `range-read fragmented MP4 ${read.state}`,
+            ),
+      );
+    } else {
+      checks.push(assessFragmentedMp4(output.bytes, { cmaf: contract.cmaf }));
+    }
   } else if (contract.containerValidator === 'mpeg-ts') {
     checks.push(assessMpegTsStructure(output.bytes));
   } else if (contract.containerValidator === 'live-webm') {
@@ -700,7 +732,13 @@ function isSinkTraceEvent(value: unknown): value is SinkTraceEvent {
 }
 
 function readOutputBytes(value: unknown):
-  | { readonly state: 'OK'; readonly bytes: Uint8Array; readonly mime: string; readonly container: string }
+  | {
+      readonly state: 'OK';
+      readonly bytes: Uint8Array;
+      readonly mime: string;
+      readonly container: string;
+      readonly artifact?: IsoBmffRangeSource;
+    }
   | { readonly state: 'INVALID'; readonly reasonCode: string; readonly detail: string } {
   if (!isRecord(value) || !(value.bytes instanceof Uint8Array) ||
       typeof value.mime !== 'string' || value.mime.trim() === '' ||
@@ -711,7 +749,32 @@ function readOutputBytes(value: unknown):
       detail: 'output must expose Uint8Array bytes plus canonical non-empty mime/container values',
     });
   }
-  return Object.freeze({ state: 'OK' as const, bytes: value.bytes, mime: value.mime, container: value.container });
+  let artifact: IsoBmffRangeSource | undefined;
+  if (value.artifact !== undefined) {
+    if (
+      !isRecord(value.artifact) ||
+      value.artifact.schema !== 'media-test/media-range-artifact@1' ||
+      !isNonNegativeInteger(value.artifact.byteLength) ||
+      typeof value.artifact.range !== 'function'
+    ) {
+      return Object.freeze({
+        state: 'INVALID' as const,
+        reasonCode: 'STREAMING_OUTPUT_RANGE_ARTIFACT_INVALID',
+        detail: 'output range artifact is malformed',
+      });
+    }
+    artifact = {
+      size: value.artifact.byteLength,
+      range: value.artifact.range as IsoBmffRangeSource['range'],
+    };
+  }
+  return Object.freeze({
+    state: 'OK' as const,
+    bytes: value.bytes,
+    mime: value.mime,
+    container: value.container,
+    ...(artifact ? { artifact } : {}),
+  });
 }
 
 function comparabilityEvidence(evidence: StreamingRuntimeEvidence | undefined): StreamingComparabilityEvidence {

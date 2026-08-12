@@ -35,6 +35,7 @@ export interface AibrushRawPacket {
   readonly durationUs?: number;
   readonly keyframe: boolean;
   readonly payload?: Uint8Array;
+  readonly payloadDigest?: string;
 }
 
 export type AibrushPacketPayloadResolver = (
@@ -195,6 +196,9 @@ export function createAibrushDemuxResultBuilder(
             // The bytes are the authoritative evidence. Do not also publish a digest derived from
             // the same buffer: an independent oracle must distrust and re-hash that self-assertion.
             ? { payload: payload.slice() }
+            : {}),
+          ...(payload === undefined && packet.payloadDigest !== undefined
+            ? { payloadDigest: packet.payloadDigest }
             : {}),
           ...(evidence?.representation !== undefined
             ? { framing: evidence.representation.framing }

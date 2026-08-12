@@ -738,9 +738,19 @@ const robustnessAudioScenarios: Scenario[] = ROBUSTNESS_AUDIO_CASES.map((c) =>
 // image/audio conversion capability.
 const imageIntoAudioScenario: Scenario = defineScenario({
   id: 'audio-dsp/negative_image_into_audio_transcode',
+  revision: 2,
   op: 'transcode',
   input: 'image.jpg',
-  options: { container: 'wav', audio: { codec: 'pcm-s16', channels: 1 } },
+  options: {
+    container: 'wav',
+    audio: { codec: 'pcm-s16', channels: 1 },
+    robustness: defineRobustnessContract(
+      'negative',
+      'media-structure',
+      ['graceful-failure'],
+      AUDIO_FUZZ_TIMEOUT_MS,
+    ),
+  },
   requires: {
     operations: ['transcode'],
   },

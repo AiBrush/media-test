@@ -22,5 +22,6 @@ export interface RegisterMediabunnyOptions {
  */
 export function registerMediabunny(opts?: RegisterMediabunnyOptions): void {
   const id = opts?.id ?? 'mediabunny';
-  registerEngine(id, () => new MediabunnyEngine(id === 'mediabunny' ? 'mediabunny@1.48.0' : id));
+  const resultId = id === 'mediabunny' ? 'mediabunny@1.48.0' : id;
+  registerEngine(id, () => new MediabunnyEngine(resultId), { resultId });
 }

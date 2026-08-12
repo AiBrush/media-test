@@ -25,6 +25,7 @@ interface Element {
 interface TrackInfo extends Omit<RemuxTrackEvidence, 'samples'> {
   number: number;
   defaultDurationUs?: number;
+  codecDelayUs?: number;
 }
 
 const ID = {
@@ -43,6 +44,7 @@ const ID = {
   LanguageIetf: 0x22b59d,
   Name: 0x536e,
   DefaultDuration: 0x23e383,
+  CodecDelay: 0x56aa,
   Video: 0xe0,
   PixelWidth: 0xb0,
   PixelHeight: 0xba,
@@ -185,6 +187,7 @@ function parseTrack(bytes: Uint8Array, entry: Element): TrackInfo | undefined {
   const roleEl = child(items, ID.Name);
   const privateEl = child(items, ID.CodecPrivate);
   const defaultDuration = child(items, ID.DefaultDuration);
+  const codecDelay = child(items, ID.CodecDelay);
   const video = child(items, ID.Video);
   const audio = child(items, ID.Audio);
   let width: number | undefined;
@@ -207,6 +210,7 @@ function parseTrack(bytes: Uint8Array, entry: Element): TrackInfo | undefined {
   }
   const uidValue = uid ? uint(bytes, uid) : undefined;
   const defaultNs = defaultDuration ? uint(bytes, defaultDuration) : undefined;
+  const codecDelayNs = codecDelay ? uint(bytes, codecDelay) : undefined;
   const language = languageEl ? text(bytes, languageEl) : undefined;
   return {
     number,
@@ -219,6 +223,7 @@ function parseTrack(bytes: Uint8Array, entry: Element): TrackInfo | undefined {
     ...(sampleRate ? { sampleRate } : {}), ...(channels ? { channels } : {}),
     ...(privateEl ? { codecPrivate: bytes.subarray(privateEl.body, privateEl.end) } : {}),
     ...(defaultNs ? { defaultDurationUs: defaultNs / 1000 } : {}),
+    ...(codecDelayNs ? { codecDelayUs: codecDelayNs / 1000 } : {}),
   };
 }
 
@@ -293,7 +298,9 @@ function parseBlock(
   const lacing = (flags >> 1) & 3;
   const frames = lacedFrames(bytes, header + 3, item.end, lacing);
   if (!frames) return undefined;
-  const basePtsUs = Math.round(((clusterTimestamp + relative) * timecodeScale) / 1000);
+  const basePtsUs = Math.round(
+    ((clusterTimestamp + relative) * timecodeScale) / 1000 - (track.codecDelayUs ?? 0),
+  );
   const totalDurationUs = blockDurationTicks !== undefined
     ? (blockDurationTicks * timecodeScale) / 1000
     : track.defaultDurationUs !== undefined
@@ -344,7 +351,13 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
     if (trackInfos.length === 0 || trackInfos.length > MAX_REMUX_TRACKS || trackInfos.some((track) => !track)) {
       return { state: 'MALFORMED', reasonCode: 'REMUX_EBML_TRACK_ENTRY_INVALID', evidence };
     }
-    const tracks = trackInfos as TrackInfo[];
+    const ticksPerSecond = 1_000_000_000 / timecodeScale;
+    const tracks = (trackInfos as TrackInfo[]).map((track) => ({
+      ...track,
+      ...(Number.isSafeInteger(ticksPerSecond) && ticksPerSecond > 0
+        ? { timescale: ticksPerSecond }
+        : {}),
+    }));
     const samples = new Map<number, RemuxSampleEvidence[]>();
     let lacing = false;
     for (const cluster of segmentItems.filter((item) => item.id === ID.Cluster)) {
@@ -384,11 +397,84 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
       }
     }
     if ([...samples.values()].every((list) => list.length === 0)) return { state: 'INCOMPLETE', reasonCode: 'REMUX_EBML_MEDIA_BLOCKS_MISSING', evidence };
-    // Matroska/WebM exposes block order and presentation timestamps, but no independent numeric DTS
-    // field. Preserve that provenance honestly: do not synthesize DTS=PTS or an invented cadence.
-    const outputTracks: RemuxTrackEvidence[] = tracks.map(({ number, defaultDurationUs: _default, ...track }) => ({
-      ...track, samples: samples.get(number) ?? [],
-    }));
+    // A Matroska Block's timestamp is PTS while its physical order is decode order. Project that encoded
+    // order into a numeric target-clock DTS axis. A reordered track starts at presentation origin minus
+    // CodecDelay and advances by its authored decode-order durations; this preserves irregular/VFR DTS
+    // cadence that cannot be recovered from presentation sorting. A non-reordered track keeps DTS=PTS.
+    // Non-terminal missing durations are recoverable from the next presentation timestamp, retaining
+    // sub-tick constant cadence without accumulating a rounded BlockDuration for every packet. The
+    // final presentation duration stays unavailable unless the file authors BlockDuration,
+    // DefaultDuration, or a nearby Segment Duration boundary; copying the preceding gap would invent
+    // timing for genuinely headerless/live files.
+    const outputTracks: RemuxTrackEvidence[] = tracks.map(
+      ({ number, defaultDurationUs: _default, codecDelayUs, ...track }) => {
+        const trackSamples = samples.get(number) ?? [];
+        const presentation = trackSamples.map((sample) => sample.ptsUs);
+        const completePresentation = presentation.every(
+          (value): value is number => value !== undefined && Number.isSafeInteger(value),
+        );
+        const reordered =
+          completePresentation &&
+          presentation.some((value, index) => index > 0 && value! < presentation[index - 1]!);
+        const byPresentation = trackSamples
+          .map((sample, index) => ({ sample, index }))
+          .filter(
+            (item): item is typeof item & { sample: RemuxSampleEvidence & { ptsUs: number } } =>
+              item.sample.ptsUs !== undefined,
+          )
+          .sort((left, right) => left.sample.ptsUs - right.sample.ptsUs || left.index - right.index);
+        const inferredDurations = new Map<number, number>();
+        for (let position = 0; position < byPresentation.length; position++) {
+          const current = byPresentation[position]!;
+          if (current.sample.durationUs !== undefined) continue;
+          let next = position + 1;
+          while (
+            next < byPresentation.length &&
+            byPresentation[next]!.sample.ptsUs === current.sample.ptsUs
+          ) {
+            next++;
+          }
+          const inferred =
+            next < byPresentation.length
+              ? byPresentation[next]!.sample.ptsUs - current.sample.ptsUs
+              : undefined;
+          if (inferred !== undefined && inferred > 0) {
+            inferredDurations.set(current.index, inferred);
+          }
+        }
+        const resolvedDuration = (index: number): number | undefined =>
+          trackSamples[index]?.durationUs ?? inferredDurations.get(index);
+        const sufficientDecodeDurations = trackSamples.every(
+          (_sample, index) =>
+            index === trackSamples.length - 1 || (resolvedDuration(index) ?? 0) > 0,
+        );
+        let decodeTimestamps: Array<number | undefined> = presentation;
+        if (reordered) {
+          if (sufficientDecodeDurations) {
+            let nextDtsUs = Math.min(...(presentation as number[])) - (codecDelayUs ?? 0);
+            decodeTimestamps = trackSamples.map((_sample, index) => {
+              const dtsUs = Math.round(nextDtsUs);
+              nextDtsUs += resolvedDuration(index)!;
+              return dtsUs;
+            });
+          } else {
+            decodeTimestamps = [...(presentation as number[])]
+              .sort((left, right) => left - right)
+              .map((ptsUs) => ptsUs - (codecDelayUs ?? 0));
+          }
+        }
+        return {
+          ...track,
+          samples: trackSamples.map((sample, index) => ({
+            ...sample,
+            ...(sample.durationUs === undefined && inferredDurations.has(index)
+              ? { durationUs: inferredDurations.get(index)! }
+              : {}),
+            ...(completePresentation ? { dtsUs: decodeTimestamps[index]! } : {}),
+          })),
+        };
+      },
+    );
     if (outputTracks.some((track) => track.type === 'video' || track.type === 'audio' ? track.samples.length === 0 : false)) {
       return { state: 'INCOMPLETE', reasonCode: 'REMUX_EBML_TRACK_SAMPLES_MISSING', evidence };
     }
@@ -406,7 +492,20 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
       : undefined;
     let terminalIntervalUs = 0;
     let terminalDurationMissing = false;
+    let reorderBoundaryUs = 0;
     for (const track of outputTracks) {
+      for (const sample of track.samples) {
+        if (
+          sample.ptsUs !== undefined &&
+          sample.dtsUs !== undefined &&
+          sample.durationUs !== undefined
+        ) {
+          reorderBoundaryUs = Math.max(
+            reorderBoundaryUs,
+            Math.abs(sample.ptsUs - sample.dtsUs) + sample.durationUs,
+          );
+        }
+      }
       const timed = track.samples
         .filter((sample): sample is RemuxSampleEvidence & { ptsUs: number } => sample.ptsUs !== undefined)
         .sort((a, b) => a.ptsUs - b.ptsUs);
@@ -419,15 +518,19 @@ export function readEbmlProgram(bytes: Uint8Array, hint = 'webm'): RemuxReadResu
         );
       }
     }
-    const declaredMaterializesTerminalDuration =
-      terminalDurationMissing &&
+    const negativeOriginUs = Number.isFinite(minimumPtsUs) ? Math.max(0, -minimumPtsUs) : 0;
+    const declaredBoundaryBandUs =
+      Math.max(50_000, terminalIntervalUs, reorderBoundaryUs) + negativeOriginUs + 1_000;
+    const declaredDefinesPresentationBoundary =
       declaredDurationUs !== undefined &&
       observedDurationUs !== undefined &&
-      Math.abs(declaredDurationUs - observedDurationUs) <= Math.max(50_000, terminalIntervalUs) + 1_000;
+      (terminalDurationMissing || declaredDurationUs <= observedDurationUs) &&
+      Math.abs(declaredDurationUs - observedDurationUs) <= declaredBoundaryBandUs;
     // A complete block walk is stronger stream-copy evidence than the optional Segment Duration
     // scalar, which real WebM files can carry stale or deliberately contradictory values for. A
-    // nearby declaration can, however, materialize the unavailable duration of a terminal block.
-    const durationUs = declaredMaterializesTerminalDuration
+    // nearby declaration can, however, materialize an unavailable terminal duration or bound one
+    // decode-reorder tail plus a negative codec-priming origin without weakening coded sample evidence.
+    const durationUs = declaredDefinesPresentationBoundary
       ? declaredDurationUs
       : observedDurationUs !== undefined && observedDurationUs > 0
       ? observedDurationUs

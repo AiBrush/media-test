@@ -9,7 +9,7 @@
  */
 
 import { registerEngine } from '../../core/registry.ts';
-import { FfmpegWasmEngine } from './adapter.ts';
+import { FFMPEG_WASM_ENGINE_ID, FfmpegWasmEngine } from './adapter.ts';
 
 export interface RegisterFfmpegWasmOptions {
   /** Override the registry KEY (used by run filters). Defaults to 'ffmpeg-wasm'. */
@@ -19,5 +19,5 @@ export interface RegisterFfmpegWasmOptions {
 /** Register the ffmpeg.wasm engine factory under its registry key. */
 export function registerFfmpegWasm(opts?: RegisterFfmpegWasmOptions): void {
   const id = opts?.id ?? 'ffmpeg-wasm';
-  registerEngine(id, () => new FfmpegWasmEngine());
+  registerEngine(id, () => new FfmpegWasmEngine(), { resultId: FFMPEG_WASM_ENGINE_ID });
 }

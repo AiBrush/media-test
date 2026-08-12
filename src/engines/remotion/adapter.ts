@@ -248,7 +248,7 @@ export class RemotionEngine implements MediaEngine {
 }
 
 export function registerRemotion(): void {
-  registerEngine('remotion', () => new RemotionEngine());
+  registerEngine('remotion', () => new RemotionEngine(), { resultId: REMOTION_ENGINE_ID });
 }
 
 function union<T>(a: readonly T[], b: readonly T[]): T[] {

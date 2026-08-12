@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
@@ -51,7 +52,9 @@ import type { ScenarioResultV2 } from '../src/core/result-schema.ts';
 import type { ResultStatus, Scenario, ScenarioResult } from '../src/core/scenario.ts';
 import viteConfig, {
   SAVE_ENDPOINT_MAX_BYTES,
+  createCachedFixtureBlockHasher,
   createSaveEndpointHandler,
+  hashFixtureBlocks,
   inspectSaveRequest,
   staticContentType,
 } from '../vite.config.mjs';
@@ -669,12 +672,66 @@ describe('REQ-UI-16: loopback and opt-in save boundary', () => {
     expect(viteConfig.server).toEqual({ host: '127.0.0.1', port: 5151, strictPort: true });
     expect(viteConfig.preview).toEqual({ host: '127.0.0.1', port: 5151, strictPort: true });
     expect(viteConfig.plugins.map((plugin: { name: string }) => plugin.name)).toEqual([
-      'cross-origin-isolation', 'ffmpeg-vendor-static', 'save-results', 'fixtures-static',
+      'cross-origin-isolation', 'ffmpeg-vendor-static', 'save-results',
+      'fixture-content-attestation', 'fixtures-static',
     ]);
     expect(staticContentType(join(ROOT, 'fixtures/lib/lossless-json-columnar-validator.mjs')))
       .toBe('text/javascript; charset=utf-8');
     expect(staticContentType(join(ROOT, 'fixtures/media/h264_ts.ts'))).toBe('video/mp2t');
     expect(staticContentType(join(ROOT, 'fixtures/media/hls_aes128/enc.key'))).toBe('application/octet-stream');
+  });
+
+  test('fixture attestations hash exact blocks and cache only an unchanged file version', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'media-test-attestation-'));
+    const filePath = join(cwd, 'fixture.bin');
+    try {
+      const bytes = Buffer.alloc(1024 * 1024 + 17);
+      for (let index = 0; index < bytes.byteLength; index++) bytes[index] = (index * 29 + 7) & 0xff;
+      writeFileSync(filePath, bytes);
+      const attestation = await hashFixtureBlocks(filePath);
+      expect(attestation).toEqual({
+        actualSha256: createHash('sha256').update(bytes).digest('hex'),
+        actualSizeBytes: bytes.byteLength,
+        chunkSizeBytes: 1024 * 1024,
+        chunkSha256: [
+          createHash('sha256').update(bytes.subarray(0, 1024 * 1024)).digest('hex'),
+          createHash('sha256').update(bytes.subarray(1024 * 1024)).digest('hex'),
+        ],
+      });
+
+      let calls = 0;
+      const cachedHash = createCachedFixtureBlockHasher(async (path: string) => {
+        calls += 1;
+        return hashFixtureBlocks(path);
+      });
+      const [first, concurrent] = await Promise.all([cachedHash(filePath), cachedHash(filePath)]);
+      expect(concurrent).toEqual(first);
+      expect(calls).toBe(1);
+      writeFileSync(filePath, Buffer.concat([bytes, Buffer.from([0xff])]));
+      expect((await cachedHash(filePath)).actualSizeBytes).toBe(bytes.byteLength + 1);
+      expect(calls).toBe(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('a failed fixture attestation is evicted instead of poisoning the cache', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'media-test-attestation-failure-'));
+    const filePath = join(cwd, 'fixture.bin');
+    try {
+      writeFileSync(filePath, 'retryable');
+      let calls = 0;
+      const cachedHash = createCachedFixtureBlockHasher(async (path: string) => {
+        calls += 1;
+        if (calls === 1) throw new Error('injected hash failure');
+        return hashFixtureBlocks(path);
+      });
+      await expect(cachedHash(filePath)).rejects.toThrow('injected hash failure');
+      expect((await cachedHash(filePath)).actualSizeBytes).toBe(9);
+      expect(calls).toBe(2);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -699,12 +756,15 @@ describe('REQ-UI-10/11/12/14/20/21: static accessibility and CLI contracts', () 
     expect(launcher).toContain('window.__SUITE__.start(requestId, filter)');
     expect(launcher).toContain('isLauncherRunDone(handshake, launchRequestId)');
     expect(launcher).toContain('let lastLog = started');
+    expect(launcher).toContain('hasUnsavedLauncherResults(lastSnapshotCount, observedResultCount)');
+    expect(launcher.indexOf('hasUnsavedLauncherResults(lastSnapshotCount, observedResultCount)'))
+      .toBeLessThan(launcher.indexOf("saveResultsPayload(page, 'incremental launcher snapshot'"));
     expect(launcher).toContain('isLauncherRunPending(pageDiagnostic.handshake, launchRequestId)');
     expect(launcher).toContain('info.handshakeSchema !== LAUNCHER_RUN_HANDSHAKE_SCHEMA');
     const snapshotBody = app.slice(snapshotStart, snapshotEnd);
     expect(snapshotBody).toContain('const run = activeRun;');
-    expect(snapshotBody.indexOf('const run = activeRun;')).toBeLessThan(snapshotBody.indexOf('await cacheSnapshot'));
-    expect(snapshotBody.slice(snapshotBody.indexOf('await cacheSnapshot'))).not.toContain('activeRun.');
+    expect(snapshotBody).toContain('const cache = run.baseManifest.cache;');
+    expect(snapshotBody).not.toContain('await cacheSnapshot');
   });
 
   test('the document exposes native progress/status controls, every legend state, and honest reference copy', () => {

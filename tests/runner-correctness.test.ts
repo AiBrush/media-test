@@ -22,6 +22,7 @@ import {
   isBenchmarkEligible,
   isExecutionFingerprintReusable,
   ORACLE_MODEL_VERSION,
+  parseHarnessContentAttestation,
   aggregateExhaustive,
   buildExecutionOrder,
   decodeFrameGoldenGap,
@@ -90,6 +91,31 @@ const pixelPass: PixelBehaviorEvidence = {
   reasonCode: 'PIXEL_RGBA_ROUNDTRIP_OK',
   detail: 'test behavior passed',
 };
+
+describe('harness content-attestation payload validation', () => {
+  const valid = {
+    schema: 'media-test/content-attestation@1',
+    logicalPath: 'scenarios/probe/example.mp4',
+    actualSha256: 'a'.repeat(64),
+    actualSizeBytes: 4,
+    chunkSizeBytes: 1024 * 1024,
+    chunkSha256: ['b'.repeat(64)],
+  };
+
+  test('accepts and isolates a complete typed payload', () => {
+    const parsed = parseHarnessContentAttestation(valid);
+    expect(parsed).toEqual(valid);
+    expect(parsed.chunkSha256).not.toBe(valid.chunkSha256);
+  });
+
+  test('rejects null, malformed numeric fields, and malformed digest maps', () => {
+    expect(() => parseHarnessContentAttestation(null)).toThrow('must be an object');
+    expect(() => parseHarnessContentAttestation({ ...valid, actualSizeBytes: 4.5 }))
+      .toThrow('non-negative safe integer');
+    expect(() => parseHarnessContentAttestation({ ...valid, chunkSha256: [null] }))
+      .toThrow('must contain lowercase SHA-256 digests');
+  });
+});
 
 function installCorpusFetch(options: { missingAsset?: boolean } = {}): { calls: string[] } {
   const calls: string[] = [];
@@ -173,6 +199,18 @@ function trimScenario(id = 'trim/runner-test'): Scenario {
       range: { startUs: 0, endUs: 500_000 },
     },
     oracles: ['playback-smoke'],
+    metrics: [],
+  });
+}
+
+function demuxScenario(id = 'demux/runner-test'): Scenario {
+  return defineScenario({
+    id,
+    op: 'demux',
+    input: 'input.mp4',
+    requires: { operations: ['demux'], containersIn: ['mp4'] },
+    options: {},
+    oracles: ['golden-packets'],
     metrics: [],
   });
 }
@@ -297,6 +335,7 @@ function streamVerifiedProbeInput(): {
 
 const LARGE_AUTHENTICATED_INPUT_BYTES = 256 * 1024 * 1024 + 1;
 const TRIM_AUTHENTICATED_INPUT_BYTES = 128 * 1024 * 1024 + 1;
+const DEMUX_AUTHENTICATED_INPUT_BYTES = 64 * 1024 * 1024 + 1;
 const largeInputSha256 = 'ab'.repeat(32);
 
 function streamVerifiedLargeInput(
@@ -362,6 +401,9 @@ function installProbeGoldenFetch(): void {
     if (url.startsWith('blob:')) return originalFetch(input, init);
     if (url.endsWith('fixtures/golden/input.mp4.meta.json')) {
       return Response.json({ container: 'mp4', durationSec: 1, tracks: [] });
+    }
+    if (url.endsWith('fixtures/golden/large-input.mp4.packets.json')) {
+      return Response.json([]);
     }
     return new Response(null, { status: 404, statusText: 'Not Found' });
   }) as typeof fetch;
@@ -1313,6 +1355,34 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
     expect(largeTrim.status).toBe('PASS');
     expect(observedTrimInput?.contentAttestation?.sha256).toBe(largeInputSha256);
 
+    let observedDemuxInput: MediaInput | undefined;
+    const largeDemux = await runOne(baseEngine('demux', {
+      capabilities: () => ({
+        ...caps('demux'),
+        features: [...caps('demux').features, AUTHENTICATED_RANGE_INPUT_FEATURE],
+      }),
+      supports: async () => ({ supported: true }),
+      demux: async (input) => {
+        observedDemuxInput = input;
+        expect(input.contentAttestation).toMatchObject({
+          sha256: largeInputSha256,
+          sizeBytes: DEMUX_AUTHENTICATED_INPUT_BYTES,
+        });
+        await expect(input.blob()).rejects.toThrow('ATTESTED_URL_WHOLE_FILE_FORBIDDEN');
+        return {
+          metadata: { container: 'mp4', durationSec: 1, tracks: [] },
+          packets: [],
+          tracks: [],
+          ordering: 'decode',
+        };
+      },
+    }), demuxScenario('demux/large-authenticated-range'), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedLargeInput(DEMUX_AUTHENTICATED_INPUT_BYTES),
+    });
+    expect(largeDemux).toMatchObject({ status: 'PASS' });
+    expect(observedDemuxInput?.contentAttestation?.sha256).toBe(largeInputSha256);
+
     let thresholdTrimCalls = 0;
     const thresholdTrim = await runOne(baseEngine('trim', {
       capabilities: () => ({
@@ -1333,6 +1403,31 @@ describe('REQ-FEAT-36/38 probe runtime contracts', () => {
       reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_FORBIDDEN'),
     });
     expect(thresholdTrimCalls).toBe(0);
+
+    let thresholdDemuxCalls = 0;
+    const thresholdDemux = await runOne(baseEngine('demux', {
+      capabilities: () => ({
+        ...caps('demux'),
+        features: [...caps('demux').features, AUTHENTICATED_RANGE_INPUT_FEATURE],
+      }),
+      demux: async () => {
+        thresholdDemuxCalls += 1;
+        return {
+          metadata: { container: 'mp4', durationSec: 1, tracks: [] },
+          packets: [],
+          tracks: [],
+          ordering: 'decode',
+        };
+      },
+    }), demuxScenario('demux/authenticated-range-exclusive-threshold'), browser, support, {
+      pixelBehavior: pixelPass,
+      ...streamVerifiedLargeInput(64 * 1024 * 1024),
+    });
+    expect(thresholdDemux).toMatchObject({
+      status: 'ERROR',
+      reason: expect.stringContaining('CORPUS_STREAM_TRANSPORT_FORBIDDEN'),
+    });
+    expect(thresholdDemuxCalls).toBe(0);
 
     let unauthenticatedLargeCalls = 0;
     const unauthenticatedLarge = await runOne(baseEngine('remux', {

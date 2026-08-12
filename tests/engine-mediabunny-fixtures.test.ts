@@ -415,7 +415,7 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
     expect(displayGetterCalls).toBe(0);
   });
 
-  test('translates only ISO-BMFF quarter-turns into the suite-clockwise convention', async () => {
+  test('preserves Mediabunny public clockwise rotation without adapter-side inversion', async () => {
     const track = (rotation: 0 | 90 | 180 | 270) => ({
       type: 'video',
       isVideoTrack: () => true,
@@ -430,16 +430,13 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
       computePacketStats: async () => ({ averagePacketRate: 30, packetCount: 120 }),
     }) as unknown as InputTrack;
 
-    expect((await normalizeTrack(track(270), { sourceContainer: 'mp4' })).rotation).toBe(90);
-    expect((await normalizeTrack(track(90), { sourceContainer: 'mov' })).rotation).toBe(270);
-    expect((await normalizeTrack(track(0), { sourceContainer: 'mp4' })).rotation).toBe(0);
-    expect((await normalizeTrack(track(180), { sourceContainer: 'mov' })).rotation).toBe(180);
-    expect((await normalizeTrack(track(270), { sourceContainer: 'mkv' })).rotation).toBe(270);
-    expect((await normalizeTrack(track(90), { sourceContainer: 'webm' })).rotation).toBe(90);
     expect((await normalizeTrack(track(270))).rotation).toBe(270);
+    expect((await normalizeTrack(track(90))).rotation).toBe(90);
+    expect((await normalizeTrack(track(0))).rotation).toBe(0);
+    expect((await normalizeTrack(track(180))).rotation).toBe(180);
   });
 
-  test('probe reports the baked ISO display matrix as clockwise 90 degrees with coded dimensions', async () => {
+  test('probe reports the baked ISO display matrix as clockwise 270 degrees with coded dimensions', async () => {
     const metadata = await withEngine(async (engine) => engine.probe(await fixture('h264_rotated90.mp4')));
     expect(metadata).toMatchObject({ container: 'mp4', durationSec: 10 });
     expect(metadata.tracks.find((track) => track.type === 'video')).toMatchObject({
@@ -447,7 +444,7 @@ describe('REQ-ENG-03: explicit packet representation and timing evidence', () =>
         codec: 'h264',
         width: 1_280,
         height: 720,
-        rotation: 90,
+        rotation: 270,
     });
   });
 
@@ -1028,7 +1025,7 @@ describe('REQ-ENG-02/04: strict packet-copy remux and mux contract', () => {
       expect(prepared.tracks.find((track) => track.type === 'video')).toMatchObject({
         width: 1_280,
         height: 720,
-        rotation: 90,
+        rotation: 270,
       });
 
       const media = await engine.trim(
@@ -1040,7 +1037,7 @@ describe('REQ-ENG-02/04: strict packet-copy remux and mux contract', () => {
       expect(metadata.tracks.find((track) => track.type === 'video')).toMatchObject({
         width: 1_280,
         height: 720,
-        rotation: 90,
+        rotation: 270,
       });
     });
   });

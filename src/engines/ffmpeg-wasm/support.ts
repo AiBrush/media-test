@@ -618,20 +618,6 @@ export function decideFfmpegSupport(
     );
   }
 
-  if (
-    request.operation === 'transcode' &&
-    outputVideo === 'h264' &&
-    numberValue(videoOptions.bitrate) === 2_000_000 &&
-    numberValue(videoOptions.passes) === 2 &&
-    request.inputs.some((input) =>
-      input.id.toLowerCase().endsWith('scenarios/transcode/h264_two_pass_bitrate/03.mp4'))
-  ) {
-    return reject(
-      'FFMPEG_H264_TWO_PASS_QUALITY_BOUND',
-      'the exact portrait 1080x1920@60 variant measures 0.9497 SSIM in the vendored FFmpeg 5.1 two-pass 2Mbps path, below the suite\'s 0.95 floor while the neighboring variants pass',
-    );
-  }
-
   if (request.operation === 'transcode' && outputVideo) {
     const sourceVideoTrack = tracks.find((track) => track.type === 'video');
     const durationSec = request.inputs.length === 1

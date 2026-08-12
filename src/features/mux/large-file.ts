@@ -13,7 +13,7 @@ export const MUX_SPARSE_CO64_ACCEPTANCE_CASE = Object.freeze({
     schema: MUX_SPARSE_FIXTURE_SCHEMA,
     fileSize: '4294975488',
     sampleOffsets: ['4096', '4294967552'],
-    samplePrefixesHex: ['00000165a1b2c3d4', '00000141d4c3b2a1'],
+    samplePrefixesHex: ['000002700605ffff', '00000a8f419a3b15'],
   }),
 } as const);
 

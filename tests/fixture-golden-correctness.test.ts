@@ -61,6 +61,29 @@ afterEach(() => {
 });
 
 describe('REQ-FIX-01/05/10 shared raw+canonical metadata normalization', () => {
+  test('converts both signs of FFmpeg display rotation into the clockwise public contract', () => {
+    const probe = (rotation: number, carrier: 'side-data' | 'tag') => ({
+      format: { format_name: 'mov,mp4,m4a,3gp,3g2,mj2', duration: '1' },
+      streams: [{
+        index: 0,
+        codec_type: 'video',
+        codec_name: 'h264',
+        width: 640,
+        height: 360,
+        ...(carrier === 'side-data'
+          ? { side_data_list: [{ side_data_type: 'Display Matrix', rotation }] }
+          : { tags: { rotate: String(rotation) } }),
+      }],
+    });
+
+    expect(normalizeProbeMetadata(probe(90, 'side-data'), { assetId: 'positive.mp4' })
+      .canonical.tracks[0].rotation).toBe(270);
+    expect(normalizeProbeMetadata(probe(-90, 'side-data'), { assetId: 'negative.mp4' })
+      .canonical.tracks[0].rotation).toBe(90);
+    expect(normalizeProbeMetadata(probe(90, 'tag'), { assetId: 'legacy.mov' })
+      .canonical.tracks[0].rotation).toBe(270);
+  });
+
   test('flat and scenario paths are byte-identical; aliases/order preserve semantic truth and raw DIFF evidence', () => {
     const first = metadataProbe(false, false);
     const reorderedAliases = metadataProbe(true, true);

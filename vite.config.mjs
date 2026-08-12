@@ -7,7 +7,7 @@
 //
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
@@ -164,6 +164,144 @@ function fixturesStatic() {
         const type = staticContentType(filePath);
         return streamStaticFile(req, res, filePath, st, type, 'cross-origin');
       });
+    },
+  };
+}
+
+const CONTENT_ATTESTATION_PATH = '/__media_test__/content-attestation';
+const CONTENT_ATTESTATION_CHUNK_BYTES = 1024 * 1024;
+
+function fixtureFileVersion(st) {
+  return [st.dev, st.ino, st.mode, st.size, st.mtimeMs, st.ctimeMs].join(':');
+}
+
+export async function hashFixtureBlocks(filePath) {
+  const before = statSync(filePath);
+  const overall = createHash('sha256');
+  let block = createHash('sha256');
+  let blockBytes = 0;
+  let actualSizeBytes = 0;
+  const chunkSha256 = [];
+  for await (const value of createReadStream(filePath, {
+    highWaterMark: CONTENT_ATTESTATION_CHUNK_BYTES,
+  })) {
+    const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+    overall.update(bytes);
+    actualSizeBytes += bytes.byteLength;
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const take = Math.min(CONTENT_ATTESTATION_CHUNK_BYTES - blockBytes, bytes.byteLength - offset);
+      block.update(bytes.subarray(offset, offset + take));
+      blockBytes += take;
+      offset += take;
+      if (blockBytes === CONTENT_ATTESTATION_CHUNK_BYTES) {
+        chunkSha256.push(block.digest('hex'));
+        block = createHash('sha256');
+        blockBytes = 0;
+      }
+    }
+  }
+  if (blockBytes > 0) chunkSha256.push(block.digest('hex'));
+  const after = statSync(filePath);
+  if (fixtureFileVersion(before) !== fixtureFileVersion(after) || actualSizeBytes !== after.size) {
+    throw new Error('fixture changed while its content attestation was being computed');
+  }
+  return {
+    actualSha256: overall.digest('hex'),
+    actualSizeBytes,
+    chunkSizeBytes: CONTENT_ATTESTATION_CHUNK_BYTES,
+    chunkSha256,
+  };
+}
+
+/** Deduplicate concurrent hashes and reuse them only while the exact file version is unchanged. */
+export function createCachedFixtureBlockHasher(hashBlocks = hashFixtureBlocks) {
+  const cache = new Map();
+  return async (filePath) => {
+    const version = fixtureFileVersion(statSync(filePath));
+    const existing = cache.get(filePath);
+    if (existing?.version === version) return existing.promise;
+
+    const promise = Promise.resolve().then(() => hashBlocks(filePath));
+    const entry = { version, promise };
+    cache.set(filePath, entry);
+    try {
+      return await promise;
+    } catch (error) {
+      if (cache.get(filePath) === entry) cache.delete(filePath);
+      throw error;
+    }
+  };
+}
+
+/**
+ * Authenticate a large fixture in the local harness process, outside the measured browser heap.
+ * The browser still binds the returned full digest to the selected identity and hashes every range
+ * the adapter consumes against this block map, preserving the admission + TOCTOU contract.
+ */
+export function createContentAttestationEndpointHandler() {
+  const fixturesMediaRoot = join(process.cwd(), 'fixtures', 'media');
+  const hashFixtureBlocksCached = createCachedFixtureBlockHasher();
+  return (req, res, next) => {
+    const requestUrl = new URL(req.url || '/', 'http://media-test.invalid');
+    if (requestUrl.pathname !== CONTENT_ATTESTATION_PATH) return next();
+    if (req.method !== 'GET') {
+      res.statusCode = 405;
+      res.setHeader('Allow', 'GET');
+      return res.end('content-attestation: GET required');
+    }
+    const logicalPath = requestUrl.searchParams.get('logicalPath');
+    if (!logicalPath) {
+      res.statusCode = 400;
+      return res.end('content-attestation: logicalPath is required');
+    }
+    const filePath = normalize(resolve(fixturesMediaRoot, logicalPath));
+    if (
+      !isTrueDescendant(fixturesMediaRoot, filePath) ||
+      !existsSync(filePath) ||
+      containsExistingSymlink(fixturesMediaRoot, filePath)
+    ) {
+      res.statusCode = 404;
+      return res.end('content-attestation: fixture not found');
+    }
+    const initial = statSync(filePath);
+    if (!initial.isFile()) {
+      res.statusCode = 404;
+      return res.end('content-attestation: fixture is not a file');
+    }
+    void hashFixtureBlocksCached(filePath).then(
+      (attestation) => {
+        if (res.destroyed || res.writableEnded) return;
+        const body = JSON.stringify({
+          schema: 'media-test/content-attestation@1',
+          logicalPath,
+          ...attestation,
+        });
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        res.setHeader('Content-Length', String(Buffer.byteLength(body)));
+        res.end(body);
+      },
+      (error) => {
+        if (res.destroyed || res.writableEnded) return;
+        res.statusCode = 500;
+        res.end(`content-attestation: ${error?.message || error}`);
+      },
+    );
+  };
+}
+
+function contentAttestationEndpoint() {
+  const handler = createContentAttestationEndpointHandler();
+  return {
+    name: 'fixture-content-attestation',
+    configureServer(server) {
+      server.middlewares.use(handler);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(handler);
     },
   };
 }
@@ -488,7 +626,13 @@ function saveEndpoint() {
 
 export default {
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
-  plugins: [crossOriginIsolation(), ffmpegVendorStatic(), saveEndpoint(), fixturesStatic()],
+  plugins: [
+    crossOriginIsolation(),
+    ffmpegVendorStatic(),
+    saveEndpoint(),
+    contentAttestationEndpoint(),
+    fixturesStatic(),
+  ],
   // The per-file robustness Worker shares dynamically imported engine/scenario chunks with the app;
   // code-splitting workers must be emitted as ES modules rather than Vite's IIFE default.
   worker: { format: 'es' },

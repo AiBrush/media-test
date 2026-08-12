@@ -72,10 +72,12 @@ import {
   assessObservedSeekLanding,
   assessSeekSequence,
   collectAlphaEvidence,
+  displayFrameEvidence,
   displayEvidenceFromFrameDigests,
   displayTransformFromOptions,
   parseAlphaEvidenceArtifact,
   seekSequenceContractFromOptions,
+  transformRgbaToDisplaySpace,
   type AlphaEvidenceArtifact,
   type DecodeSeekVerdict,
   type SeekSequenceObservation,
@@ -92,6 +94,9 @@ import {
   validateReturnedPartialRemux,
 } from '../features/remux/index.ts';
 import type {
+  IsoBmffRangeReadResult,
+  IsoBmffRangeSampleEvidence,
+  IsoBmffRangeSource,
   IsoBmffRangeTrackEvidence,
   NormalizedRemuxTrackEvidence,
 } from '../features/remux/index.ts';
@@ -103,13 +108,16 @@ import {
   TRIM_NOOP_IDENTITY_INVARIANT,
   assessAudioTrimEvidence,
   assessFeatureLabelledTrim,
+  assessGoldenVideoPacketCopyTrim,
   assessTrimComposition,
   assessFragmentedTrimOutput,
   assessTrimBoundaryEvidence,
   assessTrimNoopIdentity,
   inspectTrimAudioContainer,
   readIsoBmffPresentationTimeline,
+  sampledTrimFramesAlign,
   selectIsoBmffTrimWindows,
+  stableIsoBmffTrimTerminalOffsetUs,
   trimBoundaryEvidenceKey,
   trimContractForScenario,
   type IsoBmffPresentationTimeline,
@@ -138,6 +146,7 @@ import {
   readMuxOrientation,
   readNeutralMuxSource,
   readNeutralMuxTarget,
+  selectedMuxPresentationEndUs,
   type MuxCandidateTrackEvidence,
   type MuxDecision,
   type MuxSourceTrackEvidence,
@@ -999,7 +1008,7 @@ export async function runOracle(
       case 'average-bitrate':
         return averageBitrate(ctx);
       case 'mp4-box-layout':
-        return mp4BoxLayout(ctx);
+        return await mp4BoxLayout(ctx);
       case 'webm-live-layout':
         return webmLiveLayout(ctx);
       case 'fanout-renditions':
@@ -1040,7 +1049,7 @@ interface TopLevelBox {
   size: number;
 }
 
-function mp4BoxLayout(ctx: OracleContext): OracleOutcome {
+async function mp4BoxLayout(ctx: OracleContext): Promise<OracleOutcome> {
   const oracle: OracleId = 'mp4-box-layout';
   const out = ctx.output;
   if (!out) return fail(oracle, 'no ctx.output to inspect');
@@ -1050,6 +1059,40 @@ function mp4BoxLayout(ctx: OracleContext): OracleOutcome {
   const outputContainer = normStr(readStringOption(options, ['container']) ?? out.container);
   if (outputContainer !== 'mp4' && outputContainer !== 'mov') {
     return fail(oracle, `output container '${outputContainer || out.container}' is not an ISOBMFF layout target`);
+  }
+
+  if (out.artifact !== undefined) {
+    const ranged = await readIsoBmffRangeProgram(
+      { size: out.artifact.byteLength, range: out.artifact.range.bind(out.artifact) },
+      outputContainer,
+      ctx.signal,
+    );
+    if (ranged.state !== 'OK') {
+      return ranged.state === 'MALFORMED' || ranged.state === 'INCOMPLETE'
+        ? fail(oracle, `range-read MP4 layout ${ranged.state} [${ranged.reasonCode}]`)
+        : oracleError(
+            oracle,
+            'MP4_RANGE_LAYOUT_READER_COVERAGE_ERROR',
+            `range-read MP4 layout ${ranged.state} [${ranged.reasonCode}]`,
+          );
+    }
+    const samples = ranged.value.tracks.reduce((sum, track) => sum + track.samples.length, 0);
+    const fragmented = readBooleanOption(options, ['fragmented']) ||
+      readStringOrFalseOption(options, ['fastStart']) === 'fragmented';
+    if (fragmented && ranged.value.representation.fragmented !== true) {
+      return fail(oracle, 'range-read MP4 output is progressive, expected fragmented');
+    }
+    return pass(
+      oracle,
+      `range-read MP4 has complete ${ranged.value.representation.fragmented ? 'fragmented' : 'progressive'} ` +
+        `layout with ${ranged.value.tracks.length} track(s) and ${samples} sample(s)`,
+      {
+        outputBytes: ranged.value.byteLength,
+        tracks: ranged.value.tracks.length,
+        samples,
+        fragmented: ranged.value.representation.fragmented ? 1 : 0,
+      },
+    );
   }
 
   const boxes = parseTopLevelBoxes(out.bytes);
@@ -1703,7 +1746,8 @@ function semanticCodec(track: SemanticMetadataTrack): { raw: string; canonical: 
   const normalizedCodec = normStr(track.codec);
   const normalized = normalizedCodec || normStr(raw);
   const canonicalVocabulary = new Set([
-    'h264', 'hevc', 'vp8', 'vp9', 'av1', 'mjpeg', 'aac', 'opus', 'vorbis', 'flac', 'mp3', 'alac',
+    'h264', 'hevc', 'vp8', 'vp9', 'av1', 'mjpeg', 'png', 'webp',
+    'aac', 'opus', 'vorbis', 'flac', 'mp3', 'alac',
     'pcm-s16', 'pcm-s16be', 'pcm-s24', 'pcm-s24be', 'pcm-f32',
   ]);
   if (canonicalVocabulary.has(normalized)) return { raw, canonical: normalized };
@@ -2468,8 +2512,12 @@ function normalizePacketTrack(
   for (const entry of ordered) {
     const packet = entry.packet;
     const explicit = packet.normalizedAccessUnitId ?? packet.accessUnitId;
+    // Access-unit identities can describe coded/decoded content. Identical content may recur at
+    // many presentation times (silence and repeated video frames are common), so identity alone is
+    // not a globally unique event key. Rows belong to the same semantic access unit only when the
+    // identity and presentation time both agree.
     const key = explicit !== undefined
-      ? `id:${explicit}`
+      ? `id:${explicit}:time:${packet.ptsUs}`
       : `time:${packet.ptsUs}:${packet.durationUs ?? ''}`;
     const group = groups.get(key);
     if (group) group.push(entry);
@@ -3429,9 +3477,114 @@ interface RangeRemuxPair {
   failed: boolean;
 }
 
+interface RangeArtifactTrace {
+  bytesRead: number;
+  blockRequests: number;
+}
+
+interface TracedRemuxRangeSource extends IsoBmffRangeSource {
+  readonly trace: RangeArtifactTrace;
+}
+
+/**
+ * Inputs below the authenticated-URL threshold are already digest-verified and sealed by the
+ * runner as one in-memory body. Expose that admitted body through the same neutral range contract
+ * used by large URL inputs so a range-backed output never falls back to parsing its validation
+ * prefix as though it were the complete file.
+ */
+function materializedRemuxRangeSource(bytes: Uint8Array): TracedRemuxRangeSource {
+  const trace: RangeArtifactTrace = { bytesRead: 0, blockRequests: 0 };
+  return {
+    size: bytes.byteLength,
+    trace,
+    async range(start, end, signal) {
+      signal?.throwIfAborted();
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+        throw new RangeError('materialized remux range bounds must be safe integers');
+      }
+      const boundedStart = Math.max(0, Math.min(start, bytes.byteLength));
+      const boundedEnd = Math.max(boundedStart, Math.min(end, bytes.byteLength));
+      trace.bytesRead += boundedEnd - boundedStart;
+      trace.blockRequests++;
+      return bytes.subarray(boundedStart, boundedEnd);
+    },
+  };
+}
+
+function cachedRangeArtifactSource(
+  artifact: NonNullable<MediaBytes['artifact']>,
+): TracedRemuxRangeSource {
+  const blockBytes = 4 * 1024 * 1024;
+  const cache = new Map<number, Uint8Array>();
+  const trace: RangeArtifactTrace = { bytesRead: 0, blockRequests: 0 };
+  const load = async (index: number, signal?: AbortSignal): Promise<Uint8Array> => {
+    const cached = cache.get(index);
+    if (cached !== undefined) {
+      cache.delete(index);
+      cache.set(index, cached);
+      return cached;
+    }
+    const start = index * blockBytes;
+    const end = Math.min(artifact.byteLength, start + blockBytes);
+    const bytes = await artifact.range(start, end, signal);
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength !== end - start) {
+      throw new Error(
+        `range artifact block ${index} returned ${bytes?.byteLength ?? 'non-bytes'} bytes, expected ${end - start}`,
+      );
+    }
+    trace.bytesRead += bytes.byteLength;
+    trace.blockRequests++;
+    cache.set(index, bytes);
+    while (cache.size > 8) cache.delete(cache.keys().next().value as number);
+    return bytes;
+  };
+  return {
+    size: artifact.byteLength,
+    trace,
+    async range(start, end, signal) {
+      signal?.throwIfAborted();
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+        throw new RangeError('range artifact bounds must be safe integers');
+      }
+      const boundedStart = Math.max(0, Math.min(start, artifact.byteLength));
+      const boundedEnd = Math.max(boundedStart, Math.min(end, artifact.byteLength));
+      const out = new Uint8Array(boundedEnd - boundedStart);
+      if (out.byteLength === 0) return out;
+      const first = Math.floor(boundedStart / blockBytes);
+      const last = Math.floor((boundedEnd - 1) / blockBytes);
+      for (let index = first; index <= last; index++) {
+        const block = await load(index, signal);
+        const blockStart = index * blockBytes;
+        const copyStart = Math.max(boundedStart, blockStart);
+        const copyEnd = Math.min(boundedEnd, blockStart + block.byteLength);
+        out.set(
+          block.subarray(copyStart - blockStart, copyEnd - blockStart),
+          copyStart - boundedStart,
+        );
+      }
+      signal?.throwIfAborted();
+      return out;
+    },
+  };
+}
+
 function remuxTrackPairScore(
-  source: IsoBmffRangeTrackEvidence,
-  output: RemuxTrackEvidence,
+  source: {
+    readonly samples: readonly unknown[];
+    readonly language?: string;
+    readonly sampleRate?: number;
+    readonly channels?: number;
+    readonly width?: number;
+    readonly height?: number;
+  },
+  output: {
+    readonly samples: readonly unknown[];
+    readonly language?: string;
+    readonly sampleRate?: number;
+    readonly channels?: number;
+    readonly width?: number;
+    readonly height?: number;
+  },
 ): number {
   let score = source.samples.length === output.samples.length ? 10_000 : 0;
   for (const key of ['language', 'sampleRate', 'channels', 'width', 'height'] as const) {
@@ -3473,6 +3626,268 @@ function pairRangeRemuxTracks(
   return remaining.length === 0 ? { pairs } : { failure: 'output contains unmatched media tracks' };
 }
 
+function pairIsoRangeTracks(
+  source: readonly IsoBmffRangeTrackEvidence[],
+  output: readonly IsoBmffRangeTrackEvidence[],
+): { pairs?: Array<[IsoBmffRangeTrackEvidence, IsoBmffRangeTrackEvidence]>; failure?: string } {
+  const sourceMedia = source.filter((track) => track.type === 'video' || track.type === 'audio');
+  const outputMedia = output.filter((track) => track.type === 'video' || track.type === 'audio');
+  if (sourceMedia.length !== outputMedia.length) {
+    return { failure: `required media-track count changed: ${sourceMedia.length} -> ${outputMedia.length}` };
+  }
+  const remaining = [...outputMedia];
+  const pairs: Array<[IsoBmffRangeTrackEvidence, IsoBmffRangeTrackEvidence]> = [];
+  for (const sourceTrack of sourceMedia) {
+    let bestIndex = -1;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < remaining.length; index++) {
+      const candidate = remaining[index]!;
+      if (remuxCodecKey(sourceTrack) !== remuxCodecKey(candidate)) continue;
+      const score = remuxTrackPairScore(sourceTrack, candidate);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+    if (bestIndex < 0) return { failure: `track membership '${remuxCodecKey(sourceTrack)}' changed` };
+    pairs.push([sourceTrack, remaining.splice(bestIndex, 1)[0]!]);
+  }
+  return remaining.length === 0 ? { pairs } : { failure: 'output contains unmatched media tracks' };
+}
+
+async function rangeArtifactRemuxReference(
+  ctx: OracleContext,
+  sourceReader: TracedRemuxRangeSource,
+  sourceRead: Extract<IsoBmffRangeReadResult, { state: 'OK' }>,
+  expectedTarget: string,
+  surfaceRepresentationDifferences: boolean,
+): Promise<OracleOutcome> {
+  const oracle: OracleId = 'reference-reimport';
+  const output = ctx.output!;
+  const artifact = output.artifact!;
+  const outputReader = cachedRangeArtifactSource(artifact);
+  const outputRead = await readIsoBmffRangeProgram(outputReader, output.container, ctx.signal);
+  if (outputRead.state !== 'OK') {
+    return outputRead.state === 'MALFORMED' || outputRead.state === 'INCOMPLETE'
+      ? fail(
+          oracle,
+          `output range reader ${outputRead.state} [${outputRead.reasonCode}]`,
+        )
+      : oracleError(
+          oracle,
+          'REMUX_OUTPUT_RANGE_READER_COVERAGE_ERROR',
+          `output range reader ${outputRead.state} [${outputRead.reasonCode}]`,
+        );
+  }
+
+  const failures: string[] = [];
+  const differences: string[] = [];
+  const addFailure = (detail: string): void => {
+    if (failures.length < 16) failures.push(detail);
+  };
+  const addDifference = (detail: string): void => {
+    if (differences.length < 32 && !differences.includes(detail)) differences.push(detail);
+  };
+  if (resolveContainer(output.container, '') !== resolveContainer(expectedTarget, '')) {
+    addFailure(`returned container '${output.container}', expected '${expectedTarget}'`);
+  }
+  if (outputRead.value.representation.fragmented !== true) {
+    addFailure('range artifact is not a fragmented ISO-BMFF program');
+  }
+  const matched = pairIsoRangeTracks(sourceRead.value.tracks, outputRead.value.tracks);
+  if (matched.failure) addFailure(matched.failure);
+  const pairStates = (matched.pairs ?? []).map(([source, candidate]) => ({
+    source,
+    candidate,
+    sourceOriginUs: minimumDefined(source.samples.map((sample) => sample.ptsUs)),
+    candidateOriginUs: minimumDefined(candidate.samples.map((sample) => sample.ptsUs)),
+    sourceDtsOriginUs: minimumDefined(source.samples.map((sample) => sample.dtsUs)),
+    candidateDtsOriginUs: minimumDefined(candidate.samples.map((sample) => sample.dtsUs)),
+    sourceParameterSets: [] as Uint8Array[],
+    candidateParameterSets: [] as Uint8Array[],
+    sourceFraming: new Set<string>(),
+    candidateFraming: new Set<string>(),
+    sourceGrouping: [] as number[],
+    candidateGrouping: [] as number[],
+    comparedUnits: 0,
+    failed: false,
+  }));
+  const jobs: Array<{
+    pair: typeof pairStates[number];
+    source: IsoBmffRangeSampleEvidence;
+    candidate: IsoBmffRangeSampleEvidence;
+    sampleIndex: number;
+  }> = [];
+  for (const pair of pairStates) {
+    const label = remuxCodecKey(pair.source).replace(':', '/');
+    if (pair.source.samples.length !== pair.candidate.samples.length) {
+      addFailure(
+        `${label} coded sample count changed: ${pair.source.samples.length} -> ${pair.candidate.samples.length}`,
+      );
+    }
+    for (const key of ['language', 'sampleRate', 'channels', 'width', 'height'] as const) {
+      if (pair.source[key] !== undefined && pair.source[key] !== pair.candidate[key]) {
+        addFailure(`${label} ${key} changed ${String(pair.source[key])} -> ${String(pair.candidate[key])}`);
+      }
+    }
+    const count = Math.min(pair.source.samples.length, pair.candidate.samples.length);
+    for (let sampleIndex = 0; sampleIndex < count; sampleIndex++) {
+      jobs.push({
+        pair,
+        source: pair.source.samples[sampleIndex]!,
+        candidate: pair.candidate.samples[sampleIndex]!,
+        sampleIndex,
+      });
+    }
+  }
+  jobs.sort((left, right) => left.source.fileOffset - right.source.fileOffset);
+
+  for (const job of jobs) {
+    if (job.pair.failed) continue;
+    ctx.signal?.throwIfAborted();
+    const [sourcePayload, candidatePayload] = await Promise.all([
+      sourceReader.range(
+        job.source.fileOffset,
+        job.source.fileOffset + job.source.byteLength,
+        ctx.signal,
+      ),
+      outputReader.range(
+        job.candidate.fileOffset,
+        job.candidate.fileOffset + job.candidate.byteLength,
+        ctx.signal,
+      ),
+    ]);
+    const normalizedSource = normalizeRemuxTrackForStreamingComparison({
+      ...job.pair.source,
+      samples: [{ ...job.source, payload: sourcePayload }],
+    });
+    const normalizedCandidate = normalizeRemuxTrackForStreamingComparison({
+      ...job.pair.candidate,
+      samples: [{ ...job.candidate, payload: candidatePayload }],
+    });
+    const label = remuxCodecKey(job.pair.source).replace(':', '/');
+    if (!normalizedSource || !normalizedCandidate) {
+      addFailure(`${label} coded framing is malformed or ambiguous at sample ${job.sampleIndex}`);
+      job.pair.failed = true;
+      continue;
+    }
+    addUniqueRemuxBytes(job.pair.sourceParameterSets, normalizedSource.parameterSets);
+    addUniqueRemuxBytes(job.pair.candidateParameterSets, normalizedCandidate.parameterSets);
+    job.pair.sourceFraming.add(job.source.framing);
+    job.pair.candidateFraming.add(job.candidate.framing);
+    job.pair.sourceGrouping.push(...normalizedSource.grouping);
+    job.pair.candidateGrouping.push(...normalizedCandidate.grouping);
+    if (normalizedSource.units.length !== normalizedCandidate.units.length) {
+      addFailure(
+        `${label} normalized coded unit count changed at sample ${job.sampleIndex}: ` +
+          `${normalizedSource.units.length} -> ${normalizedCandidate.units.length}`,
+      );
+      job.pair.failed = true;
+      continue;
+    }
+    for (let unitIndex = 0; unitIndex < normalizedSource.units.length; unitIndex++) {
+      const sourceUnit = normalizedSource.units[unitIndex]!;
+      const candidateUnit = normalizedCandidate.units[unitIndex]!;
+      const absoluteUnitIndex = job.pair.comparedUnits++;
+      if (!remuxBytesEqual(sourceUnit.payload, candidateUnit.payload)) {
+        addFailure(`${label} normalized coded access-unit content changed at unit ${absoluteUnitIndex}`);
+        job.pair.failed = true;
+        break;
+      }
+      const compareAxis = (
+        axis: 'PTS' | 'DTS',
+        sourceValue: number | undefined,
+        candidateValue: number | undefined,
+        sourceOrigin: number | undefined,
+        candidateOrigin: number | undefined,
+      ): void => {
+        if (sourceValue === undefined && candidateValue === undefined) return;
+        if (
+          sourceValue === undefined || candidateValue === undefined ||
+          sourceOrigin === undefined || candidateOrigin === undefined
+        ) {
+          addDifference(`${label} ${axis} provenance differs`);
+          return;
+        }
+        const delta = Math.abs((sourceValue - sourceOrigin) - (candidateValue - candidateOrigin));
+        if (delta > 2_000) addFailure(`${label} ${axis}[${absoluteUnitIndex}] drift ${delta}us > 2000us`);
+        else if (delta > 0) addDifference(`${label} ${axis} rounded within tolerance`);
+      };
+      compareAxis(
+        'PTS', sourceUnit.ptsUs, candidateUnit.ptsUs,
+        job.pair.sourceOriginUs, job.pair.candidateOriginUs,
+      );
+      compareAxis(
+        'DTS', sourceUnit.dtsUs, candidateUnit.dtsUs,
+        job.pair.sourceDtsOriginUs, job.pair.candidateDtsOriginUs,
+      );
+      if (sourceUnit.durationUs !== undefined && candidateUnit.durationUs !== undefined) {
+        const delta = Math.abs(sourceUnit.durationUs - candidateUnit.durationUs);
+        if (delta > 50_000) addFailure(`${label} duration[${absoluteUnitIndex}] drift ${delta}us > 50000us`);
+        else if (delta > 0) addDifference(`${label} duration rounded within tolerance`);
+      } else if (sourceUnit.durationUs !== candidateUnit.durationUs) {
+        addDifference(`${label} coded-duration provenance differs`);
+      }
+    }
+  }
+
+  for (const pair of pairStates) {
+    const label = remuxCodecKey(pair.source).replace(':', '/');
+    if (!sameRemuxByteSet(pair.sourceParameterSets, pair.candidateParameterSets)) {
+      addFailure(`${label} codec parameter-set content changed`);
+    }
+    if ([...pair.sourceFraming].join(',') !== [...pair.candidateFraming].join(',')) {
+      addDifference(`${label} framing changed`);
+    }
+    if (pair.sourceGrouping.join(',') !== pair.candidateGrouping.join(',')) {
+      addDifference(`${label} legal access-unit grouping changed`);
+    }
+    if (
+      pair.source.codecPrivate && pair.candidate.codecPrivate &&
+      !remuxBytesEqual(pair.source.codecPrivate, pair.candidate.codecPrivate)
+    ) {
+      addDifference(`${label} codec configuration placement/representation differs`);
+    }
+    if (pair.source.id !== pair.candidate.id) addDifference(`${label} container track identity/order differs`);
+  }
+  if (sourceRead.value.durationUs !== undefined && outputRead.value.durationUs !== undefined) {
+    const delta = Math.abs(sourceRead.value.durationUs - outputRead.value.durationUs);
+    if (delta > 50_000) addFailure(`program duration drift ${delta}us > 50000us`);
+    else if (delta > 0) addDifference('program duration differs only within declared container tolerance');
+  }
+  if (resolveContainer(sourceRead.value.container, '') !== resolveContainer(outputRead.value.container, '')) {
+    addDifference(`wrapper changed ${sourceRead.value.container} -> ${outputRead.value.container}`);
+  }
+  const measurements = {
+    sourceTracks: sourceRead.value.tracks.length,
+    outputTracks: outputRead.value.tracks.length,
+    matchedTracks: pairStates.length,
+    sourceSamples: sourceRead.value.tracks.reduce((sum, track) => sum + track.samples.length, 0),
+    outputSamples: outputRead.value.tracks.reduce((sum, track) => sum + track.samples.length, 0),
+    sourceRangeBytesRead: sourceReader.trace.bytesRead,
+    sourceRangeBlockRequests: sourceReader.trace.blockRequests,
+    outputRangeBytesRead: outputReader.trace.bytesRead,
+    outputRangeBlockRequests: outputReader.trace.blockRequests,
+    representationDifferences: differences.length,
+  };
+  if (failures.length > 0) {
+    return {
+      state: 'VERDICT', oracle, verdict: 'FAIL', reasonCode: 'REMUX_STRICT_COPY_VIOLATION',
+      detail: failures.join('; '), measurements,
+    };
+  }
+  return {
+    state: 'VERDICT',
+    oracle,
+    verdict: 'PASS',
+    reasonCode: differences.length > 0 && surfaceRepresentationDifferences
+      ? 'REMUX_VALID_REPRESENTATION_DIFFERENCE'
+      : 'REMUX_STRICT_COPY_PRESERVED',
+    detail: differences.join('; ') || 'all required range-read coded tracks, content and timelines are preserved',
+    measurements,
+  };
+}
+
 function minimumDefined(values: readonly (number | undefined)[]): number | undefined {
   let result = Number.POSITIVE_INFINITY;
   for (const value of values) {
@@ -3481,7 +3896,7 @@ function minimumDefined(values: readonly (number | undefined)[]): number | undef
   return Number.isFinite(result) ? result : undefined;
 }
 
-async function authenticatedRangeRemuxReference(
+async function rangeRemuxReference(
   ctx: OracleContext,
   sourceContainer: string,
   expectedTarget: string,
@@ -3490,7 +3905,9 @@ async function authenticatedRangeRemuxReference(
   const oracle: OracleId = 'reference-reimport';
   const output = ctx.output;
   if (!output) return fail(oracle, 'no ctx.output bytes to re-import');
-  const reader = createAuthenticatedMediaInputReader(ctx.input);
+  const reader: TracedRemuxRangeSource = ctx.input.contentAttestation !== undefined
+    ? createAuthenticatedMediaInputReader(ctx.input)
+    : materializedRemuxRangeSource(new Uint8Array(await ctx.input.arrayBuffer()));
   const sourceRead = await readIsoBmffRangeProgram(
     reader,
     sourceContainer,
@@ -3501,6 +3918,15 @@ async function authenticatedRangeRemuxReference(
       oracle,
       'REMUX_SOURCE_RANGE_EVIDENCE_INVALID',
       `source neutral range reader ${sourceRead.state} [${sourceRead.reasonCode}]`,
+    );
+  }
+  if (output.artifact !== undefined) {
+    return rangeArtifactRemuxReference(
+      ctx,
+      reader,
+      sourceRead,
+      expectedTarget,
+      surfaceRepresentationDifferences,
     );
   }
   const outputRead = readNeutralRemuxProgram(output.bytes, output.container);
@@ -3769,9 +4195,9 @@ async function referenceReimport(ctx: OracleContext, t: Required<OracleTolerance
     const expectedTarget = remuxRoundTripContractFromOptions(ctx.scenario.options)?.backTo ??
       readStringOption(ctx.scenario.options, ['container']) ?? ctx.output.container;
     const structural =
-      ctx.input.contentAttestation !== undefined &&
+      (ctx.input.contentAttestation !== undefined || ctx.output.artifact !== undefined) &&
       (sourceContainer === 'mp4' || sourceContainer === 'mov')
-        ? await authenticatedRangeRemuxReference(
+        ? await rangeRemuxReference(
             ctx,
             sourceContainer,
             expectedTarget,
@@ -4093,10 +4519,19 @@ async function muxRotationLayer(
   const sourceOrientation = readMuxOrientation(sourceBytes, sourceContainer);
   const candidateOrientation = readMuxOrientation(ctx.output.bytes, ctx.output.container);
   const sourceMedia: MediaBytes = { bytes: sourceBytes, mime: ctx.input.mime, container: sourceContainer };
+  const sourceProgram = readNeutralRemuxProgram(sourceBytes, sourceContainer);
+  const interiorSampleTimesSec = sourceProgram.state === 'OK'
+    ? anchoredRemuxSampleTimesSec(sourceProgram.value, 12)
+    : [];
   let sourceFrames: FrameSink;
   let candidateFrames: FrameSink;
   try {
-    sourceFrames = await ctx.decodeWithPlatform(sourceMedia, { maxFrames: 12, sampling: 'uniform' });
+    sourceFrames = await ctx.decodeWithPlatform(sourceMedia, {
+      maxFrames: interiorSampleTimesSec.length || 12,
+      sampling: 'uniform',
+      ...(interiorSampleTimesSec.length ? { sampleTimesSec: interiorSampleTimesSec } : {}),
+      presentationColorManaged: true,
+    });
   } catch (error) {
     return classifyReferenceDecodeFailure(oracle, 'source', error, sourceMedia);
   }
@@ -4108,12 +4543,15 @@ async function muxRotationLayer(
       'neutral source decode produced no display-space frames',
     );
   }
-  const pairedPresentationTimesSec = sourceFrames.frames.map((frame) => frame.ptsUs / 1_000_000);
+  const pairedPresentationTimesSec = interiorSampleTimesSec.length
+    ? interiorSampleTimesSec
+    : sourceFrames.frames.map((frame) => frame.ptsUs / 1_000_000);
   try {
     candidateFrames = await ctx.decodeWithPlatform(ctx.output, {
       maxFrames: pairedPresentationTimesSec.length,
       sampling: 'uniform',
       sampleTimesSec: pairedPresentationTimesSec,
+      presentationColorManaged: true,
     });
   } catch (error) {
     return classifyReferenceDecodeFailure(oracle, 'candidate', error, ctx.output);
@@ -4121,13 +4559,69 @@ async function muxRotationLayer(
   if (candidateFrames.frames.length === 0) {
     return fail(oracle, 'neutral candidate decode produced no display-space frames');
   }
+  const sourcePresentation = await presentationFrameDigestsForOrientation(sourceFrames, sourceOrientation);
+  const candidatePresentation = await presentationFrameDigestsForOrientation(candidateFrames, candidateOrientation);
   return muxDecisionOutcome(oracle, assessMuxRotation(
     sourceOrientation,
     candidateOrientation,
-    displayEvidenceFromFrameDigests(sourceFrames.frames),
-    displayEvidenceFromFrameDigests(candidateFrames.frames),
+    displayEvidenceFromFrameDigests(sourcePresentation),
+    displayEvidenceFromFrameDigests(candidatePresentation),
     policy,
   ));
+}
+
+/**
+ * Normalize a neutral browser decode to display space when the browser exposes only the coded raster.
+ * ISO-BMFF presenters commonly apply `tkhd` themselves; Chromium currently leaves Matroska
+ * ProjectionPoseRoll unapplied. The independently parsed orientation is therefore the authority, and
+ * pixels are transformed only when every decoded frame still has the exact coded dimensions.
+ */
+async function presentationFrameDigestsForOrientation(
+  sink: FrameSink,
+  orientation: ReturnType<typeof readMuxOrientation>,
+): Promise<FrameDigest[]> {
+  if (orientation.state !== 'OK' || orientation.value.rotationDegrees === 0) return sink.frames;
+  const observed = orientation.value;
+  if (sink.frames.every(
+    (frame) => frame.width === observed.displayWidth && frame.height === observed.displayHeight,
+  )) {
+    return sink.frames;
+  }
+  if (
+    sink.getPixels === undefined ||
+    !sink.frames.every(
+      (frame) => frame.width === observed.codedWidth && frame.height === observed.codedHeight,
+    )
+  ) {
+    return sink.frames;
+  }
+  const contract = {
+    schema: 'media-test/display-space-evidence@1' as const,
+    codedWidth: observed.codedWidth,
+    codedHeight: observed.codedHeight,
+    displayWidth: observed.displayWidth,
+    displayHeight: observed.displayHeight,
+    rotationDegrees: observed.rotationDegrees,
+    flipX: false,
+    flipY: false,
+  };
+  const normalized: FrameDigest[] = [];
+  for (let index = 0; index < sink.frames.length; index++) {
+    const frame = sink.frames[index]!;
+    const pixels = await sink.getPixels(index);
+    const display = transformRgbaToDisplaySpace(
+      { width: pixels.width, height: pixels.height, data: pixels.data },
+      contract,
+    );
+    const evidence = displayFrameEvidence(frame.ptsUs, display);
+    normalized.push({
+      ...frame,
+      width: evidence.width,
+      height: evidence.height,
+      sha256: evidence.rgbaSha256,
+    });
+  }
+  return normalized;
 }
 
 function muxDecisionOutcome(oracle: OracleId, decision: MuxDecision): OracleOutcome {
@@ -5084,6 +5578,9 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
   let ssimCount = 0;
   let minSsim = 1;
   let exactCount = 0;
+  let comparedDimensions = 0;
+  let dimensionMismatches = 0;
+  let firstDimensionMismatch: string | undefined;
   const havePixels = typeof sink.getPixels === 'function';
 
   let residualSum = 0;
@@ -5094,6 +5591,17 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     // Guard against a sparse/holey candidate frame array (a null/undefined entry, or one missing a
     // sha256). Such a frame contributes no evidence rather than null-derefing on cand.sha256.
     if (!cand) continue;
+    const expectedGeometry = committedSsimExpectedGeometry(ctx, goldenFrame);
+    if (expectedGeometry) {
+      comparedDimensions++;
+      if (cand.width !== expectedGeometry.width || cand.height !== expectedGeometry.height) {
+        dimensionMismatches++;
+        firstDimensionMismatch ??=
+          `frame ${goldenFrame?.index ?? pair.referenceIndex}: ` +
+          `${cand.width ?? 'unknown'}x${cand.height ?? 'unknown'} vs ` +
+          `${expectedGeometry.kind} ${expectedGeometry.width}x${expectedGeometry.height}`;
+      }
+    }
     // digest equality → identical normalized frame → SSIM 1 / PSNR ∞
     if (goldenFrame && cand.sha256 != null && normHex(cand.sha256) === normHex(goldenFrame.sha256)) {
       exactCount++;
@@ -5130,12 +5638,23 @@ async function ssimPsnr(ctx: OracleContext, t: Required<OracleTolerances>): Prom
     requestedSamples: aligned.requestedSamples,
     pairs: aligned.pairs.length,
     exactFrames: exactCount,
+    comparedDimensions,
+    dimensionMismatches,
     ssimMean: ssimCount ? ssimSum / ssimCount : 0,
     ssimMin: ssimCount ? minSsim : 0,
     presentationCoverage: aligned.coverageRatio,
     meanTimestampResidualUs: ssimCount ? residualSum / ssimCount : 0,
     maxTimestampResidualUs: residualMax,
   };
+
+  if (dimensionMismatches > 0) {
+    return fail(
+      oracle,
+      `${dimensionMismatches}/${comparedDimensions} presentation-aligned frame geometries differ; ` +
+        (firstDimensionMismatch ?? 'candidate display geometry does not match committed evidence'),
+      finiteOnly(measurements),
+    );
+  }
 
   // PSNR: true RGB PSNR requires golden raw pixels (never committed). When every paired frame is
   // digest-identical we report Infinity; otherwise PSNR is reported as unavailable and the gate
@@ -5698,6 +6217,37 @@ function usesTransformReference(ctx: OracleContext): boolean {
     rotate === 90 || rotate === 180 || rotate === 270;
 }
 
+/**
+ * Committed frame sidecars describe the immutable source. A resize transcode therefore cannot use
+ * their raster dimensions as its output contract: the explicit requested output raster is the
+ * authority, while the committed luma signature remains the independent visual-content reference.
+ * For decode and same-size transcodes, retain the committed display geometry. Requiring both resize
+ * dimensions avoids guessing the engine's aspect-ratio policy from a one-axis request.
+ */
+function committedSsimExpectedGeometry(
+  ctx: OracleContext,
+  goldenFrame: FrameDigest | undefined,
+): { width: number; height: number; kind: 'requested output' | 'golden' } | undefined {
+  if (ctx.scenario.op === 'transcode') {
+    const options: Record<string, unknown> = isObject(ctx.scenario.options)
+      ? ctx.scenario.options
+      : {};
+    const video = isObject(options.video) ? options.video : undefined;
+    const width = readNumberOption(video, ['width']);
+    const height = readNumberOption(video, ['height']);
+    if (width !== undefined && height !== undefined && width > 0 && height > 0) {
+      return { width: Math.round(width), height: Math.round(height), kind: 'requested output' };
+    }
+  }
+  if (
+    goldenFrame && Number.isFinite(goldenFrame.width) && Number.isFinite(goldenFrame.height) &&
+    goldenFrame.width! > 0 && goldenFrame.height! > 0
+  ) {
+    return { width: goldenFrame.width!, height: goldenFrame.height!, kind: 'golden' };
+  }
+  return undefined;
+}
+
 function usesAlphaVisualReference(ctx: OracleContext): boolean {
   if (ctx.scenario.op !== 'transcode') return false;
   const options: Record<string, unknown> = isObject(ctx.scenario.options) ? ctx.scenario.options : {};
@@ -6207,9 +6757,11 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   const range = contract.range;
   const diffs: string[] = [];
   const measurements: Record<string, number> = {};
-  const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
+  const sourceBytes = ctx.input.contentAttestation === undefined
+    ? new Uint8Array(await ctx.input.arrayBuffer())
+    : undefined;
   const sourceContainer = ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
-  const sourceIsoRead = isIsoBmffContainer(sourceContainer)
+  const sourceIsoRead = sourceBytes !== undefined && isIsoBmffContainer(sourceContainer)
     ? readIsoBmffPresentationTimeline(sourceBytes)
     : undefined;
   const sourceIso = sourceIsoRead?.state === 'OK' ? sourceIsoRead : undefined;
@@ -6217,6 +6769,17 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     ? readIsoBmffPresentationTimeline(ctx.output.bytes)
     : undefined;
   const outputIso = outputIsoRead?.state === 'OK' ? outputIsoRead : undefined;
+  const sourceIsoVideo = sourceIso?.tracks.find((track) => track.type === 'video');
+  const outputIsoVideo = outputIso?.tracks.find((track) => track.type === 'video');
+  if (sourceIsoVideo) measurements.trimSourceIsoVideoSampleCount = sourceIsoVideo.samples.length;
+  if (outputIsoVideo) {
+    measurements.trimOutputIsoVideoSampleCount = outputIsoVideo.samples.length;
+    for (const [index, sample] of outputIsoVideo.samples.slice(0, 4).entries()) {
+      measurements[`trimOutputIsoVideoPtsUs${index}`] = sample.presentationStartUs;
+      measurements[`trimOutputIsoVideoDurationUs${index}`] =
+        sample.presentationEndUs - sample.presentationStartUs;
+    }
+  }
 
   // Prefer edit-list-resolved presentation duration for ISO BMFF. The generic structure reader's
   // mvhd-only scalar is only a fallback for formats without the stronger timeline reader.
@@ -6233,7 +6796,7 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   const hasVideo = ctx.golden.meta?.tracks.some((track) => track.type === 'video') === true ||
     structure?.tracks.some((track) => track.type === 'video') === true;
 
-  if (contract.mode === 'copy' && hasVideo) {
+  if (contract.mode === 'copy' && hasVideo && sourceBytes !== undefined) {
     // Exact selected coded payloads and their full relative presentation timeline are stronger
     // than wrapper duration scalars. Fragmented MP4 in particular can retain an empty mux trailer
     // after the last media sample; that representation detail must not override exact media proof.
@@ -6279,15 +6842,19 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
     // Some packetized containers (notably MPEG-TS) have no independent scalar duration reader.
     // Exact selected coded payloads plus their complete relative sample timeline are stronger than
     // that scalar and establish the half-open trim interval without inventing a duration.
-    const packetTimeline = copyTrimPacketTimelineOutcome(
-      sourceBytes,
-      sourceContainer,
-      ctx.output,
-      contract,
-      t,
-      measurements,
-    );
-    if (packetTimeline) return packetTimeline;
+    if (sourceBytes !== undefined) {
+      const packetTimeline = copyTrimPacketTimelineOutcome(
+        sourceBytes,
+        sourceContainer,
+        ctx.output,
+        contract,
+        t,
+        measurements,
+      );
+      if (packetTimeline) return packetTimeline;
+    } else {
+      return goldenPacketCopyTrimOutcome(ctx, contract, t, measurements);
+    }
     return unavailable(
       oracle,
       'NA_ASSET',
@@ -6305,6 +6872,10 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
 
   if (diffs.length) return fail(oracle, diffs.join('; '), measurements);
 
+  if (contract.mode === 'copy' && hasVideo && sourceBytes === undefined) {
+    return goldenPacketCopyTrimOutcome(ctx, contract, t, measurements);
+  }
+
   if (ctx.scenario.requires.features?.includes('trim:massive-lazy-read')) {
     if (!sourceIso || !outputIso) {
       return oracleError(
@@ -6317,6 +6888,15 @@ async function trimBoundaries(ctx: OracleContext, t: Required<OracleTolerances>)
   }
 
   if (hasVideo) {
+    if (sourceBytes === undefined) {
+      return unavailable(
+        oracle,
+        'NA_ASSET',
+        'TRIM_RANGE_SOURCE_BYTES_UNAVAILABLE',
+        'frame-accurate boundary decode requires authenticated source-byte access',
+        measurements,
+      );
+    }
     const sourceMedia: MediaBytes = {
       bytes: sourceBytes,
       mime: ctx.input.mime,
@@ -6464,6 +7044,57 @@ function copyTrimPacketTimelineOutcome(
       };
 }
 
+function goldenPacketCopyTrimOutcome(
+  ctx: OracleContext,
+  contract: TrimContract,
+  tolerances: Required<OracleTolerances>,
+  durationMeasurements: Record<string, number>,
+): OracleOutcome {
+  const oracle: OracleId = 'trim-boundaries';
+  if (!ctx.output) return fail(oracle, 'bounded-source trim output bytes are missing', durationMeasurements);
+  const packets = ctx.golden.packets;
+  const videoTrackIndex = (ctx.golden.meta?.tracks ?? []).findIndex((track) => track.type === 'video');
+  if (!packets || videoTrackIndex < 0) {
+    return unavailable(
+      oracle,
+      'NA_ASSET',
+      'TRIM_GOLDEN_VIDEO_PACKETS_MISSING',
+      'bounded-source copy trim requires an independently baked video packet table',
+      durationMeasurements,
+    );
+  }
+  const candidateRead = readNeutralRemuxProgram(ctx.output.bytes, ctx.output.container);
+  if (candidateRead.state !== 'OK') {
+    return fail(
+      oracle,
+      `candidate neutral reader ${candidateRead.state} [${candidateRead.reasonCode}]`,
+      durationMeasurements,
+    );
+  }
+  const candidateVideo = candidateRead.value.tracks.find((track) => track.type === 'video');
+  if (!candidateVideo) {
+    return fail(oracle, 'candidate bounded-source trim has no video track', durationMeasurements);
+  }
+  const decision = assessGoldenVideoPacketCopyTrim({
+    packets,
+    videoTrackIndex,
+    candidate: candidateVideo.samples.map((sample) => ({
+      payloadByteLength: sample.payload.byteLength,
+      ...(sample.ptsUs === undefined ? {} : { ptsUs: sample.ptsUs }),
+      ...(sample.dtsUs === undefined ? {} : { dtsUs: sample.dtsUs }),
+      ...(sample.durationUs === undefined ? {} : { durationUs: sample.durationUs }),
+      ...(sample.keyframe === undefined ? {} : { keyframe: sample.keyframe }),
+    })),
+    range: contract.range,
+    timestampToleranceUs: Math.max(2, Math.min(2_000, tolerances.seekToleranceUs)),
+    durationToleranceUs: Math.max(2, Math.round(tolerances.durationToleranceSec * 1_000_000)),
+  });
+  const outcome = trimDecisionOutcome(oracle, decision);
+  return outcome.measurements
+    ? { ...outcome, measurements: { ...durationMeasurements, ...outcome.measurements } }
+    : { ...outcome, measurements: durationMeasurements };
+}
+
 function massiveIsoTrimTimelineOutcome(
   contract: TrimContract,
   source: IsoBmffPresentationTimeline,
@@ -6585,7 +7216,7 @@ function expectedTrimOutputDurationUs(
   contract: TrimContract,
   sourceIso: IsoBmffPresentationTimeline | undefined,
   effectiveEndUs: number,
-  sourceBytes: Uint8Array,
+  sourceBytes: Uint8Array | undefined,
   sourceContainer: string,
 ): number {
   if (contract.mode !== 'copy') return Math.max(0, effectiveEndUs - contract.range.startUs);
@@ -6600,8 +7231,10 @@ function expectedTrimOutputDurationUs(
       return Math.max(...windows.map((window) => window.landedEndUs - window.landedStartUs));
     }
   }
-  const nativeAudio = inspectTrimAudioContainer(sourceBytes, sourceContainer);
-  if (nativeAudio.state === 'OK') {
+  const nativeAudio = sourceBytes === undefined
+    ? undefined
+    : inspectTrimAudioContainer(sourceBytes, sourceContainer);
+  if (nativeAudio?.state === 'OK') {
     if (nativeAudio.value.codec === 'pcm') {
       return Math.max(0, effectiveEndUs - contract.range.startUs);
     }
@@ -6617,8 +7250,10 @@ function expectedTrimOutputDurationUs(
       );
     }
   }
-  const neutral = readNeutralRemuxProgram(sourceBytes, sourceContainer);
-  if (neutral.state === 'OK') {
+  const neutral = sourceBytes === undefined
+    ? undefined
+    : readNeutralRemuxProgram(sourceBytes, sourceContainer);
+  if (neutral?.state === 'OK') {
     const durations = neutral.value.tracks.flatMap((track) => {
       const selected = selectTrimTrackSamples(track, contract);
       if (selected.length === 0) return [];
@@ -6668,17 +7303,23 @@ async function liveTrimBoundaryOutcome(
   const meanRequiredSimilarity = requiredSimilarities.length > 0
     ? requiredSimilarities.reduce((sum, value) => sum + value, 0) / requiredSimilarities.length
     : 0;
-  const perceptualMeanMatches = !perceptual || meanRequiredSimilarity >= contentThreshold;
-  const contentMatches = source.length === candidate.length && source.length === plan.offsetsUs.length &&
-    perceptualMeanMatches &&
-    source.every((frame, index) => {
-      if (referenceFrames[index]?.required === false) return true;
-      const got = candidate[index];
-      if (!got) return false;
-      if (Math.abs((frame.ptsUs - plan.sampleStartUs) - got.ptsUs) > t.seekToleranceUs) return false;
-      return normHex(frame.sha256) === normHex(got.sha256) ||
-        (perceptual && (similarities[index] ?? 0) >= TRIM_BOUNDARY_REENCODE_SSIM_FLOOR);
-    });
+  const contentMatches = sampledTrimFramesAlign({
+    reference: source.map((frame, index) => ({
+      ptsUs: frame.ptsUs,
+      contentDigest: frame.sha256,
+      required: referenceFrames[index]?.required ?? true,
+    })),
+    candidate: candidate.map((frame) => ({ ptsUs: frame.ptsUs, contentDigest: frame.sha256 })),
+    referenceOriginUs: plan.sampleStartUs,
+    timestampToleranceUs: t.seekToleranceUs,
+    ...(perceptual
+      ? {
+          similarities,
+          minimumContentSimilarity: TRIM_BOUNDARY_REENCODE_SSIM_FLOOR,
+          minimumMeanContentSimilarity: contentThreshold,
+        }
+      : {}),
+  });
   const landedStartUs = contentMatches ? plan.expectedStartUs : -1;
   const landedEndUs = contentMatches ? plan.expectedEndUs : -1;
   const codec = ctx.golden.meta?.tracks.find((track) => track.type === 'video')?.codec ?? 'video';
@@ -6742,10 +7383,18 @@ async function liveTrimBoundaryOutcome(
   const similarityMeasurements = similarities.length > 0
     ? {
         trimSampleFrames: similarities.length,
+        trimReferenceFrameCount: source.length,
+        trimCandidateFrameCount: candidate.length,
         trimSampleSsimMin: Math.min(...similarities),
         trimSampleSsimMean: similarities.reduce((sum, value) => sum + value, 0) / similarities.length,
         trimRequiredSampleSsimMean: meanRequiredSimilarity,
         ...Object.fromEntries(similarities.map((value, index) => [`trimSampleSsim${index}`, value])),
+        ...Object.fromEntries(source.map((frame, index) => [`trimSourcePtsUs${index}`, frame.ptsUs])),
+        ...Object.fromEntries(candidate.map((frame, index) => [`trimCandidatePtsUs${index}`, frame.ptsUs])),
+        ...Object.fromEntries(source.map((frame, index) => [
+          `trimExpectedCandidatePtsUs${index}`,
+          frame.ptsUs - plan.sampleStartUs,
+        ])),
       }
     : { trimSampleFrames: 0, trimSampleSsimMin: 0, trimSampleSsimMean: 0 };
   return outcome.measurements
@@ -7258,6 +7907,26 @@ function anchoredRemuxSampleTimesSec(
   return times;
 }
 
+/** Interior media-element seek anchors that retain the index identity of an existing frame list. */
+function interiorFrameDigestSampleTimesSec(frames: readonly FrameDigest[]): number[] {
+  if (frames.length === 0) return [];
+  const ordered = frames.slice().sort((a, b) => a.index - b.index);
+  const originUs = ordered[0]!.ptsUs;
+  const positiveDeltas = ordered
+    .slice(1)
+    .map((frame, index) => frame.ptsUs - ordered[index]!.ptsUs)
+    .filter((deltaUs) => Number.isFinite(deltaUs) && deltaUs > 0)
+    .sort((a, b) => a - b);
+  const fallbackDeltaUs = positiveDeltas[Math.floor(positiveDeltas.length / 2)] ?? 0;
+  return ordered.map((frame, index) => {
+    const nextDeltaUs = ordered[index + 1]?.ptsUs === undefined
+      ? undefined
+      : ordered[index + 1]!.ptsUs - frame.ptsUs;
+    const intervalUs = nextDeltaUs !== undefined && nextDeltaUs > 0 ? nextDeltaUs : fallbackDeltaUs;
+    return Math.max(0, frame.ptsUs - originUs + intervalUs / 2) / 1_000_000;
+  });
+}
+
 /**
  * Prefer the deterministic inline WebCodecs prefix when both wrappers expose the same decode-order
  * video essence. HTMLMediaElement seeking is still required for transformed/fragmented or genuinely
@@ -7423,6 +8092,19 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     return encryptionVerdictOutcome(oracle, compareDecryptNoopBytes(input, ctx.output.bytes));
   }
 
+  // The decrypt metamorphic contract has a digest-verified plaintext resource in this invocation.
+  // Compare that live reference with the candidate directly, just like decrypt-bitexact, instead of
+  // requiring a legacy frame sidecar to be present in the active fixture generation. This keeps the
+  // reference independent while avoiding cross-process RGBA evidence and stale-generation gaps.
+  if (which === 'decode-cleartext-baseline') {
+    const outcome = await decryptBitexact(ctx);
+    return {
+      ...outcome,
+      oracle,
+      detail: `[decode-cleartext-baseline] ${outcome.detail ?? ''}`.trim(),
+    };
+  }
+
   if (which === TRANSCODE_EFFECT_INVARIANT) {
     return transcodeEffectInvariant(ctx);
   }
@@ -7586,20 +8268,22 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     // independent reference-reimport layer still proves exact coded-unit preservation.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to decode`);
     const golden = await frameComparisonGolden(ctx);
-    const preferLiveRemuxReference = ctx.scenario.op === 'remux';
+    const candidateOrientation = readMuxOrientation(ctx.output.bytes, ctx.output.container);
+    const preferLiveSourceReference = ctx.scenario.op === 'remux' || ctx.scenario.op === 'mux';
     const preferSequentialMetadataReference =
-      preferLiveRemuxReference && ctx.scenario.family === 'metadata';
-    let want = preferLiveRemuxReference ? undefined : golden.frames;
+      ctx.scenario.op === 'remux' && ctx.scenario.family === 'metadata';
+    let want = preferLiveSourceReference ? undefined : golden.frames;
     let liveReferenceDecodeOptions:
       | {
           maxFrames: number;
           sampling: 'prefix' | 'uniform';
           durationHintSec?: number;
           sampleTimesSec?: readonly number[];
+          presentationColorManaged?: boolean;
         }
       | undefined;
     if (!want || !want.length) {
-      if (ctx.scenario.op !== 'remux') {
+      if (!preferLiveSourceReference) {
         return missingGoldenOutcome(golden, 'frames', oracle, `[${which}] source decode frame evidence is unavailable`);
       }
       const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
@@ -7615,6 +8299,7 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
         ? goldenDurationSec
         : undefined;
       const sourceRead = readNeutralRemuxProgram(sourceBytes, sourceContainer);
+      const sourceOrientation = readMuxOrientation(sourceBytes, sourceContainer);
       if (durationHintSec === undefined) {
         const durationUs = sourceRead.state === 'OK' ? sourceRead.value.durationUs : undefined;
         if (durationUs !== undefined && Number.isFinite(durationUs) && durationUs > 0) {
@@ -7654,9 +8339,17 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
             ...(durationHintSec !== undefined ? { durationHintSec } : {}),
             ...(sampleTimesSec.length ? { sampleTimesSec } : {}),
           };
+      if (sourceOrientation.state === 'OK' && sourceOrientation.value.rotationDegrees !== 0) {
+        liveReferenceDecodeOptions = {
+          ...liveReferenceDecodeOptions,
+          presentationColorManaged: true,
+        };
+      }
       try {
         const sourceSink = await ctx.decodeWithPlatform(sourceMedia, liveReferenceDecodeOptions);
-        want = sourceSink?.frames ?? [];
+        want = sourceSink
+          ? await presentationFrameDigestsForOrientation(sourceSink, sourceOrientation)
+          : [];
       } catch (err) {
         const classified = classifyReferenceDecodeFailure(oracle, 'source', err, sourceMedia);
         return {
@@ -7672,6 +8365,16 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
         );
       }
     }
+    if (candidateOrientation.state === 'OK' && candidateOrientation.value.rotationDegrees !== 0) {
+      liveReferenceDecodeOptions = liveReferenceDecodeOptions === undefined
+        ? {
+            maxFrames: want.length,
+            sampling: 'uniform',
+            sampleTimesSec: interiorFrameDigestSampleTimesSec(want),
+            presentationColorManaged: true,
+          }
+        : { ...liveReferenceDecodeOptions, presentationColorManaged: true };
+    }
     let sink: FrameSink | null | undefined;
     try {
       sink = await ctx.decodeWithPlatform(
@@ -7685,7 +8388,9 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
         detail: `[${which}] ${classified.detail ?? 'reference decode failed'}`,
       };
     }
-    const got = sink && Array.isArray(sink.frames) ? sink.frames : [];
+    const got = sink && Array.isArray(sink.frames)
+      ? await presentationFrameDigestsForOrientation(sink, candidateOrientation)
+      : [];
     const out = compareDigests(oracle, got, want);
     return {
       ...out,
@@ -7702,6 +8407,46 @@ async function propertyInvariant(ctx: OracleContext, t: Required<OracleTolerance
     // container duration, else the decoded frame-pts span, else a simple PCM (wav/aiff) parse.
     if (!ctx.output) return fail(oracle, `[${which}] no ctx.output to probe`);
     let goldenDur = ctx.golden.meta?.durationSec ?? ctx.metadata?.durationSec ?? null;
+    const options = isObject(ctx.scenario.options)
+      ? ctx.scenario.options as Record<string, unknown>
+      : {};
+    const selectors = Array.isArray(options.trackSelect)
+      ? options.trackSelect.filter((value): value is string => typeof value === 'string')
+      : [];
+    if (ctx.scenario.op === 'mux' && selectors.length > 0) {
+      const inputs = ctx.inputs?.length ? ctx.inputs : [ctx.input];
+      const sourcePrograms: RemuxProgramEvidence[] = [];
+      for (const input of inputs) {
+        const sourceBytes = new Uint8Array(await input.arrayBuffer());
+        const sourceRead = readNeutralMuxSource(sourceBytes, resolveContainer(undefined, input.id));
+        if (sourceRead.state !== 'OK') {
+          return oracleError(
+            oracle,
+            'ORACLE_MUX_SELECTED_DURATION_SOURCE_INVALID',
+            `${input.id}: selected-duration source reader ${sourceRead.state} [${sourceRead.reasonCode}]`,
+          );
+        }
+        sourcePrograms.push(sourceRead.value);
+      }
+      let selectedEndUs: number | undefined;
+      try {
+        selectedEndUs = selectedMuxPresentationEndUs(sourcePrograms, selectors);
+      } catch (error) {
+        return oracleError(
+          oracle,
+          'ORACLE_MUX_SELECTED_DURATION_CONTRACT_INVALID',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      if (selectedEndUs === undefined) {
+        return oracleError(
+          oracle,
+          'ORACLE_MUX_SELECTED_DURATION_UNAVAILABLE',
+          'selected mux tracks do not expose a complete presentation boundary',
+        );
+      }
+      goldenDur = selectedEndUs / 1_000_000;
+    }
     if (goldenDur == null && ctx.scenario.op === 'remux') {
       const sourceBytes = new Uint8Array(await ctx.input.arrayBuffer());
       const sourceContainer = ctx.golden.meta?.container ?? resolveContainer(undefined, ctx.input.id);
@@ -8777,7 +9522,7 @@ function trimVideoSamplePlan(
     ? sourceIso?.tracks.find((track) => track.trackId === videoWindow.trackId)
     : undefined;
   const isoFirstSample = videoWindow && isoVideoTrack
-    ? isoVideoTrack.samples[videoWindow.firstSampleIndex]
+    ? isoVideoTrack.samples.find((sample) => sample.sampleIndex === videoWindow.firstSampleIndex)
     : undefined;
   const neutralVideoSamples = sourceProgram?.tracks
     .filter((track) => track.type === 'video')
@@ -8805,17 +9550,23 @@ function trimVideoSamplePlan(
     ? isoFirstSample.presentationEndUs - isoFirstSample.presentationStartUs
     : neutralVideoSamples?.[0]?.durationUs;
   const stableFirstFrameInsetUs = firstFrameDurationUs !== undefined && firstFrameDurationUs > 1
-    ? Math.max(1, Math.floor(firstFrameDurationUs / 2))
+    // Stay well inside the first presentation interval. Sampling at its exact midpoint is unstable:
+    // a legal one-microsecond container-timescale rounding can make nearest-PTS selection choose the
+    // preceding source frame but the following rebased candidate frame.
+    ? Math.max(1, Math.floor(firstFrameDurationUs / 4))
     : 33_333;
   const startInsetUs = Math.min(
     stableFirstFrameInsetUs,
     Math.max(1, Math.floor(durationUs / 8)),
   );
+  const stableTerminalOffsetUs = videoWindow && isoVideoTrack
+    ? stableIsoBmffTrimTerminalOffsetUs(isoVideoTrack, videoWindow, contract.range.endUs)
+    : undefined;
   const offsetsUs = [...new Set([
     0,
     Math.min(durationUs - 1, startInsetUs),
     Math.floor(durationUs / 2),
-    Math.max(0, durationUs - endInsetUs),
+    stableTerminalOffsetUs ?? Math.max(0, durationUs - endInsetUs),
   ])].sort((a, b) => a - b);
   return { expectedStartUs, expectedEndUs, sampleStartUs, sampleEndUs, offsetsUs };
 }
@@ -9258,11 +10009,13 @@ async function trimOpenGopPropertyInvariant(
     );
   }
   const similarity = (await measuredTrimSampleSimilarities(decoded))[evidenceIndex] ?? 0;
+  const expectedOutputPtsUs = reference.ptsUs - decoded.plan.sampleStartUs;
   const matched = similarity >= trimBoundaryContentThreshold('frame-accurate', t) &&
-    Math.abs(candidate.ptsUs - (decoded.plan.offsetsUs[evidenceIndex] ?? 0)) <= t.seekToleranceUs;
+    Math.abs(candidate.ptsUs - expectedOutputPtsUs) <= t.seekToleranceUs;
   const measurements = {
     openGopSourcePtsUs: reference.ptsUs,
     openGopOutputPtsUs: candidate.ptsUs,
+    openGopExpectedOutputPtsUs: expectedOutputPtsUs,
     openGopSsim: similarity,
   };
   return matched
@@ -9300,7 +10053,7 @@ async function trimShortRangePropertyInvariant(
   }
   const similarities = await measuredTrimSampleSimilarities(decoded);
   const contentThreshold = trimBoundaryContentThreshold('frame-accurate', t);
-  const aligned = source.length === candidate.length && source.length === decoded.plan.offsetsUs.length &&
+  const aligned = source.length === candidate.length &&
     source.every((frame, index) => {
       const got = candidate[index];
       return got !== undefined &&
@@ -10213,15 +10966,29 @@ async function transcodeAudioContentInvariant(ctx: OracleContext): Promise<Oracl
 
   let sourceSignal: DecodedAudioSignal;
   let candidateSignal: DecodedAudioSignal;
+  const declaredSourceRate = ctx.golden.meta?.tracks.find((track) => track.type === 'audio')?.sampleRate;
   try {
     const sourceStructure = readTranscodeAudioStructure(source.bytes, source.container);
     const sourceTimeline = sourceStructure.state === 'OK' &&
       sourceStructure.value.timeline?.kind === 'aac-isobmff'
       ? sourceStructure.value.timeline
       : undefined;
+    const authoredSourceRate = sourceStructure.state === 'OK'
+      ? sourceStructure.value.sampleRate
+      : declaredSourceRate;
     [sourceSignal, candidateSignal] = await Promise.all([
-      decodeTranscodeAudioSignal(source, sourceTimeline, structure.value.sampleRate),
-      decodeTranscodeAudioSignal(output, structure.value.timeline, structure.value.sampleRate),
+      decodeTranscodeAudioSignal(
+        source,
+        sourceTimeline,
+        structure.value.sampleRate,
+        authoredSourceRate,
+      ),
+      decodeTranscodeAudioSignal(
+        output,
+        structure.value.timeline,
+        structure.value.sampleRate,
+        structure.value.sampleRate,
+      ),
     ]);
   } catch (error) {
     const name = isObject(error) && typeof error.name === 'string' ? error.name : '';
@@ -10240,7 +11007,6 @@ async function transcodeAudioContentInvariant(ctx: OracleContext): Promise<Oracl
       `neutral browser PCM decode failed after structural validation: ${message}`,
     );
   }
-  const declaredSourceRate = ctx.golden.meta?.tracks.find((track) => track.type === 'audio')?.sampleRate;
   if (
     canonicalTranscodeAudioCodec(structure.value.codec).startsWith('pcm-') &&
     declaredSourceRate !== undefined &&
@@ -10288,13 +11054,18 @@ function validateRequestedTranscodeAudioShape(
   }
   const expectedSampleRate = audio && readNumberOption(audio, ['sampleRate']);
   const sourceSampleRate = ctx.golden.meta?.tracks.find((track) => track.type === 'audio')?.sampleRate;
-  const requiredSampleRate = expectedSampleRate ?? sourceSampleRate;
+  const requiredSampleRate = expectedSampleRate ??
+    (canonicalTranscodeAudioCodec(expectedCodec ?? structure.codec) === 'opus'
+      ? 48_000
+      : sourceSampleRate);
   if (requiredSampleRate !== undefined && structure.sampleRate !== requiredSampleRate) {
     return transcodeVerdict(
       'FAIL', 'TRANSCODE_AUDIO_REQUESTED_SAMPLE_RATE_MISMATCH',
       expectedSampleRate !== undefined
         ? `candidate ${structure.sampleRate}Hz vs requested ${expectedSampleRate}Hz`
-        : `candidate ${structure.sampleRate}Hz vs source program ${sourceSampleRate}Hz`);
+        : canonicalTranscodeAudioCodec(expectedCodec ?? structure.codec) === 'opus'
+          ? `candidate ${structure.sampleRate}Hz vs Opus fixed 48000Hz presentation rate`
+          : `candidate ${structure.sampleRate}Hz vs source program ${sourceSampleRate}Hz`);
   }
   const expectedChannels = audio && readNumberOption(audio, ['channels']);
   if (expectedChannels !== undefined && structure.channels !== expectedChannels) {
@@ -10319,12 +11090,18 @@ async function decodeTranscodeAudioSignal(
   media: MediaBytes,
   timeline?: AudioTimelineEvidence,
   sampleRate?: number,
+  authoredSampleRate?: number,
 ): Promise<DecodedAudioSignal> {
   const native = decodedPcmFromContainer(media.bytes, media.container);
-  if (native) return native;
+  // Keep native PCM byte-exact at its authored rate. When the output contract changes rate (notably
+  // implicit 44.1 kHz PCM -> 48 kHz Opus), decode through the browser at the candidate rate instead:
+  // that is an implementation-independent reference resampler, not the candidate engine's DSP.
+  if (native && (sampleRate === undefined || native.sampleRate === sampleRate)) return native;
   if (timeline?.kind === 'aac-isobmff') {
     const decodedAac = await decodedAacPcmFromMp4(media.bytes);
-    if (decodedAac) return decodedAac;
+    if (decodedAac && (sampleRate === undefined || decodedAac.sampleRate === sampleRate)) {
+      return decodedAac;
+    }
   }
   const decoded = await decodeAudioBuffer(media, sampleRate);
   const samples = new Float64Array(decoded.length * decoded.numberOfChannels);
@@ -10348,6 +11125,9 @@ async function decodeTranscodeAudioSignal(
     sampleFrames: decoded.length,
     samples,
     timelineDomain,
+    ...(authoredSampleRate !== undefined && authoredSampleRate !== decoded.sampleRate
+      ? { resampledFromSampleRate: authoredSampleRate }
+      : {}),
     timeline: timeline ?? {
       kind: 'whole-program' as const,
       presentationSampleFrames: decoded.length,

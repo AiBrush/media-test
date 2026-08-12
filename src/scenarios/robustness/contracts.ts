@@ -8,6 +8,7 @@ import type {
 } from '../../core/engine.ts';
 import { readOutputStructureResult } from '../../core/box-readers.ts';
 import { readPcmStructure } from '../../features/audio-dsp/readers.ts';
+import { inspectTrimAudioContainer } from '../../features/trim/audio.ts';
 
 /**
  * The operation outcome is independent from the semantic oracle verdict.  In particular, an
@@ -279,6 +280,23 @@ export function validateRobustnessReturnedValue(
             reasonCode: pcm.reasonCode,
             detail: `returned ${output.container} bytes are ${pcm.state.toLowerCase()}`,
           };
+        }
+        if (pcm.state === 'UNSUPPORTED_FORMAT') {
+          const audio = inspectTrimAudioContainer(output.bytes, output.container);
+          if (audio.state === 'OK') {
+            return {
+              state: 'PASS',
+              reasonCode: 'ROBUSTNESS_MEDIA_PARTIAL_STRUCTURAL',
+              detail: `neutral audio reader accepted ${output.container} structure`,
+            };
+          }
+          if (audio.state === 'MALFORMED' || audio.state === 'INCOMPLETE') {
+            return {
+              state: 'FAIL',
+              reasonCode: audio.reasonCode,
+              detail: `returned ${output.container} bytes are ${audio.state.toLowerCase()}`,
+            };
+          }
         }
       }
       if (read.state === 'MALFORMED' || read.state === 'INCOMPLETE') {

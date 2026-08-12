@@ -655,6 +655,7 @@ describe('aibrush-media strict-copy remux boundary repairs', () => {
     if (before.state !== 'OK' || after.state !== 'OK') return;
 
     expect(before.value.durationUs).toBe(2_980_000);
+    expect(before.value.tracks[0]?.samples.at(-1)?.durationUs).toBeUndefined();
     expect(after.value.durationUs).toBe(before.value.durationUs);
     expect(after.value.tracks.map((track) => track.samples.length)).toEqual([180]);
     expect(after.value.tracks.map((track) => ({

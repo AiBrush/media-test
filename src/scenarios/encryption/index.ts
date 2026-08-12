@@ -40,8 +40,9 @@ const CENS_PATTERN = definePatternContract({
   ivRule: 'per-sample',
   ivSize: 16,
   boundaryVectorId: 'cens-avc-nal-crypt1-skip9-v1',
-  boundarySubsamples: [{ clearBytes: 902, protectedBytes: 57_168 }],
+  boundarySubsamples: [{ clearBytes: 734, protectedBytes: 23_920 }],
   fixtureBoundaryVectors: [
+    { sampleCount: 150, firstBoundarySubsamples: [{ clearBytes: 734, protectedBytes: 23_920 }] },
     { sampleCount: 150, firstBoundarySubsamples: [{ clearBytes: 902, protectedBytes: 57_168 }] },
     { sampleCount: 329, firstBoundarySubsamples: [{ clearBytes: 875, protectedBytes: 259_376 }] },
     { sampleCount: 161, firstBoundarySubsamples: [{ clearBytes: 906, protectedBytes: 47_344 }] },
@@ -105,19 +106,22 @@ const DECRYPT_CASES: DecryptCase[] = [
   },
   {
     id: 'cenc_cbcs_decrypt',
+    revision: 2,
     asset: 'cenc_cbcs.mp4',
     container: 'mp4',
     scheme: 'cenc-cbcs',
     keyName: 'cenc_cbcs',
     cleartextAsset: 'cenc_ctr_clear.mp4',
+    clearReferenceTimeline: 'protected-source',
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     pattern: CBCS_PATTERN,
     notes:
       'CENC cbcs pattern (subsample AES-CBC, crypt:skip pattern, per-subsample IV). Exercises the ' +
-      'pattern-block boundary. The committed Bento4 artifact, key record, packet table, and frame ' +
-      'evidence are authoritative; pattern contract cbcs-avc-nal-crypt1-skip9-v1 localizes wrong ' +
-      'scheme, IV, crypt:skip, or subsample handling.',
+      'pattern-block boundary. The committed Bento4 artifact supplies exact presentation timing and ' +
+      'the digest-verified clear asset independently supplies every frame identity; the typed ' +
+      'protected-source timeline policy composes those orthogonal facts. Pattern contract ' +
+      'cbcs-avc-nal-crypt1-skip9-v1 localizes wrong scheme, IV, crypt:skip, or subsample handling.',
   },
   {
     id: 'hls_aes128_decrypt',

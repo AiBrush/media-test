@@ -1314,7 +1314,15 @@ async function enrichProbeMetadata(
     const parserTrack = parserTracks[index];
     if (!parserTrack) return track;
     const header = trackHeaders.get(parserTrack.trackId);
-    let enriched: NormalizedTrack = header?.language ? { ...track, language: header.language } : track;
+    let enriched: NormalizedTrack = header
+      ? {
+          ...track,
+          ...(header.language ? { language: header.language } : {}),
+          ...(header.defaultDisposition !== undefined
+            ? { defaultDisposition: header.defaultDisposition }
+            : {}),
+        }
+      : track;
     if (track.type === 'audio' && header?.audioChannels != null) {
       enriched = {
         ...enriched,
@@ -1365,6 +1373,7 @@ interface Mp4BoxHeader {
 
 export interface IsoTrackHeaderEvidence {
   language: string | null;
+  defaultDisposition?: boolean;
   audioChannels?: number;
 }
 
@@ -1401,6 +1410,10 @@ export function isoTrackHeaderEvidence(bytes: Uint8Array): Map<number, IsoTrackH
     const audioChannels = stsd ? isoAudioSampleEntryChannels(bytes, stsd) : null;
     evidence.set(trackId, {
       language: mdhd ? isoMediaLanguage(bytes, mdhd) : null,
+      // ISO tkhd track_enabled is the selection signal exposed as normalized default disposition.
+      ...(tkhd && hasByteRange(bytes, tkhd.offset, 12)
+        ? { defaultDisposition: (readFullBoxFlags(bytes, tkhd.offset) & 1) !== 0 }
+        : {}),
       ...(audioChannels != null ? { audioChannels } : {}),
     });
   }
@@ -2618,8 +2631,9 @@ export function normalizeTrack(
 }
 
 function normalizeRemotionRotation(rotation: number): number {
-  const counterClockwise = ((rotation % 360) + 360) % 360;
-  return counterClockwise === 0 ? 0 : 360 - counterClockwise;
+  // media-parser's public video-track rotation is already normalized clockwise (its ISO parser
+  // performs the matrix-sign conversion while constructing the track).
+  return ((rotation % 360) + 360) % 360;
 }
 
 function pcmBitsPerSample(codec: string): number | null {

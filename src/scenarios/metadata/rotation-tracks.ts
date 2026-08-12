@@ -5,25 +5,22 @@
  *
  * WHY these are modeled the way they are (see _shared.ts ORACLE TRUTH — load-bearing):
  *
- * ROTATION (closes oracleGap "read_h264_rotated90 asserts nothing about rotation"): the existing
- * `metadata/read_h264_rotated90` probe case CANNOT assert rotation, because `golden-metadata`'s
- * `compareTrack` never compares `track.rotation` (and the golden for h264_rotated90 carries no
- * rotation field at all). The ONLY rotation gate expressible from a scenario file today is the
- * OBSERVABLE DECODED EFFECT:
- *   - `metadata/rotation_decode_read_h264_rotated90` decodes the rotated asset and digest-compares to
- *     golden frames. The reference decoder (mediabunny CanvasSink / VideoSample.draw) BAKES the 90°
- *     display matrix into the decoded RGBA, so golden frames are rotation-APPLIED. An engine that
- *     (a) drops the matrix, or (b) the A.16 trap — bakes rotation into width/height and serves
- *     unrotated pixels — produces a DIFFERENT decoded image → frame-digest mismatch → FAIL. This is
- *     the faithful "matrix not w/h swap" guard.
+ * ROTATION: `probe/h264_rotated90` asserts the exact 270° clockwise value and unrotated coded
+ * dimensions against the independently normalized FFprobe golden. These metadata-family cases add
+ * the OBSERVABLE DECODED EFFECT and write-path preservation:
+ *   - `metadata/rotation_decode_read_h264_rotated90` decodes the rotated asset and compares strict
+ *     display geometry plus perceptual luma evidence to committed golden frames. The reference decoder
+ *     (mediabunny CanvasSink / VideoSample.draw) BAKES the 270° display matrix into its decoded RGBA.
+ *     Exact RGBA hashes are intentionally not compared across that Canvas presenter and the product's
+ *     WebCodecs+filter presenter because legal YUV→RGB rounding differs. An engine that (a) drops the
+ *     matrix, or (b) the A.16 trap — swaps width/height but serves unrotated pixels — still fails the
+ *     independent geometry/signature evidence. This is the faithful "matrix not w/h swap" guard.
  *   - `metadata/rotation_survives_mp4_mkv` remuxes the rotated asset to MKV and asserts
  *     decode(remux(x))==decode(x): the display rotation must survive the wrapper change (a dropped
  *     matrix changes decoded presentation → mismatch). Complements the read with a WRITE-path gate
  *     and a second container (the remux family already covers mp4->mov; this covers mp4->mkv).
- * A rotation-VALUE assertion (track.rotation==90 AND width/height un-swapped) and the 180/270/-90==270
- * variants are NOT added: compareTrack would have to compare `rotation` (an oracles.ts edit, out of
- * scope) AND the corpus has no 180/270 rotated assets (inventing them is forbidden, §0.6). The gap is
- * recorded in index.ts for the model/oracle owner.
+ * Additional cardinal values are covered by structural and mutation unit tests; the public corpus
+ * keeps this one authored display-matrix fixture.
  *
  * MULTI-TRACK + TRACK ATTRIBUTION (closes oracleGap "no case SELECTS/attributes a specific track"):
  * `h264_multitrack.mp4` has 3 tracks (video + 2 audio). True per-track SELECTION (probe a specific
@@ -58,23 +55,25 @@ const ROT_TIMEOUT_MS = 30_000;
 const ROTATION_DECODE_READ: DecodeReadCase[] = [
   {
     id: 'rotation_decode_read_h264_rotated90',
+    revision: 2,
     asset: 'h264_rotated90.mp4',
     container: 'mp4',
     videoCodecs: ['h264'],
     features: ['rotation:decode'],
     // The clip is short; a handful of frames is enough to catch a wrong/absent rotation since the
-    // golden frames are baked rotation-applied. (Golden frames for this asset are produced by the
-    // in-browser frame-bake; until then decoded-frames-bitexact reports a clean "golden frames
-    // pending" NA/FAIL — the honest pre-bake state, identical to the remux rotation metamorphic case.)
+    // golden frames and luma signatures are baked rotation-applied. Geometry is exact and the 0.99
+    // luma floor tolerates only representation-level YUV→RGB differences between browser presenters.
     maxFrames: 8,
+    oracles: ['ssim-psnr'],
+    tolerances: { ssimMin: 0.99 },
     timeoutMs: ROT_TIMEOUT_MS,
     notes:
       'Rotation READ as observable decoded effect (A.16 "matrix not w/h swap"): decode h264_rotated90 ' +
-      'and digest-compare to golden frames, which the reference decoder baked rotation-APPLIED. An ' +
-      'engine that drops the 90° display matrix, or bakes rotation into width/height and serves ' +
-      'unrotated pixels, yields a different decoded image -> frame-digest mismatch. This is the only ' +
-      'rotation gate expressible from a scenario file (golden-metadata.compareTrack never compares ' +
-      'track.rotation). Requires feature rotation:decode so generic decodeFrames implementations that ' +
+      'and compare exact display geometry plus strict perceptual luma to golden frames, which the ' +
+      'reference decoder baked rotation-APPLIED. An ' +
+      'engine that drops the 270° clockwise display matrix, or bakes rotation into width/height and serves ' +
+      'unrotated pixels, fails the independent geometry/signature evidence. Complements the ' +
+      'exact clockwise-value probe gate. Requires feature rotation:decode so generic decodeFrames implementations that ' +
       'do not explicitly claim display-matrix-applied output report NA(engine) instead of a misleading ' +
       'pixel mismatch.',
   },
@@ -94,7 +93,7 @@ const ROTATION_PROPERTY: MetaPropertyCase[] = [
     features: ['rotate'],
     timeoutMs: ROT_TIMEOUT_MS,
     notes:
-      'Rotation (90° display matrix) MP4->MKV: decode(remux(x))==decode(x) proves the display rotation ' +
+      'Rotation (270° clockwise display matrix) MP4->MKV: decode(remux(x))==decode(x) proves the display rotation ' +
       'survived the container change (a dropped/garbled matrix changes decoded presentation -> ' +
       'frame-digest mismatch). Complements metadata/rotation_decode_read_h264_rotated90 (a READ gate) ' +
       'with a WRITE-path gate onto MKV (the remux family already covers the mp4->mov path).',

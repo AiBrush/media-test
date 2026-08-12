@@ -6,6 +6,7 @@ import {
   TRIM_BOUNDARY_EVIDENCE_SCHEMA,
   assessAudioTrimEvidence,
   assessFeatureLabelledTrim,
+  assessGoldenVideoPacketCopyTrim,
   assessFragmentedTrimOutput,
   assessTrimBoundaryEvidence,
   assessTrimComposition,
@@ -16,7 +17,9 @@ import {
   preflightTrimTuple,
   readIsoBmffPresentationTimeline,
   resolveEffectiveTrimInterval,
+  sampledTrimFramesAlign,
   selectIsoBmffTrimWindows,
+  stableIsoBmffTrimTerminalOffsetUs,
   trimBoundaryEvidenceKey,
   trimContractForScenario,
   trimContractFromOptions,
@@ -93,6 +96,163 @@ function exactBoundaryCandidate(): CandidateTrimBoundaryEvidence {
 }
 
 describe('REQ-FEAT-25 presentation-time-windowed boundary evidence', () => {
+  test('terminal VFR sampling stays inside the last intersecting ISO sample', () => {
+    const track = {
+      trackId: 1,
+      type: 'video' as const,
+      codec: 'h264',
+      mediaTimescale: 30_000,
+      mediaDurationTicks: 4_060_000,
+      codedSampleCount: 2,
+      edits: [],
+      presentationStartUs: 0,
+      presentationEndUs: 135_333_333,
+      emptyLeadingEditUs: 0,
+      firstMediaTimeTicks: 0,
+      rotationDegrees: 0 as const,
+      samples: [
+        {
+          sampleIndex: 14,
+          decodeStartMediaTicks: 74_000,
+          compositionStartMediaTicks: 74_000,
+          durationMediaTicks: 19_000,
+          sync: false,
+          presentationStartUs: 2_466_633,
+          presentationEndUs: 3_100_000,
+        },
+        {
+          sampleIndex: 28,
+          decodeStartMediaTicks: 165_000,
+          compositionStartMediaTicks: 165_000,
+          durationMediaTicks: 20_000,
+          sync: false,
+          presentationStartUs: 5_499_967,
+          presentationEndUs: 6_166_633,
+        },
+      ],
+    };
+    const window = {
+      trackId: 1,
+      type: 'video' as const,
+      firstSampleIndex: 14,
+      lastSampleIndex: 28,
+      landedStartUs: 2_466_633,
+      landedEndUs: 6_166_633,
+      sampleCount: 15,
+    };
+
+    const offset = stableIsoBmffTrimTerminalOffsetUs(track, window, 6_000_000);
+    const terminalSample = track.samples[1];
+    if (terminalSample === undefined) throw new Error('missing terminal sample');
+
+    expect(offset).toBe(3_158_342);
+    expect(window.landedStartUs + (offset ?? 0)).toBeGreaterThan(terminalSample.presentationStartUs);
+    expect(window.landedStartUs + (offset ?? 0)).toBeLessThan(6_000_000);
+    expect(stableIsoBmffTrimTerminalOffsetUs(track, window, window.landedStartUs)).toBeUndefined();
+  });
+
+  test('bounded-source copy evidence matches a baked packet window and rejects one-fact mutations', () => {
+    const packets = [
+      { trackIndex: 0, size: 10, ptsUs: 0, dtsUs: 0, durationUs: 1_000, keyframe: true },
+      { trackIndex: 0, size: 11, ptsUs: 2_000, dtsUs: 1_000, durationUs: 1_000, keyframe: false },
+      { trackIndex: 0, size: 12, ptsUs: 1_000, dtsUs: 2_000, durationUs: 1_000, keyframe: false },
+      { trackIndex: 0, size: 13, ptsUs: 3_000, dtsUs: 3_000, durationUs: 1_000, keyframe: true },
+    ];
+    const candidate = packets.slice(0, 3).map((packet) => ({
+      payloadByteLength: packet.size,
+      ptsUs: packet.ptsUs,
+      dtsUs: packet.dtsUs,
+      durationUs: packet.durationUs,
+      keyframe: packet.keyframe,
+    }));
+    const base = {
+      packets,
+      videoTrackIndex: 0,
+      candidate,
+      range: { startUs: 1_500, endUs: 3_000 },
+      timestampToleranceUs: 1,
+      durationToleranceUs: 1,
+    };
+    expect(assessGoldenVideoPacketCopyTrim(base)).toMatchObject({
+      state: 'VERDICT', verdict: 'PASS', reasonCode: 'TRIM_GOLDEN_PACKET_TIMELINE_MATCH',
+    });
+    expect(assessGoldenVideoPacketCopyTrim({
+      ...base,
+      candidate: candidate.map((packet, index) => index === 1
+        ? { ...packet, payloadByteLength: packet.payloadByteLength + 1 }
+        : packet),
+    })).toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH' });
+    expect(assessGoldenVideoPacketCopyTrim({
+      ...base,
+      candidate: candidate.map((packet, index) => index === 2
+        ? { ...packet, ptsUs: (packet.ptsUs ?? 0) + 2 }
+        : packet),
+    })).toMatchObject({ verdict: 'FAIL', reasonCode: 'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH' });
+  });
+
+  test('massive baked packet tables are reduced without variadic argument overflow', () => {
+    const packetCount = 150_000;
+    const packets = Array.from({ length: packetCount }, (_, index) => ({
+      trackIndex: 0,
+      size: 100 + (index % 7),
+      ptsUs: index * 1_000,
+      dtsUs: index * 1_000,
+      durationUs: 1_000,
+      keyframe: true,
+    }));
+    const selected = packets.slice(-2);
+    const candidate = selected.map((packet, index) => ({
+      payloadByteLength: packet.size,
+      ptsUs: index * 1_000,
+      dtsUs: index * 1_000,
+      durationUs: packet.durationUs,
+      keyframe: packet.keyframe,
+    }));
+    expect(assessGoldenVideoPacketCopyTrim({
+      packets,
+      videoTrackIndex: 0,
+      candidate,
+      range: { startUs: (packetCount - 2) * 1_000, endUs: packetCount * 1_000 },
+      timestampToleranceUs: 1,
+      durationToleranceUs: 1,
+    })).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      reasonCode: 'TRIM_GOLDEN_PACKET_TIMELINE_MATCH',
+    });
+  });
+
+  test('sampled decode alignment accepts coalesced queries but rejects timing and content mutations', () => {
+    const reference = [
+      { ptsUs: 2_016_667, contentDigest: 'origin', required: false },
+      { ptsUs: 4_983_333, contentDigest: 'middle' },
+      { ptsUs: 7_933_333, contentDigest: 'end' },
+    ];
+    const candidate = [
+      { ptsUs: 0, contentDigest: 'reencoded-origin' },
+      { ptsUs: 2_966_666, contentDigest: 'reencoded-middle' },
+      { ptsUs: 5_916_666, contentDigest: 'reencoded-end' },
+    ];
+    const base = {
+      reference,
+      candidate,
+      referenceOriginUs: 2_016_667,
+      timestampToleranceUs: 1,
+      similarities: [0.9, 0.999, 0.998],
+      minimumContentSimilarity: 0.99,
+      minimumMeanContentSimilarity: 0.995,
+    };
+
+    // Four nearby requests may produce only these three distinct displayed observations.
+    expect(sampledTrimFramesAlign(base)).toBe(true);
+    expect(sampledTrimFramesAlign({
+      ...base,
+      candidate: candidate.map((frame, index) => index === 1 ? { ...frame, ptsUs: frame.ptsUs + 2 } : frame),
+    })).toBe(false);
+    expect(sampledTrimFramesAlign({ ...base, similarities: [0.9, 0.98, 0.998] })).toBe(false);
+    expect(sampledTrimFramesAlign({ ...base, candidate: candidate.slice(0, 2) })).toBe(false);
+  });
+
   test('same-duration wrong interval fails while a changed-count VFR boundary match passes', () => {
     const artifact = boundaryArtifact();
     const base = {

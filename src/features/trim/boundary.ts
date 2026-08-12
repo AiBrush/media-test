@@ -64,6 +64,235 @@ export interface TrimBoundaryAssessmentRequest {
   readonly candidate: CandidateTrimBoundaryEvidence;
 }
 
+export interface SampledTrimFrame {
+  readonly ptsUs: number;
+  readonly contentDigest: string;
+  readonly required?: boolean;
+}
+
+export interface GoldenTrimPacket {
+  readonly trackIndex: number;
+  readonly size: number;
+  readonly ptsUs: number;
+  readonly dtsUs?: number;
+  readonly durationUs?: number;
+  readonly keyframe: boolean;
+}
+
+export interface CandidateTrimPacket {
+  readonly payloadByteLength: number;
+  readonly ptsUs?: number;
+  readonly dtsUs?: number;
+  readonly durationUs?: number;
+  readonly keyframe?: boolean;
+}
+
+function minimumTimestamp(values: readonly number[]): number {
+  let minimum = Number.POSITIVE_INFINITY;
+  for (const value of values) minimum = Math.min(minimum, value);
+  return minimum;
+}
+
+/** Compare a bounded URL copy-trim against an independently baked source packet table. */
+export function assessGoldenVideoPacketCopyTrim(input: {
+  readonly packets: readonly GoldenTrimPacket[];
+  readonly videoTrackIndex: number;
+  readonly candidate: readonly CandidateTrimPacket[];
+  readonly range: TrimRange;
+  readonly timestampToleranceUs: number;
+  readonly durationToleranceUs: number;
+}): TrimDecision {
+  const source = input.packets.filter((packet) => packet.trackIndex === input.videoTrackIndex);
+  if (source.length === 0) {
+    return trimUnavailable('NA_ASSET', 'TRIM_GOLDEN_VIDEO_PACKETS_MISSING', 'baked source has no video packets');
+  }
+  const sourcePresentationOriginUs = minimumTimestamp(source.map((packet) => packet.ptsUs));
+  const sourceDurationUs = (index: number): number => packetDurationUs(source, index);
+  let first = source.findIndex((packet, index) => {
+    const ptsUs = packet.ptsUs - sourcePresentationOriginUs;
+    return ptsUs < input.range.endUs && ptsUs + sourceDurationUs(index) > input.range.startUs;
+  });
+  if (first < 0) {
+    return trimUnavailable(
+      'NA_ASSET',
+      'TRIM_GOLDEN_VIDEO_INTERVAL_EMPTY',
+      'baked source has no video packet intersecting the requested range',
+    );
+  }
+  while (first > 0 && source[first]?.keyframe !== true) first--;
+  if (source[first]?.keyframe !== true) {
+    return trimUnavailable(
+      'NA_ASSET',
+      'TRIM_GOLDEN_VIDEO_RANDOM_ACCESS_MISSING',
+      'baked source has no random-access packet at or before the requested range',
+    );
+  }
+  const selected = source.slice(first).filter(
+    (packet) => packet.ptsUs - sourcePresentationOriginUs < input.range.endUs,
+  );
+  const candidate = input.candidate;
+  const measurements: Record<string, number> = {
+    selectedSourceSamples: selected.length,
+    candidateOutputSamples: candidate.length,
+  };
+  if (selected.length !== candidate.length) {
+    return trimVerdict(
+      'FAIL',
+      'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+      `candidate has ${candidate.length} video samples; baked trim window requires ${selected.length}`,
+      measurements,
+    );
+  }
+  const sourcePtsOriginUs = minimumTimestamp(selected.map((packet) => packet.ptsUs));
+  const candidatePts = candidate.flatMap((packet) => packet.ptsUs === undefined ? [] : [packet.ptsUs]);
+  if (candidatePts.length !== candidate.length) {
+    return trimVerdict('FAIL', 'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH', 'candidate video PTS is incomplete', measurements);
+  }
+  const candidatePtsOriginUs = minimumTimestamp(candidatePts);
+  const sourceDts = selected.flatMap((packet) => packet.dtsUs === undefined ? [] : [packet.dtsUs]);
+  const candidateDts = candidate.flatMap((packet) => packet.dtsUs === undefined ? [] : [packet.dtsUs]);
+  const compareDts = sourceDts.length === selected.length && candidateDts.length === candidate.length;
+  const sourceDtsOriginUs = compareDts ? minimumTimestamp(sourceDts) : 0;
+  const candidateDtsOriginUs = compareDts ? minimumTimestamp(candidateDts) : 0;
+  let maxTimestampDeltaUs = 0;
+  let maxDurationDeltaUs = 0;
+  for (let index = 0; index < selected.length; index++) {
+    const want = selected[index]!;
+    const got = candidate[index]!;
+    if (got.payloadByteLength !== want.size) {
+      return trimVerdict(
+        'FAIL',
+        'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+        `video sample ${index} size ${got.payloadByteLength} vs baked ${want.size}`,
+        measurements,
+      );
+    }
+    if (got.keyframe !== want.keyframe) {
+      return trimVerdict(
+        'FAIL',
+        'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+        `video sample ${index} random-access flag changed`,
+        measurements,
+      );
+    }
+    const ptsDeltaUs = Math.abs(
+      ((got.ptsUs as number) - candidatePtsOriginUs) - (want.ptsUs - sourcePtsOriginUs),
+    );
+    maxTimestampDeltaUs = Math.max(maxTimestampDeltaUs, ptsDeltaUs);
+    if (ptsDeltaUs > input.timestampToleranceUs) {
+      return trimVerdict(
+        'FAIL',
+        'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+        `video sample ${index} relative PTS differs by ${ptsDeltaUs}us`,
+        { ...measurements, maxTimestampDeltaUs },
+      );
+    }
+    if (compareDts) {
+      const dtsDeltaUs = Math.abs(
+        ((got.dtsUs as number) - candidateDtsOriginUs) - ((want.dtsUs as number) - sourceDtsOriginUs),
+      );
+      maxTimestampDeltaUs = Math.max(maxTimestampDeltaUs, dtsDeltaUs);
+      if (dtsDeltaUs > input.timestampToleranceUs) {
+        return trimVerdict(
+          'FAIL',
+          'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+          `video sample ${index} relative DTS differs by ${dtsDeltaUs}us`,
+          { ...measurements, maxTimestampDeltaUs },
+        );
+      }
+    }
+    const durationDeltaUs = Math.abs(packetDurationUs(candidate, index) - packetDurationUs(selected, index));
+    maxDurationDeltaUs = Math.max(maxDurationDeltaUs, durationDeltaUs);
+    if (durationDeltaUs > input.durationToleranceUs) {
+      return trimVerdict(
+        'FAIL',
+        'TRIM_GOLDEN_PACKET_TIMELINE_MISMATCH',
+        `video sample ${index} duration differs by ${durationDeltaUs}us`,
+        { ...measurements, maxTimestampDeltaUs, maxDurationDeltaUs },
+      );
+    }
+  }
+  return trimVerdict(
+    'PASS',
+    'TRIM_GOLDEN_PACKET_TIMELINE_MATCH',
+    `${selected.length} copied video samples match baked size, timing, duration, and random-access evidence`,
+    { ...measurements, maxTimestampDeltaUs, maxDurationDeltaUs },
+  );
+}
+
+function packetDurationUs(
+  packets: readonly { readonly ptsUs?: number; readonly durationUs?: number }[],
+  index: number,
+): number {
+  const packet = packets[index]!;
+  if (packet.durationUs !== undefined && packet.durationUs > 0) return packet.durationUs;
+  const ptsUs = packet.ptsUs;
+  if (ptsUs === undefined) return 1;
+  let following = Number.POSITIVE_INFINITY;
+  let preceding = Number.NEGATIVE_INFINITY;
+  for (const other of packets) {
+    if (other.ptsUs === undefined) continue;
+    if (other.ptsUs > ptsUs) following = Math.min(following, other.ptsUs);
+    else if (other.ptsUs < ptsUs) preceding = Math.max(preceding, other.ptsUs);
+  }
+  if (Number.isFinite(following)) return following - ptsUs;
+  if (Number.isFinite(preceding)) return ptsUs - preceding;
+  return 1;
+}
+
+/**
+ * Decide whether two decoder sampling passes observed the same displayed source frames after the
+ * candidate timeline was rebased. A platform decoder may coalesce multiple nearby sample requests
+ * onto one displayed frame, so evidence cardinality is compared between the two observations — never
+ * against the number of requested timestamps.
+ */
+export function sampledTrimFramesAlign(input: {
+  readonly reference: readonly SampledTrimFrame[];
+  readonly candidate: readonly SampledTrimFrame[];
+  readonly referenceOriginUs: number;
+  readonly timestampToleranceUs: number;
+  readonly similarities?: readonly number[];
+  readonly minimumContentSimilarity?: number;
+  readonly minimumMeanContentSimilarity?: number;
+}): boolean {
+  const { reference, candidate } = input;
+  if (reference.length === 0 || reference.length !== candidate.length) return false;
+
+  for (let index = 0; index < reference.length; index++) {
+    const want = reference[index]!;
+    const got = candidate[index]!;
+    if (want.required === false) continue;
+    if (Math.abs((want.ptsUs - input.referenceOriginUs) - got.ptsUs) > input.timestampToleranceUs) {
+      return false;
+    }
+    if (normalizeDigest(want.contentDigest) === normalizeDigest(got.contentDigest)) continue;
+    const similarity = input.similarities?.[index];
+    if (
+      input.minimumContentSimilarity === undefined ||
+      similarity === undefined ||
+      !Number.isFinite(similarity) ||
+      similarity < input.minimumContentSimilarity
+    ) {
+      return false;
+    }
+  }
+
+  if (input.minimumMeanContentSimilarity !== undefined) {
+    const requiredCount = reference.filter((frame) => frame.required !== false).length;
+    const allRequiredSimilarities = reference.flatMap((frame, index) => {
+      if (frame.required === false) return [];
+      const similarity = input.similarities?.[index];
+      return similarity !== undefined && Number.isFinite(similarity) ? [similarity] : [];
+    });
+    if (allRequiredSimilarities.length !== requiredCount) return false;
+    const mean = allRequiredSimilarities.reduce((sum, value) => sum + value, 0) /
+      allRequiredSimilarities.length;
+    if (mean < input.minimumMeanContentSimilarity) return false;
+  }
+
+  return true;
+}
+
 /** Stable identity for a bake. Provenance prevents one browser decode from masquerading as another. */
 export function trimBoundaryEvidenceKey(input: {
   assetId: string;

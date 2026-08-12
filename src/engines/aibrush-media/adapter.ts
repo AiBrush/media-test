@@ -58,6 +58,7 @@ import type {
 import {
   AUTHENTICATED_RANGE_INPUT_FEATURE,
   AUTHENTICATED_RANGE_PROBE_FEATURE,
+  createBrowserNotSupportedError,
   createNotApplicableError,
   DECODE_TRACK_SELECTOR_SCHEMA,
   isBrowserNotSupportedError,
@@ -87,7 +88,6 @@ import { type AibrushErrorClasses, translateAibrushFrameworkError } from './erro
 import { verifyAibrushLiveWebmShape, verifyAibrushOutputShape } from './output-shape.ts';
 import {
   AibrushCallbackAccumulator,
-  AibrushPositionedWriteUnsupportedError,
   AibrushSinkTraceRecorder,
   type AibrushStreamingRuntimeEvidence,
 } from './output-target.ts';
@@ -105,7 +105,7 @@ import {
   representationForAibrushTrack,
   type AibrushObservedTrack,
 } from './representation.ts';
-import { aibrushTupleSummary, decideAibrushSupport } from './support.ts';
+import { AIBRUSH_ENGINE_ID, aibrushTupleSummary, decideAibrushSupport } from './support.ts';
 import { takeFirstOwned } from './ownership.ts';
 // Byte-for-byte the SAME normalization the golden producer uses (platform engine). Reusing these (not
 // re-deriving them) is what makes aibrush-media's decode/seek frame digests comparable to golden.
@@ -113,7 +113,7 @@ import { digestImageData, sha256Hex } from '../platform/digest.ts';
 import { decodeWithWebCodecs, type DecodeInput } from '../platform/decode.ts';
 import { imageDataFromVideoFrame } from '../platform/raster.ts';
 
-const ENGINE_ID = 'aibrush-media@dev'; // instance .id — the versioned id stamped on every result + report
+const ENGINE_ID = AIBRUSH_ENGINE_ID; // instance .id — the versioned id stamped on every result + report
 // Registry/selection alias: the SHORT id (mirrors 'mediabunny'/'mp4box'/…). `--engine aibrush-media`
 // resolves to this, and the live matrix keys its column by it → main.ts maps it to the instance .id so
 // the column matches the streamed results. Registering under the versioned id instead left the column
@@ -300,6 +300,8 @@ const MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES = PACKET_INFO_PREP_MAX_SOURCE_
 const ISO_BMFF_BUFFER_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const STREAM_TARGET_MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 const NON_ISO_STREAM_TARGET_MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+const OPFS_STREAM_SPOOL_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
+let aibrushSpoolInstanceSequence = 0;
 const PREALLOCATED_REMUX_OUTPUT_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
 // Below this size, decode/seek feed the engine one bulk-fetched in-memory buffer instead of a fresh
 // per-call URL range source. A small clip's decode/seek reads the whole (or nearly all) file anyway, so a
@@ -402,10 +404,22 @@ interface AibrushPacketInfoMetadata {
   dtsUs?: number;
   durationUs?: number;
   keyframe: boolean;
+  payloadDigest?: string;
 }
 interface AibrushPacketInfoTable {
   tracks: ReadonlyArray<AibrushTrackInfo>;
   packets: ReadonlyArray<AibrushPacketInfoMetadata>;
+}
+
+function maximumAibrushTrackPacketCount(table: AibrushPacketInfoTable): number {
+  const counts = new Array<number>(table.tracks.length).fill(0);
+  for (const packet of table.packets) {
+    if (!Number.isSafeInteger(packet.trackIndex) || packet.trackIndex < 0 || packet.trackIndex >= counts.length) {
+      throw new Error(`aibrush packet-info row references invalid track index ${packet.trackIndex}`);
+    }
+    counts[packet.trackIndex] = counts[packet.trackIndex]! + 1;
+  }
+  return counts.reduce((maximum, count) => Math.max(maximum, count), 0);
 }
 interface AibrushPacketInfoBatchStream
   extends AsyncIterable<ReadonlyArray<AibrushPacketInfoMetadata>> {
@@ -864,6 +878,9 @@ function encodedMp4TrackFromPacketInfo(
       type: 'video',
       codec,
       timescale: 1_000_000,
+      ...(track.durationSec !== undefined && Number.isFinite(track.durationSec) && track.durationSec > 0
+        ? { durationSec: track.durationSec }
+        : {}),
       width,
       height,
       ...aibrushMuxRepresentationFields(track),
@@ -888,6 +905,9 @@ function encodedMp4TrackFromPacketInfo(
     type: 'audio',
     codec,
     timescale: 1_000_000,
+    ...(track.durationSec !== undefined && Number.isFinite(track.durationSec) && track.durationSec > 0
+      ? { durationSec: track.durationSec }
+      : {}),
     sampleRate,
     channels,
     ...aibrushMuxRepresentationFields(track),
@@ -916,6 +936,7 @@ interface AibrushTrackInfo {
     readonly attachmentIndex: number;
   };
   gapless?: {
+    readonly basis?: 'mp4-edit-list' | 'ogg-opus-granule' | 'webm-opus-codec-delay' | 'mp3-xing-lame';
     readonly leadingSamples?: number;
     readonly trailingSamples?: number;
     readonly totalSamples?: number;
@@ -924,6 +945,8 @@ interface AibrushTrackInfo {
     codec?: string;
     codedWidth?: number;
     codedHeight?: number;
+    displayAspectWidth?: number;
+    displayAspectHeight?: number;
     sampleRate?: number;
     numberOfChannels?: number;
     description?: BufferSource;
@@ -978,14 +1001,19 @@ interface AibrushAudioTarget {
   bitrate?: number;
   gainDb?: number;
   fade?: { inSec?: number; outSec?: number; curve?: 'linear' | 'equal-power' };
+  mixMatrix?: readonly (readonly number[])[];
 }
 interface AibrushStreamSink {
   readonly kind: 'stream';
 }
 type AibrushStreamTargetWriter = (chunk: Uint8Array, position: number) => void | Promise<void>;
+interface AibrushStreamTargetOptions {
+  readonly writeChunkBytes?: number;
+}
 interface AibrushStreamTargetSink {
   readonly kind: 'stream-target';
   readonly destination: WritableStream<Uint8Array> | AibrushStreamTargetWriter;
+  readonly options?: AibrushStreamTargetOptions;
 }
 type AibrushSink = AibrushStreamSink | AibrushStreamTargetSink;
 type AibrushOutput = Blob | ReadableStream<Uint8Array> | Uint8Array | undefined;
@@ -995,7 +1023,8 @@ interface AibrushConvertOptions {
   to?: string;
   video?: false | AibrushVideoTarget;
   audio?: false | AibrushAudioTarget;
-  faststart?: boolean;
+  faststart?: boolean | 'reserve';
+  maximumPacketCount?: number;
   fragmented?: boolean;
   sink?: AibrushSink;
 }
@@ -1017,19 +1046,28 @@ interface AibrushFromOptions {
 }
 interface AibrushEngine {
   from(input: unknown, opts?: AibrushFromOptions): unknown;
+  preload(...specs: Array<{
+    op: string;
+    container?: string;
+    level?: 'chunks' | 'compile' | 'ready';
+  }>): Promise<void>;
   probe(input: unknown, o?: AibrushCallOptions): Promise<AibrushInfo>;
   probeContainer?(input: unknown, container: string, o?: AibrushCallOptions): Promise<AibrushInfo>;
   packetInfo?(input: unknown, o?: AibrushCallOptions): Promise<AibrushPacketInfoTable>;
   packetInfoBatches?(
     input: unknown,
-    o?: AibrushCallOptions & { readonly batchSize?: number },
+    o?: AibrushCallOptions & {
+      readonly batchSize?: number;
+      readonly includePayloadDigests?: boolean;
+    },
   ): Promise<AibrushPacketInfoBatchStream>;
   demux(input: unknown, o?: AibrushCallOptions): Promise<AibrushDemuxed>;
   remux(
     input: unknown,
     opts: {
       to: string;
-      faststart?: boolean;
+      faststart?: boolean | 'reserve';
+      maximumPacketCount?: number;
       fragmented?: boolean;
       trackSelect?: readonly string[];
       tags?: Record<string, string>;
@@ -1077,7 +1115,8 @@ interface AibrushEngine {
     streams: AibrushPacketStreams,
     opts: {
       container: string;
-      faststart?: boolean;
+      faststart?: boolean | 'reserve';
+      maximumPacketCount?: number;
       fragmented?: boolean;
       sink?: AibrushSink;
     },
@@ -1125,7 +1164,10 @@ interface AibrushMedia {
     determinism?: 'auto' | 'force-software';
   }): AibrushEngine;
   toStream(): AibrushStreamSink;
-  toStreamTarget(destination: WritableStream<Uint8Array> | AibrushStreamTargetWriter): AibrushStreamTargetSink;
+  toStreamTarget(
+    destination: WritableStream<Uint8Array> | AibrushStreamTargetWriter,
+    options?: AibrushStreamTargetOptions,
+  ): AibrushStreamTargetSink;
   writeToStreamTarget(
     target: AibrushStreamTargetSink,
     stream: ReadableStream<Uint8Array>,
@@ -1348,6 +1390,18 @@ interface AibrushCore {
     readonly faststart?: boolean;
     readonly fragmented?: boolean;
   }): ReadableStream<Uint8Array>;
+  muxPreparedSparseMp4PacketTrack(input: {
+    readonly track: AibrushTrackInfo;
+    readonly packets: readonly AibrushPacket[];
+    readonly container: string;
+    readonly target: {
+      setSize(size: bigint | string): void;
+      write(position: bigint | string, bytes: Uint8Array): void;
+    };
+    readonly fileSize: bigint | string;
+    readonly sampleOffsets: readonly (bigint | string)[];
+    readonly signal?: AbortSignal;
+  }): Uint8Array;
   muxPreparedWebmAudioPacketTrack(input: {
     readonly track: AibrushTrackInfo;
     readonly packets: readonly AibrushPacket[];
@@ -1561,6 +1615,7 @@ async function demuxAibrushPacketInfoBatches(
   container: string,
   signal: AbortSignal,
   context: OperationContext | undefined,
+  includePayloadDigests: boolean,
 ): Promise<DemuxResult> {
   const open = engine.packetInfoBatches;
   if (open === undefined) {
@@ -1575,6 +1630,7 @@ async function demuxAibrushPacketInfoBatches(
   const batches = await open.call(engine, source, {
     signal,
     container,
+    includePayloadDigests,
   });
   const builder = createAibrushDemuxResultBuilder(
     metadataFromAibrushTracks(input, batches.tracks),
@@ -1981,6 +2037,9 @@ function parseHttpRangeTotal(value: string | null): number | undefined {
 
 const AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS = 16;
 const AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const AIBRUSH_AUTHENTICATED_LARGE_SOURCE_MIN_BYTES = 64 * 1024 * 1024;
+const AIBRUSH_AUTHENTICATED_LARGE_RANGE_CACHE_BLOCKS = 4;
+const AIBRUSH_AUTHENTICATED_LARGE_RANGE_CACHE_MAX_BYTES = 4 * 1024 * 1024;
 const AIBRUSH_AUTHENTICATED_RANGE_PARALLEL_BLOCKS = 4;
 const AIBRUSH_AUTHENTICATED_PROBE_PREFIX_MAX_BYTES = 16 * 1024 * 1024;
 
@@ -2070,8 +2129,21 @@ export function createAibrushAuthenticatedSource(
     throw new Error('createAibrushAuthenticatedSource requires MediaInput.contentAttestation');
   }
   validateAibrushAttestation(input, attestation);
-  const cache = new Map<number, Uint8Array>();
-  const inFlight = new Map<number, Promise<Uint8Array>>();
+  interface VerifiedBlock {
+    readonly bytes: Uint8Array;
+    leases: number;
+    cached: boolean;
+  }
+  const cache = new Map<number, VerifiedBlock>();
+  const inFlight = new Map<number, Promise<VerifiedBlock>>();
+  const cacheBlockLimit =
+    attestation.sizeBytes > AIBRUSH_AUTHENTICATED_LARGE_SOURCE_MIN_BYTES
+      ? AIBRUSH_AUTHENTICATED_LARGE_RANGE_CACHE_BLOCKS
+      : AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS;
+  const cacheByteLimit =
+    attestation.sizeBytes > AIBRUSH_AUTHENTICATED_LARGE_SOURCE_MIN_BYTES
+      ? AIBRUSH_AUTHENTICATED_LARGE_RANGE_CACHE_MAX_BYTES
+      : AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES;
   let cacheBytes = 0;
   const rangeOutputs = new WeakSet<Uint8Array>();
   const probePrefix = captureProbePrefix
@@ -2084,13 +2156,36 @@ export function createAibrushAuthenticatedSource(
     aibrushAuthenticatedProbePrefixBlocks.set(trace, probePrefix);
   }
 
+  const detachOwnedBytes = (bytes: Uint8Array): void => {
+    const buffer = bytes.buffer;
+    if (
+      buffer instanceof ArrayBuffer &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === buffer.byteLength
+    ) {
+      const transfer = (
+        buffer as ArrayBuffer & {
+          transfer?: (newByteLength?: number) => ArrayBuffer;
+        }
+      ).transfer;
+      if (typeof transfer === 'function') transfer.call(buffer, 0);
+    }
+  };
+  const releaseBlock = (entry: VerifiedBlock): void => {
+    if (entry.leases <= 0) {
+      throw new Error('authenticated range block lease underflow');
+    }
+    entry.leases -= 1;
+    if (entry.leases === 0 && !entry.cached) detachOwnedBytes(entry.bytes);
+  };
+
   const waitForBlock = (
-    pending: Promise<Uint8Array>,
+    pending: Promise<VerifiedBlock>,
     signal: AbortSignal | undefined,
-  ): Promise<Uint8Array> => {
+  ): Promise<VerifiedBlock> => {
     if (signal === undefined) return pending;
     signal.throwIfAborted();
-    return new Promise<Uint8Array>((resolve, reject) => {
+    return new Promise<VerifiedBlock>((resolve, reject) => {
       const abort = (): void => {
         signal.removeEventListener('abort', abort);
         reject(signal.reason);
@@ -2109,17 +2204,22 @@ export function createAibrushAuthenticatedSource(
     });
   };
 
-  const block = async (blockIndex: number, signal?: AbortSignal): Promise<Uint8Array> => {
+  const block = async (blockIndex: number, signal?: AbortSignal): Promise<VerifiedBlock> => {
     signal?.throwIfAborted();
     const cached = cache.get(blockIndex);
     if (cached !== undefined) {
       cache.delete(blockIndex);
       cache.set(blockIndex, cached);
+      cached.leases += 1;
       return cached;
     }
     const existing = inFlight.get(blockIndex);
-    if (existing !== undefined) return waitForBlock(existing, signal);
-    const pending = (async (): Promise<Uint8Array> => {
+    if (existing !== undefined) {
+      const entry = await waitForBlock(existing, signal);
+      entry.leases += 1;
+      return entry;
+    }
+    const pending = (async (): Promise<VerifiedBlock> => {
       const blockStart = blockIndex * attestation.chunkSizeBytes;
       const blockEndExclusive = Math.min(
         attestation.sizeBytes,
@@ -2173,28 +2273,38 @@ export function createAibrushAuthenticatedSource(
         probePrefix !== undefined &&
         blockEndExclusive <= AIBRUSH_AUTHENTICATED_PROBE_PREFIX_MAX_BYTES
       ) {
-        probePrefix.blocks.set(blockIndex, bytes);
+        probePrefix.blocks.set(blockIndex, bytes.slice());
       }
-      if (bytes.byteLength <= AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES) {
+      const entry: VerifiedBlock = { bytes, leases: 0, cached: false };
+      if (bytes.byteLength <= cacheByteLimit) {
         const replaced = cache.get(blockIndex);
-        if (replaced !== undefined) cacheBytes -= replaced.byteLength;
-        cache.set(blockIndex, bytes);
+        if (replaced !== undefined) {
+          cacheBytes -= replaced.bytes.byteLength;
+          replaced.cached = false;
+          if (replaced.leases === 0) detachOwnedBytes(replaced.bytes);
+        }
+        entry.cached = true;
+        cache.set(blockIndex, entry);
         cacheBytes += bytes.byteLength;
       }
       while (
-        cache.size > AIBRUSH_AUTHENTICATED_RANGE_CACHE_BLOCKS ||
-        cacheBytes > AIBRUSH_AUTHENTICATED_RANGE_CACHE_MAX_BYTES
+        cache.size > cacheBlockLimit ||
+        cacheBytes > cacheByteLimit
       ) {
-        const oldest = cache.entries().next().value as [number, Uint8Array] | undefined;
+        const oldest = cache.entries().next().value as [number, VerifiedBlock] | undefined;
         if (oldest === undefined) break;
         cache.delete(oldest[0]);
-        cacheBytes -= oldest[1].byteLength;
+        cacheBytes -= oldest[1].bytes.byteLength;
+        oldest[1].cached = false;
+        if (oldest[1].leases === 0) detachOwnedBytes(oldest[1].bytes);
       }
-      return bytes;
+      return entry;
     })();
     inFlight.set(blockIndex, pending);
     try {
-      return await pending;
+      const entry = await pending;
+      entry.leases += 1;
+      return entry;
     } finally {
       if (inFlight.get(blockIndex) === pending) inFlight.delete(blockIndex);
     }
@@ -2244,28 +2354,35 @@ export function createAibrushAuthenticatedSource(
         return { parent, listener };
       });
       const requests = indices.map((index) => block(index, batchCancellation.signal));
-      let blocks: Uint8Array[];
+      let blocks: VerifiedBlock[];
       try {
         blocks = await Promise.all(requests);
       } catch (error) {
         if (!batchCancellation.signal.aborted) batchCancellation.abort(error);
-        await Promise.allSettled(requests);
+        const settled = await Promise.allSettled(requests);
+        for (const result of settled) {
+          if (result.status === 'fulfilled') releaseBlock(result.value);
+        }
         throw error;
       } finally {
         for (const { parent, listener } of abortListeners) {
           parent.removeEventListener('abort', listener);
         }
       }
-      for (let index = 0; index < blocks.length; index++) {
-        const blockIndex = indices[index]!;
-        const bytes = blocks[index]!;
-        const blockStart = blockIndex * attestation.chunkSizeBytes;
-        const copyStart = Math.max(boundedStart, blockStart);
-        const copyEnd = Math.min(boundedEnd, blockStart + bytes.byteLength);
-        output.set(
-          bytes.subarray(copyStart - blockStart, copyEnd - blockStart),
-          copyStart - boundedStart,
-        );
+      try {
+        for (let index = 0; index < blocks.length; index++) {
+          const blockIndex = indices[index]!;
+          const entry = blocks[index]!;
+          const blockStart = blockIndex * attestation.chunkSizeBytes;
+          const copyStart = Math.max(boundedStart, blockStart);
+          const copyEnd = Math.min(boundedEnd, blockStart + entry.bytes.byteLength);
+          output.set(
+            entry.bytes.subarray(copyStart - blockStart, copyEnd - blockStart),
+            copyStart - boundedStart,
+          );
+        }
+      } finally {
+        for (const entry of blocks) releaseBlock(entry);
       }
     }
     operationSignal?.throwIfAborted();
@@ -2276,19 +2393,7 @@ export function createAibrushAuthenticatedSource(
 
   const releaseRange = (bytes: Uint8Array): void => {
     if (!rangeOutputs.delete(bytes)) return;
-    const buffer = bytes.buffer;
-    if (
-      buffer instanceof ArrayBuffer &&
-      bytes.byteOffset === 0 &&
-      bytes.byteLength === buffer.byteLength
-    ) {
-      const transfer = (
-        buffer as ArrayBuffer & {
-          transfer?: (newByteLength?: number) => ArrayBuffer;
-        }
-      ).transfer;
-      if (typeof transfer === 'function') transfer.call(buffer, 0);
-    }
+    detachOwnedBytes(bytes);
   };
 
   return {
@@ -2876,6 +2981,7 @@ function attachSourceReadTelemetry<T extends object>(
 interface AibrushOutputTelemetry {
   readonly sink: AibrushSink;
   mediaBytes(output: AibrushOutput, container: string): Promise<MediaBytes>;
+  abort?(reason: unknown): Promise<void>;
 }
 
 interface AibrushOutputRuntimeIdentity {
@@ -2885,6 +2991,9 @@ interface AibrushOutputRuntimeIdentity {
   readonly captureMuxWriteTrace?: boolean;
   /** Lossless remux estimate used to avoid retaining N bytes of chunks plus an N-byte final copy. */
   readonly expectedOutputBytes?: number;
+  /** Reserved fast-start's caller-authored per-track ceiling and independently observed track load. */
+  readonly maximumPacketCount?: number;
+  readonly observedPacketCount?: number;
 }
 
 interface AibrushOutputObservation {
@@ -2905,24 +3014,44 @@ function instrumentedAibrushSink(
   if (target === 'stream') {
     const accumulator = new AibrushCallbackAccumulator({
       operationStartMs: runtime.operationStartMs,
+      ...(runtime.maximumPacketCount === undefined
+        ? {}
+        : { maximumPacketCount: runtime.maximumPacketCount }),
     });
     const muxWrites: MuxWriteTraceEvidence['writes'] = [];
+    const muxReservations: MuxWriteTraceEvidence['reservations'] = [];
     let muxPeakBufferedBytes = 0;
+    let muxSequence = 0;
+    let muxExtent = 0;
+    let muxReservationRecorded = false;
     let emittedFirstByte = false;
     const sink = lib.toStreamTarget((chunk, position) => {
       accumulator.write(chunk, position);
       if (runtime.captureMuxWriteTrace === true && chunk.byteLength > 0) {
         const observedAtMs = accumulator.recorder.lastWriteAtMs ?? nowMs();
+        if (
+          runtime.maximumPacketCount !== undefined &&
+          !muxReservationRecorded &&
+          position > muxExtent
+        ) {
+          muxReservations.push({
+            sequence: muxSequence++,
+            position: muxExtent,
+            length: position - muxExtent,
+          });
+          muxReservationRecorded = true;
+        }
         muxWrites.push({
-          sequence: muxWrites.length,
+          sequence: muxSequence++,
           atMs:
             runtime.operationStartMs === undefined
               ? observedAtMs
               : Math.max(0, observedAtMs - runtime.operationStartMs),
           position,
           bytes: chunk.slice(),
-          kind: 'append',
+          kind: position < muxExtent ? 'patch' : 'append',
         });
+        muxExtent = Math.max(muxExtent, position + chunk.byteLength);
         muxPeakBufferedBytes = Math.max(muxPeakBufferedBytes, chunk.byteLength);
       }
       if (chunk.byteLength === 0 || runtime.operationStartMs === undefined || runtime.emit === undefined) return;
@@ -2941,7 +3070,9 @@ function instrumentedAibrushSink(
         atMs,
         count: accumulator.evidence.callbackWriteCount,
       });
-    });
+    }, opts?.writeChunkBytes === undefined
+      ? undefined
+      : { writeChunkBytes: opts.writeChunkBytes as number });
     return {
       sink,
       async mediaBytes(output, container) {
@@ -2951,9 +3082,9 @@ function instrumentedAibrushSink(
         accumulator.recorder.beginFinalize();
         const bytes = accumulator.materialize();
         const evidence = accumulator.evidence;
-        const trace = accumulator.recorder.complete('stream', evidence.peakRetainedBytes);
+        const trace = accumulator.recorder.complete('stream', evidence.peakRetainedBytes, bytes);
         observe?.({
-          writerMode: 'callback-contiguous-stream+final-concatenation',
+          writerMode: 'callback-positioned-stream+final-reconstruction',
           targetMode: 'callback-stream',
           peakRetainedBytes: evidence.peakRetainedBytes,
           callbackWriteCount: evidence.callbackWriteCount,
@@ -2968,7 +3099,7 @@ function instrumentedAibrushSink(
                 muxWriteTrace: {
                   schema: 'media-test/mux-write-trace@1',
                   writes: muxWrites,
-                  reservations: [],
+                  reservations: muxReservations,
                   finalByteLength: bytes.byteLength,
                   peakBufferedBytes: muxPeakBufferedBytes,
                 },
@@ -3031,6 +3162,131 @@ function instrumentedAibrushSink(
   };
 }
 
+interface AibrushOpfsDirectoryHandle extends FileSystemDirectoryHandle {
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<FileSystemFileHandle>;
+  removeEntry(name: string): Promise<void>;
+}
+
+interface AibrushStorageManager extends StorageManager {
+  getDirectory(): Promise<AibrushOpfsDirectoryHandle>;
+}
+
+function shouldSpoolAibrushStreamOutput(
+  input: MediaInput,
+  opts: Record<string, unknown>,
+  fragmented: boolean,
+): boolean {
+  return (
+    opts.target === 'stream' &&
+    fragmented &&
+    isIsoBmffTarget(String(opts.container ?? '')) &&
+    input.sizeBytes !== undefined &&
+    input.sizeBytes >= OPFS_STREAM_SPOOL_MIN_SOURCE_BYTES
+  );
+}
+
+/**
+ * Large fragmented ISO-BMFF output is written through the product's awaited callback target straight
+ * to OPFS. Only the sink recorder's bounded prefix/tail windows remain on the JS heap; the complete
+ * artifact stays range-readable for neutral correctness oracles.
+ */
+async function instrumentedAibrushOpfsSink(
+  lib: AibrushMedia,
+  directory: AibrushOpfsDirectoryHandle,
+  fileName: string,
+  opts: Record<string, unknown>,
+  runtime: AibrushOutputRuntimeIdentity,
+  observe?: (observation: AibrushOutputObservation) => void,
+): Promise<AibrushOutputTelemetry> {
+  const handle = await directory.getFileHandle(fileName, { create: true });
+  const writable = await handle.createWritable({ keepExistingData: false });
+  const recorder = new AibrushSinkTraceRecorder({ operationStartMs: runtime.operationStartMs });
+  let emittedFirstByte = false;
+  let closed = false;
+  const sink = lib.toStreamTarget(async (chunk, position) => {
+    if (chunk.byteLength === 0) return;
+    const writeBytes = new Uint8Array(chunk.byteLength);
+    writeBytes.set(chunk);
+    await writable.write({ type: 'write', position, data: writeBytes });
+    recorder.write(writeBytes, position);
+    if (runtime.operationStartMs === undefined || runtime.emit === undefined) return;
+    const atMs = Math.max(0, (recorder.lastWriteAtMs ?? nowMs()) - runtime.operationStartMs);
+    if (!emittedFirstByte) {
+      emittedFirstByte = true;
+      runtime.emit({ type: 'first-byte', atMs });
+    }
+    runtime.emit({ type: 'bytes-written', atMs, bytes: recorder.bytesWritten });
+    runtime.emit({ type: 'write-count', atMs, count: recorder.writeCount });
+  }, opts.writeChunkBytes === undefined
+    ? undefined
+    : { writeChunkBytes: opts.writeChunkBytes as number });
+
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await writable.close();
+  };
+  const abort = async (reason: unknown): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await writable.abort(reason).catch(() => undefined);
+  };
+  return {
+    sink,
+    abort,
+    async mediaBytes(output, container) {
+      if (output !== undefined) {
+        await abort(new Error('aibrush OPFS stream-target sink returned an output value'));
+        throw new Error('aibrush stream-target sink returned an output value instead of writing the target');
+      }
+      await close();
+      recorder.beginFinalize();
+      const retainedOutputBytes = recorder.validationRetainedBytes;
+      const trace = recorder.complete('stream', retainedOutputBytes);
+      if (trace === undefined) throw new Error('aibrush OPFS stream output produced no sink trace');
+      const file = await handle.getFile();
+      if (file.size !== trace.totalUniqueBytes) {
+        throw new Error(
+          `aibrush OPFS stream output has ${file.size} bytes, expected ${trace.totalUniqueBytes}`,
+        );
+      }
+      observe?.({
+        writerMode: 'awaited-positioned-callback+opfs-range-artifact',
+        targetMode: 'callback-stream',
+        peakRetainedBytes: retainedOutputBytes + trace.maximumQueuedBytes,
+        callbackWriteCount: recorder.writeCount,
+      });
+      const artifactByteLength = file.size;
+      const media: MediaBytes = {
+        bytes: trace.validationPrefix.slice(),
+        mime: outputMime(container),
+        container,
+        targetWrites: recorder.writeCount,
+        artifact: {
+          schema: 'media-test/media-range-artifact@1',
+          byteLength: artifactByteLength,
+          async range(start, end, signal) {
+            signal?.throwIfAborted();
+            if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+              throw new RangeError('aibrush OPFS artifact range bounds must be safe integers');
+            }
+            const boundedStart = Math.max(0, Math.min(start, artifactByteLength));
+            const boundedEnd = Math.max(boundedStart, Math.min(end, artifactByteLength));
+            const current = await handle.getFile();
+            if (current.size !== artifactByteLength) {
+              throw new Error('aibrush OPFS artifact was replaced before correctness consumption');
+            }
+            const bytes = new Uint8Array(await current.slice(boundedStart, boundedEnd).arrayBuffer());
+            signal?.throwIfAborted();
+            return bytes;
+          },
+        },
+      };
+      return attachStreamingEvidence(media, trace, runtime, 'stream');
+    },
+  };
+}
+
 function attachStreamingEvidence(
   media: MediaBytes,
   trace: ReturnType<AibrushSinkTraceRecorder['complete']>,
@@ -3053,20 +3309,30 @@ function attachStreamingEvidence(
     resolvedRepresentation: runtime.resolvedRepresentation,
     observerPolicy:
       target === 'stream'
-        ? 'aibrush-synchronous-contiguous-callback-observer@1'
+        ? media.artifact === undefined
+          ? 'aibrush-synchronous-positioned-callback-observer@1'
+          : 'aibrush-awaited-positioned-callback-opfs-observer@1'
         : 'aibrush-framework-output-materialization-observer@1',
     retainedOutputPolicy:
       target === 'stream'
-        ? 'whole-output-callback-accumulation-and-final-concatenation'
+        ? media.artifact === undefined
+          ? 'whole-output-callback-write-retention-and-final-reconstruction'
+          : 'bounded-callback-observation+opfs-range-artifact'
         : 'whole-output-framework-materialization',
     measurementContract: 'media-test/streaming-output-measurement@1',
+    ...(runtime.observedPacketCount === undefined
+      ? {}
+      : {
+          observedPacketCount: runtime.observedPacketCount,
+          reserveCompletion: 'COMPLETED' as const,
+        }),
   });
   const output = {
     ...media,
     targetWrites: trace.events.filter((event) => event.type === 'write').length,
     ...(firstByteMs !== undefined ? { firstByteMs } : {}),
     telemetry: {
-      bytesWritten: media.bytes.byteLength,
+      bytesWritten: media.artifact?.byteLength ?? media.bytes.byteLength,
       writeCount: trace.events.filter((event) => event.type === 'write').length,
       ...(firstByteMs !== undefined ? { firstByteMs } : {}),
     },
@@ -3103,6 +3369,13 @@ async function toMediaBytesWithRetention(
       media: { bytes: output, mime: outputMime(container), container },
       peakRetainedBytes: output.byteLength,
     };
+  }
+  if (
+    Number.isSafeInteger(expectedOutputBytes) &&
+    expectedOutputBytes !== undefined &&
+    expectedOutputBytes > BUFFER_TARGET_MAX_SOURCE_BYTES
+  ) {
+    return publishAibrushMultipartStreamArtifact(output, container, recorder, onWrite);
   }
   const reader = output.getReader();
   if (
@@ -3219,6 +3492,72 @@ async function toMediaBytesWithRetention(
   return {
     media: { bytes, mime: outputMime(container), container },
     peakRetainedBytes: accumulator.evidence.peakRetainedBytes,
+  };
+}
+
+/** Retain a complete buffer target as independently owned parts without one contiguous allocation. */
+export async function publishAibrushMultipartStreamArtifact(
+  output: ReadableStream<Uint8Array>,
+  container: string,
+  recorder?: AibrushSinkTraceRecorder,
+  onWrite?: () => void,
+): Promise<{ media: MediaBytes; peakRetainedBytes: number }> {
+  const reader = output.getReader();
+  const parts: Array<{ readonly start: number; readonly bytes: Uint8Array<ArrayBuffer> }> = [];
+  let byteLength = 0;
+  let peakRetainedBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const owned = new Uint8Array(value.byteLength);
+      owned.set(value);
+      parts.push({ start: byteLength, bytes: owned });
+      byteLength += owned.byteLength;
+      peakRetainedBytes = Math.max(peakRetainedBytes, byteLength + value.byteLength);
+      recorder?.write(value, recorder.bytesWritten);
+      onWrite?.();
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const range = async (start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> => {
+    signal?.throwIfAborted();
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
+      throw new RangeError('aibrush multipart artifact range bounds must be safe integers');
+    }
+    const boundedStart = Math.max(0, Math.min(start, byteLength));
+    const boundedEnd = Math.max(boundedStart, Math.min(end, byteLength));
+    const bytes = new Uint8Array(boundedEnd - boundedStart);
+    for (const part of parts) {
+      const partEnd = part.start + part.bytes.byteLength;
+      if (partEnd <= boundedStart) continue;
+      if (part.start >= boundedEnd) break;
+      const copyStart = Math.max(boundedStart, part.start);
+      const copyEnd = Math.min(boundedEnd, partEnd);
+      bytes.set(
+        part.bytes.subarray(copyStart - part.start, copyEnd - part.start),
+        copyStart - boundedStart,
+      );
+    }
+    signal?.throwIfAborted();
+    return bytes;
+  };
+  return {
+    media: {
+      bytes: await range(0, Math.min(byteLength, 4_096)),
+      mime: outputMime(container),
+      container,
+      artifact: {
+        schema: 'media-test/media-range-artifact@1',
+        byteLength,
+        range,
+      },
+    },
+    peakRetainedBytes,
   };
 }
 
@@ -4659,8 +4998,15 @@ export function resolveAibrushDecodeTrack(
 export function aibrushDecodeRequiresExactFrameworkRoute(
   options: ConcreteOperationRequest['options'] | undefined,
   selectedTrack: ReturnType<typeof resolveAibrushDecodeTrack> | undefined,
+  observedTracks: readonly { readonly type: string; readonly rotation?: number }[] = [],
 ): boolean {
-  return selectedTrack !== undefined || displayTransformFromOptions(options) !== undefined;
+  return (
+    selectedTrack !== undefined ||
+    displayTransformFromOptions(options) !== undefined ||
+    observedTracks.some(
+      (track) => track.type === 'video' && track.rotation !== undefined && track.rotation !== 0,
+    )
+  );
 }
 
 /**
@@ -4736,8 +5082,18 @@ function canUseDirectBoundedDecode(input: MediaInput, maxFrames: number): boolea
   return input.sizeBytes === undefined || input.sizeBytes <= DIRECT_BOUNDED_ISO_BMFF_MAX_SOURCE_BYTES;
 }
 
-function videoDecoderConfigFromTrackInfo(track: AibrushTrackInfo): VideoDecoderConfig | undefined {
-  const config = track.config;
+export function aibrushDirectVideoDecoderConfig(
+  config:
+    | {
+        readonly codec?: string;
+        readonly codedWidth?: number;
+        readonly codedHeight?: number;
+        readonly displayAspectWidth?: number;
+        readonly displayAspectHeight?: number;
+        readonly description?: BufferSource;
+      }
+    | undefined,
+): VideoDecoderConfig | undefined {
   if (config === undefined || typeof config.codec !== 'string') return undefined;
   const codedWidth = config.codedWidth;
   const codedHeight = config.codedHeight;
@@ -4751,11 +5107,23 @@ function videoDecoderConfigFromTrackInfo(track: AibrushTrackInfo): VideoDecoderC
   ) {
     return undefined;
   }
+  const displayAspectWidth = config.displayAspectWidth;
+  const displayAspectHeight = config.displayAspectHeight;
+  const hasValidDisplayAspect =
+    Number.isSafeInteger(displayAspectWidth) &&
+    Number.isSafeInteger(displayAspectHeight) &&
+    displayAspectWidth !== undefined &&
+    displayAspectHeight !== undefined &&
+    displayAspectWidth > 0 &&
+    displayAspectHeight > 0 &&
+    displayAspectWidth <= 0xffff_ffff &&
+    displayAspectHeight <= 0xffff_ffff;
   return {
     codec: config.codec,
     codedWidth,
     codedHeight,
     hardwareAcceleration: 'no-preference',
+    ...(hasValidDisplayAspect ? { displayAspectWidth, displayAspectHeight } : {}),
     ...(config.description !== undefined ? { description: bufferBytes(config.description) } : {}),
   };
 }
@@ -4774,7 +5142,7 @@ function directVideoPacketRows(
   if (trackIndex < 0) return undefined;
   const track = table.tracks[trackIndex];
   if (track === undefined) return undefined;
-  const config = videoDecoderConfigFromTrackInfo(track);
+  const config = aibrushDirectVideoDecoderConfig(track.config);
   if (config === undefined) return undefined;
   const all = table.packets
     .filter(
@@ -4947,6 +5315,27 @@ function fadeFrom(audio: Record<string, unknown>): AibrushAudioTarget['fade'] | 
   return Object.keys(target).length > 0 ? target : undefined;
 }
 
+/** Map one harness audio target to the engine's without dropping authored DSP controls. */
+export function mapAibrushTranscodeAudioTarget(
+  audio: TranscodeAudioOptions,
+): AibrushAudioTarget {
+  const extra = audio as unknown as Record<string, unknown>;
+  const gainDb = gainDbFrom(extra);
+  const fade = fadeFrom(extra);
+  const mixMatrix = Array.isArray(extra.mixMatrix)
+    ? (extra.mixMatrix as readonly (readonly number[])[])
+    : undefined;
+  return {
+    ...(audio.codec !== undefined ? { codec: audio.codec } : {}),
+    ...(audio.sampleRate !== undefined ? { sampleRate: audio.sampleRate } : {}),
+    ...(audio.channels !== undefined ? { channels: audio.channels } : {}),
+    ...(audio.bitrate !== undefined ? { bitrate: audio.bitrate } : {}),
+    ...(gainDb !== undefined ? { gainDb } : {}),
+    ...(fade !== undefined ? { fade } : {}),
+    ...(mixMatrix !== undefined ? { mixMatrix } : {}),
+  };
+}
+
 /** Map one harness video target to the engine's, copying only the set fields (exactOptionalPropertyTypes). */
 export function mapAibrushTranscodeVideoTarget(
   v: TranscodeVideoOptions,
@@ -4983,7 +5372,11 @@ export function mapAibrushTranscodeVideoTarget(
         }
       : {}),
     ...(typeof crf === 'number' && Number.isFinite(crf) ? { crf } : {}),
-    ...(passes === 2 ? { twoPass: true } : {}),
+    // The engine's explicit objective-quality route is itself replay-backed and may audit additional
+    // bounded candidates. Do not also request its ordinary fixed two-pass schedule: those public modes
+    // are mutually exclusive, while the harness `passes: 2` requirement is still satisfied by the
+    // analysis pass plus the selected private candidate.
+    ...(passes === 2 && v.quality === undefined ? { twoPass: true } : {}),
     ...(bitDepth === 8 || bitDepth === 10 || bitDepth === 12 ? { bitDepth } : {}),
     ...(alpha === 'keep' || alpha === 'discard' ? { alpha } : {}),
     ...(rotate !== undefined ? { rotate } : {}),
@@ -5040,18 +5433,7 @@ function convertOptionsFrom(opts: TranscodeOptions): AibrushConvertOptions {
       opts as unknown as Record<string, unknown>,
     );
   if (opts.audio) {
-    const a = opts.audio;
-    const audioExtra = a as unknown as Record<string, unknown>;
-    const gainDb = gainDbFrom(audioExtra);
-    const fade = fadeFrom(audioExtra);
-    out.audio = {
-      ...(a.codec !== undefined ? { codec: a.codec } : {}),
-      ...(a.sampleRate !== undefined ? { sampleRate: a.sampleRate } : {}),
-      ...(a.channels !== undefined ? { channels: a.channels } : {}),
-      ...(a.bitrate !== undefined ? { bitrate: a.bitrate } : {}),
-      ...(gainDb !== undefined ? { gainDb } : {}),
-      ...(fade !== undefined ? { fade } : {}),
-    };
+    out.audio = mapAibrushTranscodeAudioTarget(opts.audio);
   }
   return out;
 }
@@ -6232,17 +6614,17 @@ async function tryStrictPreparedAibrushCopyTrim(
         return undefined;
       }
       const chunks: AibrushPreparedWebmChunk[] = [];
-      let matroskaVideoDecodeUs: number | undefined;
       for (let selectedIndex = 0; selectedIndex < selection.indices.length; selectedIndex++) {
         const sourceIndex = selection.indices[selectedIndex]!;
         const row = rows[sourceIndex];
         const sample = selection.track.samples[selectedIndex];
         if (row === undefined || sample?.ptsUs === undefined) return undefined;
         const durationUs = sample.durationUs ?? row.durationUs;
-        const preserveMatroskaDecodeOrder = sourceContainer === 'mkv' && matched.track.mediaType === 'video';
-        const dtsUs = preserveMatroskaDecodeOrder
-          ? (matroskaVideoDecodeUs ?? Math.round(sample.ptsUs))
-          : (sample.dtsUs ?? row.dtsUs);
+        // Matroska stores blocks in decode order but timestamps them on the presentation axis. The
+        // neutral reader and the product packet table independently reconstruct the source DTS. Keep
+        // that exact (occasionally gapped) clock: synthesizing a dense duration sum changes the DTS of
+        // later B-frame access units when an end-boundary presentation sample is omitted.
+        const dtsUs = sample.dtsUs ?? row.dtsUs;
         chunks.push({
           timestampUs: Math.round(sample.ptsUs),
           ...(durationUs !== undefined ? { durationUs: Math.max(0, Math.round(durationUs)) } : {}),
@@ -6251,9 +6633,6 @@ async function tryStrictPreparedAibrushCopyTrim(
           ...(dtsUs !== undefined ? { dtsUs: Math.round(dtsUs) } : {}),
           ...(row.alpha !== undefined ? { alpha: row.alpha } : {}),
         });
-        if (preserveMatroskaDecodeOrder) {
-          matroskaVideoDecodeUs = (dtsUs ?? sample.ptsUs) + Math.max(1, Math.round(durationUs ?? 1));
-        }
       }
       if (chunks.length === 0) return undefined;
       tracks.push({ track: aibrushTrimmedTrackInfo(matched.track), chunks });
@@ -6329,7 +6708,8 @@ async function aibrushFrameAccurateRange(
   const overlappingLeadUs = range.startUs - video.landedStartUs;
   // A displayed sample can begin before the requested point while still intersecting the half-open
   // range. Route from that independently parsed presentation start so the complete sample is retained
-  // for both CFR quantization and long VFR frames.
+  // for both CFR quantization and long VFR frames. Keep the authored end: the codec seam clips the final
+  // intersecting sample's declared duration so the public output does not extend past the request.
   return overlappingLeadUs > 0 ? { startUs: video.landedStartUs, endUs: range.endUs } : range;
 }
 
@@ -6676,6 +7056,7 @@ async function tryPreparedMp3Remux(
   target: string,
   opts: RemuxOptions,
 ): Promise<Uint8Array | undefined> {
+  if (opts.fastStart === 'reserve') return undefined;
   if (target !== 'mp4' && target !== 'mov' && target !== 'mkv') return undefined;
   const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
   if (bytes === undefined) return undefined;
@@ -6736,7 +7117,7 @@ async function tryPreparedMp3Remux(
     track,
     packets,
     container: target,
-    faststart: faststartFrom(opts),
+    faststart: opts.fastStart !== false,
     fragmented: false,
   });
   if (presentationDurationSec === undefined || !Number.isFinite(presentationDurationSec)) return output;
@@ -6821,6 +7202,7 @@ async function tryPreparedMatroskaToContainerRemux(
   opts: RemuxOptions,
   signal: AbortSignal,
 ): Promise<Uint8Array | undefined> {
+  if (opts.fastStart === 'reserve') return undefined;
   if (target !== 'mp4' && target !== 'mov' && target !== 'ts') return undefined;
   const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
   if (bytes === undefined) return undefined;
@@ -6873,7 +7255,7 @@ async function tryPreparedMatroskaToContainerRemux(
     : core.muxPreparedMp4PacketTracks({
         tracks,
         container: target,
-        faststart: faststartFrom(opts),
+        faststart: opts.fastStart !== false,
         fragmented: false,
       });
 }
@@ -6915,6 +7297,7 @@ async function tryPreparedMpegTsToContainerRemux(
   opts: RemuxOptions,
   signal: AbortSignal,
 ): Promise<Uint8Array | undefined> {
+  if (opts.fastStart === 'reserve') return undefined;
   if (target !== 'mp4' && target !== 'mov' && target !== 'mkv') return undefined;
   const bytes = await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES);
   if (bytes === undefined) return undefined;
@@ -6939,7 +7322,7 @@ async function tryPreparedMpegTsToContainerRemux(
     const intermediate = core.muxPreparedMp4PacketTracks({
       tracks,
       container: intermediateTarget,
-      faststart: target === 'mkv' ? true : faststartFrom(opts),
+      faststart: target === 'mkv' ? true : opts.fastStart !== false,
       fragmented: false,
     });
     if (target !== 'mkv') return intermediate;
@@ -7391,24 +7774,15 @@ async function finiteWebmClusterSource(engine: AibrushEngine, input: MediaInput)
 // ── remux output-shape knobs (streaming-output family forwards them via RemuxOptions) ──────────────
 
 /**
- * Resolve the engine `faststart` boolean from the harness output-shape `fastStart` knob the
+ * Resolve the engine `faststart` mode from the harness output-shape `fastStart` knob the
  * streaming-output family carries in the remux option bag (`RemuxOptions` extends `Record<unknown>`):
  *   - `false`                  → moov AFTER mdat (the mdat-first control; `mp4_buffer_target`);
  *   - `'in-memory'`/absent → moov BEFORE mdat (the streamable default);
- *   - `'reserve'` → reason-coded NA_ENGINE because the public framework cannot express or prove the
- *     positioned reserve-write semantics.
+ *   - `'reserve'` → the public reserved, positioned-write mode.
  */
-function faststartFrom(opts: RemuxOptions): boolean {
+function faststartFrom(opts: RemuxOptions): boolean | 'reserve' {
   const fastStart = (opts as { fastStart?: unknown }).fastStart;
-  if (fastStart === 'reserve') {
-    throw createNotApplicableError(
-      ENGINE_ID,
-      'remux',
-      'the framework cannot express reserved positioned fast-start writes',
-      {},
-      'AIBRUSH_POSITIONED_RESERVE_UNSUPPORTED',
-    );
-  }
+  if (fastStart === 'reserve') return 'reserve';
   return fastStart !== false;
 }
 
@@ -7428,40 +7802,46 @@ function rejectUnforwardableOutputShape(operation: ApplicabilityOperation, opts:
       'AIBRUSH_OUTPUT_TARGET_UNKNOWN',
     );
   }
-  if (opts.fastStart === 'reserve') {
+  if (opts.fastStart === 'reserve' && opts.target !== 'stream') {
     throw createNotApplicableError(
       ENGINE_ID,
       operation,
-      'the framework cannot express reserved positioned fast-start writes',
+      'reserved positioned fast-start requires the callback-backed stream target',
       {},
-      'AIBRUSH_POSITIONED_RESERVE_UNSUPPORTED',
+      'AIBRUSH_POSITIONED_RESERVE_REQUIRES_STREAM_TARGET',
     );
   }
-  if (opts.positionedWrites === true || opts.writeMode === 'positioned') {
+  if (
+    (opts.positionedWrites === true || opts.writeMode === 'positioned') &&
+    opts.target !== 'stream'
+  ) {
     throw createNotApplicableError(
       ENGINE_ID,
       operation,
-      'the adapter proves only contiguous callback writes, not positioned output',
+      'positioned-write evidence requires the callback-backed stream target',
       {},
-      'AIBRUSH_POSITIONED_WRITES_UNSUPPORTED',
+      'AIBRUSH_POSITIONED_WRITES_REQUIRE_STREAM_TARGET',
     );
   }
-  if (opts.writeChunkBytes !== undefined) {
+  if (
+    opts.fastStart === 'reserve' &&
+    (!Number.isSafeInteger(opts.maximumPacketCount) || (opts.maximumPacketCount as number) < 1)
+  ) {
     throw createNotApplicableError(
       ENGINE_ID,
       operation,
-      'the public output API does not expose an exact write-chunk-size control',
+      'reserved fast-start requires a positive safe-integer maximumPacketCount',
       {},
-      'AIBRUSH_WRITE_CHUNK_SIZE_UNSUPPORTED',
+      'AIBRUSH_MAXIMUM_PACKET_COUNT_INVALID',
     );
   }
-  if (opts.maximumPacketCount !== undefined) {
+  if (opts.fastStart !== 'reserve' && opts.maximumPacketCount !== undefined) {
     throw createNotApplicableError(
       ENGINE_ID,
       operation,
-      'maximumPacketCount is supported only by reserved fast-start, which this adapter rejects',
+      'maximumPacketCount is valid only with reserved fast-start',
       {},
-      'AIBRUSH_MAXIMUM_PACKET_COUNT_UNSUPPORTED',
+      'AIBRUSH_MAXIMUM_PACKET_COUNT_WITHOUT_RESERVE',
     );
   }
 }
@@ -7500,6 +7880,7 @@ function resolvedStreamingRepresentation(
 ): AibrushStreamingRuntimeEvidence['resolvedRepresentation'] {
   if (isIsoBmffTarget(target)) {
     if (fragmented) return 'fragmented-mp4';
+    if (opts.fastStart === 'reserve') return 'faststart-reserve-mp4';
     return opts.fastStart === 'in-memory' ? 'faststart-in-memory-mp4' : 'progressive-mp4';
   }
   if (isWebmFamilyTarget(target)) return wantsAppendOnly(opts) ? 'live-webm' : 'finite-webm';
@@ -7551,21 +7932,338 @@ function mediaBytesSource(engine: AibrushEngine, media: MediaBytes): unknown {
   });
 }
 
+function normalizedAibrushConcatCodec(track: AibrushTrackInfo): string {
+  return (track.config?.codec ?? track.codec ?? '').trim().toLowerCase();
+}
+
+function sameAibrushConcatDescription(
+  left: BufferSource | undefined,
+  right: BufferSource | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return sameAibrushBytes(bufferBytes(left), bufferBytes(right));
+}
+
+function sameAibrushConcatColor(
+  left: AibrushTrackInfo['color'],
+  right: AibrushTrackInfo['color'],
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.matrixCoefficients === right.matrixCoefficients &&
+    left.range === right.range &&
+    left.transferCharacteristics === right.transferCharacteristics &&
+    left.primaries === right.primaries
+  );
+}
+
+/** A single coded output track cannot switch decoder/sample-entry configuration between segments. */
+export function aibrushConcatTracksCompatible(
+  left: AibrushTrackInfo,
+  right: AibrushTrackInfo,
+): boolean {
+  const leftConfig = left.config;
+  const rightConfig = right.config;
+  if (
+    left.mediaType !== right.mediaType ||
+    canonicalCodec(left.codec ?? leftConfig?.codec ?? '') !==
+      canonicalCodec(right.codec ?? rightConfig?.codec ?? '') ||
+    normalizedAibrushConcatCodec(left) !== normalizedAibrushConcatCodec(right) ||
+    (leftConfig === undefined) !== (rightConfig === undefined) ||
+    left.language !== right.language ||
+    left.rotation !== right.rotation ||
+    left.alpha !== right.alpha ||
+    !sameAibrushConcatColor(left.color, right.color)
+  ) {
+    return false;
+  }
+  if (leftConfig === undefined || rightConfig === undefined) return true;
+  return (
+    leftConfig.codedWidth === rightConfig.codedWidth &&
+    leftConfig.codedHeight === rightConfig.codedHeight &&
+    leftConfig.displayAspectWidth === rightConfig.displayAspectWidth &&
+    leftConfig.displayAspectHeight === rightConfig.displayAspectHeight &&
+    leftConfig.sampleRate === rightConfig.sampleRate &&
+    leftConfig.numberOfChannels === rightConfig.numberOfChannels &&
+    sameAibrushConcatDescription(leftConfig.description, rightConfig.description)
+  );
+}
+
+type AibrushConcatGaplessWindow = NonNullable<AibrushTrackInfo['gapless']>;
+
+export function aibrushConcatIsIsoAacEditBoundary(options: {
+  readonly target: string;
+  readonly consecutive: boolean;
+  readonly prior: AibrushTrackInfo;
+  readonly current: AibrushTrackInfo;
+}): boolean {
+  const { target, consecutive, prior, current } = options;
+  const sampleRate = prior.config?.sampleRate;
+  return (
+    isIsoBmffTarget(target) &&
+    consecutive &&
+    prior.mediaType === 'audio' &&
+    current.mediaType === 'audio' &&
+    canonicalCodec(prior.codec ?? prior.config?.codec ?? '') === 'aac' &&
+    canonicalCodec(current.codec ?? current.config?.codec ?? '') === 'aac' &&
+    sampleRate !== undefined &&
+    Number.isFinite(sampleRate) &&
+    sampleRate > 0 &&
+    sampleRate === current.config?.sampleRate &&
+    prior.gapless?.basis === 'mp4-edit-list' &&
+    current.gapless?.basis === 'mp4-edit-list' &&
+    aibrushConcatTracksCompatible(prior, current)
+  );
+}
+
+export function aibrushConcatHasIsoAudioEditMetadata(options: {
+  readonly target: string;
+  readonly prior: AibrushTrackInfo;
+  readonly current: AibrushTrackInfo;
+}): boolean {
+  const { target, prior, current } = options;
+  return (
+    isIsoBmffTarget(target) &&
+    prior.mediaType === 'audio' &&
+    current.mediaType === 'audio' &&
+    (prior.gapless?.basis === 'mp4-edit-list' || current.gapless?.basis === 'mp4-edit-list')
+  );
+}
+
+export function aibrushConcatBoundaryEditSamples(options: {
+  readonly prior: AibrushConcatGaplessWindow | undefined;
+  readonly current: AibrushConcatGaplessWindow | undefined;
+}): number | undefined {
+  const trailingSamples = options.prior?.trailingSamples;
+  const leadingSamples = options.current?.leadingSamples;
+  if (
+    trailingSamples === undefined ||
+    !Number.isSafeInteger(trailingSamples) ||
+    trailingSamples < 0 ||
+    leadingSamples === undefined ||
+    !Number.isSafeInteger(leadingSamples) ||
+    leadingSamples < 0 ||
+    !Number.isSafeInteger(trailingSamples + leadingSamples)
+  ) {
+    return undefined;
+  }
+  return trailingSamples + leadingSamples;
+}
+
+export function aibrushConcatBoundarySamplesAreComplementary(options: {
+  readonly prior: AibrushConcatGaplessWindow | undefined;
+  readonly current: AibrushConcatGaplessWindow | undefined;
+  readonly sampleRate: number | undefined;
+  readonly packetDurationUs: number;
+}): boolean {
+  const editSamples = aibrushConcatBoundaryEditSamples(options);
+  const { sampleRate, packetDurationUs } = options;
+  if (
+    editSamples === undefined ||
+    editSamples <= 0 ||
+    sampleRate === undefined ||
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    !Number.isFinite(packetDurationUs) ||
+    packetDurationUs <= 0
+  ) {
+    return false;
+  }
+  const packetSamples = Math.round((packetDurationUs * sampleRate) / 1_000_000);
+  return packetSamples > 0 && Math.abs(editSamples - packetSamples) <= 1;
+}
+
 function chunkType(type: string): EncodedAudioChunkType | EncodedVideoChunkType {
   return type === 'delta' ? 'delta' : 'key';
 }
 
-function restampedPacket(packet: AibrushPacket, mediaType: 'video' | 'audio', offsetUs: number): AibrushPacket {
+export function aibrushConcatPresentationOffsetUs(options: {
+  readonly mediaType: 'video' | 'audio';
+  readonly timestampUs: number;
+  readonly durationUs: number;
+  readonly globalOffsetUs: number;
+  readonly priorPresentationEndUs: number | undefined;
+  readonly firstPacket: boolean;
+  readonly eligibleAacEditBoundary: boolean;
+}): number {
+  const {
+    mediaType,
+    timestampUs,
+    durationUs,
+    globalOffsetUs,
+    priorPresentationEndUs,
+    firstPacket,
+    eligibleAacEditBoundary,
+  } = options;
+  if (
+    !eligibleAacEditBoundary ||
+    !firstPacket ||
+    mediaType !== 'audio' ||
+    priorPresentationEndUs === undefined
+  ) {
+    return globalOffsetUs;
+  }
+  const boundaryGapUs = timestampUs + globalOffsetUs - priorPresentationEndUs;
+  // Accurate AAC trims clamp a leading preroll packet to PTS zero. Restore only that packet at an
+  // interior seam; a gap at least one packet long remains authored silence.
+  return boundaryGapUs > 0 && boundaryGapUs < durationUs
+    ? priorPresentationEndUs - timestampUs
+    : globalOffsetUs;
+}
+
+export function aibrushConcatSegmentPresentationDurationUs(options: {
+  readonly probedDurationUs: number;
+  readonly packetPresentationEndUs: number;
+  readonly packetCount: number;
+}): number {
+  const { probedDurationUs, packetPresentationEndUs, packetCount } = options;
+  // Container duration can include a decode-tail lead (for example AAC priming) that is not part of
+  // the segment's presentation span. Prefer packet presentation truth whenever the segment has packets;
+  // probe duration is only meaningful as a clock fallback for an entirely packetless segment.
+  return packetCount > 0 ? packetPresentationEndUs : probedDurationUs;
+}
+
+export function aibrushConcatTrackDecodeOffsetUs(options: {
+  readonly globalPresentationOffsetUs: number;
+  readonly priorDecodeEndUs: number | undefined;
+  readonly firstDecodeTimestampUs: number;
+}): number {
+  const { globalPresentationOffsetUs, priorDecodeEndUs, firstDecodeTimestampUs } = options;
+  // Existing tracks stay contiguous on their coded clock; a later presentation placement belongs in
+  // PTS/CTTS, not in one stretched decode duration. A track first appearing mid-program starts at the
+  // shared presentation clock so the muxer can express its leading empty interval.
+  return (priorDecodeEndUs ?? globalPresentationOffsetUs) - firstDecodeTimestampUs;
+}
+
+export function aibrushConcatTrackPresentationDurationUs(options: {
+  readonly mediaType: 'video' | 'audio';
+  readonly packetPresentationEndUs: number;
+  readonly sampleRate: number | undefined;
+  readonly gaplessTotalSamples: number | undefined;
+}): number {
+  const { mediaType, packetPresentationEndUs, sampleRate, gaplessTotalSamples } = options;
+  return (
+    aibrushConcatGaplessPresentationDurationUs({
+      mediaType,
+      sampleRate,
+      gaplessTotalSamples,
+    }) ?? packetPresentationEndUs
+  );
+}
+
+function aibrushConcatGaplessPresentationDurationUs(options: {
+  readonly mediaType: 'video' | 'audio';
+  readonly sampleRate: number | undefined;
+  readonly gaplessTotalSamples: number | undefined;
+}): number | undefined {
+  const { mediaType, sampleRate, gaplessTotalSamples } = options;
+  return mediaType === 'audio' &&
+    sampleRate !== undefined &&
+    Number.isFinite(sampleRate) &&
+    sampleRate > 0 &&
+    gaplessTotalSamples !== undefined &&
+    Number.isSafeInteger(gaplessTotalSamples) &&
+    gaplessTotalSamples > 0
+    ? Math.round((gaplessTotalSamples * 1_000_000) / sampleRate)
+    : undefined;
+}
+
+export function aibrushConcatBoundaryPacketsMatch(options: {
+  readonly prior: {
+    readonly payload: Uint8Array;
+    readonly presentationTimestampUs: number;
+    readonly durationUs: number;
+    readonly type: string;
+  };
+  readonly current: {
+    readonly payload: Uint8Array;
+    readonly presentationTimestampUs: number;
+    readonly durationUs: number;
+    readonly type: string;
+  };
+}): boolean {
+  const { prior, current } = options;
+  return (
+    prior.presentationTimestampUs === current.presentationTimestampUs &&
+    prior.durationUs === current.durationUs &&
+    prior.type === current.type &&
+    sameAibrushBytes(prior.payload, current.payload)
+  );
+}
+
+export function aibrushConcatCanCollapseBoundary(options: {
+  readonly eligibleIsoAacEditBoundary: boolean;
+  readonly priorGapless: AibrushConcatGaplessWindow | undefined;
+  readonly currentGapless: AibrushConcatGaplessWindow | undefined;
+  readonly sampleRate: number | undefined;
+  readonly prior: Parameters<typeof aibrushConcatBoundaryPacketsMatch>[0]['prior'];
+  readonly current: Parameters<typeof aibrushConcatBoundaryPacketsMatch>[0]['current'];
+}): boolean {
+  return (
+    options.eligibleIsoAacEditBoundary &&
+    aibrushConcatBoundarySamplesAreComplementary({
+      prior: options.priorGapless,
+      current: options.currentGapless,
+      sampleRate: options.sampleRate,
+      packetDurationUs: options.current.durationUs,
+    }) &&
+    aibrushConcatBoundaryPacketsMatch({ prior: options.prior, current: options.current })
+  );
+}
+
+export function aibrushConcatMp4EditGaplessWindows(options: {
+  readonly prior: AibrushConcatGaplessWindow | undefined;
+  readonly current: AibrushConcatGaplessWindow | undefined;
+}): AibrushConcatGaplessWindow | undefined {
+  const { prior, current } = options;
+  const priorTotal = prior?.totalSamples;
+  const currentTotal = current?.totalSamples;
+  if (
+    prior?.basis !== 'mp4-edit-list' ||
+    current?.basis !== 'mp4-edit-list' ||
+    priorTotal === undefined ||
+    !Number.isSafeInteger(priorTotal) ||
+    priorTotal <= 0 ||
+    currentTotal === undefined ||
+    !Number.isSafeInteger(currentTotal) ||
+    currentTotal <= 0
+  ) {
+    return undefined;
+  }
+  const leadingSamples = prior.leadingSamples ?? 0;
+  const trailingSamples = current.trailingSamples ?? 0;
+  if (
+    !Number.isSafeInteger(leadingSamples) ||
+    leadingSamples < 0 ||
+    !Number.isSafeInteger(trailingSamples) ||
+    trailingSamples < 0 ||
+    !Number.isSafeInteger(priorTotal + currentTotal)
+  ) {
+    return undefined;
+  }
+  return {
+    basis: 'mp4-edit-list',
+    leadingSamples,
+    trailingSamples,
+    totalSamples: priorTotal + currentTotal,
+  };
+}
+
+function restampedPacket(
+  packet: AibrushPacket,
+  mediaType: 'video' | 'audio',
+  decodeOffsetUs: number,
+  presentationOffsetUs = decodeOffsetUs,
+  payload = tightBytes(packetPayloadBytes(packet)),
+): AibrushPacket {
   const chunk = packet.chunk;
-  const data = new Uint8Array(chunk.byteLength);
-  chunk.copyTo(data);
-  const timestamp = Math.max(0, Math.round(chunk.timestamp + offsetUs));
+  const timestamp = Math.round(chunk.timestamp + presentationOffsetUs);
   const duration = chunk.duration == null ? undefined : Math.max(0, Math.round(chunk.duration));
   const init = {
     type: chunkType(chunk.type),
     timestamp,
     ...(duration !== undefined ? { duration } : {}),
-    data,
+    data: payload,
   };
   const shifted =
     mediaType === 'video'
@@ -7573,7 +8271,10 @@ function restampedPacket(packet: AibrushPacket, mediaType: 'video' | 'audio', of
       : new EncodedAudioChunk(init as EncodedAudioChunkInit);
   return {
     chunk: shifted,
-    ...(packet.dtsUs !== undefined ? { dtsUs: Math.max(0, Math.round(packet.dtsUs + offsetUs)) } : {}),
+    data: payload,
+    ...(packet.dtsUs !== undefined
+      ? { dtsUs: Math.max(0, Math.round(packet.dtsUs + decodeOffsetUs)) }
+      : {}),
     ...(packet.sizeBytes !== undefined ? { sizeBytes: packet.sizeBytes } : {}),
   };
 }
@@ -7701,6 +8402,10 @@ function videoTrackInfoFromEncoded(track: EncodedTrack): AibrushTrackInfo | unde
   }
   const description = track.description === undefined ? undefined : tightBytes(track.description);
   const durationUs = encodedDurationUs(track);
+  const durationSec =
+    track.durationSec !== undefined && Number.isFinite(track.durationSec) && track.durationSec > 0
+      ? track.durationSec
+      : durationUs / 1_000_000;
   const firstDurationUs = track.chunks.find((chunk) => chunk.durationUs > 0)?.durationUs;
   const fps =
     firstDurationUs !== undefined && Number.isFinite(firstDurationUs) && firstDurationUs > 0
@@ -7711,7 +8416,7 @@ function videoTrackInfoFromEncoded(track: EncodedTrack): AibrushTrackInfo | unde
     id: 0,
     mediaType: 'video',
     codec: writerCodec,
-    ...(durationUs > 0 ? { durationSec: durationUs / 1_000_000 } : {}),
+    ...(durationSec > 0 ? { durationSec } : {}),
     ...(fps !== undefined ? { fps } : {}),
     ...(track.rotation !== undefined ? { rotation: track.rotation } : {}),
     config: {
@@ -7729,11 +8434,15 @@ function audioTrackInfoFromEncoded(track: EncodedTrack): AibrushTrackInfo | unde
   }
   const description = track.description === undefined ? undefined : tightBytes(track.description);
   const durationUs = encodedDurationUs(track);
+  const durationSec =
+    track.durationSec !== undefined && Number.isFinite(track.durationSec) && track.durationSec > 0
+      ? track.durationSec
+      : durationUs / 1_000_000;
   return {
     id: 0,
     mediaType: 'audio',
     codec: track.codec,
-    ...(durationUs > 0 ? { durationSec: durationUs / 1_000_000 } : {}),
+    ...(durationSec > 0 ? { durationSec } : {}),
     config: {
       codec: track.codec,
       sampleRate: track.sampleRate,
@@ -7747,6 +8456,14 @@ function concatTrackKey(track: AibrushTrackInfo, seenByType: Map<'video' | 'audi
   const index = seenByType.get(track.mediaType) ?? 0;
   seenByType.set(track.mediaType, index + 1);
   return `${track.mediaType}:${index}`;
+}
+
+function withAibrushConcatGapless(
+  track: AibrushTrackInfo,
+  gapless: AibrushTrackInfo['gapless'],
+): AibrushTrackInfo {
+  const { gapless: _gapless, ...withoutGapless } = track;
+  return gapless === undefined ? withoutGapless : { ...withoutGapless, gapless };
 }
 
 export function normalizedAibrushCodecFields(
@@ -8144,9 +8861,73 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+interface AibrushSparseMuxPlan {
+  readonly target: {
+    setSize(size: bigint | string): void;
+    write(position: bigint | string, bytes: Uint8Array): void;
+  };
+  readonly fileSize: string;
+  readonly samples: readonly { readonly offset: string; readonly prefixHex: string }[];
+}
+
+function aibrushSparseMuxPlan(opts: MuxOptions): AibrushSparseMuxPlan | undefined {
+  const target = objectRecord(opts.sparseTarget);
+  if (target === undefined) return undefined;
+  const robustness = objectRecord(opts.robustness);
+  const contract = objectRecord(robustness?.muxLargeFile);
+  const samples = contract?.expectedSamples;
+  if (
+    target.schema !== 'media-test/mux-sparse-target@1' ||
+    typeof target.setSize !== 'function' ||
+    typeof target.write !== 'function' ||
+    contract?.schema !== 'media-test/mux-large-file-contract@1' ||
+    contract.virtualFileKind !== 'sparse-generated-mp4' ||
+    typeof contract.minimumFileSize !== 'string' ||
+    !/^\d+$/.test(contract.minimumFileSize) ||
+    !Array.isArray(samples) ||
+    samples.length < 2
+  ) {
+    throw new Error('aibrush sparse MP4 mux received a malformed target or large-file contract');
+  }
+  const normalizedSamples = samples.map((sample, index) => {
+    const record = objectRecord(sample);
+    if (
+      typeof record?.offset !== 'string' ||
+      !/^\d+$/.test(record.offset) ||
+      typeof record.prefixHex !== 'string' ||
+      !/^(?:[0-9a-fA-F]{2})+$/.test(record.prefixHex)
+    ) {
+      throw new Error(`aibrush sparse MP4 sample contract ${index} is malformed`);
+    }
+    return { offset: record.offset, prefixHex: record.prefixHex.toLowerCase() };
+  });
+  return {
+    target: target as unknown as AibrushSparseMuxPlan['target'],
+    fileSize: contract.minimumFileSize,
+    samples: normalizedSamples,
+  };
+}
+
+function aibrushPacketHasHexPrefix(packet: AibrushPacket, prefixHex: string): boolean {
+  const bytes = packetPayloadBytes(packet);
+  if (prefixHex.length / 2 > bytes.byteLength) return false;
+  for (let offset = 0; offset < prefixHex.length; offset += 2) {
+    if (bytes[offset / 2] !== Number.parseInt(prefixHex.slice(offset, offset + 2), 16)) return false;
+  }
+  return true;
+}
+
 interface ConcatTrackPackets {
   track: AibrushTrackInfo;
   packets: AibrushPacket[];
+}
+
+interface ConcatBoundaryPacket {
+  readonly payload: Uint8Array;
+  readonly presentationTimestampUs: number;
+  readonly decodeTimestampUs: number;
+  readonly durationUs: number;
+  readonly type: string;
 }
 
 interface PreparedPcmMuxSource {
@@ -8222,6 +9003,8 @@ export class AibrushMediaEngine implements MediaEngine {
   #preparedAudioMuxOutput: PreparedAudioMuxOutput | undefined;
   #preparedWebmMuxOutput: PreparedWebmMuxOutput | undefined;
   #preparedTsMuxOutput: PreparedTsMuxOutput | undefined;
+  readonly #opfsSpoolFileName = `aibrush-media-test-stream-${++aibrushSpoolInstanceSequence}.bin`;
+  #opfsSpoolDirectory: AibrushOpfsDirectoryHandle | undefined;
   // A pooled direct-decode VideoDecoder reused across repeated SAME-CONFIG decodeFrames calls within this
   // cell. The harness builds a FRESH adapter per (engine, scenario) cell, so the pool NEVER spans inputs —
   // no cross-input state. Keyed by the exact VideoDecoderConfig; a config change or decode error rebuilds
@@ -8265,6 +9048,23 @@ export class AibrushMediaEngine implements MediaEngine {
         await this.#ensureMp4PacketInfoRuntime(context?.signal);
       } else {
         await this.#ensureFullRuntime(context?.signal);
+        // The product intentionally keeps its default driver bundle lazy and exposes preload() so
+        // applications can place that one-time code registration in initialization. Do the same at
+        // the adapter lifecycle boundary: functional peak-memory windows should measure the concrete
+        // operation and its source ranges, not first-use module compilation/registration.
+        const request = this.#currentRequest;
+        if (request !== undefined) {
+          const sourceContainer = request.inputs[0]?.container;
+          const requestedContainer = typeof request.options.container === 'string'
+            ? request.options.container
+            : undefined;
+          const preloadContainer = requestedContainer ?? sourceContainer;
+          await this.#engine().preload({
+            op: request.operation,
+            ...(preloadContainer !== undefined ? { container: preloadContainer } : {}),
+            level: 'chunks',
+          });
+        }
       }
     }
     context?.signal.throwIfAborted();
@@ -8278,6 +9078,10 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#preparedAudioMuxOutput = undefined;
     this.#preparedWebmMuxOutput = undefined;
     this.#preparedTsMuxOutput = undefined;
+    if (this.#opfsSpoolDirectory !== undefined) {
+      await this.#opfsSpoolDirectory.removeEntry(this.#opfsSpoolFileName).catch(() => undefined);
+      this.#opfsSpoolDirectory = undefined;
+    }
     this.#dropDirectDecoder();
     this.#core = undefined;
     this.#mp4PacketInfo = undefined;
@@ -8366,10 +9170,11 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   #directDecoderConfigKey(config: VideoDecoderConfig): string {
-    // codec + coded dims + description length uniquely identify the config within a cell (one input per
-    // cell, so the config never actually changes — this key only guards the pool against a config swap).
+    // Codec, coded geometry, display aspect, and description length identify the config within a cell (one
+    // input per cell, so it does not normally change — this key only guards the pool against a config swap).
     const descLen = config.description === undefined ? 0 : (config.description as { byteLength: number }).byteLength;
-    return `${config.codec}|${config.codedWidth}x${config.codedHeight}|${descLen}`;
+    const displayAspect = `${config.displayAspectWidth ?? ''}x${config.displayAspectHeight ?? ''}`;
+    return `${config.codec}|${config.codedWidth}x${config.codedHeight}|${displayAspect}|${descLen}`;
   }
 
   /**
@@ -8676,6 +9481,49 @@ export class AibrushMediaEngine implements MediaEngine {
       });
     });
   }
+  async #remuxOutputTelemetry(
+    input: MediaInput,
+    opts: Record<string, unknown>,
+    fragmented: boolean,
+    runtime: AibrushOutputRuntimeIdentity,
+  ): Promise<AibrushOutputTelemetry> {
+    if (!shouldSpoolAibrushStreamOutput(input, opts, fragmented)) {
+      return this.#outputTelemetry(opts, runtime);
+    }
+    if (!this.#lib) throw new Error('aibrush-media not initialized');
+    const storage = typeof navigator === 'undefined'
+      ? undefined
+      : navigator.storage as AibrushStorageManager | undefined;
+    if (storage === undefined || typeof storage.getDirectory !== 'function') {
+      throw createBrowserNotSupportedError(
+        ENGINE_ID,
+        'remux',
+        'large bounded stream output requires the browser OPFS directory surface',
+        { outputContainer: String(opts.container ?? '') },
+        'AIBRUSH_OPFS_STREAM_ARTIFACT_UNAVAILABLE',
+      );
+    }
+    this.#opfsSpoolDirectory ??= await storage.getDirectory();
+    return instrumentedAibrushOpfsSink(
+      this.#lib,
+      this.#opfsSpoolDirectory,
+      this.#opfsSpoolFileName,
+      opts,
+      runtime,
+      (observation) => {
+        this.#configEvidence.record({
+          operation: this.#activeOperation,
+          route: this.#activeRoute,
+          internalDriver: 'framework-router-unexposed',
+          readerMode: this.#activeRoute.includes('packet') ? 'packet-info-or-stream' : 'framework-source',
+          writerMode: observation.writerMode,
+          targetMode: observation.targetMode,
+          peakRetainedBytes: observation.peakRetainedBytes,
+          callbackWriteCount: observation.callbackWriteCount,
+        });
+      },
+    );
+  }
   async #resolveHlsSource(
     input: MediaInput,
     signal?: AbortSignal,
@@ -8908,10 +9756,9 @@ export class AibrushMediaEngine implements MediaEngine {
       // AudioEncoder table only for engines that really ship that encoder.
       // `remux:flac-in-ogg` is a native-frame packet-copy path: FLAC demux exposes byte-exact frames and
       // the Ogg muxer writes the official Ogg-FLAC mapping, with the reference-reimport oracle proving layout.
-      // Reserved positioned fast-start writes are deliberately not advertised: the public framework only
-      // exposes a boolean faststart control, so those exact tuples terminate as reason-coded NA_ENGINE.
-      // `target:writes` is the real `toStreamTarget` callback path above: the adapter observes each
-      // contiguous write position and returns the exact bytes assembled from those writes.
+      // Reserved positioned fast-start is forwarded through the public `faststart:'reserve'` plus
+      // `maximumPacketCount` contract. `target:writes` observes every callback position, reconstructs
+      // the finalized extent, and exposes the forward reservation plus later patch as oracle evidence.
       // `headerless` maps the harness's `appendOnly:true` WebM/MKV rows to the root WebM fragmented/live
       // muxer: an unknown-size Segment, no SeekHead/Duration, and one top-level Cluster per fragment.
       // `metadata:write` forwards the benchmark's `options.tags` into the engine's same-container tag
@@ -8931,11 +9778,13 @@ export class AibrushMediaEngine implements MediaEngine {
         'fastStart',
         'fastStart:none',
         'fastStart:in-memory',
+        'fastStart:reserve',
         'resize',
         'fanout',
         'crf',
         'two-pass',
         'quality-constrained-rate',
+        'depth:10bit-output',
         'depth:10bit-to-8bit',
         'fps',
         'rotate',
@@ -8972,6 +9821,7 @@ export class AibrushMediaEngine implements MediaEngine {
         'mux:vfr-timestamps',
         'mux:browser-decode-equality',
         'mux:roundtrip-compare',
+        'mux:sparse-co64',
         'remux:compose',
         'trim:compose',
         'trim:frame-accurate-hevc',
@@ -9119,7 +9969,13 @@ export class AibrushMediaEngine implements MediaEngine {
             sourceRead,
           );
         }
-        if (scaleContract !== undefined && (container === 'mp4' || container === 'mov')) {
+        const useBoundedMp4Batches =
+          (container === 'mp4' || container === 'mov') &&
+          !isMalformedHarnessInput(input) &&
+          (scaleContract !== undefined ||
+            (input.sizeBytes !== undefined &&
+              input.sizeBytes > MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES));
+        if (useBoundedMp4Batches) {
           const engine = await fullEngine();
           const source = await this.#src(engine, input, sourceRead?.onRead);
           return attachSourceReadTelemetry(
@@ -9130,6 +9986,7 @@ export class AibrushMediaEngine implements MediaEngine {
               container,
               signal,
               context,
+              scaleContract === undefined,
             ),
             sourceRead,
           );
@@ -9137,6 +9994,7 @@ export class AibrushMediaEngine implements MediaEngine {
         if (
           (container === 'mp4' || container === 'mov') &&
           !isMalformedHarnessInput(input) &&
+          input.contentAttestation === undefined &&
           input.sizeBytes !== undefined &&
           input.sizeBytes <= MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES
         ) {
@@ -9169,6 +10027,7 @@ export class AibrushMediaEngine implements MediaEngine {
         if (
           container === 'mp3' &&
           !isMalformedHarnessInput(input) &&
+          input.contentAttestation === undefined &&
           input.sizeBytes !== undefined &&
           input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES
         ) {
@@ -9184,6 +10043,8 @@ export class AibrushMediaEngine implements MediaEngine {
         if (
           (container === 'mp4' ||
             container === 'mov' ||
+            container === 'webm' ||
+            container === 'mkv' ||
             container === 'flac' ||
             container === 'adts' ||
             container === 'mp3') &&
@@ -9196,6 +10057,10 @@ export class AibrushMediaEngine implements MediaEngine {
             container,
           });
           if (packetInfo !== undefined && packetInfo.packets.length > 0) {
+            if (scaleContract !== undefined) {
+              emitAibrushDemuxScalePacketBoundary(context);
+              if (packetInfo.packets.length > 1) emitAibrushDemuxScalePacketBoundary(context);
+            }
             return attachSourceReadTelemetry(
               demuxResultFromPacketInfo(input, packetInfo, evidenceBytes),
               sourceRead,
@@ -9315,21 +10180,14 @@ export class AibrushMediaEngine implements MediaEngine {
   async remux(input: MediaInput, opts: RemuxOptions, context?: OperationContext): Promise<MediaBytes> {
     rejectUnforwardableOutputShape('remux', opts);
     const target = opts.container.toLowerCase();
+    const maximumPacketCount = opts.fastStart === 'reserve'
+      ? opts.maximumPacketCount as number
+      : undefined;
     const appendOnly = wantsAppendOnly(opts);
-    const streamTarget = wantsStreamTarget(opts);
     const fragmentedBufferAtScale = await wantsFragmentedBufferAtScale(input, opts, target);
     const fragmented = wantsFragmented(opts) || fragmentedBufferAtScale || (appendOnly && isWebmFamilyTarget(target));
     if (appendOnly && !isWebmFamilyTarget(target)) {
       throw createNotApplicableError(ENGINE_ID, 'remux', `append-only live output is webm/mkv-only (not '${target}')`);
-    }
-    if (streamTarget && isWebmFamilyTarget(target) && !appendOnly) {
-      throw createNotApplicableError(
-        ENGINE_ID,
-        'remux',
-        'finite WebM/Matroska output cannot be proven on the append-only callback target',
-        {},
-        'AIBRUSH_FINITE_WEBM_STREAM_TARGET_UNSUPPORTED',
-      );
     }
     if (wantsFragmented(opts) && isWebmFamilyTarget(target) && !appendOnly) {
       throw createNotApplicableError(
@@ -9350,6 +10208,7 @@ export class AibrushMediaEngine implements MediaEngine {
     await rejectOversizedBufferTarget(input, opts);
     await rejectUnsupportedStreamTargetScale(input, opts);
     return this.#run('remux', 'framework.remux', context, async (signal) => {
+      let telemetry: AibrushOutputTelemetry | undefined;
       try {
         const engine = this.#engine();
         const sourceRead = shouldObserveAibrushSourceReads(input, context)
@@ -9358,13 +10217,36 @@ export class AibrushMediaEngine implements MediaEngine {
         const preparedInput = sourceRead === undefined
           ? input
           : observeAibrushWholeFileInput(input, sourceRead.onRead);
-        const telemetry = this.#outputTelemetry(opts as Record<string, unknown>, {
+        let observedPacketCount: number | undefined;
+        if (opts.fastStart === 'reserve') {
+          if (engine.packetInfo === undefined) {
+            throw createNotApplicableError(
+              ENGINE_ID,
+              'remux',
+              'reserved fast-start requires independently observable per-track packet counts',
+              {},
+              'AIBRUSH_RESERVE_PACKET_COUNT_UNOBSERVABLE',
+            );
+          }
+          const packetInfo = await engine.packetInfo(await this.#src(engine, input), {
+            signal,
+            container: containerFromInput(input),
+          });
+          observedPacketCount = maximumAibrushTrackPacketCount(packetInfo);
+        }
+        telemetry = await this.#remuxOutputTelemetry(input, opts as Record<string, unknown>, fragmented, {
           operationStartMs: context?.operationStartMs,
           emit: context?.emit,
           resolvedRepresentation: resolvedStreamingRepresentation(target, opts, fragmented),
           ...(input.sizeBytes !== undefined &&
           input.sizeBytes >= PREALLOCATED_REMUX_OUTPUT_MIN_SOURCE_BYTES
             ? { expectedOutputBytes: input.sizeBytes }
+            : {}),
+          ...(opts.fastStart === 'reserve'
+            ? {
+                maximumPacketCount: maximumPacketCount as number,
+                observedPacketCount: observedPacketCount as number,
+              }
             : {}),
         });
         const prepared =
@@ -9378,6 +10260,9 @@ export class AibrushMediaEngine implements MediaEngine {
             {
               to: opts.container,
               faststart: faststartFrom(opts),
+              ...(maximumPacketCount === undefined
+                ? {}
+                : { maximumPacketCount }),
               fragmented,
               ...(opts.tags !== undefined ? { tags: opts.tags } : {}),
               sink: telemetry.sink,
@@ -9388,6 +10273,7 @@ export class AibrushMediaEngine implements MediaEngine {
           await telemetry.mediaBytes(out, opts.container),
           sourceRead,
         );
+        if (media.artifact !== undefined) return media;
         const repairedOgg = target === 'ogg' ? repairAibrushOggContinuationFlags(media.bytes) : undefined;
         return verifyRequestedIsoShape(
           repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },
@@ -9395,9 +10281,7 @@ export class AibrushMediaEngine implements MediaEngine {
           fragmented,
         );
       } catch (e) {
-        if (e instanceof AibrushPositionedWriteUnsupportedError) {
-          throw createNotApplicableError(ENGINE_ID, 'remux', e.message, {}, 'AIBRUSH_POSITIONED_WRITES_UNSUPPORTED', e);
-        }
+        await telemetry?.abort?.(e);
         try {
           return this.#naIfMiss('remux', e, input);
         } catch (translated) {
@@ -9421,6 +10305,16 @@ export class AibrushMediaEngine implements MediaEngine {
    */
   async transcode(input: MediaInput, opts: TranscodeOptions, context?: OperationContext): Promise<MediaBytes> {
     rejectUnforwardableOutputShape('transcode', opts as unknown as Record<string, unknown>);
+    if (
+      isGracefulNegativeContext(context) &&
+      [opts.video?.width, opts.video?.height].some(
+        (dimension) => typeof dimension === 'number' && dimension <= 0,
+      )
+    ) {
+      return this.#run('transcode', 'request.reject-invalid-dimensions', context, async () => {
+        throw new GracefulRejectionError('transcode', 'video dimensions must be positive');
+      });
+    }
     const ladder = h264AbrLadderFrom(opts);
     if (ladder !== undefined) return this.#transcodeH264AbrLadder(input, opts, ladder, context);
 
@@ -9656,6 +10550,7 @@ export class AibrushMediaEngine implements MediaEngine {
       const requiresExactFrameworkDecode = aibrushDecodeRequiresExactFrameworkRoute(
         this.#currentRequest?.options,
         selected,
+        this.#currentRequest?.inputs.flatMap((requestInput) => requestInput.tracks) ?? [],
       );
 
       if (!requiresExactFrameworkDecode && this.#currentRequest?.options.alphaEvidence !== undefined) {
@@ -10054,7 +10949,7 @@ export class AibrushMediaEngine implements MediaEngine {
             },
             { signal },
           );
-          return toMediaBytes(out, opts.container);
+          return attachSourceReadTelemetry(await toMediaBytes(out, opts.container), sourceRead);
         } catch (e) {
           try {
             return this.#naIfMiss('trim', e, input);
@@ -10751,6 +11646,45 @@ export class AibrushMediaEngine implements MediaEngine {
     const hasSamples = selectedTracks.some((t) => t.chunks.length > 0);
     if (!hasSamples) throw new GracefulRejectionError('mux', 'no coded samples to mux (zero-track/empty source)');
 
+    const sparsePlan = aibrushSparseMuxPlan(opts);
+    if (sparsePlan !== undefined) {
+      if (target !== 'mp4' || selectedTracks.length !== 1) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          'sparse large-file authoring requires one MP4 track',
+        );
+      }
+      const selectedTrack = selectedTracks[0]!;
+      const trackInfo =
+        selectedTrack.type === 'video'
+          ? videoTrackInfoFromEncoded(selectedTrack)
+          : audioTrackInfoFromEncoded(selectedTrack);
+      const packets = packetArrayFromEncodedTrack(selectedTrack).slice(0, sparsePlan.samples.length);
+      if (trackInfo === undefined || packets.length !== sparsePlan.samples.length) {
+        throw createNotApplicableError(
+          ENGINE_ID,
+          'mux',
+          'sparse large-file source does not expose enough prepared packets',
+        );
+      }
+      for (let index = 0; index < packets.length; index++) {
+        if (!aibrushPacketHasHexPrefix(packets[index]!, sparsePlan.samples[index]!.prefixHex)) {
+          throw new Error(`sparse MP4 source packet ${index} does not match its source-bound prefix`);
+        }
+      }
+      const prefix = this.#driverCore().muxPreparedSparseMp4PacketTrack({
+        track: trackInfo,
+        packets,
+        container: target,
+        target: sparsePlan.target,
+        fileSize: sparsePlan.fileSize,
+        sampleOffsets: sparsePlan.samples.map((sample) => sample.offset),
+        signal: context?.signal,
+      });
+      return toMediaBytes(prefix, target);
+    }
+
     // PCM-container WRITE targets (wav/aiff/caf) are NOT a coded-sample chunk-seam mux: raw PCM flows
     // through the engine's audio-dsp path (`convert({to})` → transformPcm / convertPcmNative, ADR-022).
     // Route the lone PCM source there so PCM→WAV authoring works instead of NA-ing on the chunk muxer.
@@ -11081,15 +12015,29 @@ export class AibrushMediaEngine implements MediaEngine {
       try {
         const engine = this.#engine();
         const src = await this.#src(engine, input);
-        const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>);
-        const faststart = (opts as { fastStart?: unknown }).fastStart !== false;
+        const reserveMaximumPacketCount = fastStartOption === 'reserve'
+          ? opts.maximumPacketCount as number
+          : undefined;
+        const telemetry = this.#outputTelemetry(opts as unknown as Record<string, unknown>, {
+          operationStartMs: context?.operationStartMs,
+          captureMuxWriteTrace: streamTarget === 'stream',
+          ...(reserveMaximumPacketCount === undefined
+            ? {}
+            : {
+                maximumPacketCount: reserveMaximumPacketCount,
+                observedPacketCount: Math.max(...selectedTracks.map((track) => track.chunks.length)),
+              }),
+        });
         const fragmented = wantsFragmented(opts) && (target === 'mp4' || target === 'mov');
         const trackSelect = normalizedTrackSelect(opts);
         const out = await engine.remux(
           src,
           {
             to: target,
-            faststart,
+            faststart: faststartFrom(opts),
+            ...(reserveMaximumPacketCount === undefined
+              ? {}
+              : { maximumPacketCount: reserveMaximumPacketCount }),
             fragmented,
             sink: telemetry.sink,
             ...(trackSelect.length > 0 ? { trackSelect } : {}),
@@ -11254,27 +12202,78 @@ export class AibrushMediaEngine implements MediaEngine {
       const engine = this.#engine();
       try {
         const byTrack = new Map<string, ConcatTrackPackets>();
-        let offsetUs = 0;
+        const presentationEndByTrack = new Map<string, number>();
+        const decodeEndByTrack = new Map<string, number>();
+        const terminalPacketByTrack = new Map<string, ConcatBoundaryPacket>();
+        const lastSegmentByTrack = new Map<string, number>();
+        let presentationOffsetUs = 0;
 
-        for (const segment of segments) {
+        for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+          const segment = segments[segmentIndex];
+          if (segment === undefined) continue;
           const info = await engine.probe(mediaBytesSource(engine, segment), {
             signal,
           });
           const demuxed = await engine.demux(mediaBytesSource(engine, segment), { signal });
-          let packetEndUs = 0;
+          let packetPresentationEndUs = 0;
+          let packetCount = 0;
           try {
             const seenByType = new Map<'video' | 'audio', number>();
             for (const track of demuxed.tracks) {
               const key = concatTrackKey(track, seenByType);
               const existing = byTrack.get(key);
+              const priorTrack = existing?.track;
+              const consecutive =
+                existing !== undefined && lastSegmentByTrack.get(key) === segmentIndex - 1;
               if (existing === undefined) {
                 byTrack.set(key, { track, packets: [] });
-              } else if (canonicalCodec(existing.track.codec ?? '') !== canonicalCodec(track.codec ?? '')) {
-                throw new GracefulRejectionError('concat', `segment track ${key} codec changed across segments`);
+              } else if (!aibrushConcatTracksCompatible(existing.track, track)) {
+                throw new GracefulRejectionError(
+                  'concat',
+                  `segment track ${key} decoder configuration changed across segments`,
+                );
               }
+              const isoAacEditBoundary =
+                priorTrack !== undefined &&
+                aibrushConcatIsIsoAacEditBoundary({
+                  target,
+                  consecutive,
+                  prior: priorTrack,
+                  current: track,
+                });
+              const hasIsoAudioEditMetadata =
+                priorTrack !== undefined &&
+                aibrushConcatHasIsoAudioEditMetadata({
+                  target,
+                  prior: priorTrack,
+                  current: track,
+                });
+              if (hasIsoAudioEditMetadata && !isoAacEditBoundary) {
+                throw new GracefulRejectionError(
+                  'concat',
+                  `segment track ${key} has unsupported, non-consecutive, or incompatible ISO audio edit windows`,
+                );
+              }
+              lastSegmentByTrack.set(key, segmentIndex);
 
               const entry = byTrack.get(key);
               if (entry === undefined) throw new Error(`concat track bookkeeping lost ${key}`);
+              const priorPresentationEndUs = presentationEndByTrack.get(key);
+              const priorDecodeEndUs = decodeEndByTrack.get(key);
+              const priorTerminalPacket = terminalPacketByTrack.get(key);
+              let shiftedPresentationEndUs = priorPresentationEndUs ?? 0;
+              let shiftedDecodeEndUs = priorDecodeEndUs ?? 0;
+              let decodeOffsetUs: number | undefined;
+              let terminalPacket = priorTerminalPacket;
+              let trackPacketPresentationEndUs = 0;
+              let firstPacket = true;
+              let editWindowsComposed = false;
+              const boundaryEditSamples = isoAacEditBoundary
+                ? aibrushConcatBoundaryEditSamples({
+                    prior: priorTrack?.gapless,
+                    current: track.gapless,
+                  })
+                : undefined;
               const reader = demuxed.packets(track.id).getReader();
               try {
                 for (;;) {
@@ -11282,12 +12281,147 @@ export class AibrushMediaEngine implements MediaEngine {
                   if (done) break;
                   const chunk = value.chunk;
                   const durationUs = Math.max(0, Math.round(chunk.duration ?? 0));
-                  packetEndUs = Math.max(packetEndUs, Math.round(chunk.timestamp) + durationUs);
-                  entry.packets.push(restampedPacket(value, track.mediaType, offsetUs));
+                  const timestampUs = Math.round(chunk.timestamp);
+                  const dtsUs = Math.round(value.dtsUs ?? timestampUs);
+                  const payload = tightBytes(packetPayloadBytes(value));
+                  packetCount++;
+                  trackPacketPresentationEndUs = Math.max(
+                    trackPacketPresentationEndUs,
+                    timestampUs + durationUs,
+                  );
+                  const complementaryBoundarySamples =
+                    isoAacEditBoundary &&
+                    aibrushConcatBoundarySamplesAreComplementary({
+                      prior: priorTrack?.gapless,
+                      current: track.gapless,
+                      sampleRate: track.config?.sampleRate,
+                      packetDurationUs: durationUs,
+                    });
+                  const packetPresentationOffsetUs = aibrushConcatPresentationOffsetUs({
+                    mediaType: track.mediaType,
+                    timestampUs,
+                    durationUs,
+                    globalOffsetUs: presentationOffsetUs,
+                    priorPresentationEndUs,
+                    firstPacket,
+                    eligibleAacEditBoundary: complementaryBoundarySamples,
+                  });
+                  const shiftedTimestampUs = timestampUs + packetPresentationOffsetUs;
+                  decodeOffsetUs ??= aibrushConcatTrackDecodeOffsetUs({
+                    globalPresentationOffsetUs: presentationOffsetUs,
+                    priorDecodeEndUs,
+                    firstDecodeTimestampUs: dtsUs,
+                  });
+                  const sharedBoundaryPacket =
+                    firstPacket &&
+                    priorTerminalPacket !== undefined &&
+                    aibrushConcatCanCollapseBoundary({
+                      eligibleIsoAacEditBoundary: isoAacEditBoundary,
+                      priorGapless: priorTrack?.gapless,
+                      currentGapless: track.gapless,
+                      sampleRate: track.config?.sampleRate,
+                      prior: priorTerminalPacket,
+                      current: {
+                        payload,
+                        presentationTimestampUs: shiftedTimestampUs,
+                        durationUs,
+                        type: chunk.type,
+                      },
+                    });
+                  if (firstPacket && isoAacEditBoundary) {
+                    if (boundaryEditSamples === 0) {
+                      editWindowsComposed = true;
+                    } else if (!sharedBoundaryPacket) {
+                      throw new GracefulRejectionError(
+                        'concat',
+                        `segment track ${key} MP4 AAC edit windows lack a proven shared boundary access unit`,
+                      );
+                    } else {
+                      editWindowsComposed = true;
+                    }
+                  }
+                  if (sharedBoundaryPacket && priorTerminalPacket !== undefined) {
+                    // Adjacent edit-clipped packet copies can legitimately retain the same coded AU on
+                    // both sides of the cut. Keep the prior copy and align this segment's remaining DTS
+                    // values to that retained AU rather than adding a second decode-duration interval.
+                    decodeOffsetUs = priorTerminalPacket.decodeTimestampUs - dtsUs;
+                    firstPacket = false;
+                    continue;
+                  }
+                  const shiftedDecodeTimestampUs = dtsUs + decodeOffsetUs;
+                  entry.packets.push(
+                    restampedPacket(
+                      value,
+                      track.mediaType,
+                      decodeOffsetUs,
+                      packetPresentationOffsetUs,
+                      payload,
+                    ),
+                  );
+                  shiftedPresentationEndUs = Math.max(
+                    shiftedPresentationEndUs,
+                    shiftedTimestampUs + durationUs,
+                  );
+                  shiftedDecodeEndUs = Math.max(
+                    shiftedDecodeEndUs,
+                    shiftedDecodeTimestampUs + durationUs,
+                  );
+                  terminalPacket = {
+                    payload,
+                    presentationTimestampUs: shiftedTimestampUs,
+                    decodeTimestampUs: shiftedDecodeTimestampUs,
+                    durationUs,
+                    type: chunk.type,
+                  };
+                  firstPacket = false;
                 }
               } finally {
                 reader.releaseLock();
               }
+              if (isoAacEditBoundary && !editWindowsComposed) {
+                throw new GracefulRejectionError(
+                  'concat',
+                  `segment track ${key} MP4 AAC edit windows have no coded boundary evidence`,
+                );
+              }
+              if (existing !== undefined) {
+                const composedGapless = editWindowsComposed
+                  ? aibrushConcatMp4EditGaplessWindows({
+                      prior: priorTrack?.gapless,
+                      current: track.gapless,
+                    })
+                  : undefined;
+                if (editWindowsComposed && composedGapless === undefined) {
+                  throw new GracefulRejectionError(
+                    'concat',
+                    `segment track ${key} MP4 AAC edit windows could not be composed`,
+                  );
+                }
+                existing.track = withAibrushConcatGapless(existing.track, composedGapless);
+              }
+              const gaplessPresentationDurationUs = aibrushConcatGaplessPresentationDurationUs({
+                mediaType: track.mediaType,
+                sampleRate: track.config?.sampleRate,
+                gaplessTotalSamples: track.gapless?.totalSamples,
+              });
+              const trackPresentationDurationUs = aibrushConcatTrackPresentationDurationUs({
+                mediaType: track.mediaType,
+                packetPresentationEndUs: trackPacketPresentationEndUs,
+                sampleRate: track.config?.sampleRate,
+                gaplessTotalSamples: track.gapless?.totalSamples,
+              });
+              packetPresentationEndUs = Math.max(
+                packetPresentationEndUs,
+                trackPresentationDurationUs,
+              );
+              presentationEndByTrack.set(
+                key,
+                gaplessPresentationDurationUs === undefined
+                  ? shiftedPresentationEndUs
+                  : presentationOffsetUs + gaplessPresentationDurationUs,
+              );
+              decodeEndByTrack.set(key, shiftedDecodeEndUs);
+              if (terminalPacket !== undefined) terminalPacketByTrack.set(key, terminalPacket);
             }
           } finally {
             await demuxed.close();
@@ -11296,7 +12430,11 @@ export class AibrushMediaEngine implements MediaEngine {
           const probedDurationUs = Number.isFinite(info.durationSec)
             ? Math.max(0, Math.round(info.durationSec * 1_000_000))
             : 0;
-          offsetUs += Math.max(probedDurationUs, packetEndUs);
+          presentationOffsetUs += aibrushConcatSegmentPresentationDurationUs({
+            probedDurationUs,
+            packetPresentationEndUs,
+            packetCount,
+          });
         }
 
         const streams: AibrushPacketStream[] = [];
@@ -11305,7 +12443,9 @@ export class AibrushMediaEngine implements MediaEngine {
           streams.push({
             track: {
               ...entry.track,
-              ...(offsetUs > 0 ? { durationSec: offsetUs / 1_000_000 } : {}),
+              ...(presentationOffsetUs > 0
+                ? { durationSec: presentationOffsetUs / 1_000_000 }
+                : {}),
             },
             packets: packetArrayStream(entry.packets),
           });
@@ -11402,5 +12542,5 @@ export class AibrushMediaEngine implements MediaEngine {
 
 /** Phase D wiring hook — called from src/app/register.ts (ENGINE_WIRINGS). */
 export function registerAibrushMedia(opts?: { id?: string }): void {
-  registerEngine(opts?.id ?? REGISTER_ID, () => new AibrushMediaEngine());
+  registerEngine(opts?.id ?? REGISTER_ID, () => new AibrushMediaEngine(), { resultId: ENGINE_ID });
 }

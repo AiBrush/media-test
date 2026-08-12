@@ -9,6 +9,7 @@ import {
   RUN_OPTION_LIMITS,
 } from '../src/app/options.ts';
 import {
+  hasUnsavedLauncherResults,
   isLauncherRunDone,
   isLauncherRunPending,
   LAUNCHER_RUN_HANDSHAKE_SCHEMA,
@@ -185,7 +186,7 @@ try {
 
   const started = Date.now();
   let lastLog = started;
-  let lastSnapshotCount = -1;
+  let lastSnapshotCount = 0;
   for (;;) {
     const handshake = await page.evaluate(() => window.__RUN_HANDSHAKE__ ?? null);
     if (isLauncherRunDone(handshake, launchRequestId)) break;
@@ -198,13 +199,19 @@ try {
       throw new Error(`run timed out after ${opts.timeoutMs} ms`);
     }
     if (now - lastLog >= 15_000) {
-      const snapshot = await saveResultsPayload(page, 'incremental launcher snapshot', {
-        snapshot: true,
-        quiet: true,
-      });
-      if (snapshot && snapshot.results.length !== lastSnapshotCount) {
-        console.log(`[launch] snapshot: ${snapshot.results.length} results → ${snapshot.outPath.replace(`${ROOT}/`, '')}`);
-        lastSnapshotCount = snapshot.results.length;
+      // A zero-progress checkpoint only reserializes the cache and live page while a cell may be
+      // inside its memory window. Save after completed rows advance; timeout/failure/final saves
+      // remain unconditional below.
+      const observedResultCount = await page.evaluate(() => window.__RESULTS__?.length ?? 0);
+      if (hasUnsavedLauncherResults(lastSnapshotCount, observedResultCount)) {
+        const snapshot = await saveResultsPayload(page, 'incremental launcher snapshot', {
+          snapshot: true,
+          quiet: true,
+        });
+        if (snapshot) {
+          console.log(`[launch] snapshot: ${snapshot.results.length} results → ${snapshot.outPath.replace(`${ROOT}/`, '')}`);
+          lastSnapshotCount = snapshot.results.length;
+        }
       }
       const label = await page.evaluate(() => document.getElementById('progress-label')?.textContent ?? '');
       if (label) console.log(`[launch] ${label}`);

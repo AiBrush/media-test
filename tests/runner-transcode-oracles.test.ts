@@ -501,6 +501,101 @@ describe('production transcode oracle integration', () => {
     });
   });
 
+  test('implicit 44.1 kHz PCM-to-Opus is compared through an independent 48 kHz reference resample', async () => {
+    const candidateBytes = await fixtureBytes('tiny_vp9_360p_2s.webm');
+    const structure = readTranscodeAudioStructure(candidateBytes, 'webm');
+    expect(structure).toMatchObject({
+      state: 'OK',
+      value: {
+        codec: 'opus',
+        sampleRate: 48_000,
+        channels: 2,
+        timeline: { kind: 'opus-webm', presentationSampleFrames: 96_000 },
+      },
+    });
+    if (structure.state !== 'OK' || structure.value.sampleFrames === undefined) return;
+
+    const { sampleFrames, channels } = structure.value;
+    const samples = patternedSamples(sampleFrames, channels);
+    const requestedRates: number[] = [];
+    let contextIndex = 0;
+    class ReferenceResamplingAudioContext {
+      readonly decodedFrames: number;
+
+      constructor(options?: AudioContextOptions) {
+        requestedRates.push(options?.sampleRate ?? 44_100);
+        this.decodedFrames = contextIndex++ === 0 ? sampleFrames - 74 : sampleFrames;
+      }
+
+      async decodeAudioData(): Promise<AudioBuffer> {
+        return {
+          length: this.decodedFrames,
+          numberOfChannels: channels,
+          sampleRate: 48_000,
+          copyFromChannel(destination: Float32Array, channel: number): void {
+            for (let frame = 0; frame < destination.length; frame++) {
+              destination[frame] = samples[frame * channels + channel] ?? 0;
+            }
+          },
+        } as AudioBuffer;
+      }
+
+      async close(): Promise<void> {}
+    }
+    (globalThis as Record<string, unknown>).AudioContext = ReferenceResamplingAudioContext;
+
+    const sourceFrames = Math.round(sampleFrames * 44_100 / 48_000);
+    const sourceBytes = wave(patternedSamples(sourceFrames, channels), channels, 44_100);
+    const scenario = audioScenario('aac_to_opus_webm', 'webm', 'opus');
+    const oracleContext = audioContext(scenario, sourceBytes, candidateBytes, 'webm');
+    oracleContext.golden.meta = {
+      container: 'wav',
+      durationSec: sourceFrames / 44_100,
+      tracks: [{ type: 'audio', codec: 'pcm-s16', sampleRate: 44_100, channels }],
+    };
+    const outcome = await runOracle(
+      'property-invariant',
+      oracleContext,
+    );
+    expect(outcome).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      reasonCode: 'TRANSCODE_AUDIO_LOSSY_CONTENT_MATCH',
+      measurements: {
+        sampleRate: 48_000,
+        referenceSourceSampleRate: 44_100,
+        sampleFrameDelta: 74,
+      },
+    });
+    expect(requestedRates).toEqual([48_000, 48_000]);
+  });
+
+  test('an explicit non-48 kHz Opus request still rejects a 48 kHz candidate before content scoring', async () => {
+    const candidateBytes = await fixtureBytes('tiny_vp9_360p_2s.webm');
+    const scenario = defineScenario({
+      id: 'transcode/aac_to_opus_webm',
+      op: 'transcode',
+      input: 'source.wav',
+      options: {
+        container: 'webm',
+        audio: { codec: 'opus', sampleRate: 44_100 },
+        invariant: 'transcode-audio-content',
+      },
+      requires: { operations: ['transcode'] },
+      oracles: ['property-invariant'],
+      metrics: ['wall'],
+    });
+    const outcome = await runOracle(
+      'property-invariant',
+      audioContext(scenario, wave([0.25, -0.25], 2, 44_100), candidateBytes, 'webm'),
+    );
+    expect(outcome).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'FAIL',
+      reasonCode: 'TRANSCODE_AUDIO_REQUESTED_SAMPLE_RATE_MISMATCH',
+    });
+  });
+
   test('REQ-FEAT-21 AAC edit-list priming selects the program interval and rejects count drift', async () => {
     const candidateBytes = await fixtureBytes('gapless_aac.m4a');
     const structure = readTranscodeAudioStructure(candidateBytes, 'mp4');

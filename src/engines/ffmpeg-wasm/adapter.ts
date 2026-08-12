@@ -193,7 +193,8 @@ import {
   type FfmpegRuntimeBuild,
 } from './support.ts';
 
-const ENGINE_ID = 'ffmpeg.wasm@0.12.15';
+export const FFMPEG_WASM_ENGINE_ID = 'ffmpeg.wasm@0.12.15';
+const ENGINE_ID = FFMPEG_WASM_ENGINE_ID;
 /** Vendored core version (both @ffmpeg/core and @ffmpeg/core-mt). */
 const CORE_VERSION = '0.12.10';
 const WRAPPER_VERSION = '0.12.15';

@@ -669,36 +669,6 @@ async function openInput(mb: MB, input: MediaInput, container?: string, options:
   });
 }
 
-function containerHintFromMediaInput(input: MediaInput): string | undefined {
-  const id = input.id.toLowerCase().split(/[?#]/, 1)[0] ?? '';
-  const extension = /\.([a-z0-9]+)$/.exec(id)?.[1];
-  if (extension === 'm4v' || extension === 'm4a') return 'mp4';
-  if (extension === 'mka') return 'mkv';
-  if (extension === 'aac') return 'adts';
-  if (extension && ['mp4', 'mov', 'mkv', 'webm', 'ts', 'mp3', 'wav', 'flac', 'ogg', 'adts'].includes(extension)) {
-    return extension;
-  }
-  if (input.mime.includes('quicktime')) return 'mov';
-  if (input.mime.includes('webm')) return 'webm';
-  if (input.mime.includes('matroska')) return 'mkv';
-  if (input.mime.includes('mpeg')) return input.mime.startsWith('audio/') ? 'mp3' : 'ts';
-  if (input.mime.includes('mp4')) return 'mp4';
-  return undefined;
-}
-
-function mediabunnyOutputRotation(
-  rotation: EncodedTracks['tracks'][number]['rotation'],
-  container: string,
-): Rotation | undefined {
-  if (rotation === undefined) return undefined;
-  // Mediabunny 1.48's ISO writer/reader expose the same quarter-turn sign mismatch normalized at
-  // our input boundary. Translate back only while calling that writer; EncodedTrack stays in the
-  // suite-wide clockwise convention.
-  return (container === 'mp4' || container === 'mov') && (rotation === 90 || rotation === 270)
-    ? (360 - rotation) as Rotation
-    : rotation;
-}
-
 function traceHlsFetch(trace: MediabunnyHlsReadTrace, fallbackPath: string): typeof fetch {
   return async (resource, init) => {
     const path = resource instanceof Request
@@ -893,8 +863,6 @@ export async function normalizeTrack(
   track: InputTrack,
   options: {
     frameRateMode?: 'prefix' | 'external';
-    /** Canonical source container; required when translating container-specific metadata conventions. */
-    sourceContainer?: string;
   } = {},
 ): Promise<NormalizedTrack> {
   const language = await track.getLanguageCode().catch(() => 'und');
@@ -916,20 +884,13 @@ export async function normalizeTrack(
   if (track.isVideoTrack()) {
     const v = track as InputVideoTrack;
     const mbCodec = await v.getCodec().catch(() => null);
-    const [width, height, mediabunnyRotation] = await Promise.all([
+    const [width, height, rotation] = await Promise.all([
       v.getCodedWidth().catch(() => 0),
       v.getCodedHeight().catch(() => 0),
       v.getRotation().catch(() => 0 as Rotation),
     ]);
-    // Mediabunny 1.48 derives an ISO-BMFF tkhd quarter-turn with atan2(b, a), which is the
-    // opposite sign from the suite's clockwise display convention (also used by ffprobe and the
-    // independent structural orientation reader). Its Matroska demuxer already performs that sign
-    // conversion, so invert only MP4/MOV quarter-turns at this explicit container boundary.
-    const rotation: Rotation =
-      (options.sourceContainer === 'mp4' || options.sourceContainer === 'mov') &&
-      (mediabunnyRotation === 90 || mediabunnyRotation === 270)
-        ? (360 - mediabunnyRotation) as Rotation
-        : mediabunnyRotation;
+    // Mediabunny's public Rotation type is explicitly clockwise for every input format, matching
+    // NormalizedTrack.rotation. Container-specific sign conversion belongs inside that parser.
     // FPS: estimate from a prefix of packets (averagePacketRate == frame rate for video).
     let fps: number | undefined;
     let fpsProvenance: NormalizedTrack['fpsProvenance'];
@@ -1530,7 +1491,6 @@ async function prepareOpenedInput(
   inputIndex: number,
   engineId: string,
   context?: OperationContext,
-  sourceContainer?: string,
 ): Promise<PreparedOpenedInput> {
   const tracks = await input.getTracks();
   const metadataTags = await input.getMetadataTags().catch(() => undefined);
@@ -1551,7 +1511,7 @@ async function prepareOpenedInput(
     }
     const type: 'video' | 'audio' = track.isVideoTrack() ? 'video' : 'audio';
     const typeOrdinal = typeCounts[type]++;
-    const normalized = await normalizeTrack(track, { sourceContainer });
+    const normalized = await normalizeTrack(track);
     const decoderConfig = await track.getDecoderConfig().catch(() => null);
     const observedTimescale = await track.getTimeResolution().catch(() => 1_000_000);
     const timescale = Number.isSafeInteger(observedTimescale) && observedTimescale > 0
@@ -1759,7 +1719,6 @@ async function metadataFromInput(
   for (const t of tracks) {
     const track = await normalizeTrack(t, {
       frameRateMode: options.exactFrameRateWith && t.isVideoTrack() ? 'external' : 'prefix',
-      sourceContainer: container,
     });
     if (options.exactFrameRateWith && t.isVideoTrack()) {
       const sink = new options.exactFrameRateWith.EncodedPacketSink(t);
@@ -4160,7 +4119,6 @@ export class MediabunnyEngine implements MediaEngine {
           inputIndex,
           this.id,
           context,
-          context?.request.inputs[inputIndex]?.container ?? containerHintFromMediaInput(input),
         );
         candidates.push(...prepared.candidates);
         sourceTrackCount += prepared.sourceTrackCount;
@@ -4916,10 +4874,9 @@ export class MediabunnyEngine implements MediaEngine {
         if (!mbCodec) throw new Error(`mediabunny mux: unsupported video codec '${t.codec}'`);
         const source = new mb.EncodedVideoPacketSource(mbCodec);
         let sourceClosed = false;
-        const outputRotation = mediabunnyOutputRotation(t.rotation, opts.container);
         output.addVideoTrack(source, {
           maximumPacketCount: reserveMaximumPacketCount ?? t.chunks.length,
-          ...(outputRotation !== undefined ? { rotation: outputRotation } : {}),
+          ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
         });
         pendings.push({
           add: (p, m) => source.add(p, m as EncodedVideoChunkMetadata),
@@ -5172,7 +5129,7 @@ export class MediabunnyEngine implements MediaEngine {
     context?: OperationContext,
     protectionWasResolved?: () => boolean,
   ): Promise<MediaBytes> {
-    const prepared = await prepareOpenedInput(this.lib, input, 0, this.id, context, 'mp4');
+    const prepared = await prepareOpenedInput(this.lib, input, 0, this.id, context);
     if (protectionWasResolved !== undefined && !protectionWasResolved()) {
       throw createNotApplicableError(
         this.id,

@@ -8,6 +8,7 @@ import {
   type OperationContext,
   type OperationTelemetry,
   SUPPORTED_CHECKED_SUPPORT_SNAPSHOT,
+  validateOperationTelemetry,
 } from '../src/core/engine.ts';
 import {
   isCorpusDeliveryIntegrityError,
@@ -200,6 +201,27 @@ function trimRequest(
       frameAccurate: false,
       range,
     },
+  };
+}
+
+function demuxRequest(input: MediaInput): ConcreteOperationRequest {
+  return {
+    protocol: CONCRETE_OPERATION_PROTOCOL,
+    scenarioId: 'demux/authenticated-range-adapter-integration',
+    operation: 'demux',
+    inputs: [{
+      id: input.id,
+      mime: input.mime,
+      container: 'mp4',
+      mutated: false,
+      sourceEvidence: 'RESOLVED',
+      sizeBytes: input.sizeBytes,
+      tracks: [
+        { type: 'video', codec: 'h264', width: 640, height: 360, fps: 30 },
+        { type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 2 },
+      ],
+    }],
+    options: {},
   };
 }
 
@@ -441,6 +463,86 @@ describe('AIBrush authenticated range Source', () => {
       );
       expect(byteEvents).toHaveLength(physicalRanges.length);
       expect(byteEvents.at(-1)?.bytes).toBe(physicalBytes);
+      expect(output.telemetry).toMatchObject({ bytesRead: physicalBytes });
+      expect(() => validateOperationTelemetry('aibrush-media@dev', events, output.telemetry))
+        .not.toThrow();
+    } finally {
+      await engine.dispose(context);
+      restoreGlobalFetch(fetchDescriptor);
+    }
+  });
+
+  test('routes an ordinary large MP4 demux around whole-byte packet-info shortcuts', async () => {
+    const fixture = new Uint8Array(
+      await Bun.file('fixtures/media/tiny_h264_360p_2s.mp4').arrayBuffer(),
+    );
+    const chunkSizeBytes = 1024 * 1024;
+    const sizeBytes = 64 * 1024 * 1024 + 1;
+    const firstBlock = new Uint8Array(chunkSizeBytes);
+    firstBlock.set(fixture);
+    const zeroBlock = new Uint8Array(chunkSizeBytes);
+    const zeroBlockSha256 = sha256Hex(zeroBlock);
+    const attestation: MediaInputContentAttestation = {
+      schema: 'media-test/url-content-attestation@1',
+      logicalPath: 'large-faststart.mp4',
+      sha256: 'ab'.repeat(32),
+      sizeBytes,
+      chunkSizeBytes,
+      chunkSha256: [
+        sha256Hex(firstBlock),
+        ...Array.from({ length: 63 }, () => zeroBlockSha256),
+        sha256Hex(new Uint8Array(1)),
+      ],
+    };
+    let wholeFileCalls = 0;
+    const input: MediaInput = {
+      id: attestation.logicalPath,
+      url: 'https://fixtures.test/large-faststart.mp4',
+      mime: 'video/mp4',
+      sizeBytes,
+      contentAttestation: attestation,
+      async arrayBuffer() {
+        wholeFileCalls += 1;
+        throw new Error('whole-file byte access is forbidden');
+      },
+      async blob() {
+        wholeFileCalls += 1;
+        throw new Error('whole-file blob access is forbidden');
+      },
+    };
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    const request = demuxRequest(input);
+    const controller = new AbortController();
+    const context = probeContext(request, controller.signal, []);
+    const engine = new AibrushMediaEngine();
+    const fetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    Object.defineProperty(globalThis, 'fetch', {
+      configurable: true,
+      writable: true,
+      value: (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+        const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+        if (match === null) throw new Error('expected a fixed block range');
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        physicalRanges.push({ start, end });
+        const body = new Uint8Array(end - start + 1);
+        if (start === 0) body.set(firstBlock.subarray(0, body.byteLength));
+        return new Response(body, {
+          status: 206,
+          headers: { 'Content-Range': `bytes ${start}-${end}/${sizeBytes}` },
+        });
+      }) as typeof fetch,
+    });
+
+    try {
+      expect(engine.supports(request, context)).toEqual({ supported: true });
+      await engine.init(context);
+      const result = await engine.demux(input, context);
+      expect(result.packets.length).toBeGreaterThan(0);
+      expect(result.metadata.container).toBe('mp4');
+      expect(wholeFileCalls).toBe(0);
+      expect(physicalRanges.length).toBeGreaterThan(0);
+      expect(physicalRanges.length).toBeLessThan(65);
     } finally {
       await engine.dispose(context);
       restoreGlobalFetch(fetchDescriptor);
@@ -564,6 +666,149 @@ describe('AIBrush authenticated range Source', () => {
     source.releaseRange?.(await source.range(0, 1));
     expect(physicalRanges).toHaveLength(18);
     expect(physicalRanges.at(-1)).toEqual({ start: 0, end: 0 });
+  });
+
+  test('large authenticated sources retain only a four-block working set', async () => {
+    const chunkSizeBytes = 1024 * 1024;
+    const sizeBytes = 64 * 1024 * 1024 + 1;
+    const fullBlock = new Uint8Array(chunkSizeBytes);
+    const fullBlockSha256 = sha256Hex(fullBlock);
+    const finalBlockSha256 = sha256Hex(new Uint8Array(1));
+    const attestation: MediaInputContentAttestation = {
+      schema: 'media-test/url-content-attestation@1',
+      logicalPath: 'large-zero-input.mp4',
+      sha256: 'ab'.repeat(32),
+      sizeBytes,
+      chunkSizeBytes,
+      chunkSha256: [
+        ...Array.from({ length: 64 }, () => fullBlockSha256),
+        finalBlockSha256,
+      ],
+    };
+    const input: MediaInput = {
+      id: attestation.logicalPath,
+      url: 'https://fixtures.test/large-zero-input.mp4',
+      mime: 'video/mp4',
+      sizeBytes,
+      contentAttestation: attestation,
+      async arrayBuffer() {
+        throw new Error('whole-file byte access is forbidden');
+      },
+      async blob() {
+        throw new Error('whole-file blob access is forbidden');
+      },
+    };
+    const physicalRanges: Array<{ start: number; end: number }> = [];
+    const source = createAibrushAuthenticatedSource(
+      input,
+      (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+        const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+        if (match === null) throw new Error('expected a fixed block range');
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        physicalRanges.push({ start, end });
+        return new Response(new Uint8Array(end - start + 1), {
+          status: 206,
+          headers: { 'Content-Range': `bytes ${start}-${end}/${sizeBytes}` },
+        });
+      }) as typeof fetch,
+    );
+
+    for (let index = 0; index < 5; index++) {
+      const start = index * chunkSizeBytes;
+      source.releaseRange?.(await source.range(start, start + 1));
+    }
+    expect(physicalRanges).toHaveLength(5);
+
+    source.releaseRange?.(await source.range(0, 1));
+    expect(physicalRanges).toHaveLength(6);
+    expect(physicalRanges.at(-1)).toEqual({ start: 0, end: chunkSizeBytes - 1 });
+  });
+
+  test('detaches evicted verified blocks instead of waiting for garbage collection', async () => {
+    const bytes = Uint8Array.from({ length: 20 }, (_, index) => index + 10);
+    const attestation = attestationFor(bytes, 1);
+    let detachedBlocks = 0;
+    const fetchImpl = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+      if (match === null) throw new Error('expected a fixed block range');
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const body = bytes.slice(start, end + 1);
+      const buffer = body.buffer as ArrayBuffer & {
+        transfer?: (newByteLength?: number) => ArrayBuffer;
+      };
+      const nativeTransfer = buffer.transfer?.bind(buffer);
+      Object.defineProperty(buffer, 'transfer', {
+        configurable: true,
+        value: (newByteLength?: number): ArrayBuffer => {
+          detachedBlocks += 1;
+          return nativeTransfer?.(newByteLength) ?? new ArrayBuffer(newByteLength ?? 0);
+        },
+      });
+      return {
+        status: 206,
+        headers: new Headers({ 'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}` }),
+        body: null,
+        arrayBuffer: async () => buffer,
+      } as unknown as Response;
+    }) as typeof fetch;
+    const source = createAibrushAuthenticatedSource(
+      inputFor(bytes, attestation, { count: 0 }),
+      fetchImpl,
+    );
+
+    for (let index = 0; index < 16; index++) {
+      source.releaseRange?.(await source.range(index, index + 1));
+    }
+    expect(detachedBlocks).toBe(0);
+
+    source.releaseRange?.(await source.range(16, 17));
+    expect(detachedBlocks).toBe(1);
+
+    source.releaseRange?.(await source.range(0, 1));
+    expect(detachedBlocks).toBe(2);
+  });
+
+  test('keeps an evicted verified block alive until every overlapping range releases its lease', async () => {
+    const bytes = Uint8Array.from({ length: 20 }, (_, index) => index + 10);
+    const attestation = attestationFor(bytes, 1);
+    let respondBlockOne!: (response: Response) => void;
+    const blockOneResponse = new Promise<Response>((resolve) => {
+      respondBlockOne = resolve;
+    });
+    const fetchImpl = (async (_resource: RequestInfo | URL, init?: RequestInit) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get('Range') ?? '');
+      if (match === null) throw new Error('expected a fixed block range');
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      if (start === 1) return blockOneResponse;
+      return new Response(bytes.slice(start, end + 1), {
+        status: 206,
+        headers: { 'Content-Range': `bytes ${start}-${end}/${bytes.byteLength}` },
+      });
+    }) as typeof fetch;
+    const source = createAibrushAuthenticatedSource(
+      inputFor(bytes, attestation, { count: 0 }),
+      fetchImpl,
+    );
+
+    const overlapping = source.range(0, 2);
+    const joined = await source.range(0, 1);
+    expect(joined).toEqual(bytes.slice(0, 1));
+    source.releaseRange?.(joined);
+
+    for (let index = 2; index < 18; index++) {
+      source.releaseRange?.(await source.range(index, index + 1));
+    }
+    respondBlockOne(new Response(bytes.slice(1, 2), {
+      status: 206,
+      headers: { 'Content-Range': `bytes 1-1/${bytes.byteLength}` },
+    }));
+
+    const result = await overlapping;
+    expect(result).toEqual(bytes.slice(0, 2));
+    source.releaseRange?.(result);
   });
 
   test('bounds cached bytes independently of the entry-count ceiling', async () => {

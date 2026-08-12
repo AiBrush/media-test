@@ -857,10 +857,17 @@ function buildSamplesFromFragments(
   moov: Box,
   trackId: number,
   timescale: number,
-  presentationOriginTicks: number,
+  normalizeToEarliestPts: boolean,
 ): Mp4Sample[] {
   const defaults = parseTrexDefaults(bytes, moov);
-  const samples: Mp4Sample[] = [];
+  interface RawFragmentSample {
+    data: Uint8Array;
+    decodeTicks: number;
+    presentationTicks: number;
+    durationTicks: number;
+    keyframe: boolean;
+  }
+  const rawSamples: RawFragmentSample[] = [];
   let nextDecodeTicks: number | undefined;
 
   for (const moof of iterBoxes(bytes, 0, bytes.length)) {
@@ -942,12 +949,11 @@ function buildSamplesFromFragments(
           if (durationTicks <= 0 || sizeBytes <= 0 || dataOffset + sizeBytes > bytes.byteLength) {
             throw new UnsupportedMp4Error('fragment sample has invalid duration, size, or media-data extent');
           }
-          const toUs = (ticks: number): number => Math.round((ticks * 1_000_000) / timescale);
-          samples.push({
+          rawSamples.push({
             data: bytes.subarray(dataOffset, dataOffset + sizeBytes).slice(),
-            dtsUs: toUs(decodeTicks - presentationOriginTicks),
-            ptsUs: toUs(decodeTicks + compositionOffsetTicks - presentationOriginTicks),
-            durationUs: toUs(durationTicks),
+            decodeTicks,
+            presentationTicks: decodeTicks + compositionOffsetTicks,
+            durationTicks,
             keyframe: fragmentSampleIsSync(sampleFlags),
           });
           dataOffset += sizeBytes;
@@ -958,7 +964,35 @@ function buildSamplesFromFragments(
       nextDecodeTicks = decodeTicks;
     }
   }
-  return samples;
+  const originTicks = normalizeToEarliestPts
+    ? rawSamples.reduce(
+      (minimum, sample) => Math.min(minimum, sample.presentationTicks),
+      Number.POSITIVE_INFINITY,
+    )
+    : 0;
+  const shiftTicks = Number.isFinite(originTicks) ? originTicks : 0;
+  const toUs = (ticks: number): number => Math.round((ticks * 1_000_000) / timescale);
+  return rawSamples.map((sample) => ({
+    data: sample.data,
+    dtsUs: toUs(sample.decodeTicks - shiftTicks),
+    ptsUs: toUs(sample.presentationTicks - shiftTicks),
+    durationUs: toUs(sample.durationTicks),
+    keyframe: sample.keyframe,
+  }));
+}
+
+/** Apply the same earliest-PTS origin policy to progressive, fragmented, and hybrid representations. */
+function normalizeCombinedSampleTimeline(samples: readonly Mp4Sample[]): Mp4Sample[] {
+  const originUs = samples.reduce(
+    (minimum, sample) => Math.min(minimum, sample.ptsUs),
+    Number.POSITIVE_INFINITY,
+  );
+  if (!Number.isFinite(originUs) || originUs === 0) return [...samples];
+  return samples.map((sample) => ({
+    ...sample,
+    dtsUs: sample.dtsUs - originUs,
+    ptsUs: sample.ptsUs - originUs,
+  }));
 }
 
 /** hdlr handler_type fourcc (e.g. 'vide','soun'). */
@@ -1104,7 +1138,6 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       const sampleDesc = parseStsd(bytes, stsd);
       const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
       const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
-      const fragmentPresentationOriginTicks = parseEditListTimingRaw(bytes, trak)?.mediaStartTicks ?? 0;
       let samples: Mp4Sample[] = [];
       try {
         samples = buildSamplesFromStbl(bytes, stbl, timescale);
@@ -1112,15 +1145,17 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
         if (!findBox(bytes, 0, bytes.length, 'moof')) throw error;
       }
       if (trackId !== null) {
+        const hasProgressivePrefix = samples.length > 0;
         samples.push(...buildSamplesFromFragments(
           bytes,
           moov,
           trackId,
           timescale,
-          fragmentPresentationOriginTicks,
+          !hasProgressivePrefix,
         ));
       }
       if (samples.length === 0) throw new UnsupportedMp4Error('video track contains no addressable samples');
+      samples = normalizeCombinedSampleTimeline(samples);
       const config: Mp4VideoConfig = {
         codec: sampleDesc.token,
         codecString: sampleDesc.codecString,
@@ -1146,17 +1181,18 @@ export function demuxMp4Tracks(bytes: Uint8Array): Mp4Track[] {
       }
       const tkhd = findBox(bytes, trak.bodyStart, trak.bodyEnd, 'tkhd');
       const trackId = tkhd ? parseTkhdTrackId(bytes, tkhd) : null;
-      const fragmentPresentationOriginTicks = parseEditListTimingRaw(bytes, trak)?.mediaStartTicks ?? 0;
       if (trackId !== null) {
+        const hasProgressivePrefix = samples.length > 0;
         samples.push(...buildSamplesFromFragments(
           bytes,
           moov,
           trackId,
           timescale,
-          fragmentPresentationOriginTicks,
+          !hasProgressivePrefix,
         ));
       }
       if (samples.length === 0) continue;
+      samples = normalizeCombinedSampleTimeline(samples);
       const config: Mp4AudioConfig = {
         codec: audioDesc.token,
         codecString: audioDesc.codecString,

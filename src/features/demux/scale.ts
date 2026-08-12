@@ -22,6 +22,12 @@ export interface DemuxScaleObservation {
   readonly schema: 'media-test/demux-scale-observation@1';
   readonly assetBytes: number;
   readonly peakMemoryDeltaBytes?: number;
+  readonly memoryBaselineBytes?: number;
+  readonly memoryMaximumBytes?: number;
+  readonly memoryAfterOperationBytes?: number;
+  readonly memoryOperationMaximumBytes?: number;
+  readonly memorySettleMaximumBytes?: number;
+  readonly memorySampleCount?: number;
   readonly sourceReadCalls?: number;
   readonly sourceBytesRead?: number;
   readonly longestLongTaskMs?: number;
@@ -123,7 +129,17 @@ export function assessDemuxScale(
     'peakMemoryDeltaBytes', 'sourceReadCalls', 'sourceBytesRead', 'longestLongTaskMs',
     'totalLongTaskMs', 'firstPacketMs', 'lastPacketMs',
   ] as const;
-  const invalid = fields.find((field) => observation[field] !== undefined && !finiteNonNegative(observation[field]));
+  const diagnosticFields = [
+    'memoryBaselineBytes',
+    'memoryMaximumBytes',
+    'memoryAfterOperationBytes',
+    'memoryOperationMaximumBytes',
+    'memorySettleMaximumBytes',
+    'memorySampleCount',
+  ] as const;
+  const invalid = [...fields, ...diagnosticFields].find(
+    (field) => observation[field] !== undefined && !finiteNonNegative(observation[field]),
+  );
   if (invalid) {
     return { state: 'ERROR', reasonCode: 'DEMUX_SCALE_COUNTER_INVALID', detail: `${invalid} must be finite and non-negative` };
   }
@@ -145,6 +161,24 @@ export function assessDemuxScale(
   const measurements: Record<string, number> = {
     assetBytes: observed.assetBytes,
     peakMemoryDeltaBytes: observed.peakMemoryDeltaBytes,
+    ...(observation.memoryBaselineBytes === undefined
+      ? {}
+      : { memoryBaselineBytes: observation.memoryBaselineBytes }),
+    ...(observation.memoryMaximumBytes === undefined
+      ? {}
+      : { memoryMaximumBytes: observation.memoryMaximumBytes }),
+    ...(observation.memoryAfterOperationBytes === undefined
+      ? {}
+      : { memoryAfterOperationBytes: observation.memoryAfterOperationBytes }),
+    ...(observation.memoryOperationMaximumBytes === undefined
+      ? {}
+      : { memoryOperationMaximumBytes: observation.memoryOperationMaximumBytes }),
+    ...(observation.memorySettleMaximumBytes === undefined
+      ? {}
+      : { memorySettleMaximumBytes: observation.memorySettleMaximumBytes }),
+    ...(observation.memorySampleCount === undefined
+      ? {}
+      : { memorySampleCount: observation.memorySampleCount }),
     sourceReadCalls: observed.sourceReadCalls,
     sourceBytesRead: observed.sourceBytesRead,
     sourceReadAmplification: amplification,

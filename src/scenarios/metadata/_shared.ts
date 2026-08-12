@@ -186,6 +186,8 @@ export function buildProperty(c: MetaPropertyCase): Scenario {
 export interface DecodeReadCase {
   /** unique id suffix (namespaced under metadata/) */
   id: string;
+  /** Increment when the executable evidence contract changes. */
+  revision?: number;
   asset: string;
   container: string;
   videoCodecs?: string[];
@@ -193,19 +195,24 @@ export interface DecodeReadCase {
   features?: string[];
   /** how many frames to decode + digest-compare against golden */
   maxFrames: number;
+  /** Override the default exact-RGBA gate for properties with representation-independent evidence. */
+  oracles?: OracleId[];
+  /** Optional quality floors for perceptual decoded-presentation evidence. */
+  tolerances?: OracleTolerances;
   timeoutMs?: number;
   notes?: string;
 }
 
 /**
- * Build a decodeFrames scenario gated by `decoded-frames-bitexact`. Used to read a metadata property
- * by the pixels it produces (e.g. rotation: golden frames are baked rotation-applied by the reference
- * decoder, so a demuxer that drops the display matrix — or bakes it into width/height — yields a
- * different decoded image → digest mismatch). VIDEO-ONLY; needs a baked `<asset>.frames.json`.
+ * Build a decodeFrames scenario gated by exact RGBA by default. A property whose presentation crosses
+ * two legal browser rasterization paths may instead select `ssim-psnr`; that path still requires the
+ * committed frame timing/geometry and luma-signature sidecars, so a dropped display matrix or a bare
+ * width/height swap cannot pass. VIDEO-ONLY; needs baked `<asset>.frames.json` evidence.
  */
 export function buildDecodeRead(c: DecodeReadCase): Scenario {
   return defineScenario({
     id: `metadata/${c.id}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'decodeFrames',
     input: c.asset,
     options: { maxFrames: c.maxFrames },
@@ -215,8 +222,9 @@ export function buildDecodeRead(c: DecodeReadCase): Scenario {
       ...(c.videoCodecs ? { videoCodecs: c.videoCodecs } : {}),
       ...(c.features ? { features: c.features } : {}),
     },
-    oracles: ['decoded-frames-bitexact'],
+    oracles: c.oracles ?? ['decoded-frames-bitexact'],
     metrics: ['wall'],
+    ...(c.tolerances ? { tolerances: c.tolerances } : {}),
     ...(c.timeoutMs ? { timeoutMs: c.timeoutMs } : {}),
     ...(c.notes ? { notes: c.notes } : {}),
   });

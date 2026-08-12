@@ -1,4 +1,5 @@
 import { muxVerdict, type MuxDecision } from './types.ts';
+import type { RemuxProgramEvidence } from '../remux/types.ts';
 
 export const MUX_TRACK_SELECTOR_SCHEMA = 'media-test/mux-track-selector@1' as const;
 export const MUX_TRACK_SELECTION_SCHEMA = 'media-test/mux-track-selection@1' as const;
@@ -60,6 +61,51 @@ export function parseMuxTrackSelector(value: string): ParsedMuxTrackSelector {
     ...(sourceIndex !== undefined ? { sourceIndex } : {}),
     canonical: `${type}:${typeOrdinal}${sourceIndex !== undefined ? `@${sourceIndex}` : ''}`,
   });
+}
+
+/**
+ * Resolve the latest selected source presentation boundary on the original timestamp axis.
+ * Container duration fields describe the latest authored presentation end, so a mux that drops a
+ * later-ending track must be compared with the selected tracks rather than the whole source program.
+ */
+export function selectedMuxPresentationEndUs(
+  sources: readonly RemuxProgramEvidence[],
+  selectorValues: readonly string[],
+): number | undefined {
+  if (sources.length === 0) throw new TypeError('mux duration selection requires at least one source');
+  if (selectorValues.length === 0) throw new TypeError('mux duration selection requires explicit selectors');
+
+  const selected = new Set<string>();
+  let presentationEndUs = Number.NEGATIVE_INFINITY;
+  for (const selectorValue of selectorValues) {
+    const selector = parseMuxTrackSelector(selectorValue);
+    if (sources.length > 1 && selector.sourceIndex === undefined) {
+      throw new TypeError(`multi-source selector '${selector.canonical}' must include @SOURCE`);
+    }
+    const sourceIndex = selector.sourceIndex ?? 0;
+    const source = sources[sourceIndex];
+    if (source === undefined) {
+      throw new TypeError(`selector '${selector.canonical}' refers to missing source ${sourceIndex}`);
+    }
+    const track = source.tracks.filter((candidate) => candidate.type === selector.type)[selector.typeOrdinal];
+    if (track === undefined) {
+      throw new TypeError(`selector '${selector.canonical}' does not resolve to a source track`);
+    }
+    const selectionKey = `${sourceIndex}/${selector.type}:${selector.typeOrdinal}`;
+    if (selected.has(selectionKey)) throw new TypeError(`selector '${selector.canonical}' duplicates a selected source track`);
+    selected.add(selectionKey);
+
+    let trackEndUs = Number.NEGATIVE_INFINITY;
+    for (const sample of track.samples) {
+      if (sample.ptsUs === undefined) continue;
+      const durationUs = sample.durationUs ?? 0;
+      if (!Number.isFinite(sample.ptsUs) || !Number.isFinite(durationUs) || durationUs < 0) return undefined;
+      trackEndUs = Math.max(trackEndUs, sample.ptsUs + durationUs);
+    }
+    if (!Number.isFinite(trackEndUs)) return undefined;
+    presentationEndUs = Math.max(presentationEndUs, trackEndUs);
+  }
+  return Number.isFinite(presentationEndUs) ? presentationEndUs : undefined;
 }
 
 /** Resolve selectors once before adapter dispatch. Ambiguous multi-source selectors are rejected. */

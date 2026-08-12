@@ -449,6 +449,40 @@ describe('REQ-FIX-08/09 active-generation runtime integrity', () => {
     expect(publication.hashCount(`golden/${assetId}.meta.json`)).toBe(2);
   });
 
+  test('an authenticated stream identity binds ready evidence without materializing the source body', async () => {
+    const publication = buildPublication();
+
+    const evidence = await publication.runtime.loadGoldenEvidence(
+      assetId,
+      'metadata',
+      (payload) => payload,
+      { sha256: mediaSha256, sizeBytes: mediaBytes.byteLength },
+    );
+
+    expect(evidence).toMatchObject({ state: 'ready' });
+    expect(publication.hashCount(`media/${assetId}`)).toBe(0);
+    expect(publication.hashCount(`golden/${assetId}.meta.json`)).toBe(1);
+    expect(publication.requestedUrls.some((url) => url.endsWith(`/media/${assetId}`))).toBe(false);
+  });
+
+  test('a mismatched authenticated stream identity cannot authorize indexed evidence', async () => {
+    const publication = buildPublication();
+
+    const evidence = await publication.runtime.loadGoldenEvidence(
+      assetId,
+      'metadata',
+      (payload) => payload,
+      { sha256: 'f'.repeat(64), sizeBytes: mediaBytes.byteLength },
+    );
+
+    expect(evidence).toMatchObject({
+      state: 'digest-mismatch',
+      reasonCode: 'FIXTURE_ATTESTED_IDENTITY_MISMATCH',
+    });
+    expect(publication.hashCount(`media/${assetId}`)).toBe(0);
+    expect(publication.hashCount(`golden/${assetId}.meta.json`)).toBe(0);
+  });
+
   test('materialized media is verified from the ignored media path and ready evidence may bind to it', async () => {
     const publication = buildPublication({ materializedMedia: 'ready' });
     const observed = counters();

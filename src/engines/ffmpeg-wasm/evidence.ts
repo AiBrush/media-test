@@ -369,7 +369,7 @@ export function parseTracksFromLog(log: string): NormalizedTrack[] {
         const rotation = /rotation of\s*(-?\d+(?:\.\d+)?)\s*degrees/.exec(sideData);
         if (rotation) {
           const degrees = parseFloat(rotation[1]!);
-          track.rotation = ((degrees % 360) + 360) % 360;
+          track.rotation = clockwiseRotationFromFfmpeg(degrees);
           break;
         }
       }
@@ -866,13 +866,19 @@ function annexBNalUnits(bytes: Uint8Array): Uint8Array[] {
 function rotationFromStream(stream: Record<string, unknown>): number | undefined {
   const tags = record(stream.tags);
   const direct = finite(tags.rotate);
-  if (direct !== undefined) return ((direct % 360) + 360) % 360;
+  if (direct !== undefined) return clockwiseRotationFromFfmpeg(direct);
   const sideData = Array.isArray(stream.side_data_list) ? stream.side_data_list : [];
   for (const item of sideData) {
     const rotation = finite(record(item).rotation);
-    if (rotation !== undefined) return ((rotation % 360) + 360) % 360;
+    if (rotation !== undefined) return clockwiseRotationFromFfmpeg(rotation);
   }
   return undefined;
+}
+
+/** FFmpeg's display-matrix angle is counter-clockwise; NormalizedTrack.rotation is clockwise. */
+function clockwiseRotationFromFfmpeg(rotation: number): number {
+  const counterClockwise = ((rotation % 360) + 360) % 360;
+  return counterClockwise === 0 ? 0 : 360 - counterClockwise;
 }
 
 function parseRecord(text: string, label: string): Record<string, unknown> {

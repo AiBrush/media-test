@@ -23,6 +23,11 @@ import { compareCanonicalScenarios } from './scenario-manifest.ts';
 
 export interface RegisteredEngine {
   id: string;
+  /**
+   * Stable identity stamped on result rows. Registration ids may be short CLI/UI aliases, but a
+   * pre-content outcome still belongs to the same versioned cohort as an executed cell.
+   */
+  resultId?: string;
   factory: EngineFactory;
   /**
    * Instrument-only engines back oracle helpers / golden baking (e.g. the WebCodecs 'platform'
@@ -38,12 +43,20 @@ const scenarios = new Map<string, Scenario>();
 export function registerEngine(
   id: string,
   factory: EngineFactory,
-  opts?: { instrumentOnly?: boolean },
+  opts?: { instrumentOnly?: boolean; resultId?: string },
 ): void {
   if (engines.has(id)) {
     throw new Error(`Engine id already registered: ${id}`);
   }
-  engines.set(id, { id, factory, instrumentOnly: opts?.instrumentOnly ?? false });
+  if (opts?.resultId !== undefined && opts.resultId.trim().length === 0) {
+    throw new Error(`Engine result id must not be empty: ${id}`);
+  }
+  engines.set(id, {
+    id,
+    factory,
+    instrumentOnly: opts?.instrumentOnly ?? false,
+    ...(opts?.resultId ? { resultId: opts.resultId } : {}),
+  });
 }
 
 export function registerScenario(scenario: Scenario): void {

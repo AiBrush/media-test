@@ -129,6 +129,18 @@ describe('REQ-FEAT-77: structured disposition and survivor contracts', () => {
       state: 'PASS',
       reasonCode: 'ROBUSTNESS_MEDIA_PARTIAL_STRUCTURAL',
     });
+    const flacBytes = new Uint8Array(
+      await Bun.file('fixtures/media/flac_seektable.flac').arrayBuffer(),
+    );
+    expect(validateRobustnessReturnedValue(mediaContract, {
+      output: { bytes: flacBytes, container: 'flac', mime: 'audio/flac' },
+    })).toMatchObject({
+      state: 'PASS',
+      reasonCode: 'ROBUSTNESS_MEDIA_PARTIAL_STRUCTURAL',
+    });
+    expect(validateRobustnessReturnedValue(mediaContract, {
+      output: { bytes: flacBytes.slice(0, 20), container: 'flac', mime: 'audio/flac' },
+    }).state).toBe('FAIL');
   });
 
   test('a returned boundary seek must land on the declared first/last timestamp', () => {
@@ -430,6 +442,18 @@ describe('REQ-FEAT-79: labels are literal executable rows', () => {
       invariant: 'remux(remux(x))==remux(x)',
     });
     expect(scenario?.requires.features).toContain('remux:compose');
+  });
+
+  test('reserved fast-start edge declares the position-aware target and packet bound', () => {
+    const scenario = byId.get('robustness/edge_faststart_reserve_remux');
+    expect(scenario?.revision).toBe(2);
+    expect(scenario?.options).toMatchObject({
+      container: 'mp4',
+      fastStart: 'reserve',
+      maximumPacketCount: 4096,
+      target: 'stream',
+    });
+    expect(robustnessContractFromOptions(scenario?.options)?.inputClass).toBe('hard-valid');
   });
 
   test('cross-container duration fails when only the measured matched rendition differs', async () => {

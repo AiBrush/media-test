@@ -12,7 +12,7 @@ import {
   AUTHENTICATED_RANGE_PROBE_FEATURE,
 } from '../src/core/engine.ts';
 import type { ActiveFixtureRuntime } from '../src/core/fixture-integrity.ts';
-import { sha256Hex } from '../src/core/media-selection.ts';
+import { sha256Hex, VERIFIED_STREAM_CHUNK_SIZE_BYTES } from '../src/core/media-selection.ts';
 import { registerEngine, registerScenario } from '../src/core/registry.ts';
 import { buildReport, serializeReportJson } from '../src/core/report.ts';
 import { runMatrix, type ResultReuseStore } from '../src/core/runner.ts';
@@ -612,7 +612,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     });
   });
 
-  test('range-capable scale rows stream-attest once, receive the original URL, and quarantine corruption', async () => {
+  test('range-capable scale rows harness-attest once, receive the original URL, and quarantine corruption', async () => {
     const engineId = 'selection-scale-range-engine@1.0.0';
     const unauthenticatedEngineId = 'selection-scale-remotion-like-engine@1.0.0';
     const scenarioId = 'probe/selection-scale-range';
@@ -621,6 +621,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
     const admitted = encoder.encode('authenticated-scale-selection');
     const identity = { sha256: sha256Hex(admitted), sizeBytes: admitted.byteLength };
     let served = admitted.slice();
+    let attestationRequests = 0;
     let bodyFetches = 0;
     let probeCalls = 0;
     let memorySamples = 0;
@@ -733,6 +734,17 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
         return new Response(null, { status: 404, statusText: 'catalog intentionally absent' });
       }
       if (url.includes('/fixtures/manifest.json')) return Response.json(manifest);
+      if (url.includes('/__media_test__/content-attestation')) {
+        attestationRequests += 1;
+        return Response.json({
+          schema: 'media-test/content-attestation@1',
+          logicalPath,
+          actualSha256: sha256Hex(served),
+          actualSizeBytes: served.byteLength,
+          chunkSizeBytes: VERIFIED_STREAM_CHUNK_SIZE_BYTES,
+          chunkSha256: served.byteLength === 0 ? [] : [sha256Hex(served)],
+        });
+      }
       if (url.endsWith(`/fixtures/media/${logicalPath}`)) {
         bodyFetches += 1;
         return new Response(served.slice(), { status: 200 });
@@ -767,6 +779,7 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
         status: 'NA_ENGINE',
         reason: expect.stringContaining('PROBE_AUTHENTICATED_RANGE_TRANSPORT_UNAVAILABLE'),
       });
+      expect(attestationRequests).toBe(0);
       expect(bodyFetches).toBe(0);
       expect(unauthenticatedProbeCalls).toBe(0);
 
@@ -774,7 +787,8 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
       expect(accepted[0]).toMatchObject({ status: 'PASS' });
       expect(accepted[0]?.measurement).toMatchObject({ state: 'AVAILABLE' });
       expect(accepted[0]?.bench?.wall?.n).toBe(5);
-      expect(bodyFetches).toBe(1);
+      expect(attestationRequests).toBe(1);
+      expect(bodyFetches).toBe(0);
       expect(probeCalls).toBe(8); // functional + warmup + calibration + five measured repetitions
       expect(memorySamples).toBe(18); // 3 functional + 3 × five retained benchmark repetitions
       expect(observedInput?.contentAttestation?.sha256).toBe(identity.sha256);
@@ -786,7 +800,8 @@ describe('REQ-SEL-08 selection -> runMatrix -> cache -> report acceptance', () =
         status: 'NA_ASSET',
         reason: expect.stringContaining('CORPUS_DIGEST_MISMATCH'),
       });
-      expect(bodyFetches).toBe(2);
+      expect(attestationRequests).toBe(2);
+      expect(bodyFetches).toBe(0);
       expect(probeCalls).toBe(8);
       expect(memorySamples).toBe(18);
     } finally {

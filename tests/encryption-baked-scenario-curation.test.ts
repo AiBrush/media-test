@@ -9,6 +9,12 @@ import {
   curateEncryptionBakedScenarios,
 } from '../scripts/curate-encryption-baked-scenarios.mjs';
 import { encryptionScenarios } from '../src/scenarios/encryption/index.ts';
+import {
+  assessPatternGroundTruth,
+  encryptionKeyProvenanceFromOptions,
+  inspectIsoBmffEncryption,
+  inspectPatternBoundaryEvidence,
+} from '../src/features/encryption/index.ts';
 
 interface Identity {
   sha256: string;
@@ -16,7 +22,7 @@ interface Identity {
 }
 
 describe('live encryption baked scenario curation', () => {
-  test('all live IDs have manifest/physical parity or one explicit unmanifested pending asset', () => {
+  test('all live IDs have manifest/physical parity', () => {
     const first = curateEncryptionBakedScenarios();
     const before = snapshotReadyOutputs(first);
     const second = curateEncryptionBakedScenarios();
@@ -28,16 +34,8 @@ describe('live encryption baked scenario curation', () => {
     expect(ENCRYPTION_BAKED_SCENARIO_TARGETS.map(({ scenarioId }) => scenarioId)).toEqual(
       encryptionScenarios.map(({ id }) => id),
     );
-    expect(first.filter(({ state }) => state === 'ready')).toHaveLength(23);
-    expect(first.filter(({ state }) => state === 'pending')).toEqual([
-      expect.objectContaining({
-        scenarioId: 'encryption/cenc_cens_decrypt',
-        assetId: 'cenc_cens.mp4',
-        reasonCode: 'ENCRYPTION_BAKED_ASSET_NOT_MANIFESTED',
-        media: null,
-        resources: [],
-      }),
-    ]);
+    expect(first.filter(({ state }) => state === 'ready')).toHaveLength(24);
+    expect(first.filter(({ state }) => state === 'pending')).toEqual([]);
 
     const manifest = JSON.parse(readFileSync('fixtures/manifest.json', 'utf8')) as {
       assets: Array<{ id: string; sha256: string | null; sizeBytes: number | null }>;
@@ -80,6 +78,49 @@ describe('live encryption baked scenario curation', () => {
       }
     }
   }, 30_000);
+
+  test('the canonical CENS asset protects both tracks with the authored pattern contract', () => {
+    const bytes = new Uint8Array(readFileSync('fixtures/media/cenc_cens.mp4'));
+    const evidence = inspectIsoBmffEncryption(bytes);
+    expect(evidence.state).toBe('OK');
+    if (evidence.state !== 'OK') return;
+
+    const video = evidence.tracks.find((track) => track.type === 'video');
+    const audio = evidence.tracks.find((track) => track.type === 'audio');
+    expect(evidence.tracks).toHaveLength(2);
+    expect(video).toEqual(expect.objectContaining({
+      scheme: 'cens',
+      protected: true,
+      defaultKid: '00112233445566778899aabbccddeeff',
+      cryptByteBlock: 1,
+      skipByteBlock: 9,
+    }));
+    expect(audio).toEqual(expect.objectContaining({
+      scheme: 'cens',
+      protected: true,
+      defaultKid: '00112233445566778899aabbccddeeff',
+      cryptByteBlock: 0,
+      skipByteBlock: 0,
+    }));
+
+    const scenario = encryptionScenarios.find(({ id }) => id === 'encryption/cenc_cens_decrypt');
+    const pattern = encryptionKeyProvenanceFromOptions(scenario?.options)?.pattern;
+    expect(pattern).toBeDefined();
+    if (!pattern) return;
+    expect(inspectPatternBoundaryEvidence(bytes, pattern)).toMatchObject({
+      state: 'OK',
+      scheme: 'cenc-cens',
+      trackId: 1,
+      sampleCount: 150,
+      explicitSubsampleCount: 150,
+      implicitWholeSampleCount: 0,
+      firstBoundarySubsamples: [{ clearBytes: 734, protectedBytes: 23_920 }],
+    });
+    expect(assessPatternGroundTruth(bytes, pattern)).toMatchObject({
+      verdict: 'PASS',
+      reasonCode: 'PATTERN_GROUND_TRUTH_MATCH',
+    });
+  });
 });
 
 function snapshotReadyOutputs(

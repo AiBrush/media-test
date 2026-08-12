@@ -426,6 +426,7 @@ function compareTimeline(
   differences: string[],
   label: string,
   allowEbmlDurationRematerialization: boolean,
+  outputDurationTickUs?: number,
 ): void {
   if (source.units.length !== output.units.length) return;
   const sourcePts = source.units.map((unit) => unit.ptsUs);
@@ -475,8 +476,29 @@ function compareTimeline(
   const durationA = completeDurations ? source.units.reduce((sum, unit) => sum + unit.durationUs!, 0) : 0;
   const durationB = completeDurations ? output.units.reduce((sum, unit) => sum + unit.durationUs!, 0) : 0;
   if (completeDurations && durationA > 0 && durationB > 0) {
+    if (!allowEbmlDurationRematerialization && outputDurationTickUs !== undefined) {
+      const perUnitTolerance = Math.max(tolerance.timestampUs, outputDurationTickUs ?? 0);
+      for (let index = 0; index < source.units.length; index++) {
+        const delta = Math.abs(source.units[index]!.durationUs! - output.units[index]!.durationUs!);
+        if (delta > perUnitTolerance) {
+          failures.push(
+            `${label} duration[${index}] drift ${delta}us > ${perUnitTolerance}us`,
+          );
+          break;
+        }
+      }
+    }
     const delta = Math.abs(durationA - durationB);
-    if (delta > tolerance.durationUs) {
+    // EBML BlockDuration is an integer Segment tick. Independent lawful rounding can accumulate when
+    // thousands of complete per-sample durations are summed, even though every duration and the full
+    // timestamp span remain correct. Bound that representation error by half a target tick per unit;
+    // the per-unit check above still rejects any material cadence mutation.
+    const aggregateTolerance =
+      tolerance.durationUs +
+      (outputDurationTickUs !== undefined
+        ? Math.ceil((source.units.length * outputDurationTickUs) / 2)
+        : 0);
+    if (delta > aggregateTolerance) {
       const sourceSpan = presentationSpan(source);
       const outputSpan = presentationSpan(output);
       const timestampSpanPreserved = sourceSpan !== undefined && outputSpan !== undefined &&
@@ -485,9 +507,9 @@ function compareTimeline(
       if (allowEbmlDurationRematerialization && timestampSpanPreserved) {
         differences.push(`${label} EBML per-sample duration metadata was rematerialized while the coded timestamp span stayed preserved`);
       } else {
-        failures.push(`${label} coded duration drift ${delta}us > ${tolerance.durationUs}us`);
+        failures.push(`${label} coded duration drift ${delta}us > ${aggregateTolerance}us`);
       }
-    } else if (delta > 0) differences.push(`${label} duration rounded within tolerance`);
+    } else if (delta > 0) differences.push(`${label} duration rounded within target-clock tolerance`);
   }
 }
 
@@ -557,6 +579,13 @@ export function compareStrictRemuxPrograms(
     const ebmlContainers = new Set(['webm', 'mkv']);
     const allowEbmlDurationRematerialization = ebmlContainers.has(canonicalContainer(source.container)) &&
       ebmlContainers.has(canonicalContainer(output.container));
+    const outputDurationTickUs =
+      ebmlContainers.has(canonicalContainer(output.container)) &&
+      outputTrack.timescale !== undefined &&
+      Number.isSafeInteger(outputTrack.timescale) &&
+      outputTrack.timescale > 0
+        ? 1_000_000 / outputTrack.timescale
+        : undefined;
     compareTimeline(
       normalizedSource,
       normalizedOutput,
@@ -565,6 +594,7 @@ export function compareStrictRemuxPrograms(
       differences,
       label,
       allowEbmlDurationRematerialization,
+      outputDurationTickUs,
     );
     if ([...normalizedSource.framing].join(',') !== [...normalizedOutput.framing].join(',')) differences.push(`${label} framing changed`);
     if (normalizedSource.grouping.join(',') !== normalizedOutput.grouping.join(',')) differences.push(`${label} legal access-unit grouping changed`);

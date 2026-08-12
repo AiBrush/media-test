@@ -66,7 +66,7 @@ const OUTPUT_MODE_CASES: MuxCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['fastStart:reserve'],
-    extraOptions: { fastStart: 'reserve', target: 'stream' },
+    extraOptions: { fastStart: 'reserve', maximumPacketCount: 4096, target: 'stream' },
     metrics: MUX_STREAM_METRICS,
     primaryMetric: 'targetWrites',
     notes:

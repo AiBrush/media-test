@@ -58,6 +58,14 @@ const SHA256_K = new Uint32Array([
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
 
+export interface Sha256Snapshot {
+  readonly schema: 'media-test/sha256-snapshot@1';
+  readonly state: readonly number[];
+  readonly block: readonly number[];
+  readonly blockLength: number;
+  readonly totalBytes: number;
+}
+
 function rotateRight(value: number, bits: number): number {
   return (value >>> bits) | (value << (32 - bits));
 }
@@ -70,6 +78,44 @@ export class Sha256 {
   #blockLength = 0;
   #totalBytes = 0;
   #finished = false;
+
+  static fromSnapshot(snapshot: Sha256Snapshot): Sha256 {
+    if (
+      snapshot?.schema !== 'media-test/sha256-snapshot@1' ||
+      !Array.isArray(snapshot.state) ||
+      snapshot.state.length !== 8 ||
+      snapshot.state.some((word) => !Number.isSafeInteger(word) || word < 0 || word > 0xffff_ffff) ||
+      !Number.isSafeInteger(snapshot.blockLength) ||
+      snapshot.blockLength < 0 ||
+      snapshot.blockLength >= 64 ||
+      !Array.isArray(snapshot.block) ||
+      snapshot.block.length !== snapshot.blockLength ||
+      snapshot.block.some((byte) => !Number.isSafeInteger(byte) || byte < 0 || byte > 0xff) ||
+      !Number.isSafeInteger(snapshot.totalBytes) ||
+      snapshot.totalBytes < snapshot.blockLength ||
+      snapshot.totalBytes % 64 !== snapshot.blockLength
+    ) {
+      throw new TypeError('Sha256: invalid snapshot');
+    }
+    const restored = new Sha256();
+    restored.#state.set(snapshot.state);
+    restored.#block.fill(0);
+    restored.#block.set(snapshot.block);
+    restored.#blockLength = snapshot.blockLength;
+    restored.#totalBytes = snapshot.totalBytes;
+    return restored;
+  }
+
+  snapshot(): Sha256Snapshot {
+    if (this.#finished) throw new Error('Sha256: snapshot() after digest()');
+    return {
+      schema: 'media-test/sha256-snapshot@1',
+      state: Array.from(this.#state),
+      block: Array.from(this.#block.subarray(0, this.#blockLength)),
+      blockLength: this.#blockLength,
+      totalBytes: this.#totalBytes,
+    };
+  }
 
   update(value: string | Uint8Array): this {
     if (this.#finished) throw new Error('Sha256: update() after digest()');

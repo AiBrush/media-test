@@ -632,10 +632,9 @@ export function normalizeWebDemuxerStream(stream: WebAVStream): NormalizedTrack 
   };
 }
 
-/** web-demuxer/FFmpeg reports the counter-clockwise matrix angle; the suite contract is clockwise. */
+/** web-demuxer's public stream rotation is already clockwise; only canonicalize its numeric spelling. */
 export function normalizeWebDemuxerRotation(rotation: number): number {
-  const counterClockwise = ((rotation % 360) + 360) % 360;
-  return counterClockwise === 0 ? 0 : 360 - counterClockwise;
+  return ((rotation % 360) + 360) % 360;
 }
 
 interface EbmlElement {
@@ -801,6 +800,27 @@ function isoAudioSampleEntryChannels(bytes: Uint8Array): number[] {
   return channels;
 }
 
+function isoTrackDefaultDispositions(bytes: Uint8Array): Array<boolean | undefined> {
+  const moov = findIsoChild(bytes, 0, bytes.byteLength, 'moov');
+  if (!moov) return [];
+  const dispositions: Array<boolean | undefined> = [];
+  let offset = moov.offset + moov.headerSize;
+  while (offset + 8 <= moov.end) {
+    const trak = readIsoBoxHeader(bytes, offset, moov.end);
+    if (!trak) break;
+    offset = trak.end;
+    if (trak.type !== 'trak') continue;
+    const tkhd = findIsoChild(bytes, trak.offset + trak.headerSize, trak.end, 'tkhd');
+    const enabledFlagOffset = tkhd ? tkhd.offset + tkhd.headerSize + 3 : -1;
+    dispositions.push(
+      tkhd && enabledFlagOffset < tkhd.end
+        ? (bytes[enabledFlagOffset]! & 1) !== 0
+        : undefined,
+    );
+  }
+  return dispositions;
+}
+
 export function probeMetadataWithByteEvidence(
   metadata: NormalizedMetadata,
   bytes: Uint8Array,
@@ -810,13 +830,18 @@ export function probeMetadataWithByteEvidence(
   if (enriched.container === 'mp4' || enriched.container === 'mov') {
     const majorBrand = isoBmffMajorBrand(bytes);
     const audioChannels = isoAudioSampleEntryChannels(bytes);
+    const dispositions = isoTrackDefaultDispositions(bytes);
     let audioIndex = 0;
-    const tracks = enriched.tracks.map((track) => {
-      if (track.type !== 'audio') return track;
+    const tracks = enriched.tracks.map((track, index) => {
+      const defaultDisposition = dispositions[index];
+      const withDisposition = defaultDisposition === undefined
+        ? track
+        : { ...track, defaultDisposition };
+      if (track.type !== 'audio') return withDisposition;
       const channelCount = audioChannels[audioIndex++];
       return channelCount == null
-        ? track
-        : { ...track, channels: channelCount, presentationChannels: channelCount };
+        ? withDisposition
+        : { ...withDisposition, channels: channelCount, presentationChannels: channelCount };
     });
     enriched = { ...enriched, tracks };
     if (majorBrand) {

@@ -12,18 +12,15 @@
  * BOUNDED (<< file size) while an equivalent BufferTarget shows file-sized peak memory (or OOMs). Both a
  * buffer rung and a stream rung are cased at the massive size so the leaderboard shows the divergence.
  *
- * MEASUREMENT NOTES (honest):
+ * MEASUREMENT NOTES:
  *   - peakMemory is cross-engine-correct only via measureUserAgentSpecificMemory (Chromium,
  *     cross-origin-isolated); measure.ts falls back to performance.memory.usedJSHeapSize, else null. On
  *     engines/browsers without either, peakMemory is null (omitted) — reported honestly, not faked.
- *   - The buffer-vs-stream peak-memory DIVERGENCE only materializes once the runner forwards the
- *     target/shape arg to the adapter so the stream rung actually uses a StreamTarget (today both run a
- *     buffered remux → identical peak memory). The cases are wired so the contrast appears the moment
- *     that lands; until then they honestly report equal peak memory.
- *   - The large/huge/massive assets are manifest-declared with sizeBytes=null (gated behind a non-skip-
- *     longform bake) and their golden is pending → these cases resolve to NA(asset-missing) / a clean
- *     golden-absent FAIL rather than a fabricated number. Wired now so the leaderboard cell + golden
- *     filenames line up the moment the bake completes (mirrors remux/size-ladder.ts).
+ *   - Large fragmented ISO-BMFF stream rows use an awaited product StreamTarget callback that spools to
+ *     OPFS. The returned range artifact keeps correctness fully byte-addressable while retaining only
+ *     bounded validation windows in JS memory. Buffer rows still publish one complete in-memory value.
+ *   - Scale rows use the complete neutral range reader rather than full-duration MSE buffering; ordinary
+ *     streaming rows retain the real sequential MediaSource append coverage.
  *
  * CORRECTNESS STILL GATES (§0.1): reference-reimport keeps a fast/low-memory-but-WRONG stream from
  * winning the peak-memory crown. (decode-remux/playback-smoke are omitted: at GB scale a full decode is
@@ -42,6 +39,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
   // large (~100 MB) H.264 MP4 streamed to MP4: sustained throughput + peak memory at the large rung.
   {
     id: 'stream_large_h264_mp4',
+    revision: 2,
     asset: 'large_h264_1080p_120s.mp4',
     from: 'mp4',
     to: 'mp4',
@@ -58,6 +56,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
   // large (~100 MB) VP9 WebM streamed to WebM: crosses the size axis with the WebM/VP9 family.
   {
     id: 'stream_large_vp9_webm',
+    revision: 2,
     asset: 'large_vp9_1080p_120s.webm',
     from: 'webm',
     to: 'webm',
@@ -72,6 +71,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
   // huge (~500-700 MB) .mov streamed to MP4: lazy/partial reading + sustained throughput at scale.
   {
     id: 'stream_huge_h264_mov_to_mp4',
+    revision: 2,
     asset: 'huge_h264_1080p_600s.mov',
     from: 'mov',
     to: 'mp4',
@@ -89,6 +89,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
   // massive (~1-1.4 GB, 2h) low-bitrate H.264 MP4 — STREAM rung: bounded peak memory / OOM-resistance.
   {
     id: 'stream_massive_h264_mp4',
+    revision: 2,
     asset: 'massive_h264_1080p_2h.mp4',
     from: 'mp4',
     to: 'mp4',
@@ -108,6 +109,7 @@ const SIZE_LADDER_CASES: StreamCase[] = [
   // buffer-vs-stream peak-memory divergence at the size where it matters.
   {
     id: 'buffer_massive_h264_mp4',
+    revision: 2,
     asset: 'massive_h264_1080p_2h.mp4',
     from: 'mp4',
     to: 'mp4',

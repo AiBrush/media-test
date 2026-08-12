@@ -280,6 +280,43 @@ describe('runner demand-driven corpus preparation regression', () => {
     expect(mediaFetches).toBe(1);
     expect(operations).toBe(0);
   });
+
+  test('a pre-content NA_ASSET retains the registered versioned result identity', async () => {
+    const registrationId = 'runner-empty-pool-alias';
+    const resultId = 'runner-empty-pool@1.0.0';
+    const scenarioId = 'remux/empty-pool-versioned-identity';
+    const assetId = 'missing-from-manifest.mp4';
+    let operations = 0;
+    registerEngine(
+      registrationId,
+      async () => remuxEngine(resultId, async () => {
+        operations += 1;
+        return outputBytes();
+      }),
+      { resultId },
+    );
+    registerScenario(remuxScenario(scenarioId, assetId));
+    installCorpusFetch({ rows: [], manifestAssets: [], bodies: new Map() });
+
+    const results = await runMatrix({
+      browser: 'chromium',
+      engineIds: [registrationId],
+      scenarioIds: [scenarioId],
+      pillar: 'functional',
+      rotateMedia: false,
+      fixtureIntegrityRuntime: fixtureRuntime,
+      playbackSmoke: async () => true,
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      engineId: resultId,
+      status: 'NA_ASSET',
+      reason: expect.stringContaining('CORPUS_NO_VERIFIED_CANDIDATE'),
+      env: { engineId: resultId },
+    });
+    expect(operations).toBe(0);
+  });
 });
 
 function remuxScenario(id: string, input: string) {

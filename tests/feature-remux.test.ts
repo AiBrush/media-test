@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { muxPreparedWebmChunkTracks } from '@aibrush/media/core';
 
 import type { MediaBytes, MediaInput } from '../src/core/engine.ts';
 import {
@@ -185,6 +186,34 @@ describe('REQ-FEAT-07 strict stream-copy semantic oracle', () => {
     expect(roundedResult.outcome.reasonCode).toBe('REMUX_VALID_REPRESENTATION_DIFFERENCE');
     const remapped = program('mkv', [make('b', [0, 33_000, 67_000], [0, 33_000, 67_000])]);
     expect(oracleVerdict(compareStrictRemuxPrograms(source, remapped, { tolerance: { timestampUs: 500 } }).outcome)).toBe('FAIL');
+  });
+
+  test('bounds accumulated EBML duration rounding by its target tick and still rejects one bad sample', () => {
+    const make = (id: string, rounded: boolean): RemuxTrackEvidence => ({
+      id,
+      type: 'audio',
+      codec: 'aac',
+      sampleRate: 48_000,
+      channels: 2,
+      ...(rounded ? { timescale: 1_000 } : { timescale: 48_000 }),
+      samples: Array.from({ length: 200 }, (_, index) => ({
+        payload: new Uint8Array([index & 0xff, index >> 8]),
+        ptsUs: rounded ? Math.round((index * 21_333) / 1_000) * 1_000 : index * 21_333,
+        dtsUs: rounded ? Math.round((index * 21_333) / 1_000) * 1_000 : index * 21_333,
+        durationUs: rounded ? 21_000 : 21_333,
+        keyframe: true,
+        framing: 'raw',
+      })),
+    });
+    const source = program('mp4', [make('source', false)]);
+    const output = program('mkv', [make('output', true)]);
+    const lawful = compareStrictRemuxPrograms(source, output);
+    expect(oracleVerdict(lawful.outcome)).toBe('PASS');
+    expect(lawful.representationDifferences.join(' ')).toContain('target-clock tolerance');
+
+    const mutated = structuredClone(output) as RemuxProgramEvidence;
+    (mutated.tracks[0]!.samples[20] as { durationUs: number }).durationUs = 24_000;
+    expect(oracleVerdict(compareStrictRemuxPrograms(source, mutated).outcome)).toBe('FAIL');
   });
 
   test('Opus pre-skip clipping and missing Matroska DTS stay representation differences', () => {
@@ -471,6 +500,54 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
     expect(result.value.durationUs).toBe(7_777_000);
   });
 
+  test('EBML reader reconstructs constant cadence and CodecDelay-backed B-frame DTS', () => {
+    const bytes = muxPreparedWebmChunkTracks({
+      container: 'mkv',
+      tracks: [
+        {
+          track: {
+            id: 1,
+            mediaType: 'video',
+            codec: 'vp8',
+            durationSec: 0.08,
+            config: { codec: 'vp8', codedWidth: 16, codedHeight: 16 },
+          },
+          chunks: [
+            { timestampUs: 0, dtsUs: -67_000, durationUs: 33_000, key: true, data: new Uint8Array([1]) },
+            { timestampUs: 99_000, dtsUs: -34_000, durationUs: 34_000, key: false, data: new Uint8Array([2]) },
+            { timestampUs: 33_000, dtsUs: 0, durationUs: 32_000, key: false, data: new Uint8Array([3]) },
+            { timestampUs: 66_000, dtsUs: 32_000, durationUs: 33_000, key: false, data: new Uint8Array([4]) },
+          ],
+        },
+        {
+          track: {
+            id: 2,
+            mediaType: 'audio',
+            codec: 'aac',
+            durationSec: 0.08,
+            config: { codec: 'mp4a.40.2', sampleRate: 48_000, numberOfChannels: 2 },
+          },
+          chunks: [0, 21_000, 43_000, 64_000].map((timestampUs, index) => ({
+            timestampUs,
+            durationUs: 21_333,
+            key: true,
+            data: new Uint8Array([0x20 + index]),
+          })),
+        },
+      ],
+    });
+    const result = readNeutralRemuxProgram(bytes, 'mkv');
+    expect(result.state).toBe('OK');
+    if (result.state !== 'OK') return;
+    const video = result.value.tracks.find((track) => track.type === 'video')!;
+    expect(video.samples.map((sample) => sample.ptsUs)).toEqual([0, 99_000, 33_000, 66_000]);
+    expect(video.samples.map((sample) => sample.dtsUs)).toEqual([-67_000, -34_000, 0, 32_000]);
+    expect(video.samples.map((sample) => sample.durationUs)).toEqual([33_000, 34_000, 32_000, 33_000]);
+    const audio = result.value.tracks.find((track) => track.type === 'audio')!;
+    expect(audio.samples.map((sample) => sample.durationUs)).toEqual([21_000, 22_000, 21_000, 21_000]);
+    expect(result.value.durationUs).toBe(80_000);
+  });
+
   test('Ogg EOS granule materializes Opus terminal discard padding', () => {
     const result = readNeutralRemuxProgram(
       bytesAt('fixtures/media/scenarios/remux/opus_ogg_to_mkv/02.ogg'),
@@ -529,6 +606,41 @@ describe('REQ-FEAT-08 payload-bearing neutral readers and typed boundaries', () 
         expect(descriptor.dtsUs).toBe(wholeTrack.samples[sampleIndex]!.dtsUs);
       }
     }
+  });
+
+  test('fragmented ISO-BMFF range reader retains complete lazy sample descriptors', async () => {
+    const source = bytesAt('fixtures/media/fragmented_cmaf.mp4');
+    const whole = readNeutralRemuxProgram(source, 'mp4');
+    let largestRead = 0;
+    const ranged = await readIsoBmffRangeProgram({
+      size: source.byteLength,
+      range: async (start, end) => {
+        largestRead = Math.max(largestRead, end - start);
+        return source.slice(start, end);
+      },
+    });
+    expect(whole.state).toBe('OK');
+    expect(ranged.state).toBe('OK');
+    if (whole.state !== 'OK' || ranged.state !== 'OK') return;
+    expect(ranged.value.representation.fragmented).toBe(true);
+    expect(ranged.value.durationUs).toBe(whole.value.durationUs);
+    expect(ranged.value.tracks.map((track) => track.samples.length)).toEqual(
+      whole.value.tracks.map((track) => track.samples.length),
+    );
+    for (let trackIndex = 0; trackIndex < ranged.value.tracks.length; trackIndex++) {
+      const rangeTrack = ranged.value.tracks[trackIndex]!;
+      const wholeTrack = whole.value.tracks[trackIndex]!;
+      for (const sampleIndex of [0, rangeTrack.samples.length - 1]) {
+        const descriptor = rangeTrack.samples[sampleIndex]!;
+        expect(source.slice(
+          descriptor.fileOffset,
+          descriptor.fileOffset + descriptor.byteLength,
+        )).toEqual(wholeTrack.samples[sampleIndex]!.payload);
+        expect(descriptor.ptsUs).toBe(wholeTrack.samples[sampleIndex]!.ptsUs);
+        expect(descriptor.dtsUs).toBe(wholeTrack.samples[sampleIndex]!.dtsUs);
+      }
+    }
+    expect(largestRead).toBeLessThan(source.byteLength);
   });
 
   test('real fixtures are self-identical and payload corruption is never a representation DIFF', () => {

@@ -21,6 +21,9 @@ export interface ProbeBudgetObservation {
   readMode?: ProbeReadMode;
   bytesRead?: number;
   peakMemoryDeltaBytes?: number;
+  memoryBaselineBytes?: number;
+  memoryMaximumBytes?: number;
+  memoryAfterOperationBytes?: number;
 }
 
 export type ProbeBudgetPreflightDecision =
@@ -154,6 +157,15 @@ export function assessProbeBudget(
     effectiveReadLimitBytes: effectiveReadLimit,
     peakMemoryDeltaBytes: observation.peakMemoryDeltaBytes,
     peakMemoryLimitBytes: contract.maxPeakMemoryDeltaBytes,
+    ...(observation.memoryBaselineBytes === undefined
+      ? {}
+      : { memoryBaselineBytes: observation.memoryBaselineBytes }),
+    ...(observation.memoryMaximumBytes === undefined
+      ? {}
+      : { memoryMaximumBytes: observation.memoryMaximumBytes }),
+    ...(observation.memoryAfterOperationBytes === undefined
+      ? {}
+      : { memoryAfterOperationBytes: observation.memoryAfterOperationBytes }),
   };
   const failures: string[] = [];
   if (observation.bytesRead > effectiveReadLimit) {

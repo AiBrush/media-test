@@ -113,6 +113,10 @@ export function canonicalCodecToken(raw: string): string | null {
       case 'mjpb':
       case 'jpeg':
         return 'mjpeg';
+      case 'png':
+        return 'png';
+      case 'webp':
+        return 'webp';
       // audio
       case 'mp4a': // MPEG-4 audio sample entry — AAC across the entire corpus & golden vocabulary.
         return 'aac';
@@ -283,9 +287,9 @@ function parseTkhdRotation(dv: DataView, box: Box): number | undefined {
   const matrixOffset = b + (dv.getUint8(b) === 1 ? 52 : 40);
   if (matrixOffset + 20 > box.end) return undefined;
   const a = i32(dv, matrixOffset) / 65_536;
-  const c = i32(dv, matrixOffset + 12) / 65_536;
-  if (a === 0 && c === 0) return undefined;
-  const raw = ((Math.atan2(c, a) * 180 / Math.PI) % 360 + 360) % 360;
+  const bValue = i32(dv, matrixOffset + 4) / 65_536;
+  if (a === 0 && bValue === 0) return undefined;
+  const raw = ((Math.atan2(bValue, a) * 180 / Math.PI) % 360 + 360) % 360;
   const cardinal = (Math.round(raw / 90) * 90) % 360;
   const distance = Math.min(Math.abs(raw - cardinal), 360 - Math.abs(raw - cardinal));
   return distance <= 1 && cardinal !== 0 ? cardinal : undefined;

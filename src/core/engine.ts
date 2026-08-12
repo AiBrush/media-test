@@ -102,6 +102,17 @@ export interface MediaIntermediateBytes {
   container: string;
 }
 
+/**
+ * A complete output retained outside the JavaScript heap and exposed through bounded reads. When
+ * present, `MediaBytes.bytes` is only a small owned validation prefix; correctness consumers must
+ * use this artifact for the complete byte extent.
+ */
+export interface MediaRangeArtifact {
+  readonly schema: 'media-test/media-range-artifact@1';
+  readonly byteLength: number;
+  range(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array>;
+}
+
 /** Exact positioned-write evidence for mux output-mode correctness. */
 export interface MuxPositionedWriteEvidence {
   sequence: number;
@@ -129,6 +140,8 @@ export type MediaBytes = {
   bytes: Uint8Array;
   mime: string;
   container: string;
+  /** Complete range-readable output when returning one materialized Uint8Array would violate scale. */
+  artifact?: MediaRangeArtifact;
   /** Observable output-target write count, when the adapter can instrument a real target. */
   targetWrites?: number;
   /** Milliseconds from operation entry to the first observable output-target byte. */
@@ -601,6 +614,8 @@ export interface TranscodeOptions {
 export interface EncodedTrack {
   type: TrackType;
   codec: string;
+  /** Source-declared presentation duration, distinct from coded decode pre/post-roll. */
+  durationSec?: number;
   /** Framework/native codec tag, kept separate from the canonical semantic codec token. */
   nativeCodecTag?: string;
   timescale: number;
@@ -1565,8 +1580,16 @@ export type CanonicalContainer = (typeof CANONICAL_CONTAINERS)[number];
 export const CANONICAL_VIDEO_CODECS = ['h264', 'hevc', 'vp8', 'vp9', 'av1'] as const;
 export type CanonicalVideoCodec = (typeof CANONICAL_VIDEO_CODECS)[number];
 
-/** Canonical video identities that adapters may report from read-side metadata/demux results. */
-export const CANONICAL_READ_VIDEO_CODECS = [...CANONICAL_VIDEO_CODECS, 'mjpeg'] as const;
+/**
+ * Canonical video/image identities that adapters may report from read-side metadata/demux results.
+ * Still-image tokens remain outside the moving-video encoder/capability vocabulary.
+ */
+export const CANONICAL_READ_VIDEO_CODECS = [
+  ...CANONICAL_VIDEO_CODECS,
+  'mjpeg',
+  'png',
+  'webp',
+] as const;
 export type CanonicalReadVideoCodec = (typeof CANONICAL_READ_VIDEO_CODECS)[number];
 
 export const CANONICAL_AUDIO_CODECS = [
@@ -2376,6 +2399,25 @@ function validateMediaBytesNode(
   if (record.targetWrites !== undefined) requireSafeInteger(engineId, `${path}.targetWrites`, record.targetWrites, { min: 0 });
   if (record.firstByteMs !== undefined) requireFinite(engineId, `${path}.firstByteMs`, record.firstByteMs, { min: 0 });
   let normalizedBytesWritten = bytes.byteLength;
+  if (record.artifact !== undefined) {
+    const artifact = requireRecord(engineId, `${path}.artifact`, record.artifact);
+    if (artifact.schema !== 'media-test/media-range-artifact@1') {
+      contractFail(
+        engineId,
+        `${path}.artifact.schema`,
+        "must equal 'media-test/media-range-artifact@1'",
+      );
+    }
+    normalizedBytesWritten = requireSafeInteger(
+      engineId,
+      `${path}.artifact.byteLength`,
+      artifact.byteLength,
+      { min: bytes.byteLength },
+    );
+    if (typeof artifact.range !== 'function') {
+      contractFail(engineId, `${path}.artifact.range`, 'must be a function');
+    }
+  }
   if (record.variants !== undefined) {
     if (!Array.isArray(record.variants)) contractFail(engineId, `${path}.variants`, 'must be an array');
     if (record.variants.length === 0) contractFail(engineId, `${path}.variants`, 'must not be empty when present');

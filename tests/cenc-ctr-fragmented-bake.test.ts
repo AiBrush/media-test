@@ -40,6 +40,7 @@ describe('probe-owned flat fragmented CENC-CTR fixture', () => {
     expect(FLAT_PROTECTED_MP4_ASSET_IDS).toEqual([
       'cenc_ctr.mp4',
       'cenc_ctr_fragmented.mp4',
+      'cenc_cens.mp4',
       'cenc_cbcs.mp4',
     ]);
     expect(cencCtrFragmentedIvLabel(1)).toBe('cenc_ctr_fragmented.mp4:bento4:track-1:iv');
@@ -61,8 +62,13 @@ describe('probe-owned flat fragmented CENC-CTR fixture', () => {
       '/tmp/cenc_ctr_fragmented.mp4',
     ]);
     const bakeSource = readFileSync('fixtures/bake.mjs', 'utf8');
-    expect(bakeSource).not.toMatch(/spawnSync\(\s*['"]mp4fragment['"]/u);
-    expect(bakeSource).not.toMatch(/['"]mp4fragment['"]\s*,/u);
+    const ctrRecipeStart = bakeSource.indexOf('[CENC_CTR_FRAGMENTED_ASSET_ID]: (out) =>');
+    const ctrRecipeEnd = bakeSource.indexOf('\n  [CENC_CENS_ASSET_ID]: (out) =>', ctrRecipeStart);
+    expect(ctrRecipeStart).toBeGreaterThan(0);
+    expect(ctrRecipeEnd).toBeGreaterThan(ctrRecipeStart);
+    const ctrRecipeSource = bakeSource.slice(ctrRecipeStart, ctrRecipeEnd);
+    expect(ctrRecipeSource).not.toMatch(/spawnSync\(\s*['"]mp4fragment['"]/u);
+    expect(ctrRecipeSource).not.toMatch(/['"]mp4fragment['"]\s*,/u);
     const structuralAdmission = bakeSource.indexOf('\n      assertFragmentedCencCtrStructure(');
     expect(structuralAdmission).toBeGreaterThan(bakeSource.indexOf("spawnSync('mp4encrypt'"));
     expect(structuralAdmission).toBeLessThan(bakeSource.indexOf("spawnSync(\n        'mp4decrypt'"));

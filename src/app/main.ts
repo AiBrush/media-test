@@ -811,7 +811,11 @@ async function snapshotRun(
   const run = activeRun;
   if (!run) return currentArtifact;
   const state = completionState ?? run.state;
-  const cache = await cacheSnapshot(!run.configuration.reuseData);
+  // The live runner writes each completed row to IndexedDB. Re-listing that entire store from a
+  // polling checkpoint structured-clones every historical ScenarioResult into the measured page and
+  // contaminates any concurrent UA-specific memory window. The run-start snapshot is already frozen,
+  // honest provenance for an in-progress artifact; the terminal path refreshes it after measurement.
+  const cache = run.baseManifest.cache;
   const manifest = finalizeRunManifest(
     run.baseManifest,
     run.evidence.results,

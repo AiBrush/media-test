@@ -188,9 +188,13 @@ describe('REQ-ADP-04: normalized carrier validation', () => {
     );
   });
 
-  test('accepts MJPEG as truthful read-side metadata and demux packet evidence', () => {
+  test('accepts MJPEG, PNG, and WebP as truthful read-side identities', () => {
     expect(CANONICAL_READ_VIDEO_CODECS).toContain('mjpeg');
+    expect(CANONICAL_READ_VIDEO_CODECS).toContain('png');
+    expect(CANONICAL_READ_VIDEO_CODECS).toContain('webp');
     expect(CANONICAL_VIDEO_CODECS).not.toContain('mjpeg');
+    expect(CANONICAL_VIDEO_CODECS).not.toContain('png');
+    expect(CANONICAL_VIDEO_CODECS).not.toContain('webp');
 
     const metadata: NormalizedMetadata = {
       container: 'mkv',
@@ -235,21 +239,39 @@ describe('REQ-ADP-04: normalized carrier validation', () => {
 
     expect(validateAdapterResult(ENGINE_ID, 'probe', metadata)).toBe(metadata);
     expect(validateAdapterResult(ENGINE_ID, 'demux', demux)).toBe(demux);
+
+    for (const codec of ['png', 'webp'] as const) {
+      const still: NormalizedMetadata = {
+        container: codec,
+        durationSec: 0,
+        tracks: [{
+          type: 'video',
+          codec,
+          canonicalCodec: codec,
+          codecCanonical: codec,
+          width: 640,
+          height: 480,
+        }],
+      };
+      expect(validateAdapterResult(ENGINE_ID, 'probe', still)).toBe(still);
+    }
   });
 
-  test('keeps MJPEG outside encoded-track and declared capability vocabularies', () => {
-    const encoded = encodedTrackFixture('h264', 'annexb');
-    encoded.codec = 'mjpeg';
-    expectContractPath(
-      () => validateEncodedTracks(ENGINE_ID, { tracks: [encoded] }),
-      'encodedTracks.tracks[0].codec',
-    );
+  test('keeps read-only image codecs outside encoded-track and declared capability vocabularies', () => {
+    for (const codec of ['mjpeg', 'png', 'webp']) {
+      const encoded = encodedTrackFixture('h264', 'annexb');
+      encoded.codec = codec;
+      expectContractPath(
+        () => validateEncodedTracks(ENGINE_ID, { tracks: [encoded] }),
+        'encodedTracks.tracks[0].codec',
+      );
 
-    for (const field of ['videoCodecs', 'videoCodecsIn', 'videoCodecsOut'] as const) {
-      const capabilities = emptyCaps();
-      capabilities[field] = ['mjpeg'];
-      const engine = { id: ENGINE_ID, capabilities: () => capabilities } as MediaEngine;
-      expectContractPath(() => validateCapabilitySet(engine, capabilities), `capabilities.${field}[0]`);
+      for (const field of ['videoCodecs', 'videoCodecsIn', 'videoCodecsOut'] as const) {
+        const capabilities = emptyCaps();
+        capabilities[field] = [codec];
+        const engine = { id: ENGINE_ID, capabilities: () => capabilities } as MediaEngine;
+        expectContractPath(() => validateCapabilitySet(engine, capabilities), `capabilities.${field}[0]`);
+      }
     }
   });
 
@@ -366,6 +388,28 @@ describe('REQ-ADP-04: normalized carrier validation', () => {
   test('allows explicitly permitted empty bytes but still validates ownership and shape', () => {
     const value = { bytes: new Uint8Array(), mime: 'video/mp4', container: 'mp4' };
     expect(validateMediaBytes(ENGINE_ID, value, 'output', { allowEmptyBytes: true })).toBe(value);
+  });
+
+  test('accepts a complete range artifact with a bounded owned validation prefix', () => {
+    const value: MediaBytes = {
+      bytes: new Uint8Array([0, 1, 2, 3]),
+      mime: 'video/mp4',
+      container: 'mp4',
+      artifact: {
+        schema: 'media-test/media-range-artifact@1',
+        byteLength: 1_000_000,
+        range: async (start, end) => new Uint8Array(end - start),
+      },
+      telemetry: { bytesWritten: 1_000_000 },
+    };
+    expect(validateMediaBytes(ENGINE_ID, value)).toBe(value);
+    expectContractPath(
+      () => validateMediaBytes(ENGINE_ID, {
+        ...value,
+        artifact: { ...value.artifact!, byteLength: 2 },
+      }),
+      'output.artifact.byteLength',
+    );
   });
 });
 

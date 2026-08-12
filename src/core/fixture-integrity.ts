@@ -427,6 +427,20 @@ export type ActiveFixtureMediaResult =
   | { state: 'error'; execution: 'ERROR'; reasonCode: string; detail: string; httpStatus?: number }
   | { state: 'out-of-scope'; reasonCode: 'FIXTURE_ASSET_OUTSIDE_PUBLICATION_SCOPE'; detail: string };
 
+export interface AttestedFixtureMediaIdentity {
+  readonly sha256: string;
+  readonly sizeBytes: number;
+}
+
+type EvidenceMediaReady = {
+  state: 'ready';
+  index: FixtureGenerationIndex;
+  entry: FixtureGenerationEntry;
+  actualSha256: string;
+};
+
+type EvidenceMediaResult = EvidenceMediaReady | Exclude<ActiveFixtureMediaResult, { state: 'ready' }>;
+
 export interface ActiveFixtureRuntimeOptions {
   indexUrl?: string;
   fixturesBaseUrl?: string;
@@ -475,8 +489,11 @@ export class ActiveFixtureRuntime {
     assetId: string,
     kind: Exclude<GoldenArtifactKind, 'keys' | 'segments' | 'availability'>,
     parsePayload: (payload: unknown) => T | undefined,
+    sourceIdentity?: AttestedFixtureMediaIdentity,
   ): Promise<GoldenEvidenceResult<T> | undefined> {
-    const media = await this.resolveMedia(assetId);
+    const media: EvidenceMediaResult = sourceIdentity === undefined
+      ? await this.resolveMedia(assetId)
+      : await this.#resolveAttestedMedia(assetId, sourceIdentity);
     if (media.state === 'out-of-scope') return undefined;
     const logicalPath = goldenLogicalPath(assetId, kind);
     const reference = (entry?: FixtureGenerationEntry): GoldenEvidenceReference => ({
@@ -608,8 +625,84 @@ export class ActiveFixtureRuntime {
     return { state: 'ready', index, entry: record, bytes: verified.bytes, actualSha256: verified.actualSha256, cacheHit: verified.cacheHit };
   }
 
+  async #resolveAttestedMedia(
+    assetId: string,
+    identity: AttestedFixtureMediaIdentity,
+  ): Promise<EvidenceMediaResult> {
+    if (!safeAssetId(assetId)) {
+      return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_ASSET_ID_INVALID', detail: `'${assetId}' is not a safe canonical asset id` };
+    }
+    if (!isSha(identity.sha256) || !Number.isSafeInteger(identity.sizeBytes) || identity.sizeBytes < 0) {
+      return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_ATTESTED_IDENTITY_INVALID', detail: `'${assetId}' has an invalid attested source identity` };
+    }
+    const loaded = await this.loadIndex();
+    if (loaded.state !== 'ready') {
+      return {
+        state: 'error', execution: 'ERROR', reasonCode: loaded.reasonCode, detail: loaded.detail,
+        ...(loaded.httpStatus !== undefined ? { httpStatus: loaded.httpStatus } : {}),
+      };
+    }
+    const index = loaded.index;
+    const mediaPath = `media/${assetId}`;
+    let inScope = index.publicationScope.mode === 'selected-assets'
+      ? index.publicationScope.assetIds.includes(assetId)
+      : resolveFixtureGenerationEntry(index, mediaPath) !== undefined ||
+        resolveFixtureMaterializedMedia(index, mediaPath) !== undefined;
+    if (!inScope && index.publicationScope.mode === 'complete-corpus') {
+      const manifest = await this.#loadManifest(index);
+      if (manifest.state !== 'ready') return manifest.result;
+      inScope = manifest.assets.has(assetId);
+    }
+    if (!inScope) {
+      return {
+        state: 'out-of-scope',
+        reasonCode: 'FIXTURE_ASSET_OUTSIDE_PUBLICATION_SCOPE',
+        detail: `'${assetId}' is outside active ${index.publicationScope.mode} scope`,
+      };
+    }
+    const indexedRecord = resolveFixtureGenerationEntry(index, mediaPath);
+    const materializedRecord = resolveFixtureMaterializedMedia(index, mediaPath);
+    if (!indexedRecord && !materializedRecord) {
+      return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_MEDIA_INDEX_RECORD_MISSING', detail: `${mediaPath} is in scope but has no ready/availability record` };
+    }
+    if (indexedRecord && 'state' in indexedRecord) return availabilityAsMediaResult(indexedRecord);
+    const record = indexedRecord ?? materializedMediaAsGenerationEntry(materializedRecord!);
+    if (record.artifactKind !== 'media') {
+      return { state: 'error', execution: 'ERROR', reasonCode: 'FIXTURE_MEDIA_KIND_INVALID', detail: `${mediaPath} is indexed as '${record.artifactKind}'` };
+    }
+    if (record.sha256 !== identity.sha256 || record.sizeBytes !== identity.sizeBytes) {
+      return {
+        state: 'unavailable', execution: 'NA_ASSET', reasonCode: 'FIXTURE_ATTESTED_IDENTITY_MISMATCH',
+        detail: `${mediaPath} does not match the authenticated stream identity`, availabilityState: 'digest-mismatch',
+      };
+    }
+    if (record.sourceMediaSha256 !== identity.sha256) {
+      return {
+        state: 'unavailable', execution: 'NA_ASSET', reasonCode: 'FIXTURE_SOURCE_DIGEST_MISMATCH',
+        detail: `${mediaPath} source-media digest does not match the authenticated stream identity`, availabilityState: 'digest-mismatch',
+      };
+    }
+    if (index.publicationScope.mode === 'complete-corpus') {
+      const manifest = await this.#loadManifest(index);
+      if (manifest.state !== 'ready') return manifest.result;
+      const declared = manifest.assets.get(assetId);
+      if (declared && (declared.sha256 !== identity.sha256 || declared.sizeBytes !== identity.sizeBytes)) {
+        return {
+          state: 'unavailable', execution: 'NA_ASSET', reasonCode: 'FIXTURE_MANIFEST_IDENTITY_MISMATCH',
+          detail: `${mediaPath} does not match the active manifest identity`, availabilityState: 'digest-mismatch',
+        };
+      }
+    }
+    return {
+      state: 'ready',
+      index,
+      entry: record,
+      actualSha256: identity.sha256,
+    };
+  }
+
   async #loadGoldenEvidenceUncached<T>(
-    media: Extract<ActiveFixtureMediaResult, { state: 'ready' }>,
+    media: EvidenceMediaReady,
     logicalPath: string,
     kind: Exclude<GoldenArtifactKind, 'keys' | 'segments' | 'availability'>,
     parsePayload: (payload: unknown) => T | undefined,

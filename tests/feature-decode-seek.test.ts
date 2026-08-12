@@ -228,6 +228,15 @@ describe('REQ-FEAT-40 bounded platform decode presentation prefix', () => {
     })).toEqual([0, 40_000, 80_000]);
   });
 
+  test('explicit requests are not truncated before repeated short-clip samples are de-duplicated', () => {
+    const timeline = [{ ptsUs: 0 }, { ptsUs: 33_333 }, { ptsUs: 66_667 }];
+    expect(presentationSampleTimesUs(timeline, {
+      maxFrames: 4,
+      sampling: 'uniform',
+      sampleTimesSec: [0, 0.016_666, 0.05, 0.075],
+    })).toEqual([0, 16_666, 50_000, 75_000]);
+  });
+
   test('sparse-keyframe whole-program samples share one decode instead of replaying the prefix', () => {
     const samples = Array.from({ length: 3_600 }, (_, index) => ({
       ptsUs: index * 33_333,

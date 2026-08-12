@@ -91,7 +91,7 @@ const CODEC_EDGE_PROPERTY_CASES: MuxPropertyCase[] = [
     candidateEnvelope: HD_1280X720_10S_CANDIDATE_ENVELOPE,
     oracles: ['property-invariant', 'reference-reimport'],
     notes:
-      'ROTATION mux → mov (§A.16 rotated, matrix not w/h swap): the 90° display matrix must be authored ' +
+      'ROTATION mux → mov (§A.16 rotated, matrix not w/h swap): the 270° clockwise display matrix must be authored ' +
       'into the output. decode(mux(x))==decode(x) catches a dropped matrix (decoded presentation would ' +
       'change). mov is the faithful matrix target.',
   },

@@ -123,20 +123,22 @@ const SIZE_LADDER_CASES: MuxCase[] = [
   },
   {
     id: 'size_sparse_gt4gib_co64',
-    input: 'micro_h264_1frame.mp4',
+    revision: 2,
+    input: 'tiny_h264_360p_2s.mp4',
     containersIn: ['mp4'],
     to: 'mp4',
     videoCodecs: ['h264'],
     features: ['mux:sparse-co64'],
     extraOptions: {
       invariant: 'mux-large-file-addressing',
+      trackSelect: ['video:0'],
       robustness: { muxLargeFile: MUX_SPARSE_CO64_ACCEPTANCE_CASE.contract },
     },
     oracles: ['property-invariant'],
     metrics: ['wall'],
     timeoutMs: 600_000,
     notes:
-      'LONG RESOURCE GATE: author MP4 into the runner sparse target with media offsets below and above ' +
+      'LONG RESOURCE GATE: author source-bound H.264 packets into the runner sparse target with media offsets below and above ' +
       '0xffffffff. Neutral re-import requires co64, a 64-bit mdat size, in-range offsets, and exact ' +
       'sample-prefix readback without allocating the virtual >4 GiB extent.',
   },

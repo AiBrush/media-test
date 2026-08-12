@@ -77,7 +77,7 @@ test('neutral structure exposes ISO and Matroska default/language facts', async 
   const rotatedBytes = new Uint8Array(
     await Bun.file('fixtures/media/h264_rotated90.mp4').arrayBuffer(),
   );
-  expect(readOutputStructure(rotatedBytes)?.tracks[0]?.rotation).toBe(90);
+  expect(readOutputStructure(rotatedBytes)?.tracks[0]?.rotation).toBe(270);
 });
 
 const input: MediaInput = {
@@ -269,6 +269,51 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
     }
   });
 
+  test('range-backed output compares against a verified materialized source below the URL threshold', async () => {
+    const bytes = new Uint8Array(
+      await Bun.file('fixtures/media/fragmented_cmaf.mp4').arrayBuffer(),
+    );
+    let sourceReads = 0;
+    let outputRangeReads = 0;
+    const remuxInput: MediaInput = {
+      id: 'fragmented_cmaf.mp4',
+      url: '/fragmented_cmaf.mp4',
+      mime: 'video/mp4',
+      sizeBytes: bytes.byteLength,
+      async blob() {
+        return new Blob([bytes], { type: 'video/mp4' });
+      },
+      async arrayBuffer() {
+        sourceReads += 1;
+        return bytes.buffer as ArrayBuffer;
+      },
+    };
+    const outcome = await runOracle('reference-reimport', context({
+      scenario: scenario('remux', 'reference-reimport', {
+        container: 'mp4',
+        target: 'stream',
+        fragmented: true,
+      }),
+      input: remuxInput,
+      output: {
+        bytes: bytes.slice(0, 64),
+        mime: 'video/mp4',
+        container: 'mp4',
+        artifact: {
+          schema: 'media-test/media-range-artifact@1',
+          byteLength: bytes.byteLength,
+          async range(start, end) {
+            outputRangeReads += 1;
+            return bytes.slice(start, end);
+          },
+        },
+      },
+    }));
+    expect(verdict(outcome)).toBe('PASS');
+    expect(sourceReads).toBe(1);
+    expect(outputRangeReads).toBeGreaterThan(0);
+  });
+
   test('decode-remux falls back to same-browser source decode when frame cache is pending', async () => {
     const source = new Uint8Array(
       await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
@@ -426,6 +471,86 @@ describe('REQ-ORAC-09 executable remux invariants', () => {
       { container: 'mp4', sampling: 'prefix' },
       { container: 'mp4', sampling: 'prefix' },
     ]);
+  });
+
+  test('transformed mux compares two same-browser display presentations instead of coded-space goldens', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/h264_rotated90.mp4').arrayBuffer(),
+    );
+    const rotatedInput: MediaInput = {
+      id: 'rotated.mp4', url: '/rotated.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    const store = golden({ container: 'mp4', durationSec: 10, tracks: [] });
+    store.frames = [{ index: 0, ptsUs: 0, sha256: 'cd'.repeat(32), width: 1_280, height: 720 }];
+    store.evidence.frames = {
+      state: 'OK', value: store.frames, url: 'frames.json', raw: store.frames,
+    };
+    const decodeCalls: Array<{ container?: string; presentationColorManaged?: boolean }> = [];
+    const outcome = await runOracle('property-invariant', context({
+      scenario: scenario('mux', 'property-invariant', {
+        container: 'mov',
+        invariant: 'decode(mux(x))==decode(x)',
+      }),
+      input: rotatedInput,
+      output: { bytes: source.slice(), mime: 'video/quicktime', container: 'mov' },
+      golden: store,
+      decodeWithPlatform: async (media, options) => {
+        decodeCalls.push({
+          container: media.container,
+          presentationColorManaged: options?.presentationColorManaged,
+        });
+        return {
+          frames: [{
+            index: 0,
+            ptsUs: 0,
+            sha256: 'ab'.repeat(32),
+            width: 720,
+            height: 1_280,
+          }],
+        };
+      },
+    }));
+
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodeCalls).toEqual([
+      { container: 'mp4', presentationColorManaged: true },
+      { container: 'mov', presentationColorManaged: true },
+    ]);
+  });
+
+  test('ordinary mux compares a same-browser source decode instead of a cached cross-process golden', async () => {
+    const source = new Uint8Array(
+      await Bun.file('fixtures/media/micro_h264_1frame.mp4').arrayBuffer(),
+    );
+    const muxInput: MediaInput = {
+      id: 'source.mp4', url: '/source.mp4', mime: 'video/mp4', sizeBytes: source.byteLength,
+      async blob() { return new Blob([source]); },
+      async arrayBuffer() { return source.slice().buffer as ArrayBuffer; },
+    };
+    const store = golden({ container: 'mp4', durationSec: 1, tracks: [] });
+    store.frames = [{ index: 0, ptsUs: 0, sha256: 'cd'.repeat(32) }];
+    store.evidence.frames = {
+      state: 'OK', value: store.frames, url: 'frames.json', raw: store.frames,
+    };
+    const decodeCalls: string[] = [];
+    const outcome = await runOracle('property-invariant', context({
+      scenario: scenario('mux', 'property-invariant', {
+        container: 'mp4',
+        invariant: 'decode(mux(x))==decode(x)',
+      }),
+      input: muxInput,
+      output: { bytes: source.slice(), mime: 'video/mp4', container: 'mp4' },
+      golden: store,
+      decodeWithPlatform: async (media) => {
+        decodeCalls.push(media.container ?? '');
+        return { frames: [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32) }] };
+      },
+    }));
+
+    expect(verdict(outcome)).toBe('PASS');
+    expect(decodeCalls).toEqual(['mp4', 'mp4']);
   });
 
   test('headerless remux duration derives source truth from the neutral packet timeline', async () => {
@@ -999,6 +1124,31 @@ describe('REQ-ORAC-02 semantic packets', () => {
     expect(out.detail).toContain('"rowGrouping":[{"ptsUs":0,"rows":1}]');
   });
 
+  test('repeated decoded content identities at different presentation times remain distinct units', async () => {
+    const audioMeta: NormalizedMetadata = {
+      container: 'mp4', durationSec: 1,
+      tracks: [{ type: 'audio', codec: 'aac', sampleRate: 48_000, channels: 1 }],
+    };
+    const digests = ['1'.repeat(64), '2'.repeat(64)];
+    const measured = digests.map((payloadDigest, index) => ({
+      trackIndex: 0,
+      size: 10,
+      ptsUs: index * 21_333,
+      dtsUs: index * 21_333,
+      durationUs: 21_333,
+      keyframe: true,
+      payloadDigest,
+    })) as PacketInfo[];
+    const committed = measured.map((row) => ({
+      ...row,
+      accessUnitId: 'decoded:repeated-silence',
+    }));
+
+    const out = await compare(measured, committed, audioMeta, audioMeta);
+    expect(verdict(out)).toBe('PASS');
+    expect(out.measurements?.semanticAccessUnits).toBe(2);
+  });
+
   test('removed/altered VCL and broken random-access dependencies fail', async () => {
     const want = [packet(annex([0x67, 1], [0x68, 2], [0x65, 0xaa], [0x61, 0xbb]), { framing: 'annex-b' })];
     const removed = [packet(avcc([0x65, 0xaa]), { framing: 'length-prefixed', decoderConfiguration: [1] })];
@@ -1104,6 +1254,86 @@ describe('REQ-ORAC-04 typed reference decode applicability', () => {
       },
     }));
     expect(prefixOutcome).toMatchObject({ state: 'VERDICT', verdict: 'PASS' });
+  });
+
+  test('committed SSIM requires exact display geometry even when a digest is relabeled', async () => {
+    const digest = 'ab'.repeat(32);
+    const store = emptyGoldenStore();
+    store.frames = [{ index: 0, ptsUs: 0, sha256: digest, width: 2, height: 3 }];
+    const outcome = await runOracle('ssim-psnr', context({
+      scenario: scenario('decodeFrames', 'ssim-psnr', { maxFrames: 1 }),
+      golden: store,
+      frames: { frames: [{ index: 0, ptsUs: 0, sha256: digest, width: 3, height: 2 }] },
+    }));
+    expect(outcome).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'FAIL',
+      measurements: { comparedDimensions: 1, dimensionMismatches: 1 },
+    });
+  });
+
+  test('committed SSIM enforces explicit transcode output geometry instead of source geometry', async () => {
+    const digest = 'ab'.repeat(32);
+    const store = emptyGoldenStore();
+    store.frames = [{ index: 0, ptsUs: 0, sha256: digest, width: 1_920, height: 1_080 }];
+    const resizeScenario = scenario('transcode', 'ssim-psnr', {
+      video: { codec: 'vp9', width: 320, height: 180 },
+    });
+
+    const resized = await runOracle('ssim-psnr', context({
+      scenario: resizeScenario,
+      golden: store,
+      frames: { frames: [{ index: 0, ptsUs: 0, sha256: digest, width: 320, height: 180 }] },
+    }));
+    expect(resized).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'PASS',
+      measurements: { comparedDimensions: 1, dimensionMismatches: 0 },
+    });
+
+    const wrongRaster = await runOracle('ssim-psnr', context({
+      scenario: resizeScenario,
+      golden: store,
+      frames: { frames: [{ index: 0, ptsUs: 0, sha256: digest, width: 640, height: 360 }] },
+    }));
+    expect(wrongRaster).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'FAIL',
+      measurements: { comparedDimensions: 1, dimensionMismatches: 1 },
+    });
+  });
+
+  test('committed SSIM rejects same-geometry pixels with a mutated spatial presentation', async () => {
+    const store = emptyGoldenStore();
+    store.frames = [{ index: 0, ptsUs: 0, sha256: 'ab'.repeat(32), width: 2, height: 2 }];
+    store.ssimRef = [
+      [0, 0, 255, 255],
+    ];
+    const mutated = {
+      width: 2,
+      height: 2,
+      data: new Uint8ClampedArray([
+        0, 0, 0, 255, 255, 255, 255, 255,
+        0, 0, 0, 255, 255, 255, 255, 255,
+      ]),
+      colorSpace: 'srgb',
+    } as ImageData;
+    const outcome = await runOracle('ssim-psnr', context({
+      scenario: {
+        ...scenario('decodeFrames', 'ssim-psnr', { maxFrames: 1 }),
+        tolerances: { ssimMin: 0.99 },
+      },
+      golden: store,
+      frames: {
+        frames: [{ index: 0, ptsUs: 0, sha256: 'cd'.repeat(32), width: 2, height: 2 }],
+        getPixels: async () => mutated,
+      },
+    }));
+    expect(outcome).toMatchObject({
+      state: 'VERDICT',
+      verdict: 'FAIL',
+      measurements: { comparedDimensions: 1, dimensionMismatches: 0 },
+    });
   });
 
   test('display SSIM replaces duration-spread reference sampling with the exact source prefix', async () => {
@@ -1321,6 +1551,31 @@ describe('REQ-FEAT-53/59 live decrypt oracle integration', () => {
       state: 'VERDICT',
       verdict: 'PASS',
       reasonCode: 'DECRYPT_COMPLETE_PRESENTATION_VALID',
+    });
+  });
+
+  test('cleartext-baseline property compares the verified live plaintext and rejects one frame mutation', async () => {
+    const reference = [digest(0, 0, 'a'), digest(1, 40_000, 'b')];
+    const run = (candidate: FrameDigest[]) => runOracle('property-invariant', context({
+      scenario: decryptScenario('decode-cleartext-baseline'),
+      output: { bytes: Uint8Array.of(2), mime: 'video/mp4', container: 'mp4' },
+      verifiedResources: { 'clear.mp4': Uint8Array.of(1) },
+      decodeWithPlatform: async (media) => ({
+        frames: media.bytes[0] === 1 ? reference : candidate,
+      }),
+    }));
+
+    expect(await run(reference)).toMatchObject({
+      state: 'VERDICT',
+      oracle: 'property-invariant',
+      verdict: 'PASS',
+      reasonCode: 'DECRYPT_COMPLETE_PRESENTATION_VALID',
+    });
+    expect(await run([reference[0]!, digest(1, 40_000, 'c')])).toMatchObject({
+      state: 'VERDICT',
+      oracle: 'property-invariant',
+      verdict: 'FAIL',
+      reasonCode: 'DECRYPT_FRAME_DIGEST_MISMATCH',
     });
   });
 

@@ -279,6 +279,34 @@
         "maxDurationSec": {
           "type": "number",
           "minimum": 0
+        },
+        "minAudioMeanVolumeDb": {
+          "type": "number",
+          "minimum": -160,
+          "maximum": 24
+        },
+        "excludeDimensions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "width",
+              "height"
+            ],
+            "properties": {
+              "width": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "height": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
         }
       }
     },

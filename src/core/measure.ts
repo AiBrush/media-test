@@ -677,11 +677,22 @@ export async function measurePeakMemoryWindow<T>(
     const outcome = await operationOutcome;
     const operationResult = outcome.ok ? outcome.result : failOperation(outcome.error);
     const memoryAfterOperationBytes = await take('end');
-    let settledFor = 0;
-    while (settledFor < settleWindowMs) {
-      const step = Math.min(sampleIntervalMs, settleWindowMs - settledFor);
+    const settleStartedAt = clock();
+    let nominalSettledFor = 0;
+    while (nominalSettledFor < settleWindowMs) {
+      // A cross-process memory request can itself take seconds. Bound the settle phase by elapsed
+      // wall time as well as nominal sleeps so a 500 ms protocol cannot silently become five costly
+      // observations spread over tens of seconds. The nominal counter keeps deterministic/fake-clock
+      // tests and coarse clocks finite.
+      const elapsed = Math.max(0, clock() - settleStartedAt);
+      const remaining = Math.min(
+        settleWindowMs - nominalSettledFor,
+        settleWindowMs - elapsed,
+      );
+      if (remaining <= 0) break;
+      const step = Math.min(sampleIntervalMs, remaining);
       await sleep(step);
-      settledFor += step;
+      nominalSettledFor += step;
       await take('settle');
     }
     const maximumBytes = Math.max(...points.map((point) => point.bytes));

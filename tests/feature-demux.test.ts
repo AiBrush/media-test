@@ -346,6 +346,8 @@ describe('REQ-FEAT-04 enforceable demux scale budgets', () => {
         measurements: {
           sourceReadCalls: 3, sourceBytesRead: 4, firstPacketMs: 1, lastPacketMs: 3,
           longestLongTaskMs: 0, totalLongTaskMs: 0,
+          memoryBaselineBytes: 100, memoryMaximumBytes: 100,
+          memoryAfterOperationBytes: 100, memorySampleCount: 2,
         },
       });
 

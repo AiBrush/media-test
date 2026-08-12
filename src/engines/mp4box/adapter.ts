@@ -477,9 +477,9 @@ function rotationFromMatrix(
   const d = f(matrix[4]);
   const eq = (x: number, y: number) => Math.abs(x - y) < 0.01;
   if (eq(a, 1) && eq(b, 0) && eq(c, 0) && eq(d, 1)) return 0;
-  if (eq(a, 0) && eq(b, -1) && eq(c, 1) && eq(d, 0)) return 90;
+  if (eq(a, 0) && eq(b, -1) && eq(c, 1) && eq(d, 0)) return 270;
   if (eq(a, -1) && eq(b, 0) && eq(c, 0) && eq(d, -1)) return 180;
-  if (eq(a, 0) && eq(b, 1) && eq(c, -1) && eq(d, 0)) return 270;
+  if (eq(a, 0) && eq(b, 1) && eq(c, -1) && eq(d, 0)) return 90;
   return undefined;
 }
 
@@ -732,6 +732,7 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
     const type = trackType(t);
     const trackDurSec = t.timescale > 0 ? t.duration / t.timescale : 0;
     const lang = normalizedTrackLanguage(file, t);
+    const trackHeaderFlags = file.getTrackById(t.id)?.tkhd?.flags;
     // Unwrap CENC-protected sample entries ('encv'/'enca') to their original four-cc before
     // canonicalizing; non-encrypted tracks pass `t.codec` straight through.
     const rawCodec = unwrapEncryptedCodec(file, t.id, t.codec) ?? t.codec;
@@ -748,6 +749,11 @@ function toNormalizedMetadata(file: Mp4ISOFile, info: Mp4Movie): NormalizedMetad
       ...(trackDurSec > 0 ? { mediaDurationSec: trackDurSec } : {}),
       bitrate: typeof t.bitrate === 'number' && Number.isFinite(t.bitrate) ? Math.round(t.bitrate) : null,
       language: lang,
+      // ISO tkhd flag bit 0 is track_enabled. FFmpeg exposes that presentation selection as the
+      // normalized default disposition; disabled alternate tracks remain explicitly non-default.
+      ...(typeof trackHeaderFlags === 'number'
+        ? { defaultDisposition: (trackHeaderFlags & 1) !== 0 }
+        : {}),
     };
     const editSpanSec = editPresentationSpanSec(t);
     if (editSpanSec !== undefined) {
@@ -2547,5 +2553,5 @@ export class Mp4boxEngine implements MediaEngine {
  */
 export function registerMp4box(opts?: { id?: string }): void {
   const id = opts?.id ?? 'mp4box';
-  registerEngine(id, () => new Mp4boxEngine());
+  registerEngine(id, () => new Mp4boxEngine(), { resultId: ENGINE_ID });
 }

@@ -74,6 +74,7 @@ function withRobustnessContract(
 
 interface EdgeCase {
   id: string;
+  revision?: number;
   op: 'probe' | 'demux' | 'decodeFrames' | 'remux' | 'transcode' | 'trim' | 'decrypt' | 'seek';
   asset: string;
   containersIn: string[];
@@ -204,6 +205,7 @@ const EDGE_CASES: EdgeCase[] = [
   },
   {
     id: 'edge_faststart_reserve_remux',
+    revision: 2,
     op: 'remux',
     asset: 'h264_1080p_30s.mp4',
     containersIn: ['mp4'],
@@ -211,9 +213,16 @@ const EDGE_CASES: EdgeCase[] = [
     videoCodecs: ['h264'],
     audioCodecs: ['aac'],
     features: ['fastStart:reserve'],
-    options: { container: 'mp4', fastStart: 'reserve' },
+    options: {
+      container: 'mp4',
+      fastStart: 'reserve',
+      maximumPacketCount: 4096,
+      target: 'stream',
+    },
     oracles: ['reference-reimport'],
-    notes: 'fastStart:reserve provokes a large forward seek in the target buffer.',
+    notes:
+      'fastStart:reserve reserves the forward moov on a position-aware stream target, then patches ' +
+      'it after the bounded per-track packet table is complete.',
   },
   {
     id: 'edge_fragmented_remux',
@@ -255,6 +264,7 @@ const EDGE_CASES: EdgeCase[] = [
 const edgeScenarios: Scenario[] = EDGE_CASES.map((c) =>
   defineScenario({
     id: `robustness/${c.id}`,
+    revision: c.revision ?? 1,
     op: c.op,
     input: c.asset,
     options: withRobustnessContract(

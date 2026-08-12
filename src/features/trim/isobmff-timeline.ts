@@ -174,6 +174,35 @@ export function selectIsoBmffTrimWindows(
   return windows;
 }
 
+/**
+ * Pick a stable observation inside the final displayed sample intersecting an ISO trim window.
+ *
+ * Seeking a media element a fixed distance before the authored end is not stable for sparse VFR: a
+ * browser may resolve that seek to the following frame even though the preceding long frame still
+ * covers the requested instant. This offset stays one quarter into the final sample's visible portion,
+ * relative to the window's landed start, and therefore names the same pixels before and after rebasing.
+ */
+export function stableIsoBmffTrimTerminalOffsetUs(
+  track: IsoBmffTrackTimeline,
+  window: IsoBmffTrimWindow,
+  requestedEndUs: number,
+): number | undefined {
+  if (!Number.isSafeInteger(requestedEndUs) || requestedEndUs <= window.landedStartUs) {
+    return undefined;
+  }
+  const sample = track.samples.find((candidate) => candidate.sampleIndex === window.lastSampleIndex);
+  if (sample === undefined) return undefined;
+  const visibleStartUs = Math.max(window.landedStartUs, sample.presentationStartUs);
+  const visibleEndUs = Math.min(requestedEndUs, sample.presentationEndUs);
+  if (visibleEndUs <= visibleStartUs) return undefined;
+  const visibleSpanUs = visibleEndUs - visibleStartUs;
+  const insetUs = visibleSpanUs > 1 ? Math.max(1, Math.floor(visibleSpanUs / 4)) : 0;
+  return Math.min(
+    requestedEndUs - window.landedStartUs - 1,
+    visibleStartUs + insetUs - window.landedStartUs,
+  );
+}
+
 function parseMovieHeader(bytes: Uint8Array, box: Box): { timescale: number; duration: number } {
   const version = fullBoxVersion(bytes, box);
   requireBytes(box, version === 1 ? 32 : 20);

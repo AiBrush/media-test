@@ -161,9 +161,10 @@ describe('REQ-ENG-27: representation-aware web-demuxer packet evidence', () => {
     });
   });
 
-  test('normalizes FFmpeg rotation and AAC presentation evidence without losing the coded view', () => {
-    expect(normalizeWebDemuxerRotation(270)).toBe(90);
-    expect(normalizeWebDemuxerRotation(-90)).toBe(90);
+  test('preserves web-demuxer clockwise rotation and AAC presentation evidence without losing the coded view', () => {
+    expect(normalizeWebDemuxerRotation(270)).toBe(270);
+    expect(normalizeWebDemuxerRotation(-90)).toBe(270);
+    expect(normalizeWebDemuxerRotation(90)).toBe(90);
     expect(normalizeWebDemuxerStream(stream({
       codec_type: 1,
       codec_type_string: 'audio',
@@ -187,9 +188,22 @@ describe('REQ-ENG-27: representation-aware web-demuxer packet evidence', () => {
   test('derives required ISO, Matroska, and discontinuous-TS probe fields from container bytes', async () => {
     const mp4 = new Uint8Array(await readFile('fixtures/media/h264_1080p_30s.mp4'));
     const branded = probeMetadataWithByteEvidence({
-      container: 'mp4', durationSec: 30, tracks: [],
+      container: 'mp4', durationSec: 30,
+      tracks: [{ type: 'video', codec: 'h264' }, { type: 'audio', codec: 'aac' }],
     }, mp4);
     expect(branded.tags?.major_brand).toBe('isom');
+    expect(branded.tracks.map((track) => track.defaultDisposition)).toEqual([true, true]);
+
+    const alternateMp4 = new Uint8Array(await readFile('fixtures/media/h264_multitrack.mp4'));
+    const alternates = probeMetadataWithByteEvidence({
+      container: 'mp4', durationSec: 10,
+      tracks: [
+        { type: 'video', codec: 'h264' },
+        { type: 'audio', codec: 'aac' },
+        { type: 'audio', codec: 'aac' },
+      ],
+    }, alternateMp4);
+    expect(alternates.tracks.map((track) => track.defaultDisposition)).toEqual([true, true, false]);
 
     const psMp4 = new Uint8Array(await readFile('fixtures/media/scenarios/probe/tiny_h264_360p_2s/02.mp4'));
     const psPresentation = probeMetadataWithByteEvidence({

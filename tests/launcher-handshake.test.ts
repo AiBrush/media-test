@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   finishLauncherRunHandshake,
+  hasUnsavedLauncherResults,
   isLauncherRunDone,
   isLauncherRunPending,
   LAUNCHER_RUN_HANDSHAKE_SCHEMA,
@@ -33,5 +34,12 @@ describe('launcher run handshake', () => {
     const done = finishLauncherRunHandshake(startLauncherRunHandshake('request'), undefined, 'failed');
     expect(() => finishLauncherRunHandshake(done)).toThrow(/started/);
     expect(done.error).toBe('failed');
+  });
+
+  test('checkpoints only when completed result count advances', () => {
+    expect(hasUnsavedLauncherResults(0, 0)).toBe(false);
+    expect(hasUnsavedLauncherResults(0, 1)).toBe(true);
+    expect(hasUnsavedLauncherResults(3, 3)).toBe(false);
+    expect(hasUnsavedLauncherResults(3, 2)).toBe(false);
   });
 });

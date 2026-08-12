@@ -22,6 +22,7 @@ import {
   type EncryptionPatternContract,
 } from '../src/features/encryption/index.ts';
 import { encryptionScenarios } from '../src/scenarios/encryption/index.ts';
+import { demuxMp4Video } from '../src/engines/platform/demux-mp4.ts';
 
 const originalFetch = globalThis.fetch;
 
@@ -99,21 +100,36 @@ function shiftFirstCensBoundary(bytes: Uint8Array): Uint8Array {
 describe('REQ-FEAT-56 production CENS/CBCS pattern-boundary evidence', () => {
   const cens = patternOf('cenc_cens_decrypt');
   const cbcs = patternOf('cenc_cbcs_decrypt');
+  const canonicalCensBytes = bytesAt('fixtures/media/cenc_cens.mp4');
   const censBytes = bytesAt('fixtures/media/scenarios/encryption/cenc_cens_decrypt/01.mp4');
+  const cens02Bytes = bytesAt('fixtures/media/scenarios/encryption/cenc_cens_decrypt/02.mp4');
+  const cens03Bytes = bytesAt('fixtures/media/scenarios/encryption/cenc_cens_decrypt/03.mp4');
+  const cens01ClearBytes = bytesAt(
+    'fixtures/media/scenarios/_derived_cleartext/0cd83d944a6ca7822b4a8306cecc60a36e859b041f6702c6a1ad9ead78924451.mp4',
+  );
+  const cens02ClearBytes = bytesAt(
+    'fixtures/media/scenarios/_derived_cleartext/f9c534ebc1e69ee30c7bc1c364bcd5b92f9d20f8ef07d8d5c5f2773eb4277b99.mp4',
+  );
+  const cens03ClearBytes = bytesAt(
+    'fixtures/media/scenarios/_derived_cleartext/baf03cd8ba8258e83f66da335ee16f657de0a2ae79e6ac771b134bb74d7c3714.mp4',
+  );
   const cbcsBytes = bytesAt('fixtures/media/scenarios/encryption/cenc_cbcs_decrypt/01.mp4');
 
   test('real traf/trun/senc maps prove encrypted↔clear transitions for both schemes', () => {
-    for (const [bytes, expected, firstSpan] of [
-      [censBytes, cens, { clearBytes: 902, protectedBytes: 57_168 }],
-      [cbcsBytes, cbcs, { clearBytes: 816, protectedBytes: 57_254 }],
+    for (const [bytes, expected, firstSpan, sampleCount] of [
+      [canonicalCensBytes, cens, { clearBytes: 734, protectedBytes: 23_920 }, 150],
+      [censBytes, cens, { clearBytes: 902, protectedBytes: 57_168 }, 150],
+      [cens02Bytes, cens, { clearBytes: 875, protectedBytes: 259_376 }, 329],
+      [cens03Bytes, cens, { clearBytes: 906, protectedBytes: 47_344 }, 161],
+      [cbcsBytes, cbcs, { clearBytes: 816, protectedBytes: 57_254 }, 150],
     ] as const) {
       const evidence = inspectPatternBoundaryEvidence(bytes, expected);
       expect(evidence).toMatchObject({
         state: 'OK',
         scheme: expected.scheme,
         trackId: 1,
-        sampleCount: 150,
-        explicitSubsampleCount: 150,
+        sampleCount,
+        explicitSubsampleCount: sampleCount,
         implicitWholeSampleCount: 0,
         firstBoundarySubsamples: [firstSpan],
       });
@@ -140,6 +156,19 @@ describe('REQ-FEAT-56 production CENS/CBCS pattern-boundary evidence', () => {
       firstBoundarySubsamples: [{ clearBytes: 0, protectedBytes: 24_654 }],
     });
     expect(assessPatternGroundTruth(bytesAt('fixtures/media/cenc_cbcs.mp4'), cbcs).verdict).toBe('PASS');
+  });
+
+  test('progressive clear bases and equivalent fragmented CENS rotations share one PTS origin', () => {
+    for (const [fragmented, progressive] of [
+      [censBytes, cens01ClearBytes],
+      [cens02Bytes, cens02ClearBytes],
+      [cens03Bytes, cens03ClearBytes],
+    ] as const) {
+      const got = demuxMp4Video(fragmented).samples;
+      const want = demuxMp4Video(progressive).samples;
+      expect(got).toHaveLength(want.length);
+      expect(got.map(({ ptsUs }) => ptsUs)).toEqual(want.map(({ ptsUs }) => ptsUs));
+    }
   });
 
   test('scheme, whole-sample, crypt:skip, IV, and off-by-one span mutations fail locally', () => {

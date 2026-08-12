@@ -52,3 +52,11 @@ export function isLauncherRunPending(value: unknown, requestId: string): value i
     && candidate.requestId === requestId
     && candidate.state === 'started';
 }
+
+/** A launcher checkpoint is useful only after the live run has produced another completed row. */
+export function hasUnsavedLauncherResults(savedCount: number, observedCount: number): boolean {
+  return Number.isSafeInteger(savedCount)
+    && Number.isSafeInteger(observedCount)
+    && savedCount >= 0
+    && observedCount > savedCount;
+}

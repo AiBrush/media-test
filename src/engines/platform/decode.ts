@@ -110,15 +110,17 @@ export function presentationSampleTimesUs(
   const requestedLimit = typeof opts?.maxFrames === 'number' && Number.isFinite(opts.maxFrames)
     ? Math.max(0, Math.floor(opts.maxFrames))
     : 8;
-  const limit = Math.min(requestedLimit, finitePts.length);
-  if (limit === 0) return [];
-
   const explicit = opts?.sampleTimesSec
     ?.filter((timeSec) => Number.isFinite(timeSec) && timeSec >= 0)
-    .slice(0, limit)
+    // Preserve the caller's complete bounded request set. Distinct requests may resolve to the same
+    // displayed sample, so truncating to the coded-sample count before nearest-PTS de-duplication can
+    // discard the only request that reaches the final sample of a very short clip.
+    .slice(0, requestedLimit)
     .map((timeSec) => Math.round(timeSec * 1_000_000))
     .sort((a, b) => a - b);
   if (explicit?.length) return explicit;
+  const limit = Math.min(requestedLimit, finitePts.length);
+  if (limit === 0) return [];
   if (opts?.sampling !== 'uniform') return [];
 
   const originUs = finitePts[0]!;
@@ -629,7 +631,9 @@ export async function decodeWithVideoElement(
         video,
         t,
         perFrameTimeoutMs,
-        explicitTimes?.length ? 0.001 : undefined,
+        // `sampleTimesSec` alone names an interior seek instant, not necessarily a frame PTS. Require
+        // rVFC mediaTime equality only when the caller also supplied exact source-timeline labels.
+        explicitTimestampsUs !== undefined ? 0.001 : undefined,
       );
       const seekResidualSec = Math.abs(video.currentTime - t);
       if (seekResidualSec > 0.001) {

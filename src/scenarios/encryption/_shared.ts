@@ -159,6 +159,8 @@ export function decryptKeyFor(
  */
 export interface DecryptCase {
   id: string;
+  /** Increment when the executable evidence contract changes. */
+  revision?: number;
   asset: string;
   container: string;
   scheme: EncryptionScheme;
@@ -173,6 +175,8 @@ export interface DecryptCase {
   features?: string[];
   /** Optional plaintext corpus asset whose browser-baked frame golden is the decrypt comparison target. */
   cleartextAsset?: string;
+  /** Allow the protected source to author timing while the clear reference authors frame identity. */
+  clearReferenceTimeline?: 'protected-source';
   /**
    * Override the oracle set. Default: decrypt-bitexact (frame-exact vs offline cleartext golden) +
    * reference-reimport (output re-parses as a real container) + playback-smoke (the de-protected
@@ -204,9 +208,15 @@ export function buildDecrypt(c: DecryptCase): Scenario {
   });
   return defineScenario({
     id: `encryption/${c.id}`,
+    ...(c.revision ? { revision: c.revision } : {}),
     op: 'decrypt',
     input: c.asset,
-    options: { scheme: c.scheme, key, ...(c.cleartextAsset ? { cleartextAsset: c.cleartextAsset } : {}) },
+    options: {
+      scheme: c.scheme,
+      key,
+      ...(c.cleartextAsset ? { cleartextAsset: c.cleartextAsset } : {}),
+      ...(c.clearReferenceTimeline ? { clearReferenceTimeline: c.clearReferenceTimeline } : {}),
+    },
     requires: {
       operations: ['decrypt'],
       containersIn: [c.container],

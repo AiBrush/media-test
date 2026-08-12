@@ -204,6 +204,38 @@ describe('REQ-FEAT-70: honest memory window', () => {
     }
   });
 
+  test('slow memory requests cannot stretch the defined settle window', async () => {
+    let now = 0;
+    let samplerCalls = 0;
+    const result = await measurePeakMemoryWindow(
+      async () => undefined,
+      available({
+        api: 'measureUserAgentSpecificMemory',
+        sample: async () => {
+          samplerCalls += 1;
+          // Baseline + end are immediate. The first settle request consumes more wall time than the
+          // entire remaining window, so a second settle request would be outside the protocol.
+          if (samplerCalls >= 3) now += 50;
+          return 100;
+        },
+      }),
+      {
+        sampleIntervalMs: 10,
+        settleWindowMs: 20,
+        clock: () => now,
+        sleep: async (ms) => {
+          now += ms;
+        },
+      },
+    );
+    expect(result.state).toBe('AVAILABLE');
+    if (result.state === 'AVAILABLE') {
+      expect(result.value.memory.samples.map((sample) => sample.phase)).toEqual([
+        'baseline', 'end', 'settle',
+      ]);
+    }
+  });
+
   test('unsupported memory instrumentation is NA_BROWSER and never runs the measured operation', async () => {
     let ran = false;
     const result = await measurePeakMemoryWindow(

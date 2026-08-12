@@ -672,6 +672,127 @@ function classicRangeSamples(
   return out;
 }
 
+function fragmentSequenceNumber(bytes: Uint8Array, moof: Box): number | undefined {
+  const mfhd = child(bytes, moof, 'mfhd');
+  return mfhd && mfhd.body + 8 <= mfhd.end ? u32be(bytes, mfhd.body + 4) : undefined;
+}
+
+/**
+ * Parse one bounded `moof` window into global file-range sample descriptors. The media payload is
+ * deliberately never fetched here: `trun` offsets are checked against the complete top-level mdat
+ * layout, then retained as lazy ranges for the independent content comparator.
+ */
+function fragmentRangeSamples(
+  bytes: Uint8Array,
+  localMoof: Box,
+  globalMoofStart: number,
+  tracks: readonly TrackTables[],
+  mdats: readonly Box[],
+  defaults: ReadonlyMap<number, FragmentDefaults>,
+  result: Map<number, IsoBmffRangeSampleEvidence[]>,
+): boolean {
+  for (const traf of children(bytes, localMoof)?.filter((box) => box.type === 'traf') ?? []) {
+    const tfhd = child(bytes, traf, 'tfhd');
+    if (!tfhd || tfhd.body + 8 > tfhd.end) return false;
+    const flags = u32be(bytes, tfhd.body) & 0x00ff_ffff;
+    const trackId = u32be(bytes, tfhd.body + 4);
+    const track = tracks.find((entry) => entry.id === trackId);
+    if (!track) return false;
+    let at = tfhd.body + 8;
+    let baseDataOffset = globalMoofStart;
+    if (flags & 0x000001) {
+      const value = u64beSafe(bytes, at);
+      if (value === undefined) return false;
+      baseDataOffset = value;
+      at += 8;
+    }
+    if (flags & 0x000002) at += 4;
+    const inherited = defaults.get(trackId) ?? {};
+    const defaultDuration = flags & 0x000008 ? u32be(bytes, at) : inherited.duration;
+    if (flags & 0x000008) at += 4;
+    const defaultSize = flags & 0x000010 ? u32be(bytes, at) : inherited.size;
+    if (flags & 0x000010) at += 4;
+    const defaultFlags = flags & 0x000020 ? u32be(bytes, at) : inherited.flags;
+    if (flags & 0x000020) at += 4;
+    if (at > tfhd.end) return false;
+    const tfdt = child(bytes, traf, 'tfdt');
+    let decodeTime = 0;
+    if (tfdt) {
+      const version = fullBoxVersion(bytes, tfdt);
+      const value = version === 1
+        ? u64beSafe(bytes, tfdt.body + 4)
+        : u32be(bytes, tfdt.body + 4);
+      if (value === undefined) return false;
+      decodeTime = value;
+    }
+    let implicitDataOffset = baseDataOffset;
+    for (const trun of children(bytes, traf)?.filter((box) => box.type === 'trun') ?? []) {
+      if (trun.body + 8 > trun.end) return false;
+      const version = fullBoxVersion(bytes, trun);
+      const trunFlags = u32be(bytes, trun.body) & 0x00ff_ffff;
+      const count = u32be(bytes, trun.body + 4);
+      const list = result.get(trackId) ?? [];
+      if (count > MAX_REMUX_SAMPLES || list.length + count > MAX_REMUX_SAMPLES) return false;
+      let cursor = trun.body + 8;
+      let dataOffset = implicitDataOffset;
+      if (trunFlags & 0x000001) {
+        let signed = u32be(bytes, cursor);
+        if (signed >= 0x8000_0000) signed -= 0x1_0000_0000;
+        dataOffset = baseDataOffset + signed;
+        cursor += 4;
+      }
+      const firstFlags = trunFlags & 0x000004 ? u32be(bytes, cursor) : undefined;
+      if (trunFlags & 0x000004) cursor += 4;
+      for (let index = 0; index < count; index++) {
+        const duration = trunFlags & 0x000100 ? u32be(bytes, cursor) : defaultDuration;
+        if (trunFlags & 0x000100) cursor += 4;
+        const byteLength = trunFlags & 0x000200 ? u32be(bytes, cursor) : defaultSize;
+        if (trunFlags & 0x000200) cursor += 4;
+        const sampleFlags = trunFlags & 0x000400
+          ? u32be(bytes, cursor)
+          : index === 0 && firstFlags !== undefined
+            ? firstFlags
+            : defaultFlags;
+        if (trunFlags & 0x000400) cursor += 4;
+        let composition = 0;
+        if (trunFlags & 0x000800) {
+          composition = u32be(bytes, cursor);
+          if (version === 1 && composition >= 0x8000_0000) composition -= 0x1_0000_0000;
+          cursor += 4;
+        }
+        if (
+          !duration ||
+          !byteLength ||
+          cursor > trun.end ||
+          !Number.isSafeInteger(dataOffset) ||
+          !inMdat(dataOffset, byteLength, mdats)
+        ) {
+          return false;
+        }
+        const toUs = (value: number): number => Math.round((value / track.timescale) * 1_000_000);
+        list.push({
+          byteLength,
+          fileOffset: dataOffset,
+          dtsUs: toUs(decodeTime),
+          ptsUs: toUs(decodeTime + composition),
+          durationUs: toUs(duration),
+          keyframe: sampleFlags !== undefined
+            ? (sampleFlags & 0x0001_0000) === 0
+            : track.type === 'audio'
+              ? true
+              : undefined,
+          framing: track.codec === 'h264' || track.codec === 'hevc' ? 'length-prefixed' : 'raw',
+        });
+        decodeTime += duration;
+        dataOffset += byteLength;
+      }
+      result.set(trackId, list);
+      implicitDataOffset = dataOffset;
+    }
+  }
+  return true;
+}
+
 async function topLevelRangeBoxes(
   source: IsoBmffRangeSource,
   signal?: AbortSignal,
@@ -731,12 +852,7 @@ export async function readIsoBmffRangeProgram(
     if (!top) {
       return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_BOX_INCOMPLETE' };
     }
-    if (top.some((box) => box.type === 'moof')) {
-      return {
-        state: 'UNSUPPORTED_STRUCTURE',
-        reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENTED_UNSUPPORTED',
-      };
-    }
+    const fragmented = top.some((box) => box.type === 'moof');
     const moov = top.find((box) => box.type === 'moov');
     const mdats = top.filter((box) => box.type === 'mdat');
     if (!moov || mdats.length === 0) {
@@ -757,9 +873,54 @@ export async function readIsoBmffRangeProgram(
     if (!tables) {
       return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_TRACK_TABLE_INVALID' };
     }
+    let fragments: Map<number, IsoBmffRangeSampleEvidence[]> | undefined;
+    if (fragmented) {
+      const firstMoof = top.find((box) => box.type === 'moof')!;
+      const ftyp = top.find((box) => box.type === 'ftyp');
+      if (
+        ftyp === undefined ||
+        ftyp.start > moov.start ||
+        moov.start > firstMoof.start ||
+        child(moovBytes, localMoov, 'mvex') === undefined
+      ) {
+        return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENT_INIT_INVALID' };
+      }
+      fragments = new Map();
+      const defaults = trexDefaults(moovBytes, localMoov);
+      let previousSequence = -1;
+      for (const moof of top.filter((box) => box.type === 'moof')) {
+        signal?.throwIfAborted();
+        const moofBytes = await source.range(moof.start, moof.end, signal);
+        const local = boxes(moofBytes, 0, moofBytes.byteLength)?.find((box) => box.type === 'moof');
+        const sequence = local ? fragmentSequenceNumber(moofBytes, local) : undefined;
+        if (!local || sequence === undefined || sequence <= previousSequence) {
+          return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENT_SEQUENCE_INVALID' };
+        }
+        previousSequence = sequence;
+        if (!fragmentRangeSamples(
+          moofBytes,
+          local,
+          moof.start,
+          tables,
+          mdats,
+          defaults,
+          fragments,
+        )) {
+          return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENT_INVALID' };
+        }
+      }
+      const missingRandomAccess = tables.find((table) =>
+        table.type === 'video' && fragments?.get(table.id)?.[0]?.keyframe !== true
+      );
+      if (missingRandomAccess !== undefined) {
+        return { state: 'MALFORMED', reasonCode: 'REMUX_ISOBMFF_RANGE_FRAGMENT_RANDOM_ACCESS_MISSING' };
+      }
+    }
     const tracks: IsoBmffRangeTrackEvidence[] = [];
     for (const table of tables) {
-      const samples = classicRangeSamples(moovBytes, table, mdats);
+      const samples = fragmented
+        ? fragments?.get(table.id)
+        : classicRangeSamples(moovBytes, table, mdats);
       if (!samples || samples.length === 0) {
         return { state: 'INCOMPLETE', reasonCode: 'REMUX_ISOBMFF_RANGE_SAMPLES_INCOMPLETE' };
       }
@@ -815,7 +976,7 @@ export async function readIsoBmffRangeProgram(
         byteLength: source.size,
         ...(durationUs !== undefined && durationUs >= 0 ? { durationUs } : {}),
         tracks,
-        representation: { fragmented: false },
+        representation: { fragmented },
       },
     };
   } catch {

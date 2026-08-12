@@ -123,10 +123,11 @@ import { emptyGoldenStore, loadGolden, runOracle } from './oracles.ts';
 import {
   ActiveFixtureRuntime,
   type ActiveFixtureMediaResult,
+  type AttestedFixtureMediaIdentity,
 } from './fixture-integrity.ts';
 import { readOutputPacketsResult, readOutputStructureResult } from './box-readers.ts';
 import { disabledCellReason } from './disabled-cells.ts';
-import { sha256Hex } from './seeded-rng.ts';
+import { sha256Hex, type Sha256Snapshot } from './seeded-rng.ts';
 import {
   loadScenarioSources,
   selectForRun,
@@ -137,6 +138,7 @@ import {
   DECRYPT_METAMORPHIC_INVARIANT,
   evaluateCandidateEvidence,
   isCorpusDeliveryIntegrityError,
+  VERIFIED_STREAM_CHUNK_SIZE_BYTES,
   verifyContentStream,
   withVerifiedContent,
 } from './media-selection.ts';
@@ -144,6 +146,7 @@ import type {
   ContentIdentity,
   CandidateOracleEvidencePlan,
   ResolvedInput,
+  RejectedContent,
   ScenarioSelection,
   VerifiedContent,
   VerifiedStreamContent,
@@ -958,6 +961,7 @@ function loadGoldenForRun(
   assetId: string,
   runtime?: ActiveFixtureRuntime,
   requestedKinds?: readonly GoldenKind[],
+  sourceIdentity?: AttestedFixtureMediaIdentity,
 ): Promise<GoldenStore> {
   const baseUrl = new URL(
     FIXTURES_GOLDEN_BASE,
@@ -981,7 +985,9 @@ function loadGoldenForRun(
   const plan = requestedKinds
     ? GOLDEN_LOAD_KIND_ORDER.filter((kind) => requestedKinds.includes(kind))
     : GOLDEN_LOAD_KIND_ORDER;
-  const cacheKey = `${assetId}\u0000${plan.join(',')}`;
+  const cacheKey = `${assetId}\u0000${plan.join(',')}\u0000${
+    sourceIdentity === undefined ? 'materialized' : `${sourceIdentity.sha256}/${sourceIdentity.sizeBytes}`
+  }`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -993,7 +999,12 @@ function loadGoldenForRun(
     baseUrl,
     requestedKinds: plan,
     evidenceProvider: {
-      load: (kind, parsePayload) => runtime.loadGoldenEvidence(assetId, kind, parsePayload),
+      load: (kind, parsePayload) => runtime.loadGoldenEvidence(
+        assetId,
+        kind,
+        parsePayload,
+        sourceIdentity,
+      ),
     },
   }).catch((error) => {
     cache?.delete(cacheKey);
@@ -1282,13 +1293,15 @@ function buildAttestedStreamMediaInput(
  * the digest-bound URL source. This is an operation/size policy, deliberately independent of asset
  * ids and containers: adding or rotating a corpus file cannot silently change its delivery mode.
  *
- * Trim's 128 MiB boundary matches the adapter's strict prepared-copy ceiling. Remux and demux keep
- * their established 256 MiB ceiling because their bounded byte-table paths are independently sized.
+ * Demux uses a 64 MiB boundary so whole-body admission cannot consume more than one quarter of the
+ * 256 MiB scale-row memory budget before packet tables and parser state exist. Trim's 128 MiB
+ * boundary matches the adapter's strict prepared-copy ceiling. Remux keeps its established 256 MiB
+ * ceiling because its bounded byte-table path is independently sized.
  */
 const AUTHENTICATED_RANGE_INPUT_MIN_BYTES_BY_OPERATION: Readonly<Partial<Record<Operation, number>>> = {
   trim: 128 * 1024 * 1024,
   remux: 256 * 1024 * 1024,
-  demux: 256 * 1024 * 1024,
+  demux: 64 * 1024 * 1024,
 };
 
 function commonAuthenticatedStreamTransportEligible(
@@ -1502,6 +1515,330 @@ function verifiedStreamContentsMismatch(
     }
   }
   return undefined;
+}
+
+const STREAM_ADMISSION_DELIVERY_RANGE_BYTES = 8 * 1024 * 1024;
+const STREAM_ADMISSION_WORKER_BATCH_BYTES = 32 * 1024 * 1024;
+
+type StreamVerificationWorkerResponse =
+  | {
+      readonly kind: 'verification-progress';
+      readonly endExclusive: number;
+      readonly overallSnapshot: Sha256Snapshot;
+      readonly chunkSnapshot: Sha256Snapshot;
+      readonly chunkBytes: number;
+      readonly chunkSha256: readonly string[];
+    }
+  | {
+      readonly kind: 'verification-complete';
+      readonly endExclusive: number;
+      readonly actualSha256: string;
+      readonly chunkSha256: readonly string[];
+    }
+  | { readonly kind: 'verification-failed'; readonly message: string };
+
+interface StreamVerificationWorkerRequest {
+  readonly kind: 'verify-stream-content-batch';
+  readonly url: string;
+  readonly identity: ContentIdentity;
+  readonly chunkSizeBytes: number;
+  readonly deliveryRangeBytes: number;
+  readonly start: number;
+  readonly endExclusive: number;
+  readonly overallSnapshot?: Sha256Snapshot;
+  readonly chunkSnapshot?: Sha256Snapshot;
+  readonly chunkBytes: number;
+}
+
+export interface HarnessContentAttestation {
+  readonly schema: 'media-test/content-attestation@1';
+  readonly logicalPath: string;
+  readonly actualSha256: string;
+  readonly actualSizeBytes: number;
+  readonly chunkSizeBytes: number;
+  readonly chunkSha256: readonly string[];
+}
+
+export function parseHarnessContentAttestation(value: unknown): HarnessContentAttestation {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('content-attestation payload must be an object');
+  }
+  const item = value as Record<string, unknown>;
+  if (item.schema !== 'media-test/content-attestation@1') {
+    throw new TypeError('content-attestation payload has an unsupported schema');
+  }
+  if (typeof item.logicalPath !== 'string' || item.logicalPath.length === 0) {
+    throw new TypeError('content-attestation logicalPath must be a non-empty string');
+  }
+  if (typeof item.actualSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(item.actualSha256)) {
+    throw new TypeError('content-attestation actualSha256 must be a lowercase SHA-256 digest');
+  }
+  if (!Number.isSafeInteger(item.actualSizeBytes) || (item.actualSizeBytes as number) < 0) {
+    throw new TypeError('content-attestation actualSizeBytes must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(item.chunkSizeBytes) || (item.chunkSizeBytes as number) <= 0) {
+    throw new TypeError('content-attestation chunkSizeBytes must be a positive safe integer');
+  }
+  if (
+    !Array.isArray(item.chunkSha256) ||
+    item.chunkSha256.some((digest) => typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest))
+  ) {
+    throw new TypeError('content-attestation chunkSha256 must contain lowercase SHA-256 digests');
+  }
+  return {
+    schema: item.schema,
+    logicalPath: item.logicalPath,
+    actualSha256: item.actualSha256,
+    actualSizeBytes: item.actualSizeBytes as number,
+    chunkSizeBytes: item.chunkSizeBytes as number,
+    chunkSha256: item.chunkSha256.slice(),
+  };
+}
+
+async function tryHarnessContentAttestation(
+  identity: ContentIdentity,
+  url: string,
+  signal?: AbortSignal,
+): Promise<VerifiedStreamContent | RejectedContent | undefined> {
+  const endpoint = new URL('/__media_test__/content-attestation', url);
+  endpoint.searchParams.set('logicalPath', identity.logicalPath);
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      cache: 'no-store',
+      ...(signal ? { signal } : {}),
+    });
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason;
+    return {
+      state: 'REJECTED',
+      identity,
+      issue: {
+        scope: 'CORPUS',
+        status: 'NA_ASSET',
+        reasonCode: 'CORPUS_FETCH_FAILED',
+        logicalPath: identity.logicalPath,
+        expectedSha256: identity.sha256,
+        expectedSizeBytes: identity.sizeBytes,
+        detail: `content-attestation request failed: ${errMessage(error)}`,
+      },
+    };
+  }
+  // Custom/remote suite hosts may not implement this optimization. The streaming verifier remains
+  // the compatibility fallback, while any implemented endpoint must fail closed.
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    return {
+      state: 'REJECTED',
+      identity,
+      issue: {
+        scope: 'CORPUS',
+        status: 'NA_ASSET',
+        reasonCode: 'CORPUS_FETCH_FAILED',
+        logicalPath: identity.logicalPath,
+        expectedSha256: identity.sha256,
+        expectedSizeBytes: identity.sizeBytes,
+        detail: `content-attestation endpoint returned HTTP ${response.status}`,
+      },
+    };
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    return {
+      state: 'REJECTED',
+      identity,
+      issue: {
+        scope: 'CORPUS',
+        status: 'NA_ASSET',
+        reasonCode: 'CORPUS_FETCH_FAILED',
+        logicalPath: identity.logicalPath,
+        expectedSha256: identity.sha256,
+        expectedSizeBytes: identity.sizeBytes,
+        detail: `content-attestation endpoint returned invalid JSON: ${errMessage(error)}`,
+      },
+    };
+  }
+  let attestation: HarnessContentAttestation;
+  try {
+    attestation = parseHarnessContentAttestation(payload);
+  } catch (error) {
+    return {
+      state: 'REJECTED',
+      identity,
+      issue: {
+        scope: 'CORPUS',
+        status: 'NA_ASSET',
+        reasonCode: 'CORPUS_FETCH_FAILED',
+        logicalPath: identity.logicalPath,
+        expectedSha256: identity.sha256,
+        expectedSizeBytes: identity.sizeBytes,
+        detail: `content-attestation endpoint returned an invalid payload: ${errMessage(error)}`,
+      },
+    };
+  }
+  const result: VerifiedStreamContent = {
+    state: 'VERIFIED_STREAM',
+    identity,
+    actualSha256: attestation.actualSha256,
+    actualSizeBytes: attestation.actualSizeBytes,
+    chunkSizeBytes: attestation.chunkSizeBytes,
+    chunkSha256: attestation.chunkSha256.slice(),
+    retainedBytes: 0,
+  };
+  const mismatch = attestation.logicalPath !== identity.logicalPath ||
+    verifiedStreamContentsMismatch([identity], [result]);
+  if (mismatch) {
+    const digestMismatch = attestation.actualSha256 !== identity.sha256;
+    const sizeMismatch = attestation.actualSizeBytes !== identity.sizeBytes;
+    return {
+      state: 'REJECTED',
+      identity,
+      issue: {
+        scope: 'CORPUS',
+        status: 'NA_ASSET',
+        reasonCode: sizeMismatch
+          ? 'CORPUS_SIZE_MISMATCH'
+          : digestMismatch
+            ? 'CORPUS_DIGEST_MISMATCH'
+            : 'CORPUS_FETCH_FAILED',
+        logicalPath: identity.logicalPath,
+        expectedSha256: identity.sha256,
+        ...(digestMismatch ? { actualSha256: attestation.actualSha256 } : {}),
+        expectedSizeBytes: identity.sizeBytes,
+        ...(sizeMismatch ? { actualSizeBytes: attestation.actualSizeBytes } : {}),
+        detail: `content-attestation endpoint did not match the selected identity${
+          typeof mismatch === 'string' ? `: ${mismatch}` : ''
+        }`,
+      },
+    };
+  }
+  return result;
+}
+
+function runStreamVerificationWorkerBatch(
+  request: StreamVerificationWorkerRequest,
+  signal?: AbortSignal,
+): Promise<StreamVerificationWorkerResponse> {
+  const worker = new Worker(
+    new URL('./stream-verification-worker.ts', import.meta.url),
+    { type: 'module', name: 'media-test-stream-verification' },
+  );
+  return new Promise<StreamVerificationWorkerResponse>((resolve, reject) => {
+    let settled = false;
+    const finish = (body: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      worker.terminate();
+      // Let the just-closed realm release its bounded fetch buffers before starting the next batch.
+      setTimeout(body, 0);
+    };
+    const onAbort = (): void => finish(() => reject(signal?.reason));
+    worker.addEventListener('message', (event: MessageEvent<StreamVerificationWorkerResponse>) => {
+      const response = event.data;
+      if (
+        response?.kind === 'verification-progress' ||
+        response?.kind === 'verification-complete' ||
+        response?.kind === 'verification-failed'
+      ) {
+        finish(() => resolve(response));
+      }
+    });
+    worker.addEventListener('error', (event) => {
+      finish(() => resolve({
+        kind: 'verification-failed',
+        message: event.message || 'stream verification worker failed',
+      }));
+    });
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+    }
+    worker.postMessage(request);
+  });
+}
+
+async function verifyStreamContentInDisposableWorker(
+  identity: ContentIdentity,
+  url: string,
+  signal?: AbortSignal,
+): Promise<VerifiedStreamContent | RejectedContent> {
+  const harnessAttestation = await tryHarnessContentAttestation(identity, url, signal);
+  if (harnessAttestation !== undefined) return harnessAttestation;
+  if (typeof Worker !== 'function') {
+    return verifyContentStream(identity, async () => {
+      const response = await fetch(url, {
+        cache: 'no-store',
+        ...(signal ? { signal } : {}),
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      if (!response.body) throw new Error('response has no readable body');
+      return response.body;
+    });
+  }
+  let start = 0;
+  let overallSnapshot: Sha256Snapshot | undefined;
+  let chunkSnapshot: Sha256Snapshot | undefined;
+  let chunkBytes = 0;
+  const chunkSha256: string[] = [];
+  while (start < identity.sizeBytes) {
+    const endExclusive = Math.min(identity.sizeBytes, start + STREAM_ADMISSION_WORKER_BATCH_BYTES);
+    const response = await runStreamVerificationWorkerBatch({
+      kind: 'verify-stream-content-batch',
+      url,
+      identity,
+      chunkSizeBytes: VERIFIED_STREAM_CHUNK_SIZE_BYTES,
+      deliveryRangeBytes: STREAM_ADMISSION_DELIVERY_RANGE_BYTES,
+      start,
+      endExclusive,
+      ...(overallSnapshot === undefined ? {} : { overallSnapshot }),
+      ...(chunkSnapshot === undefined ? {} : { chunkSnapshot }),
+      chunkBytes,
+    }, signal);
+    if (response.kind === 'verification-failed') {
+      return {
+        state: 'REJECTED',
+        identity,
+        issue: {
+          scope: 'CORPUS',
+          status: 'NA_ASSET',
+          reasonCode: 'CORPUS_FETCH_FAILED',
+          logicalPath: identity.logicalPath,
+          expectedSha256: identity.sha256,
+          expectedSizeBytes: identity.sizeBytes,
+          detail: response.message,
+        },
+      };
+    }
+    if (response.endExclusive !== endExclusive) {
+      throw new Error(`stream verification worker stopped at ${response.endExclusive}, expected ${endExclusive}`);
+    }
+    chunkSha256.push(...response.chunkSha256);
+    if (response.kind === 'verification-complete') {
+      const result: VerifiedStreamContent = {
+        state: 'VERIFIED_STREAM',
+        identity,
+        actualSha256: response.actualSha256,
+        actualSizeBytes: response.endExclusive,
+        chunkSizeBytes: VERIFIED_STREAM_CHUNK_SIZE_BYTES,
+        chunkSha256,
+        retainedBytes: 0,
+      };
+      const mismatch = verifiedStreamContentsMismatch([identity], [result]);
+      if (mismatch) throw new Error(`invalid completed stream verification: ${mismatch}`);
+      return result;
+    }
+    overallSnapshot = response.overallSnapshot;
+    chunkSnapshot = response.chunkSnapshot;
+    chunkBytes = response.chunkBytes;
+    start = response.endExclusive;
+  }
+  throw new Error(`stream verification ended without completing '${identity.logicalPath}'`);
 }
 
 // ── Pillar gating ──────────────────────────────────────────────────────────────────────────────
@@ -5101,6 +5438,19 @@ export async function runOne(
     if (assetIds.length === 0) {
       return finalize('ERROR', [], 'scenario declares no input asset');
     }
+    const goldenSourceIdentityAt = (index: number): AttestedFixtureMediaIdentity | undefined => {
+      const verified = opts?.verifiedStreamContents?.[index];
+      const resolved = operationResolvedInputs?.[index];
+      if (
+        verified === undefined ||
+        resolved === undefined ||
+        resolved.sha256 !== verified.actualSha256 ||
+        resolved.sizeBytes !== verified.actualSizeBytes
+      ) {
+        return undefined;
+      }
+      return { sha256: verified.actualSha256, sizeBytes: verified.actualSizeBytes };
+    };
     const activeMediaByLogicalPath = new Map<
       string,
       Extract<ActiveFixtureMediaResult, { state: 'ready' }>
@@ -5486,7 +5836,12 @@ export async function runOne(
     let golden: GoldenStore | undefined;
     if (scenario.op === 'decodeFrames') {
       golden = await cancellation.run(
-        () => loadGoldenForRun(assetIds[0]!, fixtureIntegrityRuntime, requestedGoldenKinds),
+        () => loadGoldenForRun(
+          assetIds[0]!,
+          fixtureIntegrityRuntime,
+          requestedGoldenKinds,
+          goldenSourceIdentityAt(0),
+        ),
         operationTimeoutMs,
       );
       const goldenGap = decodeFrameGoldenGap(scenario, golden);
@@ -5497,7 +5852,12 @@ export async function runOne(
       scenarioMayUseStrictPixelOracle(scenario)
     ) {
       golden ??= await cancellation.run(
-        () => loadGoldenForRun(assetIds[0]!, fixtureIntegrityRuntime, requestedGoldenKinds),
+        () => loadGoldenForRun(
+          assetIds[0]!,
+          fixtureIntegrityRuntime,
+          requestedGoldenKinds,
+          goldenSourceIdentityAt(0),
+        ),
         operationTimeoutMs,
       );
       const pixelGap = await strictPixelBrowserGap(
@@ -5519,7 +5879,12 @@ export async function runOne(
         assetIds.map(async (assetId, index) =>
           index === 0 && golden
             ? golden
-            : loadGoldenForRun(assetId, fixtureIntegrityRuntime, requestedGoldenKinds)),
+            : loadGoldenForRun(
+                assetId,
+                fixtureIntegrityRuntime,
+                requestedGoldenKinds,
+                goldenSourceIdentityAt(index),
+              )),
       ),
       operationTimeoutMs,
     );
@@ -5748,6 +6113,9 @@ export async function runOne(
           readMode: metadata?.probeEvidence?.readMode,
           bytesRead: metadata?.telemetry?.bytesRead,
           peakMemoryDeltaBytes: observed.value.memory.deltaBytes,
+          memoryBaselineBytes: observed.value.memory.baselineBytes,
+          memoryMaximumBytes: observed.value.memory.maximumBytes,
+          memoryAfterOperationBytes: observed.value.memory.memoryAfterOperationBytes,
         });
       } else {
         opResult = await executeFunctional();
@@ -5799,14 +6167,24 @@ export async function runOne(
     if (engine.configUsed !== undefined) configSnapshots.capture('functional', engine.configUsed);
 
     // 6) Assemble OracleContext (inject decode/playback hooks + reference engine + golden).
-    golden ??= await loadGoldenForRun(primaryInput.id, fixtureIntegrityRuntime, requestedGoldenKinds);
+    golden ??= await loadGoldenForRun(
+      primaryInput.id,
+      fixtureIntegrityRuntime,
+      requestedGoldenKinds,
+      goldenSourceIdentityAt(0),
+    );
     if (opResult.probeMetadatas?.length) {
       opResult = {
         ...opResult,
         probeMetadatas: await Promise.all(
-          opResult.probeMetadatas.map(async (entry) => ({
+          opResult.probeMetadatas.map(async (entry, index) => ({
             ...entry,
-            golden: await loadGoldenForRun(entry.input.id, fixtureIntegrityRuntime, requestedGoldenKinds),
+            golden: await loadGoldenForRun(
+              entry.input.id,
+              fixtureIntegrityRuntime,
+              requestedGoldenKinds,
+              goldenSourceIdentityAt(index),
+            ),
           })),
         ),
       };
@@ -6287,10 +6665,30 @@ function assessFunctionalDemuxScale(
   const explicitPacketBoundaryTrace = demux.packets.length > 0 && packetEvents.length === expectedBoundaryEvents;
   const legacyPacketBoundaryTrace = demux.packets.length > 0 && readEvents.length === demux.packets.length;
   const packetBoundaryEvents = explicitPacketBoundaryTrace ? packetEvents : readEvents;
+  const operationMemorySamples = memory.samples.filter((sample) => sample.phase === 'operation');
+  const settleMemorySamples = memory.samples.filter((sample) => sample.phase === 'settle');
   const observation: DemuxScaleObservation = {
     schema: 'media-test/demux-scale-observation@1',
     assetBytes: input.sizeBytes ?? 0,
     peakMemoryDeltaBytes: memory.deltaBytes,
+    memoryBaselineBytes: memory.baselineBytes,
+    memoryMaximumBytes: memory.maximumBytes,
+    memoryAfterOperationBytes: memory.memoryAfterOperationBytes,
+    ...(operationMemorySamples.length === 0
+      ? {}
+      : {
+          memoryOperationMaximumBytes: Math.max(
+            ...operationMemorySamples.map((sample) => sample.bytes),
+          ),
+        }),
+    ...(settleMemorySamples.length === 0
+      ? {}
+      : {
+          memorySettleMaximumBytes: Math.max(
+            ...settleMemorySamples.map((sample) => sample.bytes),
+          ),
+        }),
+    memorySampleCount: memory.samples.length,
     ...(readEvents.length > 0 ? { sourceReadCalls: readEvents.length } : {}),
     ...(finalReadBytes !== undefined ? { sourceBytesRead: finalReadBytes } : {}),
     longestLongTaskMs: longtasks.value.longestDurationMs,
@@ -7348,8 +7746,11 @@ function observedTargetWrites(output: MediaBytes, telemetry: OperationFinalCount
 
 function outputByteLength(output: MediaBytes): number {
   return output.variants?.length
-    ? output.variants.reduce((sum, variant) => sum + variant.bytes.byteLength, 0)
-    : output.bytes.byteLength;
+    ? output.variants.reduce(
+        (sum, variant) => sum + (variant.artifact?.byteLength ?? variant.bytes.byteLength),
+        0,
+      )
+    : output.artifact?.byteLength ?? output.bytes.byteLength;
 }
 
 function benchmarkPresentationDuration(
@@ -7728,15 +8129,11 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       };
     }
     const identity = declared.identities[0]!;
-    const result = await verifyContentStream(identity, async () => {
-      const response = await fetch(mediaAssetUrl(identity.logicalPath), {
-        cache: 'no-store',
-        ...(opts.signal ? { signal: opts.signal } : {}),
-      });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      if (!response.body) throw new Error('response has no readable body');
-      return response.body;
-    });
+    const result = await verifyStreamContentInDisposableWorker(
+      identity,
+      mediaAssetUrl(identity.logicalPath),
+      opts.signal,
+    );
     if (opts.signal?.aborted) {
       return { state: 'SKIPPED', reason: '[RUN_CANCELLED] content verification cancelled' };
     }
@@ -8079,8 +8476,9 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
       continue;
     }
     if (selectionFailureReason || !selection) {
+      const resultEngineId = reg.resultId ?? engineId;
       const blocked: ScenarioResult = {
-        engineId,
+        engineId: resultEngineId,
         browser: opts.browser,
         scenarioId: scenario.id,
         family: scenario.family,
@@ -8088,14 +8486,14 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         oracleOutcomes: [],
         reason: selectionFailureReason ?? '[CORPUS_NO_VERIFIED_CANDIDATE] scenario has no selected candidate',
         measurement: { state: 'NOT_REQUESTED' },
-        env: { ...runEnvBase, engineId },
+        env: { ...runEnvBase, engineId: resultEngineId },
         ...(scenario.primaryMetric ? { primaryMetric: scenario.primaryMetric } : {}),
       };
       await opts.resultReuse?.put(blocked).catch(() => undefined);
       results.push(blocked);
       opts.onResult?.(blocked);
       done += 1;
-      opts.onProgress?.(done, total, `${scenario.id} / ${engineId} (no verified candidate)`);
+      opts.onProgress?.(done, total, `${scenario.id} / ${resultEngineId} (no verified candidate)`);
       continue;
     }
 
@@ -8122,6 +8520,26 @@ export async function runMatrix(opts: RunOptions): Promise<ScenarioResult[]> {
         opts.onResult?.(result);
         done += 1;
         opts.onProgress?.(done, total, label);
+        continue;
+      }
+      if (reg.resultId !== undefined && engine.id !== reg.resultId) {
+        result = matrixSelectionStatusResult(
+          reg.resultId,
+          opts.browser,
+          scenario,
+          'ERROR',
+          `registered result identity '${reg.resultId}' disagrees with factory identity '${engine.id}'`,
+          selection,
+          exhaustiveList,
+          runEnvBase,
+        );
+        if (scenario.primaryMetric !== undefined) result.primaryMetric = scenario.primaryMetric;
+        await disposeConstructedEngine(engine, opts.signal);
+        await opts.resultReuse?.put(result).catch(() => undefined);
+        results.push(result);
+        opts.onResult?.(result);
+        done += 1;
+        opts.onProgress?.(done, total, `${scenario.id} / ${reg.resultId} (identity mismatch)`);
         continue;
       }
 

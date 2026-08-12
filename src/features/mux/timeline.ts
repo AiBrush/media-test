@@ -60,6 +60,12 @@ export function muxTimelineEvidenceFromProgram(
       });
     }
     const samples: MuxTimelineSample[] = [];
+    const timescale =
+      track.timescale !== undefined && Number.isSafeInteger(track.timescale) && track.timescale > 0
+        ? track.timescale
+        : 1_000_000;
+    const toTrackTicks = (microseconds: number): number =>
+      Math.round((microseconds * timescale) / 1_000_000);
     for (let index = 0; index < track.samples.length; index++) {
       const sample = track.samples[index]!;
       if (!Number.isSafeInteger(sample.ptsUs) || !Number.isSafeInteger(sample.dtsUs) ||
@@ -73,9 +79,9 @@ export function muxTimelineEvidenceFromProgram(
       }
       samples.push(Object.freeze({
         decodeIndex: index,
-        pts: sample.ptsUs!,
-        dts: sample.dtsUs!,
-        duration: sample.durationUs!,
+        pts: toTrackTicks(sample.ptsUs!),
+        dts: toTrackTicks(sample.dtsUs!),
+        duration: toTrackTicks(sample.durationUs!),
         keyframe: track.type === 'audio' ? true : sample.keyframe!,
       }));
     }
@@ -83,7 +89,7 @@ export function muxTimelineEvidenceFromProgram(
       semanticId: resolvedId,
       type: track.type,
       codec: track.codec,
-      timescale: 1_000_000,
+      timescale,
       samples: Object.freeze(samples),
     }));
   }

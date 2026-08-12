@@ -14,11 +14,26 @@ import {
   type AudioTransformContract,
   type GaplessNativeEvidence,
 } from '../src/features/audio-dsp/index.ts';
+import { robustnessContractFromOptions } from '../src/scenarios/robustness/contracts.ts';
 import { audioDspScenarios } from '../src/scenarios/audio-dsp/index.ts';
 import { demuxMp4GaplessAudio } from '../src/engines/platform/demux-mp4.ts';
 import { parseScenarioSourceCatalog, scenarioSourceMap } from '../src/core/media-selection.ts';
 
 const AUDIO_MEDIA = 'fixtures/media';
+
+describe('audio DSP robustness scenario contracts', () => {
+  test('image-to-audio negative publishes an explicit clean-rejection contract', () => {
+    const scenario = audioDspScenarios.find(
+      (item) => item.id === 'audio-dsp/negative_image_into_audio_transcode',
+    );
+    expect(scenario?.revision).toBe(2);
+    expect(robustnessContractFromOptions(scenario?.options)).toMatchObject({
+      inputClass: 'negative',
+      returnedOutputCheck: 'media-structure',
+      survivorOracles: ['graceful-failure'],
+    });
+  });
+});
 
 describe('REQ-FEAT-62/63 native PCM readers and evidence', () => {
   test('reads RIFF, WAVEFORMATEXTENSIBLE, AIFF and CAF with native shape', async () => {

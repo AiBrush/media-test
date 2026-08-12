@@ -14,6 +14,8 @@ import {
   type Scenario,
 } from '../src/core/scenario.ts';
 import { sha256Hex } from '../src/core/seeded-rng.ts';
+import { assessCandidateEligibility } from '../src/core/media-selection.ts';
+import { parseScenarioSourceCatalog } from '../src/core/selection-integrity.ts';
 import {
   decideRobustnessDisposition,
   robustnessContractFromOptions,
@@ -374,35 +376,35 @@ describe('REQ-FEAT-53 structural clear output and complete presentation', () => 
 });
 
 describe('REQ-FEAT-54 DERIVED rotation is positive-source-equivalence only', () => {
-  const sourceRows = textAt('fixtures/media/scenarios/_sources.ndjson')
-    .trim()
-    .split('\n')
-    .map((line) => JSON.parse(line) as Record<string, unknown>);
-  const censRow = sourceRows.find((row) => row.scenarioId === 'encryption/cenc_cens_decrypt') as {
-    files: Array<{
-      file: string;
-      sha256: string;
-      keys: DecryptKey & { scheme: 'cenc-cens' };
-      cleartextBase: { poolPath: string; sha256: string };
-    }>;
-  };
+  const catalog = parseScenarioSourceCatalog(textAt('fixtures/media/scenarios/_sources.ndjson'));
+  if (catalog.state !== 'VALID') throw new Error('scenario source catalog is invalid');
+  const censRow = catalog.catalog.rows.find((row) => row.scenarioId === 'encryption/cenc_cens_decrypt');
+  if (!censRow) throw new Error('CENS source row is missing');
   const positive = scenario('cenc_cens_decrypt');
   const candidates: DerivedCencCandidateContract[] = censRow.files.map((file) => ({
     sourceId: file.file,
     sourceSha256: file.sha256,
-    scheme: file.keys.scheme,
-    key: file.keys,
-    cleartextBaseAsset: file.cleartextBase.poolPath,
-    cleartextBaseSha256: file.cleartextBase.sha256,
+    scheme: file.keys!.scheme as 'cenc-cens',
+    key: file.keys! as DecryptKey,
+    cleartextBaseAsset: file.cleartextBase!.poolPath,
+    cleartextBaseSha256: file.cleartextBase!.sha256,
   }));
 
-  test('all three CENS candidates remain eligible with their own 64-bit source IV', () => {
+  test('all three CENS candidates are source/base-bound and fully eligible with distinct 64-bit IVs', () => {
     expect(provenanceOf(positive).schema).toBe(ENCRYPTION_KEY_PROVENANCE_SCHEMA);
     expect(isPositiveSourceEquivalenceScenario(positive)).toBe(true);
     expect(candidates).toHaveLength(3);
-    for (const candidate of candidates) {
+    expect(new Set(candidates.map(({ key }) => key.ivHex)).size).toBe(3);
+    for (const [index, candidate] of candidates.entries()) {
       expect(candidate.key.ivHex).toMatch(/^[0-9a-f]{16}$/);
       expect(assessDerivedEncryptionRotation(positive, candidate)).toMatchObject({ state: 'ELIGIBLE' });
+      expect(assessCandidateEligibility(positive, censRow, censRow.files[index]!)).toMatchObject({
+        eligible: true,
+        evidencePlan: {
+          requiredOracles: ['property-invariant'],
+          sufficientOracleSets: [['property-invariant']],
+        },
+      });
     }
   });
 
@@ -529,6 +531,10 @@ describe('REQ-FEAT-56 CENS/CBCS scheme, pattern, IV, and boundary coverage', () 
         ivSize: 16,
       });
     }
+    expect(scenario('cenc_cbcs_decrypt')).toMatchObject({
+      revision: 2,
+      options: { clearReferenceTimeline: 'protected-source' },
+    });
   });
 
   test('wrong algorithm, whole-sample, off-by-one pattern/IV, and subsample offsets localize FAIL', () => {

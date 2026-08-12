@@ -485,7 +485,11 @@ describe('REQ-ENG-21/22: representation packets, AAC views, and cadence evidence
       expect(tagged.tags?.major_brand).toBe('mp42');
 
       const rotated = await engine.probe(await fixtureInput('h264_rotated90.mp4'));
-      expect(rotated.tracks.find((track) => track.type === 'video')?.rotation).toBe(90);
+      expect(rotated.tracks.find((track) => track.type === 'video')?.rotation).toBe(270);
+      expect(rotated.tracks.map((track) => track.defaultDisposition)).toEqual([true, true]);
+
+      const multitrack = await engine.probe(await fixtureInput('h264_multitrack.mp4'));
+      expect(multitrack.tracks.map((track) => track.defaultDisposition)).toEqual([true, true, false]);
 
       const vfr = await engine.probe(await fixtureInput(
         'scenarios/probe/h264_vfr/02.mp4',
