@@ -176,10 +176,14 @@ async function imageDataFromAibrushFrame(frame: VideoFrame): Promise<ImageData> 
     try {
       // VideoFrame.copyTo accepts any ArrayBufferView. Writing directly into ImageData's required
       // Uint8ClampedArray avoids the extra full-frame Uint8Array → Uint8ClampedArray copy that otherwise
-      // dominates dense CPU-readable decode workloads.
+      // dominates dense CPU-readable decode workloads. The resolved layout must describe ONE packed RGBA
+      // plane: a runtime that ignores the requested format (WebKit 26) resolves with its native planar
+      // layout and plane bytes, which are not the picture. Fall through to the shared raster there.
       const rgba = new Uint8ClampedArray(width * height * 4);
-      await frame.copyTo(rgba, { format: 'RGBA' });
-      return new ImageData(rgba, width, height);
+      const layouts = await frame.copyTo(rgba, { format: 'RGBA' });
+      if (!Array.isArray(layouts) || (layouts.length === 1 && (layouts[0]?.stride ?? 0) >= width * 4)) {
+        return new ImageData(rgba, width, height);
+      }
     } catch {
       // Rotation/crop/browser-format edges retain the shared canvas-aware normalization fallback.
     }

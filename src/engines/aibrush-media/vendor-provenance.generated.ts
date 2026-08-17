@@ -4,8 +4,8 @@ export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {
   formatVersion: 1,
   dependency: 'file:../media',
   packageVersion: '0.0.0',
-  sourceRevision: '2944b1c4a4cb6e9ccd9803a9c9c2edfd67595c87',
-  sourceTreeDigest: '576ded255b8bbf366462cb5467b69c84ca626839101c21be7fbe6bfa77f93a5c',
+  sourceRevision: 'c14a9cea1f83d8811a7af05c030c191251058afa',
+  sourceTreeDigest: 'e2cfdcded586918e54f4025d6639585b4a047a155856f2359f265bd220b60b18',
   dirtyState: 'dirty',
   buildFlags: [
     'bun run build',

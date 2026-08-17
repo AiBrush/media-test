@@ -88,6 +88,23 @@ export async function imageDataFromVideoFrame(frame: VideoFrame): Promise<ImageD
   return canvas.getImageData();
 }
 
+/**
+ * True only when a resolved copyTo really produced ONE packed RGBA plane.
+ *
+ * `format: 'RGBA'` conversion is optional in WebCodecs. Chromium and Gecko perform it and resolve with a
+ * single plane whose stride is `width × 4`. WebKit 26 ignores the requested format: it resolves with the
+ * frame's NATIVE planar layout (e.g. two NV12 planes of stride `width`) and writes those plane bytes into
+ * the destination, so reading the result as RGBA yields a picture that is not the decoded frame at all.
+ * WebKit does report that layout honestly, so the resolved layout is the gate. A runtime that reports no
+ * layout carries no counter-evidence and is trusted; a rejected conversion already falls through.
+ */
+function isPackedRgbaLayout(layouts: unknown, width: number): boolean {
+  if (!Array.isArray(layouts)) return true;
+  if (layouts.length !== 1) return false;
+  const plane = layouts[0] as { stride?: unknown } | undefined;
+  return typeof plane?.stride === 'number' && plane.stride >= width * 4;
+}
+
 async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: number): Promise<ImageData | null> {
   const f = frame as unknown as {
     codedWidth?: number;
@@ -108,7 +125,8 @@ async function imageDataViaCopyTo(frame: VideoFrame, width: number, height: numb
 
   try {
     const rgba = new Uint8Array(width * height * 4);
-    await f.copyTo(rgba, { format: 'RGBA' });
+    const layouts = await f.copyTo(rgba, { format: 'RGBA' });
+    if (!isPackedRgbaLayout(layouts, width)) return null;
     return new ImageData(new Uint8ClampedArray(rgba), width, height);
   } catch {
     return null;
