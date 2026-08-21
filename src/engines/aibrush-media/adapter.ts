@@ -1166,6 +1166,7 @@ interface AibrushMedia {
   readonly ConstraintUnsatisfiedError: NonNullable<AibrushErrorClasses['ConstraintUnsatisfiedError']>;
   createMedia(opts?: {
     determinism?: 'auto' | 'force-software';
+    assetBaseUrl?: string;
   }): AibrushEngine;
   toStream(): AibrushStreamSink;
   toStreamTarget(

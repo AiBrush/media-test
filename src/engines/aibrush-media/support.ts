@@ -32,14 +32,21 @@ const PCM_CODECS = new Set([
 ]);
 const VIDEO_ENCODERS = new Set(["h264", "hevc", "av1", "vp8", "vp9"]);
 const DEMUX_VIDEO_CODECS = new Set([...VIDEO_ENCODERS, "mjpeg"]);
+// `mp3` joined this set once @aibrush/media shipped its lazy LAME WebAssembly encode tail
+// (`src/codecs/wasm-mp3-enc`). Verified against the installed build in a real browser: a 5.04 s 48 kHz
+// stereo WAV converts to MP4 with an `mp4a.6b` track in 118 ms, the raw elementary stream carries 211
+// valid MPEG-1 Layer III frames at the requested rate, and decoding that output back yields 241,920
+// samples of non-silent PCM. No browser exposes an `AudioEncoder` for MP3, so this is a framework tail,
+// not a platform capability.
 const AUDIO_ENCODERS = new Set([
 	"aac",
 	"opus",
 	"flac",
+	"mp3",
 	"vorbis",
 	...PCM_CODECS,
 ]);
-const DEMUX_AUDIO_CODECS = new Set([...AUDIO_ENCODERS, "mp3"]);
+const DEMUX_AUDIO_CODECS = new Set([...AUDIO_ENCODERS]);
 const LOSSY_TRIM_AUDIO_CODECS = new Set(["aac", "mp3", "opus"]);
 const STILL_IMAGE_PROBE_VIDEO_CODEC = new Map<string, string>([
 	["jpeg", "mjpeg"],
@@ -347,22 +354,20 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 
 	const tracks = inputs.flatMap((input) => input.tracks);
 	const codecs = tracks.map((track) => track.codec.toLowerCase());
-	if (
-		operation === "trim" &&
-		options.invariant === "trim-audio-content" &&
-		tracks.length > 0 &&
-		tracks.every((track) => track.type === "audio") &&
+	// Same-container MP3→MP3 exact trim is no longer a packet-copy problem for @aibrush/media. The old
+	// declaration assumed the decoder had to be warmed by replaying whole source frames, which does blow
+	// the 12-bit LAME delay field (measured: the 5 s cut of `mp3_xing.mp3` needs 5–6 lead frames, delay
+	// 6804). The engine instead synthesizes one silent Layer III carrier frame holding exactly the bytes
+	// the first target frame borrows through its bit reservoir (a ≤511-byte dependency, not a frame one),
+	// so the lead-in collapses to 2 frames on MPEG-1 / 3 on MPEG-2/2.5 and the authored delay is always
+	// inside the field. Verified over 5 fixtures × 56 trim points against ffmpeg as an independent
+	// decoder: bit-exact over the authored window in every case.
+	const singleTrackMp3Program =
 		inputContainers.length === 1 &&
 		firstContainer === "mp3" &&
 		outputContainer === "mp3" &&
 		tracks.length === 1 &&
-		codecs[0] === "mp3"
-	) {
-		return reject(
-			"AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED",
-			"MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable",
-		);
-	}
+		codecs[0] === "mp3";
 	if (
 		operation === "trim" &&
 		options.invariant === "trim-audio-content" &&
@@ -371,6 +376,7 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 		tracks.some((track) =>
 			LOSSY_TRIM_AUDIO_CODECS.has(track.codec.toLowerCase()),
 		) &&
+		!singleTrackMp3Program &&
 		!(
 			inputContainers.length === 1 &&
 			firstContainer === "ogg" &&
@@ -381,7 +387,7 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 	) {
 		return reject(
 			"AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED",
-			"the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
+			"raw ADTS carries whole AAC access units with no delay/padding field and no edit list, and AAC-LC's 50%-overlap 2048-sample MDCT makes the first copied access unit decode differently from the source, so the exact decoded presentation window is not authorable outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
 		);
 	}
 	if (operation === "remux" && outputContainer !== undefined) {

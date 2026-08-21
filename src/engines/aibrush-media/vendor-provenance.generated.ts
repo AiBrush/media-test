@@ -4,9 +4,9 @@ export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {
   formatVersion: 1,
   dependency: 'file:../media',
   packageVersion: '0.0.0',
-  sourceRevision: 'c14a9cea1f83d8811a7af05c030c191251058afa',
-  sourceTreeDigest: 'e2cfdcded586918e54f4025d6639585b4a047a155856f2359f265bd220b60b18',
-  dirtyState: 'dirty',
+  sourceRevision: '08d5ca8e6ab7ed10e88860b9cd628488af2190c2',
+  sourceTreeDigest: 'a1c4f825163b58d321990e2974683826a6bd8e0abf5a0144f30d12395d65cfae',
+  dirtyState: 'clean',
   buildFlags: [
     'bun run build',
     'bun run vendor-wasm',
@@ -14,6 +14,7 @@ export const GENERATED_AIBRUSH_VENDOR_PROVENANCE = {
   bundledWasmArtifacts: [
     { path: 'dist/aac_wasm_bg.wasm', sha256: 'd31dcbbfb9b733b6f3256b040d85e862d3c00d8ee4d4a69a017f69155814219c' },
     { path: 'dist/dav1d_wasm_bg.wasm', sha256: 'db43216c275e6eb82662125a0aec794fd4a30153a1e60915558fe53113365487' },
+    { path: 'dist/mp3_enc_wasm_bg.wasm', sha256: '85e81719250b9a667b1258143f689dda70e3e57a7e7c29ab0b4cef65c8f6eb9a' },
     { path: 'dist/mp3_wasm_bg.wasm', sha256: 'b56264c129fdadeb347f31c9d7da3ef2ff77a48830bac181add4614aa7fba032' },
     { path: 'dist/vorbis_wasm_bg.wasm', sha256: '602175754176d500e2530baa96ca9a8ac8fbcc4d33a559c6cc7a44eba0390d22' },
   ],
