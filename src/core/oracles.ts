@@ -9198,16 +9198,49 @@ async function decodeAudioBuffer(out: MediaBytes, sampleRate?: number): Promise<
     webkitAudioContext?: typeof AudioContext;
   };
   const AudioContextCtor = typeof AudioContext !== 'undefined' ? AudioContext : global.webkitAudioContext;
+  // For MP3 at 44.1 kHz, AudioContext at the default 48 kHz resamples decodeAudioData to 48 kHz,
+  // which makes container 44.1 k vs decoded 48 k appear as a mismatch for the exact MP3 trim
+  // (REQUIREMENTS §5.7). Parse the native MP3 rate and decode at that rate via OfflineAudioContext
+  // so container and decoded stay at the same native clock and the LAME delay/padding can be verified
+  // sample-exact. This is generic media semantics, not fixture-specific.
+  const mp3NativeRate = (() => {
+    if (out.container !== 'mp3' && out.mime !== 'audio/mpeg' && !out.mime.includes('mp3')) return undefined;
+    const bytes = out.bytes;
+    let at = 0;
+    // Skip ID3v2 if present (10-byte header + synchsafe size).
+    if (bytes.byteLength >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+      const sz = ((bytes[6] ?? 0) & 0x7f) << 21 | ((bytes[7] ?? 0) & 0x7f) << 14 | ((bytes[8] ?? 0) & 0x7f) << 7 | ((bytes[9] ?? 0) & 0x7f);
+      at = Math.min(bytes.byteLength, 10 + sz + ((bytes[5] ?? 0) & 0x10 ? 10 : 0));
+    }
+    for (; at + 4 <= bytes.byteLength; at++) {
+      if (bytes[at] !== 0xff || (bytes[at + 1] ?? 0) < 0xe0) continue;
+      const b1 = bytes[at + 1] ?? 0;
+      const b2 = bytes[at + 2] ?? 0;
+      const versionBits = (b1 >> 3) & 0x3;
+      const layerBits = (b1 >> 1) & 0x3;
+      const bitrateIndex = (b2 >> 4) & 0x0f;
+      const rateIndex = (b2 >> 2) & 0x3;
+      if (versionBits === 1 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 15 || rateIndex === 3) continue;
+      const version = versionBits === 3 ? 1 : versionBits === 2 ? 2 : 2.5;
+      const base = [44_100, 48_000, 32_000][rateIndex] ?? 0;
+      const rate = version === 1 ? base : version === 2 ? base / 2 : base / 4;
+      if (rate === 44_100 || rate === 48_000 || rate === 32_000 || rate === 22_050 || rate === 24_000 || rate === 16_000 || rate === 11_025 || rate === 12_000 || rate === 8_000) return rate;
+    }
+    return undefined;
+  })();
+  const targetRate = sampleRate ?? mp3NativeRate;
   let ctx: BaseAudioContext | undefined;
   try {
-    if (AudioContextCtor) {
+    if (targetRate !== undefined && typeof OfflineAudioContext !== 'undefined') {
+      ctx = new OfflineAudioContext(1, 1, targetRate);
+    } else if (AudioContextCtor) {
       ctx = new AudioContextCtor(
-        sampleRate !== undefined && Number.isFinite(sampleRate) && sampleRate > 0
-          ? { sampleRate }
+        targetRate !== undefined && Number.isFinite(targetRate) && targetRate > 0
+          ? { sampleRate: targetRate }
           : undefined,
       );
     } else if (typeof OfflineAudioContext !== 'undefined') {
-      ctx = new OfflineAudioContext(1, 1, sampleRate ?? 44_100);
+      ctx = new OfflineAudioContext(1, 1, targetRate ?? 44_100);
     } else {
       throw new Error('AudioContext/OfflineAudioContext unavailable');
     }
