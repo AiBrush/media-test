@@ -8,17 +8,10 @@
     "note": "Use bun/bunx. npm/npx are unavailable in this environment."
   },
   "scripts": {
-    "bake": "bash scripts/bake-fixtures.sh",
-    "bake:scenario-goldens": "bun fixtures/bake-scenario-goldens.mjs",
-    "serve": "bash scripts/serve.sh",
-    "run": "bash scripts/run.sh",
-    "sync-vendor": "bash scripts/sync-aibrush-vendor.sh",
-    "compare": "bash scripts/compare.sh",
-    "add-engine": "bash scripts/add-engine.sh",
-    "dev": "vite",
     "build": "vite build",
-    "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "serve": "bash scripts/serve.sh --preview --port 5152",
+    "dev": "vite",
+    "sync-vendor": "bash scripts/sync-aibrush-vendor.sh"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.70",

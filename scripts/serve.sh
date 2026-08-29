@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # scripts/serve.sh — serve the manual-idle suite URL in any supported browser. Serves the app
-# (Vite dev server) AND the fixtures/ tree (media + golden)
-# from the same origin so the runner can fetch /fixtures/media/<id> and /fixtures/golden/<id>.*.json.
+# AND the fixtures/ tree (media + golden) from the same origin so the runner can fetch
+# /fixtures/media/<id> and /fixtures/golden/<id>.*.json.
 #
-# Uses bun/bunx (npm/npx are unavailable in this environment, §1). Vite is the default — it resolves
-# the .ts module imports and serves the repo root, which already contains fixtures/, so no extra
-# config is needed. Falls back to `vite preview` against a build if a dev server is not wanted.
+# Uses bun/bunx (npm/npx are unavailable in this environment, §1).
+# Default is `vite preview` (production build, no watch/HMR) — the `serve` script must NOT
+# restart on code change. `dev` (vite dev server) is the hot/watch mode.
 #
-#   serve.sh                 # vite dev server on :5151 (default)
+#   serve.sh                 # build then `vite preview` on :5152 (default, no watch/HMR)
 #   serve.sh --port 8080     # choose a port
 #   serve.sh --host          # explicitly expose on the LAN (0.0.0.0; review trust boundary first)
-#   serve.sh --preview       # build then `vite preview` (serves dist/ + fixtures via symlink)
+#   serve.sh --dev           # vite dev server with HMR (hot/watch mode, same as `bun run dev`)
+#   serve.sh --preview       # alias for default preview mode (kept for backwards compat)
 #
 # Cross-origin isolation: performance.measureUserAgentSpecificMemory needs COOP/COEP headers. Vite's
 # dev server honors a small middleware we set via the VITE config if present; absent that, peak-mem
@@ -22,20 +23,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
-PORT="5151"
+PORT="5152"
 HOST_VALUE="127.0.0.1"
-PREVIEW=0
+PREVIEW=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --port=*) PORT="${1#*=}"; shift ;;
-    --host) HOST_VALUE="0.0.0.0"; echo "warning: explicitly exposing the media-test dev server on the LAN" >&2; shift ;;
+    --host) HOST_VALUE="0.0.0.0"; echo "warning: explicitly exposing the media-test server on the LAN" >&2; shift ;;
     --preview) PREVIEW=1; shift ;;
+    --dev) PREVIEW=0; shift ;;
     -h|--help)
       printf '%s\n' \
-        "bash scripts/serve.sh [--port <n>] [--host] [--preview]" \
-        "Serves on 127.0.0.1:5151 (loopback by default). --host explicitly exposes 0.0.0.0 to the LAN." \
+        "bash scripts/serve.sh [--port <n>] [--host] [--preview] [--dev]" \
+        "Default: build then vite preview on 127.0.0.1:5152 (loopback, NO watch/HMR, does not restart on code change)." \
+        "--preview is the default and kept for backwards compat. --dev starts the vite dev server with HMR (hot/watch)." \
+        "--host explicitly exposes 0.0.0.0 to the LAN." \
         "The suite can be opened manually or automated in a visible browser window by scripts/run.sh."
       exit 0 ;;
     *) echo "serve.sh: unknown arg '$1'" >&2; exit 2 ;;
