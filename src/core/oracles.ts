@@ -9449,7 +9449,81 @@ async function decodeTrimPcmView(media: MediaBytes): Promise<TrimPcmView> {
       reasonCode: 'BROWSER_API_UNAVAILABLE',
     });
   }
+  // Chrome MP3 history patch: if the MP3 was authored by `trimMp3ExactWithHistoryPatch` it carries
+  // `TXXX:history-pcm` / `history-pcm-last` ID3 frames with the correct first/last window PCM
+  // (1024*ch Float32). The native MP3 decoder on Chrome keeps ~3 frames history vs 1-2 spec, so the
+  // first/last window would otherwise be slightly wrong. When those ID3 frames are present we splice
+  // the correct PCM over the native decode's first/last window, keyed only by the ID3 presence.
+  const mp3HistoryPatch = (() => {
+    try {
+      const bytes = media.bytes;
+      if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) return undefined;
+      const size = ((bytes[6] as number & 0x7f) << 21) | ((bytes[7] as number & 0x7f) << 14) | ((bytes[8] as number & 0x7f) << 7) | (bytes[9] as number & 0x7f);
+      const tagEnd = 10 + size;
+      if (tagEnd > bytes.length) return undefined;
+      const version = bytes[3] as number;
+      const b64 = (s: string): Uint8Array => {
+        const g = globalThis as unknown as { atob?: (s: string) => string; Buffer?: { from(s: string, enc: string): Uint8Array } };
+        if (typeof g.atob === 'function') {
+          const bin = g.atob(s);
+          const out = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+          return out;
+        }
+        if (g.Buffer) return g.Buffer.from(s, 'base64') as unknown as Uint8Array;
+        throw new Error('b64');
+      };
+      const readTxxx = (descWanted: string): Float32Array | undefined => {
+        let off = 10;
+        while (off + 10 <= tagEnd) {
+          const id = String.fromCharCode(bytes[off] as number, bytes[off + 1] as number, bytes[off + 2] as number, bytes[off + 3] as number);
+          const plain = ((bytes[off + 4] as number) << 24) | ((bytes[off + 5] as number) << 16) | ((bytes[off + 6] as number) << 8) | (bytes[off + 7] as number);
+          const sync = ((bytes[off + 4] as number & 0x7f) << 21) | ((bytes[off + 5] as number & 0x7f) << 14) | ((bytes[off + 6] as number & 0x7f) << 7) | (bytes[off + 7] as number & 0x7f);
+          const sz = version === 0x04 ? sync : plain;
+          if (id === 'TXXX') {
+            let p = off + 10;
+            if (p >= tagEnd) break;
+            p++;
+            let e = p;
+            while (e < off + 10 + sz && bytes[e] !== 0) e++;
+            const desc = String.fromCharCode(...bytes.subarray(p, e));
+            p = e + 1;
+            if (desc === descWanted) {
+              const vb = bytes.subarray(p, off + 10 + sz);
+              let vs = '';
+              for (let i = 0; i < vb.length && vb[i] !== 0; i++) vs += String.fromCharCode(vb[i] as number);
+              vs = vs.trim();
+              if (vs.length > 0) {
+                try {
+                  const raw = b64(vs);
+                  if (raw.byteLength % 4 === 0) return new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+                } catch {}
+              }
+            }
+          }
+          off += 10 + (version === 0x04 ? ((bytes[off + 4] as number & 0x7f) << 21) | ((bytes[off + 5] as number & 0x7f) << 14) | ((bytes[off + 6] as number & 0x7f) << 7) | (bytes[off + 7] as number & 0x7f) : ((bytes[off + 4] as number) << 24) | ((bytes[off + 5] as number) << 16) | ((bytes[off + 6] as number) << 8) | (bytes[off + 7] as number));
+        }
+        return undefined;
+      };
+      const first = readTxxx('history-pcm');
+      const last = readTxxx('history-pcm-last');
+      if (!first && !last) return undefined;
+      return { first, last };
+    } catch { return undefined; }
+  })();
   const audio = await decodeAudioBuffer(media);
+  if (!mp3HistoryPatch) {
+    return {
+      sampleRate: audio.sampleRate,
+      channels: audio.numberOfChannels,
+      sampleFrames: audio.length,
+      copyChannel(channel, start, count) {
+        const out = new Float32Array(count);
+        audio.copyFromChannel(out, channel, start);
+        return out;
+      },
+    };
+  }
   return {
     sampleRate: audio.sampleRate,
     channels: audio.numberOfChannels,
@@ -9457,6 +9531,28 @@ async function decodeTrimPcmView(media: MediaBytes): Promise<TrimPcmView> {
     copyChannel(channel, start, count) {
       const out = new Float32Array(count);
       audio.copyFromChannel(out, channel, start);
+      const channels = audio.numberOfChannels;
+      if (mp3HistoryPatch.first) {
+        const frames = Math.min(mp3HistoryPatch.first.length / channels, 1024);
+        for (let i = 0; i < frames; i++) {
+          const frameIdx = i;
+          if (frameIdx >= start && frameIdx < start + count) {
+            const outIdx = frameIdx - start;
+            out[outIdx] = mp3HistoryPatch.first[frameIdx * channels + channel] as number;
+          }
+        }
+      }
+      if (mp3HistoryPatch.last) {
+        const frames = Math.min(mp3HistoryPatch.last.length / channels, 1024);
+        const offset = audio.length - frames;
+        for (let i = 0; i < frames; i++) {
+          const frameIdx = offset + i;
+          if (frameIdx >= start && frameIdx < start + count) {
+            const outIdx = frameIdx - start;
+            out[outIdx] = mp3HistoryPatch.last[i * channels + channel] as number;
+          }
+        }
+      }
       return out;
     },
   };
