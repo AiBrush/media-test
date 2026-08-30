@@ -217,7 +217,30 @@ async function boot(): Promise<void> {
     handshakeSchema: LAUNCHER_RUN_HANDSHAKE_SCHEMA,
     ready: true,
   };
-  if (shouldAutoStart()) window.setTimeout(() => { void runFromUi(); }, 0);
+  if (shouldAutoStart()) window.setTimeout(() => {
+    const params = new URLSearchParams(window.location.search);
+    const hasFilter = params.has('engine') || params.has('pillar') || params.has('scenario') || params.has('feature') || params.has('operation') || params.has('exhaustive') || params.has('reuse');
+    if (hasFilter) {
+      const filter: SuiteRunFilter = {};
+      const engine = params.get('engine');
+      if (engine) filter.engineIds = engine.split(',').map((s) => s.trim()).filter(Boolean);
+      const pillar = params.get('pillar');
+      if (pillar) filter.pillar = pillar as SuiteRunFilter['pillar'];
+      const scenario = params.get('scenario');
+      if (scenario) filter.scenarioIds = scenario.split(',').map((s) => s.trim()).filter(Boolean);
+      const feature = params.get('feature');
+      if (feature) filter.featureIds = feature.split(',').map((s) => s.trim()).filter(Boolean) as SuiteRunFilter['featureIds'];
+      const operation = params.get('operation');
+      if (operation) filter.operations = operation.split(',').map((s) => s.trim()).filter(Boolean) as SuiteRunFilter['operations'];
+      const exhaustive = params.get('exhaustive');
+      filter.exhaustiveMedia = exhaustive === null ? false : (exhaustive === '1' || exhaustive === 'true');
+      const reuse = params.get('reuse');
+      filter.reuseData = reuse === null ? true : (reuse === '1' || reuse === 'true');
+      void runFromFilter(filter);
+    } else {
+      void runFromUi();
+    }
+  }, 0);
 }
 
 async function restoreLatestCachedRun(): Promise<boolean> {
@@ -338,8 +361,13 @@ function wireControls(): void {
 }
 
 function shouldAutoStart(): boolean {
-  const autorun = new URLSearchParams(window.location.search).get('autorun');
-  return autorun === '1' || autorun === 'true';
+  const params = new URLSearchParams(window.location.search);
+  const autorun = params.get('autorun');
+  if (autorun === '0' || autorun === 'false') return false;
+  if (autorun === '1' || autorun === 'true') return true;
+  // `bun run serve` (5152) or any explicit filter param (?engine=, ?pillar=, ?scenario=) auto-runs like other frameworks
+  if (params.has('engine') || params.has('pillar') || params.has('scenario') || params.has('feature') || params.has('operation')) return true;
+  return window.location.port === '5152';
 }
 
 function setRunButtonLabel(text: string): void {
@@ -485,6 +513,13 @@ async function runFromFilter(
       ? listScenarios()
       : listScenarios().filter((scenario) => filter.scenarioIds!.includes(scenario.id));
     selectedScenarios = filterScenarios(requestedScenarios, filter);
+    if (filter.scenarioIds !== undefined && selectedScenarios.length !== requestedScenarios.length) {
+      const dropped = requestedScenarios.filter((s) => !selectedScenarios.some((sel) => sel.id === s.id));
+      const droppedIds = dropped.map((s) => s.id).join(', ');
+      const msg = `${dropped.length} explicitly requested scenario(s) were excluded by pillar/feature/operation filters: ${droppedIds}. Check --pillar (functional vs all vs robustness) and feature/operation selections.`;
+      console.warn(`[run] ${msg}`);
+      try { setRunStatus(msg); } catch {}
+    }
     configuration = freezeRunConfiguration({
       ...filter,
       browser: resolvedBrowser,

@@ -8,9 +8,9 @@
     "note": "Use bun/bunx. npm/npx are unavailable in this environment."
   },
   "scripts": {
-    "build": "vite build",
-    "serve": "bash scripts/serve.sh --preview --port 5152",
-    "dev": "vite",
+    "build": "bun --bun vite build",
+    "serve": "lsof -ti:5152 | xargs kill -9 2>/dev/null || true; sleep 1; bun --bun vite build && bun --bun vite preview --port 5152 --host 127.0.0.1 --strictPort",
+    "dev": "bun --bun vite",
     "sync-vendor": "bash scripts/sync-aibrush-vendor.sh"
   },
   "devDependencies": {

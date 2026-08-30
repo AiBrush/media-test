@@ -55,11 +55,9 @@ time.
 ## Commands (bun only — npm/npx unavailable)
 
 ```sh
-bash scripts/serve.sh                 # vite dev server → http://127.0.0.1:5151
-bash scripts/run.sh --browser chromium --engine <id> --feature <family> \
-    --port 5151 --no-reuse            # one cell, visible Playwright browser (needs display)
-#   add --exhaustive for the full per-file sweep; --scenario <id> for one row
-bash scripts/compare.sh               # results/raw/*.json → results/report.md
+bun run dev                 # vite dev server → http://127.0.0.1:5151
+bun run serve               # vite build + preview → http://127.0.0.1:5152
+bun run build               # production build
 bun test && bun run typecheck         # unit tests — must stay green
 ```
 
@@ -79,11 +77,9 @@ await window.__SUITE__.run({ engineIds: ['mp4box'], featureIds: ['trim'],
 
 ## Traps
 
-- Secure context: only `http://127.0.0.1:5151` (serve.sh also sets COOP/COEP, required
+- Secure context: only `http://127.0.0.1:5151` / `5152` (vite sets COOP/COEP, required
   for memory measurement and multithreaded ffmpeg.wasm). LAN-HTTP ⇒ every cell ERRORs.
-- `run.sh` remembers and reuses its last free cache-origin port. If that port is busy it announces
-  a temporary origin with a separate IndexedDB cache. Pin `--port 5151` when an exact origin is
-  required; use `--no-reuse` to force a fresh run.
+- `bun run serve` is `127.0.0.1:5152` (preview), `bun run dev` is `127.0.0.1:5151` (dev). Use `reuseData:false` in `window.__SUITE__.run()` to force a fresh run.
 - Fixtures must exist (`fixtures/manifest.json`); baking (`bun run bake`) needs native
   ffmpeg and is the only place native ffmpeg is allowed.
 

@@ -10,8 +10,8 @@
       origin. All measurement happens in-page / in Workers — never in the launcher process.
 
       Presentation only: the live scoreboard, hero chips and cell animations are wired in src/app/ui.ts
-      against the ids below. They are purely cosmetic — a run never depends on them, and the automated
-      launcher (scripts/launch.mjs) drives the page through window.__SUITE__, not the DOM.
+      against the ids below. They are purely cosmetic — a run never depends on them, and
+      in-page `window.__SUITE__.run()` drives the suite through window.__SUITE__, not the DOM.
     -->
     <style>
       :root {
@@ -1661,7 +1661,7 @@
     </header>
 
     <noscript>
-      <p class="banner">This suite requires JavaScript modules. Serve it with <code>scripts/serve.sh</code>.</p>
+      <p class="banner">This suite requires JavaScript modules. Serve it with <code>bun run dev</code> or <code>bun run serve</code>.</p>
     </noscript>
 
     <section id="env-section" class="fade-seq" style="animation-delay: 0.1s">
@@ -1793,7 +1793,7 @@
               </span>
             </label>
             <label class="toggle-card">
-              <input data-run-config="true" id="exhaustive-media" type="checkbox" checked />
+              <input data-run-config="true" id="exhaustive-media" type="checkbox" />
               <span class="toggle-copy">
                 <strong>Use every eligible media file</strong>
                 <small>Run each scenario across its full catalog instead of its canonical input.</small>

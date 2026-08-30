@@ -1,7 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { $ } from 'bun';
 
 import {
   adaptiveBench,
@@ -64,7 +62,7 @@ describe('REQ-FEAT-68: actual output presentation-unit numerators', () => {
       ['h264_vfr.mp4', 111],
     ] as const;
     for (const [file, expectedVideoUnits] of fixtures) {
-      const bytes = new Uint8Array(await Bun.file(join(ROOT, 'fixtures/media', file)).arrayBuffer());
+      const bytes = new Uint8Array(await Bun.file(`${ROOT}/fixtures/media/${file}`).arrayBuffer());
       const output: MediaBytes = { bytes, mime: 'video/mp4', container: 'mp4' };
       const counted = countOutputPresentationUnits(output);
       expect(counted).toMatchObject({
@@ -87,7 +85,7 @@ describe('REQ-FEAT-68: actual output presentation-unit numerators', () => {
       state: 'AVAILABLE', value: { count: 240, source: 'adapter-final-counter' },
     });
 
-    const bytes = new Uint8Array(await Bun.file(join(ROOT, 'fixtures/media/h264_vfr.mp4')).arrayBuffer());
+    const bytes = new Uint8Array(await Bun.file(`${ROOT}/fixtures/media/h264_vfr.mp4`).arrayBuffer());
     expect(countOutputPresentationUnits({
       bytes, mime: 'video/mp4', container: 'mp4', telemetry: { encodedFrames: 110 },
     })).toMatchObject({ state: 'UNAVAILABLE', status: 'ERROR', reasonCode: 'ENCODED_FRAME_COUNTER_MISMATCH' });
@@ -700,8 +698,8 @@ describe('REQ-FEAT-72: complete early-joined bundle transfer components', () => 
 
   test('the production build producer counts emitted JS plus runtime WASM, workers, and codec cores', async () => {
     await runCommand(['bun', 'run', 'build']);
-    const temporary = mkdtempSync(join(tmpdir(), 'media-test-bundles-'));
-    const artifactPath = join(temporary, 'bundle-measurements.json');
+    const temporary = (await $`mktemp -d /tmp/media-test-bundles-XXXXXX`.text()).trim();
+    const artifactPath = `${temporary}/bundle-measurements.json`;
     try {
       await runCommand([
         'bun',
@@ -709,7 +707,7 @@ describe('REQ-FEAT-72: complete early-joined bundle transfer components', () => 
         '--dist', 'dist',
         '--out', artifactPath,
       ]);
-      const artifact = JSON.parse(readFileSync(artifactPath, 'utf8')) as ProductionBundleArtifact;
+      const artifact = JSON.parse(await Bun.file(artifactPath).text()) as ProductionBundleArtifact;
       expect(artifact.measurements).toHaveLength(7);
       for (const measurement of artifact.measurements) {
         expect(measurement.state).toBe('MEASURED');
@@ -723,7 +721,7 @@ describe('REQ-FEAT-72: complete early-joined bundle transfer components', () => 
         expect(measurement.transferTotalBytes).toBe(componentTotal);
         for (const component of measurement.components) {
           expect(component.files.reduce((sum, file) => sum + file.transferBytes, 0)).toBe(component.transferBytes);
-          for (const file of component.files) expect(existsSync(join(ROOT, 'dist', file.path))).toBe(true);
+          for (const file of component.files) expect(await Bun.file(`${ROOT}/dist/${file.path}`).exists()).toBe(true);
         }
       }
 
@@ -743,7 +741,7 @@ describe('REQ-FEAT-72: complete early-joined bundle transfer components', () => 
       expect(componentBytes('aibrush-media@dev', 'worker')).toBeGreaterThan(0);
       expect(componentBytes('aibrush-media@dev', 'codec-core')).toBeGreaterThan(0);
     } finally {
-      rmSync(temporary, { recursive: true, force: true });
+      await $`rm -rf ${temporary}`.quiet();
     }
   }, 120_000);
 });
@@ -812,8 +810,8 @@ describe('REQ-FEAT-74: data-driven scale availability and de-duplicated question
     expect(performanceAggregateScenarioIds).not.toContain('performance/op-sweep-demux');
   });
 
-  test('committed long-form identities and goldens run without stale source availability notes', () => {
-    const manifest = JSON.parse(readFileSync(join(ROOT, 'fixtures/manifest.json'), 'utf8')) as {
+  test('committed long-form identities and goldens run without stale source availability notes', async () => {
+    const manifest = JSON.parse(await Bun.file(`${ROOT}/fixtures/manifest.json`).text()) as {
       assets: Array<{ id: string; sha256?: string; sizeBytes?: number }>;
     };
     for (const assetId of [
@@ -824,8 +822,8 @@ describe('REQ-FEAT-74: data-driven scale availability and de-duplicated question
       const asset = manifest.assets.find((entry) => entry.id === assetId)!;
       expect(asset.sha256).toMatch(/^[0-9a-f]{64}$/);
       expect(asset.sizeBytes).toBeGreaterThan(0);
-      expect(existsSync(join(ROOT, 'fixtures/golden', `${assetId}.meta.json`))).toBe(true);
-      expect(existsSync(join(ROOT, 'fixtures/golden', `${assetId}.packets.json`))).toBe(true);
+      expect(await Bun.file(`${ROOT}/fixtures/golden/${assetId}.meta.json`).exists()).toBe(true);
+      expect(await Bun.file(`${ROOT}/fixtures/golden/${assetId}.packets.json`).exists()).toBe(true);
     }
     expect(performanceScenarios.map((scenario) => scenario.notes).join('\n'))
       .not.toMatch(/un[- ]?baked|not (?:yet )?baked|golden[- ]absent/i);
@@ -987,7 +985,7 @@ describe('REQ-FEAT-75: close frames and prove repeated decode returns to baselin
     const scenario = performanceScenarios.find((entry) => entry.id === 'performance/decode-fps');
     expect(scenario).toBeDefined();
     if (!scenario) return;
-    const fixture = Bun.file(join(ROOT, 'fixtures/media', String(scenario.input)));
+    const fixture = Bun.file(`${ROOT}/fixtures/media/${String(scenario.input)}`);
     const input: MediaInput = {
       id: String(scenario.input),
       url: `https://fixtures.invalid/${String(scenario.input)}`,

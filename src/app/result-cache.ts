@@ -686,7 +686,8 @@ async function storageEstimate(): Promise<{ usage?: number; quota?: number } | u
 }
 
 function currentOrigin(): string {
-  return typeof location === 'undefined' ? 'unknown-origin' : location.origin;
+  // Fixed origin so `bun run dev` (5151) and `bun run serve` (5152) share IndexedDB (browser-scoped, not port-scoped)
+  return 'media-test-cache';
 }
 
 function errorName(error: unknown): string {

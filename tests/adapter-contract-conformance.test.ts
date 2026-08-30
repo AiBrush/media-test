@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { rm } from 'node:fs/promises';
+import { $ } from 'bun';
 import {
   AdapterContractError,
   AdapterLifecycleController,
@@ -307,7 +307,7 @@ describe('REQ-ADP-09/13: scaffold conformance gate', () => {
       expect(checkCode).toBe(0);
     } finally {
       __resetRegistry();
-      await rm(directory, { recursive: true, force: true });
+      await $`rm -rf ${directory}`.quiet();
     }
     expect(await Bun.file('src/core/disabled-cells.ts').text()).toBe(scenarioBefore);
     expect(await Bun.file('src/core/scenario.ts').text()).toBe(registryBefore);

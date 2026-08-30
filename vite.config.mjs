@@ -625,6 +625,7 @@ function saveEndpoint() {
 }
 
 export default {
+  logLevel: 'error',
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
   plugins: [
     crossOriginIsolation(),
@@ -644,6 +645,16 @@ export default {
   // loading. Exclude it so vite serves the engine as-is (same as when it lived under src/…/vendor).
   optimizeDeps: { exclude: ['@aibrush/media'] },
   // Bundle-cost evidence walks the real emitted graph. Keep the production manifest beside dist so
-  // scripts/measure-bundles.mjs never falls back to a synthetic package-only build.
-  build: { manifest: true },
+  // the bundle measurement never falls back to a synthetic package-only build.
+  build: {
+    manifest: true,
+    rollupOptions: {
+      onwarn(warning, warn) {
+        if (warning.message?.includes('has been externalized for browser compatibility')) return;
+        if (warning.message?.includes('is dynamically imported by') && warning.message?.includes('but also statically imported')) return;
+        if (warning.message?.includes("doesn't exist at build time")) return;
+        warn(warning);
+      },
+    },
+  },
 };

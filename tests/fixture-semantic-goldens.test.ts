@@ -1,8 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { $ } from 'bun';
 
 import {
   GOLDEN_METADATA_SCHEMA,
@@ -74,10 +71,10 @@ describe('REQ-FIX-05 production-shared versioned normalization', () => {
     ]);
   });
 
-  test('both production entrypoints call the shared packet/decode builders and contain no local normalizer copy', () => {
-    const flatSource = readFileSync('fixtures/bake.mjs', 'utf8');
-    const scenarioSource = readFileSync('fixtures/bake-scenario-goldens.mjs', 'utf8');
-    const normalizationSource = readFileSync('fixtures/lib/golden-normalization.mjs', 'utf8');
+  test('both production entrypoints call the shared packet/decode builders and contain no local normalizer copy', async () => {
+    const flatSource = await Bun.file('fixtures/bake.mjs').text();
+    const scenarioSource = await Bun.file('fixtures/bake-scenario-goldens.mjs').text();
+    const normalizationSource = await Bun.file('fixtures/lib/golden-normalization.mjs').text();
     for (const source of [flatSource, scenarioSource]) {
       expect(source).toContain('buildGoldenPacketProbeArgs(inOpts, mediaPath)');
       expect(source).toContain('runStreamingFfprobePacketProbe({');
@@ -134,11 +131,8 @@ describe('REQ-FIX-05 production-shared versioned normalization', () => {
     ]));
   });
 
-  test('protected probe curation reuses three structurally genuine candidates per declared scheme', () => {
-    const rows = readFileSync('fixtures/media/scenarios/_sources.ndjson', 'utf8')
-      .trim()
-      .split(/\r?\n/u)
-      .map((line) => JSON.parse(line));
+  test('protected probe curation reuses three structurally genuine candidates per declared scheme', async () => {
+    const rows = (await Bun.file('fixtures/media/scenarios/_sources.ndjson').text()).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     const replacements = buildProtectedProbeCatalogRows(rows);
     for (const contract of PROTECTED_PROBE_DERIVATIONS) {
       const row = replacements.get(contract.scenarioId)!;
@@ -159,9 +153,9 @@ describe('REQ-FIX-05 production-shared versioned normalization', () => {
           expect(row).toEqual(published);
           continue;
         }
-        const sourcePath = join('fixtures/media/scenarios', contract.sourceScenarioId, file.file);
+        const sourcePath = `fixtures/media/scenarios/${contract.sourceScenarioId}/${file.file}`;
         const evidence = assertProtectedProbeCandidate(
-          new Uint8Array(readFileSync(sourcePath)),
+          new Uint8Array(await Bun.file(sourcePath).arrayBuffer()),
           file,
           contract,
         );
@@ -668,8 +662,8 @@ describe('REQ-FIX-07 deterministic crypto and pinned normal entrypoint', () => {
     )).toBeUndefined();
   });
 
-  test('Bento4 CBCS uses a committed-seed IV, retains key/KID, and never emits the random token', () => {
-    const seed = JSON.parse(readFileSync('fixtures/fixture-seed.json', 'utf8')).seedHex as string;
+  test('Bento4 CBCS uses a committed-seed IV, retains key/KID, and never emits the random token', async () => {
+    const seed = JSON.parse(await Bun.file('fixtures/fixture-seed.json').text()).seedHex as string;
     const changedSeed = `${seed[0] === '0' ? '1' : '0'}${seed.slice(1)}`;
     const input = {
       keyHex: '0123456789abcdef0123456789abcdef',
@@ -688,24 +682,24 @@ describe('REQ-FIX-07 deterministic crypto and pinned normal entrypoint', () => {
     expect(first.args.join(' ')).not.toMatch(/\brandom\b/i);
     expect(first.args[first.args.indexOf('--key') + 1]).toBe(`1:${input.keyHex}:${first.ivHex}`);
     expect(first.args[first.args.indexOf('--property') + 1]).toBe(`1:KID:${input.kidHex}`);
-    expect(readFileSync('fixtures/bake.mjs', 'utf8')).not.toContain(`1:\${keyHex}:random`);
+    expect(await Bun.file('fixtures/bake.mjs').text()).not.toContain(`1:\${keyHex}:random`);
   });
 
-  test('scripts/bake-fixtures.sh exports the lock perimeter before invoking the bake', () => {
-    const lock = JSON.parse(readFileSync('fixtures/toolchain.lock.json', 'utf8')) as {
+  test('scripts/bake-fixtures.sh exports the lock perimeter before invoking the bake', async () => {
+    const lock = JSON.parse(await Bun.file('fixtures/toolchain.lock.json').text()) as {
       sourceDateEpoch: number; locale: string; timezone: string;
     };
-    const scriptSource = readFileSync('scripts/bake-fixtures.sh', 'utf8');
+    const scriptSource = await Bun.file('scripts/bake-fixtures.sh').text();
     expect(scriptSource).toContain('Bun.file("fixtures/toolchain.lock.json")');
     expect(scriptSource.indexOf('SOURCE_DATE_EPOCH|LANG|LC_ALL|TZ'))
       .toBeLessThan(scriptSource.indexOf('exec bun fixtures/bake.mjs'));
 
-    const root = mkdtempSync(join(tmpdir(), 'media-test-pinned-bake-'));
+    const root = (await $`mktemp -d /tmp/media-test-pinned-bake-XXXXXX`.text()).trim();
     try {
-      const fakeBin = join(root, 'bin');
-      mkdirSync(fakeBin, { recursive: true });
-      const bunPath = join(fakeBin, 'bun');
-      writeFileSync(bunPath, `#!/bin/sh
+      const fakeBin = `${root}/bin`;
+      await $`mkdir -p ${fakeBin}`.quiet();
+      const bunPath = `${fakeBin}/bun`;
+      await Bun.write(bunPath, `#!/bin/sh
 if [ "$1" = "-e" ]; then
   printf '%s\\n' 'SOURCE_DATE_EPOCH=${lock.sourceDateEpoch}' 'LANG=${lock.locale}' 'LC_ALL=${lock.locale}' 'TZ=${lock.timezone}'
   exit 0
@@ -713,25 +707,26 @@ fi
 printf 'PINNED:%s|%s|%s|%s\\n' "$SOURCE_DATE_EPOCH" "$LANG" "$LC_ALL" "$TZ"
 `);
       for (const name of ['bun', 'ffmpeg', 'ffprobe']) {
-        const path = join(fakeBin, name);
-        if (name !== 'bun') writeFileSync(path, '#!/bin/sh\nexit 0\n');
-        chmodSync(path, 0o755);
+        const path = `${fakeBin}/${name}`;
+        if (name !== 'bun') await Bun.write(path, '#!/bin/sh\nexit 0\n');
+        await $`chmod 755 ${path}`.quiet();
       }
-      const result = spawnSync('/bin/bash', ['scripts/bake-fixtures.sh', '--help'], {
+      const result = Bun.spawnSync(['bash', 'scripts/bake-fixtures.sh', '--help'], {
         cwd: process.cwd(),
-        encoding: 'utf8',
         env: {
           ...process.env,
           PATH: `${fakeBin}:/usr/bin:/bin`,
           SOURCE_DATE_EPOCH: '1', LANG: 'C', LC_ALL: 'C', TZ: 'Europe/Stockholm',
         },
+        stdout: 'pipe',
+        stderr: 'pipe',
       });
-      expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain(
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain(
         `PINNED:${lock.sourceDateEpoch}|${lock.locale}|${lock.locale}|${lock.timezone}`,
       );
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await $`rm -rf ${root}`.quiet();
     }
   });
 });

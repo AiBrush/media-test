@@ -1,6 +1,3 @@
-import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-
 import { describe, expect, test } from 'bun:test';
 
 import {
@@ -8,16 +5,17 @@ import {
   curateMetadataBakedScenarios,
 } from '../scripts/curate-metadata-baked-scenarios.mjs';
 
-function identity(path: string): { sha256: string; sizeBytes: number } {
-  const bytes = readFileSync(path);
+async function identity(path: string): Promise<{ sha256: string; sizeBytes: number }> {
+  const bytes = await Bun.file(path).arrayBuffer();
+  const sha256 = new Bun.CryptoHasher('sha256').update(new Uint8Array(bytes)).digest('hex');
   return {
-    sha256: createHash('sha256').update(bytes).digest('hex'),
+    sha256,
     sizeBytes: bytes.byteLength,
   };
 }
 
 describe('metadata baked scenario curation', () => {
-  test('authored-rotation mirrors are manifest-bound, complete, and byte-idempotent', () => {
+  test('authored-rotation mirrors are manifest-bound, complete, and byte-idempotent', async () => {
     const first = curateMetadataBakedScenarios();
     const second = curateMetadataBakedScenarios();
 
@@ -28,7 +26,7 @@ describe('metadata baked scenario curation', () => {
       'metadata/rotation_survives_mp4_mkv',
     ]);
 
-    const sourceMedia = identity('fixtures/media/h264_rotated90.mp4');
+    const sourceMedia = await identity('fixtures/media/h264_rotated90.mp4');
     for (const target of METADATA_BAKED_SCENARIO_TARGETS) {
       const report = first.find((item) => item.scenarioId === target.scenarioId);
       expect(report).toMatchObject({
@@ -38,10 +36,10 @@ describe('metadata baked scenario curation', () => {
         media: sourceMedia,
       });
       expect(Object.keys(report!.goldens).sort()).toEqual(['meta', 'packets']);
-      expect(identity(`fixtures/media/scenarios/${target.scenarioId}/${target.assetId}`)).toEqual(sourceMedia);
+      expect(await identity(`fixtures/media/scenarios/${target.scenarioId}/${target.assetId}`)).toEqual(sourceMedia);
       for (const kind of ['meta', 'packets'] as const) {
-        expect(identity(`fixtures/golden/scenarios/${target.scenarioId}/${target.assetId}.${kind}.json`))
-          .toEqual(identity(`fixtures/golden/${target.assetId}.${kind}.json`));
+        expect(await identity(`fixtures/golden/scenarios/${target.scenarioId}/${target.assetId}.${kind}.json`))
+          .toEqual(await identity(`fixtures/golden/${target.assetId}.${kind}.json`));
       }
     }
   }, 30_000);
