@@ -215,23 +215,28 @@ export function bindRuntimeAibrushWasmArtifacts(
   return Object.freeze([...bound.values()]);
 }
 
-/** Hash only generated-manifest resources actually present in the current page's resource timeline. */
+/** Hash generated-manifest resources, either from pre-observed URLs or the page's resource timeline. */
 export async function captureLoadedAibrushWasmArtifacts(
   bundled: readonly AibrushBundledWasmArtifact[],
   signal?: AbortSignal,
+  observedUrls?: readonly string[],
 ): Promise<readonly AibrushRuntimeWasmObservation[]> {
   if (
-    typeof performance === 'undefined' ||
     typeof fetch !== 'function' ||
-    globalThis.crypto?.subtle === undefined
+    globalThis.crypto?.subtle === undefined ||
+    (observedUrls === undefined && typeof performance === 'undefined')
   ) {
     return [];
   }
+  const matchesManifest = (url: string): boolean =>
+    bundled.some((artifact) => runtimeNameMatchesBundled(runtimeResourceName(url), artifact.path));
   const urls = [...new Set(
-    performance
-      .getEntriesByType('resource')
-      .map((entry) => entry.name)
-      .filter((url) => bundled.some((artifact) => runtimeNameMatchesBundled(runtimeResourceName(url), artifact.path))),
+    observedUrls !== undefined
+      ? observedUrls.filter(matchesManifest)
+      : performance
+        .getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .filter(matchesManifest),
   )].sort();
   const observations: AibrushRuntimeWasmObservation[] = [];
   for (const url of urls) {
@@ -254,6 +259,75 @@ export async function captureLoadedAibrushWasmArtifacts(
     }
   }
   return observations;
+}
+
+/**
+ * One-shot watch for bundled WASM artifacts appearing in the page's resource timeline.
+ * A buffered PerformanceObserver receives every completed resource entry (existing ones are
+ * replayed on attach), so the adapter never needs to re-scan the whole timeline per operation —
+ * on sub-millisecond rows that O(entries) rebuild was pure wall-time tax. On platforms without
+ * the observer the watch reports `observerBacked: false` and `captureNow(): true`, preserving
+ * the historical scan-until-captured fallback exactly.
+ */
+export interface AibrushWasmLoadWatch {
+  /** Whether the capture pass should run after the current operation. */
+  captureNow(): boolean;
+  /** Observed manifest-matching URLs (observer mode), or undefined when a timeline scan is needed. */
+  observedUrls(): readonly string[] | undefined;
+  /** True when a working observer backs this watch (capture may settle on an empty result). */
+  readonly observerBacked: boolean;
+  stop(): void;
+}
+
+export function watchAibrushWasmArtifactLoads(
+  bundled: readonly AibrushBundledWasmArtifact[],
+): AibrushWasmLoadWatch {
+  const urls = new Set<string>();
+  const matches = (url: string): boolean =>
+    bundled.some((artifact) => runtimeNameMatchesBundled(runtimeResourceName(url), artifact.path));
+  let observer: PerformanceObserver | undefined;
+  let attached = false;
+  if (
+    typeof PerformanceObserver === 'function' &&
+    typeof performance !== 'undefined'
+  ) {
+    try {
+      const candidate = new PerformanceObserver((list) => {
+        // Once the watch has latched on the first manifest-matching completion the capture
+        // decision is made; later (unexpected) deliveries never rewrite the bound set.
+        if (urls.size > 0) return;
+        for (const entry of list.getEntries()) {
+          if (matches(entry.name)) urls.add(entry.name);
+        }
+        if (urls.size > 0) {
+          observer?.disconnect();
+          observer = undefined;
+        }
+      });
+      candidate.observe({ type: 'resource', buffered: true });
+      observer = candidate;
+      attached = true;
+    } catch {
+      observer?.disconnect();
+      observer = undefined;
+      attached = false;
+    }
+  }
+  return {
+    captureNow(): boolean {
+      return attached ? urls.size > 0 : true;
+    },
+    observedUrls(): readonly string[] | undefined {
+      return attached ? [...urls] : undefined;
+    },
+    get observerBacked(): boolean {
+      return attached;
+    },
+    stop(): void {
+      observer?.disconnect();
+      observer = undefined;
+    },
+  };
 }
 
 function assertBundledWasmManifest(artifacts: readonly AibrushBundledWasmArtifact[]): void {

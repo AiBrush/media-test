@@ -96,7 +96,16 @@ import {
   AibrushConfigEvidence,
   AibrushProvenanceError,
   captureLoadedAibrushWasmArtifacts,
+  watchAibrushWasmArtifactLoads,
+  type AibrushWasmLoadWatch,
 } from './provenance.ts';
+import {
+  hlsPlaylistEvidence,
+  isHlsAsset,
+  isPlaylistOnlyProbeRequest,
+  playlistOnlyHlsProbeMetadata,
+} from './hls-playlist-probe.ts';
+import { FrameDigestPool, frameIsPoolEligible } from './frame-digest-pool.ts';
 import {
   buildAibrushDemuxResult,
   canonicalAibrushCodec,
@@ -165,8 +174,8 @@ async function imageDataFromAibrushFrame(frame: VideoFrame): Promise<ImageData> 
   const canCopyDirectly =
     width > 0 &&
     height > 0 &&
-    frame.codedWidth === width &&
-    frame.codedHeight === height &&
+    frame.codedWidth >= width &&
+    frame.codedHeight >= height &&
     (!rect ||
       (rect.x === 0 &&
         rect.y === 0 &&
@@ -200,7 +209,12 @@ function hashBytesToHex(hash: ArrayBuffer): string {
   return out;
 }
 
-async function digestAibrushImageData(img: ImageData, index: number, ptsUs: number): Promise<FrameDigest> {
+/**
+ * sha256 hex over the normalized tight-RGBA bytes of an ImageData — the exact golden-comparable
+ * digest value (index/pts live in {@link digestAibrushImageData}; splitting the hash lets the fused
+ * decode pipeline start hashing while later frames are still rasterizing).
+ */
+async function sha256HexOfNormalizedRgba(img: ImageData): Promise<string> {
   const expectedBytes = img.width * img.height * 4;
   const pixels = img.data;
   if (
@@ -212,10 +226,14 @@ async function digestAibrushImageData(img: ImageData, index: number, ptsUs: numb
     // imageDataFromAibrushFrame owns an exact-sized ArrayBuffer. WebCrypto consumes this bounded view
     // directly, so hashing does not need the shared helper's two defensive full-frame copies.
     const view = new Uint8Array(pixels.buffer, pixels.byteOffset, expectedBytes);
-    const sha256 = hashBytesToHex(await crypto.subtle.digest('SHA-256', view));
-    return { index, ptsUs, sha256, width: img.width, height: img.height };
+    return hashBytesToHex(await crypto.subtle.digest('SHA-256', view));
   }
-  return digestImageData(img, index, ptsUs);
+  return (await digestImageData(img, 0, 0)).sha256;
+}
+
+async function digestAibrushImageData(img: ImageData, index: number, ptsUs: number): Promise<FrameDigest> {
+  const sha256 = await sha256HexOfNormalizedRgba(img);
+  return { index, ptsUs, sha256, width: img.width, height: img.height };
 }
 
 /**
@@ -1303,6 +1321,21 @@ interface AibrushCore {
     bytes: Uint8Array,
     opts?: { readonly includeOffsets?: boolean; readonly signal?: AbortSignal },
   ): Promise<AibrushPacketInfoTable>;
+  /**
+   * Kernel fused-consumption utility (`kernel/presentation-order.ts`): bounded-concurrency,
+   * presentation-ordered collection over any readable stream. Optional because older vendored
+   * runtimes predate it — the decode sink falls back to drain-then-digest when absent.
+   */
+  collectPresentationOrdered?: <T, R>(
+    items: ReadableStream<T>,
+    options: {
+      keyOf(item: T): number;
+      map(item: T): Promise<R>;
+      inFlight: number;
+      maxItems: number;
+      reorderMargin?: number;
+    },
+  ) => Promise<R[]>;
   mp4PacketInfoFromUrl(
     url: string,
     opts?: {
@@ -1395,6 +1428,12 @@ interface AibrushCore {
     readonly faststart?: boolean;
     readonly fragmented?: boolean;
   }): ReadableStream<Uint8Array>;
+  /**
+   * Byte-for-byte compatible QuickTime rewrap (driver-author seam): returns the rewritten MP4 or
+   * `undefined` when the audit declines. Optional because older vendored runtimes predate it —
+   * the mov→mp4 prepared route falls through to the general stream-copy when absent.
+   */
+  rewrapCompatibleMovToMp4FromBytes?: (bytes: Uint8Array) => Promise<Uint8Array | undefined>;
   muxPreparedSparseMp4PacketTrack(input: {
     readonly track: AibrushTrackInfo;
     readonly packets: readonly AibrushPacket[];
@@ -1922,9 +1961,6 @@ function inputUrl(input: MediaInput): URL {
   return new URL(input.url, globalThis.location?.href ?? 'http://localhost/');
 }
 /** True when the asset is an HLS playlist (an .m3u8/.m3u URL). */
-function isHlsAsset(input: MediaInput): boolean {
-  return /\.m3u8?($|\?)/i.test(input.url ?? '') || /\.m3u8?$/i.test(input.id);
-}
 /** Browser fetch of a (resolved, absolute) HLS resource URI → bytes (segments / keys / sub-playlists). */
 const hlsFetch = async (uri: string, signal?: AbortSignal): Promise<Uint8Array> => {
   const init: RequestInit = signal === undefined ? { cache: 'no-store' } : { cache: 'no-store', signal };
@@ -5170,11 +5206,123 @@ function directVideoPacketRows(
   return { config, rows, hasMore: all.length > rows.length };
 }
 
+/**
+ * Fused per-frame consumption record: the retained RGBA pixels (getPixels evidence), the capture
+ * timestamp, and the golden-comparable digest — produced while later frames are still decoding.
+ */
+interface RasterizedFrameDigest {
+  readonly img: ImageData;
+  readonly ptsUs: number;
+  readonly sha256: string;
+}
+
+/**
+ * Rasterize + digest one arriving VideoFrame exactly once, releasing the native surface as soon as
+ * its own RGBA copy is complete (the digest reads only the copy). This is the fused transform the
+ * presentation-order pipeline starts per arrival so GPU readback + SHA-256 overlap the decoder.
+ */
+async function rasterizeDigestAndRelease(frame: VideoFrame): Promise<RasterizedFrameDigest> {
+  const ptsUs = frame.timestamp; // capture before close: getters throw on a released frame
+  let img: ImageData;
+  try {
+    img = await imageDataFromAibrushFrame(frame);
+  } finally {
+    closeFrame(frame);
+  }
+  return { img, ptsUs, sha256: await sha256HexOfNormalizedRgba(img) };
+}
+
+/** Concurrency ceiling of the fused decode pipeline (native surfaces + partial RGBA copies in flight). */
+const FUSED_DECODE_MAX_IN_FLIGHT = 3;
+/** Reorder window for fused pipeline collect — matches the collect path's submit margin. */
+const FUSED_DECODE_REORDER_MARGIN = 16;
+
+// ── off-thread raster+digest pool (frame-digest-pool.ts) ─────────────────────────────────────────
+// A single lazily-built pool for the page's lifetime: worker spawn happens in the untimed
+// adapter init(), workers idle cheaply between cells, and ANY protocol surprise permanently
+// degrades the pool to the main-thread fused path (never a wrong digest, never a lost frame).
+let sharedFrameDigestPool: FrameDigestPool | undefined;
+
+function ensureFrameDigestPool(): FrameDigestPool | undefined {
+  if (sharedFrameDigestPool === undefined && typeof Worker === 'function' && typeof VideoFrame === 'function') {
+    try {
+      sharedFrameDigestPool = new FrameDigestPool();
+    } catch {
+      sharedFrameDigestPool = undefined;
+    }
+  }
+  return sharedFrameDigestPool?.available ? sharedFrameDigestPool : undefined;
+}
+
+function disposeFrameDigestPool(): void {
+  sharedFrameDigestPool?.dispose();
+  sharedFrameDigestPool = undefined;
+}
+
+/**
+ * Off-thread-preferred fused transform. Eligible frames (tight full-visible RGBA, no sidecar,
+ * worker realm available) are rasterized + hashed in the digest pool — bytes identical to the
+ * main path by construction. Anything else, and ANY pool surprise, keeps the main-thread fused
+ * transform with the still-open frame; both paths close each frame exactly once.
+ */
+async function rasterizeDigestReleasePreferPool(frame: VideoFrame): Promise<RasterizedFrameDigest> {
+  const pool = ensureFrameDigestPool();
+  if (pool !== undefined) {
+    const ptsUs = frame.timestamp;
+    const width = frame.displayWidth || frame.codedWidth || 0;
+    const height = frame.displayHeight || frame.codedHeight || 0;
+    if (width > 0 && height > 0 && frameIsPoolEligible(frame, rgbaPixelSidecar(frame) !== undefined)) {
+      try {
+        const pooled = await pool.digest(frame, { ptsUs, width, height });
+        closeFrame(frame);
+        return pooled;
+      } catch {
+        // Pool lost the job (or never took it): the caller-owned frame is still open below.
+      }
+    }
+  }
+  return rasterizeDigestAndRelease(frame);
+}
+
+type OrderedCollector = <T, R>(
+  items: ReadableStream<T>,
+  options: {
+    keyOf(item: T): number;
+    map(item: T): Promise<R>;
+    inFlight: number;
+    maxItems: number;
+    reorderMargin?: number;
+  },
+) => Promise<R[]>;
+
+/** Drain → sort → rasterize+digest the presentation-ordered prefix (pre-fused fallback). */
+async function decodeRecordsLegacy(videoStream: ReadableStream<VideoFrame>, maxFrames: number): Promise<RasterizedFrameDigest[]> {
+  const collected = await collectVideoFrames(videoStream, maxFrames);
+  // Presentation order, then re-index 0..N-1 — exactly how the golden frame list is produced, so the
+  // decoded-frames-bitexact oracle pairs frame[i] ↔ golden[i] correctly.
+  collected.sort((a, b) => a.timestamp - b.timestamp);
+  const emit = Number.isFinite(maxFrames) ? collected.slice(0, maxFrames) : collected;
+  const records: RasterizedFrameDigest[] = [];
+  try {
+    for (const frame of emit) {
+      try {
+        records.push(await rasterizeDigestAndRelease(frame));
+      } finally {
+        closeFrame(frame);
+      }
+    }
+  } finally {
+    for (const frame of collected) closeFrame(frame);
+  }
+  return records;
+}
+
 async function decodeToFrameSink(
   streams: AibrushMediaStreams,
   maxFrames: number,
   presence: DecodeTrackPresence,
   onFirstFrame?: () => void,
+  collectOrdered?: OrderedCollector,
 ): Promise<FrameSink> {
   const sink = new RetainingFrameSink();
   if (presence.hasVideo) {
@@ -5185,27 +5333,28 @@ async function decodeToFrameSink(
       return sink; // no decodable video track → empty sink (honest 0-frame result)
     }
 
-    const collected = await collectVideoFrames(videoStream, maxFrames);
-    // Presentation order, then re-index 0..N-1 — exactly how the golden frame list is produced, so the
-    // decoded-frames-bitexact oracle pairs frame[i] ↔ golden[i] correctly.
-    collected.sort((a, b) => a.timestamp - b.timestamp);
-    const emit = Number.isFinite(maxFrames) ? collected.slice(0, maxFrames) : collected;
-    try {
-      for (let i = 0; i < emit.length; i++) {
-        const frame = emit[i]!;
-        try {
-          const img = await imageDataFromAibrushFrame(frame);
-          const digest = await digestAibrushImageData(img, i, frame.timestamp);
-          sink.add(digest, img);
-          if (i === 0) onFirstFrame?.();
-        } finally {
-          // Release each native decoder surface as soon as its retained RGBA copy is complete. This keeps
-          // high-resolution bounded decodes from holding every VideoFrame and every ImageData at once.
-          closeFrame(frame);
-        }
-      }
-    } finally {
-      for (const frame of collected) closeFrame(frame);
+    // Fused consumption: WebCodecs emits decoded video in presentation order, so each arrival's
+    // raster + digest starts immediately (≤ FUSED_DECODE_MAX_IN_FLIGHT concurrent) instead of the
+    // whole-stream drain → serial-transform pattern. Results join in (timestamp, arrival) order —
+    // the identical list drain-then-sort produced — and the stream is cancelled as soon as the
+    // `maxFrames` monotonic prefix is in hand. Older runtimes without the collector keep the
+    // byte-identical legacy path.
+    const records = collectOrdered
+      ? await collectOrdered(videoStream, {
+          keyOf: (frame) => frame.timestamp,
+          map: rasterizeDigestReleasePreferPool,
+          inFlight: FUSED_DECODE_MAX_IN_FLIGHT,
+          maxItems: maxFrames,
+          reorderMargin: FUSED_DECODE_REORDER_MARGIN,
+        })
+      : await decodeRecordsLegacy(videoStream, maxFrames);
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i]!;
+      sink.add(
+        { index: i, ptsUs: record.ptsUs, sha256: record.sha256, width: record.img.width, height: record.img.height },
+        record.img,
+      );
+      if (i === 0) onFirstFrame?.();
     }
     return sink;
   }
@@ -7358,6 +7507,23 @@ async function tryStrictPreparedAibrushRemux(
   const source = containerFromInput(input);
   const target = opts.container.toLowerCase();
   if (source === 'mp3') return tryPreparedMp3Remux(core, input, target, opts);
+  if (source === 'mov' && target === 'mp4') {
+    // Canonical QuickTime layouts (moov second, or moov-last relocation with an exact stco/co64
+    // shift) rewrap byte-for-byte from the already-fetched source buffer: no per-sample iteration,
+    // no transport round-trips, output size equals input size. Declines to the general path on
+    // anything the library audit cannot prove safe (including reserved-gap and non-faststart
+    // publication requests, which the rewrap layout cannot express).
+    if (opts.fastStart === 'reserve') return undefined;
+    const rewrapBytes = (await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES)) ?? undefined;
+    if (rewrapBytes !== undefined && core.rewrapCompatibleMovToMp4FromBytes !== undefined) {
+      const rewrapped = await core.rewrapCompatibleMovToMp4FromBytes(rewrapBytes);
+      if (rewrapped !== undefined) {
+        signal.throwIfAborted();
+        return rewrapped;
+      }
+    }
+    return undefined;
+  }
   if ((source === 'mp4' || source === 'mov') && target === 'ts') {
     return tryPreparedIsoToMpegTsRemux(core, input, source, signal);
   }
@@ -8742,41 +8908,14 @@ function greatestCommonDivisor(a: number, b: number): number {
   return left || 1;
 }
 
-function hlsVodProbePlan(
-  playlistText: string,
-): { readonly durationSec: number; readonly firstSegmentUri: string } | undefined {
-  let pendingDuration: number | undefined;
-  let totalDuration = 0;
-  let firstSegmentUri: string | undefined;
-  for (const rawLine of playlistText.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line.length === 0) continue;
-    if (line.startsWith('#EXTINF:')) {
-      const value = Number.parseFloat(line.slice('#EXTINF:'.length).split(',', 1)[0] ?? '');
-      pendingDuration = Number.isFinite(value) && value > 0 ? value : undefined;
-      if (pendingDuration !== undefined) totalDuration += pendingDuration;
-      continue;
-    }
-    if (line.startsWith('#')) continue;
-    if (pendingDuration !== undefined && firstSegmentUri === undefined) {
-      firstSegmentUri = line;
-    }
-    pendingDuration = undefined;
-  }
-  return totalDuration > 0 && firstSegmentUri !== undefined
-    ? { durationSec: totalDuration, firstSegmentUri }
-    : undefined;
-}
-
 async function fastHlsProbeMetadata(
   engine: AibrushEngine,
   input: MediaInput,
   signal: AbortSignal,
   playlistOnly: boolean,
 ): Promise<NormalizedMetadata | undefined> {
-  const playlistText = new TextDecoder().decode(await inputBytes(input));
-  const baseUrl = inputUrl(input).href;
-  const plan = hlsVodProbePlan(playlistText);
+  const evidence = await hlsPlaylistEvidence(input);
+  const { playlistText, baseUrl, plan } = evidence;
   if (plan === undefined) return undefined;
   const playlistAccess = {
     role: 'playlist' as const,
@@ -8784,17 +8923,7 @@ async function fastHlsProbeMetadata(
     disposition: 'read' as const,
   };
   if (playlistOnly) {
-    const metadata = {
-      container: 'hls',
-      durationSec: plan.durationSec,
-      tracks: [],
-      protectionScheme: /^#EXT-X-KEY:.*METHOD=AES-128/im.test(playlistText) ? 'hls-aes128' : null,
-      probeEvidence: {
-        readMode: 'whole-file' as const,
-        resourceAccesses: [playlistAccess],
-      },
-    } satisfies NormalizedMetadata & { protectionScheme: string | null };
-    return metadata;
+    return playlistOnlyHlsProbeMetadata(evidence);
   }
   const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
   const resourceAccesses: NonNullable<NormalizedMetadata['probeEvidence']>['resourceAccesses'] = [playlistAccess];
@@ -8835,7 +8964,7 @@ async function fastHlsProbeMetadata(
     durationSec: plan.durationSec,
   });
   metadata.probeEvidence = { readMode: 'whole-file', resourceAccesses };
-  if (/^#EXT-X-KEY:.*METHOD=AES-128/im.test(playlistText)) {
+  if (evidence.aes128Keyed) {
     (metadata as NormalizedMetadata & { protectionScheme?: string }).protectionScheme = 'hls-aes128';
   }
   return metadata;
@@ -8850,14 +8979,6 @@ function hlsKeyUrisFromText(playlistText: string, baseUrl: string): Set<string> 
     if (raw) uris.add(new URL(raw.trim(), baseUrl).href);
   }
   return uris;
-}
-
-function isPlaylistOnlyProbeRequest(context: OperationContext | undefined): boolean {
-  const options = context?.request.options;
-  const robustness = objectRecord(options?.robustness);
-  const probe = objectRecord(robustness?.probe);
-  const contract = objectRecord(probe?.probeContract);
-  return contract?.schema === 'media-test/hls-playlist-only-probe@1';
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -9000,6 +9121,14 @@ export class AibrushMediaEngine implements MediaEngine {
   #activeOperation = 'none';
   #activeRoute = 'not-executed';
   #wasmProvenanceCaptured = false;
+  /**
+   * Buffered resource-timing watch for bundled WASM loads. Replaces the historical per-operation
+   * full-timeline rescan (O(resource entries) per op) that dominated sub-millisecond rows: capture
+   * runs exactly once, and only after the page has actually loaded a manifest artifact.
+   */
+  readonly #wasmLoadWatch: AibrushWasmLoadWatch = watchAibrushWasmArtifactLoads(
+    AIBRUSH_VENDOR_PROVENANCE.bundledWasmArtifacts,
+  );
   #engineInstance: AibrushEngine | undefined;
   /** Source(s) recorded by prepareMuxTracks for the immediately-following mux() (same instance, serial). */
   #muxSource: MediaInput[] | undefined;
@@ -9073,9 +9202,17 @@ export class AibrushMediaEngine implements MediaEngine {
       }
     }
     context?.signal.throwIfAborted();
+    // Spawn the off-thread raster+digest pool here (untimed) so measured decode windows never pay
+    // worker boot; the fused transform degrades to main-thread rasterization when the pool is
+    // unavailable or poisoned, so this is pure upside.
+    if (!isWorkerRealm()) ensureFrameDigestPool();
+    context?.signal.throwIfAborted();
   }
 
   async dispose(context?: LifecycleContext): Promise<void> {
+    disposeFrameDigestPool();
+    await this.#captureWasmProvenance().catch(() => undefined);
+    this.#wasmLoadWatch.stop();
     this.#bindCellSignal(context, 'dispose');
     this.#muxSource = undefined;
     this.#preparedPcmMuxSource = undefined;
@@ -9135,17 +9272,31 @@ export class AibrushMediaEngine implements MediaEngine {
       callbackWriteCount: 0,
     });
     const result = await withCellSignal(context, body);
-    if (!this.#wasmProvenanceCaptured) {
-      const observations = await captureLoadedAibrushWasmArtifacts(
-        AIBRUSH_VENDOR_PROVENANCE.bundledWasmArtifacts,
-        context?.signal,
-      );
-      if (observations.length > 0) {
-        this.#configEvidence.setLoadedWasmArtifacts(observations);
-        this.#wasmProvenanceCaptured = true;
-      }
-    }
+    await this.#captureWasmProvenance(context?.signal);
     return result;
+  }
+
+  /**
+   * WASM provenance is captured once per cell, and only when the resource-timing watch has actually
+   * seen a bundled artifact load. Before the watch existed, every operation re-scanned the full
+   * resource timeline (O(entries) allocation + sort) for cells that never load WASM — a per-operation
+   * wall tax on every sub-millisecond row. Without observer support the watch degrades to the
+   * historical scan-until-captured behavior.
+   */
+  async #captureWasmProvenance(signal?: AbortSignal): Promise<void> {
+    if (this.#wasmProvenanceCaptured || !this.#wasmLoadWatch.captureNow()) return;
+    const observations = await captureLoadedAibrushWasmArtifacts(
+      AIBRUSH_VENDOR_PROVENANCE.bundledWasmArtifacts,
+      signal,
+      this.#wasmLoadWatch.observedUrls(),
+    );
+    if (observations.length > 0 || this.#wasmLoadWatch.observerBacked) {
+      // Non-empty observations bind real digests; an observer-backed empty result means the page
+      // provably loaded no manifest artifact — either way the decision is final for this cell.
+      if (observations.length > 0) this.#configEvidence.setLoadedWasmArtifacts(observations);
+      this.#wasmProvenanceCaptured = true;
+      this.#wasmLoadWatch.stop();
+    }
   }
 
   #naIfMiss(operation: ApplicabilityOperation, error: unknown, input?: MediaInput): never {
@@ -9851,6 +10002,22 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   async probe(input: MediaInput, context?: OperationContext): Promise<NormalizedMetadata> {
+    // The playlist-only contract is fully determined by the playlist text: no WAV header sniff and
+    // no container runtime are needed. Checking the contract first keeps the sub-millisecond row's
+    // per-op cost at the harness floor; unparseable playlists still fall through to the general
+    // framework probe below, so no input class changes behavior.
+    if (isHlsAsset(input) && isPlaylistOnlyProbeRequest(context)) {
+      const evidence = await hlsPlaylistEvidence(input).catch(() => undefined);
+      if (evidence?.plan !== undefined) {
+        return this.#run(
+          'probe',
+          'framework.probe',
+          context,
+          async () => playlistOnlyHlsProbeMetadata(evidence),
+          'core',
+        );
+      }
+    }
     const lightweightWav = await tryLightweightWavProbe(this.#wavRuntime(), input, context?.signal);
     if (lightweightWav !== undefined) {
       if ('error' in lightweightWav) {
@@ -10639,7 +10806,7 @@ export class AibrushMediaEngine implements MediaEngine {
         signal,
         ...(selected ? { trackSelect: selected.trackSelect } : {}),
       });
-      return finish(await decodeToFrameSink(streams, maxFrames, presence, onFirstFrame));
+      return finish(await decodeToFrameSink(streams, maxFrames, presence, onFirstFrame, this.#core?.collectPresentationOrdered));
     } catch (e) {
       try {
         return this.#naIfMiss('decodeFrames', e, input);

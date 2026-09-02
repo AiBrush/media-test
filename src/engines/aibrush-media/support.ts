@@ -259,11 +259,22 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 			options.target === "buffer" &&
 			fragmented &&
 			(outputContainer === "mp4" || outputContainer === "mov");
+		// WebM/MKV streaming remux is bounded (≤128MiB) regardless of total output size; it should
+		// not be gated by the finite 1 GiB whole-output ceiling. This is general (any WebM/MKV
+		// remux with a streaming-capable source) and matches the engine's `requiresStreamingWebmRemux`,
+		// but only up to the verified 1 GiB publication limit — beyond that the harness has no
+		// verified streaming artifact size, so the 1 GiB ceiling remains the honest NA.
+		const isStreamingWebmTarget =
+			(outputContainer === "webm" || outputContainer === "mkv") &&
+			sourceBytes !== undefined &&
+			sourceBytes > 64 * 1024 * 1024 &&
+			sourceBytes <= AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES;
 		const publicationLimit = publishesMultipartIsoBuffer
 			? AIBRUSH_MULTIPART_ISO_BUFFER_PUBLICATION_MAX_BYTES
 			: AIBRUSH_FINITE_REMUX_PUBLICATION_MAX_BYTES;
 		if (
 			!publishesRangeArtifact &&
+			!isStreamingWebmTarget &&
 			sourceBytes !== undefined &&
 			sourceBytes > publicationLimit
 		) {
