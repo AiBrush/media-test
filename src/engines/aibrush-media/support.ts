@@ -396,9 +396,13 @@ function rejectTuple(request: ConcreteOperationRequest): Rejection | undefined {
 			codecs[0] === "opus"
 		)
 	) {
+		// The reason names the container's own obstacle: raw ADTS access units for ADTS, the generic packet-copy
+		// presentation-window limit for every other lossy audio container.
 		return reject(
 			"AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED",
-			"raw ADTS carries whole AAC access units with no delay/padding field and no edit list, and AAC-LC's 50%-overlap 2048-sample MDCT makes the first copied access unit decode differently from the source, so the exact decoded presentation window is not authorable outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
+			firstContainer === "adts"
+				? "raw ADTS carries whole AAC access units with no delay/padding field and no edit list, and AAC-LC's 50%-overlap 2048-sample MDCT makes the first copied access unit decode differently from the source, so the exact decoded presentation window is not authorable outside same-container Ogg Opus granule or MP3 Xing/LAME authoring"
+				: "the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
 		);
 	}
 	if (operation === "remux" && outputContainer !== undefined) {

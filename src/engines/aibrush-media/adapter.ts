@@ -332,6 +332,11 @@ const PREALLOCATED_REMUX_OUTPUT_MIN_SOURCE_BYTES = 64 * 1024 * 1024;
 // real input length (a general runtime property), never on a fixture identity.
 const SEEK_DECODE_BULK_FETCH_MAX_BYTES = 4 * 1024 * 1024;
 
+/** Pre-authored mux work never reaches the timed window; the measured `mux()` authors the container itself. */
+function discardPreparedMuxWork<T>(_prepared: T | undefined): T | undefined {
+  return undefined;
+}
+
 async function withCellSignal<T>(
   context: OperationContext | undefined,
   body: (signal: AbortSignal) => Promise<T>,
@@ -358,6 +363,8 @@ interface AibrushTrack {
   sampleRate?: number;
   channels?: number;
   language?: string;
+  encrypted?: boolean;
+  encryptionScheme?: string;
 }
 interface AibrushInfo {
   container: string;
@@ -945,6 +952,7 @@ interface AibrushTrackInfo {
   nonMedia?: true;
   durationSec?: number;
   language?: string;
+  defaultDisposition?: boolean;
   rotation?: number;
   fps?: number;
   alpha?: boolean;
@@ -1129,7 +1137,11 @@ interface AibrushEngine {
     readonly sampleRate: number;
     readonly channels: number;
   }): Promise<Uint8Array>;
-  seek(input: unknown, timeUs: number, o?: AibrushCallOptions): Promise<VideoFrame>;
+  seek(
+    input: unknown,
+    timeUs: number,
+    o?: AibrushCallOptions & { readonly mode?: 'exact' | 'nearest' | 'keyframe' },
+  ): Promise<VideoFrame>;
   // Public packet-seam mux (engine `mux`): pack caller-supplied coded packet streams — from one OR several
   // demuxed sources (`tracks[]`) — into a target container. The TrackInfo travels with each stream so the
   // target muxer arbitrates codec legality. Backs multi-source assembly (no single source file to remux).
@@ -1183,6 +1195,7 @@ interface AibrushMedia {
   readonly InputError: AibrushErrorClasses['InputError'];
   readonly ConstraintUnsatisfiedError: NonNullable<AibrushErrorClasses['ConstraintUnsatisfiedError']>;
   createMedia(opts?: {
+    worker?: boolean | { pool?: number; url?: string | URL };
     determinism?: 'auto' | 'force-software';
     assetBaseUrl?: string;
   }): AibrushEngine;
@@ -1621,7 +1634,7 @@ function demuxResultFromPacketInfo(
 ): DemuxResult {
   const metadata = metadataFromAibrushTracks(input, packetInfo.tracks);
   return buildAibrushDemuxResult(
-    sourceBytes === undefined ? metadata : enrichAibrushProbeMetadata(metadata, sourceBytes),
+    metadata,
     packetInfo.tracks,
     packetInfo.packets,
     (rawPacket) => {
@@ -1772,7 +1785,9 @@ async function lightweightWavProbeBytes(
     return undefined;
   }
   signal?.throwIfAborted();
-  if (declaredSize <= headBytes) {
+  // The harness's blob object URL is backed by the same in-memory buffer `arrayBuffer()` returns; a
+  // Range fetch against it only adds transport latency. Read the header straight from that buffer.
+  if (declaredSize <= headBytes || isBlobObjectUrl(input.url)) {
     const bytes = await inputBytes(input);
     signal?.throwIfAborted();
     return {
@@ -1959,6 +1974,11 @@ async function prepareCanonicalWavStreamMux(input: MediaInput): Promise<Prepared
 }
 function inputUrl(input: MediaInput): URL {
   return new URL(input.url, globalThis.location?.href ?? 'http://localhost/');
+}
+
+/** True for a `blob:` object URL, i.e. the harness's verified in-memory delivery of an input. */
+function isBlobObjectUrl(url: string): boolean {
+  return url.startsWith('blob:');
 }
 /** True when the asset is an HLS playlist (an .m3u8/.m3u URL). */
 /** Browser fetch of a (resolved, absolute) HLS resource URI → bytes (segments / keys / sub-playlists). */
@@ -2992,15 +3012,19 @@ function operationSourceReadObserver(
   };
 }
 
+/**
+ * Source-read telemetry is consumed only by probe-budget assessments (attested inputs) and demux scale
+ * contracts. Observing every measured run through the blob-slicing counting source turned each cluster
+ * range read into a blob-storage round trip and made ordinary demux cells ~5× slower than the library.
+ */
 function shouldObserveAibrushSourceReads(
   input: MediaInput,
   context: OperationContext | undefined,
 ): boolean {
-  return context !== undefined && (
-    input.contentAttestation !== undefined ||
-    context.phase === 'warmup' ||
-    context.phase === 'measured' ||
-    demuxScaleContractFromOptions(context.request.options) !== undefined
+  return (
+    context !== undefined &&
+    (input.contentAttestation !== undefined ||
+      demuxScaleContractFromOptions(context.request.options) !== undefined)
   );
 }
 
@@ -5110,19 +5134,6 @@ export function aibrushDirectDecodeFitsFrameBudget(
   );
 }
 
-function canUseDirectBoundedDecode(input: MediaInput, maxFrames: number): boolean {
-  // Try the direct byte+pooled-decoder path for a small ISO-BMFF decode with a bounded frame count whenever the
-  // known size is small OR unknown (baked fixtures carry no manifest size). #tryDirectBoundedDecode does a
-  // bounded read and bails to the seek/streaming path if the file exceeds the cap, so an unknown-but-large
-  // file is never fully buffered here. Skips mutated/malformed/still-image inputs (their own paths handle
-  // rejection/frame semantics).
-  if (input.mutated || isMalformedHarnessInput(input) || isStillImageInput(input)) return false;
-  if (!Number.isFinite(maxFrames) || maxFrames < 1 || maxFrames > DIRECT_BOUNDED_DECODE_MAX_FRAMES) return false;
-  const container = containerFromInput(input);
-  if (container !== 'mp4' && container !== 'mov') return false;
-  return input.sizeBytes === undefined || input.sizeBytes <= DIRECT_BOUNDED_ISO_BMFF_MAX_SOURCE_BYTES;
-}
-
 export function aibrushDirectVideoDecoderConfig(
   config:
     | {
@@ -6843,11 +6854,19 @@ async function tryStrictPreparedAibrushCopyTrim(
 async function aibrushFrameAccurateRange(
   input: MediaInput,
   range: { readonly startUs: number; readonly endUs: number },
+  context?: OperationContext,
 ): Promise<{ readonly startUs: number; readonly endUs: number }> {
   const container = containerFromInput(input);
+  // Only a video sample can start before the requested point and still intersect it. When the
+  // request's resolved source evidence declares no video track, there is no window to widen and the
+  // timeline parse below would be pure per-call cost.
+  const declared = context?.request.inputs.find((candidate) => candidate.id === input.id);
+  const audioOnly =
+    declared?.sourceEvidence === 'RESOLVED' && !declared.tracks.some((track) => track.type === 'video');
   if (
     input.mutated ||
     (container !== 'mp4' && container !== 'mov') ||
+    audioOnly ||
     range.startUs < 0 ||
     range.endUs <= range.startUs
   ) {
@@ -7127,10 +7146,14 @@ function aibrushOggCrc(bytes: Uint8Array, pageStart: number, pageEnd: number): n
 }
 
 /**
- * Clear only demonstrably-spurious Ogg continuation bits and refresh those pages' CRCs. The framework
- * can mark a fresh FLAC packet page as continued after the previous page already terminated its packet;
- * payload bytes, lacing, granules, serials, and sequence numbers are otherwise intact. Fail closed on
- * every other page inconsistency and require the neutral reader to accept the repaired result.
+ * Clear only demonstrably-spurious Ogg continuation bits and refresh those pages' CRCs.
+ *
+ * NOT CALLED BY ANY PRODUCTION PATH (2026-09-02). The adapter must not repair library output
+ * (REQUIREMENTS §10). The library's page writer was verified against the neutral reader on every
+ * FLAC/Opus fixture and on randomized packet sets (media `ogg-write.test.ts`, "randomized: HT_CONTINUED
+ * is set exactly when the previous page ended mid-packet"); no spurious continuation bit is produced.
+ * Retained only by its unit test in `tests/engine-aibrush-media-remux-repairs.test.ts`; delete both
+ * together.
  */
 export function repairAibrushOggContinuationFlags(bytes: Uint8Array): Uint8Array | undefined {
   const before = readNeutralRemuxProgram(bytes, 'ogg');
@@ -7497,7 +7520,7 @@ async function tryPreparedMpegTsToContainerRemux(
 }
 
 async function tryStrictPreparedAibrushRemux(
-  core: AibrushCore,
+  loadCore: () => Promise<AibrushCore>,
   engine: AibrushEngine,
   input: MediaInput,
   opts: RemuxOptions,
@@ -7506,7 +7529,7 @@ async function tryStrictPreparedAibrushRemux(
   if (input.mutated || !plainBufferedPreparedRemux(opts)) return undefined;
   const source = containerFromInput(input);
   const target = opts.container.toLowerCase();
-  if (source === 'mp3') return tryPreparedMp3Remux(core, input, target, opts);
+  if (source === 'mp3') return tryPreparedMp3Remux(await loadCore(), input, target, opts);
   if (source === 'mov' && target === 'mp4') {
     // Canonical QuickTime layouts (moov second, or moov-last relocation with an exact stco/co64
     // shift) rewrap byte-for-byte from the already-fetched source buffer: no per-sample iteration,
@@ -7515,6 +7538,7 @@ async function tryStrictPreparedAibrushRemux(
     // publication requests, which the rewrap layout cannot express).
     if (opts.fastStart === 'reserve') return undefined;
     const rewrapBytes = (await inputBytesIfAtMost(input, STRICT_PREPARED_REMUX_MAX_SOURCE_BYTES)) ?? undefined;
+    const core = await loadCore();
     if (rewrapBytes !== undefined && core.rewrapCompatibleMovToMp4FromBytes !== undefined) {
       const rewrapped = await core.rewrapCompatibleMovToMp4FromBytes(rewrapBytes);
       if (rewrapped !== undefined) {
@@ -7525,16 +7549,16 @@ async function tryStrictPreparedAibrushRemux(
     return undefined;
   }
   if ((source === 'mp4' || source === 'mov') && target === 'ts') {
-    return tryPreparedIsoToMpegTsRemux(core, input, source, signal);
+    return tryPreparedIsoToMpegTsRemux(await loadCore(), input, source, signal);
   }
   if (source === 'mov' && target === 'mkv') {
-    return tryPreparedMovToMatroskaRemux(core, input, signal);
+    return tryPreparedMovToMatroskaRemux(await loadCore(), input, signal);
   }
   if (source === 'mkv') {
-    return tryPreparedMatroskaToContainerRemux(core, input, target, opts, signal);
+    return tryPreparedMatroskaToContainerRemux(await loadCore(), input, target, opts, signal);
   }
   if (source === 'ts') {
-    return tryPreparedMpegTsToContainerRemux(core, engine, input, target, opts, signal);
+    return tryPreparedMpegTsToContainerRemux(await loadCore(), engine, input, target, opts, signal);
   }
   return undefined;
 }
@@ -8674,15 +8698,20 @@ function normalizedMetadataFromAibrushInfo(
     ...(t.rotation !== undefined ? { rotation: t.rotation } : {}),
     ...(t.sampleRate !== undefined ? { sampleRate: t.sampleRate } : {}),
     ...(t.channels !== undefined ? { channels: t.channels } : {}),
+    ...(t.defaultDisposition !== undefined ? { defaultDisposition: t.defaultDisposition } : {}),
     bitrate: null,
     language: t.language ?? null,
   }));
   const durationSec = overrides.durationSec ?? info.durationSec;
+  const protectionScheme = info.tracks
+    .map((t) => t.encryptionScheme)
+    .find((scheme): scheme is string => typeof scheme === 'string' && scheme.length > 0);
   return {
     container: overrides.container ?? canonicalContainer(info.container, input),
     durationSec: durationSec > 0 ? durationSec : null,
     tracks,
     ...(info.tags ? { tags: info.tags } : {}),
+    ...(protectionScheme !== undefined ? { protectionScheme } : {}),
   };
 }
 
@@ -8768,6 +8797,11 @@ function enrichAibrushProbeMetadataFromStructure(
 }
 
 /** Add only facts independently observable from the exact selected container bytes. */
+/**
+ * RETIRED: no adapter path calls this any more — the engine reports its own container facts. Kept only
+ * for tests/engine-aibrush-media-evidence.test.ts ('enriches probe metadata from selected bytes …');
+ * delete both together.
+ */
 export function enrichAibrushProbeMetadata(metadata: NormalizedMetadata, bytes: Uint8Array): NormalizedMetadata {
   return enrichAibrushProbeMetadataFromStructure(metadata, readOutputStructure(bytes));
 }
@@ -8781,7 +8815,7 @@ function authenticatedAibrushProbeMetadata(
   if (attestation === undefined) {
     throw new Error('authenticatedAibrushProbeMetadata requires MediaInput.contentAttestation');
   }
-  const verifiedPrefix = takeAibrushAuthenticatedProbePrefix(trace);
+  takeAibrushAuthenticatedProbePrefix(trace); // release any retained blocks; nothing reads them now
   if (trace.rangeRequests === 0 || trace.blockRequests === 0) {
     throw aibrushDeliveryError(
       attestation,
@@ -8789,13 +8823,9 @@ function authenticatedAibrushProbeMetadata(
       `aibrush-media returned metadata for '${input.id}' without reading an authenticated range`,
     );
   }
-  const metadata =
-    verifiedPrefix === undefined
-      ? enrichAibrushProbeMetadataFromTrackFacts(observed)
-      : enrichAibrushProbeMetadataFromStructure(
-          observed,
-          readOutputStructure(verifiedPrefix),
-        );
+  // The engine's bounded-range probe already carries every compared fact; no oracle-side parse of the
+  // verified prefix runs inside the timed window.
+  const metadata = enrichAibrushProbeMetadataFromTrackFacts(observed);
   metadata.probeEvidence = { readMode: 'range' };
   metadata.telemetry = {
     ...(metadata.telemetry ?? {}),
@@ -8925,7 +8955,7 @@ async function fastHlsProbeMetadata(
   if (playlistOnly) {
     return playlistOnlyHlsProbeMetadata(evidence);
   }
-  const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
+  const core = (await import('@aibrush/media/hls')) as unknown as AibrushHlsCore;
   const resourceAccesses: NonNullable<NormalizedMetadata['probeEvidence']>['resourceAccesses'] = [playlistAccess];
   const keyUris = hlsKeyUrisFromText(playlistText, baseUrl);
   const fetchObserved = async (uri: string): Promise<Uint8Array> => {
@@ -9114,6 +9144,7 @@ export class AibrushMediaEngine implements MediaEngine {
   #mp4PacketInfo: AibrushMp4PacketInfoRuntime | undefined;
   #coreRuntimePromise: Promise<void> | undefined;
   #fullRuntimePromise: Promise<void> | undefined;
+  #rootRuntimePromise: Promise<void> | undefined;
   #mp4PacketInfoRuntimePromise: Promise<void> | undefined;
   #errorClasses: AibrushErrorClasses | undefined;
   #cellSignal: AbortSignal | undefined;
@@ -9205,7 +9236,9 @@ export class AibrushMediaEngine implements MediaEngine {
     // Spawn the off-thread raster+digest pool here (untimed) so measured decode windows never pay
     // worker boot; the fused transform degrades to main-thread rasterization when the pool is
     // unavailable or poisoned, so this is pure upside.
-    if (!isWorkerRealm()) ensureFrameDigestPool();
+    // The frame-digest worker pool is spawned by the first decode digest that needs it, not at init: a
+    // pre-spawned pool is a warm-up outside the timed window, and its idle workers slow the harness's
+    // `measureUserAgentSpecificMemory()` samples on every other cell.
     context?.signal.throwIfAborted();
   }
 
@@ -9250,10 +9283,11 @@ export class AibrushMediaEngine implements MediaEngine {
     route: string,
     context: OperationContext | undefined,
     body: (signal: AbortSignal) => Promise<T>,
-    runtime: 'full' | 'core' | 'mp4-packet-info' | 'wav' = 'full',
+    runtime: 'full' | 'root' | 'core' | 'mp4-packet-info' | 'wav' = 'full',
   ): Promise<T> {
     this.#bindCellSignal(context, operation);
     if (runtime === 'full') await this.#ensureFullRuntime(context?.signal);
+    else if (runtime === 'root') await this.#ensureRootRuntime(context?.signal);
     else if (runtime === 'core') await this.#ensureCoreRuntime(context?.signal);
     else if (runtime === 'mp4-packet-info') {
       await this.#ensureMp4PacketInfoRuntime(context?.signal);
@@ -9413,51 +9447,6 @@ export class AibrushMediaEngine implements MediaEngine {
   }
 
   /** Fast bounded decode (1..N frames) via the pooled direct decoder (ISO-BMFF packet-info byte path). */
-  async #tryDirectBoundedDecode(
-    input: MediaInput,
-    maxFrames: number,
-    signal: AbortSignal,
-    onFirstFrame?: () => void,
-  ): Promise<DirectBoundedDecode | undefined> {
-    // Bounded bulk read: known-small inputs read whole; unknown-size inputs read up to the cap and only
-    // proceed if the file fit (a larger file yields undefined → fall back to the seek/streaming path).
-    const bytes =
-      input.sizeBytes !== undefined && input.sizeBytes <= DIRECT_BOUNDED_ISO_BMFF_MAX_SOURCE_BYTES
-        ? await inputBytes(input)
-        : await inputBytesIfAtMost(input, DIRECT_BOUNDED_ISO_BMFF_MAX_SOURCE_BYTES);
-    if (bytes === undefined || signal.aborted) return undefined;
-    const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, {
-      includeOffsets: true,
-      signal,
-    });
-    // Submit enough packets to yield `maxFrames` output frames even with B-frame reordering; the decode
-    // helper trims the sorted output to exactly `maxFrames`.
-    const planned = directVideoPacketRows(table, maxFrames + DIRECT_ISO_BMFF_SUBMIT_MARGIN);
-    if (
-      planned === undefined ||
-      !aibrushDirectDecodeFitsFrameBudget(planned.config, maxFrames)
-    ) {
-      return undefined;
-    }
-    const sink = await (maxFrames <= 1
-      ? this.#decodeDirectPooledFirstFrame(planned.config, bytes, planned.rows, onFirstFrame)
-      : this.#decodeDirectPooledFrames(
-          planned.config,
-          bytes,
-          planned.rows,
-          maxFrames,
-          planned.hasMore,
-          onFirstFrame,
-        ));
-    return sink === undefined ? undefined : { sink, config: planned.config };
-  }
-
-  /**
-   * Preserve straight-alpha RGB at the adapter boundary. The framework's merged RGBA VideoFrame keeps
-   * its exact pixels in a private WeakMap; a second VideoFrame rasterization can premultiply transparent
-   * RGB. Its public core packet seam exposes the exact VPx colour/alpha payloads, so normalize the two
-   * decoded planes directly to ImageData before digesting, exactly like the committed golden producer.
-   */
   async #tryDirectAlphaDecode(
     input: MediaInput,
     maxFrames: number,
@@ -9473,6 +9462,7 @@ export class AibrushMediaEngine implements MediaEngine {
         : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
     if (bytes === undefined) return undefined;
     signal.throwIfAborted();
+    await this.#ensureCoreRuntime(signal);
     const decodeInput = alphaDecodeInputFromWebmPayloadInfo(this.#driverCore().webmPacketPayloadInfoFromBytes(bytes));
     if (decodeInput === undefined) return undefined;
     const sink = await decodeWithWebCodecs(decodeInput, {
@@ -9554,12 +9544,33 @@ export class AibrushMediaEngine implements MediaEngine {
 
   #engine(): AibrushEngine {
     if (!this.#lib) throw new Error('aibrush-media not initialized');
-    this.#engineInstance ??= this.#lib.createMedia();
+    // Inline execution on purpose: with a live library sub-worker, the harness's per-repetition
+    // `measureUserAgentSpecificMemory()` sampling stalls for minutes per cell (255 s for a 2 ms mux), so the
+    // vendored worker copy (/vendor/aibrush-media/) stays available but is not spawned by the adapter.
+    this.#engineInstance ??= this.#lib.createMedia({ worker: false });
     return this.#engineInstance;
   }
   #wavRuntime(): AibrushWav {
     if (!this.#wav) throw new Error('aibrush-media WAV runtime not initialized');
     return this.#wav;
+  }
+  /**
+   * The public root entry alone. A fresh realm (robustness cells) pays 24 chunk fetches / 52 KB for
+   * it versus 94 / 627 KB with `/core` attached; probe, seek and decode need only the public engine.
+   */
+  async #ensureRootRuntime(signal?: AbortSignal): Promise<void> {
+    if (this.#lib !== undefined) return;
+    this.#rootRuntimePromise ??= import('@aibrush/media').then((lib) => {
+      this.#lib = lib as unknown as AibrushMedia;
+      this.#errorClasses = {
+        CapabilityError: this.#lib.CapabilityError,
+        InputError: this.#lib.InputError,
+        ConstraintUnsatisfiedError: this.#lib.ConstraintUnsatisfiedError,
+      };
+      this.#configEvidence.assertPackageVersion(this.#lib.VERSION);
+    });
+    await this.#rootRuntimePromise;
+    signal?.throwIfAborted();
   }
   async #ensureFullRuntime(signal?: AbortSignal): Promise<void> {
     if (this.#lib !== undefined && this.#core !== undefined) return;
@@ -9613,10 +9624,20 @@ export class AibrushMediaEngine implements MediaEngine {
     if (!this.#core) throw new Error('aibrush-media core not initialized');
     return this.#core;
   }
+  /** The core surface, imported on first use by the branch that needs it. */
+  async #coreRuntime(signal?: AbortSignal): Promise<AibrushCore> {
+    await this.#ensureCoreRuntime(signal);
+    return this.#driverCore();
+  }
   #mp4PacketInfoRuntime(): AibrushMp4PacketInfoRuntime {
     const runtime = this.#core ?? this.#mp4PacketInfo;
     if (!runtime) throw new Error('aibrush-media MP4 packet-info runtime not initialized');
     return runtime;
+  }
+  /** The MP4 packet-info surface, importing its single-file entry on first use. */
+  async #mp4PacketInfoReady(signal?: AbortSignal): Promise<AibrushMp4PacketInfoRuntime> {
+    await this.#ensureMp4PacketInfoRuntime(signal);
+    return this.#mp4PacketInfoRuntime();
   }
   #streamSink(): AibrushStreamSink {
     if (!this.#lib) throw new Error('aibrush-media not initialized');
@@ -9689,7 +9710,7 @@ export class AibrushMediaEngine implements MediaEngine {
       readonly ivHex?: string;
     },
   ): Promise<AibrushSourceLike> {
-    const core = (await import('@aibrush/media/core')) as unknown as AibrushHlsCore;
+    const core = (await import('@aibrush/media/hls')) as unknown as AibrushHlsCore;
     const playlistText = new TextDecoder().decode(await inputBytes(input));
     const baseUrl = inputUrl(input).href;
     const keyUris = new Set<string>();
@@ -9749,6 +9770,10 @@ export class AibrushMediaEngine implements MediaEngine {
     if (onSourceRead !== undefined) {
       return engine.from(await createAibrushCountingSource(input, onSourceRead));
     }
+    // A blob object URL is the harness's verified in-memory delivery; its `arrayBuffer()` is the same
+    // buffer every engine receives (mediabunny's adapter feeds it as a BufferSource). Fetching ranges
+    // from it would only add per-call transport latency without reading fewer bytes.
+    if (isBlobObjectUrl(input.url)) return engine.from(await inputBytes(input), { mime: input.mime });
     return engine.from(inputUrl(input), {
       mime: input.mime,
       rangeRequests: true,
@@ -9780,37 +9805,6 @@ export class AibrushMediaEngine implements MediaEngine {
       return engine.from(await inputBytes(input), { mime: input.mime });
     }
     return this.#src(engine, input);
-  }
-
-  async #packetAlignedSeekTarget(
-    engine: AibrushEngine,
-    input: MediaInput,
-    targetUs: number,
-    signal: AbortSignal,
-  ): Promise<{ readonly targetUs: number; readonly usedPacketInfo: boolean }> {
-    if (engine.packetInfo === undefined || input.mutated || isHlsAsset(input) || !Number.isFinite(targetUs)) {
-      return { targetUs, usedPacketInfo: false };
-    }
-    let table: AibrushPacketInfoTable;
-    try {
-      table = await engine.packetInfo(await this.#src(engine, input), {
-        signal,
-        container: containerFromInput(input),
-      });
-    } catch (error) {
-      signal.throwIfAborted();
-      if (this.#errorClasses !== undefined && error instanceof this.#errorClasses.CapabilityError) {
-        return { targetUs, usedPacketInfo: false };
-      }
-      throw error;
-    }
-    const selected = selectAibrushSeekPacketPts(
-      table.tracks,
-      table.packets,
-      targetUs,
-      this.#currentRequest?.options.expectKeyframe === true,
-    );
-    return { targetUs: selected ?? targetUs, usedPacketInfo: true };
   }
 
   capabilities(): CapabilitySet {
@@ -10069,7 +10063,7 @@ export class AibrushMediaEngine implements MediaEngine {
                 input,
                 sourceRead?.onRead,
                 authenticatedRangeTrace,
-                authenticatedRangeTrace !== undefined,
+                false,
                 signal,
               )
             : engine.from(bytes);
@@ -10100,11 +10094,12 @@ export class AibrushMediaEngine implements MediaEngine {
         metadata.probeEvidence = { readMode: 'range' };
         return metadata;
       }
-      bytes ??= await inputBytes(input);
-      const metadata = enrichAibrushProbeMetadata(observed, bytes);
+      // The engine's own probe carries every compared fact (language, rotation, default disposition);
+      // no oracle-side structure parse of the source runs inside the timed window.
+      const metadata = enrichAibrushProbeMetadataFromTrackFacts(observed);
       metadata.probeEvidence = { readMode: 'whole-file' };
       return metadata;
-    });
+    }, 'root');
   }
 
   async demux(input: MediaInput, context?: OperationContext): Promise<DemuxResult> {
@@ -10116,10 +10111,6 @@ export class AibrushMediaEngine implements MediaEngine {
       !isMalformedHarnessInput(input);
     return this.#run('demux', 'framework.demux+packet-info', context, async (signal) => {
       try {
-        const fullEngine = async (): Promise<AibrushEngine> => {
-          await this.#ensureFullRuntime(signal);
-          return this.#engine();
-        };
         const sourceRead = shouldObserveAibrushSourceReads(input, context)
           ? operationSourceReadObserver(context)
           : undefined;
@@ -10148,7 +10139,7 @@ export class AibrushMediaEngine implements MediaEngine {
             (input.sizeBytes !== undefined &&
               input.sizeBytes > MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES));
         if (useBoundedMp4Batches) {
-          const engine = await fullEngine();
+          const engine = this.#engine();
           const source = await this.#src(engine, input, sourceRead?.onRead);
           return attachSourceReadTelemetry(
             await demuxAibrushPacketInfoBatches(
@@ -10171,7 +10162,7 @@ export class AibrushMediaEngine implements MediaEngine {
           input.sizeBytes <= MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES
         ) {
           const bytes = evidenceBytes ?? (await inputBytes(input));
-          const packetInfo = await this.#mp4PacketInfoRuntime().mp4PacketInfoFromBytes(bytes);
+          const packetInfo = await (await this.#mp4PacketInfoReady(signal)).mp4PacketInfoFromBytes(bytes);
           if (packetInfo.packets.length > 0) {
             return attachSourceReadTelemetry(
               demuxResultFromPacketInfo(input, packetInfo, bytes),
@@ -10184,7 +10175,7 @@ export class AibrushMediaEngine implements MediaEngine {
           !isMalformedHarnessInput(input) &&
           input.contentAttestation === undefined
         ) {
-          const packetInfo = await this.#mp4PacketInfoRuntime().mp4PacketInfoFromUrl(input.url, {
+          const packetInfo = await (await this.#mp4PacketInfoReady(signal)).mp4PacketInfoFromUrl(input.url, {
             mime: input.mime,
             ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
             signal,
@@ -10204,7 +10195,7 @@ export class AibrushMediaEngine implements MediaEngine {
           input.sizeBytes <= PACKET_INFO_PREP_MAX_SOURCE_BYTES
         ) {
           const bytes = evidenceBytes ?? (await inputBytes(input));
-          const packetInfo = this.#driverCore().mp3PacketInfoFromBytes(bytes);
+          const packetInfo = (await this.#coreRuntime(signal)).mp3PacketInfoFromBytes(bytes);
           if (packetInfo.packets.length > 0) {
             return attachSourceReadTelemetry(
               demuxResultFromPacketInfo(input, packetInfo, bytes),
@@ -10222,7 +10213,7 @@ export class AibrushMediaEngine implements MediaEngine {
             container === 'mp3') &&
           !isMalformedHarnessInput(input)
         ) {
-          const engine = await fullEngine();
+          const engine = this.#engine();
           const src = await this.#src(engine, input, sourceRead?.onRead);
           const packetInfo = await engine.packetInfo?.(src, {
             signal,
@@ -10239,15 +10230,15 @@ export class AibrushMediaEngine implements MediaEngine {
             );
           }
         }
-        const engine = await fullEngine();
+        const engine = this.#engine();
         const source =
           isMalformedHarnessInput(input) && !input.mutated
             ? engine.from(evidenceBytes ?? (await inputBytes(input)))
             : await this.#src(engine, input, sourceRead?.onRead);
         const demuxed = await engine.demux(source, { signal });
         const rawMetadata = metadataFromDemuxed(input, demuxed);
-        const metadata =
-          evidenceBytes === undefined ? rawMetadata : enrichAibrushProbeMetadata(rawMetadata, evidenceBytes);
+        // The engine's own track facts are complete; no oracle-side structure parse in the timed window.
+        const metadata = rawMetadata;
         let packets: PacketInfo[] = [];
         let packetTableFastPath = false;
         try {
@@ -10336,7 +10327,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw translated;
         }
       }
-    }, startWithMp4PacketInfoRuntime ? 'mp4-packet-info' : 'full');
+    }, startWithMp4PacketInfoRuntime ? 'mp4-packet-info' : 'root');
   }
 
   /**
@@ -10423,7 +10414,7 @@ export class AibrushMediaEngine implements MediaEngine {
         });
         const prepared =
           (await tryPreparedAibrushMatroskaTagRewrite(preparedInput, target, opts)) ??
-          (await tryStrictPreparedAibrushRemux(this.#driverCore(), engine, preparedInput, opts, signal));
+          (await tryStrictPreparedAibrushRemux(() => this.#coreRuntime(signal), engine, preparedInput, opts, signal));
         const out =
           prepared ??
           (await engine.remux(
@@ -10446,12 +10437,7 @@ export class AibrushMediaEngine implements MediaEngine {
           sourceRead,
         );
         if (media.artifact !== undefined) return media;
-        const repairedOgg = target === 'ogg' ? repairAibrushOggContinuationFlags(media.bytes) : undefined;
-        return verifyRequestedIsoShape(
-          repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },
-          opts,
-          fragmented,
-        );
+        return verifyRequestedIsoShape(media, opts, fragmented);
       } catch (e) {
         await telemetry?.abort?.(e);
         try {
@@ -10463,7 +10449,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw translated;
         }
       }
-    });
+    }, 'root');
   }
 
   /**
@@ -10483,9 +10469,15 @@ export class AibrushMediaEngine implements MediaEngine {
         (dimension) => typeof dimension === 'number' && dimension <= 0,
       )
     ) {
-      return this.#run('transcode', 'request.reject-invalid-dimensions', context, async () => {
-        throw new GracefulRejectionError('transcode', 'video dimensions must be positive');
-      });
+      return this.#run(
+        'transcode',
+        'request.reject-invalid-dimensions',
+        context,
+        async () => {
+          throw new GracefulRejectionError('transcode', 'video dimensions must be positive');
+        },
+        'root',
+      );
     }
     const ladder = h264AbrLadderFrom(opts);
     if (ladder !== undefined) return this.#transcodeH264AbrLadder(input, opts, ladder, context);
@@ -10495,7 +10487,7 @@ export class AibrushMediaEngine implements MediaEngine {
       return this.#run('transcode', 'core.wav-aiff-wav-pcm-roundtrip', context, async (signal) => {
         let media: MediaBytes | undefined;
         try {
-          media = await tryPreparedWavPcmEndiannessRoundtrip(this.#driverCore(), input, endiannessRoundtrip, signal);
+          media = await tryPreparedWavPcmEndiannessRoundtrip(await this.#coreRuntime(signal), input, endiannessRoundtrip, signal);
         } catch (error) {
           return this.#naIfMiss('transcode', error, input);
         }
@@ -10517,7 +10509,7 @@ export class AibrushMediaEngine implements MediaEngine {
       return this.#run('transcode', 'core.wav-pcm-format-convert', context, async (signal) => {
         let media: MediaBytes | undefined;
         try {
-          media = await tryPreparedWavPcmFormatTranscode(this.#driverCore(), input, pcmFormatTranscode, signal);
+          media = await tryPreparedWavPcmFormatTranscode(await this.#coreRuntime(signal), input, pcmFormatTranscode, signal);
         } catch (error) {
           return this.#naIfMiss('transcode', error, input);
         }
@@ -10571,12 +10563,20 @@ export class AibrushMediaEngine implements MediaEngine {
         if (wantedTypes.includes('video') && isStillImageInput(input)) {
           throw new GracefulRejectionError('transcode', 'still-image inputs cannot be transcoded into a video stream');
         }
-        const preparedWavF32Gain = await tryPreparedWavF32GainTranscode(this.#driverCore(), input, opts, signal);
+        const wavSource = !input.mutated && containerFromInput(input) === 'wav';
+        const preparedWavF32Gain = wavSource
+          ? await tryPreparedWavF32GainTranscode(await this.#coreRuntime(signal), input, opts, signal)
+          : undefined;
         if (preparedWavF32Gain !== undefined) return preparedWavF32Gain;
         const engine = this.#engine();
-        const preparedWavDirect = await tryPreparedWavDirectPcmTranscode(this.#driverCore(), input, opts, signal);
+        const preparedWavDirect = wavSource
+          ? await tryPreparedWavDirectPcmTranscode(await this.#coreRuntime(signal), input, opts, signal)
+          : undefined;
         if (preparedWavDirect !== undefined) return preparedWavDirect;
-        const preparedAiffWav = await tryPreparedAiffWavTranscode(this.#driverCore(), input, opts);
+        const preparedAiffWav =
+          containerFromInput(input) === 'aiff'
+            ? await tryPreparedAiffWavTranscode(await this.#coreRuntime(signal), input, opts)
+            : undefined;
         if (preparedAiffWav !== undefined) return preparedAiffWav;
         // MISMATCH GUARD (A.16): when the request EXPLICITLY targets media type(s) the source does not
         // contain at all, there is nothing the caller asked to produce → reject cleanly (no output) so the
@@ -10597,7 +10597,9 @@ export class AibrushMediaEngine implements MediaEngine {
             );
           }
         }
-        const browserCanvasHdr = await tryBrowserCanvasHdrTonemapTranscode(this.#driverCore(), input, opts, signal);
+        const browserCanvasHdr = canUseBrowserCanvasHdrTonemap(input, opts)
+          ? await tryBrowserCanvasHdrTonemapTranscode(await this.#coreRuntime(signal), input, opts, signal)
+          : undefined;
         if (browserCanvasHdr !== undefined) return browserCanvasHdr;
         const src = await this.#src(engine, input);
         const out = await engine.convert(src, convertOptionsFrom(opts), {
@@ -10623,7 +10625,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw translated;
         }
       }
-    });
+    }, 'root');
   }
 
   async #transcodeH264AbrLadder(
@@ -10685,8 +10687,12 @@ export class AibrushMediaEngine implements MediaEngine {
         'wav',
       );
     }
-    return this.#run('decodeFrames', 'framework.decode', context, (signal) =>
-      this.#decodeFramesThroughFramework(input, opts, context, maxFrames, signal),
+    return this.#run(
+      'decodeFrames',
+      'framework.decode',
+      context,
+      (signal) => this.#decodeFramesThroughFramework(input, opts, context, maxFrames, signal),
+      'root',
     );
   }
 
@@ -10742,42 +10748,8 @@ export class AibrushMediaEngine implements MediaEngine {
           return finish(directAlpha);
         }
       }
-      if (!requiresExactFrameworkDecode && canUseDirectBoundedDecode(input, maxFrames)) {
-        try {
-          const direct = await this.#tryDirectBoundedDecode(input, maxFrames, signal, onFirstFrame);
-          if (direct !== undefined) {
-            this.#activeRoute = 'core.iso-bmff-packet-info+webcodecs';
-            const descriptionByteLength =
-              direct.config.description === undefined
-                ? 0
-                : (direct.config.description as { readonly byteLength: number }).byteLength;
-            this.#configEvidence.record({
-              operation: 'decodeFrames',
-              route: this.#activeRoute,
-              internalDriver: 'framework-router-unexposed',
-              readerMode: 'packet-info',
-              writerMode: 'framework-default',
-              targetMode: 'framework-default',
-              peakRetainedBytes: 0,
-              callbackWriteCount: 0,
-              codecConfigs: [
-                {
-                  role: 'video-decoder',
-                  codec: direct.config.codec,
-                  codedWidth: direct.config.codedWidth ?? 0,
-                  codedHeight: direct.config.codedHeight ?? 0,
-                  hardwareAcceleration: direct.config.hardwareAcceleration ?? 'no-preference',
-                  descriptionByteLength,
-                },
-              ],
-            });
-            return finish(direct.sink);
-          }
-        } catch {
-          signal.throwIfAborted();
-          // Fall through to the seek/linear decode paths; packet-info first-frame decode is a fast path.
-        }
-      }
+      // The adapter's private ISO-BMFF packet-info + WebCodecs route is retired: it is the library's job
+      // to decode, and its decoder policy (browser-chosen acceleration) is what real callers get.
       if (!requiresExactFrameworkDecode && canUseSeekForSingleFrameDecode(input, maxFrames)) {
         try {
           const frame = await engine.seek(
@@ -10834,27 +10806,18 @@ export class AibrushMediaEngine implements MediaEngine {
     // land on the first keyframe — exactly what the seek_negative edge expects ("never throw on the
     // sign, never seek before the start"). A non-finite target stays a real InputError below.
     const seekUs = Number.isFinite(tUs) && tUs < 0 ? 0 : tUs;
+    // The harness's landing rule maps onto the engine's public seek modes: a keyframe scenario wants
+    // the last random-access frame at or before the target (or the first after it), every other
+    // scenario the frame nearest to the target. The engine resolves both from its own index or
+    // packet table; the adapter no longer walks a packet table to pre-compute the landing time.
+    const mode = context?.request.options.expectKeyframe === true ? 'keyframe' : 'nearest';
     return this.#run('seek', 'framework.seek', context, async (signal) => {
       try {
         const engine = this.#engine();
-        const planned = await this.#packetAlignedSeekTarget(engine, input, seekUs, signal);
-        if (planned.usedPacketInfo) {
-          this.#activeRoute = 'framework.packet-info+seek';
-          this.#configEvidence.record({
-            operation: 'seek',
-            route: this.#activeRoute,
-            internalDriver: 'framework-router-unexposed',
-            readerMode: 'packet-info+framework-source',
-            writerMode: 'framework-default',
-            targetMode: 'framework-default',
-            peakRetainedBytes: 0,
-            callbackWriteCount: 0,
-          });
-        }
         const frame = await engine.seek(
           await this.#srcWholeForSmall(engine, input, SEEK_DECODE_BULK_FETCH_MAX_BYTES),
-          planned.targetUs,
-          { signal },
+          seekUs,
+          { signal, mode },
         );
         try {
           const img = await imageDataFromVideoFrame(frame);
@@ -10867,7 +10830,7 @@ export class AibrushMediaEngine implements MediaEngine {
       } catch (e) {
         return this.#naIfMiss('seek', e, input);
       }
-    });
+    }, 'root');
   }
 
   async trim(
@@ -10960,7 +10923,7 @@ export class AibrushMediaEngine implements MediaEngine {
         async (signal) => {
           try {
             return await tryStrictPreparedAibrushCopyTrim(
-              this.#driverCore(),
+              (await this.#coreRuntime(context?.signal)),
               undefined,
               input,
               range,
@@ -10994,7 +10957,7 @@ export class AibrushMediaEngine implements MediaEngine {
         context,
         async (signal) => {
           try {
-            const bytes = await this.#driverCore().mp4TrimFromUrl(input.url, {
+            const bytes = await (await this.#coreRuntime(context?.signal)).mp4TrimFromUrl(input.url, {
               mime: input.mime,
               size: input.sizeBytes,
               startSec: range.startUs / 1e6,
@@ -11040,7 +11003,7 @@ export class AibrushMediaEngine implements MediaEngine {
             input.contentAttestation === undefined &&
             containerFromInput(input) === 'adts'
           ) {
-            const bytes = await this.#driverCore().adtsTrimFromUrl(input.url, {
+            const bytes = await (await this.#coreRuntime(context?.signal)).adtsTrimFromUrl(input.url, {
               mime: input.mime,
               ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
               startSec: range.startUs / 1e6,
@@ -11060,7 +11023,7 @@ export class AibrushMediaEngine implements MediaEngine {
             input.contentAttestation === undefined &&
             containerFromInput(input) === 'wav'
           ) {
-            const bytes = await this.#driverCore().wavTrimFromUrl(input.url, {
+            const bytes = await (await this.#coreRuntime(context?.signal)).wavTrimFromUrl(input.url, {
               mime: input.mime,
               ...(input.sizeBytes !== undefined ? { size: input.sizeBytes } : {}),
               startSec: range.startUs / 1e6,
@@ -11081,7 +11044,7 @@ export class AibrushMediaEngine implements MediaEngine {
             context?.request.options.invariant !== 'trim-noop-semantic-identity'
           ) {
             const prepared = await tryStrictPreparedAibrushCopyTrim(
-              this.#driverCore(),
+              (await this.#coreRuntime(context?.signal)),
               engine,
               input,
               range,
@@ -11098,7 +11061,7 @@ export class AibrushMediaEngine implements MediaEngine {
             }
           }
           const effectiveRange = opts.frameAccurate
-            ? await aibrushFrameAccurateRange(input, range)
+            ? await aibrushFrameAccurateRange(input, range, context)
             : await aibrushMatroskaKeyframeRange(input, range);
           // Frame-accurate trim routes to the engine's accurate codec-seam path (ADR-082); keyframe trim is
           // the lossless stream-copy. A codec the browser cannot decode for the accurate path surfaces as a
@@ -11154,12 +11117,10 @@ export class AibrushMediaEngine implements MediaEngine {
     this.#bindCellSignal(context, 'prepareMuxTracks');
     if (context !== undefined) this.#currentRequest = context.request;
     context?.signal.throwIfAborted();
-    // Robustness cells execute in a fresh Worker, where init() deliberately loads only the lightweight
-    // WAV surface. Every packet-preparation fast path below is core-backed and several run before the
-    // full-runtime #run fallback, so establish that shared driver surface once before dispatch. The
-    // cached import is also safe for main-realm callers; the per-cell core reference is released in
-    // dispose().
-    await this.#ensureCoreRuntime(context?.signal);
+    // Robustness cells execute in a fresh Worker. Only the single-file MP4 packet-info entry is loaded up
+    // front; the wider core surface (pre-authored outputs, WebM/ADTS/MP3/Ogg packet tables) is imported
+    // lazily by the branch that needs it, so a plain source→demux preparation never pays for it.
+    await this.#ensureMp4PacketInfoRuntime(context?.signal);
     this.#activeOperation = 'prepareMuxTracks';
     this.#activeRoute = 'framework.packet-preparation';
     this.#configEvidence.record({
@@ -11189,16 +11150,9 @@ export class AibrushMediaEngine implements MediaEngine {
       (options as { target?: unknown } | undefined)?.target !== 'stream'
     ) {
       try {
-        const prepared = await prepareMultiSourceWebmMux(this.#driverCore(), inputs, undefined);
+        const prepared = await prepareMultiSourceWebmMux((await this.#coreRuntime(context?.signal)), inputs, undefined);
         if (prepared !== undefined) {
-          this.#preparedWebmMuxOutput = {
-            inputs,
-            target: requestedTarget,
-            bytes: this.#driverCore().muxPreparedWebmChunkTracks({
-              tracks: prepared.preparedTracks,
-              container: requestedTarget,
-            }),
-          };
+          // (pre-authored output removed: the timed mux() authors the container itself)
           this.#muxSource = inputs;
           return { tracks: prepared.tracks };
         }
@@ -11268,19 +11222,12 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
+            const table = await (await this.#coreRuntime(context?.signal)).mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
             const tracks = encodedMp4TracksFromPacketInfo(table, bytes);
             const preparedTracks = tracks === undefined ? undefined : preparedMp4PacketTracksFromEncoded(tracks);
             if (tracks !== undefined && preparedTracks !== undefined) {
               if ((options as { target?: unknown } | undefined)?.target !== 'stream') {
-                this.#preparedTsMuxOutput = {
-                  input,
-                  target: requestedTarget,
-                  bytes: this.#driverCore().muxPreparedMpegTsPacketTracks({
-                    tracks: preparedTracks,
-                    container: requestedTarget,
-                  }),
-                };
+                // (pre-authored output removed: the timed mux() authors the container itself)
               }
               this.#muxSource = inputs;
               return { tracks };
@@ -11315,7 +11262,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().webmPacketPayloadInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).webmPacketPayloadInfoFromBytes(bytes);
             const tracks = encodedTracksFromWebmPayloadInfo(table);
             if (tracks !== undefined) {
               if (
@@ -11324,14 +11271,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ) {
                 const preparedTracks = preparedWebmChunkTracksFromPayloadInfo(table);
                 if (preparedTracks !== undefined) {
-                  this.#preparedWebmMuxOutput = {
-                    input,
-                    target: requestedTarget,
-                    bytes: this.#driverCore().muxPreparedWebmChunkTracks({
-                      tracks: preparedTracks,
-                      container: requestedTarget,
-                    }),
-                  };
+                  // (pre-authored output removed: the timed mux() authors the container itself)
                 }
               }
               this.#muxSource = inputs;
@@ -11354,7 +11294,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
+            const table = await (await this.#coreRuntime(context?.signal)).mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
             const tracks = encodedMp4TracksFromPacketInfo(table, bytes);
             if (tracks !== undefined) {
               if ((options as { target?: unknown } | undefined)?.target !== 'stream') {
@@ -11372,16 +11312,7 @@ export class AibrushMediaEngine implements MediaEngine {
                 }
                 if (preparedTracks.length === tracks.length) {
                   const rotated = hasNonIdentityMuxRotation(tracks);
-                  this.#preparedWebmMuxOutput = {
-                    input,
-                    target: requestedTarget,
-                    bytes: rotated
-                      ? await muxPreparedWebmRotationTracks(preparedTracks, requestedTarget, context?.signal)
-                      : this.#driverCore().muxPreparedWebmChunkTracks({
-                          tracks: preparedTracks,
-                          container: requestedTarget,
-                        }),
-                  };
+                  // (pre-authored output removed: the timed mux() authors the container itself)
                 }
               }
               this.#muxSource = inputs;
@@ -11407,7 +11338,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
+            const table = await (await this.#coreRuntime(context?.signal)).mp4PacketInfoFromBytes(bytes, { includeOffsets: true });
             const tracks = encodedMp4TracksFromPacketInfo(table, bytes);
             if (tracks !== undefined && tracks.length === table.tracks.length) {
               const outputTarget = (options as { target?: unknown } | undefined)?.target;
@@ -11423,17 +11354,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ) {
                 const preparedTracks = preparedMp4PacketTracksFromEncoded(tracks);
                 if (preparedTracks !== undefined) {
-                  this.#preparedMp4MuxOutput = {
-                    input,
-                    target: requestedTarget,
-                    fragmented,
-                    bytes: this.#driverCore().muxPreparedMp4PacketTracks({
-                      tracks: preparedTracks,
-                      container: requestedTarget,
-                      faststart,
-                      fragmented,
-                    }),
-                  };
+                  // (pre-authored output removed: the timed mux() authors the container itself)
                 }
               } else if (
                 outputTarget !== 'stream' &&
@@ -11445,18 +11366,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ) {
                 const trackInfo = videoTrackInfoFromEncoded(tracks[0]);
                 if (trackInfo !== undefined) {
-                  this.#preparedMp4MuxOutput = {
-                    input,
-                    target: requestedTarget,
-                    fragmented: false,
-                    bytes: this.#driverCore().muxPreparedMp4PacketTrack({
-                      track: trackInfo,
-                      packets: packetArrayFromEncodedTrack(tracks[0]),
-                      container: requestedTarget,
-                      faststart,
-                      fragmented: false,
-                    }),
-                  };
+                  // (pre-authored output removed: the timed mux() authors the container itself)
                 }
               }
               this.#muxSource = inputs;
@@ -11482,7 +11392,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().webmPacketPayloadInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).webmPacketPayloadInfoFromBytes(bytes);
             const tracks = encodedTracksFromWebmPayloadInfo(table);
             if (tracks !== undefined && tracks.length === table.tracks.length) {
               const outputTarget = (options as { target?: unknown } | undefined)?.target;
@@ -11498,17 +11408,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ) {
                 const preparedTracks = preparedMp4PacketTracksFromEncoded(tracks);
                 if (preparedTracks !== undefined) {
-                  this.#preparedMp4MuxOutput = {
-                    input,
-                    target: requestedTarget,
-                    fragmented,
-                    bytes: this.#driverCore().muxPreparedMp4PacketTracks({
-                      tracks: preparedTracks,
-                      container: requestedTarget,
-                      faststart,
-                      fragmented,
-                    }),
-                  };
+                  // (pre-authored output removed: the timed mux() authors the container itself)
                 }
               }
               this.#muxSource = inputs;
@@ -11538,25 +11438,14 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().adtsPacketInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).adtsPacketInfoFromBytes(bytes);
             const track = encodedAdtsAudioTrackFromPacketInfo(table, bytes);
             const trackInfo = track === undefined ? undefined : audioTrackInfoFromEncoded(track);
             if (track !== undefined && trackInfo !== undefined) {
               const outputTarget = (options as { target?: unknown } | undefined)?.target;
               const faststart = (options as { fastStart?: unknown } | undefined)?.fastStart !== false;
               if (outputTarget !== 'stream') {
-                this.#preparedMp4MuxOutput = {
-                  input,
-                  target: requestedTarget,
-                  fragmented: false,
-                  bytes: this.#driverCore().muxPreparedMp4PacketTrack({
-                    track: trackInfo,
-                    packets: packetArrayFromEncodedTrack(track),
-                    container: requestedTarget,
-                    faststart,
-                    fragmented: false,
-                  }),
-                };
+                // (pre-authored output removed: the timed mux() authors the container itself)
               }
               this.#muxSource = inputs;
               return { tracks: [track] };
@@ -11578,25 +11467,14 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().mp3PacketInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).mp3PacketInfoFromBytes(bytes);
             const track = encodedMp3AudioTrackFromPacketInfo(table, bytes);
             const trackInfo = track === undefined ? undefined : audioTrackInfoFromEncoded(track);
             if (track !== undefined && trackInfo !== undefined) {
               const outputTarget = (options as { target?: unknown } | undefined)?.target;
               const faststart = (options as { fastStart?: unknown } | undefined)?.fastStart !== false;
               if (outputTarget !== 'stream') {
-                this.#preparedMp4MuxOutput = {
-                  input,
-                  target: requestedTarget,
-                  fragmented: false,
-                  bytes: this.#driverCore().muxPreparedMp4PacketTrack({
-                    track: trackInfo,
-                    packets: packetArrayFromEncodedTrack(track),
-                    container: requestedTarget,
-                    faststart,
-                    fragmented: false,
-                  }),
-                };
+                // (pre-authored output removed: the timed mux() authors the container itself)
               }
               this.#muxSource = inputs;
               return { tracks: [track] };
@@ -11621,20 +11499,12 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().mp3PacketInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).mp3PacketInfoFromBytes(bytes);
             const track = encodedMp3AudioTrackFromPacketInfo(table, bytes);
             const trackInfo = track === undefined ? undefined : audioTrackInfoFromEncoded(track);
             if (track !== undefined && trackInfo !== undefined) {
               if ((options as { target?: unknown } | undefined)?.target !== 'stream') {
-                this.#preparedAudioMuxOutput = {
-                  input,
-                  target: requestedTarget,
-                  track,
-                  bytes: this.#driverCore().muxPreparedMp3PacketTrack({
-                    track: trackInfo,
-                    packets: preparedMp3PacketsFromEncodedTrack(track),
-                  }),
-                };
+                // (pre-authored output removed: the timed mux() authors the container itself)
               }
               this.#muxSource = inputs;
               return { tracks: [track] };
@@ -11659,7 +11529,7 @@ export class AibrushMediaEngine implements MediaEngine {
               ? await inputBytes(input)
               : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
           if (bytes !== undefined) {
-            const table = this.#driverCore().oggPacketInfoFromBytes(bytes);
+            const table = (await this.#coreRuntime(context?.signal)).oggPacketInfoFromBytes(bytes);
             const track = encodedOggAudioTrackFromPacketInfo(table, bytes);
             const trackInfo = track === undefined ? undefined : audioTrackInfoFromEncoded(track);
             if (track !== undefined && trackInfo !== undefined) {
@@ -11667,16 +11537,7 @@ export class AibrushMediaEngine implements MediaEngine {
                 (requestedTarget === 'webm' || requestedTarget === 'mkv') &&
                 (options as { target?: unknown } | undefined)?.target !== 'stream'
               ) {
-                this.#preparedAudioMuxOutput = {
-                  input,
-                  target: requestedTarget,
-                  track,
-                  bytes: this.#driverCore().muxPreparedWebmAudioPacketTrack({
-                    track: trackInfo,
-                    packets: packetArrayFromEncodedTrack(track),
-                    container: requestedTarget,
-                  }),
-                };
+                // (pre-authored output removed: the timed mux() authors the container itself)
               }
               this.#muxSource = inputs;
               return { tracks: [track] };
@@ -11691,6 +11552,8 @@ export class AibrushMediaEngine implements MediaEngine {
         }
       }
     }
+    // Root runtime only: every path below is probe / packetInfo / demux on the root entry, or the
+    // single-file MP4 packet-info entry. The full runtime (root + core) is never needed here.
     return this.#run('prepareMuxTracks', 'framework.demux-packet-preparation', context, async (signal) => {
       try {
         if (inputs.length === 1 && requestedTarget === 'mkv') {
@@ -11774,9 +11637,8 @@ export class AibrushMediaEngine implements MediaEngine {
         this.#preparedAudioMuxOutput = undefined;
         return this.#naIfMiss('mux', e, inputs[0]);
       }
-    });
+    }, 'root');
   }
-
   /**
    * Mux step 2 (runner hook): author the target container from the recorded source's coded samples. The
    * harness `mux` op COPIES coded samples verbatim into a container (no re-encode). We produce that by
@@ -11797,11 +11659,13 @@ export class AibrushMediaEngine implements MediaEngine {
     if (context !== undefined) this.#currentRequest = context.request;
     context?.signal.throwIfAborted();
     const recorded = this.#muxSource;
-    const preparedPcmSource = this.#preparedPcmMuxSource;
-    const preparedMp4MuxOutput = this.#preparedMp4MuxOutput;
-    const preparedAudioMuxOutput = this.#preparedAudioMuxOutput;
-    const preparedWebmMuxOutput = this.#preparedWebmMuxOutput;
-    const preparedTsMuxOutput = this.#preparedTsMuxOutput;
+    // Outputs pre-authored during `prepareMuxTracks` are never returned from the timed window: the
+    // measured `mux()` always performs the container authoring itself (adapter rule: no pre-computation).
+    const preparedPcmSource = discardPreparedMuxWork(this.#preparedPcmMuxSource);
+    const preparedMp4MuxOutput = discardPreparedMuxWork(this.#preparedMp4MuxOutput);
+    const preparedAudioMuxOutput = discardPreparedMuxWork(this.#preparedAudioMuxOutput);
+    const preparedWebmMuxOutput = discardPreparedMuxWork(this.#preparedWebmMuxOutput);
+    const preparedTsMuxOutput = discardPreparedMuxWork(this.#preparedTsMuxOutput);
     this.#muxSource = undefined; // consume once; never leak state into an unrelated later mux
     this.#preparedPcmMuxSource = undefined;
     this.#preparedMp4MuxOutput = undefined;
@@ -11845,7 +11709,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw new Error(`sparse MP4 source packet ${index} does not match its source-bound prefix`);
         }
       }
-      const prefix = this.#driverCore().muxPreparedSparseMp4PacketTrack({
+      const prefix = (await this.#coreRuntime(context?.signal)).muxPreparedSparseMp4PacketTrack({
         track: trackInfo,
         packets,
         container: target,
@@ -11967,7 +11831,7 @@ export class AibrushMediaEngine implements MediaEngine {
         } catch (e) {
           return this.#naIfMiss('mux', e, input);
         }
-      });
+      }, 'root');
     }
 
     rejectIllegalMuxTarget(target, selectedTracks);
@@ -12056,7 +11920,7 @@ export class AibrushMediaEngine implements MediaEngine {
         if (!fragmented && outputTarget !== 'stream') {
           try {
             const packets = packetArrayFromEncodedTrack(preparedSingleTrack);
-            const out = this.#driverCore().muxPreparedMp4PacketTrack({
+            const out = (await this.#coreRuntime(context?.signal)).muxPreparedMp4PacketTrack({
               track: trackInfo,
               packets,
               container: target,
@@ -12094,7 +11958,7 @@ export class AibrushMediaEngine implements MediaEngine {
           } catch (e) {
             return this.#naIfMiss('mux', e, recorded[0]);
           }
-        });
+        }, 'root');
       }
     }
 
@@ -12121,7 +11985,7 @@ export class AibrushMediaEngine implements MediaEngine {
             if (telemetry.sink.kind !== 'stream-target') {
               throw new Error('prepared MP4 streaming mux requires a stream-target sink');
             }
-            const stream = this.#driverCore().muxPreparedMp4PacketTracksStream({
+            const stream = (await this.#coreRuntime(context?.signal)).muxPreparedMp4PacketTracksStream({
               tracks: preparedTracks,
               container: target,
               faststart: fastStartOption === undefined ? false : fastStartOption !== false,
@@ -12132,7 +11996,7 @@ export class AibrushMediaEngine implements MediaEngine {
           } catch (e) {
             return this.#naIfMiss('mux', e, recorded[0]);
           }
-        });
+        }, 'root');
       }
     }
 
@@ -12168,16 +12032,11 @@ export class AibrushMediaEngine implements MediaEngine {
               { signal },
             );
             const media = await telemetry.mediaBytes(out, target);
-            const repairedOgg = target === 'ogg' ? repairAibrushOggContinuationFlags(media.bytes) : undefined;
-            return verifyRequestedIsoShape(
-              repairedOgg === undefined ? media : { ...media, bytes: repairedOgg },
-              opts,
-              false,
-            );
+            return verifyRequestedIsoShape(media, opts, false);
           } catch (e) {
             return this.#naIfMiss('mux', e, recorded[0]);
           }
-        });
+        }, 'root');
       }
     }
 
@@ -12220,7 +12079,7 @@ export class AibrushMediaEngine implements MediaEngine {
       } catch (e) {
         return this.#naIfMiss('mux', e, input);
       }
-    });
+    }, 'root');
   }
 
   /**
@@ -12245,7 +12104,8 @@ export class AibrushMediaEngine implements MediaEngine {
           ? await inputBytes(input)
           : await inputBytesIfAtMost(input, PACKET_INFO_PREP_MAX_SOURCE_BYTES);
       if (bytes === undefined) return undefined;
-      const table = await this.#driverCore().mp4PacketInfoFromBytes(bytes, {
+      await this.#ensureMp4PacketInfoRuntime(signal);
+      const table = await this.#mp4PacketInfoRuntime().mp4PacketInfoFromBytes(bytes, {
         includeOffsets: true,
         signal,
       });
@@ -12637,7 +12497,7 @@ export class AibrushMediaEngine implements MediaEngine {
       } catch (e) {
         return this.#naIfMiss('concat', e);
       }
-    });
+    }, 'root');
   }
 
   async decrypt(
@@ -12677,7 +12537,7 @@ export class AibrushMediaEngine implements MediaEngine {
             throw translated;
           }
         }
-      });
+      }, 'root');
     }
     const scheme = (() => {
       switch (opts.scheme) {
@@ -12708,7 +12568,7 @@ export class AibrushMediaEngine implements MediaEngine {
           throw translated;
         }
       }
-    });
+    }, 'root');
   }
 }
 

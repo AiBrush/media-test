@@ -8,7 +8,7 @@
 // Runtime: bun (`bunx vite` / `bun x vite`). No node CLI anywhere.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, statSync, writeFileSync, readdirSync } from 'node:fs';
 import { dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
 const MIME = {
@@ -307,7 +307,70 @@ function contentAttestationEndpoint() {
 }
 
 /**
- * Serve /vendor/ffmpeg-wasm/** raw, ahead of Vite transforms, for Emscripten workers.
+ * Serve /vendor/ffmpeg-wasm/**
+ * Serve and copy the vendored `@aibrush/media` dist as `/vendor/aibrush-media/**` (the same way the
+ * ffmpeg.wasm runtime is exposed). The engine's worker offload spawns `dist/worker.js`, which imports
+ * its sibling code-split chunks by relative path; a bundler-renamed chunk graph cannot satisfy that, so
+ * the adapter points `createMedia({ worker: { url } })` at this untouched copy instead.
+ */
+function aibrushMediaVendorStatic() {
+  const publicPrefix = '/vendor/aibrush-media/';
+  const distRoot = join(process.cwd(), 'node_modules', '@aibrush', 'media', 'dist');
+
+  const resolveFile = (rel) => {
+    if (rel.includes('..') || rel.startsWith('/')) return null;
+    const filePath = join(distRoot, rel);
+    return existsSync(filePath) ? filePath : null;
+  };
+
+  const serve = (req, res, next) => {
+    const url = (req.url || '').split('?')[0];
+    if (!url.startsWith(publicPrefix)) return next();
+    const filePath = resolveFile(decodeURIComponent(url.slice(publicPrefix.length)));
+    if (!filePath) {
+      res.statusCode = 404;
+      return res.end('aibrush-media vendor: not found');
+    }
+    const st = statSync(filePath);
+    if (st.isDirectory()) {
+      res.statusCode = 404;
+      return res.end('aibrush-media vendor: is a directory');
+    }
+    return streamStaticFile(req, res, filePath, st, staticContentType(filePath), 'same-origin');
+  };
+
+  // `statSync` follows the symlinks a file: install leaves in node_modules; dirent kinds would not.
+  const copyTree = (from, to) => {
+    mkdirSync(to, { recursive: true });
+    for (const name of readdirSync(from)) {
+      const source = join(from, name);
+      const target = join(to, name);
+      const st = statSync(source);
+      if (st.isDirectory()) copyTree(source, target);
+      else if (st.isFile() && !name.endsWith('.map') && !name.endsWith('.d.ts')) copyFileSync(source, target);
+    }
+  };
+
+  return {
+    name: 'aibrush-media-vendor-static',
+    buildStart() {
+      if (!resolveFile('worker.js')) this.error('Missing @aibrush/media dist/worker.js. Run bun run sync-vendor.');
+    },
+    writeBundle(outputOptions) {
+      const outDir = outputOptions.dir;
+      if (!outDir) return;
+      copyTree(distRoot, join(outDir, 'vendor', 'aibrush-media'));
+    },
+    configureServer(server) {
+      server.middlewares.use(serve);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(serve);
+    },
+  };
+}
+
+/** raw, ahead of Vite transforms, for Emscripten workers.
  *
  * A checked-out `src/engines/ffmpeg-wasm/vendor` directory is optional (and gitignored). The pinned
  * package assets in node_modules are the primary source, with that directory as a legacy fallback.
@@ -628,6 +691,7 @@ export default {
   logLevel: 'error',
   // crossOriginIsolation FIRST so COOP/COEP land on every response (incl. fixtures + wasm + workers).
   plugins: [
+    aibrushMediaVendorStatic(),
     crossOriginIsolation(),
     ffmpegVendorStatic(),
     saveEndpoint(),

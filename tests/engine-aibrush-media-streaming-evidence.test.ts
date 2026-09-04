@@ -619,6 +619,7 @@ describe('aibrush-media streaming-output production boundary', () => {
   });
 
   test('real append-only WebM callback output resolves as live and satisfies the live shape verifier', async () => {
+    const restoreChunks = installEncodedChunkShims();
     const bytes = new Uint8Array(await readFile(new URL('../fixtures/media/tiny_vp9_360p_2s.webm', import.meta.url)));
     const input: MediaInput = {
       id: 'tiny_vp9_360p_2s.webm',
@@ -663,9 +664,50 @@ describe('aibrush-media streaming-output production boundary', () => {
       expect(trace?.retainedOutputBytes).toBeGreaterThanOrEqual(output.bytes.byteLength);
     } finally {
       await engine.dispose(lifecycle);
+      restoreChunks();
     }
   });
 });
+
+/** Bun has no WebCodecs; the live WebM stream copy only needs the chunk constructors' data contract. */
+class TestEncodedChunk {
+  readonly type: string;
+  readonly timestamp: number;
+  readonly duration: number | null;
+  readonly byteLength: number;
+  readonly #data: Uint8Array;
+  constructor(init: { type: string; timestamp: number; duration?: number | null; data: BufferSource }) {
+    this.type = init.type;
+    this.timestamp = init.timestamp;
+    this.duration = init.duration ?? null;
+    const d = init.data;
+    this.#data = ArrayBuffer.isView(d)
+      ? new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength))
+      : new Uint8Array((d as ArrayBuffer).slice(0));
+    this.byteLength = this.#data.byteLength;
+  }
+  copyTo(destination: ArrayBuffer | ArrayBufferView): void {
+    const view = ArrayBuffer.isView(destination)
+      ? new Uint8Array(destination.buffer, destination.byteOffset, destination.byteLength)
+      : new Uint8Array(destination);
+    view.set(this.#data);
+  }
+}
+
+function installEncodedChunkShims(): () => void {
+  const previous = {
+    video: Object.getOwnPropertyDescriptor(globalThis, 'EncodedVideoChunk'),
+    audio: Object.getOwnPropertyDescriptor(globalThis, 'EncodedAudioChunk'),
+  };
+  Object.defineProperty(globalThis, 'EncodedVideoChunk', { configurable: true, writable: true, value: TestEncodedChunk });
+  Object.defineProperty(globalThis, 'EncodedAudioChunk', { configurable: true, writable: true, value: TestEncodedChunk });
+  return () => {
+    for (const [key, descriptor] of [['EncodedVideoChunk', previous.video], ['EncodedAudioChunk', previous.audio]] as const) {
+      if (descriptor === undefined) Reflect.deleteProperty(globalThis, key);
+      else Object.defineProperty(globalThis, key, descriptor);
+    }
+  };
+}
 
 function remuxRequest(
   outputContainer: string,

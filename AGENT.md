@@ -84,3 +84,23 @@ await window.__SUITE__.run({ engineIds: ['mp4box'], featureIds: ['trim'],
   ffmpeg and is the only place native ffmpeg is allowed.
 
 Use `/test-cell <engine> <feature>` for the full step-by-step procedure.
+
+## Adapter rules (all engines, enforced for `aibrush-media` first)
+
+An adapter is a thin translation layer between the harness `MediaEngine` interface and the
+engine's **public** API. It is not a place to finish the engine's work. Concretely:
+
+- Import only the package's root entry (`@aibrush/media`, `mediabunny`, ...). Never the
+  `/core` or other private/internal entries. A cell that needs an internal entry is a
+  public-API gap: record it as `NA_ENGINE` with the gap cited, then file it against the engine.
+- Never branch on harness context (scenario id, family, pillar, fixture name, size, hash,
+  golden, or cache contents). The adapter sees an input and options, nothing else.
+- Never post-process, repair, or re-author engine output before the oracle sees it (no
+  page/CRC fixes, no box rewrites, no tag rewrites, no PCM splicing). If output is wrong,
+  the cell FAILs and the engine gets the bug.
+- Never read metadata the engine planted for the oracle. Oracles read only what a real
+  player reads; an oracle change that recognises engine-specific side channels is invalid.
+- Target size: an adapter SHOULD stay under 1,500 lines. Every hand-written fast path in an
+  adapter is evidence the engine's public API is too hard to use.
+- The engine's autonomous improvement loop must never modify this repository. Oracle,
+  golden, fixture, and adapter changes are made here by a human, in their own commit.

@@ -1695,9 +1695,9 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 	});
 
 	test("declares only lossy audio copy trims without exact presentation timing NA", () => {
-		for (const [container, codec] of [
-			["mp4", "aac"],
-			["adts", "aac"],
+		for (const [container, codec, reason] of [
+			["mp4", "aac", "the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring"],
+			["adts", "aac", "raw ADTS carries whole AAC access units with no delay/padding field and no edit list, and AAC-LC's 50%-overlap 2048-sample MDCT makes the first copied access unit decode differently from the source, so the exact decoded presentation window is not authorable outside same-container Ogg Opus granule or MP3 Xing/LAME authoring"],
 		] as const) {
 			expect(
 				decideAibrushSupport(
@@ -1722,8 +1722,7 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 				supported: false,
 				status: "NA_ENGINE",
 				reasonCode: "AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED",
-				reason:
-					"the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
+				reason,
 			});
 		}
 
@@ -1748,11 +1747,8 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 				),
 			),
 		).toEqual({
-			supported: false,
-			status: "NA_ENGINE",
-			reasonCode: "AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED",
-			reason:
-				"MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable",
+			// exact MP3 copy trims are authored within the Xing/LAME preroll limit (mp3-exact-trim.ts)
+			supported: true,
 		});
 
 		expect(
@@ -1839,7 +1835,7 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 			status: "NA_ENGINE",
 			reasonCode: "AIBRUSH_AUDIO_PRESENTATION_TIMING_UNSUPPORTED",
 			reason:
-				"the packet-copy trim surface cannot author the exact decoded presentation window outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
+				"raw ADTS carries whole AAC access units with no delay/padding field and no edit list, and AAC-LC's 50%-overlap 2048-sample MDCT makes the first copied access unit decode differently from the source, so the exact decoded presentation window is not authorable outside same-container Ogg Opus granule or MP3 Xing/LAME authoring",
 		});
 
 		const fetchDescriptor = Object.getOwnPropertyDescriptor(
@@ -1891,7 +1887,7 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 		}
 	});
 
-	test("keeps exact MP3 copy trim NA after auditing the Xing/LAME preroll limit", async () => {
+	test("supports exact MP3 copy trim within the Xing/LAME preroll limit", async () => {
 		const range = { startUs: 5_000_000, endUs: 10_000_000 };
 		const operationRequest = request(
 			"trim",
@@ -1922,13 +1918,8 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 				},
 			},
 		);
-		expect(decideAibrushSupport(operationRequest)).toEqual({
-			supported: false,
-			status: "NA_ENGINE",
-			reasonCode: "AIBRUSH_MP3_EXACT_TRIM_UNSUPPORTED",
-			reason:
-				"MP3 packet copy cannot reconstruct the source decoder state within the 4095-sample Xing/LAME delay limit, so the exact decoded PCM boundaries are not authorable",
-		});
+		// The library authors exact MP3 copy trims within the Xing/LAME preroll limit (mp3-exact-trim.ts).
+		expect(decideAibrushSupport(operationRequest)).toEqual({ supported: true });
 
 		for (const file of ["02.mp3", "03.mp3", "mp3_xing.mp3"]) {
 			const bytes = new Uint8Array(
@@ -2509,7 +2500,7 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 		}
 	});
 
-	test("dense ISO-BMFF decode uses the product packet plan and owned RGBA views", async () => {
+	test("dense ISO-BMFF decode runs the framework decode route with owned RGBA views", async () => {
 		const videoDecoderDescriptor = Object.getOwnPropertyDescriptor(
 			globalThis,
 			"VideoDecoder",
@@ -2517,6 +2508,10 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 		const encodedChunkDescriptor = Object.getOwnPropertyDescriptor(
 			globalThis,
 			"EncodedVideoChunk",
+		);
+		const encodedAudioChunkDescriptor = Object.getOwnPropertyDescriptor(
+			globalThis,
+			"EncodedAudioChunk",
 		);
 		const imageDataDescriptor = Object.getOwnPropertyDescriptor(
 			globalThis,
@@ -2565,6 +2560,9 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 		}
 
 		class FakeDecoder {
+			static async isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport> {
+				return { supported: true, config };
+			}
 			state: CodecState = "unconfigured";
 			readonly #queued: FakeChunk[] = [];
 
@@ -2606,6 +2604,11 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 			value: FakeDecoder,
 		});
 		Object.defineProperty(globalThis, "EncodedVideoChunk", {
+			configurable: true,
+			writable: true,
+			value: FakeChunk,
+		});
+		Object.defineProperty(globalThis, "EncodedAudioChunk", {
 			configurable: true,
 			writable: true,
 			value: FakeChunk,
@@ -2662,24 +2665,20 @@ describe("REQ-ENG-32: aibrush-media concrete tuple applicability", () => {
 				codedHeight: 240,
 				hardwareAcceleration: "no-preference",
 			});
+			// The public decode route keeps codec configuration inside the framework router; the adapter
+			// records only the route and the source/writer modes it can observe.
 			expect(engine.configUsed).toMatchObject({
-				route: "core.iso-bmff-packet-info+webcodecs",
+				route: "framework.decode",
 				operation: "decodeFrames",
-				codecConfigs: [
-					{
-						role: "video-decoder",
-						codec: "avc1.64001F",
-						codedWidth: 320,
-						codedHeight: 240,
-						hardwareAcceleration: "no-preference",
-						descriptionByteLength: 44,
-					},
-				],
+				backend: "framework-router-unexposed",
+				readerMode: "framework-source",
+				writerMode: "framework-default",
 			});
 		} finally {
 			await engine.dispose(operationContext);
 			restoreGlobal("VideoDecoder", videoDecoderDescriptor);
 			restoreGlobal("EncodedVideoChunk", encodedChunkDescriptor);
+			restoreGlobal("EncodedAudioChunk", encodedAudioChunkDescriptor);
 			restoreGlobal("ImageData", imageDataDescriptor);
 		}
 	});
