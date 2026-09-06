@@ -436,6 +436,8 @@ interface AibrushPacketInfoMetadata {
   payloadDigest?: string;
 }
 interface AibrushPacketInfoTable {
+  /** The container the engine actually routed to; authoritative over the input's name/MIME hint. */
+  container?: string;
   tracks: ReadonlyArray<AibrushTrackInfo>;
   packets: ReadonlyArray<AibrushPacketInfoMetadata>;
 }
@@ -989,6 +991,8 @@ interface AibrushTrackInfo {
   };
 }
 interface AibrushDemuxed {
+  /** The container the engine actually routed to; authoritative over the input's name/MIME hint. */
+  container?: string;
   tracks: ReadonlyArray<AibrushTrackInfo>;
   packetInfoTable?(): ReadonlyArray<AibrushPacketInfoMetadata>;
   packetTable?(): ReadonlyArray<AibrushPacketMetadata>;
@@ -1611,6 +1615,7 @@ function knownContainerProbeToken(input: MediaInput): 'mp4' | 'mov' | 'webm' | '
 function metadataFromAibrushTracks(
   input: MediaInput,
   observedTracks: readonly AibrushObservedTrack[],
+  reportedContainer?: string,
 ): NormalizedMetadata {
   let durationSec: number | null = null;
   const tracks: NormalizedTrack[] = observedTracks.map((t) => {
@@ -1620,11 +1625,17 @@ function metadataFromAibrushTracks(
     }
     return normalizeAibrushTrack(t);
   });
-  return { container: containerFromInput(input), durationSec, tracks };
+  // The engine's own token is authoritative for a byte container (it beats a lying file name), but an
+  // HLS presentation is resolved by this adapter before the engine ever sees it, so the engine can only
+  // report the transport its segments use.
+  const container = isHlsAsset(input)
+    ? containerFromInput(input)
+    : (reportedContainer ?? containerFromInput(input));
+  return { container, durationSec, tracks };
 }
 
 function metadataFromDemuxed(input: MediaInput, demuxed: AibrushDemuxed): NormalizedMetadata {
-  return metadataFromAibrushTracks(input, demuxed.tracks);
+  return metadataFromAibrushTracks(input, demuxed.tracks, demuxed.container);
 }
 
 function demuxResultFromPacketInfo(
@@ -1632,7 +1643,7 @@ function demuxResultFromPacketInfo(
   packetInfo: AibrushPacketInfoTable,
   sourceBytes?: Uint8Array,
 ): DemuxResult {
-  const metadata = metadataFromAibrushTracks(input, packetInfo.tracks);
+  const metadata = metadataFromAibrushTracks(input, packetInfo.tracks, packetInfo.container);
   return buildAibrushDemuxResult(
     metadata,
     packetInfo.tracks,
@@ -10139,6 +10150,10 @@ export class AibrushMediaEngine implements MediaEngine {
             (input.sizeBytes !== undefined &&
               input.sizeBytes > MP4_DEMUX_BYTE_PACKET_INFO_MAX_SOURCE_BYTES));
         if (useBoundedMp4Batches) {
+          // `init()` starts clean MP4/MOV demux on the focused packet-info runtime, which has no
+          // bounded-batch surface. Load the public root entry (not `/core`: a fresh realm pays 34 ms
+          // for the driver-author surface this path never touches) before using the engine.
+          await this.#ensureRootRuntime(signal);
           const engine = this.#engine();
           const source = await this.#src(engine, input, sourceRead?.onRead);
           return attachSourceReadTelemetry(
@@ -10213,6 +10228,7 @@ export class AibrushMediaEngine implements MediaEngine {
             container === 'mp3') &&
           !isMalformedHarnessInput(input)
         ) {
+          await this.#ensureRootRuntime(signal);
           const engine = this.#engine();
           const src = await this.#src(engine, input, sourceRead?.onRead);
           const packetInfo = await engine.packetInfo?.(src, {
@@ -10230,6 +10246,7 @@ export class AibrushMediaEngine implements MediaEngine {
             );
           }
         }
+        await this.#ensureRootRuntime(signal);
         const engine = this.#engine();
         const source =
           isMalformedHarnessInput(input) && !input.mutated
